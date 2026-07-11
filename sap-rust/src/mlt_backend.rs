@@ -88,8 +88,8 @@ use serde_json::{json, Value};
 
 use crate::backend::{
     parse_mlt_keyframe_entry, Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo,
-    FilterListEntry, JobStatus, KeyframeInfo, Marker, PlaylistEntry, ProjectState, SplitClipResult,
-    SubtitleTrackInfo, Track, TransitionInfo,
+    FilterListEntry, JobStatus, KeyframeInfo, Marker, PlaylistEntry, PlaylistEntryDetail, ProjectState,
+    SplitClipResult, SubtitleTrackInfo, Track, TransitionInfo,
 };
 
 /// Project frame rate assumed throughout this backend's MLT profile and
@@ -329,6 +329,12 @@ impl MltBackend {
 impl Backend for MltBackend {
     fn project_select(&mut self, project_id: &str) -> BackendResult<ProjectState> {
         self.project_mut(project_id)?;
+        // Bug fix: previously never wired up -- see the same fix + comment
+        // in backend.rs's MockBackend::project_select for the rationale
+        // (recent-list state is per-ProjectData here, so recording the
+        // project's own id on select is this backend's equivalent of
+        // 10-testing-plan.md's Phase 3 recent.* requirement).
+        self.recent_add(project_id, project_id)?;
         self.project_get_state(project_id)
     }
 
@@ -477,6 +483,98 @@ impl Backend for MltBackend {
 
     fn playlist_list(&mut self, project_id: &str) -> BackendResult<Vec<PlaylistEntry>> {
         Ok(self.project_mut(project_id)?.playlist_bin.clone())
+    }
+
+    fn playlist_insert(
+        &mut self,
+        project_id: &str,
+        index: usize,
+        source: Value,
+        name: Option<String>,
+    ) -> BackendResult<PlaylistEntry> {
+        let producer = resolve_source_direct(&source)?;
+        let (in_f, out_f) = default_in_out(&producer)?;
+        let duration_frames = out_f - in_f + 1;
+        let data = self.project_mut(project_id)?;
+        if index > data.playlist_bin.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "playlist.insert index {index} out of range (len {})",
+                data.playlist_bin.len()
+            )));
+        }
+        let mut producers = bin_producers_as_vec(data);
+        producers.insert(index, producer);
+        let entry = PlaylistEntry { index, name: name.unwrap_or_else(|| format!("clip{index}")), source, duration_frames };
+        data.playlist_bin.insert(index, entry);
+        for (i, e) in data.playlist_bin.iter_mut().enumerate() {
+            e.index = i;
+        }
+        set_bin_producers_from_vec(data, producers);
+        data.dirty = true;
+        Ok(data.playlist_bin[index].clone())
+    }
+
+    fn playlist_remove(&mut self, project_id: &str, index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        if index >= data.playlist_bin.len() {
+            return Err(BackendError::NotFound(format!("playlist index {index}")));
+        }
+        let mut producers = bin_producers_as_vec(data);
+        producers.remove(index);
+        data.playlist_bin.remove(index);
+        for (i, e) in data.playlist_bin.iter_mut().enumerate() {
+            e.index = i;
+        }
+        set_bin_producers_from_vec(data, producers);
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn playlist_move(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        let len = data.playlist_bin.len();
+        if from_index >= len {
+            return Err(BackendError::NotFound(format!("playlist index {from_index}")));
+        }
+        if to_index >= len {
+            return Err(BackendError::InvalidParams(format!("toIndex {to_index} out of range (len {len})")));
+        }
+        let mut producers = bin_producers_as_vec(data);
+        let p = producers.remove(from_index);
+        producers.insert(to_index, p);
+        let entry = data.playlist_bin.remove(from_index);
+        data.playlist_bin.insert(to_index, entry);
+        for (i, e) in data.playlist_bin.iter_mut().enumerate() {
+            e.index = i;
+        }
+        set_bin_producers_from_vec(data, producers);
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn playlist_get(&mut self, project_id: &str, index: usize) -> BackendResult<PlaylistEntryDetail> {
+        let data = self.project_mut(project_id)?;
+        let entry = data
+            .playlist_bin
+            .get(index)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("playlist index {index}")))?;
+        // Reuse the same real `ffprobe`-backed helper `file.probe` uses --
+        // only meaningful for file-backed sources (a generator/title or
+        // blank-spacer entry has no real file to probe, so `probe` is
+        // honestly `None` there, not an error).
+        let probe = entry
+            .source
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|p| probe_media(p).ok());
+        Ok(PlaylistEntryDetail {
+            index: entry.index,
+            name: entry.name,
+            source: entry.source,
+            duration_frames: entry.duration_frames,
+            probe,
+        })
     }
 
     fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry> {
@@ -1470,6 +1568,28 @@ fn resolve_source(data: &MltProjectData, source: &Value) -> BackendResult<Produc
     resolve_source_direct(source)
 }
 
+/// `bin_producers` is keyed by playlist-bin index and must always stay
+/// index-aligned with `playlist_bin` (invariant established by
+/// `playlist_append`/`file_import`). `playlist.insert/remove/move` need to
+/// shift that alignment the same way they shift `playlist_bin` itself --
+/// round-tripping through a plain `Vec` (ordered 0..len) makes that a
+/// single, obviously-correct `Vec` operation instead of separately-derived
+/// index arithmetic on the `HashMap` for each of the three operations.
+fn bin_producers_as_vec(data: &MltProjectData) -> Vec<ProducerSpec> {
+    (0..data.playlist_bin.len())
+        .map(|i| {
+            data.bin_producers
+                .get(&i)
+                .cloned()
+                .expect("bin_producers must be index-aligned with playlist_bin")
+        })
+        .collect()
+}
+
+fn set_bin_producers_from_vec(data: &mut MltProjectData, producers: Vec<ProducerSpec>) {
+    data.bin_producers = producers.into_iter().enumerate().collect();
+}
+
 fn default_in_out(producer: &ProducerSpec) -> BackendResult<(i64, i64)> {
     match producer {
         ProducerSpec::File { path } => {
@@ -1892,6 +2012,86 @@ mod tests {
             BackendError::NotFound(_) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Proof for playlist.insert/remove/move/get, mirroring the existing
+    /// `edit_split_clip_and_filter_lifecycle` style: real `MltBackend`
+    /// state, no real media files needed (blank spacers are real MLT
+    /// producers too, just transparent ones -- see the module doc comment's
+    /// "Mid-timeline positioning" note), which also exercises that
+    /// `bin_producers` stays correctly index-aligned with `playlist_bin`
+    /// across all three mutations (a later `edit.appendClip` by
+    /// `playlistIndex` would silently resolve the wrong producer if it
+    /// didn't).
+    #[test]
+    fn playlist_insert_remove_move_get_keep_bin_producers_aligned() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-playlist-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+
+        backend.playlist_append("project", json!({"blank": 10}), Some("a".into())).unwrap();
+        backend.playlist_append("project", json!({"blank": 30}), Some("c".into())).unwrap();
+        let inserted = backend
+            .playlist_insert("project", 1, json!({"blank": 20}), Some("b".into()))
+            .unwrap();
+        assert_eq!(inserted.index, 1);
+        assert_eq!(inserted.duration_frames, 20);
+        let names: Vec<String> = backend.playlist_list("project").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+
+        // playlist.get: full metadata, probe is honestly None for a blank
+        // spacer (nothing real to ffprobe).
+        let got = backend.playlist_get("project", 1).unwrap();
+        assert_eq!(got.name, "b");
+        assert_eq!(got.duration_frames, 20);
+        assert!(got.probe.is_none());
+        assert!(backend.playlist_get("project", 99).is_err());
+
+        // bin_producers alignment check: edit.appendClip by playlistIndex 1
+        // ("b", 20 frames) must resolve to the right producer post-insert.
+        backend.edit_add_track("project", "video").unwrap();
+        let clip = backend.edit_append_clip("project", 0, json!({"playlistIndex": 1})).unwrap();
+        assert_eq!(clip.out_frame - clip.in_frame + 1, 20, "clip appended via playlistIndex 1 should resolve to entry \"b\" (20 frames), not a stale producer");
+
+        // Move "c" (index 2) to the front; bin_producers must move with it.
+        backend.playlist_move("project", 2, 0).unwrap();
+        let names: Vec<String> = backend.playlist_list("project").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["c", "a", "b"]);
+        let clip = backend.edit_append_clip("project", 0, json!({"playlistIndex": 0})).unwrap();
+        assert_eq!(clip.out_frame - clip.in_frame + 1, 30, "playlistIndex 0 should now resolve to \"c\" (30 frames) after the move");
+
+        // Remove "a" (now index 1); reindexing + producer alignment again.
+        backend.playlist_remove("project", 1).unwrap();
+        let names: Vec<String> = backend.playlist_list("project").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["c", "b"]);
+        let clip = backend.edit_append_clip("project", 0, json!({"playlistIndex": 1})).unwrap();
+        assert_eq!(clip.out_frame - clip.in_frame + 1, 20, "playlistIndex 1 should now resolve to \"b\" (20 frames) after the remove");
+
+        assert!(backend.playlist_remove("project", 99).is_err());
+        assert!(backend.playlist_move("project", 0, 99).is_err());
+        assert!(backend.playlist_insert("project", 99, json!({"blank": 5}), None).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Proof for testing-plan.md Phase 3's `recent.*` row against the real
+    /// (`MltBackend`, disk-persisted) implementor, not just `MockBackend`.
+    #[test]
+    fn project_select_adds_the_project_to_its_own_recent_list() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-recent-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        assert!(backend.recent_list("proj").unwrap().is_empty());
+
+        backend.project_select("proj").unwrap();
+        assert_eq!(backend.recent_list("proj").unwrap(), vec!["proj".to_string()]);
+
+        backend.project_select("proj").unwrap();
+        assert_eq!(backend.recent_list("proj").unwrap(), vec!["proj".to_string()]);
+
+        // Persisted to disk too (same `.snapshot/recent.json` `recent_add`
+        // itself already persists to), not just held in memory.
+        let persisted = std::fs::read_to_string(root.join("proj/.snapshot/recent.json")).unwrap();
+        assert!(persisted.contains("proj"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

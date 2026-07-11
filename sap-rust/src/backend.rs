@@ -59,6 +59,22 @@ pub struct PlaylistEntry {
     pub duration_frames: i64,
 }
 
+/// Result of `playlist.get` -- full metadata for one playlist bin entry,
+/// including probe data where available. `probe` is `None` for entries
+/// this backend cannot probe (e.g. `MockBackend`, or a non-file-backed
+/// source like a generator/blank spacer) rather than the call failing --
+/// only an out-of-range `index` is an error here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistEntryDetail {
+    pub index: usize,
+    pub name: String,
+    pub source: Value,
+    pub duration_frames: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<FileProbe>,
+}
+
 /// Result of `transitions.addCrossfade`, per 01's `transitions.*` namespace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,6 +224,41 @@ pub trait Backend: Send {
     ) -> BackendResult<PlaylistEntry>;
 
     fn playlist_list(&mut self, project_id: &str) -> BackendResult<Vec<PlaylistEntry>>;
+
+    /// `playlist.insert` -- insert a source into the Playlist bin at
+    /// `index` (shifting existing entries at/after `index` up by one),
+    /// per `PlaylistModel::insert()`. `name` follows the same optional
+    /// convention as `playlist_append`.
+    fn playlist_insert(
+        &mut self,
+        project_id: &str,
+        index: usize,
+        source: Value,
+        name: Option<String>,
+    ) -> BackendResult<PlaylistEntry>;
+
+    /// `playlist.remove` -- remove the entry at `index` (shifting
+    /// subsequent entries down by one), per `PlaylistModel::remove()`.
+    fn playlist_remove(&mut self, project_id: &str, index: usize) -> BackendResult<()>;
+
+    /// `playlist.move` -- move the entry at `from_index` to `to_index`,
+    /// per `PlaylistModel::move()`.
+    fn playlist_move(
+        &mut self,
+        project_id: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> BackendResult<()>;
+
+    /// `playlist.get` -- full metadata for one playlist bin entry,
+    /// including probe data where available (see `PlaylistEntryDetail`).
+    fn playlist_get(&mut self, project_id: &str, index: usize) -> BackendResult<PlaylistEntryDetail>;
+
+    // Note: `playlist.addToTimeline` has no dedicated trait method -- per
+    // 01-jsonrpc-spec.md it's a pure convenience wrapper equivalent to
+    // `edit.appendClip({source: {playlistIndex: index}})`, so server.rs
+    // dispatches it straight to the existing `edit_append_clip` rather than
+    // this trait growing a near-duplicate method.
 
     /// `file.import` -- import a local file into the project's playlist bin.
     fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry>;
@@ -537,6 +588,12 @@ impl MockBackend {
 impl Backend for MockBackend {
     fn project_select(&mut self, project_id: &str) -> BackendResult<ProjectState> {
         self.project_mut(project_id);
+        // Bug fix: previously never wired up -- 10-testing-plan.md's Phase 3
+        // `recent.*` row expects `recent.list` to contain a project after
+        // `project.select`. Recent-list state lives per-`ProjectData` (see
+        // the `recent` field below), so the natural equivalent here is
+        // recording the project's own id into its own recent bin on select.
+        let _ = self.recent_add(project_id, project_id);
         Ok(self.state_of(project_id))
     }
 
@@ -668,6 +725,83 @@ impl Backend for MockBackend {
 
     fn playlist_list(&mut self, project_id: &str) -> BackendResult<Vec<PlaylistEntry>> {
         Ok(self.project_mut(project_id).playlist.clone())
+    }
+
+    fn playlist_insert(
+        &mut self,
+        project_id: &str,
+        index: usize,
+        source: Value,
+        name: Option<String>,
+    ) -> BackendResult<PlaylistEntry> {
+        let data = self.project_mut(project_id);
+        if index > data.playlist.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "playlist.insert index {index} out of range (len {})",
+                data.playlist.len()
+            )));
+        }
+        let entry = PlaylistEntry {
+            index,
+            name: name.unwrap_or_else(|| format!("clip{index}")),
+            source,
+            duration_frames: 0,
+        };
+        data.playlist.insert(index, entry);
+        for (i, e) in data.playlist.iter_mut().enumerate() {
+            e.index = i;
+        }
+        data.dirty = true;
+        Ok(data.playlist[index].clone())
+    }
+
+    fn playlist_remove(&mut self, project_id: &str, index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        if index >= data.playlist.len() {
+            return Err(BackendError::NotFound(format!("playlist index {index}")));
+        }
+        data.playlist.remove(index);
+        for (i, e) in data.playlist.iter_mut().enumerate() {
+            e.index = i;
+        }
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn playlist_move(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        let len = data.playlist.len();
+        if from_index >= len {
+            return Err(BackendError::NotFound(format!("playlist index {from_index}")));
+        }
+        if to_index >= len {
+            return Err(BackendError::InvalidParams(format!("toIndex {to_index} out of range (len {len})")));
+        }
+        let entry = data.playlist.remove(from_index);
+        data.playlist.insert(to_index, entry);
+        for (i, e) in data.playlist.iter_mut().enumerate() {
+            e.index = i;
+        }
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn playlist_get(&mut self, project_id: &str, index: usize) -> BackendResult<PlaylistEntryDetail> {
+        let data = self.project_mut(project_id);
+        let entry = data
+            .playlist
+            .get(index)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("playlist index {index}")))?;
+        // MockBackend has no real probe capability (see `file_probe` above),
+        // so `probe` is honestly `None` here rather than fabricated data.
+        Ok(PlaylistEntryDetail {
+            index: entry.index,
+            name: entry.name,
+            source: entry.source,
+            duration_frames: entry.duration_frames,
+            probe: None,
+        })
     }
 
     fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry> {
@@ -1700,7 +1834,12 @@ mod tests {
     #[test]
     fn recent_add_list_remove_dedupes_newest_first() {
         let mut b = MockBackend::new();
-        b.project_select("p").unwrap();
+        // Deliberately does *not* call project_select first (unlike other
+        // tests here) -- project_select itself now also pushes onto the
+        // recent list (see project_select_adds_the_project_to_its_own_recent_list
+        // below), which would otherwise pollute these exact-list assertions.
+        // recent_add/list/remove all lazily create the project entry on
+        // their own, same as every other per-project method here.
 
         b.recent_add("p", "/a.mp4").unwrap();
         b.recent_add("p", "/b.mp4").unwrap();
@@ -1711,6 +1850,63 @@ mod tests {
         assert_eq!(removed, "/b.mp4");
         assert_eq!(b.recent_list("p").unwrap(), vec!["/a.mp4".to_string()]);
         assert!(b.recent_remove("p", "/missing.mp4").is_err());
+    }
+
+    /// Proof for testing-plan.md Phase 3's `recent.*` row: "After a
+    /// project.select, confirm the project appears in recent.list" -- this
+    /// was previously never wired up (project_select didn't touch `recent`
+    /// at all); see the bug fix in `project_select` above.
+    #[test]
+    fn project_select_adds_the_project_to_its_own_recent_list() {
+        let mut b = MockBackend::new();
+        assert!(b.recent_list("proj").unwrap().is_empty());
+
+        b.project_select("proj").unwrap();
+        assert_eq!(b.recent_list("proj").unwrap(), vec!["proj".to_string()]);
+
+        // Re-selecting the same project must dedupe (move-to-front), not
+        // grow the list -- same dedupe contract `recent_add` already has.
+        b.project_select("proj").unwrap();
+        assert_eq!(b.recent_list("proj").unwrap(), vec!["proj".to_string()]);
+    }
+
+    #[test]
+    fn playlist_insert_remove_move_get_round_trip() {
+        let mut b = MockBackend::new();
+        b.playlist_append("p", json!({"path": "/a.mp4"}), Some("a".into())).unwrap();
+        b.playlist_append("p", json!({"path": "/c.mp4"}), Some("c".into())).unwrap();
+
+        // Insert "b" between "a" and "c".
+        let inserted = b.playlist_insert("p", 1, json!({"path": "/b.mp4"}), Some("b".into())).unwrap();
+        assert_eq!(inserted.index, 1);
+        assert_eq!(inserted.name, "b");
+        let names: Vec<String> = b.playlist_list("p").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+
+        // playlist.get returns full entry metadata (MockBackend: probe is
+        // honestly None, no fabricated data).
+        let got = b.playlist_get("p", 1).unwrap();
+        assert_eq!(got.name, "b");
+        assert_eq!(got.source, json!({"path": "/b.mp4"}));
+        assert!(got.probe.is_none());
+        assert!(b.playlist_get("p", 99).is_err());
+
+        // Move "c" (index 2) to the front.
+        b.playlist_move("p", 2, 0).unwrap();
+        let names: Vec<String> = b.playlist_list("p").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["c", "a", "b"]);
+
+        // Remove "a" (now index 1); reindexing must be reflected.
+        b.playlist_remove("p", 1).unwrap();
+        let remaining = b.playlist_list("p").unwrap();
+        let names: Vec<String> = remaining.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["c", "b"]);
+        assert_eq!(remaining[0].index, 0);
+        assert_eq!(remaining[1].index, 1);
+
+        assert!(b.playlist_remove("p", 99).is_err());
+        assert!(b.playlist_move("p", 0, 99).is_err());
+        assert!(b.playlist_insert("p", 99, json!({"path": "/z.mp4"}), None).is_err());
     }
 
     #[test]

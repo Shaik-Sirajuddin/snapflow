@@ -16,16 +16,16 @@
 
 #![cfg(feature = "real_ffi")]
 
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_void};
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 
 use serde_json::Value;
 
 use crate::backend::{
     Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo, FilterListEntry, JobStatus,
-    KeyframeInfo, Marker, PlaylistEntry, ProjectState, SplitClipResult, SubtitleTrackInfo, Track,
-    TransitionInfo,
+    KeyframeInfo, Marker, PlaylistEntry, PlaylistEntryDetail, ProjectState, SplitClipResult,
+    SubtitleTrackInfo, Track, TransitionInfo,
 };
 use crate::ffi;
 use crate::server::{self, ServerConfig};
@@ -156,14 +156,49 @@ impl Backend for FfiBackend {
     fn edit_append_clip(
         &mut self,
         _project_id: &str,
-        _track_index: usize,
-        _source: Value,
+        track_index: usize,
+        source: Value,
     ) -> BackendResult<Clip> {
-        // Stub: no real FFI wrapper for TimelineDock::append() yet -- it
-        // reads from the system clipboard / "current source" rather than
-        // taking a source parameter directly, so wrapping it needs a bit
-        // more design than this pass covers. Flagged in the final report.
-        Err(BackendError::NotFound("edit.appendClip not wired to real FFI yet".into()))
+        // Real wiring: `sap_append_clip` (sap_ffi.cpp) opens `source.path`
+        // as an actual Mlt::Producer and pushes it via the real,
+        // undoable Timeline::AppendCommand -- see that file for the full
+        // path. Unlike TimelineDock::append() (which only reads the
+        // clipboard/"current source"), this takes the path directly.
+        let path = source
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
+
+        let raw =
+            unsafe { ffi::sap_append_clip(self.main_window, track_index as c_int, c_path.as_ptr()) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "failed to append clip from {path} to track {track_index} (invalid track, or {path} did not open as a valid MLT producer)"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AppendedClip {
+            clip_id: String,
+            index: usize,
+            in_frame: i64,
+            out_frame: i64,
+        }
+        let appended: AppendedClip = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad append-clip JSON: {e}")))?;
+
+        Ok(Clip {
+            clip_id: appended.clip_id,
+            index: appended.index,
+            source,
+            in_frame: appended.in_frame,
+            out_frame: appended.out_frame,
+        })
     }
 
     fn edit_list_clips(&mut self, _project_id: &str, _track_index: usize) -> BackendResult<Vec<Clip>> {
@@ -207,6 +242,34 @@ impl Backend for FfiBackend {
 
     fn playlist_list(&mut self, _project_id: &str) -> BackendResult<Vec<PlaylistEntry>> {
         Ok(Vec::new())
+    }
+
+    // --- Minimal stubs for the new playlist.* trait methods (task: keep
+    // this file's changes to an absolute minimum -- these are explicit
+    // NotFound entries, not real Qt/MLT wiring, same honesty policy as
+    // playlist_append/file_import above; playlist.addToTimeline has no
+    // trait method at all, see backend.rs's comment on that). ---
+
+    fn playlist_insert(
+        &mut self,
+        _project_id: &str,
+        _index: usize,
+        _source: Value,
+        _name: Option<String>,
+    ) -> BackendResult<PlaylistEntry> {
+        Err(BackendError::NotFound("playlist.insert not wired to real FFI yet".into()))
+    }
+
+    fn playlist_remove(&mut self, _project_id: &str, _index: usize) -> BackendResult<()> {
+        Err(BackendError::NotFound("playlist.remove not wired to real FFI yet".into()))
+    }
+
+    fn playlist_move(&mut self, _project_id: &str, _from_index: usize, _to_index: usize) -> BackendResult<()> {
+        Err(BackendError::NotFound("playlist.move not wired to real FFI yet".into()))
+    }
+
+    fn playlist_get(&mut self, _project_id: &str, _index: usize) -> BackendResult<PlaylistEntryDetail> {
+        Err(BackendError::NotFound("playlist.get not wired to real FFI yet".into()))
     }
 
     fn file_import(&mut self, _project_id: &str, _path: &str) -> BackendResult<PlaylistEntry> {
@@ -422,10 +485,30 @@ impl Backend for FfiBackend {
     fn playback_get_frame(
         &mut self,
         _project_id: &str,
-        _frame: i64,
-        _format: &str,
+        frame: i64,
+        format: &str,
     ) -> BackendResult<String> {
-        Err(BackendError::NotFound("playback.getFrame not wired to real FFI yet".into()))
+        // Real wiring: `sap_get_frame` (sap_ffi.cpp) renders the requested
+        // frame off the live project producer via Controller::image() (the
+        // same primitive Shotcut's own thumbnails use) and encodes it with
+        // Qt's QImage::save(). Base64-encoded here with the same alphabet
+        // as MltBackend::playback_get_frame (mlt_backend.rs) for wire-format
+        // consistency; duplicated locally rather than imported since that
+        // function is private to mlt_backend.rs.
+        let c_format = CString::new(format)
+            .map_err(|e| BackendError::InvalidParams(format!("invalid format: {e}")))?;
+        let mut out_len: c_int = 0;
+        let raw = unsafe {
+            ffi::sap_get_frame(self.main_window, frame, c_format.as_ptr(), &mut out_len as *mut c_int)
+        };
+        if raw.is_null() || out_len <= 0 {
+            return Err(BackendError::InvalidParams(format!(
+                "failed to render frame {frame} (format {format}): no live producer, out-of-range frame, or no codec for that format"
+            )));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(raw, out_len as usize) }.to_vec();
+        unsafe { ffi::sap_free_bytes(raw) };
+        Ok(base64_encode(&bytes))
     }
 
     fn markers_append(
@@ -550,4 +633,26 @@ pub unsafe extern "C" fn sap_start_server(
     if let Err(e) = rt.block_on(server::serve(config, backend)) {
         eprintln!("sap-rust: server exited with error: {e}");
     }
+}
+
+/// Standard base64 (RFC 4648, with `=` padding) -- a local copy of
+/// `mlt_backend::base64_encode`'s algorithm/alphabet, kept in sync
+/// deliberately (not imported: that function is private to
+/// `mlt_backend.rs`, and this file is restricted to touching
+/// `ffi_backend.rs`/`ffi.rs` only) so `playback_get_frame`'s wire format
+/// matches `MltBackend::playback_get_frame`'s byte-for-byte.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
 }

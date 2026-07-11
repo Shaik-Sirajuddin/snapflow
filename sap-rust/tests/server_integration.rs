@@ -400,3 +400,103 @@ async fn edit_split_clip_and_filter_lifecycle_dispatch() {
     let filters = client.call("filter.list", json!({"clipId": left_id})).await;
     assert_eq!(filters.result.unwrap().as_array().unwrap().len(), 1);
 }
+
+/// Proof for testing-plan.md Phase 3's `notes.*` row: "confirm notes.changed
+/// notification fires on a second, concurrently-connected session" -- same
+/// pattern as `edit_add_track_fans_out_to_other_client_on_same_project`/
+/// `playlist_append_fans_out_to_other_client_on_same_project`, applied to
+/// `notes.setText`. Also confirms the underlying text is actually shared
+/// project state (client B reads back client A's write), not just that a
+/// notification happened to arrive.
+#[tokio::test]
+async fn notes_set_text_fans_out_to_other_client_on_same_project() {
+    let path = start_server("notes-fanout", TOKEN).await;
+
+    let mut client_a = Client::connect(&path).await;
+    client_a.call("sap.hello", json!({"token": TOKEN})).await;
+    client_a.call("project.select", json!({"projectId": "shared-notes-project"})).await;
+
+    let mut client_b = Client::connect(&path).await;
+    client_b.call("sap.hello", json!({"token": TOKEN})).await;
+    client_b.call("project.select", json!({"projectId": "shared-notes-project"})).await;
+
+    let set = client_a.call("notes.setText", json!({"text": "hello from A"})).await;
+    assert!(set.error.is_none(), "client A's notes.setText should succeed: {:?}", set.error);
+
+    // Client B never called notes.setText itself -- it must still see the
+    // change via an unsolicited notes.changed notification.
+    let notification = client_b
+        .recv_notification_timeout(Duration::from_secs(2))
+        .await
+        .expect("client B should receive a fan-out notes.changed notification");
+    assert_eq!(notification.method, "notes.changed");
+    assert_eq!(notification.params["reason"], "setText");
+
+    // And the underlying state really is shared, not just the notification.
+    let got = client_b.call("notes.getText", json!({})).await;
+    assert!(got.error.is_none(), "client B's notes.getText should succeed: {:?}", got.error);
+    assert_eq!(got.result.unwrap()["text"], "hello from A");
+}
+
+/// Targeted proof for 11-e2e-scenario-tests.md's Phase B step 4: "the
+/// shared, single linear undo stack" means `project.undo()` issued from one
+/// session can undo a *different* session's most recent edit, not
+/// necessarily the caller's own last edit -- there is no per-session undo
+/// scoping. Honesty note (same caveat `mlt_backend.rs`/`backend.rs`
+/// document elsewhere): `project_undo` here is a plain shared depth
+/// counter, not real command-level timeline rewind, so this proves the
+/// stack's *sharedness and strict LIFO ordering across sessions* -- exactly
+/// the semantic the doc asks to confirm given that stub, not full content-
+/// level undo/redo.
+#[tokio::test]
+async fn project_undo_from_one_session_can_undo_a_different_sessions_most_recent_edit() {
+    let path = start_server("shared-undo", TOKEN).await;
+
+    let mut agent1 = Client::connect(&path).await;
+    agent1.call("sap.hello", json!({"token": TOKEN})).await;
+    agent1.call("project.select", json!({"projectId": "shared-undo-project"})).await;
+
+    let mut agent2 = Client::connect(&path).await;
+    agent2.call("sap.hello", json!({"token": TOKEN})).await;
+    agent2.call("project.select", json!({"projectId": "shared-undo-project"})).await;
+
+    // Agent 1 edits first...
+    let a1 = agent1.call("edit.addTrack", json!({"kind": "video"})).await;
+    assert!(a1.error.is_none(), "agent1 edit.addTrack: {:?}", a1.error);
+    // ...then Agent 2 makes the *most recent* edit on the shared project,
+    // strictly after Agent 1's.
+    let a2 = agent2.call("edit.addTrack", json!({"kind": "audio"})).await;
+    assert!(a2.error.is_none(), "agent2 edit.addTrack: {:?}", a2.error);
+
+    let before = agent1.call("project.getState", json!({})).await;
+    let before_undo = before.result.as_ref().unwrap()["undoDepth"].as_u64().unwrap();
+    assert_eq!(before_undo, 2, "both agents' edits should land on the same shared undo stack");
+
+    // Agent 1 undoes -- per 05-multi-client-concurrency.md's accepted
+    // single-linear-stack policy, this must be able to undo Agent 2's most
+    // recent edit; there is no per-session undo scoping to stop it.
+    let undo = agent1.call("project.undo", json!({})).await;
+    assert!(undo.error.is_none(), "agent1's project.undo should succeed: {:?}", undo.error);
+
+    // Agent 2 -- which never called undo itself -- must observe the shared
+    // stack's new depth via its own project.getState, proving project state
+    // (not just the connection) is what's shared.
+    let after = agent2.call("project.getState", json!({})).await;
+    let after_undo = after.result.as_ref().unwrap()["undoDepth"].as_u64().unwrap();
+    let after_redo = after.result.as_ref().unwrap()["redoDepth"].as_u64().unwrap();
+    assert_eq!(after_undo, before_undo - 1, "agent2 should observe the shared undoDepth decremented by agent1's undo");
+    assert_eq!(after_redo, 1, "agent2 should observe redoDepth incremented by agent1's undo");
+
+    // A second project.undo (still from agent1) must now undo Agent 1's own
+    // remaining edit -- confirms strict LIFO order across both sessions'
+    // edits, not e.g. silently stopping early or double-counting.
+    let undo2 = agent1.call("project.undo", json!({})).await;
+    assert!(undo2.error.is_none(), "agent1's second project.undo should succeed: {:?}", undo2.error);
+    let final_state = agent2.call("project.getState", json!({})).await;
+    assert_eq!(final_state.result.as_ref().unwrap()["undoDepth"].as_u64().unwrap(), 0);
+
+    // The shared stack is now exhausted -- a further undo must fail, not
+    // silently no-op or go negative.
+    let too_many = agent1.call("project.undo", json!({})).await;
+    assert!(too_many.error.is_some(), "undo past the bottom of the shared stack must fail, not silently succeed");
+}

@@ -73,6 +73,37 @@ extern "C" {
     /// of commands available to redo on `MAIN.undoStack()`. -1 on error.
     pub fn sap_get_redo_depth(main_window_handle: *mut c_void) -> c_int;
 
+    /// C++ side: `char* sap_append_clip(void* mainWindowHandle, int
+    /// trackIndex, const char* sourcePath);` -- opens `sourcePath` as a
+    /// real `Mlt::Producer` and appends it to `trackIndex` via the real,
+    /// undoable `Timeline::AppendCommand` (pushed on `MAIN.undoStack()`).
+    /// Returns a heap-allocated JSON object string, e.g.
+    /// `{"clipId":"t0c0","index":0,"inFrame":0,"outFrame":119}`, or NULL on
+    /// error. Caller must free the returned pointer via `sap_free_string`.
+    pub fn sap_append_clip(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        source_path: *const c_char,
+    ) -> *mut c_char;
+
+    /// C++ side: `unsigned char* sap_get_frame(void* mainWindowHandle,
+    /// long long frame, const char* format, int* outLen);` -- renders the
+    /// given absolute timeline frame off the live project producer and
+    /// encodes it (JPEG unless `format` is "png"), via
+    /// `Controller::image()` (mltcontroller.cpp), the same primitive
+    /// Shotcut's own thumbnails use. `*out_len` receives the byte length.
+    /// Returns NULL (and `*out_len == 0`) on error. Caller must free the
+    /// returned pointer via `sap_free_bytes`.
+    pub fn sap_get_frame(
+        main_window_handle: *mut c_void,
+        frame: c_longlong,
+        format: *const c_char,
+        out_len: *mut c_int,
+    ) -> *mut u8;
+
+    /// Frees a byte buffer returned by `sap_get_frame`.
+    pub fn sap_free_bytes(buf: *mut u8);
+
     /// Frees a string returned by `sap_list_tracks`.
     pub fn sap_free_string(s: *mut c_char);
 }

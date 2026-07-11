@@ -13,7 +13,7 @@
 //! the `melt` render it triggers, and the resulting MP4 file's actual
 //! duration/codecs as reported by a real `ffprobe` run.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -410,4 +410,214 @@ async fn full_export_pipeline_produces_a_real_playable_file() {
     );
     let data_b64 = frame["data"].as_str().expect("playback.getFrame returns base64 data");
     assert!(!data_b64.is_empty(), "grabbed frame payload should not be empty");
+}
+
+/// Full RPC round trip for the newly-added `playlist.*` methods (task 1):
+/// `insert`/`remove`/`move`/`get`/`addToTimeline`, against a real
+/// `MltBackend` over a real socket -- mirrors
+/// `playlist_append_and_append_clip_round_trip`'s style/level, extended to
+/// the rest of the namespace. `playlist.get`'s real `ffprobe`-backed probe
+/// data is asserted explicitly (reusing `file.probe`'s own helper, per the
+/// task), not just the bare entry shape `playlist.append`/`list` return.
+#[tokio::test]
+async fn playlist_insert_remove_move_get_and_add_to_timeline_round_trip() {
+    let workdir = std::env::temp_dir().join(unique_tag("mlt-workdir-playlist-ext"));
+    std::fs::create_dir_all(&workdir).unwrap();
+    let source_a = generate_test_source(&workdir, 1); // 30 frames
+
+    let projects_root = std::env::temp_dir().join(unique_tag("mlt-projects-playlist-ext"));
+    let path = start_server("playlist-ext", projects_root).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "playlist-ext-proj"})).await;
+
+    // Seed with two blank spacers (index 0, 1), then insert a real source
+    // clip between them at index 1.
+    Client::ok(&client.call("playlist.append", json!({"source": {"blank": 10}, "name": "a"})).await, "append a");
+    Client::ok(&client.call("playlist.append", json!({"source": {"blank": 40}, "name": "c"})).await, "append c");
+    let inserted = Client::ok(
+        &client
+            .call("playlist.insert", json!({"index": 1, "source": {"path": source_a.to_string_lossy()}, "name": "b"}))
+            .await,
+        "playlist.insert",
+    );
+    assert_eq!(inserted["index"], 1);
+    assert_eq!(inserted["name"], "b");
+    assert_eq!(inserted["durationFrames"], 30);
+
+    let listed = Client::ok(&client.call("playlist.list", json!({})).await, "playlist.list");
+    let names: Vec<&str> = listed.as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["a", "b", "c"]);
+
+    // playlist.get: full metadata including real ffprobe-derived probe
+    // data for the real source clip at index 1.
+    let got = Client::ok(&client.call("playlist.get", json!({"index": 1})).await, "playlist.get");
+    assert_eq!(got["name"], "b");
+    let probe = got.get("probe").expect("playlist.get should include probe data for a real file source");
+    assert_eq!(probe["durationFrames"], 30);
+    assert!(probe["codec"].as_str().is_some_and(|c| !c.is_empty()), "probe.codec should be a real codec name: {probe:?}");
+
+    // A blank spacer has nothing real to probe -- honestly None/absent,
+    // not fabricated.
+    let blank_detail = Client::ok(&client.call("playlist.get", json!({"index": 0})).await, "playlist.get (blank)");
+    assert!(blank_detail.get("probe").is_none(), "blank spacer entries should have no probe data: {blank_detail:?}");
+
+    let missing = client.call("playlist.get", json!({"index": 99})).await;
+    assert!(missing.error.is_some(), "playlist.get on an out-of-range index must fail");
+
+    // playlist.move: move "c" (index 2) to the front.
+    Client::ok(&client.call("playlist.move", json!({"fromIndex": 2, "toIndex": 0})).await, "playlist.move");
+    let listed = Client::ok(&client.call("playlist.list", json!({})).await, "playlist.list (after move)");
+    let names: Vec<&str> = listed.as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["c", "a", "b"]);
+
+    // playlist.addToTimeline: convenience wrapper equivalent to
+    // edit.appendClip({source: {playlistIndex}}) -- "b" is now at index 2.
+    Client::ok(&client.call("edit.addTrack", json!({"kind": "video"})).await, "edit.addTrack");
+    let clip = Client::ok(
+        &client.call("playlist.addToTimeline", json!({"index": 2, "trackIndex": 0, "position": 0})).await,
+        "playlist.addToTimeline",
+    );
+    assert_eq!(clip["outFrame"], 29, "addToTimeline'd clip should resolve to \"b\"'s real 30-frame source");
+    let clips = Client::ok(&client.call("edit.listClips", json!({"trackIndex": 0})).await, "edit.listClips");
+    assert_eq!(clips.as_array().unwrap().len(), 1);
+
+    // playlist.remove: remove "a" (now index 1).
+    Client::ok(&client.call("playlist.remove", json!({"index": 1})).await, "playlist.remove");
+    let listed = Client::ok(&client.call("playlist.list", json!({})).await, "playlist.list (after remove)");
+    let names: Vec<&str> = listed.as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["c", "b"]);
+
+    let bad_remove = client.call("playlist.remove", json!({"index": 99})).await;
+    assert!(bad_remove.error.is_some());
+}
+
+/// Generates a real, CPU-heavy H.264 source (a fractal pattern that's hard
+/// for `libx264` to compress) that reliably takes several real seconds for
+/// `melt` to re-encode -- long enough to call `jobs.stop` mid-flight and
+/// prove it kills a genuinely in-flight process, not just win a race
+/// against an export that was always going to finish before the stop call
+/// landed. Empirically measured during development: this exact
+/// 1920x1080/30s/mandelbrot config takes ~5s wall-clock for `melt`'s
+/// default libx264 re-encode on the dev machine (20 cores) -- ample margin
+/// over the sub-millisecond local Unix-socket round trip `jobs.stop` needs.
+fn generate_slow_test_source(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("slow-source.mp4");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("mandelbrot=size=1920x1080:rate={PROJECT_FPS}"),
+            "-t",
+            "30",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-loglevel",
+            "error",
+        ])
+        .arg(&path)
+        .status()
+        .expect("failed to spawn ffmpeg to generate the slow test source");
+    assert!(status.success(), "ffmpeg failed to generate the slow synthetic test source");
+    assert!(path.exists());
+    path
+}
+
+/// Returns the pid of the first process whose command line contains
+/// `needle`, if any -- used below to (a) confirm a real `melt` process is
+/// actually running before `jobs.stop` is called, and (b) confirm that
+/// exact pid is fully gone (not lingering as a zombie/orphan) afterward.
+fn pgrep_pid(needle: &str) -> Option<u32> {
+    let output = Command::new("pgrep").args(["-f"]).arg(needle).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().next()?.trim().parse().ok()
+}
+
+/// Proof for testing-plan.md Phase 3's `jobs.*` row + task 2c: `jobs.stop`
+/// against a *real* in-flight `file.export`, not just the existing
+/// `jobs_stop_marks_unknown_as_not_found` not-found-job unit test. Confirms
+/// (a) the job's status settles on `"stopped"`, never `"done"`, and (b) the
+/// real `melt` subprocess is actually killed -- its pid is fully reaped
+/// (no `/proc/<pid>` entry at all, so not even a transient zombie), not
+/// merely orphaned and left running in the background.
+#[tokio::test]
+async fn jobs_stop_kills_a_real_inflight_slow_export() {
+    let workdir = std::env::temp_dir().join(unique_tag("mlt-workdir-jobstop"));
+    std::fs::create_dir_all(&workdir).unwrap();
+    let source = generate_slow_test_source(&workdir);
+
+    let projects_root = std::env::temp_dir().join(unique_tag("mlt-projects-jobstop"));
+    let path = start_server("jobstop", projects_root).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "jobstop-proj"})).await;
+
+    Client::ok(
+        &client.call("playlist.append", json!({"source": {"path": source.to_string_lossy()}})).await,
+        "playlist.append",
+    );
+    Client::ok(&client.call("edit.addTrack", json!({"kind": "video"})).await, "edit.addTrack");
+    Client::ok(
+        &client.call("edit.appendClip", json!({"trackIndex": 0, "source": {"playlistIndex": 0}})).await,
+        "edit.appendClip",
+    );
+
+    let export_dir = workdir.join("out");
+    std::fs::create_dir_all(&export_dir).unwrap();
+    let output_path = export_dir.join("jobstop-output.mp4");
+    let export = client
+        .call("file.export", json!({"outputPath": output_path.to_string_lossy(), "codec": "libx264", "container": "mp4"}))
+        .await;
+    let export_result = Client::ok(&export, "file.export");
+    let job_id = export_result["jobId"].as_str().expect("file.export returns a jobId").to_string();
+
+    // Confirm a real melt process is actually running against this exact
+    // (UUID-unique) output path before stopping it -- otherwise stopping
+    // "too fast" wouldn't prove anything about killing a real in-flight job.
+    let output_str = output_path.to_string_lossy().into_owned();
+    let mut running_pid = None;
+    for _ in 0..40 {
+        if let Some(pid) = pgrep_pid(&output_str) {
+            running_pid = Some(pid);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let running_pid = running_pid.unwrap_or_else(|| panic!("expected a real melt process running against {output_str} before stopping it"));
+
+    let stop = client.call("jobs.stop", json!({"jobId": job_id})).await;
+    Client::ok(&stop, "jobs.stop");
+
+    // Poll jobs.get -- must settle on "stopped", never "done" or "error".
+    let mut status = String::new();
+    let mut last_job = Value::Null;
+    for _ in 0..100 {
+        let job = Client::ok(&client.call("jobs.get", json!({"jobId": job_id})).await, "jobs.get");
+        status = job["status"].as_str().unwrap_or_default().to_string();
+        last_job = job.clone();
+        if status != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, "stopped", "jobs.stop'd export should settle on status=stopped, never done: {last_job:?}");
+
+    // Real process-kill proof: the exact pid we observed running must be
+    // fully reaped -- no /proc entry at all (not running, not a zombie).
+    let mut proc_gone = false;
+    for _ in 0..40 {
+        if !Path::new(&format!("/proc/{running_pid}")).exists() {
+            proc_gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(proc_gone, "melt pid {running_pid} should be fully reaped after jobs.stop (no zombie/orphan)");
+    assert!(pgrep_pid(&output_str).is_none(), "no melt process should remain running against {output_str} after jobs.stop");
 }

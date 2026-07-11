@@ -790,6 +790,117 @@ fn build_op_ext(
             Err(e) => err_result(e),
         })),
 
+        "playlist.insert" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                index: usize,
+                source: Value,
+                #[serde(default)]
+                name: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.playlist_insert(&project_id, p.index, p.source, p.name) {
+                Ok(entry) => BackendCallResult {
+                    result: Ok(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
+                    notify: Some(RpcNotification::new(
+                        "playlist.changed",
+                        json!({"reason": "insert", "index": entry.index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "playlist.remove" => {
+            #[derive(Deserialize)]
+            struct P {
+                index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            let index = p.index;
+            Ok(Box::new(move |b| match b.playlist_remove(&project_id, index) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({})),
+                    notify: Some(RpcNotification::new("playlist.changed", json!({"reason": "remove", "index": index}))),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "playlist.move" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                from_index: usize,
+                to_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.playlist_move(&project_id, p.from_index, p.to_index) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({})),
+                    notify: Some(RpcNotification::new(
+                        "playlist.changed",
+                        json!({"reason": "move", "fromIndex": p.from_index, "toIndex": p.to_index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "playlist.get" => {
+            #[derive(Deserialize)]
+            struct P {
+                index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.playlist_get(&project_id, p.index) {
+                Ok(entry) => ok_result(serde_json::to_value(&entry).expect("PlaylistEntryDetail serializes")),
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "playlist.addToTimeline" => {
+            // Pure convenience wrapper per 01-jsonrpc-spec.md -- "equivalent
+            // to edit.appendClip({source: {playlistIndex: index}, ...})".
+            // Dispatches straight to the existing `edit_append_clip`
+            // codepath rather than a dedicated trait method, so this reuses
+            // every backend's real implementation (MltBackend's real MLT
+            // producer resolution included) with no duplicated logic.
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                index: usize,
+                track_index: usize,
+                // Accepted for wire-shape parity with the spec table, but
+                // currently a no-op: `edit_append_clip` has no arbitrary-
+                // position parameter (see mlt_backend.rs's "Mid-timeline
+                // positioning" module doc note) -- like edit.appendClip
+                // itself, this always appends at the end of the track.
+                #[serde(default)]
+                position: Option<i64>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.edit_append_clip(&project_id, p.track_index, json!({"playlistIndex": p.index})) {
+                    Ok(clip) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({
+                                "reason": "addToTimeline",
+                                "trackIndex": p.track_index,
+                                "clipIndex": clip.index,
+                                "playlistIndex": p.index,
+                                "positionRequested": p.position,
+                            }),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
         "file.import" => {
             #[derive(Deserialize)]
             struct P {
