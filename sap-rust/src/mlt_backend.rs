@@ -99,6 +99,23 @@ const DEFAULT_FPS: i64 = 30;
 /// Default duration for a generated title clip (no natural source length),
 /// matching real Shotcut's ballpark default title length.
 const DEFAULT_TITLE_DURATION_FRAMES: i64 = 150; // 5s @ 30fps
+/// Still-image codec names ffprobe reports for single-frame image files
+/// (`png`, `mjpeg` for jpg, etc.) -- these never carry a `format.duration`
+/// or `stream.duration` because a still image has no time dimension, so
+/// `probe_media` falls back to `DEFAULT_IMAGE_DURATION_FRAMES` for these
+/// instead of erroring. Real bug found via a live `claude -p` "photo
+/// gallery" scenario run: `playlist.append`/`edit.appendClip` with
+/// `source={"path": "*.png"}` unconditionally failed with "ffprobe
+/// returned no duration" for *every* bare still image (confirmed via
+/// direct `ffprobe` on both a freshly generated PNG and the pre-existing
+/// `overlay.png` fixture -- neither ever reports a duration field), so no
+/// still image could ever be used as a producer through this codepath.
+const STILL_IMAGE_CODECS: &[&str] =
+    &["png", "mjpeg", "bmp", "gif", "tiff", "webp", "targa", "ppm", "pgm", "pbm", "sgi"];
+/// Default duration applied to a still image when ffprobe reports none,
+/// matching real Shotcut's default still-image duration preference (4s)
+/// rather than MLT's un-set producer default (10 minutes).
+const DEFAULT_IMAGE_DURATION_FRAMES: i64 = DEFAULT_FPS * 4; // 4s
 
 // --------------------------------------------------------------------
 // In-memory project model
@@ -1715,19 +1732,30 @@ fn probe_media(path: &str) -> BackendResult<FileProbe> {
         .get("codec_name")
         .and_then(Value::as_str)
         .ok_or_else(|| BackendError::InvalidParams(format!("ffprobe returned no codec for {path}")))?;
-    let duration_seconds = json
+    let is_still_image = STILL_IMAGE_CODECS.contains(&codec);
+    let probed_duration_seconds = json
         .get("format")
         .and_then(|f| f.get("duration"))
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<f64>().ok())
-        .or_else(|| stream.get("duration").and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()))
-        .ok_or_else(|| BackendError::InvalidParams(format!("ffprobe returned no duration for {path}")))?;
+        .or_else(|| stream.get("duration").and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()));
+    let duration_seconds = match probed_duration_seconds {
+        Some(d) => d,
+        None if is_still_image => DEFAULT_IMAGE_DURATION_FRAMES as f64 / DEFAULT_FPS as f64,
+        None => return Err(BackendError::InvalidParams(format!("ffprobe returned no duration for {path}"))),
+    };
     let duration_frames = stream
         .get("nb_frames")
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<i64>().ok())
         .filter(|frames| *frames > 0)
-        .unwrap_or_else(|| (duration_seconds * DEFAULT_FPS as f64).round() as i64);
+        .unwrap_or_else(|| {
+            if is_still_image {
+                DEFAULT_IMAGE_DURATION_FRAMES
+            } else {
+                (duration_seconds * DEFAULT_FPS as f64).round() as i64
+            }
+        });
     if duration_frames <= 0 || !duration_seconds.is_finite() || duration_seconds < 0.0 {
         return Err(BackendError::InvalidParams(format!("ffprobe returned an invalid duration for {path}")));
     }
@@ -1976,6 +2004,58 @@ mod tests {
         assert!(root.join("project.mlt").is_file());
         assert!(!root.join("bound-project/project.mlt").exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Real bug found via a live `claude -p` "photo gallery" scenario:
+    /// `playlist.append`/`edit.appendClip` with a bare still-image
+    /// `source={"path": "*.png"}` unconditionally failed with "ffprobe
+    /// returned no duration for <path>", because ffprobe never reports a
+    /// duration for single-frame image formats -- so no still image could
+    /// ever be used as a producer through this codepath (title-generator
+    /// clips and blanks were unaffected, only bare-path stills). Confirmed
+    /// against a real generated PNG (not a mock), guarding
+    /// `STILL_IMAGE_CODECS`'s `DEFAULT_IMAGE_DURATION_FRAMES` fallback in
+    /// `probe_media`.
+    #[test]
+    fn playlist_append_and_append_clip_accept_a_bare_still_image_path() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-still-image-{}", uuid::Uuid::new_v4()));
+        let png_path = std::env::temp_dir().join(format!("sap-rust-mlt-still-image-{}.png", uuid::Uuid::new_v4()));
+        let status = std::process::Command::new(resolve_ffprobe_binary().replace("ffprobe", "ffmpeg"))
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=64x64",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&png_path)
+            .status()
+            .expect("ffmpeg must be on PATH to generate the still-image fixture");
+        assert!(status.success(), "ffmpeg failed to generate the test PNG fixture");
+
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        let entry = backend
+            .playlist_append("project", json!({"path": png_path.to_string_lossy()}), None)
+            .unwrap();
+        assert_eq!(entry.duration_frames, DEFAULT_IMAGE_DURATION_FRAMES);
+
+        backend.edit_add_track("project", "video").unwrap();
+        let clip = backend
+            .edit_append_clip("project", 0, json!({"path": png_path.to_string_lossy()}))
+            .unwrap();
+        assert_eq!(clip.out_frame - clip.in_frame + 1, DEFAULT_IMAGE_DURATION_FRAMES);
+
+        let probe = backend.file_probe(&png_path.to_string_lossy()).unwrap();
+        assert_eq!(probe.duration_frames, DEFAULT_IMAGE_DURATION_FRAMES);
+        assert_eq!(probe.codec, "png");
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(png_path);
     }
 
     #[test]
