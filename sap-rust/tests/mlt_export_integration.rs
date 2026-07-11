@@ -412,6 +412,81 @@ async fn full_export_pipeline_produces_a_real_playable_file() {
     assert!(!data_b64.is_empty(), "grabbed frame payload should not be empty");
 }
 
+/// Regression test for a real bug a live `claude -p` MCP agent run
+/// surfaced against this exact codebase: the agent naturally supplied
+/// `codec: "h264"` (matching `memory/head/gen/rust-fork/11-e2e-scenario-tests.md`'s
+/// own `file.export` example), but `melt`'s `avformat` consumer only
+/// recognizes the real libavcodec encoder name `libx264` -- with the raw
+/// `codec` param passed straight through, `melt` logged
+/// "h264 unrecognised - ignoring", silently dropped the entire video
+/// stream, and still exited 0, so `jobs.get` reported "done" on an
+/// audio-only file. Every other test in this file sidesteps the bug by
+/// hardcoding `codec: "libx264"` directly, which is why it went
+/// undetected until a real end-to-end agent transcript hit it. This test
+/// uses the exact spec-level value an agent would supply.
+#[tokio::test]
+async fn file_export_normalizes_spec_level_codec_name_to_a_real_encoder() {
+    let workdir = std::env::temp_dir().join(unique_tag("mlt-workdir-codec-alias"));
+    std::fs::create_dir_all(&workdir).unwrap();
+    let source = generate_test_source(&workdir, 2);
+
+    let projects_root = std::env::temp_dir().join(unique_tag("mlt-projects-codec-alias"));
+    let path = start_server("codec-alias", projects_root.clone()).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    let select = client.call("project.select", json!({"projectId": "codec-alias-proj"})).await;
+    assert!(select.error.is_none(), "project.select should succeed: {:?}", select.error);
+
+    Client::ok(
+        &client.call("playlist.append", json!({"source": {"path": source.to_string_lossy()}})).await,
+        "playlist.append",
+    );
+    Client::ok(&client.call("edit.addTrack", json!({"kind": "video"})).await, "edit.addTrack");
+    Client::ok(
+        &client.call("edit.appendClip", json!({"trackIndex": 0, "source": {"playlistIndex": 0}})).await,
+        "edit.appendClip",
+    );
+
+    let export_dir = workdir.join("out");
+    std::fs::create_dir_all(&export_dir).unwrap();
+    let output_path = export_dir.join("h264-alias.mp4");
+    let export = client
+        .call(
+            "file.export",
+            // Deliberately "h264", not "libx264" -- the exact value the
+            // e2e scenario doc and a real agent both used.
+            json!({"outputPath": output_path.to_string_lossy(), "codec": "h264", "container": "mp4"}),
+        )
+        .await;
+    let export_result = Client::ok(&export, "file.export");
+    let job_id = export_result["jobId"].as_str().expect("file.export returns a jobId").to_string();
+
+    let mut status = String::new();
+    let mut last_status_json = Value::Null;
+    for _ in 0..600 {
+        let job = Client::ok(&client.call("jobs.get", json!({"jobId": job_id})).await, "jobs.get");
+        status = job["status"].as_str().unwrap_or_default().to_string();
+        last_status_json = job.clone();
+        if status != "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(status, "done", "export job should finish successfully: {last_status_json:?}");
+
+    assert!(output_path.exists(), "exported file should exist at {}", output_path.display());
+    let probe = ffprobe_json(&output_path);
+    let streams = probe["streams"].as_array().expect("ffprobe reports streams");
+    let has_video = streams.iter().any(|s| s["codec_type"] == "video");
+    assert!(
+        has_video,
+        "exported file must have a real video stream even when codec was requested as \"h264\" \
+         (the raw spec-level name, not the encoder name \"libx264\"): {probe:?}"
+    );
+    let has_h264 = streams.iter().any(|s| s["codec_type"] == "video" && s["codec_name"] == "h264");
+    assert!(has_h264, "video stream should actually be encoded as h264: {probe:?}");
+}
+
 /// Full RPC round trip for the newly-added `playlist.*` methods (task 1):
 /// `insert`/`remove`/`move`/`get`/`addToTimeline`, against a real
 /// `MltBackend` over a real socket -- mirrors

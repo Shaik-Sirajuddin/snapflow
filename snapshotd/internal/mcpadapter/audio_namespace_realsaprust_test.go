@@ -2,7 +2,6 @@ package mcpadapter_test
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -98,10 +97,7 @@ func TestMCPAdapter_AudioSetGainWhenEnabled(t *testing.T) {
 	if searchRes.IsError {
 		t.Fatalf("audio.setGain search should succeed when enabled: %s", toolResultText(searchRes))
 	}
-	var matches []map[string]any
-	if err := json.Unmarshal([]byte(toolResultText(searchRes)), &matches); err != nil {
-		t.Fatalf("decode audio search result: %v", err)
-	}
+	matches := decodeArrayResult(t, toolResultText(searchRes))
 	if len(matches) != 1 || matches[0]["method"] != "audio.setGain" {
 		t.Fatalf("expected enabled audio.setGain to be discoverable, got %+v", matches)
 	}
@@ -241,10 +237,7 @@ func TestMCPAdapter_AudioRemainingHelpersWhenEnabled(t *testing.T) {
 		if searchRes.IsError {
 			t.Fatalf("%s search should succeed when enabled: %s", method, toolResultText(searchRes))
 		}
-		var matches []map[string]any
-		if err := json.Unmarshal([]byte(toolResultText(searchRes)), &matches); err != nil {
-			t.Fatalf("decode %s search result: %v", method, err)
-		}
+		matches := decodeArrayResult(t, toolResultText(searchRes))
 		if len(matches) != 1 || matches[0]["method"] != method {
 			t.Fatalf("expected enabled %s to be discoverable, got %+v", method, matches)
 		}

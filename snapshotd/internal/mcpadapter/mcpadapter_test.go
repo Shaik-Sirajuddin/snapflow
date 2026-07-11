@@ -187,11 +187,7 @@ func TestMCPAdapter_SapSearchAndMissingBindingOverSSE(t *testing.T) {
 		if res.IsError {
 			t.Fatalf("sap.search(%q) returned an error: %s", query, toolResultText(res))
 		}
-		var matches []map[string]any
-		if err := json.Unmarshal([]byte(toolResultText(res)), &matches); err != nil {
-			t.Fatalf("decode sap.search(%q): %v; raw=%s", query, err, toolResultText(res))
-		}
-		return matches
+		return decodeArrayResult(t, toolResultText(res))
 	}
 
 	crossfade := search("transitions.addCrossfade")

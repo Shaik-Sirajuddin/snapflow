@@ -153,7 +153,15 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		return registry.ProcessInstance{}, fmt.Errorf("procmgr: socket path %q exceeds Unix domain socket path length limits; configure a shorter RunDir", sockPath)
 	}
 
-	cmd := exec.CommandContext(ctx, m.BinPath)
+	// Deliberately exec.Command, not exec.CommandContext(ctx, ...): ctx here
+	// is the inbound RPC request's context, which is cancelled the moment
+	// daemon.launch's response is sent. CommandContext kills the process
+	// group as soon as its context is done, which would SIGKILL this child
+	// right after Launch returns success. The child is meant to outlive the
+	// request that spawned it -- explicit cleanup (Close, or the
+	// ConnectTimeout failure path below) is the only thing that should kill
+	// it.
+	cmd := exec.Command(m.BinPath)
 	headlessVal := "0"
 	if opts.Headless {
 		headlessVal = "1"

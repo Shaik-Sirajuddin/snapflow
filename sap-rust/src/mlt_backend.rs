@@ -1167,7 +1167,7 @@ impl Backend for MltBackend {
             fs::create_dir_all(parent).map_err(|e| BackendError::InvalidParams(format!("failed to create export dir: {e}")))?;
         }
 
-        let vcodec = if codec.is_empty() { "libx264".to_string() } else { codec.to_string() };
+        let vcodec = normalize_vcodec(codec);
         let melt_bin = resolve_melt_binary();
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
         // melt links Qt; without a display the xcb plugin aborts. Prefer an
@@ -1253,9 +1253,27 @@ impl Backend for MltBackend {
                     return;
                 }
                 match outcome {
-                    Ok((status, _)) if status.success() => {
-                        job.status = "done".into();
-                        job.percent = 100.0;
+                    Ok((status, stderr)) if status.success() => {
+                        // `melt`/libavcodec exit 0 even when a requested
+                        // video/audio codec name isn't a real encoder --
+                        // it just logs "<codec> unrecognised - ignoring"
+                        // to stderr and silently drops that stream (this
+                        // is exactly how an agent-supplied codec like
+                        // "h264" instead of the real encoder name
+                        // "libx264" produced an audio-only "successful"
+                        // export before normalize_vcodec existed). Treat
+                        // that as a real failure, not success, so
+                        // jobs.get never reports "done" for a broken
+                        // export.
+                        if let Some(bad) = detect_unrecognised_codec(&stderr) {
+                            job.status = "error".into();
+                            job.error = Some(format!(
+                                "melt exited 0 but dropped a stream: {bad} (stderr: {stderr})"
+                            ));
+                        } else {
+                            job.status = "done".into();
+                            job.percent = 100.0;
+                        }
                     }
                     Ok((status, stderr)) => {
                         job.status = "error".into();
@@ -1602,6 +1620,44 @@ fn default_in_out(producer: &ProducerSpec) -> BackendResult<(i64, i64)> {
         ProducerSpec::Title { .. } => Ok((0, DEFAULT_TITLE_DURATION_FRAMES - 1)),
         ProducerSpec::Blank { frames } => Ok((0, frames - 1)),
     }
+}
+
+/// Maps the friendly/spec-level codec names agents naturally reach for
+/// (matching `memory/head/gen/rust-fork/11-e2e-scenario-tests.md`'s own
+/// `file.export({..., codec: "h264", ...})` example, and what a real
+/// `claude -p` MCP agent supplied end-to-end when this normalization was
+/// missing) to the real libavcodec encoder names `melt`'s `avformat`
+/// consumer requires via `vcodec=...`. Without this, `melt` logs
+/// "<name> unrecognised - ignoring" to stderr, silently drops the video
+/// stream, and still exits 0 -- producing an audio-only "successful"
+/// export. Unknown/already-correct values (e.g. an operator passing
+/// "libx264" or "prores_ks" directly, as this crate's own tests do) pass
+/// through unchanged.
+fn normalize_vcodec(codec: &str) -> String {
+    if codec.is_empty() {
+        return "libx264".to_string();
+    }
+    match codec.to_ascii_lowercase().as_str() {
+        "h264" | "avc" | "avc1" => "libx264".to_string(),
+        "h265" | "hevc" => "libx265".to_string(),
+        "vp8" => "libvpx".to_string(),
+        "vp9" => "libvpx-vp9".to_string(),
+        "av1" => "libaom-av1".to_string(),
+        "prores" => "prores_ks".to_string(),
+        _ => codec.to_string(),
+    }
+}
+
+/// Defense-in-depth companion to `normalize_vcodec`: scans `melt`/libavcodec
+/// stderr for the "<codec> unrecognised - ignoring" pattern that indicates a
+/// stream was silently dropped despite a zero exit status, so `file_export`
+/// can report the job as failed instead of "done" even for a codec value
+/// this module doesn't already know how to normalize. Returns the offending
+/// line if found.
+fn detect_unrecognised_codec(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find(|line| line.contains("unrecognised - ignoring") || line.contains("unrecognized - ignoring"))
 }
 
 fn resolve_melt_binary() -> String {

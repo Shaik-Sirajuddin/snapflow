@@ -39,6 +39,7 @@
 package mcpadapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -228,7 +229,11 @@ func sapSearchTool(audioEnabled bool) server.ServerTool {
 					matches = append(matches, method)
 				}
 			}
-			return mcp.NewToolResultJSON(matches)
+			raw, err := json.Marshal(matches)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("marshaling result", err), nil
+			}
+			return mcp.NewToolResultJSON(wrapArrayResult(raw))
 		},
 	}
 }
@@ -284,7 +289,7 @@ func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
 			if len(result) == 0 {
 				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", method)), nil
 			}
-			return mcp.NewToolResultJSON(json.RawMessage(result))
+			return mcp.NewToolResultJSON(wrapArrayResult(result))
 		},
 	}
 }
@@ -318,6 +323,28 @@ func (s *mcpSink) Notify(method string, params json.RawMessage) {
 // method of the same name, since the on-wire JSON shape of every daemon.*
 // method's params already matches its MCP tool's arguments 1:1 (both are
 // just JSON objects with the same field names).
+// wrapArrayResult ensures a JSON tool result's StructuredContent is an
+// object, per the MCP spec (structuredContent must be a JSON object, not a
+// bare array) -- several of this package's results are naturally
+// top-level arrays (daemon.list, daemon.listProjects, sap.search, and
+// whatever array-shaped results sap-rust itself returns through the
+// sap.call passthrough). Rather than typing this per call site, wrap any
+// top-level JSON array as {"items": [...]} right before handing it to
+// mcp.NewToolResultJSON; objects and scalars pass through unchanged.
+func wrapArrayResult(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return raw
+	}
+	wrapped, err := json.Marshal(struct {
+		Items json.RawMessage `json:"items"`
+	}{Items: raw})
+	if err != nil {
+		return raw
+	}
+	return wrapped
+}
+
 func tool(name, description string, primaryOpt mcp.ToolOption, h Handler, extraOpts ...mcp.ToolOption) server.ServerTool {
 	opts := []mcp.ToolOption{mcp.WithDescription(description)}
 	if primaryOpt != nil {
@@ -339,7 +366,11 @@ func tool(name, description string, primaryOpt mcp.ToolOption, h Handler, extraO
 			if result == nil {
 				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", name)), nil
 			}
-			res, err := mcp.NewToolResultJSON(result)
+			resultRaw, err := json.Marshal(result)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("marshaling result", err), nil
+			}
+			res, err := mcp.NewToolResultJSON(wrapArrayResult(resultRaw))
 			if err != nil {
 				return mcp.NewToolResultErrorFromErr("marshaling result", err), nil
 			}

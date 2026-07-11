@@ -161,10 +161,7 @@ func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 	if listRes.IsError {
 		t.Fatalf("unexpected error result: %+v", toolResultText(listRes))
 	}
-	var tracks []map[string]any
-	if err := json.Unmarshal([]byte(toolResultText(listRes)), &tracks); err != nil {
-		t.Fatalf("unmarshal tracks: %v", err)
-	}
+	tracks := decodeArrayResult(t, toolResultText(listRes))
 	if len(tracks) != 1 || tracks[0]["kind"] != "video" {
 		t.Fatalf("expected the real, previously-added track to be listed, got %+v", tracks)
 	}

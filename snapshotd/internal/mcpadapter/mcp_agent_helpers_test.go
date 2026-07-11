@@ -153,6 +153,24 @@ func (a *mcpAgent) waitForSAPNotification(sapMethod string, timeout time.Duratio
 	}
 }
 
+// decodeArrayResult unmarshals a tool result body that server-side
+// wrapArrayResult (mcpadapter.go) has wrapped as {"items": [...]}, and
+// returns the underlying items. All SAP array-shaped results (edit.list*,
+// playlist.list, jobs.list, sap.search, daemon.list, daemon.listProjects,
+// ...) go through wrapArrayResult on the server, so every test-side decode
+// of an array result must unwrap through this helper rather than
+// unmarshaling directly into []map[string]any.
+func decodeArrayResult(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+	var wrapped struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(raw), &wrapped); err != nil {
+		t.Fatalf("decode wrapped array result: %v (raw: %s)", err, raw)
+	}
+	return wrapped.Items
+}
+
 // sapCallList is like sapCall but for SAP methods whose result is a JSON
 // array (e.g. edit.listClips, edit.listTracks, playlist.list) rather than
 // an object.
@@ -168,11 +186,7 @@ func (a *mcpAgent) sapCallList(method string, params map[string]any) []map[strin
 	if res.IsError {
 		a.t.Fatalf("sap.call(%s) returned an error result: %s", method, toolResultText(res))
 	}
-	var out []map[string]any
-	if err := json.Unmarshal([]byte(toolResultText(res)), &out); err != nil {
-		a.t.Fatalf("sap.call(%s): unmarshal array result: %v (raw: %s)", method, err, toolResultText(res))
-	}
-	return out
+	return decodeArrayResult(a.t, toolResultText(res))
 }
 
 // requireFFmpegTools skips the test if ffmpeg/ffprobe aren't on PATH --
