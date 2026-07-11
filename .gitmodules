@@ -1,0 +1,6 @@
+[submodule "memory"]
+	path = memory
+	url = ./memory
+[submodule "shotcut"]
+	path = shotcut
+	url = https://github.com/Shaik-Sirajuddin/shotcut.git
