@@ -78,16 +78,18 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::backend::{
-    Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo, JobStatus, PlaylistEntry,
-    ProjectState, SubtitleTrackInfo, Track, TransitionInfo,
+    parse_mlt_keyframe_entry, Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo,
+    FilterListEntry, JobStatus, KeyframeInfo, Marker, PlaylistEntry, ProjectState, SplitClipResult,
+    SubtitleTrackInfo, Track, TransitionInfo,
 };
 
 /// Project frame rate assumed throughout this backend's MLT profile and
@@ -156,11 +158,14 @@ struct MltProjectData {
     subtitle_tracks: Vec<PathBuf>, // per subtitle track index: its .srt sidecar path
     transitions: HashMap<usize, Vec<CrossfadeRecord>>, // track_index -> crossfades
     next_clip_seq: u64,
+    markers: Vec<Marker>,
+    /// Newest-first, deduped on add. Persisted under `.snapshot/recent.json`.
+    recent: Vec<String>,
 }
 
 impl MltProjectData {
     fn new(root: PathBuf) -> Self {
-        Self {
+        let mut data = Self {
             root,
             dirty: false,
             undo_depth: 0,
@@ -173,12 +178,76 @@ impl MltProjectData {
             subtitle_tracks: Vec::new(),
             transitions: HashMap::new(),
             next_clip_seq: 0,
+            markers: Vec::new(),
+            recent: Vec::new(),
+        };
+        data.load_markers_from_disk();
+        data.load_recent_from_disk();
+        data
+    }
+
+    fn snapshot_dir(&self) -> PathBuf {
+        self.root.join(".snapshot")
+    }
+
+    fn load_markers_from_disk(&mut self) {
+        let path = self.snapshot_dir().join("markers.json");
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(mut markers) = serde_json::from_str::<Vec<Marker>>(&raw) {
+                for (i, m) in markers.iter_mut().enumerate() {
+                    m.index = i;
+                }
+                self.markers = markers;
+            }
         }
+    }
+
+    fn load_recent_from_disk(&mut self) {
+        let path = self.snapshot_dir().join("recent.json");
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(recent) = serde_json::from_str::<Vec<String>>(&raw) {
+                self.recent = recent;
+            }
+        }
+    }
+
+    fn persist_markers(&self) -> BackendResult<()> {
+        let dir = self.snapshot_dir();
+        fs::create_dir_all(&dir).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to create .snapshot dir: {e}"))
+        })?;
+        let path = dir.join("markers.json");
+        let raw = serde_json::to_string_pretty(&self.markers).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to serialize markers: {e}"))
+        })?;
+        fs::write(&path, raw).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to write {}: {e}", path.display()))
+        })?;
+        Ok(())
+    }
+
+    fn persist_recent(&self) -> BackendResult<()> {
+        let dir = self.snapshot_dir();
+        fs::create_dir_all(&dir).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to create .snapshot dir: {e}"))
+        })?;
+        let path = dir.join("recent.json");
+        let raw = serde_json::to_string_pretty(&self.recent).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to serialize recent: {e}"))
+        })?;
+        fs::write(&path, raw).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to write {}: {e}", path.display()))
+        })?;
+        Ok(())
     }
 }
 
 fn find_clip_mut<'a>(data: &'a mut MltProjectData, clip_id: &str) -> Option<&'a mut MltClip> {
     data.clips.values_mut().flat_map(|v| v.iter_mut()).find(|c| c.clip_id == clip_id)
+}
+
+fn find_clip<'a>(data: &'a MltProjectData, clip_id: &str) -> Option<&'a MltClip> {
+    data.clips.values().flat_map(|v| v.iter()).find(|c| c.clip_id == clip_id)
 }
 
 // --------------------------------------------------------------------
@@ -202,6 +271,9 @@ pub struct MltBackend {
     /// Maps each export job to its project so `jobs.list` is project-scoped
     /// even when this backend hosts multiple standalone projects.
     job_projects: HashMap<String, String>,
+    /// Live `melt` child processes for `jobs.stop`. Shared with the
+    /// background waiter so either side can take ownership of the Child.
+    job_children: HashMap<String, Arc<Mutex<Option<Child>>>>,
 }
 
 impl MltBackend {
@@ -216,6 +288,7 @@ impl MltBackend {
             projects: HashMap::new(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             job_projects: HashMap::new(),
+            job_children: HashMap::new(),
         }
     }
 
@@ -229,6 +302,7 @@ impl MltBackend {
             projects: HashMap::new(),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             job_projects: HashMap::new(),
+            job_children: HashMap::new(),
         }
     }
 
@@ -492,6 +566,65 @@ impl Backend for MltBackend {
         Ok(())
     }
 
+    fn edit_split_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        position: i64,
+    ) -> BackendResult<SplitClipResult> {
+        let data = self.project_mut(project_id)?;
+        let (left_clip_id, source, producer, out_frame, filters) = {
+            let clips = data
+                .clips
+                .get(&track_index)
+                .ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))?;
+            if clip_index >= clips.len() {
+                return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+            }
+            let left = &clips[clip_index];
+            if position <= left.in_frame || position > left.out_frame {
+                return Err(BackendError::InvalidParams(format!(
+                    "position {position} must be strictly between inFrame {} and outFrame {} (inclusive of outFrame)",
+                    left.in_frame, left.out_frame
+                )));
+            }
+            (
+                left.clip_id.clone(),
+                left.source.clone(),
+                left.producer.clone(),
+                left.out_frame,
+                left.filters.clone(),
+            )
+        };
+
+        data.next_clip_seq += 1;
+        let right_clip_id = format!("clip-{}", data.next_clip_seq);
+
+        let clips = data.clips.get_mut(&track_index).expect("track clips");
+        clips[clip_index].out_frame = position - 1;
+        clips.insert(
+            clip_index + 1,
+            MltClip {
+                clip_id: right_clip_id.clone(),
+                source,
+                producer,
+                in_frame: position,
+                out_frame,
+                filters,
+            },
+        );
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(SplitClipResult {
+            left_clip_id,
+            right_clip_id,
+            left_index: clip_index,
+            right_index: clip_index + 1,
+        })
+    }
+
     fn transitions_add_crossfade(
         &mut self,
         project_id: &str,
@@ -605,6 +738,150 @@ impl Backend for MltBackend {
         Ok(())
     }
 
+    fn filter_list(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+    ) -> BackendResult<Vec<FilterListEntry>> {
+        let data = self.project_mut(project_id)?;
+        let clip = find_clip(data, clip_id).ok_or_else(|| BackendError::NotFound(format!("clip {clip_id}")))?;
+        Ok(clip
+            .filters
+            .iter()
+            .enumerate()
+            .map(|(index, f)| {
+                let mut map = serde_json::Map::new();
+                for (k, v) in &f.properties {
+                    if f.keyframes.contains_key(k) {
+                        continue;
+                    }
+                    map.insert(k.clone(), mlt_prop_to_json(v));
+                }
+                FilterListEntry {
+                    index,
+                    mlt_service: f.mlt_service.clone(),
+                    properties: Value::Object(map),
+                }
+            })
+            .collect())
+    }
+
+    fn filter_remove(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        let clip = find_clip_mut(data, clip_id).ok_or_else(|| BackendError::NotFound(format!("clip {clip_id}")))?;
+        if filter_index >= clip.filters.len() {
+            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")));
+        }
+        clip.filters.remove(filter_index);
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+    fn filter_reorder(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        new_index: usize,
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        let clip = find_clip_mut(data, clip_id).ok_or_else(|| BackendError::NotFound(format!("clip {clip_id}")))?;
+        if filter_index >= clip.filters.len() {
+            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")));
+        }
+        if new_index >= clip.filters.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "newIndex {new_index} out of range (len={})",
+                clip.filters.len()
+            )));
+        }
+        if filter_index != new_index {
+            let item = clip.filters.remove(filter_index);
+            clip.filters.insert(new_index, item);
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+    fn filter_list_keyframes(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+    ) -> BackendResult<Vec<KeyframeInfo>> {
+        let data = self.project_mut(project_id)?;
+        let clip = find_clip(data, clip_id).ok_or_else(|| BackendError::NotFound(format!("clip {clip_id}")))?;
+        let filter = clip
+            .filters
+            .get(filter_index)
+            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        let mut list = filter
+            .keyframes
+            .get(property)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(_, entry)| parse_mlt_keyframe_entry(entry))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        list.sort_by_key(|k| k.position);
+        Ok(list)
+    }
+
+    fn filter_remove_keyframe(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+        position: i64,
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        let clip = find_clip_mut(data, clip_id).ok_or_else(|| BackendError::NotFound(format!("clip {clip_id}")))?;
+        let filter = clip
+            .filters
+            .get_mut(filter_index)
+            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        let list = filter
+            .keyframes
+            .get_mut(property)
+            .ok_or_else(|| {
+                BackendError::NotFound(format!(
+                    "keyframe at {position} on property {property} of filter {filter_index}"
+                ))
+            })?;
+        let before = list.len();
+        list.retain(|(p, _)| *p != position);
+        if list.len() == before {
+            return Err(BackendError::NotFound(format!(
+                "keyframe at {position} on property {property} of filter {filter_index}"
+            )));
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+
+    fn clip_length_frames(&mut self, project_id: &str, clip_id: &str) -> BackendResult<i64> {
+        let data = self.project_mut(project_id)?;
+        let clip = find_clip_mut(data, clip_id)
+            .ok_or_else(|| BackendError::NotFound(format!("clip {clip_id}")))?;
+        Ok((clip.out_frame - clip.in_frame + 1).max(0))
+    }
+
     fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
         let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("simple").to_string();
         let text = params
@@ -679,6 +956,101 @@ impl Backend for MltBackend {
         Ok(())
     }
 
+    fn subtitles_remove_items(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        item_indices: &[usize],
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        let path = data
+            .subtitle_tracks
+            .get(track_index)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("subtitle track {track_index}")))?;
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        let rewritten = remove_srt_cues(&existing, item_indices).map_err(BackendError::InvalidParams)?;
+        fs::write(&path, rewritten).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to rewrite {}: {e}", path.display()))
+        })?;
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn subtitles_import_srt(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        new_track: bool,
+    ) -> BackendResult<SubtitleTrackInfo> {
+        let root = self.project_ref(project_id)?.root.clone();
+        let requested = Path::new(path);
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        };
+        // Allow any readable path (absolute outside the project root is OK):
+        // agents commonly import caption files from outside the project tree.
+        // Relative paths resolve against the project root for convenience.
+        let content = fs::read_to_string(&candidate).map_err(|e| {
+            BackendError::InvalidParams(format!(
+                "subtitles.importSrt path {} is not readable: {e}",
+                candidate.display()
+            ))
+        })?;
+        // Normalize numbering by parse+rewrite even if the source is already valid SRT.
+        let normalized = format_srt(&parse_srt(&content));
+
+        let track_index = if new_track || self.project_ref(project_id)?.subtitle_tracks.is_empty() {
+            self.subtitles_add_track(project_id)?.track_index
+        } else {
+            0
+        };
+
+        let data = self.project_mut(project_id)?;
+        let dest = data
+            .subtitle_tracks
+            .get(track_index)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("subtitle track {track_index}")))?;
+        fs::write(&dest, normalized).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to write {}: {e}", dest.display()))
+        })?;
+        data.dirty = true;
+        Ok(SubtitleTrackInfo { track_index })
+    }
+
+    fn subtitles_export_srt(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        track_index: usize,
+    ) -> BackendResult<String> {
+        let data = self.project_ref(project_id)?;
+        let srt_src = data
+            .subtitle_tracks
+            .get(track_index)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("subtitle track {track_index}")))?;
+        let content = fs::read_to_string(&srt_src).unwrap_or_default();
+        let requested = Path::new(path);
+        let dest = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            data.root.join(requested)
+        };
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                BackendError::InvalidParams(format!("failed to create export dir: {e}"))
+            })?;
+        }
+        fs::write(&dest, content).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to write SRT to {}: {e}", dest.display()))
+        })?;
+        Ok(dest.to_string_lossy().into_owned())
+    }
+
     fn file_export(&mut self, project_id: &str, output_path: &str, codec: &str, container: &str) -> BackendResult<String> {
         let xml = {
             let data = self.project_ref(project_id)?;
@@ -700,6 +1072,9 @@ impl Backend for MltBackend {
         let vcodec = if codec.is_empty() { "libx264".to_string() } else { codec.to_string() };
         let melt_bin = resolve_melt_binary();
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
+        // melt links Qt; without a display the xcb plugin aborts. Prefer an
+        // explicit QT_QPA_PLATFORM from the environment, otherwise offscreen.
+        let qt_platform = std::env::var("QT_QPA_PLATFORM").unwrap_or_else(|_| "offscreen".to_string());
 
         let mut cmd = Command::new(&melt_bin);
         cmd.arg(&mlt_path)
@@ -708,6 +1083,7 @@ impl Backend for MltBackend {
             .arg(format!("vcodec={vcodec}"))
             .arg("acodec=aac")
             .env("DISPLAY", &display)
+            .env("QT_QPA_PLATFORM", &qt_platform)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -731,6 +1107,12 @@ impl Backend for MltBackend {
         }
         self.job_projects.insert(job_id.clone(), project_id.to_string());
 
+        // Keep a kill handle so `jobs.stop` can terminate the melt process.
+        // The waiter polls `try_wait` rather than taking ownership via
+        // `wait_with_output`, so either side can claim the Child.
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        self.job_children.insert(job_id.clone(), child_slot.clone());
+
         // `file.export` must return jobId immediately (01-jsonrpc-spec.md);
         // the actual render happens on a plain OS thread, *not* the shared
         // single-writer dispatcher, so a multi-second/minute melt run never
@@ -738,17 +1120,48 @@ impl Backend for MltBackend {
         let jobs = self.jobs.clone();
         let job_id_bg = job_id.clone();
         std::thread::spawn(move || {
-            let outcome = child.wait_with_output();
+            let outcome = loop {
+                let mut guard = child_slot.lock().expect("job child mutex poisoned");
+                match guard.as_mut() {
+                    None => {
+                        // `jobs_stop` took the Child and already set status.
+                        return;
+                    }
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let mut finished = guard.take().expect("child present after try_wait");
+                            let mut stderr = String::new();
+                            if let Some(mut pipe) = finished.stderr.take() {
+                                let _ = pipe.read_to_string(&mut stderr);
+                            }
+                            break Ok((status, stderr));
+                        }
+                        Ok(None) => {
+                            drop(guard);
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(e) => {
+                            *guard = None;
+                            break Err(e);
+                        }
+                    },
+                }
+            };
+
             let mut jobs = jobs.lock().expect("jobs mutex poisoned");
             if let Some(job) = jobs.get_mut(&job_id_bg) {
+                // Don't overwrite a client-initiated stop.
+                if job.status != "running" {
+                    return;
+                }
                 match outcome {
-                    Ok(out) if out.status.success() => {
+                    Ok((status, _)) if status.success() => {
                         job.status = "done".into();
                         job.percent = 100.0;
                     }
-                    Ok(out) => {
+                    Ok((status, stderr)) => {
                         job.status = "error".into();
-                        job.error = Some(format!("melt exited with {}: {}", out.status, String::from_utf8_lossy(&out.stderr)));
+                        job.error = Some(format!("melt exited with {status}: {stderr}"));
                     }
                     Err(e) => {
                         job.status = "error".into();
@@ -786,6 +1199,28 @@ impl Backend for MltBackend {
         Ok(out)
     }
 
+    fn jobs_stop(&mut self, job_id: &str) -> BackendResult<()> {
+        {
+            let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
+            let job = jobs
+                .get_mut(job_id)
+                .ok_or_else(|| BackendError::NotFound(format!("job {job_id}")))?;
+            if job.status != "running" {
+                // Already terminal (done/error/stopped) — idempotent success.
+                return Ok(());
+            }
+            job.status = "stopped".into();
+            job.error = Some("stopped by client".into());
+        }
+        if let Some(slot) = self.job_children.remove(job_id) {
+            if let Some(mut child) = slot.lock().expect("job child mutex poisoned").take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        Ok(())
+    }
+
     fn playback_get_frame(&mut self, project_id: &str, frame: i64, format: &str) -> BackendResult<String> {
         let xml = build_mlt_xml(self.project_ref(project_id)?)?;
         let data = self.project_mut(project_id)?;
@@ -799,6 +1234,7 @@ impl Backend for MltBackend {
 
         let melt_bin = resolve_melt_binary();
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
+        let qt_platform = std::env::var("QT_QPA_PLATFORM").unwrap_or_else(|_| "offscreen".to_string());
 
         // Blocks the shared dispatcher for the duration of one frame render
         // (a real `melt` single-frame grab is sub-second) -- acceptable for
@@ -811,6 +1247,7 @@ impl Backend for MltBackend {
             .arg("-consumer")
             .arg(format!("avformat:{}", frame_path.display()))
             .env("DISPLAY", &display)
+            .env("QT_QPA_PLATFORM", &qt_platform)
             .output()
             .map_err(|e| BackendError::InvalidParams(format!("failed to spawn `{melt_bin}` for frame grab: {e}")))?;
 
@@ -823,6 +1260,180 @@ impl Backend for MltBackend {
 
         let bytes = fs::read(&frame_path).map_err(|e| BackendError::InvalidParams(format!("failed to read grabbed frame: {e}")))?;
         Ok(base64_encode(&bytes))
+    }
+
+    fn markers_append(
+        &mut self,
+        project_id: &str,
+        frame: i64,
+        text: Option<String>,
+        color: Option<String>,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id)?;
+        let marker = Marker {
+            index: data.markers.len(),
+            frame,
+            text: text.unwrap_or_default(),
+            color: color.unwrap_or_else(|| "#000000".to_string()),
+            end_frame: None,
+        };
+        data.markers.push(marker.clone());
+        data.dirty = true;
+        data.persist_markers()?;
+        Ok(marker)
+    }
+
+    fn markers_remove(&mut self, project_id: &str, marker_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        if marker_index >= data.markers.len() {
+            return Err(BackendError::NotFound(format!("marker {marker_index}")));
+        }
+        data.markers.remove(marker_index);
+        for (i, m) in data.markers.iter_mut().enumerate() {
+            m.index = i;
+        }
+        data.dirty = true;
+        data.persist_markers()?;
+        Ok(())
+    }
+
+    fn markers_update(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        frame: Option<i64>,
+        text: Option<String>,
+        color: Option<String>,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id)?;
+        {
+            let marker = data
+                .markers
+                .get_mut(marker_index)
+                .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))?;
+            if let Some(frame) = frame {
+                marker.frame = frame;
+            }
+            if let Some(text) = text {
+                marker.text = text;
+            }
+            if let Some(color) = color {
+                marker.color = color;
+            }
+        }
+        data.dirty = true;
+        let out = data.markers[marker_index].clone();
+        data.persist_markers()?;
+        Ok(out)
+    }
+
+    fn markers_move(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        start: i64,
+        end: i64,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id)?;
+        {
+            let marker = data
+                .markers
+                .get_mut(marker_index)
+                .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))?;
+            marker.frame = start;
+            marker.end_frame = if end != start { Some(end) } else { None };
+        }
+        data.dirty = true;
+        let out = data.markers[marker_index].clone();
+        data.persist_markers()?;
+        Ok(out)
+    }
+
+    fn markers_set_color(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        color: &str,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id)?;
+        {
+            let marker = data
+                .markers
+                .get_mut(marker_index)
+                .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))?;
+            marker.color = color.to_string();
+        }
+        data.dirty = true;
+        let out = data.markers[marker_index].clone();
+        data.persist_markers()?;
+        Ok(out)
+    }
+
+    fn markers_clear(&mut self, project_id: &str) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        data.markers.clear();
+        data.dirty = true;
+        data.persist_markers()?;
+        Ok(())
+    }
+
+    fn markers_list(&mut self, project_id: &str) -> BackendResult<Vec<Marker>> {
+        Ok(self.project_mut(project_id)?.markers.clone())
+    }
+
+    fn markers_get(&mut self, project_id: &str, marker_index: usize) -> BackendResult<Marker> {
+        self.project_mut(project_id)?
+            .markers
+            .get(marker_index)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))
+    }
+
+    fn markers_next(&mut self, project_id: &str, from_frame: i64) -> BackendResult<Option<i64>> {
+        let mut frames: Vec<i64> = self
+            .project_mut(project_id)?
+            .markers
+            .iter()
+            .map(|m| m.frame)
+            .filter(|f| *f > from_frame)
+            .collect();
+        frames.sort_unstable();
+        Ok(frames.into_iter().next())
+    }
+
+    fn markers_prev(&mut self, project_id: &str, from_frame: i64) -> BackendResult<Option<i64>> {
+        let mut frames: Vec<i64> = self
+            .project_mut(project_id)?
+            .markers
+            .iter()
+            .map(|m| m.frame)
+            .filter(|f| *f < from_frame)
+            .collect();
+        frames.sort_unstable();
+        Ok(frames.into_iter().next_back())
+    }
+
+    fn recent_add(&mut self, project_id: &str, path: &str) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        data.recent.retain(|p| p != path);
+        data.recent.insert(0, path.to_string());
+        data.persist_recent()?;
+        Ok(())
+    }
+
+    fn recent_remove(&mut self, project_id: &str, path: &str) -> BackendResult<String> {
+        let data = self.project_mut(project_id)?;
+        let before = data.recent.len();
+        data.recent.retain(|p| p != path);
+        if data.recent.len() == before {
+            return Err(BackendError::NotFound(format!("recent path {path}")));
+        }
+        data.persist_recent()?;
+        Ok(path.to_string())
+    }
+
+    fn recent_list(&mut self, project_id: &str) -> BackendResult<Vec<String>> {
+        Ok(self.project_mut(project_id)?.recent.clone())
     }
 }
 
@@ -1049,6 +1660,16 @@ fn json_value_to_mlt_prop(v: &Value) -> String {
     }
 }
 
+fn mlt_prop_to_json(s: &str) -> Value {
+    if let Ok(n) = s.parse::<i64>() {
+        json!(n)
+    } else if let Ok(n) = s.parse::<f64>() {
+        json!(n)
+    } else {
+        json!(s)
+    }
+}
+
 fn title_filter_xml(mode: &str, text: &str, fg: &str) -> String {
     if mode == "simple" {
         format!(
@@ -1113,6 +1734,58 @@ mod tests {
     }
 
     #[test]
+    fn edit_split_clip_and_filter_lifecycle() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-split-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.generator_create_title("project", json!({"text": "title"})).unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        let clip = backend.edit_append_clip("project", 0, json!({"playlistIndex": 0})).unwrap();
+        // Title default is 0..=149; split at mid-clip.
+        let split = backend.edit_split_clip("project", 0, 0, 75).unwrap();
+        assert_eq!(split.left_clip_id, clip.clip_id);
+        assert_eq!(split.left_index, 0);
+        assert_eq!(split.right_index, 1);
+        let clips = backend.edit_list_clips("project", 0).unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].out_frame, 74);
+        assert_eq!(clips[1].in_frame, 75);
+        assert_eq!(clips[1].out_frame, clip.out_frame);
+
+        let left_id = split.left_clip_id;
+        backend
+            .filter_add("project", &left_id, "qtcrop", json!({"rect": "0 0 50 50"}))
+            .unwrap();
+        backend
+            .filter_add("project", &left_id, "brightness", json!({"level": 0.5}))
+            .unwrap();
+        backend.filter_reorder("project", &left_id, 0, 1).unwrap();
+        let listed = backend.filter_list("project", &left_id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].mlt_service, "brightness");
+        assert_eq!(listed[1].mlt_service, "qtcrop");
+
+        backend
+            .filter_add_keyframe("project", &left_id, 0, "level", 10, json!(0.2), "linear")
+            .unwrap();
+        backend
+            .filter_add_keyframe("project", &left_id, 0, "level", 20, json!(0.9), "smooth")
+            .unwrap();
+        let kfs = backend.filter_list_keyframes("project", &left_id, 0, "level").unwrap();
+        assert_eq!(kfs.len(), 2);
+        assert_eq!(kfs[0].interpolation, "linear");
+        assert_eq!(kfs[1].interpolation, "smooth");
+        backend.filter_remove_keyframe("project", &left_id, 0, "level", 10).unwrap();
+        assert_eq!(backend.filter_list_keyframes("project", &left_id, 0, "level").unwrap().len(), 1);
+
+        backend.filter_remove("project", &left_id, 0).unwrap();
+        let listed = backend.filter_list("project", &left_id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].mlt_service, "qtcrop");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn fixed_root_writes_project_file_without_project_id_suffix() {
         let root = std::env::temp_dir().join(format!("sap-rust-mlt-fixed-root-{}", uuid::Uuid::new_v4()));
         let mut backend = MltBackend::new_fixed_root(&root);
@@ -1138,6 +1811,87 @@ mod tests {
 
         assert!(root.join("project-a").is_dir());
         assert!(root.join("project-b").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_format_srt_round_trip_and_remove() {
+        let raw = "1\n00:00:02,000 --> 00:00:03,000\nHighlight One\n\n2\n00:00:06,667 --> 00:00:07,667\nHighlight Two\n\n3\n00:00:10,000 --> 00:00:11,000\nThree\n\n";
+        let cues = parse_srt(raw);
+        assert_eq!(cues.len(), 3);
+        assert_eq!(cues[0].text, "Highlight One");
+        assert_eq!(cues[1].start, "00:00:06,667");
+        assert_eq!(cues[2].text, "Three");
+
+        let rewritten = remove_srt_cues(raw, &[1]).unwrap();
+        let remaining = parse_srt(&rewritten);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].text, "Highlight One");
+        assert_eq!(remaining[1].text, "Three");
+        // Re-numbered 1..N
+        assert!(rewritten.starts_with("1\n"));
+        assert!(rewritten.contains("\n2\n"));
+        assert!(!rewritten.contains("Highlight Two"));
+
+        assert!(remove_srt_cues(raw, &[99]).is_err());
+    }
+
+    #[test]
+    fn subtitles_remove_import_export_round_trip() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-subs-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.subtitles_add_track("project").unwrap();
+        backend
+            .subtitles_append_item("project", 0, 60, 90, "One")
+            .unwrap();
+        backend
+            .subtitles_append_item("project", 0, 200, 230, "Two")
+            .unwrap();
+        backend
+            .subtitles_append_item("project", 0, 300, 330, "Three")
+            .unwrap();
+
+        backend.subtitles_remove_items("project", 0, &[1]).unwrap();
+        let track_path = root.join("project/subtitles/track0.srt");
+        let after_remove = fs::read_to_string(&track_path).unwrap();
+        let cues = parse_srt(&after_remove);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "One");
+        assert_eq!(cues[1].text, "Three");
+
+        let external = root.join("external.srt");
+        fs::write(
+            &external,
+            "1\n00:00:01,000 --> 00:00:02,000\nImported\n\n",
+        )
+        .unwrap();
+        let info = backend
+            .subtitles_import_srt("project", external.to_str().unwrap(), true)
+            .unwrap();
+        assert_eq!(info.track_index, 1);
+
+        let export_path = root.join("out.srt");
+        let exported = backend
+            .subtitles_export_srt("project", export_path.to_str().unwrap(), 1)
+            .unwrap();
+        assert_eq!(exported, export_path.to_string_lossy());
+        let exported_cues = parse_srt(&fs::read_to_string(&export_path).unwrap());
+        assert_eq!(exported_cues.len(), 1);
+        assert_eq!(exported_cues[0].text, "Imported");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn jobs_stop_marks_unknown_as_not_found() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-jobs-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        let err = backend.jobs_stop("no-such-job").unwrap_err();
+        match err {
+            BackendError::NotFound(_) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -1304,6 +2058,89 @@ fn build_mlt_xml(data: &MltProjectData) -> BackendResult<String> {
     out.push_str(&tractor);
     out.push_str("</mlt>\n");
     Ok(out)
+}
+
+/// One SRT cue after parse (0-based cue order matches append order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrtCue {
+    pub start: String,
+    pub end: String,
+    pub text: String,
+}
+
+/// Parse SubRip content into ordered cues. Cue index numbers in the file are
+/// ignored; order is document order (same as `subtitles.appendItem` order).
+pub fn parse_srt(content: &str) -> Vec<SrtCue> {
+    let mut cues = Vec::new();
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let timing = if line.contains("-->") {
+            line.to_string()
+        } else {
+            match lines.next() {
+                Some(next) => next.trim_end_matches('\r').to_string(),
+                None => break,
+            }
+        };
+        let Some((start, end)) = timing.split_once("-->") else {
+            continue;
+        };
+        let start = start.trim().to_string();
+        let end = end.trim().to_string();
+        let mut text_lines = Vec::new();
+        while let Some(peek) = lines.peek() {
+            let t = peek.trim_end_matches('\r');
+            if t.trim().is_empty() {
+                lines.next();
+                break;
+            }
+            text_lines.push(t.to_string());
+            lines.next();
+        }
+        cues.push(SrtCue {
+            start,
+            end,
+            text: text_lines.join("\n"),
+        });
+    }
+    cues
+}
+
+/// Serialize cues with contiguous 1-based numbering.
+pub fn format_srt(cues: &[SrtCue]) -> String {
+    let mut out = String::new();
+    for (i, cue) in cues.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            i + 1,
+            cue.start,
+            cue.end,
+            cue.text
+        ));
+    }
+    out
+}
+
+/// Remove cues by 0-based indices and re-number the remainder.
+pub fn remove_srt_cues(content: &str, item_indices: &[usize]) -> Result<String, String> {
+    let mut cues = parse_srt(content);
+    let mut remove: Vec<usize> = item_indices.to_vec();
+    remove.sort_unstable();
+    remove.dedup();
+    for &idx in remove.iter().rev() {
+        if idx >= cues.len() {
+            return Err(format!(
+                "subtitle item index {idx} out of range (len {})",
+                cues.len()
+            ));
+        }
+        cues.remove(idx);
+    }
+    Ok(format_srt(&cues))
 }
 
 fn frames_to_srt_timestamp(frame: i64, fps: i64) -> String {

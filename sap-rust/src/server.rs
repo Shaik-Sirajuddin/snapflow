@@ -399,6 +399,371 @@ fn build_op_ext(
             }))
         }
 
+        "audio.setPan" => {
+            if !audio_enabled {
+                return Err(method_not_found(method));
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                pan: f64,
+                #[serde(default)]
+                position: Option<i64>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            if !p.pan.is_finite() {
+                return Err(RpcError {
+                    code: error_codes::INVALID_PARAMS,
+                    message: "audio.setPan pan must be finite".to_string(),
+                    data: None,
+                });
+            }
+            Ok(Box::new(move |b| {
+                // Shotcut audio_pan defaults: channel=0, start=0, split=pan (0..1).
+                let mut initial = json!({"channel": 0, "start": 0});
+                if p.position.is_none() {
+                    initial["split"] = json!(p.pan);
+                }
+                match b.filter_add(&project_id, &p.clip_id, "panner", initial) {
+                    Ok(info) => {
+                        if let Some(position) = p.position {
+                            if let Err(e) = b.filter_set_property(
+                                &project_id,
+                                &p.clip_id,
+                                info.filter_index,
+                                "split",
+                                json!(p.pan),
+                                Some(position),
+                            ) {
+                                return err_result(e);
+                            }
+                        }
+                        BackendCallResult {
+                            result: Ok(serde_json::to_value(&info).expect("FilterInfo serializes")),
+                            notify: Some(RpcNotification::new(
+                                "filter.changed",
+                                json!({"clipId": p.clip_id, "filterIndex": info.filter_index, "reason": "audio.setPan"}),
+                            )),
+                        }
+                    }
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "audio.setBalance" => {
+            if !audio_enabled {
+                return Err(method_not_found(method));
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                balance: f64,
+                #[serde(default)]
+                position: Option<i64>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            if !p.balance.is_finite() {
+                return Err(RpcError {
+                    code: error_codes::INVALID_PARAMS,
+                    message: "audio.setBalance balance must be finite".to_string(),
+                    data: None,
+                });
+            }
+            Ok(Box::new(move |b| {
+                // Shotcut audio_balance uses the same panner service with
+                // channel=-1 (stereo balance) rather than pan's channel=0.
+                let mut initial = json!({"channel": -1});
+                if p.position.is_none() {
+                    initial["split"] = json!(p.balance);
+                }
+                match b.filter_add(&project_id, &p.clip_id, "panner", initial) {
+                    Ok(info) => {
+                        if let Some(position) = p.position {
+                            if let Err(e) = b.filter_set_property(
+                                &project_id,
+                                &p.clip_id,
+                                info.filter_index,
+                                "split",
+                                json!(p.balance),
+                                Some(position),
+                            ) {
+                                return err_result(e);
+                            }
+                        }
+                        BackendCallResult {
+                            result: Ok(serde_json::to_value(&info).expect("FilterInfo serializes")),
+                            notify: Some(RpcNotification::new(
+                                "filter.changed",
+                                json!({"clipId": p.clip_id, "filterIndex": info.filter_index, "reason": "audio.setBalance"}),
+                            )),
+                        }
+                    }
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "audio.setNormalize" => {
+            if !audio_enabled {
+                return Err(method_not_found(method));
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                mode: String,
+                #[serde(default)]
+                target_level: Option<f64>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            if let Some(level) = p.target_level {
+                if !level.is_finite() {
+                    return Err(RpcError {
+                        code: error_codes::INVALID_PARAMS,
+                        message: "audio.setNormalize targetLevel must be finite".to_string(),
+                        data: None,
+                    });
+                }
+            }
+            let (mlt_service, initial) = match p.mode.as_str() {
+                // audio_normalize_1p → dynamic_loudness, property target_loudness
+                "1pass" => {
+                    let target = p.target_level.unwrap_or(-23.0);
+                    (
+                        "dynamic_loudness",
+                        json!({
+                            "target_loudness": target,
+                            "window": 10,
+                            "max_gain": 15,
+                            "min_gain": -15,
+                            "max_rate": 3,
+                            "discontinuity_reset": 1,
+                        }),
+                    )
+                }
+                // audio_normalize_2p → loudness, property program
+                "2pass" => {
+                    let target = p.target_level.unwrap_or(-23.0);
+                    ("loudness", json!({"program": target}))
+                }
+                _ => {
+                    return Err(RpcError {
+                        code: error_codes::INVALID_PARAMS,
+                        message: "audio.setNormalize mode must be \"1pass\" or \"2pass\"".to_string(),
+                        data: None,
+                    });
+                }
+            };
+            Ok(Box::new(move |b| {
+                match b.filter_add(&project_id, &p.clip_id, mlt_service, initial) {
+                    Ok(info) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&info).expect("FilterInfo serializes")),
+                        notify: Some(RpcNotification::new(
+                            "filter.changed",
+                            json!({"clipId": p.clip_id, "filterIndex": info.filter_index, "reason": "audio.setNormalize"}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "audio.setFadeInOut" => {
+            if !audio_enabled {
+                return Err(method_not_found(method));
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                #[serde(default)]
+                fade_in_frames: Option<i64>,
+                #[serde(default)]
+                fade_out_frames: Option<i64>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            if p.fade_in_frames.is_none() && p.fade_out_frames.is_none() {
+                return Err(RpcError {
+                    code: error_codes::INVALID_PARAMS,
+                    message: "audio.setFadeInOut requires fadeInFrames and/or fadeOutFrames"
+                        .to_string(),
+                    data: None,
+                });
+            }
+            if let Some(n) = p.fade_in_frames {
+                if n <= 0 {
+                    return Err(RpcError {
+                        code: error_codes::INVALID_PARAMS,
+                        message: "audio.setFadeInOut fadeInFrames must be positive".to_string(),
+                        data: None,
+                    });
+                }
+            }
+            if let Some(n) = p.fade_out_frames {
+                if n <= 0 {
+                    return Err(RpcError {
+                        code: error_codes::INVALID_PARAMS,
+                        message: "audio.setFadeInOut fadeOutFrames must be positive".to_string(),
+                        data: None,
+                    });
+                }
+            }
+            Ok(Box::new(move |b| {
+                // Shotcut audio_fadein/audio_fadeout are distinct volume
+                // filters with keyframed `level` envelopes (dB).
+                let mut result = json!({});
+                let mut last_index: Option<usize> = None;
+
+                if let Some(fade_in) = p.fade_in_frames {
+                    match b.filter_add(&project_id, &p.clip_id, "volume", json!({})) {
+                        Ok(info) => {
+                            // level -60 at frame 0, level 0 at fadeInFrames-1
+                            if let Err(e) = b.filter_set_property(
+                                &project_id,
+                                &p.clip_id,
+                                info.filter_index,
+                                "level",
+                                json!(-60),
+                                Some(0),
+                            ) {
+                                return err_result(e);
+                            }
+                            if let Err(e) = b.filter_set_property(
+                                &project_id,
+                                &p.clip_id,
+                                info.filter_index,
+                                "level",
+                                json!(0),
+                                Some((fade_in - 1).max(0)),
+                            ) {
+                                return err_result(e);
+                            }
+                            last_index = Some(info.filter_index);
+                            result["fadeIn"] =
+                                serde_json::to_value(&info).expect("FilterInfo serializes");
+                        }
+                        Err(e) => return err_result(e),
+                    }
+                }
+
+                if let Some(fade_out) = p.fade_out_frames {
+                    let clip_len = match b.clip_length_frames(&project_id, &p.clip_id) {
+                        Ok(n) => n,
+                        Err(e) => return err_result(e),
+                    };
+                    if clip_len <= 0 {
+                        return err_result(BackendError::InvalidParams(
+                            "audio.setFadeInOut clip has zero length".into(),
+                        ));
+                    }
+                    match b.filter_add(&project_id, &p.clip_id, "volume", json!({})) {
+                        Ok(info) => {
+                            // level 0 at (clip_length - fadeOut), -60 at (clip_length - 1)
+                            let start = (clip_len - fade_out).max(0);
+                            let end = (clip_len - 1).max(0);
+                            if let Err(e) = b.filter_set_property(
+                                &project_id,
+                                &p.clip_id,
+                                info.filter_index,
+                                "level",
+                                json!(0),
+                                Some(start),
+                            ) {
+                                return err_result(e);
+                            }
+                            if let Err(e) = b.filter_set_property(
+                                &project_id,
+                                &p.clip_id,
+                                info.filter_index,
+                                "level",
+                                json!(-60),
+                                Some(end),
+                            ) {
+                                return err_result(e);
+                            }
+                            last_index = Some(info.filter_index);
+                            result["fadeOut"] =
+                                serde_json::to_value(&info).expect("FilterInfo serializes");
+                        }
+                        Err(e) => return err_result(e),
+                    }
+                }
+
+                BackendCallResult {
+                    result: Ok(result),
+                    notify: last_index.map(|filter_index| {
+                        RpcNotification::new(
+                            "filter.changed",
+                            json!({
+                                "clipId": p.clip_id,
+                                "filterIndex": filter_index,
+                                "reason": "audio.setFadeInOut",
+                            }),
+                        )
+                    }),
+                }
+            }))
+        }
+
+        "audio.setAutoFade" => {
+            if !audio_enabled {
+                return Err(method_not_found(method));
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                enabled: bool,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                if p.enabled {
+                    // Shotcut audio_autofade → mlt_service "autofade", default fade_duration 500 ms.
+                    match b.filter_add(
+                        &project_id,
+                        &p.clip_id,
+                        "autofade",
+                        json!({"fade_duration": 500}),
+                    ) {
+                        Ok(info) => BackendCallResult {
+                            result: Ok(serde_json::to_value(&info).expect("FilterInfo serializes")),
+                            notify: Some(RpcNotification::new(
+                                "filter.changed",
+                                json!({"clipId": p.clip_id, "filterIndex": info.filter_index, "reason": "audio.setAutoFade"}),
+                            )),
+                        },
+                        Err(e) => err_result(e),
+                    }
+                } else {
+                    // Disable by removing any autofade filters on the clip (highest index first).
+                    match b.filter_list(&project_id, &p.clip_id) {
+                        Ok(filters) => {
+                            let mut removed = 0usize;
+                            for f in filters.into_iter().rev() {
+                                if f.mlt_service == "autofade" {
+                                    if let Err(e) = b.filter_remove(&project_id, &p.clip_id, f.index) {
+                                        return err_result(e);
+                                    }
+                                    removed += 1;
+                                }
+                            }
+                            BackendCallResult {
+                                result: Ok(json!({"enabled": false, "removed": removed})),
+                                notify: Some(RpcNotification::new(
+                                    "filter.changed",
+                                    json!({"clipId": p.clip_id, "reason": "audio.setAutoFade", "enabled": false, "removed": removed}),
+                                )),
+                            }
+                        }
+                        Err(e) => err_result(e),
+                    }
+                }
+            }))
+        }
+
         "playlist.append" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -482,6 +847,36 @@ fn build_op_ext(
                         notify: Some(RpcNotification::new(
                             "edit.changed",
                             json!({"reason": "trimClipOut", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "edit.splitClip" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                clip_index: usize,
+                position: i64,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.edit_split_clip(&project_id, p.track_index, p.clip_index, p.position) {
+                    Ok(info) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&info).expect("SplitClipResult serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({
+                                "reason": "splitClip",
+                                "trackIndex": p.track_index,
+                                "clipIndex": p.clip_index,
+                                "position": p.position,
+                                "leftClipId": info.left_clip_id,
+                                "rightClipId": info.right_clip_id,
+                            }),
                         )),
                     },
                     Err(e) => err_result(e),
@@ -605,6 +1000,122 @@ fn build_op_ext(
             }))
         }
 
+        "filter.list" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.filter_list(&project_id, &p.clip_id) {
+                Ok(entries) => ok_result(serde_json::to_value(&entries).expect("FilterListEntry serializes")),
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "filter.remove" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                filter_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.filter_remove(&project_id, &p.clip_id, p.filter_index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "filter.changed",
+                            json!({"clipId": p.clip_id, "filterIndex": p.filter_index, "reason": "remove"}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "filter.reorder" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                filter_index: usize,
+                new_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.filter_reorder(&project_id, &p.clip_id, p.filter_index, p.new_index) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "filter.changed",
+                            json!({
+                                "clipId": p.clip_id,
+                                "filterIndex": p.filter_index,
+                                "newIndex": p.new_index,
+                                "reason": "reorder",
+                            }),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "filter.listKeyframes" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                filter_index: usize,
+                property: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.filter_list_keyframes(&project_id, &p.clip_id, p.filter_index, &p.property) {
+                    Ok(kfs) => ok_result(serde_json::to_value(&kfs).expect("KeyframeInfo serializes")),
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "filter.removeKeyframe" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                clip_id: String,
+                filter_index: usize,
+                property: String,
+                position: i64,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.filter_remove_keyframe(
+                    &project_id,
+                    &p.clip_id,
+                    p.filter_index,
+                    &p.property,
+                    p.position,
+                ) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "filter.changed",
+                            json!({
+                                "clipId": p.clip_id,
+                                "filterIndex": p.filter_index,
+                                "property": p.property,
+                                "position": p.position,
+                                "reason": "removeKeyframe",
+                            }),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
         "generator.createTitle" => Ok(Box::new(move |b| match b.generator_create_title(&project_id, params) {
             Ok(entry) => ok_result(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
             Err(e) => err_result(e),
@@ -637,6 +1148,75 @@ fn build_op_ext(
                             json!({"reason": "appendItem", "trackIndex": p.track_index}),
                         )),
                     },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "subtitles.removeItems" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                item_indices: Vec<usize>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.subtitles_remove_items(&project_id, p.track_index, &p.item_indices) {
+                    Ok(()) => BackendCallResult {
+                        result: Ok(json!({})),
+                        notify: Some(RpcNotification::new(
+                            "subtitles.changed",
+                            json!({
+                                "reason": "removeItems",
+                                "trackIndex": p.track_index,
+                                "itemIndices": p.item_indices,
+                            }),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "subtitles.importSrt" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                path: String,
+                #[serde(default)]
+                new_track: bool,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.subtitles_import_srt(&project_id, &p.path, p.new_track) {
+                    Ok(info) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&info).expect("SubtitleTrackInfo serializes")),
+                        notify: Some(RpcNotification::new(
+                            "subtitles.changed",
+                            json!({
+                                "reason": "importSrt",
+                                "trackIndex": info.track_index,
+                                "newTrack": p.new_track,
+                            }),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "subtitles.exportSrt" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                path: String,
+                track_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.subtitles_export_srt(&project_id, &p.path, p.track_index) {
+                    Ok(path) => ok_result(json!({"path": path})),
                     Err(e) => err_result(e),
                 }
             }))
@@ -691,6 +1271,25 @@ fn build_op_ext(
             Err(e) => err_result(e),
         })),
 
+        "jobs.stop" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                job_id: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.jobs_stop(&p.job_id) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({})),
+                    notify: Some(RpcNotification::new(
+                        "jobs.changed",
+                        json!({"jobId": p.job_id, "status": "stopped"}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
         "playback.getFrame" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]
@@ -708,6 +1307,220 @@ fn build_op_ext(
                 Err(e) => err_result(e),
             }))
         }
+
+        // --- markers.* ---
+        "markers.append" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                frame: i64,
+                #[serde(default)]
+                text: Option<String>,
+                #[serde(default)]
+                color: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.markers_append(&project_id, p.frame, p.text, p.color) {
+                    Ok(marker) => {
+                        let marker_index = marker.index;
+                        BackendCallResult {
+                            result: Ok(serde_json::to_value(&marker).expect("Marker serializes")),
+                            notify: Some(RpcNotification::new(
+                                "markers.changed",
+                                json!({"reason": "append", "markerIndex": marker_index}),
+                            )),
+                        }
+                    }
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "markers.remove" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                marker_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.markers_remove(&project_id, p.marker_index) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({})),
+                    notify: Some(RpcNotification::new(
+                        "markers.changed",
+                        json!({"reason": "remove", "markerIndex": p.marker_index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "markers.update" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                marker_index: usize,
+                #[serde(default)]
+                frame: Option<i64>,
+                #[serde(default)]
+                text: Option<String>,
+                #[serde(default)]
+                color: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.markers_update(&project_id, p.marker_index, p.frame, p.text, p.color) {
+                    Ok(marker) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&marker).expect("Marker serializes")),
+                        notify: Some(RpcNotification::new(
+                            "markers.changed",
+                            json!({"reason": "update", "markerIndex": p.marker_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "markers.move" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                marker_index: usize,
+                start: i64,
+                end: i64,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.markers_move(&project_id, p.marker_index, p.start, p.end) {
+                    Ok(marker) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&marker).expect("Marker serializes")),
+                        notify: Some(RpcNotification::new(
+                            "markers.changed",
+                            json!({"reason": "move", "markerIndex": p.marker_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "markers.setColor" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                marker_index: usize,
+                color: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.markers_set_color(&project_id, p.marker_index, &p.color) {
+                    Ok(marker) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&marker).expect("Marker serializes")),
+                        notify: Some(RpcNotification::new(
+                            "markers.changed",
+                            json!({"reason": "setColor", "markerIndex": p.marker_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "markers.clear" => Ok(Box::new(move |b| match b.markers_clear(&project_id) {
+            Ok(()) => BackendCallResult {
+                result: Ok(json!({})),
+                notify: Some(RpcNotification::new("markers.changed", json!({"reason": "clear"}))),
+            },
+            Err(e) => err_result(e),
+        })),
+
+        "markers.list" => Ok(Box::new(move |b| match b.markers_list(&project_id) {
+            Ok(markers) => ok_result(serde_json::to_value(&markers).expect("markers serialize")),
+            Err(e) => err_result(e),
+        })),
+
+        "markers.get" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                marker_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.markers_get(&project_id, p.marker_index) {
+                Ok(marker) => ok_result(serde_json::to_value(&marker).expect("Marker serializes")),
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "markers.next" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                from_frame: i64,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.markers_next(&project_id, p.from_frame) {
+                Ok(frame) => ok_result(json!(frame)),
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "markers.prev" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                from_frame: i64,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.markers_prev(&project_id, p.from_frame) {
+                Ok(frame) => ok_result(json!(frame)),
+                Err(e) => err_result(e),
+            }))
+        }
+
+        // --- recent.* ---
+        "recent.add" => {
+            #[derive(Deserialize)]
+            struct P {
+                path: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.recent_add(&project_id, &p.path) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({})),
+                    notify: Some(RpcNotification::new(
+                        "recent.changed",
+                        json!({"reason": "add", "path": p.path}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "recent.remove" => {
+            #[derive(Deserialize)]
+            struct P {
+                path: String,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.recent_remove(&project_id, &p.path) {
+                Ok(path) => BackendCallResult {
+                    result: Ok(json!({"path": path})),
+                    notify: Some(RpcNotification::new(
+                        "recent.changed",
+                        json!({"reason": "remove", "path": p.path}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "recent.list" => Ok(Box::new(move |b| match b.recent_list(&project_id) {
+            Ok(paths) => ok_result(json!(paths)),
+            Err(e) => err_result(e),
+        })),
 
         _ => Err(method_not_found(method)),
     }

@@ -77,11 +77,54 @@ pub struct FilterInfo {
     pub mlt_service: String,
 }
 
+/// One entry from `filter.list`, per 01's `filter.*` namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterListEntry {
+    pub index: usize,
+    pub mlt_service: String,
+    pub properties: Value,
+}
+
+/// One keyframe from `filter.listKeyframes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyframeInfo {
+    pub position: i64,
+    pub value: Value,
+    /// `"linear"` | `"smooth"` | `"discrete"`
+    pub interpolation: String,
+}
+
+/// Result of `edit.splitClip`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitClipResult {
+    pub left_clip_id: String,
+    pub right_clip_id: String,
+    pub left_index: usize,
+    pub right_index: usize,
+}
+
 /// Result of `subtitles.addTrack`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtitleTrackInfo {
     pub track_index: usize,
+}
+
+/// A timeline marker, per 01's `markers.*` namespace (`MarkersModel::Marker`:
+/// text / start / end / color). Wire shape uses `frame` for the start
+/// position and optional `endFrame` for range markers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Marker {
+    pub index: usize,
+    pub frame: i64,
+    pub text: String,
+    pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_frame: Option<i64>,
 }
 
 /// A `jobs.get` snapshot, per 01's `jobs.*` namespace -- deliberately a
@@ -91,7 +134,7 @@ pub struct SubtitleTrackInfo {
 #[serde(rename_all = "camelCase")]
 pub struct JobStatus {
     pub job_id: String,
-    /// "running" | "done" | "error"
+    /// "running" | "done" | "error" | "stopped"
     pub status: String,
     pub percent: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,6 +228,18 @@ pub trait Backend: Send {
         new_frame: i64,
     ) -> BackendResult<()>;
 
+    /// `edit.splitClip` -- split a clip at a source frame strictly between
+    /// `in_frame` and `out_frame`. Left keeps the original `clip_id` with
+    /// `out_frame = position - 1`; right gets a new `clip_id` with
+    /// `in_frame = position` (Shotcut-compatible inclusive-frame split).
+    fn edit_split_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        position: i64,
+    ) -> BackendResult<SplitClipResult>;
+
     /// `transitions.addCrossfade`.
     fn transitions_add_crossfade(
         &mut self,
@@ -229,6 +284,55 @@ pub trait Backend: Send {
         interpolation: &str,
     ) -> BackendResult<()>;
 
+    /// `filter.list` -- enumerate filters attached to a clip.
+    fn filter_list(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+    ) -> BackendResult<Vec<FilterListEntry>>;
+
+    /// `filter.remove` -- detach a filter and reindex the chain.
+    fn filter_remove(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+    ) -> BackendResult<()>;
+
+    /// `filter.reorder` -- move a filter within the clip's filter chain.
+    fn filter_reorder(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        new_index: usize,
+    ) -> BackendResult<()>;
+
+    /// `filter.listKeyframes` -- return the full curve for one property.
+    fn filter_list_keyframes(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+    ) -> BackendResult<Vec<KeyframeInfo>>;
+
+    /// `filter.removeKeyframe` -- remove one keyframe from a property curve.
+    fn filter_remove_keyframe(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+        position: i64,
+    ) -> BackendResult<()>;
+
+
+    /// Inclusive clip length in frames (`out - in + 1`), used by
+    /// `audio.setFadeInOut` to place the fade-out level envelope relative
+    /// to the clip end.
+    fn clip_length_frames(&mut self, project_id: &str, clip_id: &str) -> BackendResult<i64>;
+
     /// `generator.createTitle` -- constructs a title-card producer (color
     /// background + `dynamictext`/`qtext` filter, per 01's `generator.*`
     /// namespace) and adds it to the Playlist bin, ready for
@@ -245,6 +349,33 @@ pub trait Backend: Send {
         text: &str,
     ) -> BackendResult<()>;
 
+    /// `subtitles.removeItems` -- remove cues by 0-based index (append order).
+    fn subtitles_remove_items(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        item_indices: &[usize],
+    ) -> BackendResult<()>;
+
+    /// `subtitles.importSrt` -- import an SRT file into an existing track
+    /// (default track 0, creating it if needed) or a new track when
+    /// `new_track` is true. Returns the target `trackIndex`.
+    fn subtitles_import_srt(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        new_track: bool,
+    ) -> BackendResult<SubtitleTrackInfo>;
+
+    /// `subtitles.exportSrt` -- write a track's SRT to `path` (relative paths
+    /// resolve against the project root). Returns the resolved path.
+    fn subtitles_export_srt(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        track_index: usize,
+    ) -> BackendResult<String>;
+
     /// `file.export` -- returns a `jobId` immediately per 01's async-job
     /// convention; progress/completion is polled via `jobs_get`.
     fn file_export(
@@ -260,6 +391,10 @@ pub trait Backend: Send {
     fn jobs_get(&mut self, job_id: &str) -> BackendResult<JobStatus>;
     fn jobs_list(&mut self, project_id: &str) -> BackendResult<Vec<JobStatus>>;
 
+    /// `jobs.stop` -- cancel a running job (`AbstractJob::stop` equivalent).
+    /// Sets status to `"stopped"` when the job was running.
+    fn jobs_stop(&mut self, job_id: &str) -> BackendResult<()>;
+
     /// `playback.getFrame` -- one-off frame render for agent-side visual
     /// verification. Returns base64-encoded image bytes in `format`.
     fn playback_get_frame(
@@ -268,6 +403,68 @@ pub trait Backend: Send {
         frame: i64,
         format: &str,
     ) -> BackendResult<String>;
+
+    // --- markers.* / recent.* (additive; append-only on the trait) ---
+
+    /// `markers.append` -- place a cue/range marker on the timeline.
+    fn markers_append(
+        &mut self,
+        project_id: &str,
+        frame: i64,
+        text: Option<String>,
+        color: Option<String>,
+    ) -> BackendResult<Marker>;
+
+    fn markers_remove(&mut self, project_id: &str, marker_index: usize) -> BackendResult<()>;
+
+    fn markers_update(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        frame: Option<i64>,
+        text: Option<String>,
+        color: Option<String>,
+    ) -> BackendResult<Marker>;
+
+    /// `markers.move` -- set the marker's frame range. Stores `start`/`end`
+    /// when the model supports range markers; always sets `frame = start`.
+    fn markers_move(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        start: i64,
+        end: i64,
+    ) -> BackendResult<Marker>;
+
+    fn markers_set_color(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        color: &str,
+    ) -> BackendResult<Marker>;
+
+    fn markers_clear(&mut self, project_id: &str) -> BackendResult<()>;
+
+    fn markers_list(&mut self, project_id: &str) -> BackendResult<Vec<Marker>>;
+
+    fn markers_get(&mut self, project_id: &str, marker_index: usize) -> BackendResult<Marker>;
+
+    /// `markers.next` -- next marker frame strictly after `from_frame`, or
+    /// `None` if none.
+    fn markers_next(&mut self, project_id: &str, from_frame: i64) -> BackendResult<Option<i64>>;
+
+    /// `markers.prev` -- previous marker frame strictly before `from_frame`,
+    /// or `None` if none.
+    fn markers_prev(&mut self, project_id: &str, from_frame: i64) -> BackendResult<Option<i64>>;
+
+    /// `recent.add` -- project-scoped recent path list (dedupe, newest first).
+    fn recent_add(&mut self, project_id: &str, path: &str) -> BackendResult<()>;
+
+    /// `recent.remove` -- remove `path` from the recent list; returns the
+    /// removed path on success.
+    fn recent_remove(&mut self, project_id: &str, path: &str) -> BackendResult<String>;
+
+    fn recent_list(&mut self, project_id: &str) -> BackendResult<Vec<String>>;
 }
 
 #[derive(Default)]
@@ -281,15 +478,29 @@ struct ProjectData {
     playlist: Vec<PlaylistEntry>,
     filters: HashMap<String, Vec<MockFilter>>,
     subtitle_tracks: usize,
+    /// Per-track cue list (0-based track index → cues in append order).
+    subtitle_items: HashMap<usize, Vec<MockSubtitleItem>>,
     next_clip_id: u64,
     next_job_id: u64,
     jobs: HashMap<String, JobStatus>,
+    markers: Vec<Marker>,
+    /// Newest-first, deduped on add.
+    recent: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone)]
+struct MockSubtitleItem {
+    start_frame: i64,
+    end_frame: i64,
+    text: String,
+}
+
+#[derive(Default, Clone)]
 struct MockFilter {
+    mlt_service: String,
     properties: HashMap<String, Value>,
-    keyframes: HashMap<String, HashMap<i64, Value>>,
+    /// property -> (position -> (value, interpolation))
+    keyframes: HashMap<String, HashMap<i64, (Value, String)>>,
 }
 
 /// Stands in for the real backend until sap_ffi.h/.cpp (per 02-rust-embedding.md)
@@ -499,6 +710,68 @@ impl Backend for MockBackend {
         Ok(())
     }
 
+    fn edit_split_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        position: i64,
+    ) -> BackendResult<SplitClipResult> {
+        let data = self.project_mut(project_id);
+        let (left_clip_id, source, out_frame) = {
+            let clips = data
+                .clips
+                .get(&track_index)
+                .ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))?;
+            if clip_index >= clips.len() {
+                return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+            }
+            let left = &clips[clip_index];
+            // Both halves must be non-empty: left [in, position-1], right [position, out].
+            // Equivalent to position strictly after in_frame and not past out_frame.
+            if position <= left.in_frame || position > left.out_frame {
+                return Err(BackendError::InvalidParams(format!(
+                    "position {position} must be strictly between inFrame {} and outFrame {} (inclusive of outFrame)",
+                    left.in_frame, left.out_frame
+                )));
+            }
+            (left.clip_id.clone(), left.source.clone(), left.out_frame)
+        };
+
+        data.next_clip_id += 1;
+        let right_clip_id = format!("clip-{}", data.next_clip_id);
+
+        // Clone filters from left onto right (Shotcut copies producer + filters).
+        if let Some(filters) = data.filters.get(&left_clip_id).cloned() {
+            data.filters.insert(right_clip_id.clone(), filters);
+        }
+
+        let clips = data.clips.get_mut(&track_index).expect("track clips");
+        clips[clip_index].out_frame = position - 1;
+        clips.insert(
+            clip_index + 1,
+            Clip {
+                clip_id: right_clip_id.clone(),
+                index: clip_index + 1,
+                source,
+                in_frame: position,
+                out_frame,
+            },
+        );
+        for (i, c) in clips.iter_mut().enumerate() {
+            c.index = i;
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(SplitClipResult {
+            left_clip_id,
+            right_clip_id,
+            left_index: clip_index,
+            right_index: clip_index + 1,
+        })
+    }
+
     fn transitions_add_crossfade(
         &mut self,
         project_id: &str,
@@ -522,8 +795,21 @@ impl Backend for MockBackend {
         properties: Value,
     ) -> BackendResult<FilterInfo> {
         let data = self.project_mut(project_id);
+        // clip_id must address a real timeline clip so agents cannot attach
+        // filters to ghosts; scan all tracks.
+        let known = data
+            .clips
+            .values()
+            .flat_map(|c| c.iter())
+            .any(|c| c.clip_id == clip_id);
+        if !known {
+            return Err(BackendError::NotFound(format!("clip {clip_id}")));
+        }
         let filters = data.filters.entry(clip_id.to_string()).or_default();
-        let mut filter = MockFilter::default();
+        let mut filter = MockFilter {
+            mlt_service: mlt_service.to_string(),
+            ..MockFilter::default()
+        };
         if let Value::Object(properties) = properties {
             filter.properties = properties.into_iter().collect();
         }
@@ -550,7 +836,11 @@ impl Backend for MockBackend {
             .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
         match position {
             Some(position) => {
-                filter.keyframes.entry(property.to_string()).or_default().insert(position, value);
+                filter
+                    .keyframes
+                    .entry(property.to_string())
+                    .or_default()
+                    .insert(position, (value, "linear".to_string()));
             }
             None => {
                 filter.properties.insert(property.to_string(), value);
@@ -563,15 +853,176 @@ impl Backend for MockBackend {
     fn filter_add_keyframe(
         &mut self,
         project_id: &str,
-        _clip_id: &str,
-        _filter_index: usize,
-        _property: &str,
-        _position: i64,
-        _value: Value,
-        _interpolation: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+        position: i64,
+        value: Value,
+        interpolation: &str,
     ) -> BackendResult<()> {
-        self.project_mut(project_id).dirty = true;
+        let interp = normalize_interpolation(interpolation);
+        let data = self.project_mut(project_id);
+        let filter = data
+            .filters
+            .get_mut(clip_id)
+            .and_then(|filters| filters.get_mut(filter_index))
+            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        filter
+            .keyframes
+            .entry(property.to_string())
+            .or_default()
+            .insert(position, (value, interp));
+        data.dirty = true;
         Ok(())
+    }
+
+    fn filter_list(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+    ) -> BackendResult<Vec<FilterListEntry>> {
+        let data = self.project_mut(project_id);
+        let known = data
+            .clips
+            .values()
+            .flat_map(|c| c.iter())
+            .any(|c| c.clip_id == clip_id);
+        if !known {
+            return Err(BackendError::NotFound(format!("clip {clip_id}")));
+        }
+        let filters = data.filters.get(clip_id).map(|f| f.as_slice()).unwrap_or(&[]);
+        Ok(filters
+            .iter()
+            .enumerate()
+            .map(|(index, f)| FilterListEntry {
+                index,
+                mlt_service: f.mlt_service.clone(),
+                properties: Value::Object(f.properties.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            })
+            .collect())
+    }
+
+    fn filter_remove(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        let filters = data
+            .filters
+            .get_mut(clip_id)
+            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        if filter_index >= filters.len() {
+            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")));
+        }
+        filters.remove(filter_index);
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+    fn filter_reorder(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        new_index: usize,
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        let filters = data
+            .filters
+            .get_mut(clip_id)
+            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        if filter_index >= filters.len() {
+            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")));
+        }
+        if new_index >= filters.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "newIndex {new_index} out of range (len={})",
+                filters.len()
+            )));
+        }
+        if filter_index != new_index {
+            let item = filters.remove(filter_index);
+            filters.insert(new_index, item);
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+    fn filter_list_keyframes(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+    ) -> BackendResult<Vec<KeyframeInfo>> {
+        let data = self.project_mut(project_id);
+        let filter = data
+            .filters
+            .get(clip_id)
+            .and_then(|filters| filters.get(filter_index))
+            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        let mut list = filter
+            .keyframes
+            .get(property)
+            .map(|map| {
+                map.iter()
+                    .map(|(position, (value, interpolation))| KeyframeInfo {
+                        position: *position,
+                        value: value.clone(),
+                        interpolation: interpolation.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        list.sort_by_key(|k| k.position);
+        Ok(list)
+    }
+
+    fn filter_remove_keyframe(
+        &mut self,
+        project_id: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+        position: i64,
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        let filter = data
+            .filters
+            .get_mut(clip_id)
+            .and_then(|filters| filters.get_mut(filter_index))
+            .ok_or_else(|| BackendError::NotFound(format!("filter {filter_index} on clip {clip_id}")))?;
+        let removed = filter
+            .keyframes
+            .get_mut(property)
+            .and_then(|map| map.remove(&position))
+            .is_some();
+        if !removed {
+            return Err(BackendError::NotFound(format!(
+                "keyframe at {position} on property {property} of filter {filter_index}"
+            )));
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+
+    fn clip_length_frames(&mut self, project_id: &str, clip_id: &str) -> BackendResult<i64> {
+        let data = self.project_mut(project_id);
+        for clips in data.clips.values() {
+            if let Some(clip) = clips.iter().find(|c| c.clip_id == clip_id) {
+                return Ok((clip.out_frame - clip.in_frame + 1).max(0));
+            }
+        }
+        Err(BackendError::NotFound(format!("clip {clip_id}")))
     }
 
     fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
@@ -591,6 +1042,7 @@ impl Backend for MockBackend {
         let data = self.project_mut(project_id);
         let track_index = data.subtitle_tracks;
         data.subtitle_tracks += 1;
+        data.subtitle_items.entry(track_index).or_default();
         data.dirty = true;
         Ok(SubtitleTrackInfo { track_index })
     }
@@ -599,16 +1051,98 @@ impl Backend for MockBackend {
         &mut self,
         project_id: &str,
         track_index: usize,
-        _start_frame: i64,
-        _end_frame: i64,
-        _text: &str,
+        start_frame: i64,
+        end_frame: i64,
+        text: &str,
     ) -> BackendResult<()> {
         let data = self.project_mut(project_id);
         if track_index >= data.subtitle_tracks {
             return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
         }
+        data.subtitle_items
+            .entry(track_index)
+            .or_default()
+            .push(MockSubtitleItem {
+                start_frame,
+                end_frame,
+                text: text.to_string(),
+            });
         data.dirty = true;
         Ok(())
+    }
+
+    fn subtitles_remove_items(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        item_indices: &[usize],
+    ) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.subtitle_tracks {
+            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+        }
+        let items = data.subtitle_items.entry(track_index).or_default();
+        let mut remove: Vec<usize> = item_indices.to_vec();
+        remove.sort_unstable();
+        remove.dedup();
+        for &idx in remove.iter().rev() {
+            if idx >= items.len() {
+                return Err(BackendError::InvalidParams(format!(
+                    "subtitle item index {idx} out of range (len {})",
+                    items.len()
+                )));
+            }
+            items.remove(idx);
+        }
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn subtitles_import_srt(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        new_track: bool,
+    ) -> BackendResult<SubtitleTrackInfo> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            BackendError::InvalidParams(format!("subtitles.importSrt path {path} is not readable: {e}"))
+        })?;
+        let cues = parse_mock_srt_cues(&content);
+        let track_index = if new_track || self.project_mut(project_id).subtitle_tracks == 0 {
+            self.subtitles_add_track(project_id)?.track_index
+        } else {
+            0
+        };
+        let data = self.project_mut(project_id);
+        data.subtitle_items.insert(track_index, cues);
+        data.dirty = true;
+        Ok(SubtitleTrackInfo { track_index })
+    }
+
+    fn subtitles_export_srt(
+        &mut self,
+        project_id: &str,
+        path: &str,
+        track_index: usize,
+    ) -> BackendResult<String> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.subtitle_tracks {
+            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+        }
+        let items = data.subtitle_items.get(&track_index).cloned().unwrap_or_default();
+        let srt = format_mock_srt(&items);
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    BackendError::InvalidParams(format!("failed to create export parent: {e}"))
+                })?;
+            }
+        }
+        std::fs::write(path, srt).map_err(|e| {
+            BackendError::InvalidParams(format!("failed to write SRT to {path}: {e}"))
+        })?;
+        data.dirty = true;
+        Ok(path.to_string())
     }
 
     fn file_export(
@@ -623,7 +1157,13 @@ impl Backend for MockBackend {
         let job_id = format!("mock-job-{}", data.next_job_id);
         data.jobs.insert(
             job_id.clone(),
-            JobStatus { job_id: job_id.clone(), status: "done".into(), percent: 100.0, result_path: None, error: None },
+            JobStatus {
+                job_id: job_id.clone(),
+                status: "running".into(),
+                percent: 0.0,
+                result_path: None,
+                error: None,
+            },
         );
         Ok(job_id)
     }
@@ -648,6 +1188,17 @@ impl Backend for MockBackend {
         Ok(jobs)
     }
 
+    fn jobs_stop(&mut self, job_id: &str) -> BackendResult<()> {
+        for data in self.projects.values_mut() {
+            if let Some(job) = data.jobs.get_mut(job_id) {
+                job.status = "stopped".into();
+                job.error = Some("stopped by client".into());
+                return Ok(());
+            }
+        }
+        Err(BackendError::NotFound(format!("job {job_id}")))
+    }
+
     fn playback_get_frame(
         &mut self,
         _project_id: &str,
@@ -655,5 +1206,528 @@ impl Backend for MockBackend {
         _format: &str,
     ) -> BackendResult<String> {
         Err(BackendError::NotFound("playback.getFrame not implemented in MockBackend".into()))
+    }
+
+    fn markers_append(
+        &mut self,
+        project_id: &str,
+        frame: i64,
+        text: Option<String>,
+        color: Option<String>,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id);
+        let marker = Marker {
+            index: data.markers.len(),
+            frame,
+            text: text.unwrap_or_default(),
+            color: color.unwrap_or_else(|| "#000000".to_string()),
+            end_frame: None,
+        };
+        data.markers.push(marker.clone());
+        data.dirty = true;
+        Ok(marker)
+    }
+
+    fn markers_remove(&mut self, project_id: &str, marker_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        if marker_index >= data.markers.len() {
+            return Err(BackendError::NotFound(format!("marker {marker_index}")));
+        }
+        data.markers.remove(marker_index);
+        reindex_markers(&mut data.markers);
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn markers_update(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        frame: Option<i64>,
+        text: Option<String>,
+        color: Option<String>,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id);
+        {
+            let marker = data
+                .markers
+                .get_mut(marker_index)
+                .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))?;
+            if let Some(frame) = frame {
+                marker.frame = frame;
+            }
+            if let Some(text) = text {
+                marker.text = text;
+            }
+            if let Some(color) = color {
+                marker.color = color;
+            }
+        }
+        data.dirty = true;
+        Ok(data.markers[marker_index].clone())
+    }
+
+    fn markers_move(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        start: i64,
+        end: i64,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id);
+        {
+            let marker = data
+                .markers
+                .get_mut(marker_index)
+                .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))?;
+            marker.frame = start;
+            marker.end_frame = if end != start { Some(end) } else { None };
+        }
+        data.dirty = true;
+        Ok(data.markers[marker_index].clone())
+    }
+
+    fn markers_set_color(
+        &mut self,
+        project_id: &str,
+        marker_index: usize,
+        color: &str,
+    ) -> BackendResult<Marker> {
+        let data = self.project_mut(project_id);
+        {
+            let marker = data
+                .markers
+                .get_mut(marker_index)
+                .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))?;
+            marker.color = color.to_string();
+        }
+        data.dirty = true;
+        Ok(data.markers[marker_index].clone())
+    }
+
+    fn markers_clear(&mut self, project_id: &str) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        data.markers.clear();
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn markers_list(&mut self, project_id: &str) -> BackendResult<Vec<Marker>> {
+        Ok(self.project_mut(project_id).markers.clone())
+    }
+
+    fn markers_get(&mut self, project_id: &str, marker_index: usize) -> BackendResult<Marker> {
+        self.project_mut(project_id)
+            .markers
+            .get(marker_index)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("marker {marker_index}")))
+    }
+
+    fn markers_next(&mut self, project_id: &str, from_frame: i64) -> BackendResult<Option<i64>> {
+        let mut frames: Vec<i64> = self
+            .project_mut(project_id)
+            .markers
+            .iter()
+            .map(|m| m.frame)
+            .filter(|f| *f > from_frame)
+            .collect();
+        frames.sort_unstable();
+        Ok(frames.into_iter().next())
+    }
+
+    fn markers_prev(&mut self, project_id: &str, from_frame: i64) -> BackendResult<Option<i64>> {
+        let mut frames: Vec<i64> = self
+            .project_mut(project_id)
+            .markers
+            .iter()
+            .map(|m| m.frame)
+            .filter(|f| *f < from_frame)
+            .collect();
+        frames.sort_unstable();
+        Ok(frames.into_iter().next_back())
+    }
+
+    fn recent_add(&mut self, project_id: &str, path: &str) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        data.recent.retain(|p| p != path);
+        data.recent.insert(0, path.to_string());
+        Ok(())
+    }
+
+    fn recent_remove(&mut self, project_id: &str, path: &str) -> BackendResult<String> {
+        let data = self.project_mut(project_id);
+        let before = data.recent.len();
+        data.recent.retain(|p| p != path);
+        if data.recent.len() == before {
+            return Err(BackendError::NotFound(format!("recent path {path}")));
+        }
+        Ok(path.to_string())
+    }
+
+    fn recent_list(&mut self, project_id: &str) -> BackendResult<Vec<String>> {
+        Ok(self.project_mut(project_id).recent.clone())
+    }
+}
+
+fn reindex_markers(markers: &mut [Marker]) {
+    for (i, m) in markers.iter_mut().enumerate() {
+        m.index = i;
+    }
+}
+
+/// Minimal SRT parser for MockBackend import (cue number + timing + text blocks).
+fn parse_mock_srt_cues(content: &str) -> Vec<MockSubtitleItem> {
+    let mut items = Vec::new();
+    let mut lines = content.lines().peekable();
+    while let Some(line) = lines.next() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let timing = if line.contains("-->") {
+            line.to_string()
+        } else {
+            match lines.next() {
+                Some(next) => next.trim_end_matches('\r').to_string(),
+                None => break,
+            }
+        };
+        let Some((start_ts, end_ts)) = timing.split_once("-->") else {
+            continue;
+        };
+        let start_frame = mock_srt_timestamp_to_frames(start_ts.trim());
+        let end_frame = mock_srt_timestamp_to_frames(end_ts.trim());
+        let mut text_lines = Vec::new();
+        while let Some(peek) = lines.peek() {
+            let t = peek.trim_end_matches('\r');
+            if t.trim().is_empty() {
+                lines.next();
+                break;
+            }
+            text_lines.push(t.to_string());
+            lines.next();
+        }
+        items.push(MockSubtitleItem {
+            start_frame,
+            end_frame,
+            text: text_lines.join("\n"),
+        });
+    }
+    items
+}
+
+fn format_mock_srt(items: &[MockSubtitleItem]) -> String {
+    let mut out = String::new();
+    for (i, item) in items.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            i + 1,
+            mock_frames_to_srt_timestamp(item.start_frame),
+            mock_frames_to_srt_timestamp(item.end_frame),
+            item.text
+        ));
+    }
+    out
+}
+
+fn mock_frames_to_srt_timestamp(frame: i64) -> String {
+    // Mock uses the same 30fps convention as MltBackend for round-trips in unit tests.
+    let fps = 30i64;
+    let total_ms = (frame.max(0) as f64 / fps as f64 * 1000.0).round() as i64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{h:02}:{m:02}:{s:02},{ms:03}")
+}
+
+fn mock_srt_timestamp_to_frames(ts: &str) -> i64 {
+    // HH:MM:SS,mmm or HH:MM:SS.mmm
+    let ts = ts.replace('.', ",");
+    let parts: Vec<&str> = ts.split(&[',', ':'][..]).collect();
+    if parts.len() < 4 {
+        return 0;
+    }
+    let h: i64 = parts[0].parse().unwrap_or(0);
+    let m: i64 = parts[1].parse().unwrap_or(0);
+    let s: i64 = parts[2].parse().unwrap_or(0);
+    let ms: i64 = parts[3].parse().unwrap_or(0);
+    let total_ms = ((h * 3600 + m * 60 + s) * 1000) + ms;
+    ((total_ms as f64 / 1000.0) * 30.0).round() as i64
+}
+
+/// Map wire/API interpolation names onto the three SAP values.
+fn normalize_interpolation(interpolation: &str) -> String {
+    match interpolation {
+        "smooth" => "smooth".to_string(),
+        "discrete" | "hold" => "discrete".to_string(),
+        _ => "linear".to_string(),
+    }
+}
+
+/// Parse one MLT animated-property keyframe token (`"10=value"`, `"10~=value"`,
+/// `"10|=value"`) into position / value / interpolation. Used by MltBackend's
+/// `filter.listKeyframes` and unit-tested here so the mapping stays shared.
+pub fn parse_mlt_keyframe_entry(entry: &str) -> Option<KeyframeInfo> {
+    let eq = entry.find('=')?;
+    let lhs = &entry[..eq];
+    let rhs = &entry[eq + 1..];
+    let (position_str, interpolation) = if let Some(pos) = lhs.strip_suffix('~') {
+        (pos, "smooth")
+    } else if let Some(pos) = lhs.strip_suffix('|') {
+        (pos, "discrete")
+    } else {
+        (lhs, "linear")
+    };
+    let position: i64 = position_str.parse().ok()?;
+    let value = if let Ok(n) = rhs.parse::<i64>() {
+        json!(n)
+    } else if let Ok(n) = rhs.parse::<f64>() {
+        json!(n)
+    } else {
+        json!(rhs)
+    };
+    Some(KeyframeInfo {
+        position,
+        value,
+        interpolation: interpolation.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn edit_split_clip_splits_and_reindexes() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let clip = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
+            .unwrap();
+        b.edit_trim_clip_in("p", 0, 0, 10).unwrap();
+        b.edit_trim_clip_out("p", 0, 0, 100).unwrap();
+
+        let result = b.edit_split_clip("p", 0, 0, 50).unwrap();
+        assert_eq!(result.left_clip_id, clip.clip_id);
+        assert_eq!(result.left_index, 0);
+        assert_eq!(result.right_index, 1);
+        assert_ne!(result.right_clip_id, result.left_clip_id);
+
+        let clips = b.edit_list_clips("p", 0).unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].clip_id, result.left_clip_id);
+        assert_eq!(clips[0].in_frame, 10);
+        assert_eq!(clips[0].out_frame, 49);
+        assert_eq!(clips[0].index, 0);
+        assert_eq!(clips[1].clip_id, result.right_clip_id);
+        assert_eq!(clips[1].in_frame, 50);
+        assert_eq!(clips[1].out_frame, 100);
+        assert_eq!(clips[1].index, 1);
+        assert_eq!(clips[1].source, json!({"path": "/tmp/a.mp4"}));
+    }
+
+    #[test]
+    fn edit_split_clip_rejects_boundary_position() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        b.edit_trim_clip_in("p", 0, 0, 10).unwrap();
+        b.edit_trim_clip_out("p", 0, 0, 100).unwrap();
+        assert!(b.edit_split_clip("p", 0, 0, 10).is_err());
+        assert!(b.edit_split_clip("p", 0, 0, 101).is_err());
+    }
+
+    #[test]
+    fn filter_lifecycle_list_remove_reorder_keyframes() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let clip = b
+            .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
+            .unwrap();
+
+        let f0 = b
+            .filter_add("p", &clip.clip_id, "qtcrop", json!({"rect": "0 0 100 100"}))
+            .unwrap();
+        let f1 = b
+            .filter_add("p", &clip.clip_id, "brightness", json!({"level": 0.5}))
+            .unwrap();
+        assert_eq!(f0.filter_index, 0);
+        assert_eq!(f1.filter_index, 1);
+
+        let listed = b.filter_list("p", &clip.clip_id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].mlt_service, "qtcrop");
+        assert_eq!(listed[1].mlt_service, "brightness");
+        assert_eq!(listed[1].properties["level"], json!(0.5));
+
+        b.filter_reorder("p", &clip.clip_id, 0, 1).unwrap();
+        let listed = b.filter_list("p", &clip.clip_id).unwrap();
+        assert_eq!(listed[0].mlt_service, "brightness");
+        assert_eq!(listed[1].mlt_service, "qtcrop");
+
+        // brightness is now index 0
+        b.filter_add_keyframe("p", &clip.clip_id, 0, "level", 10, json!(0.2), "linear")
+            .unwrap();
+        b.filter_add_keyframe("p", &clip.clip_id, 0, "level", 20, json!(0.8), "smooth")
+            .unwrap();
+        b.filter_add_keyframe("p", &clip.clip_id, 0, "level", 30, json!(1.0), "discrete")
+            .unwrap();
+
+        let kfs = b.filter_list_keyframes("p", &clip.clip_id, 0, "level").unwrap();
+        assert_eq!(kfs.len(), 3);
+        assert_eq!(kfs[0].position, 10);
+        assert_eq!(kfs[0].interpolation, "linear");
+        assert_eq!(kfs[1].position, 20);
+        assert_eq!(kfs[1].interpolation, "smooth");
+        assert_eq!(kfs[2].position, 30);
+        assert_eq!(kfs[2].interpolation, "discrete");
+
+        b.filter_remove_keyframe("p", &clip.clip_id, 0, "level", 20).unwrap();
+        let kfs = b.filter_list_keyframes("p", &clip.clip_id, 0, "level").unwrap();
+        assert_eq!(kfs.len(), 2);
+        assert_eq!(kfs[0].position, 10);
+        assert_eq!(kfs[1].position, 30);
+
+        b.filter_remove("p", &clip.clip_id, 0).unwrap();
+        let listed = b.filter_list("p", &clip.clip_id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].mlt_service, "qtcrop");
+        assert_eq!(listed[0].index, 0);
+    }
+
+    #[test]
+    fn markers_append_list_remove_next_prev() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+
+        let m0 = b
+            .markers_append("p", 100, Some("first".into()), Some("#ff0000".into()))
+            .unwrap();
+        assert_eq!(m0.index, 0);
+        assert_eq!(m0.frame, 100);
+        assert_eq!(m0.text, "first");
+        assert_eq!(m0.color, "#ff0000");
+
+        let m1 = b.markers_append("p", 50, None, None).unwrap();
+        assert_eq!(m1.index, 1);
+        assert_eq!(m1.frame, 50);
+        assert_eq!(m1.color, "#000000");
+
+        let m2 = b.markers_append("p", 200, Some("third".into()), None).unwrap();
+        assert_eq!(m2.index, 2);
+
+        let listed = b.markers_list("p").unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].frame, 100);
+        assert_eq!(listed[1].frame, 50);
+        assert_eq!(listed[2].frame, 200);
+
+        assert_eq!(b.markers_next("p", 50).unwrap(), Some(100));
+        assert_eq!(b.markers_next("p", 100).unwrap(), Some(200));
+        assert_eq!(b.markers_next("p", 200).unwrap(), None);
+        assert_eq!(b.markers_prev("p", 200).unwrap(), Some(100));
+        assert_eq!(b.markers_prev("p", 100).unwrap(), Some(50));
+        assert_eq!(b.markers_prev("p", 50).unwrap(), None);
+
+        b.markers_remove("p", 0).unwrap();
+        let listed = b.markers_list("p").unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].index, 0);
+        assert_eq!(listed[0].frame, 50);
+        assert_eq!(listed[1].index, 1);
+        assert_eq!(listed[1].frame, 200);
+
+        let got = b.markers_get("p", 1).unwrap();
+        assert_eq!(got.frame, 200);
+        assert!(b.markers_get("p", 9).is_err());
+    }
+
+    #[test]
+    fn markers_update_move_set_color_clear() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.markers_append("p", 10, Some("a".into()), Some("#111111".into()))
+            .unwrap();
+
+        let updated = b
+            .markers_update("p", 0, Some(20), Some("b".into()), None)
+            .unwrap();
+        assert_eq!(updated.frame, 20);
+        assert_eq!(updated.text, "b");
+        assert_eq!(updated.color, "#111111");
+
+        let moved = b.markers_move("p", 0, 30, 40).unwrap();
+        assert_eq!(moved.frame, 30);
+        assert_eq!(moved.end_frame, Some(40));
+
+        let colored = b.markers_set_color("p", 0, "#abcdef").unwrap();
+        assert_eq!(colored.color, "#abcdef");
+
+        b.markers_clear("p").unwrap();
+        assert!(b.markers_list("p").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mock_subtitles_remove_and_jobs_stop() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.subtitles_add_track("p").unwrap();
+        b.subtitles_append_item("p", 0, 0, 30, "a").unwrap();
+        b.subtitles_append_item("p", 0, 30, 60, "b").unwrap();
+        b.subtitles_append_item("p", 0, 60, 90, "c").unwrap();
+        b.subtitles_remove_items("p", 0, &[1]).unwrap();
+        let items = &b.projects.get("p").unwrap().subtitle_items[&0];
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "a");
+        assert_eq!(items[1].text, "c");
+
+        let job_id = b.file_export("p", "out.mp4", "h264", "mp4").unwrap();
+        assert_eq!(b.jobs_get(&job_id).unwrap().status, "running");
+        b.jobs_stop(&job_id).unwrap();
+        let stopped = b.jobs_get(&job_id).unwrap();
+        assert_eq!(stopped.status, "stopped");
+        assert_eq!(stopped.error.as_deref(), Some("stopped by client"));
+    }
+
+    #[test]
+    fn recent_add_list_remove_dedupes_newest_first() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+
+        b.recent_add("p", "/a.mp4").unwrap();
+        b.recent_add("p", "/b.mp4").unwrap();
+        b.recent_add("p", "/a.mp4").unwrap(); // move to front
+        assert_eq!(b.recent_list("p").unwrap(), vec!["/a.mp4".to_string(), "/b.mp4".to_string()]);
+
+        let removed = b.recent_remove("p", "/b.mp4").unwrap();
+        assert_eq!(removed, "/b.mp4");
+        assert_eq!(b.recent_list("p").unwrap(), vec!["/a.mp4".to_string()]);
+        assert!(b.recent_remove("p", "/missing.mp4").is_err());
+    }
+
+    #[test]
+    fn parse_mlt_keyframe_entry_tags() {
+        let linear = parse_mlt_keyframe_entry("10=0.5").unwrap();
+        assert_eq!(linear.position, 10);
+        assert_eq!(linear.interpolation, "linear");
+        assert_eq!(linear.value, json!(0.5));
+
+        let smooth = parse_mlt_keyframe_entry("20~=1").unwrap();
+        assert_eq!(smooth.position, 20);
+        assert_eq!(smooth.interpolation, "smooth");
+        assert_eq!(smooth.value, json!(1));
+
+        let discrete = parse_mlt_keyframe_entry("30|=hold-me").unwrap();
+        assert_eq!(discrete.position, 30);
+        assert_eq!(discrete.interpolation, "discrete");
+        assert_eq!(discrete.value, json!("hold-me"));
     }
 }

@@ -23,8 +23,9 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::backend::{
-    Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo, JobStatus, PlaylistEntry,
-    ProjectState, SubtitleTrackInfo, Track, TransitionInfo,
+    Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo, FilterListEntry, JobStatus,
+    KeyframeInfo, Marker, PlaylistEntry, ProjectState, SplitClipResult, SubtitleTrackInfo, Track,
+    TransitionInfo,
 };
 use crate::ffi;
 use crate::server::{self, ServerConfig};
@@ -234,6 +235,16 @@ impl Backend for FfiBackend {
         Err(BackendError::NotFound("edit.trimClipOut not wired to real FFI yet".into()))
     }
 
+    fn edit_split_clip(
+        &mut self,
+        _project_id: &str,
+        _track_index: usize,
+        _clip_index: usize,
+        _position: i64,
+    ) -> BackendResult<SplitClipResult> {
+        Err(BackendError::NotFound("edit.splitClip not wired to real FFI yet".into()))
+    }
+
     fn transitions_add_crossfade(
         &mut self,
         _project_id: &str,
@@ -281,6 +292,59 @@ impl Backend for FfiBackend {
         Err(BackendError::NotFound("filter.addKeyframe not wired to real FFI yet".into()))
     }
 
+    fn filter_list(
+        &mut self,
+        _project_id: &str,
+        _clip_id: &str,
+    ) -> BackendResult<Vec<FilterListEntry>> {
+        Err(BackendError::NotFound("filter.list not wired to real FFI yet".into()))
+    }
+
+    fn filter_remove(
+        &mut self,
+        _project_id: &str,
+        _clip_id: &str,
+        _filter_index: usize,
+    ) -> BackendResult<()> {
+        Err(BackendError::NotFound("filter.remove not wired to real FFI yet".into()))
+    }
+
+    fn filter_reorder(
+        &mut self,
+        _project_id: &str,
+        _clip_id: &str,
+        _filter_index: usize,
+        _new_index: usize,
+    ) -> BackendResult<()> {
+        Err(BackendError::NotFound("filter.reorder not wired to real FFI yet".into()))
+    }
+
+    fn filter_list_keyframes(
+        &mut self,
+        _project_id: &str,
+        _clip_id: &str,
+        _filter_index: usize,
+        _property: &str,
+    ) -> BackendResult<Vec<KeyframeInfo>> {
+        Err(BackendError::NotFound("filter.listKeyframes not wired to real FFI yet".into()))
+    }
+
+    fn filter_remove_keyframe(
+        &mut self,
+        _project_id: &str,
+        _clip_id: &str,
+        _filter_index: usize,
+        _property: &str,
+        _position: i64,
+    ) -> BackendResult<()> {
+        Err(BackendError::NotFound("filter.removeKeyframe not wired to real FFI yet".into()))
+    }
+
+
+    fn clip_length_frames(&mut self, _project_id: &str, _clip_id: &str) -> BackendResult<i64> {
+        Err(BackendError::NotFound("clip_length_frames not wired to real FFI yet".into()))
+    }
+
     fn generator_create_title(&mut self, _project_id: &str, _params: Value) -> BackendResult<PlaylistEntry> {
         Err(BackendError::NotFound("generator.createTitle not wired to real FFI yet".into()))
     }
@@ -298,6 +362,33 @@ impl Backend for FfiBackend {
         _text: &str,
     ) -> BackendResult<()> {
         Err(BackendError::NotFound("subtitles.appendItem not wired to real FFI yet".into()))
+    }
+
+    fn subtitles_remove_items(
+        &mut self,
+        _project_id: &str,
+        _track_index: usize,
+        _item_indices: &[usize],
+    ) -> BackendResult<()> {
+        Err(BackendError::Unsupported("subtitles.removeItems not wired to real FFI yet".into()))
+    }
+
+    fn subtitles_import_srt(
+        &mut self,
+        _project_id: &str,
+        _path: &str,
+        _new_track: bool,
+    ) -> BackendResult<SubtitleTrackInfo> {
+        Err(BackendError::Unsupported("subtitles.importSrt not wired to real FFI yet".into()))
+    }
+
+    fn subtitles_export_srt(
+        &mut self,
+        _project_id: &str,
+        _path: &str,
+        _track_index: usize,
+    ) -> BackendResult<String> {
+        Err(BackendError::Unsupported("subtitles.exportSrt not wired to real FFI yet".into()))
     }
 
     fn file_export(
@@ -324,6 +415,10 @@ impl Backend for FfiBackend {
         Err(BackendError::Unsupported("jobs.list not wired to real FFI yet".into()))
     }
 
+    fn jobs_stop(&mut self, _job_id: &str) -> BackendResult<()> {
+        Err(BackendError::Unsupported("jobs.stop not wired to real FFI yet".into()))
+    }
+
     fn playback_get_frame(
         &mut self,
         _project_id: &str,
@@ -331,6 +426,82 @@ impl Backend for FfiBackend {
         _format: &str,
     ) -> BackendResult<String> {
         Err(BackendError::NotFound("playback.getFrame not wired to real FFI yet".into()))
+    }
+
+    fn markers_append(
+        &mut self,
+        _project_id: &str,
+        _frame: i64,
+        _text: Option<String>,
+        _color: Option<String>,
+    ) -> BackendResult<Marker> {
+        Err(BackendError::Unsupported("markers.append not wired to real FFI yet".into()))
+    }
+
+    fn markers_remove(&mut self, _project_id: &str, _marker_index: usize) -> BackendResult<()> {
+        Err(BackendError::Unsupported("markers.remove not wired to real FFI yet".into()))
+    }
+
+    fn markers_update(
+        &mut self,
+        _project_id: &str,
+        _marker_index: usize,
+        _frame: Option<i64>,
+        _text: Option<String>,
+        _color: Option<String>,
+    ) -> BackendResult<Marker> {
+        Err(BackendError::Unsupported("markers.update not wired to real FFI yet".into()))
+    }
+
+    fn markers_move(
+        &mut self,
+        _project_id: &str,
+        _marker_index: usize,
+        _start: i64,
+        _end: i64,
+    ) -> BackendResult<Marker> {
+        Err(BackendError::Unsupported("markers.move not wired to real FFI yet".into()))
+    }
+
+    fn markers_set_color(
+        &mut self,
+        _project_id: &str,
+        _marker_index: usize,
+        _color: &str,
+    ) -> BackendResult<Marker> {
+        Err(BackendError::Unsupported("markers.setColor not wired to real FFI yet".into()))
+    }
+
+    fn markers_clear(&mut self, _project_id: &str) -> BackendResult<()> {
+        Err(BackendError::Unsupported("markers.clear not wired to real FFI yet".into()))
+    }
+
+    fn markers_list(&mut self, _project_id: &str) -> BackendResult<Vec<Marker>> {
+        Err(BackendError::Unsupported("markers.list not wired to real FFI yet".into()))
+    }
+
+    fn markers_get(&mut self, _project_id: &str, _marker_index: usize) -> BackendResult<Marker> {
+        Err(BackendError::Unsupported("markers.get not wired to real FFI yet".into()))
+    }
+
+    fn markers_next(&mut self, _project_id: &str, _from_frame: i64) -> BackendResult<Option<i64>> {
+        Err(BackendError::Unsupported("markers.next not wired to real FFI yet".into()))
+    }
+
+    fn markers_prev(&mut self, _project_id: &str, _from_frame: i64) -> BackendResult<Option<i64>> {
+        Err(BackendError::Unsupported("markers.prev not wired to real FFI yet".into()))
+    }
+
+    fn recent_add(&mut self, _project_id: &str, _path: &str) -> BackendResult<()> {
+        Err(BackendError::Unsupported("recent.add not wired to real FFI yet".into()))
+    }
+
+    fn recent_remove(&mut self, _project_id: &str, _path: &str) -> BackendResult<String> {
+        Err(BackendError::Unsupported("recent.remove not wired to real FFI yet".into()))
+    }
+
+    fn recent_list(&mut self, _project_id: &str) -> BackendResult<Vec<String>> {
+        Err(BackendError::Unsupported("recent.list not wired to real FFI yet".into()))
     }
 }
 

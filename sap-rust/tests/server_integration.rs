@@ -235,12 +235,29 @@ async fn audio_set_gain_is_not_callable_when_audio_is_disabled() {
         .await;
     let clip_id = clip.result.unwrap()["clipId"].as_str().unwrap().to_string();
 
-    let response = client
-        .call("audio.setGain", json!({"clipId": clip_id, "db": -9}))
-        .await;
-    let error = response.error.expect("disabled audio.setGain must be rejected");
-    assert_eq!(error.code, error_codes::METHOD_NOT_FOUND);
-    assert!(error.message.contains("audio.setGain"));
+    for (method, params) in [
+        ("audio.setGain", json!({"clipId": clip_id, "db": -9})),
+        ("audio.setPan", json!({"clipId": clip_id, "pan": 0.25})),
+        ("audio.setBalance", json!({"clipId": clip_id, "balance": 0.75})),
+        ("audio.setNormalize", json!({"clipId": clip_id, "mode": "1pass"})),
+        ("audio.setFadeInOut", json!({"clipId": clip_id, "fadeInFrames": 10})),
+        ("audio.setAutoFade", json!({"clipId": clip_id, "enabled": true})),
+    ] {
+        let response = client.call(method, params).await;
+        let error = response
+            .error
+            .unwrap_or_else(|| panic!("disabled {method} must be rejected"));
+        assert_eq!(
+            error.code,
+            error_codes::METHOD_NOT_FOUND,
+            "{method} should be method-not-found when audio is disabled"
+        );
+        assert!(
+            error.message.contains(method),
+            "error for {method} should mention the method, got {}",
+            error.message
+        );
+    }
 }
 
 #[tokio::test]
@@ -267,4 +284,119 @@ async fn edit_add_track_fans_out_to_other_client_on_same_project() {
     assert_eq!(notification.method, "edit.changed");
     assert_eq!(notification.params["reason"], "addTrack");
     assert_eq!(notification.params["trackIndex"], 0);
+}
+
+#[tokio::test]
+async fn edit_split_clip_and_filter_lifecycle_dispatch() {
+    let path = start_server("split-filter-lifecycle", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client
+        .call("project.select", json!({"projectId": "split-filter-project"}))
+        .await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    let clip = client
+        .call(
+            "edit.appendClip",
+            json!({"trackIndex": 0, "source": {"path": "/tmp/source.mp4"}}),
+        )
+        .await;
+    let clip_id = clip.result.unwrap()["clipId"].as_str().unwrap().to_string();
+    client
+        .call(
+            "edit.trimClipIn",
+            json!({"trackIndex": 0, "clipIndex": 0, "newFrame": 0}),
+        )
+        .await;
+    client
+        .call(
+            "edit.trimClipOut",
+            json!({"trackIndex": 0, "clipIndex": 0, "newFrame": 99}),
+        )
+        .await;
+
+    let split = client
+        .call(
+            "edit.splitClip",
+            json!({"trackIndex": 0, "clipIndex": 0, "position": 40}),
+        )
+        .await;
+    assert!(split.error.is_none(), "edit.splitClip should succeed: {:?}", split.error);
+    let split_result = split.result.unwrap();
+    assert_eq!(split_result["leftClipId"], clip_id);
+    assert_eq!(split_result["leftIndex"], 0);
+    assert_eq!(split_result["rightIndex"], 1);
+    assert!(split_result["rightClipId"].as_str().unwrap().len() > 0);
+
+    let listed = client
+        .call("edit.listClips", json!({"trackIndex": 0}))
+        .await;
+    let clips = listed.result.unwrap();
+    assert_eq!(clips.as_array().unwrap().len(), 2);
+    assert_eq!(clips[0]["outFrame"], 39);
+    assert_eq!(clips[1]["inFrame"], 40);
+
+    let left_id = split_result["leftClipId"].as_str().unwrap().to_string();
+    client
+        .call(
+            "filter.add",
+            json!({"clipId": left_id, "mltService": "qtcrop", "properties": {"rect": "0 0 10 10"}}),
+        )
+        .await;
+    client
+        .call(
+            "filter.add",
+            json!({"clipId": left_id, "mltService": "brightness", "properties": {"level": 0.5}}),
+        )
+        .await;
+    let filters = client.call("filter.list", json!({"clipId": left_id})).await;
+    assert!(filters.error.is_none(), "filter.list: {:?}", filters.error);
+    assert_eq!(filters.result.as_ref().unwrap().as_array().unwrap().len(), 2);
+
+    let reorder = client
+        .call(
+            "filter.reorder",
+            json!({"clipId": left_id, "filterIndex": 0, "newIndex": 1}),
+        )
+        .await;
+    assert!(reorder.error.is_none(), "filter.reorder: {:?}", reorder.error);
+
+    client
+        .call(
+            "filter.addKeyframe",
+            json!({
+                "clipId": left_id,
+                "filterIndex": 0,
+                "property": "level",
+                "position": 10,
+                "value": 0.2,
+                "interpolation": "smooth",
+            }),
+        )
+        .await;
+    let kfs = client
+        .call(
+            "filter.listKeyframes",
+            json!({"clipId": left_id, "filterIndex": 0, "property": "level"}),
+        )
+        .await;
+    assert!(kfs.error.is_none(), "filter.listKeyframes: {:?}", kfs.error);
+    let kf_arr = kfs.result.unwrap();
+    assert_eq!(kf_arr.as_array().unwrap().len(), 1);
+    assert_eq!(kf_arr[0]["interpolation"], "smooth");
+
+    let rm_kf = client
+        .call(
+            "filter.removeKeyframe",
+            json!({"clipId": left_id, "filterIndex": 0, "property": "level", "position": 10}),
+        )
+        .await;
+    assert!(rm_kf.error.is_none(), "filter.removeKeyframe: {:?}", rm_kf.error);
+
+    let rm = client
+        .call("filter.remove", json!({"clipId": left_id, "filterIndex": 0}))
+        .await;
+    assert!(rm.error.is_none(), "filter.remove: {:?}", rm.error);
+    let filters = client.call("filter.list", json!({"clipId": left_id})).await;
+    assert_eq!(filters.result.unwrap().as_array().unwrap().len(), 1);
 }
