@@ -1,0 +1,314 @@
+// Package mcpadapter is the MCP access-point adapter described in
+// 06-daemon-mcp-proxy.md's correction: it translates MCP tool calls into
+// calls against the same daemon core (internal/daemon.Daemon) used by the
+// SDP JSON-RPC server (internal/sdp) -- it holds no state of its own beyond
+// the mcp-go server/transport plumbing.
+//
+// Transport: SSE, served by default, per 08-lifecycle-and-cli.md's "SSE MCP
+// enabled by default" decision -- `snapshotd serve` starts this listener
+// automatically, no flag required.
+//
+// Deferred/lazy tool listing: 10-testing-plan.md's Phase 2 calls for tools
+// to be "deferred/lazily-searchable" rather than eagerly dumped into an
+// agent's context, matching this very environment's own ToolSearch pattern.
+// mark3labs/mcp-go v0.56.0 (the version pulled by this module) does not
+// offer an equivalent first-class mechanism -- it has WithToolFilter
+// (per-session visibility/access control) and WithToolCapabilities(listChanged)
+// (list-changed-notification support), but no built-in "register tools as
+// lazily-searchable, full schemas fetched on demand" primitive. Given that,
+// this adapter registers all 7 daemon.* tools normally via AddTools; a real
+// deferred-listing gap only matters once the daemon-side proxy grows to the
+// full ~70+ method project/edit/playback/etc. surface mentioned in
+// 01-jsonrpc-spec.md, which is out of scope for this package. See
+// snapshotd/README.md for this noted as an explicit, honest gap rather than
+// something invented to paper over it.
+//
+// Generic SAP passthrough: rather than trying to keep up with sap-rust's
+// growing project.*/edit.*/playlist.*/filter.*/transitions.*/generator.*/
+// file.*/jobs.*/playback.*/subtitles.* surface (01-jsonrpc-spec.md) as
+// individually typed MCP tools, this adapter exposes exactly one additional
+// tool, "sap.call", that forwards method+params opaquely to
+// Handler.ForwardSAP (internal/daemon.Daemon.ForwardSAP ->
+// internal/sapproxy.Router), the same generic proxy internal/sdp uses for
+// raw clients. This makes every current and future sap-rust method callable
+// over MCP today without this package needing to know its schema. See
+// snapshotd/README.md for the tradeoffs (no per-method typed schema/
+// validation/description over MCP -- only over the generic tool's own
+// method/params shape) and for what a later, fuller typed-tool-surface pass
+// would look like.
+package mcpadapter
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+
+	"snapshotd/internal/sapproxy"
+)
+
+// Handler is the subset of internal/daemon.Daemon this adapter depends on --
+// kept as a small interface for the same reason internal/sdp.Handler is: the
+// adapter should not need to import daemon-internal types beyond what it
+// actually calls, and it makes the tool handlers straightforwardly testable
+// with a fake.
+type Handler interface {
+	// Dispatch handles the "daemon."-prefixed control-plane primitives.
+	Dispatch(ctx context.Context, method string, params json.RawMessage) (any, error)
+
+	// ForwardSAP handles the generic "sap.call" tool below: project.select
+	// binds this MCP session (via sink) to a project's pooled SAP
+	// connection; every other method/params pair is forwarded opaquely.
+	ForwardSAP(ctx context.Context, sessionID string, sink sapproxy.Sink, method string, params json.RawMessage) (json.RawMessage, error)
+
+	// UnbindSession releases a session's SAP project binding/notification
+	// sink -- wired to mcp-go's OnUnregisterSession hook below.
+	UnbindSession(sessionID string)
+}
+
+// New constructs an MCP server exposing the daemon.* SDP methods as tools,
+// per 06's primitives table.
+func New(h Handler) *server.MCPServer {
+	audioEnabled := false
+	if capability, ok := h.(interface{ AudioNamespaceEnabled() bool }); ok {
+		audioEnabled = capability.AudioNamespaceEnabled()
+	}
+	hooks := &server.Hooks{}
+	s := server.NewMCPServer(
+		"snapshotd",
+		"0.1.0",
+		server.WithToolCapabilities(false),
+		server.WithHooks(hooks),
+	)
+	// Mirrors internal/sdp.Server's own connection-close cleanup: whenever
+	// an MCP client session ends (SSE stream closes, etc), release whatever
+	// SAP project binding/notification sink it held, per 06's fan-out
+	// requirement not leaking stale sinks onto a still-live pooled
+	// connection.
+	hooks.AddOnUnregisterSession(func(ctx context.Context, session server.ClientSession) {
+		h.UnbindSession(session.SessionID())
+	})
+
+	s.AddTools(
+		tool("daemon.createProject",
+			"Create a new project folder under the daemon's projects root and register it in the registry.",
+			mcp.WithString("name", mcp.Required(), mcp.Description("Project folder name to create")),
+			h),
+		tool("daemon.deleteProject",
+			"Delete a project's registry row (does not delete files on disk).",
+			mcp.WithString("projectId", mcp.Required(), mcp.Description("Project ID to delete")),
+			h),
+		tool("daemon.listProjects",
+			"List all known projects.",
+			nil,
+			h),
+		tool("daemon.launch",
+			"Launch (spawn) a Snapshot child process for a project.",
+			mcp.WithString("projectId", mcp.Description("Project ID to launch (use this or projectPath)")),
+			h,
+			mcp.WithString("projectPath", mcp.Description("Filesystem path to a project folder or legacy .mlt file (use this or projectId)")),
+			mcp.WithBoolean("headless", mcp.Description("Launch headless (offscreen), no GUI display needed")),
+		),
+		tool("daemon.list",
+			"List known process instances (running and previously running).",
+			nil,
+			h),
+		tool("daemon.health",
+			"Check whether a process instance's SAP socket is responsive.",
+			mcp.WithString("instanceId", mcp.Required(), mcp.Description("Process instance ID")),
+			h),
+		tool("daemon.close",
+			"Stop a running process instance.",
+			mcp.WithString("instanceId", mcp.Required(), mcp.Description("Process instance ID")),
+			h),
+	)
+
+	s.AddTools(sapCallTool(s, h))
+	s.AddTools(sapSearchTool(audioEnabled))
+
+	return s
+}
+
+type sapMethodMetadata struct {
+	Method      string `json:"method"`
+	Description string `json:"description"`
+	Params      string `json:"params"`
+}
+
+// Keep this list limited to methods implemented by the current SAP server.
+// audio.* entries are filtered from results unless the daemon enables that
+// namespace.
+var supportedSAPMethods = []sapMethodMetadata{
+	{Method: "project.getState", Description: "Read the bound project's state.", Params: "{}"},
+	{Method: "project.save", Description: "Save the bound project.", Params: "{}"},
+	{Method: "project.undo", Description: "Undo the latest bound-project edit.", Params: "{}"},
+	{Method: "project.redo", Description: "Redo the latest undone bound-project edit.", Params: "{}"},
+	{Method: "edit.addTrack", Description: "Add a video or audio timeline track.", Params: `{kind}`},
+	{Method: "edit.removeTrack", Description: "Remove a timeline track.", Params: `{trackIndex}`},
+	{Method: "edit.listTracks", Description: "List timeline tracks.", Params: "{}"},
+	{Method: "edit.appendClip", Description: "Append a source clip to a timeline track.", Params: `{trackIndex, source}`},
+	{Method: "edit.listClips", Description: "List clips on a timeline track.", Params: `{trackIndex}`},
+	{Method: "edit.trimClipIn", Description: "Trim a clip's in point.", Params: `{trackIndex, clipIndex, newFrame}`},
+	{Method: "edit.trimClipOut", Description: "Trim a clip's out point.", Params: `{trackIndex, clipIndex, newFrame}`},
+	{Method: "playlist.append", Description: "Append a source to the project playlist.", Params: `{source, name?}`},
+	{Method: "playlist.list", Description: "List project playlist entries.", Params: "{}"},
+	{Method: "transitions.addCrossfade", Description: "Add a crossfade between adjacent clips.", Params: `{trackIndex, betweenClips, durationFrames}`},
+	{Method: "filter.add", Description: "Attach an MLT filter to a clip.", Params: `{clipId, mltService, properties?}`},
+	{Method: "filter.addKeyframe", Description: "Add a filter-property keyframe.", Params: `{clipId, filterIndex, property, position, value, interpolation?}`},
+	{Method: "audio.setGain", Description: "Add a volume filter with a gain in dB.", Params: `{clipId, db, position?}`},
+	{Method: "generator.createTitle", Description: "Create a title producer for the project playlist.", Params: `{mode, text|html, ...}`},
+	{Method: "subtitles.addTrack", Description: "Add a subtitles track.", Params: "{}"},
+	{Method: "subtitles.appendItem", Description: "Append a subtitle item.", Params: `{trackIndex, startFrame, endFrame, text}`},
+	{Method: "file.import", Description: "Import a media file inside the bound project's root.", Params: `{path}`},
+	{Method: "file.probe", Description: "Probe a media file without project binding.", Params: `{path}`},
+	{Method: "file.export", Description: "Start an export job for the bound project.", Params: `{outputPath, codec?, container?}`},
+	{Method: "jobs.list", Description: "List export jobs for the bound project.", Params: "{}"},
+	{Method: "jobs.get", Description: "Read an export job's status.", Params: `{jobId}`},
+	{Method: "playback.seek", Description: "Seek the bound project's playhead.", Params: `{frame}`},
+	{Method: "playback.getFrame", Description: "Read a rendered frame from the bound project.", Params: `{frame, format?}`},
+	{Method: "notes.getText", Description: "Read the bound project's notes.", Params: "{}"},
+	{Method: "notes.setText", Description: "Replace the bound project's notes.", Params: `{text}`},
+}
+
+func sapSearchTool(audioEnabled bool) server.ServerTool {
+	return server.ServerTool{
+		Tool: mcp.NewTool("sap.search",
+			mcp.WithDescription("Search supported SAP methods and return concise metadata for use with sap.call."),
+			mcp.WithString("query", mcp.Description("Case-insensitive text to match against method names and descriptions; empty returns all supported methods.")),
+		),
+		Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			query, _ := req.GetArguments()["query"].(string)
+			query = strings.ToLower(strings.TrimSpace(query))
+			matches := make([]sapMethodMetadata, 0, len(supportedSAPMethods))
+			for _, method := range supportedSAPMethods {
+				if !audioEnabled && strings.HasPrefix(method.Method, "audio.") {
+					continue
+				}
+				if query == "" ||
+					strings.Contains(strings.ToLower(method.Method), query) ||
+					strings.Contains(strings.ToLower(method.Description), query) {
+					matches = append(matches, method)
+				}
+			}
+			return mcp.NewToolResultJSON(matches)
+		},
+	}
+}
+
+// sapCallTool builds the "sap.call" generic passthrough tool described in
+// the package doc comment above.
+func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
+	return server.ServerTool{
+		Tool: mcp.NewTool("sap.call",
+			mcp.WithDescription(
+				"Generic passthrough to the project's live sap-rust process. "+
+					"Call with method=\"project.select\" and params={\"projectId\": ...} first "+
+					"to bind this MCP session to a project (opens or reuses one pooled SAP "+
+					"connection per project). Every other opaque SAP method -- project.*, "+
+					"edit.*, playlist.*, filter.*, transitions.*, generator.*, file.*, jobs.*, "+
+					"playback.*, subtitles.*, ... -- is then forwarded verbatim to sap-rust and "+
+					"its raw result (or error) is returned unchanged. This tool exists because "+
+					"mark3labs/mcp-go v0.56.0 has no deferred/lazy tool-listing primitive to "+
+					"expose sap-rust's full method surface as individually typed MCP tools -- "+
+					"see snapshotd/README.md.",
+			),
+			mcp.WithString("method", mcp.Required(),
+				mcp.Description(`SAP JSON-RPC method name, e.g. "project.select", "edit.addTrack", "playlist.append"`)),
+			mcp.WithObject("params",
+				mcp.Description("Method params, forwarded verbatim as the SAP call's params object (schema depends entirely on `method`; opaque to snapshotd)")),
+		),
+		Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args := req.GetArguments()
+			method, _ := args["method"].(string)
+			if method == "" {
+				return mcp.NewToolResultError(`sap.call: "method" is required`), nil
+			}
+
+			var paramsRaw json.RawMessage
+			if p, ok := args["params"]; ok && p != nil {
+				raw, err := json.Marshal(p)
+				if err != nil {
+					return mcp.NewToolResultErrorFromErr("marshaling params", err), nil
+				}
+				paramsRaw = raw
+			}
+
+			cs := server.ClientSessionFromContext(ctx)
+			if cs == nil {
+				return mcp.NewToolResultError("sap.call: no MCP client session in context"), nil
+			}
+			sink := &mcpSink{server: s, sessionID: cs.SessionID()}
+
+			result, err := h.ForwardSAP(ctx, cs.SessionID(), sink, method, paramsRaw)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if len(result) == 0 {
+				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", method)), nil
+			}
+			return mcp.NewToolResultJSON(json.RawMessage(result))
+		},
+	}
+}
+
+// mcpSink relays a project's fanned-out SAP notifications (edit.changed,
+// project.dirty, etc -- opaque to this package, see internal/sapproxy) to
+// one MCP client session over its existing transport (SSE by default), via
+// mark3labs/mcp-go's SendNotificationToSpecificClient. The method/params
+// pair is wrapped under a stable "sap.notification" MCP notification method
+// so clients can recognize these without this package needing to know
+// sap-rust's specific method names.
+type mcpSink struct {
+	server    *server.MCPServer
+	sessionID string
+}
+
+func (s *mcpSink) Notify(method string, params json.RawMessage) {
+	var fields map[string]any
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &fields)
+	}
+	_ = s.server.SendNotificationToSpecificClient(s.sessionID, "sap.notification", map[string]any{
+		"method": method,
+		"params": fields,
+	})
+}
+
+// tool builds a ServerTool that forwards to Handler.Dispatch: mcpOpts are
+// applied on top of the base name/description, and the handler binds the
+// MCP call's arguments straight into JSON and dispatches it as the SDP
+// method of the same name, since the on-wire JSON shape of every daemon.*
+// method's params already matches its MCP tool's arguments 1:1 (both are
+// just JSON objects with the same field names).
+func tool(name, description string, primaryOpt mcp.ToolOption, h Handler, extraOpts ...mcp.ToolOption) server.ServerTool {
+	opts := []mcp.ToolOption{mcp.WithDescription(description)}
+	if primaryOpt != nil {
+		opts = append(opts, primaryOpt)
+	}
+	opts = append(opts, extraOpts...)
+
+	return server.ServerTool{
+		Tool: mcp.NewTool(name, opts...),
+		Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			raw, err := json.Marshal(req.GetArguments())
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("marshaling arguments", err), nil
+			}
+			result, err := h.Dispatch(ctx, name, raw)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if result == nil {
+				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", name)), nil
+			}
+			res, err := mcp.NewToolResultJSON(result)
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("marshaling result", err), nil
+			}
+			return res, nil
+		},
+	}
+}

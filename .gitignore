@@ -1,0 +1,7 @@
+# Rust build output
+/sap-rust/target/
+
+# Local test and editor artifacts
+/.DS_Store
+/.idea/
+/.vscode/
