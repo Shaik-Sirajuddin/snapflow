@@ -9,6 +9,13 @@ description = "acpx daemon entrypoint: transport layer + gateway API"
 name = "acpx-server"
 path = "src/main.rs"
 
+# Standalone black-box health-check CLI (see the top-of-file doc comment
+# in `src/bin/selftest.rs`) -- a separate publishable binary from this
+# same package, not part of the `cargo test` suite.
+[[bin]]
+name = "acpx-selftest"
+path = "src/bin/selftest.rs"
+
 [dependencies]
 acpx-proto = { workspace = true }
 acpx-core = { workspace = true }
@@ -20,6 +27,10 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Real (non-dev) dependency, promoted from dev-dependencies below --
+# `src/bin/selftest.rs` makes real HTTP calls against a deployed
+# `acpx-server` instance and isn't test-only code.
+reqwest = { workspace = true }
 # Phase 2 step 11 (HTTP/WS transport): axum gives us a JSON-RPC POST
 # endpoint and a WS upgrade endpoint on the same router/listener with
 # minimal glue code. `ws` feature enables `axum::extract::ws`.

@@ -86,6 +86,41 @@ missing.
 
 Combined workspace test count after Phase 6: **113 passed, 0 failed, 1 ignored** (the pre-existing `live_registry` network test), `cargo fmt --all --check` clean, `cargo build --workspace` clean. This is the final phase in `04-phased-plan.md` -- all six phases are now implemented, with gaps honestly tracked below rather than silently left out.
 
+## Post-Phase-6 -- black-box self-test layer (not a new plan phase; closes a real gap the user asked about directly: "do we have end-to-end tests against the actual published/built artifact, not just in-process code")
+
+Every test suite through Phase 6, including the Phase 6 e2e harness, either
+compiles `acpx-server`'s source files directly into the test binary via
+`#[path]` (it has no `[lib]` target) or drives `acpx_core::router::Router`
+in-process. None of them ever booted the actual, already-compiled
+`acpx-server` binary as a real OS process and talked to it purely from the
+outside -- so a regression in `main.rs` itself (config parsing, the
+concurrent stdio/HTTP `tokio::select!`, the real TCP listener) had no test
+that could catch it. Three additions close this gap, built as three
+parallel disjoint-ownership pieces:
+
+| What | Implementation | Test coverage | Status |
+|---|---|---|---|
+| Black-box binary test: spawns the real compiled `acpx-server` binary (via cargo's `CARGO_BIN_EXE_acpx-server`) and drives it purely from outside the process over real stdio, real HTTP, and a real WebSocket upgrade | `acpx-server/tests/binary_self_test.rs` | 3 tests: `real_binary_serves_http_rpc_end_to_end` (full `session/new`->`session/prompt`->`session/close` over HTTP against the real process, which itself spawns a real stand-in backend subprocess), `real_binary_serves_websocket_end_to_end`, `real_binary_serves_stdio_end_to_end` | Done |
+| `acpx-selftest`: a standalone, publishable diagnostic CLI (separate `[[bin]]` in the same package) for operators/CI to black-box-check an **already-deployed** `acpx-server` over the network -- distinct from `cargo test`, which only ever runs against a checked-out source tree | `acpx-server/src/bin/selftest.rs` (`--target`/`ACPX_SELFTEST_TARGET` resolution, mandatory `session/list`+`agents/list` checks, optional `ACPX_SELFTEST_FULL=1` full round trip that tolerates backend-specific errors as a pass and only hard-fails on transport-level errors) | Manually verified against both an unreachable target (correct `FAIL`/exit 1) and a real locally-spawned `acpx-server` (correct `PASS`/exit 0, 38 real registry agents reported); no `cargo test` coverage by design, since it's meant to be run standalone post-deployment, not as part of the in-repo test suite | Done |
+| `scripts/self_test.sh`: one-shot wrapper tying it together for a human/CI -- builds the workspace, boots a real `acpx-server` against a stand-in backend on an ephemeral port, runs `acpx-selftest` against it, propagates its exit code | `scripts/self_test.sh` (`README.md`'s new `## Self-test` section documents it) | Run twice manually end-to-end during development (real build, real server, real `acpx-selftest`), both passed; also verified correct FAIL propagation against an unreachable port | Done |
+
+Combined workspace test count after this addition: **116 passed, 0 failed,
+1 ignored**, `cargo fmt --all --check` clean, `cargo build --workspace`
+clean.
+
+One real bug was found and fixed while building `scripts/self_test.sh`:
+`acpx-server`'s stdio transport races its HTTP transport in a
+`tokio::select!` (`main.rs`), so backgrounding the process naively left
+stdin at immediate EOF and the whole process exited within ~100ms even
+though the HTTP listener was healthy. Fixed by holding a FIFO open
+read-write on a spare fd and feeding the server's stdin from that, which
+keeps stdin open for the process's lifetime without leaking a background
+`sleep` process. This is an operational footgun for anyone else trying to
+run `acpx-server` as a backgrounded shell job with no live stdin --
+worth keeping in mind if a real init system/systemd unit is written later
+(not yet tracked as a `05-open-risks.md` item; added here since it's a
+concrete deployment gotcha discovered empirically, not a design risk).
+
 ## Gaps / not yet covered
 
 Pulled from `memory/acpx/gen/plans/acp-gateway-daemon/05-open-risks.md` --
