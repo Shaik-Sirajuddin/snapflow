@@ -4,6 +4,7 @@
 //! resolution, MCP-server merge, and gateway-native handlers land in
 //! Phase 2/3.
 
+use crate::persistence::{Direction, PersistenceStore};
 use crate::session_registry::{BackendSessionId, SessionRegistry};
 
 /// Which bucket a given JSON-RPC method falls into. See the classification
@@ -84,6 +85,15 @@ pub struct Router {
     /// every call. No TTL/invalidation yet; a later phase can add one if
     /// the registry needs to be re-polled for changes mid-run.
     registry_cache: Option<acpx_registry::Registry>,
+    /// Optional sqlite-backed persistence (Phase 2 step 10, see
+    /// `crate::persistence`). `None` by default -- a `Router` used purely
+    /// in-memory (e.g. most of this crate's own tests) never touches
+    /// sqlite at all. When set via [`Router::with_persistence`], session
+    /// metadata and transcripts are written fire-and-forget via
+    /// `tokio::spawn` off the dispatch hot path, per that module's
+    /// "written asynchronously" design goal -- a slow/failed persistence
+    /// write never delays or fails the client's actual request.
+    persistence: Option<PersistenceStore>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,7 +134,16 @@ impl Router {
             default_agent_id: default_agent_id.into(),
             http: reqwest::Client::new(),
             registry_cache: None,
+            persistence: None,
         }
+    }
+
+    /// Attach a [`PersistenceStore`] -- session metadata and transcripts
+    /// are recorded from that point on. Builder-style so callers can write
+    /// `Router::new(id).with_persistence(store)`.
+    pub fn with_persistence(mut self, store: PersistenceStore) -> Self {
+        self.persistence = Some(store);
+        self
     }
 
     /// Register how to spawn a given agent id. Mirrors
@@ -132,6 +151,103 @@ impl Router {
     /// just owns the `Supervisor` instance.
     pub fn register_agent(&mut self, agent_id: impl Into<String>, spec: acpx_conductor::SpawnSpec) {
         self.supervisor.register(agent_id, spec);
+    }
+
+    /// Fire-and-forget one transcript append, if persistence is attached.
+    /// Never awaited by the caller -- spawned onto the runtime so a slow
+    /// sqlite write can't add latency to the client-visible request path.
+    fn spawn_transcript(
+        &self,
+        gateway_session_id: impl Into<String>,
+        direction: Direction,
+        payload: serde_json::Value,
+    ) {
+        let Some(store) = self.persistence.clone() else {
+            return;
+        };
+        let gateway_session_id = gateway_session_id.into();
+        tokio::spawn(async move {
+            if let Err(err) = store
+                .append_transcript(gateway_session_id, direction, payload, now_rfc3339())
+                .await
+            {
+                tracing::warn!(%err, "failed to persist transcript entry");
+            }
+        });
+    }
+
+    /// Fire-and-forget persistence for a freshly-registered session:
+    /// `record_session` followed by the two `session/new` transcript rows
+    /// (client request, agent response), all inside a *single* spawned
+    /// task so the writes are strictly ordered.
+    ///
+    /// This matters beyond bookkeeping: `transcripts.gateway_session_id`
+    /// has a `FOREIGN KEY` on `sessions.gateway_session_id` (see
+    /// `persistence/mod.rs`'s `SCHEMA_SQL`). Spawning `record_session` and
+    /// the transcript appends as three *independent* `tokio::spawn` tasks
+    /// (as this used to do) races them against each other -- if either
+    /// transcript insert's blocking-pool task got scheduled before
+    /// `record_session`'s, sqlite rejected it with `FOREIGN KEY constraint
+    /// failed`, and because these are fire-and-forget the error was only
+    /// ever logged via `tracing::warn!`, never surfacing to a caller. That
+    /// produced the exact flake seen in `router_persistence_test.rs`:
+    /// `list_transcripts` intermittently stuck at 0 or 1 instead of 2.
+    /// Doing all three writes sequentially inside one task preserves the
+    /// "never block the client-visible request path" property while
+    /// guaranteeing the parent `sessions` row always lands first.
+    fn spawn_session_persistence(
+        &self,
+        gateway_session_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        backend_session_id: impl Into<String>,
+        client_request: serde_json::Value,
+        agent_response: serde_json::Value,
+    ) {
+        let Some(store) = self.persistence.clone() else {
+            return;
+        };
+        let gateway_session_id = gateway_session_id.into();
+        let agent_id = agent_id.into();
+        let backend_session_id = backend_session_id.into();
+        tokio::spawn(async move {
+            if let Err(err) = store
+                .record_session(
+                    gateway_session_id.clone(),
+                    agent_id,
+                    backend_session_id,
+                    None,
+                    now_rfc3339(),
+                )
+                .await
+            {
+                tracing::warn!(%err, "failed to persist session metadata");
+                // Don't attempt the transcript inserts -- without a
+                // `sessions` row they'd only fail the same FK check.
+                return;
+            }
+            if let Err(err) = store
+                .append_transcript(
+                    gateway_session_id.clone(),
+                    Direction::ClientToAgent,
+                    client_request,
+                    now_rfc3339(),
+                )
+                .await
+            {
+                tracing::warn!(%err, "failed to persist transcript entry");
+            }
+            if let Err(err) = store
+                .append_transcript(
+                    gateway_session_id,
+                    Direction::AgentToClient,
+                    agent_response,
+                    now_rfc3339(),
+                )
+                .await
+            {
+                tracing::warn!(%err, "failed to persist transcript entry");
+            }
+        });
     }
 
     /// Ensure the registry cache is populated, fetching (live, falling
@@ -206,8 +322,23 @@ impl Router {
         // Rewrite the backend's own session id into the gateway-issued one
         // before it ever reaches the client -- the client only ever sees
         // gateway session ids, never a raw backend id.
+        let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
+        }
+        if let Some(entry) = self
+            .sessions
+            .resolve(&acpx_proto::session::GatewaySessionId(
+                gateway_session_id_str.clone(),
+            ))
+        {
+            self.spawn_session_persistence(
+                gateway_session_id_str,
+                entry.agent_id.clone(),
+                entry.backend_session_id.0.clone(),
+                request,
+                response.clone(),
+            );
         }
         Ok(response)
     }
@@ -216,6 +347,11 @@ impl Router {
         &mut self,
         mut request: serde_json::Value,
     ) -> Result<serde_json::Value, RouterError> {
+        let method = request
+            .get("method")
+            .and_then(|m| m.as_str())
+            .ok_or(RouterError::MissingMethod)?
+            .to_string();
         let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
         let params = request
             .get_mut("params")
@@ -231,7 +367,7 @@ impl Router {
             .resolve(&acpx_proto::session::GatewaySessionId(
                 gateway_session_id.clone(),
             ))
-            .ok_or(RouterError::UnknownSession(gateway_session_id))?;
+            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
 
@@ -240,9 +376,30 @@ impl Router {
         // in 02-architecture.md.
         params["sessionId"] = serde_json::Value::String(backend_session_id);
 
+        self.spawn_transcript(
+            gateway_session_id.clone(),
+            Direction::ClientToAgent,
+            request.clone(),
+        );
+
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         backend.writer.write_value(&request).await?;
-        read_matching_response(backend, &id).await
+        let response = read_matching_response(backend, &id).await?;
+        self.spawn_transcript(
+            gateway_session_id.clone(),
+            Direction::AgentToClient,
+            response.clone(),
+        );
+        if method == "session/close" {
+            if let Some(store) = self.persistence.clone() {
+                tokio::spawn(async move {
+                    if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
+                        tracing::warn!(%err, "failed to persist session close");
+                    }
+                });
+            }
+        }
+        Ok(response)
     }
 
     async fn dispatch_native(
@@ -360,6 +517,17 @@ async fn read_matching_response(
             "dropping unmatched backend message (no reverse-direction routing yet, see 05-open-risks.md)"
         );
     }
+}
+
+/// Wall-clock timestamp for persistence rows, RFC 3339 via `SystemTime` (no
+/// extra date/time crate dependency -- acpx-core doesn't otherwise need
+/// one, and this precision is more than enough for session/transcript
+/// bookkeeping).
+fn now_rfc3339() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
 }
 
 #[cfg(test)]

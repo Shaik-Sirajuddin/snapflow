@@ -4,3 +4,8 @@
 pub mod http;
 pub mod stdio;
 pub mod ws;
+
+// Re-exported so `main.rs` can call `transport::serve(...)` / build a
+// `transport::SharedRouter` without reaching into `transport::http`
+// directly.
+pub use http::{serve, SharedRouter};

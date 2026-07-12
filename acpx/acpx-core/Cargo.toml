@@ -17,6 +17,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+# Sqlite driver for persistence/ (Phase 2 step 10). Not a workspace
+# dependency -- acpx-core is currently the only crate that needs it. See the
+# doc comment at the top of src/persistence/mod.rs for why rusqlite (sync +
+# spawn_blocking) was picked over sqlx here. `bundled` vendors sqlite itself
+# so no system libsqlite3 is required.
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
