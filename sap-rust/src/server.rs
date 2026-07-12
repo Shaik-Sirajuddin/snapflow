@@ -1724,6 +1724,25 @@ async fn handle_request(
             Err(e) => return respond(Err(invalid_params(&e))),
         };
         let project_id = p.project_id;
+
+        // Harness guard: reject switching to a different project on an
+        // already-bound session/connection without an intervening
+        // project.exit. Reselecting the SAME project stays a harmless,
+        // idempotent no-op success (matches pre-existing behavior and the
+        // Phase B same-project multi-session model, which repeatedly
+        // reselects the same project on a shared connection).
+        if let Some(bound) = session.project_id.clone() {
+            if bound != project_id {
+                return respond(Err(RpcError {
+                    code: error_codes::ALREADY_BOUND,
+                    message: format!(
+                        "session already bound to project {bound:?}; call project.exit first before selecting a different project {project_id:?}"
+                    ),
+                    data: None,
+                }));
+            }
+        }
+
         let dispatch_project_id = project_id.clone();
         let outcome = dispatch(
             dispatch_tx,

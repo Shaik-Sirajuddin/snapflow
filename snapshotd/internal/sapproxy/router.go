@@ -3,6 +3,7 @@ package sapproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -95,25 +96,34 @@ func (r *Router) getOrDial(ctx context.Context, projectID string) (*pooledConn, 
 	return pc, nil
 }
 
+// ErrAlreadyBound is (wrapped and) returned by Bind when sessionID is
+// already bound to a different project than the one being requested,
+// without an intervening Unbind (driven by the caller handling
+// "project.exit" -- see internal/daemon.Daemon.ForwardSAP). Reselecting the
+// SAME project a session is already bound to is always allowed and stays
+// the pre-existing idempotent no-op success; only a genuinely different
+// target project trips this guard.
+var ErrAlreadyBound = errors.New("sapproxy: session already bound to a project")
+
 // Bind implements the project.select side of the proxy: it (re)selects
 // projectID on the shared pooled connection for that project, registers
 // sink to receive that project's fanned-out notifications for sessionID
 // (replacing any previous project binding that sessionID had), and returns
 // sap-rust's real project.select result verbatim.
 func (r *Router) Bind(ctx context.Context, sessionID, projectID string, sink Sink) (json.RawMessage, error) {
+	r.mu.Lock()
+	if prevProject, ok := r.sessionProject[sessionID]; ok && prevProject != projectID {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: bound to %q, requested %q; call project.exit first before selecting a different project", ErrAlreadyBound, prevProject, projectID)
+	}
+	r.mu.Unlock()
+
 	pc, err := r.getOrDial(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
 
 	r.mu.Lock()
-	if prevProject, ok := r.sessionProject[sessionID]; ok && prevProject != projectID {
-		if prevConn, ok := r.conns[prevProject]; ok {
-			prevConn.mu.Lock()
-			delete(prevConn.sinks, sessionID)
-			prevConn.mu.Unlock()
-		}
-	}
 	r.sessionProject[sessionID] = projectID
 	r.mu.Unlock()
 

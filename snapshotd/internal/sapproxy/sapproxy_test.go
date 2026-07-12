@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"path/filepath"
 	"sync"
@@ -283,6 +284,51 @@ func TestRouter_BadToken_ReturnsError(t *testing.T) {
 
 	if _, err := router.Bind(ctx, "s1", "proj-1", &recordingSink{}); err == nil {
 		t.Fatalf("expected sap.hello failure with a bad token")
+	}
+}
+
+func TestRouter_Bind_RejectsSwitchingProjectWithoutUnbind(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "fake.sock")
+	srv := newFakeSapServer("tok-123")
+	srv.serve(t, sock)
+
+	router := NewRouter(func(projectID string) (string, string, error) {
+		return sock, "tok-123", nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := router.Bind(ctx, "session-a", "proj-1", &recordingSink{}); err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+
+	// Reselecting the SAME project must stay an idempotent no-op success.
+	if _, err := router.Bind(ctx, "session-a", "proj-1", &recordingSink{}); err != nil {
+		t.Fatalf("reselecting the same project must succeed: %v", err)
+	}
+
+	// Switching to a different project without an intervening Unbind must
+	// be rejected -- this is the Go-layer half of the harness guard
+	// (internal/daemon.Daemon.ForwardSAP handles "project.exit" by calling
+	// Router.Unbind before a later Bind, which is exercised below).
+	if _, err := router.Bind(ctx, "session-a", "proj-2", &recordingSink{}); !errors.Is(err, ErrAlreadyBound) {
+		t.Fatalf("expected ErrAlreadyBound switching projects without unbind, got %v", err)
+	}
+
+	// The rejected attempt must not have disturbed the existing binding --
+	// session-a should still be able to call against proj-1.
+	if _, err := router.Call(ctx, "session-a", "edit.listTracks", nil); err != nil {
+		t.Fatalf("session-a should still be bound to proj-1 after the rejected switch: %v", err)
+	}
+
+	// After Unbind (what ForwardSAP's "project.exit" handling does), a
+	// switch to a different project must succeed.
+	router.Unbind("session-a")
+	if _, err := router.Bind(ctx, "session-a", "proj-2", &recordingSink{}); err != nil {
+		t.Fatalf("bind to a different project after unbind should succeed: %v", err)
+	}
+	if _, err := router.Call(ctx, "session-a", "edit.listTracks", nil); err != nil {
+		t.Fatalf("session-a should now be bound to proj-2: %v", err)
 	}
 }
 

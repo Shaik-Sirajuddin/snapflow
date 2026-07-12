@@ -345,6 +345,24 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 		return result, nil
 	}
 
+	if method == "project.exit" {
+		// Deliberately NOT forwarded to sap-rust: internal/sapproxy pools one
+		// SAP connection per project, shared by every session bound to that
+		// project, and sap-rust's own project.select gate lives on that one
+		// shared connection (see sap-rust/src/server.rs's per-connection
+		// `session.project_id`), not per Go-level session. Forwarding a raw
+		// "project.exit" through the shared connection would unselect the
+		// project for every OTHER session still bound to it too. "Exit" is
+		// therefore purely local bookkeeping: it clears this session's own
+		// Router binding (sapproxy.Router.Unbind) so a later project.select
+		// -- possibly to a different project -- is no longer rejected by
+		// Bind's already-bound guard. This matches sap-rust's own
+		// project.exit being harmless/idempotent when called while unbound.
+		d.SAP.Unbind(sessionID)
+		_ = d.Sessions.BindProject(sessionID, "")
+		return json.RawMessage(`{}`), nil
+	}
+
 	return d.SAP.Call(ctx, sessionID, method, params)
 }
 

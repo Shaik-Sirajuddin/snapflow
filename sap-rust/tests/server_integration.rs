@@ -168,6 +168,58 @@ async fn project_scoped_call_before_select_is_rejected() {
 }
 
 #[tokio::test]
+async fn reselecting_the_same_project_stays_a_noop_success() {
+    let path = start_server("reselect-same-project", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+
+    let first = client.call("project.select", json!({"projectId": "proj-same"})).await;
+    assert!(first.error.is_none(), "first select should succeed: {:?}", first.error);
+
+    let second = client.call("project.select", json!({"projectId": "proj-same"})).await;
+    assert!(second.error.is_none(), "reselecting the same project must stay idempotent: {:?}", second.error);
+}
+
+#[tokio::test]
+async fn switching_project_without_exit_is_rejected() {
+    let path = start_server("switch-without-exit", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+
+    let first = client.call("project.select", json!({"projectId": "proj-x"})).await;
+    assert!(first.error.is_none(), "first select should succeed: {:?}", first.error);
+
+    let switch = client.call("project.select", json!({"projectId": "proj-y"})).await;
+    let err = switch.error.expect("switching project without project.exit must be rejected");
+    assert_eq!(err.code, error_codes::ALREADY_BOUND);
+    assert!(err.message.contains("proj-x"), "error should name the currently-bound project: {}", err.message);
+
+    // The session must remain usable and still bound to the ORIGINAL
+    // project — the rejected attempt must not have partially rebound it.
+    let listed = client.call("edit.listTracks", json!({})).await;
+    assert!(listed.error.is_none(), "session should still be bound to proj-x after the rejected switch");
+}
+
+#[tokio::test]
+async fn project_exit_then_select_a_different_project_succeeds() {
+    let path = start_server("exit-then-switch", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+
+    let first = client.call("project.select", json!({"projectId": "proj-x"})).await;
+    assert!(first.error.is_none());
+
+    let exit = client.call("project.exit", json!({})).await;
+    assert!(exit.error.is_none(), "project.exit should succeed: {:?}", exit.error);
+
+    let switch = client.call("project.select", json!({"projectId": "proj-y"})).await;
+    assert!(switch.error.is_none(), "select after exit must succeed: {:?}", switch.error);
+
+    let listed = client.call("edit.listTracks", json!({})).await;
+    assert!(listed.error.is_none(), "session should now be usable against proj-y");
+}
+
+#[tokio::test]
 async fn file_probe_dispatches_and_mock_reports_unsupported() {
     let path = start_server("file-probe-mock", TOKEN).await;
     let mut client = Client::connect(&path).await;

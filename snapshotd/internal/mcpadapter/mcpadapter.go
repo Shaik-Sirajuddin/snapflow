@@ -51,6 +51,25 @@ import (
 	"snapshotd/internal/sapproxy"
 )
 
+// serverInstructions is the MCP server's top-level `instructions` field: a
+// short, self-contained usage summary shown to a client connecting cold, so
+// it doesn't need any out-of-band documentation to get productive. Kept free
+// of absolute filesystem paths and internal plan-doc filenames on purpose --
+// this text must stay meaningful for any deployment, not just this repo's
+// own checkout.
+const serverInstructions = "Video/media editing MCP server. Typical flow: " +
+	"(1) use the daemon.* tools (createProject, listProjects, launch, list, health, close) " +
+	"to manage project folders and start a project's editing process; " +
+	"(2) call sap.call with method=\"project.select\" and params={\"projectId\": ...} to bind " +
+	"this session to one project (required before any other project-scoped call); " +
+	"(3) call sap.search, optionally with a text query, to discover the live SAP method " +
+	"surface for that project -- project.*, edit.*, playlist.*, filter.*, transitions.*, " +
+	"generator.*, file.*, jobs.*, playback.*, subtitles.*, and audio.* when that namespace is " +
+	"enabled; (4) call sap.call with any discovered method name and matching params to perform " +
+	"the edit. A session may only be bound to one project at a time: call sap.call with " +
+	"method=\"project.exit\" before selecting a different project, or project.select will be " +
+	"rejected with an already-bound error."
+
 // Handler is the subset of internal/daemon.Daemon this adapter depends on --
 // kept as a small interface for the same reason internal/sdp.Handler is: the
 // adapter should not need to import daemon-internal types beyond what it
@@ -83,6 +102,7 @@ func New(h Handler) *server.MCPServer {
 		"0.1.0",
 		server.WithToolCapabilities(false),
 		server.WithHooks(hooks),
+		server.WithInstructions(serverInstructions),
 	)
 	// Mirrors internal/sdp.Server's own connection-close cleanup: whenever
 	// an MCP client session ends (SSE stream closes, etc), release whatever

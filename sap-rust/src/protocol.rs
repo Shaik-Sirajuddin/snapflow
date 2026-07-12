@@ -69,6 +69,13 @@ pub mod error_codes {
     /// does not exist. Maps from `backend::BackendError::NotFound`.
     pub const NOT_FOUND: i64 = -32004;
 
+    /// Sent when `project.select` is called for a different project than the
+    /// one this connection/session is already bound to, without an
+    /// intervening `project.exit`. A same-project reselect is always allowed
+    /// (idempotent no-op success), only a *different* target project trips
+    /// this guard.
+    pub const ALREADY_BOUND: i64 = -32005;
+
     pub fn message(code: i64) -> &'static str {
         match code {
             PARSE_ERROR => "Parse error",
@@ -80,6 +87,7 @@ pub mod error_codes {
             NO_PROJECT_BOUND => "No project bound: call project.select first",
             BAD_TOKEN => "Invalid token",
             NOT_FOUND => "Not found",
+            ALREADY_BOUND => "Already bound to a different project: call project.exit first",
             _ => "Server error",
         }
     }

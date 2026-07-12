@@ -187,3 +187,93 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 	}
 	return b
 }
+
+// TestForwardSAP_RealSapRust_ProjectSwitchGuard proves the harness guard
+// end-to-end through the real daemon.ForwardSAP entry point (the same one
+// internal/sdp and internal/mcpadapter use): a session already bound to one
+// project is rejected when it tries to project.select a different one
+// without an intervening project.exit, and project.exit -- handled locally
+// by ForwardSAP, not forwarded to the shared sap-rust connection, see its
+// doc comment -- correctly clears the binding so a later select to a
+// different project succeeds.
+func TestForwardSAP_RealSapRust_ProjectSwitchGuard(t *testing.T) {
+	binPath := realSapRustBinary(t)
+
+	cfg := config.Config{
+		HomeDir:         t.TempDir(),
+		ProjectsRoot:    filepath.Join(t.TempDir(), "projects"),
+		RunDir:          filepath.Join(t.TempDir(), "run"),
+		SnapshotBinPath: binPath,
+	}
+	cfg.DBPath = filepath.Join(cfg.HomeDir, "registry.db")
+	cfg.ControlSocketPath = filepath.Join(cfg.HomeDir, "control.sock")
+
+	d, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	if err != nil {
+		t.Fatalf("new daemon: %v", err)
+	}
+	d.Proc.ConnectTimeout = 10 * time.Second
+	t.Cleanup(func() { _ = d.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	projA, err := d.CreateProject(ctx, CreateProjectParams{Name: "switch-guard-a"})
+	if err != nil {
+		t.Fatalf("create project a: %v", err)
+	}
+	projB, err := d.CreateProject(ctx, CreateProjectParams{Name: "switch-guard-b"})
+	if err != nil {
+		t.Fatalf("create project b: %v", err)
+	}
+
+	piA, err := d.Launch(ctx, LaunchParams{ProjectID: projA.ID})
+	if err != nil {
+		t.Fatalf("launch project a: %v", err)
+	}
+	piB, err := d.Launch(ctx, LaunchParams{ProjectID: projB.ID})
+	if err != nil {
+		t.Fatalf("launch project b: %v", err)
+	}
+
+	sink := &fanoutSink{}
+
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
+		t.Fatalf("project.select projA: %v", err)
+	}
+
+	// Reselecting the SAME project must stay a no-op success.
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projA.ID})); err != nil {
+		t.Fatalf("reselecting projA should succeed: %v", err)
+	}
+
+	// Switching to project B without exiting project A must be rejected.
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projB.ID})); err == nil {
+		t.Fatalf("expected project.select to projB to be rejected while still bound to projA")
+	}
+
+	// Still usable against project A -- the rejected attempt must not have
+	// disturbed the existing binding.
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "edit.listTracks", nil); err != nil {
+		t.Fatalf("session should still be bound to projA after the rejected switch: %v", err)
+	}
+
+	// project.exit, then select project B, must succeed.
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.exit", mustJSON(t, map[string]any{})); err != nil {
+		t.Fatalf("project.exit: %v", err)
+	}
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "project.select", mustJSON(t, map[string]any{"projectId": projB.ID})); err != nil {
+		t.Fatalf("project.select projB after exit should succeed: %v", err)
+	}
+	if _, err := d.ForwardSAP(ctx, "session-switch", sink, "edit.listTracks", nil); err != nil {
+		t.Fatalf("session should now be bound to projB: %v", err)
+	}
+
+	d.UnbindSession("session-switch")
+	if err := d.CloseInstance(ctx, piA.ID); err != nil {
+		t.Fatalf("close instance a: %v", err)
+	}
+	if err := d.CloseInstance(ctx, piB.ID); err != nil {
+		t.Fatalf("close instance b: %v", err)
+	}
+}
