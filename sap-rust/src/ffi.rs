@@ -203,6 +203,15 @@ extern "C" {
         position: c_longlong,
     ) -> *mut c_char;
 
+    /// C++ side: `long long sap_clip_length_frames(void* mainWindowHandle,
+    /// int trackIndex, int clipIndex);` -- `Mlt::ClipInfo::frame_count`.
+    /// Returns -1 on error.
+    pub fn sap_clip_length_frames(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+    ) -> c_longlong;
+
     /// Playlist ("Source"/bin panel) operations via the real PlaylistModel
     /// slots. NOT part of the undo stack in real Shotcut either (bin
     /// management isn't undoable there). Each returns a heap-allocated
@@ -215,6 +224,44 @@ extern "C" {
     pub fn sap_playlist_move(main_window_handle: *mut c_void, from_index: c_int, to_index: c_int) -> c_int;
     pub fn sap_playlist_get(main_window_handle: *mut c_void, index: c_int) -> *mut c_char;
     pub fn sap_playlist_list(main_window_handle: *mut c_void) -> *mut c_char;
+
+    /// Timeline markers (real `MarkersModel`) via
+    /// `Markers::AppendCommand`/`DeleteCommand`/`UpdateCommand`/
+    /// `ClearCommand` (undoable). Marker JSON:
+    /// `{"index":N,"frame":N,"endFrame":N|absent,"text":"...",
+    /// "color":"#RRGGBB"}`. Caller must free string results via
+    /// `sap_free_string`.
+    pub fn sap_markers_append(
+        main_window_handle: *mut c_void,
+        frame: c_longlong,
+        text: *const c_char,
+        color: *const c_char,
+    ) -> *mut c_char;
+    pub fn sap_markers_remove(main_window_handle: *mut c_void, marker_index: c_int) -> c_int;
+    pub fn sap_markers_update(
+        main_window_handle: *mut c_void,
+        marker_index: c_int,
+        frame: c_longlong,
+        end_frame: c_longlong,
+        text: *const c_char,
+        color: *const c_char,
+    ) -> *mut c_char;
+    pub fn sap_markers_move(
+        main_window_handle: *mut c_void,
+        marker_index: c_int,
+        start: c_longlong,
+        end: c_longlong,
+    ) -> *mut c_char;
+    pub fn sap_markers_set_color(
+        main_window_handle: *mut c_void,
+        marker_index: c_int,
+        color: *const c_char,
+    ) -> *mut c_char;
+    pub fn sap_markers_clear(main_window_handle: *mut c_void) -> c_int;
+    pub fn sap_markers_list(main_window_handle: *mut c_void) -> *mut c_char;
+    pub fn sap_markers_get(main_window_handle: *mut c_void, marker_index: c_int) -> *mut c_char;
+    pub fn sap_markers_next(main_window_handle: *mut c_void, from_frame: c_longlong) -> c_longlong;
+    pub fn sap_markers_prev(main_window_handle: *mut c_void, from_frame: c_longlong) -> c_longlong;
 
     /// C++ side: `char* sap_list_tracks(void* mainWindowHandle);` -- returns a
     /// heap-allocated, NUL-terminated JSON array string of the form

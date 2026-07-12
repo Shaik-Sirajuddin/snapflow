@@ -90,6 +90,23 @@ impl FfiBackend {
         Ok((track_index, clip_index))
     }
 
+    /// Parses a raw `sap_markers_*` JSON object result (NULL pointer, or a
+    /// `{"index":N,"frame":N,"endFrame":N|absent,"text":"...",
+    /// "color":"#RRGGBB"}` string) into a `Marker`. `Marker`'s own
+    /// `#[serde(rename_all = "camelCase")]` shape matches the C++ side's
+    /// JSON exactly, so no intermediate raw struct is needed here (unlike
+    /// `parse_playlist_entry`/`SplitClipResult`'s raw structs, which do
+    /// need field remapping).
+    fn parse_marker(raw: *mut c_char, not_found_msg: &str) -> BackendResult<Marker> {
+        if raw.is_null() {
+            return Err(BackendError::NotFound(not_found_msg.to_string()));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<Marker>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad marker JSON: {e}")))
+    }
+
     /// Parses one `sap_playlist_*` JSON object result (`{"index":N,
     /// "name":"...","path":"...","durationFrames":N}`) into a `PlaylistEntry`,
     /// with the caller-supplied `source` value (so `playlist.append`/
@@ -844,8 +861,15 @@ impl Backend for FfiBackend {
     }
 
 
-    fn clip_length_frames(&mut self, _project_id: &str, _clip_id: &str) -> BackendResult<i64> {
-        Err(BackendError::NotFound("clip_length_frames not wired to real FFI yet".into()))
+    fn clip_length_frames(&mut self, _project_id: &str, clip_id: &str) -> BackendResult<i64> {
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let frames = unsafe {
+            ffi::sap_clip_length_frames(self.main_window, track_index as c_int, clip_index as c_int)
+        };
+        if frames < 0 {
+            return Err(BackendError::NotFound(format!("clip {clip_id} unavailable")));
+        }
+        Ok(frames)
     }
 
     fn generator_create_title(&mut self, _project_id: &str, _params: Value) -> BackendResult<PlaylistEntry> {
@@ -955,65 +979,126 @@ impl Backend for FfiBackend {
     fn markers_append(
         &mut self,
         _project_id: &str,
-        _frame: i64,
-        _text: Option<String>,
-        _color: Option<String>,
+        frame: i64,
+        text: Option<String>,
+        color: Option<String>,
     ) -> BackendResult<Marker> {
-        Err(BackendError::Unsupported("markers.append not wired to real FFI yet".into()))
+        // Defaults mirror MltBackend's (backend.rs's Mock/Mlt both use
+        // text="" / color="#000000" when unset) so the two backends behave
+        // identically for an agent that never passes these optional args.
+        let c_text = CString::new(text.unwrap_or_default())
+            .map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let c_color = CString::new(color.unwrap_or_else(|| "#000000".to_string()))
+            .map_err(|e| BackendError::InvalidParams(format!("bad color: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_markers_append(self.main_window, frame, c_text.as_ptr(), c_color.as_ptr())
+        };
+        Self::parse_marker(raw, "markers.append failed")
     }
 
-    fn markers_remove(&mut self, _project_id: &str, _marker_index: usize) -> BackendResult<()> {
-        Err(BackendError::Unsupported("markers.remove not wired to real FFI yet".into()))
+    fn markers_remove(&mut self, _project_id: &str, marker_index: usize) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_markers_remove(self.main_window, marker_index as c_int) };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("marker {marker_index}")));
+        }
+        Ok(())
     }
 
     fn markers_update(
         &mut self,
-        _project_id: &str,
-        _marker_index: usize,
-        _frame: Option<i64>,
-        _text: Option<String>,
-        _color: Option<String>,
+        project_id: &str,
+        marker_index: usize,
+        frame: Option<i64>,
+        text: Option<String>,
+        color: Option<String>,
     ) -> BackendResult<Marker> {
-        Err(BackendError::Unsupported("markers.update not wired to real FFI yet".into()))
+        // The real `MarkersModel::update()` slot always replaces the full
+        // marker (there's no partial setter beyond move()/setColor(), which
+        // are their own RPCs) -- so resolve the optional fields against the
+        // marker's current state first, then push one full-replace update.
+        // `endFrame` is deliberately left untouched here (only
+        // `markers.move` changes the range), matching MockBackend/
+        // MltBackend's `markers_update`, which never touches `end_frame`.
+        let current = self.markers_get(project_id, marker_index)?;
+        let resolved_frame = frame.unwrap_or(current.frame);
+        let resolved_end = current.end_frame.unwrap_or(current.frame);
+        let resolved_text = text.unwrap_or(current.text);
+        let resolved_color = color.unwrap_or(current.color);
+        let c_text = CString::new(resolved_text)
+            .map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let c_color = CString::new(resolved_color)
+            .map_err(|e| BackendError::InvalidParams(format!("bad color: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_markers_update(
+                self.main_window,
+                marker_index as c_int,
+                resolved_frame,
+                resolved_end,
+                c_text.as_ptr(),
+                c_color.as_ptr(),
+            )
+        };
+        Self::parse_marker(raw, &format!("marker {marker_index}"))
     }
 
     fn markers_move(
         &mut self,
         _project_id: &str,
-        _marker_index: usize,
-        _start: i64,
-        _end: i64,
+        marker_index: usize,
+        start: i64,
+        end: i64,
     ) -> BackendResult<Marker> {
-        Err(BackendError::Unsupported("markers.move not wired to real FFI yet".into()))
+        let raw =
+            unsafe { ffi::sap_markers_move(self.main_window, marker_index as c_int, start, end) };
+        Self::parse_marker(raw, &format!("marker {marker_index}"))
     }
 
     fn markers_set_color(
         &mut self,
         _project_id: &str,
-        _marker_index: usize,
-        _color: &str,
+        marker_index: usize,
+        color: &str,
     ) -> BackendResult<Marker> {
-        Err(BackendError::Unsupported("markers.setColor not wired to real FFI yet".into()))
+        let c_color =
+            CString::new(color).map_err(|e| BackendError::InvalidParams(format!("bad color: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_markers_set_color(self.main_window, marker_index as c_int, c_color.as_ptr())
+        };
+        Self::parse_marker(raw, &format!("marker {marker_index}"))
     }
 
     fn markers_clear(&mut self, _project_id: &str) -> BackendResult<()> {
-        Err(BackendError::Unsupported("markers.clear not wired to real FFI yet".into()))
+        let rc = unsafe { ffi::sap_markers_clear(self.main_window) };
+        if rc != 0 {
+            return Err(BackendError::NotFound("no active project/timeline".into()));
+        }
+        Ok(())
     }
 
     fn markers_list(&mut self, _project_id: &str) -> BackendResult<Vec<Marker>> {
-        Err(BackendError::Unsupported("markers.list not wired to real FFI yet".into()))
+        let raw = unsafe { ffi::sap_markers_list(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::NotFound("no active project/timeline".into()));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<Vec<Marker>>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad markers-list JSON: {e}")))
     }
 
-    fn markers_get(&mut self, _project_id: &str, _marker_index: usize) -> BackendResult<Marker> {
-        Err(BackendError::Unsupported("markers.get not wired to real FFI yet".into()))
+    fn markers_get(&mut self, _project_id: &str, marker_index: usize) -> BackendResult<Marker> {
+        let raw = unsafe { ffi::sap_markers_get(self.main_window, marker_index as c_int) };
+        Self::parse_marker(raw, &format!("marker {marker_index}"))
     }
 
-    fn markers_next(&mut self, _project_id: &str, _from_frame: i64) -> BackendResult<Option<i64>> {
-        Err(BackendError::Unsupported("markers.next not wired to real FFI yet".into()))
+    fn markers_next(&mut self, _project_id: &str, from_frame: i64) -> BackendResult<Option<i64>> {
+        let frame = unsafe { ffi::sap_markers_next(self.main_window, from_frame) };
+        Ok(if frame < 0 { None } else { Some(frame) })
     }
 
-    fn markers_prev(&mut self, _project_id: &str, _from_frame: i64) -> BackendResult<Option<i64>> {
-        Err(BackendError::Unsupported("markers.prev not wired to real FFI yet".into()))
+    fn markers_prev(&mut self, _project_id: &str, from_frame: i64) -> BackendResult<Option<i64>> {
+        let frame = unsafe { ffi::sap_markers_prev(self.main_window, from_frame) };
+        Ok(if frame < 0 { None } else { Some(frame) })
     }
 
     fn recent_add(&mut self, _project_id: &str, _path: &str) -> BackendResult<()> {
@@ -1057,10 +1142,22 @@ pub unsafe extern "C" fn sap_start_server(
     };
 
     let backend = FfiBackend::new(main_window);
+    // Mirrors main.rs's (the standalone/snapshotd-driven path)
+    // SNAPSHOT_AUDIO_ENABLED gate exactly -- this was previously
+    // hardcoded false here, silently disabling the whole audio.*
+    // namespace (method_not_found) whenever the server ran embedded
+    // inside a real Shotcut process instead of via snapshotd, with no
+    // way to opt in. Bug, not a deliberate FFI-path restriction: audio.*
+    // is pure filter.add/filter.setProperty plumbing (see server.rs),
+    // which is fully wired in FfiBackend.
+    let audio_enabled = matches!(
+        std::env::var("SNAPSHOT_AUDIO_ENABLED").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("True")
+    );
     let config = ServerConfig {
         socket_path: PathBuf::from(&socket_path),
         token,
-        audio_enabled: false,
+        audio_enabled,
     };
 
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
