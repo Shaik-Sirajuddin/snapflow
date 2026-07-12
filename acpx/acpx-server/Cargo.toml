@@ -1,0 +1,25 @@
+[package]
+name = "acpx-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "acpx daemon entrypoint: transport layer + gateway API"
+
+[[bin]]
+name = "acpx-server"
+path = "src/main.rs"
+
+[dependencies]
+acpx-proto = { workspace = true }
+acpx-core = { workspace = true }
+acpx-conductor = { workspace = true }
+acpx-registry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

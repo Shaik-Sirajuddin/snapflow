@@ -1,0 +1,13 @@
+[package]
+name = "acpx-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust client SDK for consumers of the acpx gateway"
+
+[dependencies]
+acpx-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

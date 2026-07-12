@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "acpx-proto",
+    "acpx-registry",
+    "acpx-conductor",
+    "acpx-core",
+    "acpx-server",
+    "acpx-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/acpx-dev/acpx"
+
+# Single pin for the official ACP Rust SDK so acpx-proto (server side) and
+# acpx-client never drift onto different wire-type versions. See
+# memory/acpx/gen/plans/acp-gateway-daemon/03-crate-and-folder-layout.md.
+[workspace.dependencies]
+agent-client-protocol = "1"
+acpx-proto = { path = "acpx-proto" }
+acpx-registry = { path = "acpx-registry" }
+acpx-conductor = { path = "acpx-conductor" }
+acpx-core = { path = "acpx-core" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
