@@ -87,7 +87,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::backend::{
-    parse_mlt_keyframe_entry, Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo,
+    default_blend_mode, parse_mlt_keyframe_entry, Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo,
     FilterListEntry, JobStatus, KeyframeInfo, Marker, PlaylistEntry, PlaylistEntryDetail, ProjectState,
     SplitClipResult, SubtitleTrackInfo, Track, TransitionInfo,
 };
@@ -178,6 +178,12 @@ struct MltProjectData {
     markers: Vec<Marker>,
     /// Newest-first, deduped on add. Persisted under `.snapshot/recent.json`.
     recent: Vec<String>,
+    /// Project-wide timeline row height, `shotcut:trackHeight` on the
+    /// tractor at export (real Shotcut stores this as one value for the
+    /// whole project, not per-track -- see multitrackmodel.cpp
+    /// trackHeight()/setTrackHeight()). `0` means "unset", omitted from
+    /// the XML.
+    track_height: i64,
 }
 
 impl MltProjectData {
@@ -197,6 +203,7 @@ impl MltProjectData {
             next_clip_seq: 0,
             markers: Vec::new(),
             recent: Vec::new(),
+            track_height: 0,
         };
         data.load_markers_from_disk();
         data.load_recent_from_disk();
@@ -405,7 +412,14 @@ impl Backend for MltBackend {
             return Err(BackendError::InvalidParams(format!("bad track kind: {kind}")));
         }
         let data = self.project_mut(project_id)?;
-        let track = Track { index: data.tracks.len(), kind: kind.to_string() };
+        let track = Track {
+            index: data.tracks.len(),
+            kind: kind.to_string(),
+            muted: false,
+            hidden: false,
+            locked: false,
+            blend_mode: default_blend_mode(),
+        };
         data.tracks.push(track.clone());
         data.dirty = true;
         data.undo_depth += 1;
@@ -429,6 +443,147 @@ impl Backend for MltBackend {
 
     fn edit_list_tracks(&mut self, project_id: &str) -> BackendResult<Vec<Track>> {
         Ok(self.project_mut(project_id)?.tracks.clone())
+    }
+
+    fn edit_reorder_track(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<Vec<Track>> {
+        let data = self.project_mut(project_id)?;
+        let len = data.tracks.len();
+        if from_index >= len {
+            return Err(BackendError::NotFound(format!("track {from_index}")));
+        }
+        if to_index >= len {
+            return Err(BackendError::InvalidParams(format!("toIndex {to_index} out of range (len {len})")));
+        }
+        let old_clips: HashMap<usize, Vec<MltClip>> = data.clips.drain().collect();
+        let old_transitions: HashMap<usize, Vec<CrossfadeRecord>> = data.transitions.drain().collect();
+
+        let track = data.tracks.remove(from_index);
+        data.tracks.insert(to_index, track);
+        for (i, t) in data.tracks.iter_mut().enumerate() {
+            t.index = i;
+        }
+
+        let mut order: Vec<usize> = (0..len).collect();
+        let moved = order.remove(from_index);
+        order.insert(to_index, moved);
+        let mut new_clips = HashMap::new();
+        let mut new_transitions = HashMap::new();
+        for (new_index, old_index) in order.into_iter().enumerate() {
+            if let Some(clips) = old_clips.get(&old_index) {
+                new_clips.insert(new_index, clips.clone());
+            }
+            if let Some(transitions) = old_transitions.get(&old_index) {
+                new_transitions.insert(new_index, transitions.clone());
+            }
+        }
+        data.clips = new_clips;
+        data.transitions = new_transitions;
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(data.tracks.clone())
+    }
+
+    fn edit_set_track_properties(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        muted: Option<bool>,
+        hidden: Option<bool>,
+        locked: Option<bool>,
+        blend_mode: Option<String>,
+    ) -> BackendResult<Track> {
+        let data = self.project_mut(project_id)?;
+        let track = data
+            .tracks
+            .get_mut(track_index)
+            .ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))?;
+        if let Some(v) = muted {
+            track.muted = v;
+        }
+        if let Some(v) = hidden {
+            track.hidden = v;
+        }
+        if let Some(v) = locked {
+            track.locked = v;
+        }
+        if let Some(v) = blend_mode {
+            track.blend_mode = v;
+        }
+        let result = track.clone();
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(result)
+    }
+
+    fn edit_set_track_height(&mut self, project_id: &str, height: i64) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        data.track_height = height;
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn edit_remove_clip(&mut self, project_id: &str, track_index: usize, clip_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id)?;
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        let clips = data
+            .clips
+            .get_mut(&track_index)
+            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+        if clip_index >= clips.len() {
+            return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+        }
+        clips.remove(clip_index);
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+    fn edit_move_clip(
+        &mut self,
+        project_id: &str,
+        from_track_index: usize,
+        from_clip_index: usize,
+        to_track_index: usize,
+        to_clip_index: usize,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id)?;
+        if from_track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {from_track_index}")));
+        }
+        if to_track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {to_track_index}")));
+        }
+        let mlt_clip = {
+            let source_clips = data
+                .clips
+                .get_mut(&from_track_index)
+                .ok_or_else(|| BackendError::NotFound(format!("clip {from_track_index}/{from_clip_index}")))?;
+            if from_clip_index >= source_clips.len() {
+                return Err(BackendError::NotFound(format!("clip {from_track_index}/{from_clip_index}")));
+            }
+            source_clips.remove(from_clip_index)
+        };
+        let dest_clips = data.clips.entry(to_track_index).or_default();
+        if to_clip_index > dest_clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "toClipIndex {to_clip_index} out of range (len {})",
+                dest_clips.len()
+            )));
+        }
+        let clip_id = mlt_clip.clip_id.clone();
+        let source = mlt_clip.source.clone();
+        let in_frame = mlt_clip.in_frame;
+        let out_frame = mlt_clip.out_frame;
+        dest_clips.insert(to_clip_index, mlt_clip);
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(Clip { clip_id, index: to_clip_index, source, in_frame, out_frame })
     }
 
     fn edit_append_clip(&mut self, project_id: &str, track_index: usize, source: Value) -> BackendResult<Clip> {
@@ -1919,6 +2074,121 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn edit_reorder_track_remaps_clips_and_transitions_in_real_backend() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-reorder-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        backend.generator_create_title("project", json!({"text": "t0"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "t1"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "t2a"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "t2b"})).unwrap();
+        let clip0 = backend.edit_append_clip("project", 0, json!({"playlistIndex": 0})).unwrap();
+        let clip1 = backend.edit_append_clip("project", 1, json!({"playlistIndex": 1})).unwrap();
+        let clip2a = backend.edit_append_clip("project", 2, json!({"playlistIndex": 2})).unwrap();
+        let clip2b = backend.edit_append_clip("project", 2, json!({"playlistIndex": 3})).unwrap();
+        // A crossfade on track 2, between its two clips -- proves the
+        // `transitions` HashMap (keyed by track_index) is remapped too,
+        // not just `clips`.
+        backend.transitions_add_crossfade("project", 2, (0, 1), 10).unwrap();
+
+        // Move track 0 to index 2: new order is [track1, track2, track0].
+        let tracks = backend.edit_reorder_track("project", 0, 2).unwrap();
+        assert_eq!(tracks.iter().map(|t| t.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        assert_eq!(backend.edit_list_clips("project", 0).unwrap()[0].clip_id, clip1.clip_id);
+        let track1_clips = backend.edit_list_clips("project", 1).unwrap();
+        assert_eq!(track1_clips.len(), 2);
+        assert_eq!(track1_clips[0].clip_id, clip2a.clip_id);
+        assert_eq!(track1_clips[1].clip_id, clip2b.clip_id);
+        assert_eq!(backend.edit_list_clips("project", 2).unwrap()[0].clip_id, clip0.clip_id);
+
+        // The crossfade must have moved with its track (now index 1) --
+        // proven indirectly via a successful, non-panicking export whose
+        // XML still contains exactly one mix-tractor (the nested
+        // luma+mix pair build_track_playlist emits per crossfade).
+        backend.project_save("project").unwrap();
+        let xml = std::fs::read_to_string(root.join("project/project.mlt")).unwrap();
+        assert_eq!(xml.matches("mlt_service\">mix</property>").count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_reorder_track_rejects_out_of_range_indices() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-reorder-oob-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        assert!(backend.edit_reorder_track("project", 5, 0).is_err());
+        assert!(backend.edit_reorder_track("project", 0, 5).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_mlt_xml_emits_track_hide_bitmask_blend_mode_and_track_height() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-trackprops-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.edit_add_track("project", "video").unwrap(); // index 0
+        backend.edit_add_track("project", "video").unwrap(); // index 1, composites over 0
+        backend.edit_add_track("project", "audio").unwrap(); // index 2
+
+        // Video track 0: hidden -> hide bitmask 1 -> hide="video".
+        backend
+            .edit_set_track_properties("project", 0, None, Some(true), None, None)
+            .unwrap();
+        // Video track 1: real per-track blend mode -> qtblend "compositing".
+        backend
+            .edit_set_track_properties("project", 1, None, None, None, Some("13".to_string()))
+            .unwrap();
+        // Audio track 2: muted -> combined with the audio-kind base bit ->
+        // hide bitmask 1|2 = 3 -> hide="both".
+        backend
+            .edit_set_track_properties("project", 2, Some(true), None, None, None)
+            .unwrap();
+        backend.edit_set_track_height("project", 120).unwrap();
+        backend.project_save("project").unwrap();
+
+        let xml = std::fs::read_to_string(root.join("project/project.mlt")).unwrap();
+        assert!(xml.contains("<property name=\"shotcut:trackHeight\">120</property>"));
+        assert!(xml.contains("hide=\"video\""));
+        assert!(xml.contains("hide=\"both\""));
+        assert!(xml.contains("<property name=\"compositing\">13</property>"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_remove_clip_and_move_clip_round_trip_in_real_backend() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-move-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        backend.generator_create_title("project", json!({"text": "a"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "b"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "c"})).unwrap();
+        let a = backend.edit_append_clip("project", 0, json!({"playlistIndex": 0})).unwrap();
+        backend.edit_append_clip("project", 0, json!({"playlistIndex": 1})).unwrap();
+        let c = backend.edit_append_clip("project", 0, json!({"playlistIndex": 2})).unwrap();
+
+        backend.edit_remove_clip("project", 0, 1).unwrap(); // removes `b`
+        let clips = backend.edit_list_clips("project", 0).unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].clip_id, a.clip_id);
+        assert_eq!(clips[1].clip_id, c.clip_id);
+        assert!(backend.edit_remove_clip("project", 0, 99).is_err());
+
+        let moved = backend.edit_move_clip("project", 0, 0, 1, 0).unwrap();
+        assert_eq!(moved.clip_id, a.clip_id);
+        assert_eq!(backend.edit_list_clips("project", 0).unwrap()[0].clip_id, c.clip_id);
+        assert_eq!(backend.edit_list_clips("project", 1).unwrap()[0].clip_id, a.clip_id);
+        assert!(backend.edit_move_clip("project", 0, 99, 1, 0).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn filter_set_property_last_static_write_is_serialized() {
         let root = std::env::temp_dir().join(format!("sap-rust-mlt-unit-{}", uuid::Uuid::new_v4()));
         let mut backend = MltBackend::new(&root);
@@ -2336,12 +2606,33 @@ fn build_mlt_xml(data: &MltProjectData) -> BackendResult<String> {
 
     let tractor_id = ctx.alloc("tractor");
     let mut tractor = format!("  <tractor id=\"{tractor_id}\" title=\"project\">\n");
-    for (pid, kind) in &track_refs {
-        if kind == "audio" {
-            tractor.push_str(&format!("    <track producer=\"{pid}\" hide=\"video\"/>\n"));
-        } else {
-            tractor.push_str(&format!("    <track producer=\"{pid}\"/>\n"));
+    if data.track_height > 0 {
+        tractor.push_str(&format!(
+            "    <property name=\"shotcut:trackHeight\">{}</property>\n",
+            data.track_height
+        ));
+    }
+    // Real `hide` bitmask semantics (multitrackmodel.cpp setTrackMute/
+    // setTrackHidden): bit 1 = video hidden, bit 2 = audio muted. An
+    // audio-kind track always has its video hidden regardless of the
+    // `hidden` flag (unchanged prior behavior); `muted`/`hidden` extend
+    // that with the per-track properties set via edit.setTrackProperties.
+    for (i, (pid, kind)) in track_refs.iter().enumerate() {
+        let track = &data.tracks[i];
+        let mut hide = if kind == "audio" { 1 } else { 0 };
+        if track.hidden {
+            hide |= 1;
         }
+        if track.muted {
+            hide |= 2;
+        }
+        let hide_attr = match hide {
+            0 => String::new(),
+            1 => " hide=\"video\"".to_string(),
+            2 => " hide=\"audio\"".to_string(),
+            _ => " hide=\"both\"".to_string(),
+        };
+        tractor.push_str(&format!("    <track producer=\"{pid}\"{hide_attr}/>\n"));
     }
 
     // Real multi-track video compositing: plant a `qtblend` transition
@@ -2358,8 +2649,9 @@ fn build_mlt_xml(data: &MltProjectData) -> BackendResult<String> {
     for (index, (_, kind)) in track_refs.iter().enumerate() {
         if kind != "audio" {
             if let Some(prev) = last_video_index {
+                let blend_mode = &data.tracks[index].blend_mode;
                 tractor.push_str(&format!(
-                    "    <transition>\n      <property name=\"mlt_service\">qtblend</property>\n      <property name=\"a_track\">{prev}</property>\n      <property name=\"b_track\">{index}</property>\n    </transition>\n"
+                    "    <transition>\n      <property name=\"mlt_service\">qtblend</property>\n      <property name=\"a_track\">{prev}</property>\n      <property name=\"b_track\">{index}</property>\n      <property name=\"compositing\">{blend_mode}</property>\n    </transition>\n"
                 ));
             }
             last_video_index = Some(index);

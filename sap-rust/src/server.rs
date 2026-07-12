@@ -249,6 +249,125 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             Err(e) => err_result(e),
         })),
 
+        "edit.reorderTrack" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                from_index: usize,
+                to_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.edit_reorder_track(&project_id, p.from_index, p.to_index) {
+                Ok(tracks) => BackendCallResult {
+                    result: Ok(serde_json::to_value(&tracks).expect("tracks serialize")),
+                    notify: Some(RpcNotification::new(
+                        "edit.changed",
+                        json!({"reason": "reorderTrack", "fromIndex": p.from_index, "toIndex": p.to_index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "edit.setTrackProperties" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                #[serde(default)]
+                muted: Option<bool>,
+                #[serde(default)]
+                hidden: Option<bool>,
+                #[serde(default)]
+                locked: Option<bool>,
+                #[serde(default)]
+                blend_mode: Option<String>,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            let track_index = p.track_index;
+            Ok(Box::new(move |b| {
+                match b.edit_set_track_properties(&project_id, track_index, p.muted, p.hidden, p.locked, p.blend_mode.clone()) {
+                    Ok(track) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&track).expect("Track serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({"reason": "setTrackProperties", "trackIndex": track_index}),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
+        "edit.setTrackHeight" => {
+            #[derive(Deserialize)]
+            struct P {
+                height: i64,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.edit_set_track_height(&project_id, p.height) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({})),
+                    notify: Some(RpcNotification::new(
+                        "edit.changed",
+                        json!({"reason": "setTrackHeight", "height": p.height}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "edit.removeClip" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                clip_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.edit_remove_clip(&project_id, p.track_index, p.clip_index) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({})),
+                    notify: Some(RpcNotification::new(
+                        "edit.changed",
+                        json!({"reason": "removeClip", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "edit.moveClip" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                from_track_index: usize,
+                from_clip_index: usize,
+                to_track_index: usize,
+                to_clip_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| {
+                match b.edit_move_clip(&project_id, p.from_track_index, p.from_clip_index, p.to_track_index, p.to_clip_index) {
+                    Ok(clip) => BackendCallResult {
+                        result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                        notify: Some(RpcNotification::new(
+                            "edit.changed",
+                            json!({
+                                "reason": "moveClip",
+                                "fromTrackIndex": p.from_track_index,
+                                "fromClipIndex": p.from_clip_index,
+                                "toTrackIndex": p.to_track_index,
+                                "toClipIndex": p.to_clip_index,
+                                "clipId": clip.clip_id,
+                            }),
+                        )),
+                    },
+                    Err(e) => err_result(e),
+                }
+            }))
+        }
+
         "edit.appendClip" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]

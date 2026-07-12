@@ -130,7 +130,14 @@ impl Backend for FfiBackend {
         if index < 0 {
             return Err(BackendError::InvalidParams("failed to add track".into()));
         }
-        Ok(Track { index: index as usize, kind: kind.to_string() })
+        Ok(Track {
+            index: index as usize,
+            kind: kind.to_string(),
+            muted: false,
+            hidden: false,
+            locked: false,
+            blend_mode: crate::backend::default_blend_mode(),
+        })
     }
 
     fn edit_remove_track(&mut self, _project_id: &str, track_index: usize) -> BackendResult<()> {
@@ -140,6 +147,41 @@ impl Backend for FfiBackend {
         } else {
             Err(BackendError::NotFound(format!("track {track_index}")))
         }
+    }
+
+    fn edit_reorder_track(&mut self, _project_id: &str, _from_index: usize, _to_index: usize) -> BackendResult<Vec<Track>> {
+        Err(BackendError::Unsupported("edit.reorderTrack not wired to real FFI yet".into()))
+    }
+
+    fn edit_set_track_properties(
+        &mut self,
+        _project_id: &str,
+        _track_index: usize,
+        _muted: Option<bool>,
+        _hidden: Option<bool>,
+        _locked: Option<bool>,
+        _blend_mode: Option<String>,
+    ) -> BackendResult<Track> {
+        Err(BackendError::Unsupported("edit.setTrackProperties not wired to real FFI yet".into()))
+    }
+
+    fn edit_set_track_height(&mut self, _project_id: &str, _height: i64) -> BackendResult<()> {
+        Err(BackendError::Unsupported("edit.setTrackHeight not wired to real FFI yet".into()))
+    }
+
+    fn edit_remove_clip(&mut self, _project_id: &str, _track_index: usize, _clip_index: usize) -> BackendResult<()> {
+        Err(BackendError::Unsupported("edit.removeClip not wired to real FFI yet".into()))
+    }
+
+    fn edit_move_clip(
+        &mut self,
+        _project_id: &str,
+        _from_track_index: usize,
+        _from_clip_index: usize,
+        _to_track_index: usize,
+        _to_clip_index: usize,
+    ) -> BackendResult<Clip> {
+        Err(BackendError::Unsupported("edit.moveClip not wired to real FFI yet".into()))
     }
 
     fn edit_list_tracks(&mut self, _project_id: &str) -> BackendResult<Vec<Track>> {

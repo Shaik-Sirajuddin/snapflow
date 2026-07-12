@@ -152,6 +152,69 @@ async fn add_track_and_list_tracks_round_trip() {
 }
 
 #[tokio::test]
+async fn track_reorder_properties_and_clip_remove_move_dispatch() {
+    let path = start_server("track-clip-ops", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-ops"})).await;
+
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+
+    let props = client
+        .call(
+            "edit.setTrackProperties",
+            json!({"trackIndex": 1, "muted": true, "blendMode": "14"}),
+        )
+        .await;
+    assert!(props.error.is_none(), "edit.setTrackProperties should succeed: {:?}", props.error);
+    let track = props.result.expect("edit.setTrackProperties returns the updated track");
+    assert_eq!(track["muted"], true);
+    assert_eq!(track["blendMode"], "14");
+
+    let height = client.call("edit.setTrackHeight", json!({"height": 90})).await;
+    assert!(height.error.is_none());
+
+    let reordered = client.call("edit.reorderTrack", json!({"fromIndex": 0, "toIndex": 1})).await;
+    assert!(reordered.error.is_none(), "edit.reorderTrack should succeed: {:?}", reordered.error);
+    let tracks = reordered.result.expect("edit.reorderTrack returns the new track list");
+    let tracks = tracks.as_array().expect("tracks is a JSON array");
+    // The muted/blendMode track (originally index 1) is now at index 0.
+    assert_eq!(tracks[0]["muted"], true);
+    assert_eq!(tracks[0]["blendMode"], "14");
+
+    let clip_a = client
+        .call("edit.appendClip", json!({"trackIndex": 0, "source": {"path": "/tmp/a.mp4"}}))
+        .await
+        .result
+        .expect("appendClip a");
+    client
+        .call("edit.appendClip", json!({"trackIndex": 0, "source": {"path": "/tmp/b.mp4"}}))
+        .await;
+
+    let moved = client
+        .call(
+            "edit.moveClip",
+            json!({"fromTrackIndex": 0, "fromClipIndex": 0, "toTrackIndex": 1, "toClipIndex": 0}),
+        )
+        .await;
+    assert!(moved.error.is_none(), "edit.moveClip should succeed: {:?}", moved.error);
+    let moved_clip = moved.result.expect("edit.moveClip returns the moved clip");
+    assert_eq!(moved_clip["clipId"], clip_a["clipId"]);
+
+    let track1_clips = client.call("edit.listClips", json!({"trackIndex": 1})).await.result.unwrap();
+    assert_eq!(track1_clips.as_array().unwrap().len(), 1);
+
+    let removed = client.call("edit.removeClip", json!({"trackIndex": 0, "clipIndex": 0})).await;
+    assert!(removed.error.is_none(), "edit.removeClip should succeed: {:?}", removed.error);
+    let track0_clips = client.call("edit.listClips", json!({"trackIndex": 0})).await.result.unwrap();
+    assert_eq!(track0_clips.as_array().unwrap().len(), 0);
+
+    let bad = client.call("edit.reorderTrack", json!({"fromIndex": 9, "toIndex": 0})).await;
+    assert!(bad.error.is_some(), "out-of-range reorder must be rejected");
+}
+
+#[tokio::test]
 async fn project_scoped_call_before_select_is_rejected() {
     let path = start_server("no-project-bound", TOKEN).await;
     let mut client = Client::connect(&path).await;

@@ -24,9 +24,35 @@ pub enum BackendError {
 pub type BackendResult<T> = Result<T, BackendError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Track {
     pub index: usize,
     pub kind: String, // "video" | "audio"
+    /// Audio muted -- bit 2 (value 2) of the real MLT `<track hide=".."/>`
+    /// bitmask (see `multitrackmodel.cpp::setTrackMute`). Defaulted so
+    /// existing `Track { index, kind }` struct literals / wire payloads
+    /// from before this field existed keep compiling and deserializing.
+    #[serde(default)]
+    pub muted: bool,
+    /// Video hidden -- bit 1 (value 1) of the same `hide` bitmask (see
+    /// `multitrackmodel.cpp::setTrackHidden`). Independent of `kind ==
+    /// "audio"`, which always implies video-hidden regardless of this flag.
+    #[serde(default)]
+    pub hidden: bool,
+    /// UI edit-guard only, matches real Shotcut's `shotcut:lock` track
+    /// property -- has no effect on rendered/exported output.
+    #[serde(default)]
+    pub locked: bool,
+    /// QPainter composition-mode index as a string, matching the
+    /// `qtblend` transition's `compositing` property in real Shotcut's
+    /// per-track blend mode combo (`trackpropertieswidget.cpp`).
+    /// `"0"` = Source Over / Normal, the default.
+    #[serde(default = "default_blend_mode")]
+    pub blend_mode: String,
+}
+
+pub(crate) fn default_blend_mode() -> String {
+    "0".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +317,58 @@ pub trait Backend: Send {
         position: i64,
     ) -> BackendResult<SplitClipResult>;
 
+    /// `edit.reorderTrack` -- move the track at `from_index` to `to_index`,
+    /// shifting the tracks in between (same remove+insert+reindex
+    /// semantics as `playlist_move`). Implementors must also remap any
+    /// track_index-keyed storage (clips, and MltBackend's transitions) so
+    /// each track's clips/crossfades follow it to its new position.
+    /// Returns the full, reindexed track list.
+    fn edit_reorder_track(
+        &mut self,
+        project_id: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> BackendResult<Vec<Track>>;
+
+    /// `edit.setTrackProperties` -- partial update of mute/hidden/locked/
+    /// blendMode on one track; `None` fields are left unchanged. Returns
+    /// the updated `Track`.
+    fn edit_set_track_properties(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        muted: Option<bool>,
+        hidden: Option<bool>,
+        locked: Option<bool>,
+        blend_mode: Option<String>,
+    ) -> BackendResult<Track>;
+
+    /// `edit.setTrackHeight` -- real Shotcut stores this as ONE
+    /// project-wide timeline row height (`shotcut:trackHeight` on the
+    /// tractor), not per track.
+    fn edit_set_track_height(&mut self, project_id: &str, height: i64) -> BackendResult<()>;
+
+    /// `edit.removeClip` -- remove the clip at `clip_index` on
+    /// `track_index`, reindexing the remaining clips on that track.
+    fn edit_remove_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+    ) -> BackendResult<()>;
+
+    /// `edit.moveClip` -- move/reposition a clip within the same track or
+    /// across tracks. `to_clip_index == <dest track's clip count>` means
+    /// "append at end". Returns the moved `Clip` (with its updated index).
+    fn edit_move_clip(
+        &mut self,
+        project_id: &str,
+        from_track_index: usize,
+        from_clip_index: usize,
+        to_track_index: usize,
+        to_clip_index: usize,
+    ) -> BackendResult<Clip>;
+
     /// `transitions.addCrossfade`.
     fn transitions_add_crossfade(
         &mut self,
@@ -537,6 +615,9 @@ struct ProjectData {
     markers: Vec<Marker>,
     /// Newest-first, deduped on add.
     recent: Vec<String>,
+    /// Project-wide timeline row height, `shotcut:trackHeight` on export.
+    /// `0` means "unset" (build_mlt_xml omits the attribute).
+    track_height: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -635,7 +716,14 @@ impl Backend for MockBackend {
             return Err(BackendError::InvalidParams(format!("bad track kind: {kind}")));
         }
         let data = self.project_mut(project_id);
-        let track = Track { index: data.tracks.len(), kind: kind.to_string() };
+        let track = Track {
+            index: data.tracks.len(),
+            kind: kind.to_string(),
+            muted: false,
+            hidden: false,
+            locked: false,
+            blend_mode: default_blend_mode(),
+        };
         data.tracks.push(track.clone());
         data.dirty = true;
         data.undo_depth += 1;
@@ -658,6 +746,155 @@ impl Backend for MockBackend {
 
     fn edit_list_tracks(&mut self, project_id: &str) -> BackendResult<Vec<Track>> {
         Ok(self.project_mut(project_id).tracks.clone())
+    }
+
+    fn edit_reorder_track(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<Vec<Track>> {
+        let data = self.project_mut(project_id);
+        let len = data.tracks.len();
+        if from_index >= len {
+            return Err(BackendError::NotFound(format!("track {from_index}")));
+        }
+        if to_index >= len {
+            return Err(BackendError::InvalidParams(format!("toIndex {to_index} out of range (len {len})")));
+        }
+        // Snapshot old-index -> clips before mutating `tracks`, so the
+        // remap below can rebuild the HashMap keyed by each track's *new*
+        // index while still knowing what used to live at each *old* index.
+        let old_clips: HashMap<usize, Vec<Clip>> = data.clips.drain().collect();
+
+        let track = data.tracks.remove(from_index);
+        data.tracks.insert(to_index, track);
+        for (i, t) in data.tracks.iter_mut().enumerate() {
+            t.index = i;
+        }
+
+        // Reproduce the same remove+insert permutation on a Vec of old
+        // indices to learn each new index's original index, then rebuild
+        // `clips` keyed by new index.
+        let mut order: Vec<usize> = (0..len).collect();
+        let moved = order.remove(from_index);
+        order.insert(to_index, moved);
+        let mut new_clips = HashMap::new();
+        for (new_index, old_index) in order.into_iter().enumerate() {
+            if let Some(clips) = old_clips.get(&old_index) {
+                new_clips.insert(new_index, clips.clone());
+            }
+        }
+        data.clips = new_clips;
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(data.tracks.clone())
+    }
+
+    fn edit_set_track_properties(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        muted: Option<bool>,
+        hidden: Option<bool>,
+        locked: Option<bool>,
+        blend_mode: Option<String>,
+    ) -> BackendResult<Track> {
+        let data = self.project_mut(project_id);
+        let track = data
+            .tracks
+            .get_mut(track_index)
+            .ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))?;
+        if let Some(v) = muted {
+            track.muted = v;
+        }
+        if let Some(v) = hidden {
+            track.hidden = v;
+        }
+        if let Some(v) = locked {
+            track.locked = v;
+        }
+        if let Some(v) = blend_mode {
+            track.blend_mode = v;
+        }
+        let result = track.clone();
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(result)
+    }
+
+    fn edit_set_track_height(&mut self, project_id: &str, height: i64) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        data.track_height = height;
+        data.dirty = true;
+        Ok(())
+    }
+
+    fn edit_remove_clip(&mut self, project_id: &str, track_index: usize, clip_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        let clips = data
+            .clips
+            .get_mut(&track_index)
+            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+        if clip_index >= clips.len() {
+            return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+        }
+        clips.remove(clip_index);
+        for (i, c) in clips.iter_mut().enumerate() {
+            c.index = i;
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(())
+    }
+
+    fn edit_move_clip(
+        &mut self,
+        project_id: &str,
+        from_track_index: usize,
+        from_clip_index: usize,
+        to_track_index: usize,
+        to_clip_index: usize,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id);
+        if from_track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {from_track_index}")));
+        }
+        if to_track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {to_track_index}")));
+        }
+        let mut clip = {
+            let source_clips = data
+                .clips
+                .get_mut(&from_track_index)
+                .ok_or_else(|| BackendError::NotFound(format!("clip {from_track_index}/{from_clip_index}")))?;
+            if from_clip_index >= source_clips.len() {
+                return Err(BackendError::NotFound(format!("clip {from_track_index}/{from_clip_index}")));
+            }
+            source_clips.remove(from_clip_index)
+        };
+        if let Some(source_clips) = data.clips.get_mut(&from_track_index) {
+            for (i, c) in source_clips.iter_mut().enumerate() {
+                c.index = i;
+            }
+        }
+        let dest_clips = data.clips.entry(to_track_index).or_default();
+        if to_clip_index > dest_clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "toClipIndex {to_clip_index} out of range (len {})",
+                dest_clips.len()
+            )));
+        }
+        dest_clips.insert(to_clip_index.min(dest_clips.len()), clip.clone());
+        for (i, c) in dest_clips.iter_mut().enumerate() {
+            c.index = i;
+        }
+        clip.index = to_clip_index;
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(clip)
     }
 
     fn edit_append_clip(
@@ -1635,6 +1872,98 @@ pub fn parse_mlt_keyframe_entry(entry: &str) -> Option<KeyframeInfo> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn edit_reorder_track_remaps_clips_to_follow_their_track() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let clip0 = b.edit_append_clip("p", 0, json!({"path": "/tmp/track0.mp4"})).unwrap();
+        let clip1 = b.edit_append_clip("p", 1, json!({"path": "/tmp/track1.mp4"})).unwrap();
+        let clip2 = b.edit_append_clip("p", 2, json!({"path": "/tmp/track2.mp4"})).unwrap();
+
+        // Move track 0 to index 2: new order is [track1, track2, track0].
+        let tracks = b.edit_reorder_track("p", 0, 2).unwrap();
+        assert_eq!(tracks.iter().map(|t| t.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+
+        assert_eq!(b.edit_list_clips("p", 0).unwrap()[0].clip_id, clip1.clip_id);
+        assert_eq!(b.edit_list_clips("p", 1).unwrap()[0].clip_id, clip2.clip_id);
+        assert_eq!(b.edit_list_clips("p", 2).unwrap()[0].clip_id, clip0.clip_id);
+    }
+
+    #[test]
+    fn edit_set_track_properties_is_a_partial_update() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+
+        let t = b.edit_set_track_properties("p", 0, Some(true), None, None, None).unwrap();
+        assert!(t.muted);
+        assert!(!t.hidden);
+        assert!(!t.locked);
+        assert_eq!(t.blend_mode, "0");
+
+        let t = b.edit_set_track_properties("p", 0, None, None, None, Some("13".into())).unwrap();
+        // muted from the previous call must survive this unrelated update.
+        assert!(t.muted);
+        assert_eq!(t.blend_mode, "13");
+
+        assert!(b.edit_set_track_properties("p", 5, Some(true), None, None, None).is_err());
+    }
+
+    #[test]
+    fn edit_set_track_height_round_trips_via_state() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        assert!(b.edit_set_track_height("p", 120).is_ok());
+    }
+
+    #[test]
+    fn edit_remove_clip_reindexes_remaining_clips() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        let keep = b.edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"})).unwrap();
+        b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+
+        b.edit_remove_clip("p", 0, 0).unwrap();
+        let clips = b.edit_list_clips("p", 0).unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].clip_id, keep.clip_id);
+        assert_eq!(clips[0].index, 0);
+        assert_eq!(clips[1].index, 1);
+        assert!(b.edit_remove_clip("p", 0, 99).is_err());
+    }
+
+    #[test]
+    fn edit_move_clip_same_track_and_cross_track() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        let bee = b.edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"})).unwrap();
+
+        // Same-track reorder: move clip 0 (a) to the end of track 0.
+        let moved = b.edit_move_clip("p", 0, 0, 0, 1).unwrap();
+        assert_eq!(moved.clip_id, a.clip_id);
+        let clips = b.edit_list_clips("p", 0).unwrap();
+        assert_eq!(clips[0].clip_id, bee.clip_id);
+        assert_eq!(clips[1].clip_id, a.clip_id);
+
+        // Cross-track move: move `a` (now at track 0 index 1) onto track 1.
+        let moved = b.edit_move_clip("p", 0, 1, 1, 0).unwrap();
+        assert_eq!(moved.clip_id, a.clip_id);
+        assert_eq!(b.edit_list_clips("p", 0).unwrap().len(), 1);
+        assert_eq!(b.edit_list_clips("p", 1).unwrap()[0].clip_id, a.clip_id);
+
+        assert!(b.edit_move_clip("p", 0, 99, 1, 0).is_err());
+        assert!(b.edit_move_clip("p", 9, 0, 1, 0).is_err());
+    }
 
     #[test]
     fn edit_split_clip_splits_and_reindexes() {
