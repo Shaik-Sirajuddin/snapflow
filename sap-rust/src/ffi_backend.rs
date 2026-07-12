@@ -984,50 +984,141 @@ impl Backend for FfiBackend {
         Ok(frames)
     }
 
-    fn generator_create_title(&mut self, _project_id: &str, _params: Value) -> BackendResult<PlaylistEntry> {
-        Err(BackendError::NotFound("generator.createTitle not wired to real FFI yet".into()))
+    fn generator_create_title(&mut self, _project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+        let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("simple").to_string();
+        let text = params
+            .get("text")
+            .or_else(|| params.get("html"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::InvalidParams("generator.createTitle requires text (or html)".into()))?
+            .to_string();
+        let fg = params.get("fgColour").and_then(|v| v.as_str()).map(str::to_string);
+        let bg = params.get("bgColour").and_then(|v| v.as_str()).map(str::to_string);
+        let c_mode = CString::new(mode).map_err(|e| BackendError::InvalidParams(format!("bad mode: {e}")))?;
+        let c_text = CString::new(text).map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let c_fg = fg
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| BackendError::InvalidParams(format!("bad fgColour: {e}")))?;
+        let c_bg = bg
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| BackendError::InvalidParams(format!("bad bgColour: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_generator_create_title(
+                self.main_window,
+                c_mode.as_ptr(),
+                c_text.as_ptr(),
+                c_fg.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+                c_bg.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+            )
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams("generator.createTitle failed (no playlist bin?)".into()));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<PlaylistEntry>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad generator-create-title JSON: {e}")))
     }
 
     fn subtitles_add_track(&mut self, _project_id: &str) -> BackendResult<SubtitleTrackInfo> {
-        Err(BackendError::NotFound("subtitles.addTrack not wired to real FFI yet".into()))
+        let raw = unsafe { ffi::sap_subtitles_add_track(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(
+                "subtitles.addTrack unavailable (no clip on the timeline yet?)".into(),
+            ));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<SubtitleTrackInfo>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad subtitles-add-track JSON: {e}")))
     }
 
     fn subtitles_append_item(
         &mut self,
         _project_id: &str,
-        _track_index: usize,
-        _start_frame: i64,
-        _end_frame: i64,
-        _text: &str,
+        track_index: usize,
+        start_frame: i64,
+        end_frame: i64,
+        text: &str,
     ) -> BackendResult<()> {
-        Err(BackendError::NotFound("subtitles.appendItem not wired to real FFI yet".into()))
+        let c_text = CString::new(text).map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let rc = unsafe {
+            ffi::sap_subtitles_append_item(
+                self.main_window,
+                track_index as c_int,
+                start_frame as c_longlong,
+                end_frame as c_longlong,
+                c_text.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("subtitle track {track_index} unavailable")));
+        }
+        Ok(())
     }
 
     fn subtitles_remove_items(
         &mut self,
         _project_id: &str,
-        _track_index: usize,
-        _item_indices: &[usize],
+        track_index: usize,
+        item_indices: &[usize],
     ) -> BackendResult<()> {
-        Err(BackendError::Unsupported("subtitles.removeItems not wired to real FFI yet".into()))
+        let indices_json = serde_json::to_string(item_indices)
+            .map_err(|e| BackendError::InvalidParams(format!("bad item_indices: {e}")))?;
+        let c_indices = CString::new(indices_json)
+            .map_err(|e| BackendError::InvalidParams(format!("bad item_indices: {e}")))?;
+        let rc = unsafe {
+            ffi::sap_subtitles_remove_items(self.main_window, track_index as c_int, c_indices.as_ptr())
+        };
+        if rc != 0 {
+            return Err(BackendError::InvalidParams(format!(
+                "subtitles.removeItems failed for track {track_index} (out-of-range index, or a \
+                 non-contiguous index set -- the real SubtitlesModel::removeItems() only supports \
+                 removing one contiguous run at a time)"
+            )));
+        }
+        Ok(())
     }
 
     fn subtitles_import_srt(
         &mut self,
         _project_id: &str,
-        _path: &str,
-        _new_track: bool,
+        path: &str,
+        new_track: bool,
     ) -> BackendResult<SubtitleTrackInfo> {
-        Err(BackendError::Unsupported("subtitles.importSrt not wired to real FFI yet".into()))
+        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_subtitles_import_srt(self.main_window, c_path.as_ptr(), new_track as c_int)
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "subtitles.importSrt failed for {path} (unreadable, no cues, or no timeline clip yet)"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<SubtitleTrackInfo>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad subtitles-import-srt JSON: {e}")))
     }
 
     fn subtitles_export_srt(
         &mut self,
         _project_id: &str,
-        _path: &str,
-        _track_index: usize,
+        path: &str,
+        track_index: usize,
     ) -> BackendResult<String> {
-        Err(BackendError::Unsupported("subtitles.exportSrt not wired to real FFI yet".into()))
+        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_subtitles_export_srt(self.main_window, track_index as c_int, c_path.as_ptr())
+        };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(format!("subtitle track {track_index} unavailable")));
+        }
+        let out = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        Ok(out)
     }
 
     fn file_export(

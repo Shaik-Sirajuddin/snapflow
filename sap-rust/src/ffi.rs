@@ -175,6 +175,79 @@ extern "C" {
         position: c_longlong,
     ) -> c_int;
 
+    /// C++ side: `char* sap_generator_create_title(void* mainWindowHandle,
+    /// const char* mode, const char* text, const char* fgColour, const
+    /// char* bgColour);` -- builds a real MLT title-card producer (color:
+    /// producer + dynamictext/qtext filter) and appends it to the real
+    /// Playlist bin. Returns a heap-allocated JSON object
+    /// `{"index":N,"name":"...","source":{...},"durationFrames":N}`
+    /// matching `PlaylistEntry`'s wire shape, or NULL on error. Caller
+    /// must free via `sap_free_string`.
+    pub fn sap_generator_create_title(
+        main_window_handle: *mut c_void,
+        mode: *const c_char,
+        text: *const c_char,
+        fg_colour: *const c_char,
+        bg_colour: *const c_char,
+    ) -> *mut c_char;
+
+    /// C++ side: `char* sap_subtitles_add_track(void* mainWindowHandle);`
+    /// -- real `SubtitlesModel::addTrack()` (undoable). Returns a
+    /// heap-allocated JSON object `{"trackIndex":N}`, or NULL on error
+    /// (invalid handle, or no multitrack producer loaded yet). Caller
+    /// must free via `sap_free_string`.
+    pub fn sap_subtitles_add_track(main_window_handle: *mut c_void) -> *mut c_char;
+
+    /// C++ side: `int sap_subtitles_append_item(void* mainWindowHandle,
+    /// int trackIndex, long long startFrame, long long endFrame, const
+    /// char* text);` -- real `SubtitlesModel::appendItem()` (undoable),
+    /// start/endFrame converted to ms via the real project fps. Returns 0
+    /// on success, -1 on error.
+    pub fn sap_subtitles_append_item(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        start_frame: c_longlong,
+        end_frame: c_longlong,
+        text: *const c_char,
+    ) -> c_int;
+
+    /// C++ side: `int sap_subtitles_remove_items(void* mainWindowHandle,
+    /// int trackIndex, const char* itemIndicesJson);` -- real
+    /// `SubtitlesModel::removeItems()` (undoable). itemIndicesJson is a
+    /// JSON array of indices that must form one contiguous run once
+    /// sorted/deduplicated (the real primitive only supports removing a
+    /// single `[first,last]` range). Returns 0 on success, -1 on error
+    /// (including a non-contiguous index set).
+    pub fn sap_subtitles_remove_items(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        item_indices_json: *const c_char,
+    ) -> c_int;
+
+    /// C++ side: `char* sap_subtitles_import_srt(void* mainWindowHandle,
+    /// const char* path, int newTrack);` -- real `Subtitles::
+    /// readFromSrtFile()` + `SubtitlesModel::importSubtitles()`/
+    /// `importSubtitlesToNewTrack()` (undoable). Returns a heap-allocated
+    /// JSON object `{"trackIndex":N}`, or NULL on error (invalid handle,
+    /// unreadable/empty-of-cues path, or no multitrack producer loaded).
+    /// Caller must free via `sap_free_string`.
+    pub fn sap_subtitles_import_srt(
+        main_window_handle: *mut c_void,
+        path: *const c_char,
+        new_track: c_int,
+    ) -> *mut c_char;
+
+    /// C++ side: `char* sap_subtitles_export_srt(void* mainWindowHandle,
+    /// int trackIndex, const char* path);` -- real `SubtitlesModel::
+    /// exportSubtitles()` (wraps `Subtitles::writeToSrtFile()`). Returns a
+    /// heap-allocated copy of path on success, or NULL on error (invalid
+    /// handle/trackIndex). Caller must free via `sap_free_string`.
+    pub fn sap_subtitles_export_srt(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        path: *const c_char,
+    ) -> *mut c_char;
+
     /// C++ side: `char* sap_filter_list(void* mainWindowHandle, int
     /// trackIndex, int clipIndex);` -- returns a heap-allocated JSON array
     /// string `[{"filterIndex":0,"mltService":"..."},...]` in raw MLT
