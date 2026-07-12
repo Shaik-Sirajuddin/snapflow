@@ -636,6 +636,50 @@ impl Backend for MltBackend {
         Ok(Clip { clip_id, index: clip_index, source, in_frame, out_frame })
     }
 
+    fn edit_overwrite_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id)?;
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        let producer = resolve_source(data, &source)?;
+        let (in_frame, out_frame) = default_in_out(&producer)?;
+        data.next_clip_seq += 1;
+        let clip_id = format!("clip-{}", data.next_clip_seq);
+        let clips = data.clips.entry(track_index).or_default();
+        if clip_index > clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "clipIndex {clip_index} out of range (len {})",
+                clips.len()
+            )));
+        }
+        let mlt_clip = MltClip {
+            clip_id: clip_id.clone(),
+            source: source.clone(),
+            producer,
+            in_frame,
+            out_frame,
+            filters: Vec::new(),
+        };
+        if clip_index == clips.len() {
+            // No occupant to replace -- behaves like append.
+            clips.push(mlt_clip);
+        } else {
+            // Non-rippling: drop and replace, downstream indices
+            // unaffected (unlike edit_insert_clip's splice).
+            clips[clip_index] = mlt_clip;
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(Clip { clip_id, index: clip_index, source, in_frame, out_frame })
+    }
+
     fn edit_list_clips(&mut self, project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>> {
         let data = self.project_mut(project_id)?;
         Ok(data
@@ -2264,6 +2308,49 @@ mod tests {
         let pos_b = xml.find(">b<").expect("title b in xml");
         let pos_c = xml.find(">c<").expect("title c in xml");
         assert!(pos_a < pos_b && pos_b < pos_c, "expected a < b < c ordering in saved XML");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_overwrite_clip_replaces_in_place_in_real_backend() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-overwrite-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        backend.generator_create_title("project", json!({"text": "a"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "b"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "c"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "x"})).unwrap();
+        let a = backend.edit_append_clip("project", 0, json!({"playlistIndex": 0})).unwrap();
+        let b = backend.edit_append_clip("project", 0, json!({"playlistIndex": 1})).unwrap();
+        let c = backend.edit_append_clip("project", 0, json!({"playlistIndex": 2})).unwrap();
+
+        // Overwrite slot 1 (b) with x -- a drop-and-replace, not a splice:
+        // clip count must stay 3, c must not ripple to index 3.
+        let overwritten =
+            backend.edit_overwrite_clip("project", 0, 1, json!({"playlistIndex": 3})).unwrap();
+        assert_eq!(overwritten.index, 1);
+        assert_ne!(overwritten.clip_id, b.clip_id);
+
+        let clips = backend.edit_list_clips("project", 0).unwrap();
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].clip_id, a.clip_id);
+        assert_eq!(clips[1].clip_id, overwritten.clip_id);
+        assert_eq!(clips[2].clip_id, c.clip_id);
+        assert_eq!(clips[2].index, 2);
+
+        assert!(backend.edit_overwrite_clip("project", 0, 99, json!({"playlistIndex": 0})).is_err());
+        assert!(backend.edit_overwrite_clip("project", 9, 0, json!({"playlistIndex": 0})).is_err());
+
+        backend.project_save("project").unwrap();
+        let xml = std::fs::read_to_string(root.join("project/project.mlt")).unwrap();
+        // a, x, c must all be real MLT producers in the saved XML, in
+        // a-x-c order; b must no longer appear on the track's playlist
+        // (it was replaced, not appended alongside).
+        let pos_a = xml.find(">a<").expect("title a in xml");
+        let pos_x = xml.find(">x<").expect("title x in xml");
+        let pos_c = xml.find(">c<").expect("title c in xml");
+        assert!(pos_a < pos_x && pos_x < pos_c, "expected a < x < c ordering in saved XML");
         let _ = std::fs::remove_dir_all(root);
     }
 

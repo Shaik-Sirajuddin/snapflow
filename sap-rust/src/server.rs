@@ -412,6 +412,29 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
             }))
         }
 
+        "edit.overwriteClip" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                clip_index: usize,
+                source: Value,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            let track_index = p.track_index;
+            let clip_index = p.clip_index;
+            Ok(Box::new(move |b| match b.edit_overwrite_clip(&project_id, track_index, clip_index, p.source) {
+                Ok(clip) => BackendCallResult {
+                    result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                    notify: Some(RpcNotification::new(
+                        "edit.changed",
+                        json!({"reason": "overwriteClip", "trackIndex": track_index, "clipIndex": clip.index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
         "edit.listClips" => {
             #[derive(Deserialize)]
             #[serde(rename_all = "camelCase")]

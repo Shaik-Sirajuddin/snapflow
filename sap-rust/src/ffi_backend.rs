@@ -490,6 +490,57 @@ impl Backend for FfiBackend {
         })
     }
 
+    fn edit_overwrite_clip(
+        &mut self,
+        _project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        // Real wiring: `sap_overwrite_clip` (sap_ffi.cpp) opens
+        // `source.path` as an actual Mlt::Producer and pushes it via the
+        // real, undoable Timeline::OverwriteCommand -- distinct from
+        // sap_insert_clip's InsertCommand, this does NOT ripple
+        // downstream clips; it drops and replaces whatever occupies
+        // clip-slot `clipIndex`.
+        let path = source
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
+
+        let raw = unsafe {
+            ffi::sap_overwrite_clip(self.main_window, track_index as c_int, clip_index as c_int, c_path.as_ptr())
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "failed to overwrite clip at {track_index}/{clip_index} with {path} (invalid track/clipIndex, locked track, or {path} did not open as a valid MLT producer)"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OverwrittenClip {
+            clip_id: String,
+            index: usize,
+            in_frame: i64,
+            out_frame: i64,
+        }
+        let overwritten: OverwrittenClip = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad overwrite-clip JSON: {e}")))?;
+
+        Ok(Clip {
+            clip_id: overwritten.clip_id,
+            index: overwritten.index,
+            source,
+            in_frame: overwritten.in_frame,
+            out_frame: overwritten.out_frame,
+        })
+    }
+
     fn edit_list_clips(&mut self, _project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>> {
         let raw = unsafe { ffi::sap_list_clips(self.main_window, track_index as c_int) };
         if raw.is_null() {

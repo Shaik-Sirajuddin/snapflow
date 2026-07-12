@@ -389,6 +389,25 @@ pub trait Backend: Send {
         source: Value,
     ) -> BackendResult<Clip>;
 
+    /// `edit.overwriteClip` -- place `source` on `track_index` starting at
+    /// clip-slot `clip_index`, REPLACING whatever clip currently occupies
+    /// that slot (non-rippling "drop and replace"), rather than shifting
+    /// downstream clips like `edit_insert_clip` does. `clip_index ==
+    /// that track's current clip count` means "no clip to replace",
+    /// which behaves like `edit_append_clip`. One real
+    /// `Timeline::OverwriteCommand` (real backend), one undo step.
+    /// `clip_index` (not an absolute frame) for the same reason
+    /// `edit_insert_clip`/`edit_move_clip` use a clip-slot index -- this
+    /// trait models a track as an ordered clip list, not raw frame
+    /// offsets.
+    fn edit_overwrite_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip>;
+
     /// `transitions.addCrossfade`.
     fn transitions_add_crossfade(
         &mut self,
@@ -941,6 +960,41 @@ impl Backend for MockBackend {
         clips.insert(clip_index, clip.clone());
         for (i, c) in clips.iter_mut().enumerate() {
             c.index = i;
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(clip)
+    }
+
+    fn edit_overwrite_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        data.next_clip_id += 1;
+        let clip_id = format!("clip-{}", data.next_clip_id);
+        let clips = data.clips.entry(track_index).or_default();
+        if clip_index > clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "clipIndex {clip_index} out of range (len {})",
+                clips.len()
+            )));
+        }
+        let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        if clip_index == clips.len() {
+            // No clip occupies this slot yet -- behaves like append.
+            clips.push(clip.clone());
+        } else {
+            // Non-rippling: replace the occupant in place, downstream
+            // indices unaffected (unlike edit_insert_clip's splice).
+            clips[clip_index] = clip.clone();
         }
         data.dirty = true;
         data.undo_depth += 1;
@@ -2042,6 +2096,38 @@ mod tests {
 
         assert!(b.edit_insert_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"})).is_err());
         assert!(b.edit_insert_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"})).is_err());
+    }
+
+    #[test]
+    fn edit_overwrite_clip_replaces_in_place_without_rippling_downstream() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        let bee = b.edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"})).unwrap();
+        let c = b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+
+        // Overwrite slot 1 (b) with a new clip -- unlike insertClip, this
+        // must NOT shift c's index.
+        let overwritten = b.edit_overwrite_clip("p", 0, 1, json!({"path": "/tmp/x.mp4"})).unwrap();
+        assert_eq!(overwritten.index, 1);
+        assert_ne!(overwritten.clip_id, bee.clip_id);
+
+        let clips = b.edit_list_clips("p", 0).unwrap();
+        assert_eq!(clips.len(), 3); // count unchanged -- replace, not splice.
+        assert_eq!(clips[0].clip_id, a.clip_id);
+        assert_eq!(clips[1].clip_id, overwritten.clip_id);
+        assert_eq!(clips[2].clip_id, c.clip_id);
+        assert_eq!(clips[2].index, 2); // c did NOT ripple, unlike insertClip.
+
+        // clipIndex == current clip count is append-equivalent.
+        let appended_via_overwrite =
+            b.edit_overwrite_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"})).unwrap();
+        assert_eq!(appended_via_overwrite.index, 3);
+        assert_eq!(b.edit_list_clips("p", 0).unwrap().len(), 4);
+
+        assert!(b.edit_overwrite_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"})).is_err());
+        assert!(b.edit_overwrite_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"})).is_err());
     }
 
     #[test]

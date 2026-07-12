@@ -176,6 +176,8 @@ var supportedSAPMethods = []sapMethodMetadata{
 	{Method: "edit.removeClip", Description: "Remove a clip from a timeline track.", Params: `{trackIndex, clipIndex}`},
 	{Method: "edit.moveClip", Description: "Move/reposition a clip within a track or across tracks.", Params: `{fromTrackIndex, fromClipIndex, toTrackIndex, toClipIndex}`},
 	{Method: "edit.appendClip", Description: "Append a source clip to a timeline track.", Params: `{trackIndex, source}`},
+	{Method: "edit.insertClip", Description: "Insert a source clip on a track BEFORE clip-slot clipIndex, rippling downstream clips forward to make room (clipIndex == clip count is append-equivalent).", Params: `{trackIndex, clipIndex, source}`},
+	{Method: "edit.overwriteClip", Description: "Place a source clip on a track starting at clip-slot clipIndex, replacing whatever occupies that slot without rippling downstream clips (clipIndex == clip count is append-equivalent).", Params: `{trackIndex, clipIndex, source}`},
 	{Method: "edit.listClips", Description: "List clips on a timeline track.", Params: `{trackIndex}`},
 	{Method: "edit.trimClipIn", Description: "Trim a clip's in point.", Params: `{trackIndex, clipIndex, newFrame}`},
 	{Method: "edit.trimClipOut", Description: "Trim a clip's out point.", Params: `{trackIndex, clipIndex, newFrame}`},
