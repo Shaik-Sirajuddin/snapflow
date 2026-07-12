@@ -43,6 +43,17 @@ pub struct BackendProcess {
     child: Child,
     pub reader: FramedReader,
     pub writer: FramedWriter,
+    /// Whether the ACP `initialize` handshake has already been performed
+    /// against this process instance. Deliberately just a generic done/not
+    /// flag owned here (not ACP-specific logic -- this crate stays
+    /// protocol-agnostic per `03-crate-and-folder-layout.md`'s crate
+    /// split, `acpx-core::router` owns what "initialize" actually means)
+    /// so callers holding this process's own lock can check-and-set it
+    /// atomically without a second, separate piece of bookkeeping keyed
+    /// off process identity: this flag's lifetime is exactly this
+    /// `BackendProcess` instance's lifetime, so a crash + respawn (a
+    /// brand new instance) naturally starts back at `false`.
+    pub handshake_done: bool,
 }
 
 impl BackendProcess {
@@ -67,6 +78,7 @@ impl BackendProcess {
             child,
             reader: FramedReader::new(stdout),
             writer: FramedWriter::new(stdin),
+            handshake_done: false,
         })
     }
 

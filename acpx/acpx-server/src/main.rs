@@ -60,14 +60,26 @@ async fn main() -> anyhow::Result<()> {
     // `router` handle, concurrently, for the lifetime of the process.
     let stdio_router = router.clone();
     let stdio_task = tokio::spawn(async move { transport::stdio::run(stdio_router).await });
-    let http_task =
+    let mut http_task =
         tokio::spawn(async move { transport::serve(router, config.http_bind_addr).await });
 
+    // Bug fix (discovered driving the real-adapter e2e test with a
+    // Stdio::null()/closed-stdin child, the same shape any daemonized
+    // deployment -- systemd, nohup, a supervisor that doesn't attach a
+    // local stdio client at all -- uses): stdio hitting EOF is a normal,
+    // expected event (no local client, or a local client that
+    // disconnected) and must NOT tear down the HTTP/WS transport, which
+    // may still be serving remote clients. Only a real stdio *error*
+    // should end the whole process early; clean stdio completion instead
+    // falls through to just waiting on `http_task` alone (selected here
+    // by `&mut` -- std's blanket `impl Future for &mut F where F: Future
+    // + Unpin` -- so the same handle can still be awaited again below).
     tokio::select! {
         result = stdio_task => {
             result??;
+            (&mut http_task).await??;
         }
-        result = http_task => {
+        result = &mut http_task => {
             result??;
         }
     }

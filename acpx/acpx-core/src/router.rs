@@ -77,17 +77,19 @@ pub fn classify(method: &str) -> MethodClass {
 /// agent -> ensure process running -> forward -> register the returned
 /// backend session id under a fresh gateway session id).
 ///
-/// **Known Phase 2 gap** (tracked in `05-open-risks.md`'s
-/// "Reverse-direction (agent-initiated) messages" item): agent-initiated
-/// messages that arrive on a backend's stdout without a matching request id
-/// (e.g. `session/update` notifications) are currently logged and dropped
-/// rather than routed back to the owning client connection -- there is no
-/// reverse-direction wiring yet, since Phase 2 hasn't connected a
-/// multi-client transport to this `Router` (that's `acpx-server`'s HTTP/WS
-/// work, step 11, still pending). `acpx-server`'s Phase 1 stdio spike also
-/// still bypasses this `Router` entirely for the same reason -- it proxies
-/// one client to one backend directly, so it never needed
-/// request/response correlation across concurrent sessions.
+/// **Formerly a "Known Phase 2 gap", now closed** (was tracked in
+/// `05-open-risks.md`'s "Reverse-direction (agent-initiated) messages"
+/// item): agent-initiated messages that arrive on a backend's stdout
+/// without a matching request id (overwhelmingly `session/update`
+/// notifications -- confirmed against a real published adapter, not just
+/// a hypothetical) are no longer dropped. `read_matching_response`
+/// collects them and every proxied/hybrid dispatch path folds them into
+/// the JSON-RPC response envelope's `_acpx.updates` array -- see
+/// `read_matching_response`'s doc comment for the full rationale and
+/// `acpx/COVERAGE.md`'s "real ACP content delivery" section for why this
+/// mattered: without it, a client talking to a real streaming-style
+/// adapter through acpx got a `session/prompt` result with no actual
+/// reply text in it, ever.
 pub struct Router {
     supervisor: acpx_conductor::Supervisor,
     sessions: SessionRegistry,
@@ -147,6 +149,8 @@ pub enum RouterError {
     UnknownSession(String),
     #[error("backend response to session/new has no result.sessionId")]
     MissingBackendSessionId,
+    #[error("backend rejected session/new: {0}")]
+    BackendSessionNewError(serde_json::Value),
     #[error("{0} is not implemented yet")]
     NotImplemented(&'static str),
     #[error(transparent)]
@@ -377,16 +381,13 @@ impl Router {
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let mut response = {
             let mut backend = backend.lock().await;
+            ensure_backend_initialized(&mut backend).await?;
             backend.writer.write_value(&request).await?;
-            read_matching_response(&mut backend, &id).await?
+            let (response, notifications) = read_matching_response(&mut backend, &id).await?;
+            attach_updates(response, notifications)
         };
 
-        let backend_session_id = response
-            .get("result")
-            .and_then(|r| r.get("sessionId"))
-            .and_then(|s| s.as_str())
-            .ok_or(RouterError::MissingBackendSessionId)?
-            .to_string();
+        let backend_session_id = extract_backend_session_id(&response)?;
         let gateway_id = self
             .sessions
             .register(agent_id, BackendSessionId(backend_session_id));
@@ -542,8 +543,10 @@ impl Router {
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let response = {
             let mut backend = backend.lock().await;
+            ensure_backend_initialized(&mut backend).await?;
             backend.writer.write_value(&request).await?;
-            read_matching_response(&mut backend, &id).await?
+            let (response, notifications) = read_matching_response(&mut backend, &id).await?;
+            attach_updates(response, notifications)
         };
         self.spawn_transcript(
             gateway_session_id.clone(),
@@ -722,23 +725,155 @@ impl Router {
 }
 
 /// Read backend messages until one whose `id` matches the request we just
-/// sent. Anything else (an agent-initiated notification/request with no
-/// matching id, most notably `session/update`) is logged and dropped --
-/// see the `Router` doc comment's "Known Phase 2 gap" note.
+/// sent, collecting every unmatched message seen along the way (almost
+/// always `session/update` notifications -- an agent-initiated request
+/// with no matching id is vanishingly rare and, if it ever happens, gets
+/// collected the same way rather than silently dropped either).
+///
+/// **Reverse-direction routing (closes the former "Known Phase 2 gap",
+/// see `acpx/COVERAGE.md`'s "real ACP content delivery" section for the
+/// full story of why this mattered in practice):** real ACP agents (every
+/// adapter checked against a real published npx package, not just the
+/// synthetic stand-ins used elsewhere in this workspace's tests) deliver
+/// the actual assistant reply text via `session/update`
+/// `agent_message_chunk` notifications streamed *during* a `session/
+/// prompt` call -- the call's own JSON-RPC result is just `{stopReason,
+/// usage}`, with no message content at all. Silently dropping every
+/// notification (this function's pre-fix behavior) meant a client talking
+/// to a real adapter through acpx got back a result with no actual answer
+/// in it, ever -- a correctness bug serious enough that it made "acpx
+/// client working end to end against a real backend" false regardless of
+/// anything else in this gateway working correctly.
+///
+/// The fix returns every collected notification alongside the matched
+/// response; every caller below folds them into the JSON-RPC envelope's
+/// `_acpx.updates` field (additive, namespaced, ignorable by any raw ACP
+/// client that doesn't know about it) rather than a true live push --
+/// see `dispatch_proxied`/`dispatch_proxied_shared`'s doc comments for why
+/// aggregation-into-the-response is the right fit for this gateway's
+/// request/response-shaped transports (HTTP chief among them) rather than
+/// a separate out-of-band push channel.
+/// Fixed request id for the one-time ACP `initialize` handshake performed
+/// against a backend process the first time it's used (see
+/// [`ensure_backend_initialized`]'s doc comment). Numeric (not a string
+/// id) deliberately -- this workspace's synthetic `sh -c '...'` stand-in
+/// backends (used by roughly a dozen pre-existing tests) extract the
+/// request id with a numeric-only shell regex (`grep -o '"id":[0-9]*'`)
+/// and echo it back verbatim; a string id would make every one of those
+/// scripts emit malformed JSON (`"id":`) in reply. Never collides with a
+/// real client's own request id in practice: this handshake always
+/// completes (or fails the whole dispatch) before the actual client
+/// request is ever written to the same backend.
+const INITIALIZE_REQUEST_ID: i64 = 0;
+
+/// Perform the real ACP `initialize` request/response round trip against
+/// `proc` if it hasn't already happened for this exact process instance
+/// (`BackendProcess::handshake_done`, reset to `false` on every fresh
+/// spawn -- see that field's doc comment).
+///
+/// **Real bug this fixes** (found driving `real_claude_multi_agent_test.rs`
+/// against a real, published `@agentclientprotocol/claude-agent-acp`
+/// adapter, not a synthetic stand-in): every dispatch path wrote
+/// `session/new` as the very first message on a freshly spawned backend's
+/// stdio, with no ACP `initialize` handshake ever performed first. This
+/// workspace's ~120 pre-existing tests never caught it because their
+/// synthetic `sh -c '...'` stand-in backends answer *any* request
+/// uniformly regardless of ordering. A real adapter does not: verified
+/// against claude-agent-acp, it silently omits `result.sessionId` from
+/// its `session/new` response if `initialize` was never called first,
+/// which acpx surfaced as an opaque `RouterError::MissingBackendSessionId`
+/// with no indication the real problem was protocol ordering, not the
+/// request itself.
+async fn ensure_backend_initialized(
+    proc: &mut acpx_conductor::BackendProcess,
+) -> Result<(), RouterError> {
+    if proc.handshake_done {
+        return Ok(());
+    }
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": INITIALIZE_REQUEST_ID,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": { "readTextFile": false, "writeTextFile": false }
+            }
+        }
+    });
+    proc.writer.write_value(&request).await?;
+    loop {
+        let value = proc.reader.read_value().await?;
+        if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
+            break;
+        }
+        // A well-behaved adapter shouldn't emit anything unprompted
+        // before answering `initialize`, but stay defensive rather than
+        // assuming the very first line back is necessarily the match --
+        // `read_value`'s own `FramingError::Eof` on a closed pipe is
+        // still the hard stop if the backend never answers at all.
+    }
+    proc.handshake_done = true;
+    Ok(())
+}
+
+/// Pulls `result.sessionId` out of a `session/new` response, or a proper
+/// [`RouterError::BackendSessionNewError`] carrying the backend's own
+/// JSON-RPC `error` object if it sent one -- **discovered as a real
+/// debugging pain point** driving `real_claude_multi_agent_test.rs`: the
+/// old code only ever checked for a missing `result.sessionId`, so a
+/// backend that legitimately rejected the request (e.g. claude-agent-acp
+/// returning a real `-32602 Invalid params` for a `session/new` missing
+/// its required `mcpServers` field) surfaced through acpx as an opaque
+/// "no result.sessionId" with the actual rejection reason silently
+/// dropped, not forwarded.
+fn extract_backend_session_id(response: &serde_json::Value) -> Result<String, RouterError> {
+    if let Some(error) = response.get("error") {
+        return Err(RouterError::BackendSessionNewError(error.clone()));
+    }
+    response
+        .get("result")
+        .and_then(|r| r.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
+        .ok_or(RouterError::MissingBackendSessionId)
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
-) -> Result<serde_json::Value, RouterError> {
+) -> Result<(serde_json::Value, Vec<serde_json::Value>), RouterError> {
+    let mut notifications = Vec::new();
     loop {
         let value = backend.reader.read_value().await?;
         if value.get("id") == Some(id) {
-            return Ok(value);
+            return Ok((value, notifications));
         }
-        tracing::warn!(
-            ?value,
-            "dropping unmatched backend message (no reverse-direction routing yet, see 05-open-risks.md)"
+        notifications.push(value);
+    }
+}
+
+/// Fold `notifications` (as collected by [`read_matching_response`]) into
+/// `response`'s `_acpx.updates` array, if there are any. No-op (response
+/// left byte-for-byte untouched) when `notifications` is empty, so a
+/// stand-in backend that never emits `session/update` at all (every
+/// synthetic test double in this workspace) produces identical response
+/// shapes to before this fix -- verified by every pre-existing test in
+/// this workspace continuing to pass unmodified.
+fn attach_updates(
+    mut response: serde_json::Value,
+    notifications: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    if notifications.is_empty() {
+        return response;
+    }
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "_acpx".to_string(),
+            serde_json::json!({ "updates": notifications }),
         );
     }
+    response
 }
 
 /// Free-function twin of `Router::spawn_transcript`, taking an already-
@@ -926,8 +1061,10 @@ async fn dispatch_proxied_shared(
 
     let response = {
         let mut proc = backend.lock().await;
+        ensure_backend_initialized(&mut proc).await?;
         proc.writer.write_value(&request).await?;
-        read_matching_response(&mut proc, &id).await?
+        let (response, notifications) = read_matching_response(&mut proc, &id).await?;
+        attach_updates(response, notifications)
     };
 
     spawn_transcript_fn(
@@ -1006,16 +1143,13 @@ async fn dispatch_session_new_shared(
 
     let mut response = {
         let mut proc = backend.lock().await;
+        ensure_backend_initialized(&mut proc).await?;
         proc.writer.write_value(&request).await?;
-        read_matching_response(&mut proc, &id).await?
+        let (response, notifications) = read_matching_response(&mut proc, &id).await?;
+        attach_updates(response, notifications)
     };
 
-    let backend_session_id = response
-        .get("result")
-        .and_then(|r| r.get("sessionId"))
-        .and_then(|s| s.as_str())
-        .ok_or(RouterError::MissingBackendSessionId)?
-        .to_string();
+    let backend_session_id = extract_backend_session_id(&response)?;
 
     let (gateway_session_id_str, persist_args) = {
         let mut r = router.lock().await;

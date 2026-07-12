@@ -39,6 +39,13 @@ axum = { version = "0.7", features = ["ws"] }
 [dev-dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# Real-adapter multi-agent e2e test (tests/real_claude_multi_agent_test.rs)
+# drives the real, already-compiled acpx-server binary through the real
+# acpx-client SDK, not just raw reqwest calls -- proving "acpx daemon +
+# acpx client end to end" together, not just the daemon alone. No cycle:
+# acpx-client's own (non-dev) dependency graph never depends back on
+# acpx-server or acpx-core.
+acpx-client = { path = "../acpx-client" }
 # WS client for http_ws_transport_test.rs only -- default features are
 # enough since tests only ever connect to our own plaintext ws://
 # loopback listener, no TLS involved.

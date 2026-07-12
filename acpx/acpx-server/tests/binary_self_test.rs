@@ -231,6 +231,63 @@ async fn real_binary_serves_websocket_end_to_end() {
 }
 
 #[tokio::test]
+async fn real_binary_with_closed_stdin_still_serves_http() {
+    // Regression test for a real startup bug found driving the
+    // real-adapter e2e test (`real_claude_multi_agent_test.rs`) with a
+    // `Stdio::null()` child: `main.rs` used to `tokio::select!` between
+    // its stdio task and its HTTP task, so stdio hitting immediate EOF
+    // (which is exactly what happens when stdin is `/dev/null`, e.g. any
+    // daemonized/backgrounded/systemd-style launch, or this test) tore
+    // down the *entire* process, HTTP/WS included, within milliseconds
+    // of starting -- before it could ever accept a connection. Every
+    // other test in this file avoids tripping this by keeping stdin
+    // piped-and-open for the lifetime of the `Child` handle, which
+    // masked the bug rather than covering it. This test deliberately
+    // closes stdin up front and asserts the HTTP transport still comes
+    // up and keeps serving requests well past the moment stdio would
+    // have hit EOF.
+    let script_path = write_stand_in_script();
+    let addr = ephemeral_addr().await;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env("ACPX_HTTP_BIND", addr.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn real acpx-server binary");
+    let _server = ServerGuard { child, script_path };
+
+    let mut connected = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        connected,
+        "real acpx-server binary with closed stdin never opened its HTTP listener on {addr}"
+    );
+
+    // Give any latent stdio-EOF-triggered shutdown a real chance to fire
+    // before proving the process is still alive and serving.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "session/list", "params": {}}))
+        .send()
+        .await
+        .expect("POST /rpc session/list against the real binary after stdin EOF");
+    assert!(response.status().is_success());
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["jsonrpc"], json!("2.0"));
+}
+
+#[tokio::test]
 async fn real_binary_serves_stdio_end_to_end() {
     // A different ephemeral port than the other tests (each test spawns
     // its own process), even though this test only drives the process's

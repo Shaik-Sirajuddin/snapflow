@@ -80,6 +80,7 @@ dependencies = [
 name = "acpx-server"
 version = "0.1.0"
 dependencies = [
+ "acpx-client",
  "acpx-conductor",
  "acpx-core",
  "acpx-proto",
