@@ -155,14 +155,52 @@ impl Backend for FfiBackend {
 
     fn edit_set_track_properties(
         &mut self,
-        _project_id: &str,
-        _track_index: usize,
-        _muted: Option<bool>,
-        _hidden: Option<bool>,
-        _locked: Option<bool>,
-        _blend_mode: Option<String>,
+        project_id: &str,
+        track_index: usize,
+        muted: Option<bool>,
+        hidden: Option<bool>,
+        locked: Option<bool>,
+        blend_mode: Option<String>,
     ) -> BackendResult<Track> {
-        Err(BackendError::Unsupported("edit.setTrackProperties not wired to real FFI yet".into()))
+        // Real wiring for mute/hidden/locked via `MultitrackModel::
+        // setTrackMute/setTrackHidden/setTrackLock` (sap_ffi.cpp). blendMode
+        // is not wired yet -- real Shotcut's per-track blend mode lives on
+        // the qtblend/cairoblend *transition* between adjacent video
+        // tracks (trackpropertieswidget.cpp), which needs its own
+        // transition-lookup C-ABI function not yet added here.
+        if blend_mode.is_some() {
+            return Err(BackendError::Unsupported(
+                "edit.setTrackProperties: blendMode not wired to real FFI yet (mute/hidden/locked are)".into(),
+            ));
+        }
+        if let Some(v) = muted {
+            let rc = unsafe { ffi::sap_set_track_muted(self.main_window, track_index as c_int, v as c_int) };
+            if rc != 0 {
+                return Err(BackendError::NotFound(format!("track {track_index}")));
+            }
+        }
+        if let Some(v) = hidden {
+            let rc = unsafe { ffi::sap_set_track_hidden(self.main_window, track_index as c_int, v as c_int) };
+            if rc != 0 {
+                return Err(BackendError::NotFound(format!("track {track_index}")));
+            }
+        }
+        if let Some(v) = locked {
+            let rc = unsafe { ffi::sap_set_track_locked(self.main_window, track_index as c_int, v as c_int) };
+            if rc != 0 {
+                return Err(BackendError::NotFound(format!("track {track_index}")));
+            }
+        }
+        // `sap_list_tracks` now reads muted/hidden/locked back from the
+        // real MultitrackModel::IsMute/Hidden/LockedRole (genuine current
+        // Qt/MLT state, not an echo), so re-querying after the writes
+        // above is both simpler and more honest than reconstructing the
+        // response from the input we just sent.
+        let tracks = self.edit_list_tracks(project_id)?;
+        tracks
+            .into_iter()
+            .find(|t| t.index == track_index)
+            .ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))
     }
 
     fn edit_set_track_height(&mut self, _project_id: &str, _height: i64) -> BackendResult<()> {

@@ -37,6 +37,14 @@ extern "C" {
     /// Returns 0 on success, -1 on error (invalid handle/index).
     pub fn sap_remove_track(main_window_handle: *mut c_void, track_index: c_int) -> c_int;
 
+    /// C++ side: `int sap_set_track_muted/hidden/locked(void* mainWindowHandle,
+    /// int trackIndex, int value);` -- real
+    /// `MultitrackModel::setTrackMute`/`setTrackHidden`/`setTrackLock`.
+    /// Returns 0 on success, -1 on error (invalid handle/index).
+    pub fn sap_set_track_muted(main_window_handle: *mut c_void, track_index: c_int, muted: c_int) -> c_int;
+    pub fn sap_set_track_hidden(main_window_handle: *mut c_void, track_index: c_int, hidden: c_int) -> c_int;
+    pub fn sap_set_track_locked(main_window_handle: *mut c_void, track_index: c_int, locked: c_int) -> c_int;
+
     /// C++ side: `char* sap_list_tracks(void* mainWindowHandle);` -- returns a
     /// heap-allocated, NUL-terminated JSON array string of the form
     /// `[{"index":0,"kind":"video"},...]` (built from the real
