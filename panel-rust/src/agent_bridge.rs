@@ -19,7 +19,13 @@
 //!   even spawned (see the `new_with_agent_cmd_and_cache_dir` loop
 //!   below), so the very first render (`panel_rust_create` ->
 //!   `bridge.history(0)`) shows cached scrollback immediately, with zero
-//!   dependency on a subprocess round trip having completed.
+//!   dependency on a subprocess round trip having completed. (The
+//!   subprocess handshake/`open_session` call itself *does* happen
+//!   synchronously within `AgentBridge::new` -- see that constructor's
+//!   comment for why: it closes a real race where an immediate
+//!   follow-up `send_prompt` could otherwise silently be dropped. That
+//!   blocking is bounded and one-time at panel-creation, and is
+//!   independent of -- does not gate -- the cache-seeded render above.)
 //! - **No conflict when json content varies:** the seeded messages are
 //!   plain `Vec<ChatMessage>` appended in file order, whatever mix of
 //!   `MessageKind`s they happen to contain -- there is no schema
@@ -158,6 +164,15 @@ fn now_token() -> String {
     format!("unix:{secs}")
 }
 
+/// The `cwd` argument ACP's `session/new` wants -- this crate has no
+/// concept of a project directory of its own (the chat panel isn't
+/// editing files directly), so the process's own working directory is
+/// as reasonable a default as any, with `.` as a last-resort fallback if
+/// that's somehow unavailable.
+fn cwd_for_session() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 impl AgentBridge {
     /// Production constructor: real agent command + real (dev-checkout)
     /// cache dir, both resolved via env-override-or-fallback.
@@ -214,8 +229,28 @@ impl AgentBridge {
             // already holds -- of any prior shape/length -- *before*
             // spawning the live connection below, so `history(idx)` is
             // immediately populated for the first render.
+            //
+            // A load failure here (missing/renamed field, truncated
+            // write, hand-edited file, whatever) is deliberately *not*
+            // propagated as a fatal `BridgeError` -- doing so would take
+            // down every other thread's live agent connection too, just
+            // because one thread's cache file happened to be malformed.
+            // "No conflict in UI views when content varies in json" cuts
+            // both ways: a cache file this crate itself never wrote (or
+            // wrote in some earlier, incompatible shape) must not be
+            // able to disable the whole chat panel -- it degrades to an
+            // empty scrollback for *that thread only*, same as any other
+            // cache miss.
             let seeded = match &store {
-                Some(s) => s.load(&thread_id).map_err(BridgeError::Cache)?.messages,
+                Some(s) => match s.load(&thread_id) {
+                    Ok(cached) => cached.messages,
+                    Err(e) => {
+                        eprintln!(
+                            "panel-rust: jsonl cache load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge"
+                        );
+                        Vec::new()
+                    }
+                },
                 None => Vec::new(),
             };
 
@@ -239,27 +274,43 @@ impl AgentBridge {
             let store_for_task = store.clone();
             let slot_for_task = slot;
             let handle_for_task = handle;
-            runtime.spawn(async move {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                match handle_for_task.open_session(cwd).await {
-                    Ok(session_id) => {
-                        *slot_for_task
-                            .acp_session_id
-                            .lock()
-                            .expect("acp_session_id mutex poisoned") = Some(session_id);
-                    }
-                    Err(e) => {
-                        events_out
-                            .lock()
-                            .expect("event queue mutex poisoned")
-                            .push_back(BridgeEvent {
-                                thread_index: idx,
-                                event: AgentEvent::Error(format!("open_session failed: {e}")),
-                            });
-                        return;
-                    }
-                }
 
+            // Open this thread's ACP session *synchronously* (from this
+            // constructor's point of view -- via `block_on` on the
+            // background runtime, not on the caller's own async task).
+            // This closes a real race that otherwise existed here: if
+            // `AgentBridge::new` returned immediately and opened the
+            // session purely in the background, a caller that called
+            // `send_prompt` right away (exactly what a "renders
+            // smoothly, then the user immediately sends a follow-up"
+            // flow looks like) could have its `SendPrompt` command
+            // reach the actor *before* `OpenSession` had been
+            // processed, hitting `NoActiveSession` and silently never
+            // producing a `TurnEnded` -- observed directly as a flaky
+            // test failure in this module before this fix. The cost is
+            // bounded, one-time blocking during panel creation (one
+            // local subprocess handshake per thread), which is an
+            // acceptable trade for "a message sent right after startup
+            // must actually go through."
+            match runtime.block_on(handle_for_task.open_session(cwd_for_session())) {
+                Ok(session_id) => {
+                    *slot_for_task
+                        .acp_session_id
+                        .lock()
+                        .expect("acp_session_id mutex poisoned") = Some(session_id);
+                }
+                Err(e) => {
+                    events
+                        .lock()
+                        .expect("event queue mutex poisoned")
+                        .push_back(BridgeEvent {
+                            thread_index: idx,
+                            event: AgentEvent::Error(format!("open_session failed: {e}")),
+                        });
+                }
+            }
+
+            runtime.spawn(async move {
                 while let Some(ev) = events_rx.recv().await {
                     match &ev {
                         AgentEvent::Message(msg) => {
@@ -500,7 +551,6 @@ mod tests {
     #[test]
     fn no_cache_dir_means_no_jsonl_file_written() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
-        std::env::set_current_dir(&cache_dir).ok(); // harmless if it fails
         let names = ["Solo Thread"];
         let bridge =
             AgentBridge::new_with_agent_cmd(&names, mock_agent_cmd()).expect("bridge");
@@ -585,6 +635,10 @@ mod tests {
         // Drive one real live turn through the mock agent subprocess and
         // wait (bounded) for its events to land via poll().
         bridge.send_prompt(0, "second look".into());
+        // By construction, `AgentBridge::new*` only returns once every
+        // thread's session is already open (see the constructor's own
+        // comment on why), so this prompt is guaranteed to actually
+        // reach the mock agent -- a short bound is enough.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut saw_turn_ended = false;
         while std::time::Instant::now() < deadline && !saw_turn_ended {
@@ -613,5 +667,56 @@ mod tests {
         let reloaded = seed_store.load(&thread_id).expect("reload from disk");
         assert_eq!(&reloaded.messages[..4], &seeded_messages[..]);
         assert!(reloaded.messages.len() > 4);
+    }
+
+    /// Regression guard for a real bug this session's manual smoke test
+    /// caught: one thread's malformed/incompatible jsonl cache file must
+    /// not disable the whole bridge (and every other thread's live agent
+    /// connection with it) -- it should degrade to an empty scrollback
+    /// for *that thread only*, exactly like a cache miss.
+    #[test]
+    fn malformed_jsonl_for_one_thread_does_not_break_construction_or_other_threads() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let names = ["Broken Thread", "Healthy Thread"];
+
+        // Hand-write a cache file with a bogus trailer field name --
+        // exactly the kind of "content varies in json" mismatch this
+        // module has to tolerate (e.g. a field renamed in a later
+        // version of this crate, or a hand-edited file).
+        std::fs::write(
+            cache_dir.path().join("broken-thread.jsonl"),
+            b"{\"line_kind\":\"trailer\",\"acp_session_id\":\"x\",\"title\":null,\"updated_at\":null,\"message_count\":0}\n",
+        )
+        .expect("write malformed cache file");
+
+        let seed_store = JsonlStore::open(cache_dir.path()).expect("open store for seeding");
+        seed_store
+            .overwrite(
+                "healthy-thread",
+                &[ChatMessage {
+                    kind: MessageKind::Agent,
+                    text: "healthy scrollback".into(),
+                }],
+                &ThreadTrailer {
+                    acp_session_id: "ok".into(),
+                    title: Some("Healthy Thread".into()),
+                    updated_at: Some("unix:1".into()),
+                    message_count: 1,
+                },
+            )
+            .expect("seed healthy thread");
+
+        // Must not error out entirely just because thread 0's cache is bad.
+        let bridge = AgentBridge::new_with_agent_cmd_and_cache_dir(
+            &names,
+            mock_agent_cmd(),
+            Some(cache_dir.path().to_path_buf()),
+        )
+        .expect("bridge construction must survive one thread's bad cache file");
+
+        // Broken thread degrades to empty history, not a fatal error.
+        assert!(bridge.history(0).is_empty());
+        // Healthy thread is completely unaffected.
+        assert_eq!(bridge.history(1)[0].text, "healthy scrollback");
     }
 }
