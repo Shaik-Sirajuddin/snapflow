@@ -440,6 +440,56 @@ impl Backend for FfiBackend {
         })
     }
 
+    fn edit_insert_clip(
+        &mut self,
+        _project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        // Real wiring: `sap_insert_clip` (sap_ffi.cpp) opens `source.path`
+        // as an actual Mlt::Producer and pushes it via the real, undoable
+        // Timeline::InsertCommand -- distinct from sap_append_clip's
+        // AppendCommand, this RIPPLES every downstream clip on the track
+        // forward, a genuine mid-track splice in one undo step.
+        let path = source
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
+
+        let raw = unsafe {
+            ffi::sap_insert_clip(self.main_window, track_index as c_int, clip_index as c_int, c_path.as_ptr())
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "failed to insert clip from {path} at {track_index}/{clip_index} (invalid track/clipIndex, locked track, or {path} did not open as a valid MLT producer)"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct InsertedClip {
+            clip_id: String,
+            index: usize,
+            in_frame: i64,
+            out_frame: i64,
+        }
+        let inserted: InsertedClip = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad insert-clip JSON: {e}")))?;
+
+        Ok(Clip {
+            clip_id: inserted.clip_id,
+            index: inserted.index,
+            source,
+            in_frame: inserted.in_frame,
+            out_frame: inserted.out_frame,
+        })
+    }
+
     fn edit_list_clips(&mut self, _project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>> {
         let raw = unsafe { ffi::sap_list_clips(self.main_window, track_index as c_int) };
         if raw.is_null() {

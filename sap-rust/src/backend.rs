@@ -369,6 +369,26 @@ pub trait Backend: Send {
         to_clip_index: usize,
     ) -> BackendResult<Clip>;
 
+    /// `edit.insertClip` -- insert `source` on `track_index` BEFORE the
+    /// clip currently at `clip_index` (`clip_index == that track's
+    /// current clip count` means "insert at the end", equivalent to
+    /// `edit_append_clip`), rippling every downstream clip on that track
+    /// forward by the inserted clip's duration. Distinct from
+    /// `edit_append_clip` + `edit_move_clip`: this is one undo step, one
+    /// real `Timeline::InsertCommand` (real backend) rather than an
+    /// append followed by a non-rippling reposition. `clip_index` (not an
+    /// absolute frame) for the same reason `edit_move_clip` uses
+    /// `to_clip_index` rather than the spec's `toPosition` -- this trait
+    /// models a track as an ordered clip list, not raw frame offsets; see
+    /// `edit_move_clip`'s doc comment.
+    fn edit_insert_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip>;
+
     /// `transitions.addCrossfade`.
     fn transitions_add_crossfade(
         &mut self,
@@ -891,6 +911,37 @@ impl Backend for MockBackend {
             c.index = i;
         }
         clip.index = to_clip_index;
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(clip)
+    }
+
+    fn edit_insert_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        data.next_clip_id += 1;
+        let clip_id = format!("clip-{}", data.next_clip_id);
+        let clips = data.clips.entry(track_index).or_default();
+        if clip_index > clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "clipIndex {clip_index} out of range (len {})",
+                clips.len()
+            )));
+        }
+        let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        clips.insert(clip_index, clip.clone());
+        for (i, c) in clips.iter_mut().enumerate() {
+            c.index = i;
+        }
         data.dirty = true;
         data.undo_depth += 1;
         data.redo_depth = 0;
@@ -1963,6 +2014,34 @@ mod tests {
 
         assert!(b.edit_move_clip("p", 0, 99, 1, 0).is_err());
         assert!(b.edit_move_clip("p", 9, 0, 1, 0).is_err());
+    }
+
+    #[test]
+    fn edit_insert_clip_splices_mid_track_and_ripples_downstream_indices() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        let c = b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+
+        // Splice `b` between `a` and `c` in one call, distinct from
+        // append+move: the caller never places `b` at the end first.
+        let inserted = b.edit_insert_clip("p", 0, 1, json!({"path": "/tmp/b.mp4"})).unwrap();
+        assert_eq!(inserted.index, 1);
+
+        let clips = b.edit_list_clips("p", 0).unwrap();
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].clip_id, a.clip_id);
+        assert_eq!(clips[1].clip_id, inserted.clip_id);
+        assert_eq!(clips[2].clip_id, c.clip_id);
+        assert_eq!(clips[2].index, 2); // c rippled from index 1 to 2.
+
+        // clipIndex == current clip count is append-equivalent.
+        let appended_via_insert = b.edit_insert_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"})).unwrap();
+        assert_eq!(appended_via_insert.index, 3);
+
+        assert!(b.edit_insert_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"})).is_err());
+        assert!(b.edit_insert_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"})).is_err());
     }
 
     #[test]

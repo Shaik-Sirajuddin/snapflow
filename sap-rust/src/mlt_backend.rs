@@ -604,6 +604,38 @@ impl Backend for MltBackend {
         Ok(Clip { clip_id, index, source, in_frame, out_frame })
     }
 
+    fn edit_insert_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id)?;
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        let producer = resolve_source(data, &source)?;
+        let (in_frame, out_frame) = default_in_out(&producer)?;
+        data.next_clip_seq += 1;
+        let clip_id = format!("clip-{}", data.next_clip_seq);
+        let clips = data.clips.entry(track_index).or_default();
+        if clip_index > clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "clipIndex {clip_index} out of range (len {})",
+                clips.len()
+            )));
+        }
+        clips.insert(
+            clip_index,
+            MltClip { clip_id: clip_id.clone(), source: source.clone(), producer, in_frame, out_frame, filters: Vec::new() },
+        );
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(Clip { clip_id, index: clip_index, source, in_frame, out_frame })
+    }
+
     fn edit_list_clips(&mut self, project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>> {
         let data = self.project_mut(project_id)?;
         Ok(data
@@ -2195,6 +2227,43 @@ mod tests {
         assert_eq!(backend.edit_list_clips("project", 0).unwrap()[0].clip_id, c.clip_id);
         assert_eq!(backend.edit_list_clips("project", 1).unwrap()[0].clip_id, a.clip_id);
         assert!(backend.edit_move_clip("project", 0, 99, 1, 0).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn edit_insert_clip_splices_mid_track_in_real_backend() {
+        let root = std::env::temp_dir().join(format!("sap-rust-mlt-insert-{}", uuid::Uuid::new_v4()));
+        let mut backend = MltBackend::new(&root);
+        backend.project_select("project").unwrap();
+        backend.edit_add_track("project", "video").unwrap();
+        backend.generator_create_title("project", json!({"text": "a"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "b"})).unwrap();
+        backend.generator_create_title("project", json!({"text": "c"})).unwrap();
+        let a = backend.edit_append_clip("project", 0, json!({"playlistIndex": 0})).unwrap();
+        let c = backend.edit_append_clip("project", 0, json!({"playlistIndex": 2})).unwrap();
+
+        // Splice `b` between `a` and `c` in one call -- no prior append to
+        // the end followed by a separate move.
+        let inserted = backend.edit_insert_clip("project", 0, 1, json!({"playlistIndex": 1})).unwrap();
+        assert_eq!(inserted.index, 1);
+
+        let clips = backend.edit_list_clips("project", 0).unwrap();
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].clip_id, a.clip_id);
+        assert_eq!(clips[1].clip_id, inserted.clip_id);
+        assert_eq!(clips[2].clip_id, c.clip_id);
+
+        assert!(backend.edit_insert_clip("project", 0, 99, json!({"playlistIndex": 1})).is_err());
+        assert!(backend.edit_insert_clip("project", 9, 0, json!({"playlistIndex": 1})).is_err());
+
+        backend.project_save("project").unwrap();
+        let xml = std::fs::read_to_string(root.join("project/project.mlt")).unwrap();
+        // All three titles must be real MLT producers in the saved XML,
+        // in a-b-c order on the track's playlist.
+        let pos_a = xml.find(">a<").expect("title a in xml");
+        let pos_b = xml.find(">b<").expect("title b in xml");
+        let pos_c = xml.find(">c<").expect("title c in xml");
+        assert!(pos_a < pos_b && pos_b < pos_c, "expected a < b < c ordering in saved XML");
         let _ = std::fs::remove_dir_all(root);
     }
 

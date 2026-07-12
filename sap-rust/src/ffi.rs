@@ -490,6 +490,23 @@ extern "C" {
         source_path: *const c_char,
     ) -> *mut c_char;
 
+    /// C++ side: `char* sap_insert_clip(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, const char* sourcePath);` -- opens
+    /// `sourcePath` as a real `Mlt::Producer` and inserts it BEFORE
+    /// clip-slot `clipIndex` on `trackIndex` (`clipIndex` == that track's
+    /// clip count means "insert at the end") via the real, undoable
+    /// `Timeline::InsertCommand`, rippling every downstream clip on that
+    /// track forward. Returns a heap-allocated JSON object string, e.g.
+    /// `{"clipId":"t0c1","index":1,"inFrame":0,"outFrame":119}`, or NULL
+    /// on error. Caller must free the returned pointer via
+    /// `sap_free_string`.
+    pub fn sap_insert_clip(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        source_path: *const c_char,
+    ) -> *mut c_char;
+
     /// C++ side: `unsigned char* sap_get_frame(void* mainWindowHandle,
     /// long long frame, const char* format, int* outLen);` -- renders the
     /// given absolute timeline frame off the live project producer and
