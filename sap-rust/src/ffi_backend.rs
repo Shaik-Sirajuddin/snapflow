@@ -17,7 +17,7 @@
 #![cfg(feature = "real_ffi")]
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_longlong, c_void};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
@@ -767,11 +767,8 @@ impl Backend for FfiBackend {
         filter_index: usize,
         property: &str,
         value: Value,
-        _position: Option<i64>,
+        position: Option<i64>,
     ) -> BackendResult<()> {
-        // `_position` (keyframe position) isn't wired yet -- this always
-        // sets the filter's static/non-keyframed property value, same as
-        // filter_add_keyframe's own not-yet-wired status below.
         let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
         let c_property = CString::new(property)
             .map_err(|e| BackendError::InvalidParams(format!("bad property name: {e}")))?;
@@ -787,6 +784,7 @@ impl Backend for FfiBackend {
                 filter_index as c_int,
                 c_property.as_ptr(),
                 c_value.as_ptr(),
+                position.unwrap_or(-1) as c_longlong,
             )
         };
         if rc != 0 {
@@ -800,14 +798,40 @@ impl Backend for FfiBackend {
     fn filter_add_keyframe(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
-        _filter_index: usize,
-        _property: &str,
-        _position: i64,
-        _value: Value,
-        _interpolation: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+        position: i64,
+        value: Value,
+        interpolation: &str,
     ) -> BackendResult<()> {
-        Err(BackendError::NotFound("filter.addKeyframe not wired to real FFI yet".into()))
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let c_property = CString::new(property)
+            .map_err(|e| BackendError::InvalidParams(format!("bad property name: {e}")))?;
+        let value_json = serde_json::to_string(&value)
+            .map_err(|e| BackendError::InvalidParams(format!("bad value: {e}")))?;
+        let c_value = CString::new(value_json)
+            .map_err(|e| BackendError::InvalidParams(format!("bad value: {e}")))?;
+        let c_interp = CString::new(interpolation)
+            .map_err(|e| BackendError::InvalidParams(format!("bad interpolation: {e}")))?;
+        let rc = unsafe {
+            ffi::sap_filter_add_keyframe(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                filter_index as c_int,
+                c_property.as_ptr(),
+                position as c_longlong,
+                c_value.as_ptr(),
+                c_interp.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "filter {filter_index} on clip {clip_id} unavailable, or bad keyframe value"
+            )));
+        }
+        Ok(())
     }
 
     fn filter_list(
@@ -892,22 +916,60 @@ impl Backend for FfiBackend {
     fn filter_list_keyframes(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
-        _filter_index: usize,
-        _property: &str,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
     ) -> BackendResult<Vec<KeyframeInfo>> {
-        Err(BackendError::NotFound("filter.listKeyframes not wired to real FFI yet".into()))
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let c_property = CString::new(property)
+            .map_err(|e| BackendError::InvalidParams(format!("bad property name: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_filter_list_keyframes(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                filter_index as c_int,
+                c_property.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(format!(
+                "filter {filter_index} on clip {clip_id} unavailable"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<Vec<KeyframeInfo>>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad keyframe-list JSON: {e}")))
     }
 
     fn filter_remove_keyframe(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
-        _filter_index: usize,
-        _property: &str,
-        _position: i64,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+        position: i64,
     ) -> BackendResult<()> {
-        Err(BackendError::NotFound("filter.removeKeyframe not wired to real FFI yet".into()))
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let c_property = CString::new(property)
+            .map_err(|e| BackendError::InvalidParams(format!("bad property name: {e}")))?;
+        let rc = unsafe {
+            ffi::sap_filter_remove_keyframe(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                filter_index as c_int,
+                c_property.as_ptr(),
+                position as c_longlong,
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "no keyframe at position {position} for filter {filter_index} property {property} on clip {clip_id}"
+            )));
+        }
+        Ok(())
     }
 
 

@@ -113,9 +113,13 @@ extern "C" {
 
     /// C++ side: `int sap_filter_set_property(void* mainWindowHandle, int
     /// trackIndex, int clipIndex, int filterIndex, const char* property,
-    /// const char* valueJson);` -- `valueJson` is one JSON-encoded scalar.
-    /// Same non-undoable caveat as `sap_filter_add`. Returns 0 on success,
-    /// -1 on error.
+    /// const char* valueJson, long long position);` -- `valueJson` is one
+    /// JSON-encoded scalar. `position` < 0 means "no keyframe position"
+    /// (plain static set, same as before this parameter was added);
+    /// `position` >= 0 sets a real MLT keyframe at that frame via
+    /// `Mlt::Properties::anim_set()` (linear interpolation) instead. Same
+    /// non-undoable caveat as `sap_filter_add`. Returns 0 on success, -1
+    /// on error.
     pub fn sap_filter_set_property(
         main_window_handle: *mut c_void,
         track_index: c_int,
@@ -123,6 +127,52 @@ extern "C" {
         filter_index: c_int,
         property: *const c_char,
         value_json: *const c_char,
+        position: c_longlong,
+    ) -> c_int;
+
+    /// C++ side: `int sap_filter_add_keyframe(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, int filterIndex, const char* property,
+    /// long long position, const char* valueJson, const char*
+    /// interpolation);` -- real `Mlt::Properties::anim_set()`. Same
+    /// non-undoable caveat as `sap_filter_add`. Returns 0 on success, -1
+    /// on error.
+    pub fn sap_filter_add_keyframe(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        filter_index: c_int,
+        property: *const c_char,
+        position: c_longlong,
+        value_json: *const c_char,
+        interpolation: *const c_char,
+    ) -> c_int;
+
+    /// C++ side: `char* sap_filter_list_keyframes(void* mainWindowHandle,
+    /// int trackIndex, int clipIndex, int filterIndex, const char*
+    /// property);` -- returns a heap-allocated JSON array
+    /// `[{"position":N,"value":<number>,"interpolation":"linear"|
+    /// "smooth"|"discrete"},...]` (empty array if never keyframed), or
+    /// NULL on error. Caller must free via `sap_free_string`.
+    pub fn sap_filter_list_keyframes(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        filter_index: c_int,
+        property: *const c_char,
+    ) -> *mut c_char;
+
+    /// C++ side: `int sap_filter_remove_keyframe(void* mainWindowHandle,
+    /// int trackIndex, int clipIndex, int filterIndex, const char*
+    /// property, long long position);` -- real `Mlt::Animation::
+    /// remove()`. Returns 0 on success, -1 on error (including "no
+    /// keyframe exactly at position").
+    pub fn sap_filter_remove_keyframe(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        filter_index: c_int,
+        property: *const c_char,
+        position: c_longlong,
     ) -> c_int;
 
     /// C++ side: `char* sap_filter_list(void* mainWindowHandle, int
