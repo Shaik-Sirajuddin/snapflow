@@ -15,6 +15,7 @@
 //! concurrently against the same shared lock.
 
 use crate::transport::http::SharedRouter;
+use acpx_core::router::dispatch_shared;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Run the stdio request/response loop against `router` until stdin closes.
@@ -35,8 +36,7 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             }
         };
         let response = {
-            let mut router = router.lock().await;
-            match router.dispatch(request.clone()).await {
+            match dispatch_shared(&router, request.clone()).await {
                 Ok(response) => response,
                 Err(err) => {
                     tracing::warn!(%err, "dispatch error, returning JSON-RPC error response");

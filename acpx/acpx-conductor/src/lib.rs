@@ -9,4 +9,4 @@ pub mod process;
 pub mod supervisor;
 
 pub use process::{BackendProcess, SpawnSpec};
-pub use supervisor::{ProcessStatus, Supervisor, SupervisorError};
+pub use supervisor::{ProcessStatus, SharedBackendProcess, Supervisor, SupervisorError};

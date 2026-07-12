@@ -33,14 +33,17 @@ use axum::routing::{get, post};
 use axum::Json;
 use tokio::sync::Mutex;
 
-use acpx_core::router::{Router, RouterError};
+use acpx_core::router::{dispatch_shared, Router, RouterError};
 
 /// Shared, lockable handle to the one `Router` instance serving every
-/// concurrent HTTP/WS client. `Router::dispatch` takes `&mut self`, so a
-/// whole-router `Mutex` (one dispatch in flight at a time across every
-/// connection) is the simplest correct choice for this phase -- see the
-/// Phase 2 step 11 task notes for why finer-grained locking isn't
-/// warranted yet.
+/// concurrent HTTP/WS client. The `Mutex` here is intentionally *not* held
+/// for the duration of a whole request anymore -- see
+/// `acpx_core::router::dispatch_shared`'s doc comment. Every transport in
+/// this file calls `dispatch_shared(&router, ...)` rather than
+/// `router.lock().await.dispatch(...)`, so this `Mutex` is only ever held
+/// briefly for gateway-state bookkeeping, never across a backend agent's
+/// real-LLM-latency stdio round trip -- concurrent requests against
+/// *different* backend agents now genuinely run in parallel.
 pub type SharedRouter = Arc<Mutex<Router>>;
 
 /// Header carrying an explicit profile selection, highest precedence per
@@ -74,8 +77,7 @@ async fn rpc_handler(
     Json(mut request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     inject_profile_header(&headers, &mut request);
-    let mut router = router.lock().await;
-    let response = match router.dispatch(request.clone()).await {
+    let response = match dispatch_shared(&router, request.clone()).await {
         Ok(response) => response,
         Err(err) => json_rpc_error(&request, err),
     };

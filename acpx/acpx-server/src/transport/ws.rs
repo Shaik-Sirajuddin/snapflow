@@ -15,6 +15,8 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 
+use acpx_core::router::dispatch_shared;
+
 use super::http::{json_rpc_error, SharedRouter};
 
 /// Axum handler for `GET /ws`: upgrades the connection, then hands off to
@@ -63,8 +65,7 @@ async fn handle_socket(mut socket: WebSocket, router: SharedRouter) {
         };
 
         let response = {
-            let mut router = router.lock().await;
-            match router.dispatch(request.clone()).await {
+            match dispatch_shared(&router, request.clone()).await {
                 Ok(response) => response,
                 Err(err) => json_rpc_error(&request, err),
             }

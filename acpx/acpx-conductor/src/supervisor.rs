@@ -1,10 +1,32 @@
 //! N supervised backend processes keyed by agent name, with
 //! restart-on-crash + backoff, per `04-phased-plan.md` Phase 2 step 5.
+//!
+//! **Concurrency (added post-Phase-6, see `acpx/COVERAGE.md`'s "real
+//! multi-agent concurrency" section):** each running process is handed out
+//! as a [`SharedBackendProcess`] (`Arc<tokio::sync::Mutex<BackendProcess>>`)
+//! rather than an exclusive `&mut BackendProcess` borrow tied to the
+//! `Supervisor`'s own lifetime. This lets a caller (`acpx-core::router`)
+//! release the `Supervisor`'s/`Router`'s own lock *before* doing the
+//! actual (potentially many-second, real-LLM-latency) stdio round trip
+//! against one specific backend -- two callers targeting two *different*
+//! agent ids proceed fully in parallel; two callers targeting the *same*
+//! agent id still correctly serialize on that one process's own mutex,
+//! since one backend's stdin/stdout is a single duplex stream with no
+//! request/response demuxing (`acpx-core::router`'s `read_matching_response`
+//! doc comment) -- you cannot interleave two in-flight requests on one
+//! child process's stdio regardless of locking strategy.
 
 use crate::backoff;
 use crate::process::{BackendProcess, ProcessError, SpawnSpec};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+/// A supervised backend process, shared behind a per-process lock so
+/// distinct agents' in-flight requests never contend with each other.
+/// See this module's doc comment.
+pub type SharedBackendProcess = Arc<Mutex<BackendProcess>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
@@ -50,7 +72,7 @@ struct BackoffState {
 /// backend doesn't spin-loop respawn attempts.
 pub struct Supervisor {
     specs: HashMap<String, SpawnSpec>,
-    running: HashMap<String, BackendProcess>,
+    running: HashMap<String, SharedBackendProcess>,
     attempts: HashMap<String, BackoffState>,
     /// How long a process must stay alive before its consecutive-failure
     /// count resets. Defaults to `backoff::STABLE_AFTER`; overridable via
@@ -92,12 +114,22 @@ impl Supervisor {
 
     /// Report whether `agent_id`'s process is currently running, has
     /// exited, or was never started. Non-blocking.
+    ///
+    /// Uses [`Mutex::try_lock`] rather than `.await`ing the per-process
+    /// lock, so this stays a synchronous, non-blocking call even though
+    /// the process handle is now shared: if some other caller currently
+    /// holds the lock (mid request/response I/O), that's itself proof the
+    /// process is alive and in use, so a contended lock is reported as
+    /// `Running` rather than blocking here to find out for certain.
     pub fn status(&mut self, agent_id: &str) -> ProcessStatus {
-        match self.running.get_mut(agent_id) {
+        match self.running.get(agent_id) {
             None => ProcessStatus::NotStarted,
-            Some(proc) => match proc.try_exit_status() {
-                Some(exit) => ProcessStatus::Exited { code: exit.code() },
-                None => ProcessStatus::Running,
+            Some(handle) => match handle.try_lock() {
+                Ok(mut proc) => match proc.try_exit_status() {
+                    Some(exit) => ProcessStatus::Exited { code: exit.code() },
+                    None => ProcessStatus::Running,
+                },
+                Err(_) => ProcessStatus::Running,
             },
         }
     }
@@ -114,17 +146,25 @@ impl Supervisor {
     pub async fn ensure_running(
         &mut self,
         agent_id: &str,
-    ) -> Result<&mut BackendProcess, SupervisorError> {
+    ) -> Result<SharedBackendProcess, SupervisorError> {
         if !self.specs.contains_key(agent_id) {
             return Err(SupervisorError::UnknownAgent(agent_id.to_string()));
         }
         let now = Instant::now();
 
         // Check liveness first and drop the borrow immediately (as an owned
-        // bool) rather than holding it across the branches below -- keeps
-        // this simple for the borrow checker instead of threading a `&mut
-        // BackendProcess` through conditional early returns.
-        let exited = self.running.get_mut(agent_id).map(|proc| proc.has_exited());
+        // bool) rather than holding a lock guard across the branches below.
+        // Locking here is a brief, uncontended (in the common case) check,
+        // never held across an `.await` on backend I/O -- the only other
+        // holder of this same per-process lock would be a concurrent
+        // request already in flight against this exact agent, in which
+        // case blocking briefly to confirm liveness is correct anyway
+        // (see `status`'s doc comment for the non-blocking variant used
+        // there instead).
+        let exited = match self.running.get(agent_id) {
+            Some(handle) => Some(handle.lock().await.has_exited()),
+            None => None,
+        };
 
         match exited {
             Some(false) => {
@@ -137,10 +177,11 @@ impl Supervisor {
                         }
                     }
                 }
-                return Ok(self
-                    .running
-                    .get_mut(agent_id)
-                    .expect("checked Some(false) above"));
+                return Ok(Arc::clone(
+                    self.running
+                        .get(agent_id)
+                        .expect("checked Some(false) above"),
+                ));
             }
             Some(true) => {
                 self.running.remove(agent_id);
@@ -183,8 +224,10 @@ impl Supervisor {
         state.last_spawn_at = Some(now);
         match BackendProcess::spawn(spec).await {
             Ok(proc) => {
-                self.running.insert(agent_id.to_string(), proc);
-                Ok(self.running.get_mut(agent_id).expect("just inserted"))
+                let handle: SharedBackendProcess = Arc::new(Mutex::new(proc));
+                self.running
+                    .insert(agent_id.to_string(), Arc::clone(&handle));
+                Ok(handle)
             }
             Err(e) => {
                 state.consecutive_failures = state.consecutive_failures.saturating_add(1);
@@ -194,7 +237,11 @@ impl Supervisor {
     }
 
     pub async fn stop(&mut self, agent_id: &str) -> Result<(), SupervisorError> {
-        if let Some(mut proc) = self.running.remove(agent_id) {
+        if let Some(handle) = self.running.remove(agent_id) {
+            // Waits for any in-flight request against this agent to finish
+            // before killing it, rather than yanking the process out from
+            // under a concurrent caller mid-I/O.
+            let mut proc = handle.lock().await;
             proc.kill().await.map_err(ProcessError::Spawn)?;
         }
         // An intentional stop isn't a crash -- clear backoff bookkeeping so

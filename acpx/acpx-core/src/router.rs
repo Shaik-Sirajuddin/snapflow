@@ -32,7 +32,20 @@ pub fn classify(method: &str) -> MethodClass {
     match method {
         "session/new" => MethodClass::Hybrid,
         "session/prompt" | "session/resume" | "session/load" | "session/close"
-        | "session/set_mode" | "session/cancel" => MethodClass::Proxied,
+        | "session/set_mode" | "session/cancel"
+        // `session/set_config_option`: not one of the plan's originally
+        // enumerated ACP methods, but a real, published extension method
+        // used by `@agentclientprotocol/claude-agent-acp` (and, per the
+        // ACP ecosystem's `configOptions` pattern surfaced on every
+        // `session/new` response, likely other adapters too) for
+        // in-session model selection -- verified against the real
+        // published adapter, see `acpx/COVERAGE.md`'s "real multi-agent
+        // concurrency" section for how this was discovered. Session-scoped
+        // (carries `sessionId`, forwarded byte-for-byte like every other
+        // proxied method) so it fits this bucket exactly; omitting it
+        // meant a real client had no way to ever pick a non-default model
+        // for a claude-agent-acp-backed profile through the gateway.
+        | "session/set_config_option" => MethodClass::Proxied,
         "agents/list" | "agents/install" | "agents/status" | "session/list" => {
             MethodClass::GatewayNative
         }
@@ -227,18 +240,12 @@ impl Router {
         direction: Direction,
         payload: serde_json::Value,
     ) {
-        let Some(store) = self.persistence.clone() else {
-            return;
-        };
-        let gateway_session_id = gateway_session_id.into();
-        tokio::spawn(async move {
-            if let Err(err) = store
-                .append_transcript(gateway_session_id, direction, payload, now_rfc3339())
-                .await
-            {
-                tracing::warn!(%err, "failed to persist transcript entry");
-            }
-        });
+        spawn_transcript_fn(
+            self.persistence.clone(),
+            gateway_session_id,
+            direction,
+            payload,
+        );
     }
 
     /// Fire-and-forget persistence for a freshly-registered session:
@@ -269,51 +276,15 @@ impl Router {
         client_request: serde_json::Value,
         agent_response: serde_json::Value,
     ) {
-        let Some(store) = self.persistence.clone() else {
-            return;
-        };
-        let gateway_session_id = gateway_session_id.into();
-        let agent_id = agent_id.into();
-        let backend_session_id = backend_session_id.into();
-        tokio::spawn(async move {
-            if let Err(err) = store
-                .record_session(
-                    gateway_session_id.clone(),
-                    agent_id,
-                    backend_session_id,
-                    profile_name,
-                    now_rfc3339(),
-                )
-                .await
-            {
-                tracing::warn!(%err, "failed to persist session metadata");
-                // Don't attempt the transcript inserts -- without a
-                // `sessions` row they'd only fail the same FK check.
-                return;
-            }
-            if let Err(err) = store
-                .append_transcript(
-                    gateway_session_id.clone(),
-                    Direction::ClientToAgent,
-                    client_request,
-                    now_rfc3339(),
-                )
-                .await
-            {
-                tracing::warn!(%err, "failed to persist transcript entry");
-            }
-            if let Err(err) = store
-                .append_transcript(
-                    gateway_session_id,
-                    Direction::AgentToClient,
-                    agent_response,
-                    now_rfc3339(),
-                )
-                .await
-            {
-                tracing::warn!(%err, "failed to persist transcript entry");
-            }
-        });
+        spawn_session_persistence_fn(
+            self.persistence.clone(),
+            gateway_session_id,
+            agent_id,
+            backend_session_id,
+            profile_name,
+            client_request,
+            agent_response,
+        );
     }
 
     /// Ensure the registry cache is populated, fetching (live, falling
@@ -404,8 +375,11 @@ impl Router {
         }
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        backend.writer.write_value(&request).await?;
-        let mut response = read_matching_response(backend, &id).await?;
+        let mut response = {
+            let mut backend = backend.lock().await;
+            backend.writer.write_value(&request).await?;
+            read_matching_response(&mut backend, &id).await?
+        };
 
         let backend_session_id = response
             .get("result")
@@ -566,8 +540,11 @@ impl Router {
         );
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        backend.writer.write_value(&request).await?;
-        let response = read_matching_response(backend, &id).await?;
+        let response = {
+            let mut backend = backend.lock().await;
+            backend.writer.write_value(&request).await?;
+            read_matching_response(&mut backend, &id).await?
+        };
         self.spawn_transcript(
             gateway_session_id.clone(),
             Direction::AgentToClient,
@@ -762,6 +739,319 @@ async fn read_matching_response(
             "dropping unmatched backend message (no reverse-direction routing yet, see 05-open-risks.md)"
         );
     }
+}
+
+/// Free-function twin of `Router::spawn_transcript`, taking an already-
+/// cloned `Option<PersistenceStore>` instead of `&self` -- shared by both
+/// the original `&mut self` dispatch path and [`dispatch_shared`]'s
+/// unlock-during-backend-I/O path below, so the two never drift apart.
+fn spawn_transcript_fn(
+    store: Option<PersistenceStore>,
+    gateway_session_id: impl Into<String>,
+    direction: Direction,
+    payload: serde_json::Value,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let gateway_session_id = gateway_session_id.into();
+    tokio::spawn(async move {
+        if let Err(err) = store
+            .append_transcript(gateway_session_id, direction, payload, now_rfc3339())
+            .await
+        {
+            tracing::warn!(%err, "failed to persist transcript entry");
+        }
+    });
+}
+
+/// Free-function twin of `Router::spawn_session_persistence` -- see
+/// `spawn_transcript_fn`'s doc comment for why this split exists.
+#[allow(clippy::too_many_arguments)]
+fn spawn_session_persistence_fn(
+    store: Option<PersistenceStore>,
+    gateway_session_id: impl Into<String>,
+    agent_id: impl Into<String>,
+    backend_session_id: impl Into<String>,
+    profile_name: Option<String>,
+    client_request: serde_json::Value,
+    agent_response: serde_json::Value,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let gateway_session_id = gateway_session_id.into();
+    let agent_id = agent_id.into();
+    let backend_session_id = backend_session_id.into();
+    tokio::spawn(async move {
+        if let Err(err) = store
+            .record_session(
+                gateway_session_id.clone(),
+                agent_id,
+                backend_session_id,
+                profile_name,
+                now_rfc3339(),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to persist session metadata");
+            return;
+        }
+        if let Err(err) = store
+            .append_transcript(
+                gateway_session_id.clone(),
+                Direction::ClientToAgent,
+                client_request,
+                now_rfc3339(),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to persist transcript entry");
+        }
+        if let Err(err) = store
+            .append_transcript(
+                gateway_session_id,
+                Direction::AgentToClient,
+                agent_response,
+                now_rfc3339(),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to persist transcript entry");
+        }
+    });
+}
+
+/// `Arc<tokio::sync::Mutex<Router>>` -- the handle type
+/// `acpx-server`'s transports hold and pass to [`dispatch_shared`].
+/// Re-exported here (rather than only living in `acpx-server`) so this
+/// module can define `dispatch_shared` against it directly.
+pub type SharedRouterHandle = std::sync::Arc<tokio::sync::Mutex<Router>>;
+
+/// Real multi-agent concurrency entry point (added post-Phase-6, replacing
+/// the naive "hold the whole-`Router` mutex for an entire `dispatch` call,
+/// including the backend's real-LLM-latency I/O" pattern every transport
+/// used through Phase 6 -- see `acpx/COVERAGE.md`'s "real multi-agent
+/// concurrency" section for the full writeup of why that was a genuine
+/// correctness/scalability bug, not just a style preference, for a
+/// "virtual gateway daemon" whose entire purpose is fronting *multiple*
+/// concurrently-used backend agents).
+///
+/// Same [`RouterError`] contract as [`Router::dispatch`] (in fact
+/// delegates to it for [`MethodClass::GatewayNative`] and
+/// [`MethodClass::Unknown`], which never touch a backend process and stay
+/// cheap/local). For [`MethodClass::Hybrid`] (`session/new`) and
+/// [`MethodClass::Proxied`] (`session/prompt` and friends) -- the only
+/// method classes that ever talk to a backend agent process -- this
+/// function locks `router` only long enough to resolve gateway state
+/// (session registry, profile/provider resolution, `Supervisor::
+/// ensure_running`'s bookkeeping) and obtain a
+/// `acpx_conductor::SharedBackendProcess` handle, then **drops that lock**
+/// before doing the actual backend stdio round trip against just that
+/// handle's own per-process mutex. Two concurrent callers resolving to two
+/// *different* backend agents now genuinely run their I/O in parallel;
+/// two callers resolving to the *same* backend agent still correctly
+/// serialize on that one process's own lock (see
+/// `acpx_conductor::supervisor`'s module doc comment for why that part is
+/// unavoidable, not a remaining bug).
+///
+/// `acpx-server`'s HTTP/WS/stdio transports all call this instead of
+/// `router.lock().await.dispatch(...)`; `Router::dispatch` itself is left
+/// untouched and still used directly by every in-process test in this
+/// workspace that constructs a bare `Router` (no sharing, no concurrency
+/// to speak of), so none of those ~100 existing tests needed to change.
+pub async fn dispatch_shared(
+    router: &SharedRouterHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let method = request
+        .get("method")
+        .and_then(|m| m.as_str())
+        .ok_or(RouterError::MissingMethod)?
+        .to_string();
+    match classify(&method) {
+        MethodClass::Hybrid => dispatch_session_new_shared(router, request).await,
+        MethodClass::Proxied => dispatch_proxied_shared(router, request).await,
+        MethodClass::GatewayNative | MethodClass::Unknown => {
+            router.lock().await.dispatch(request).await
+        }
+    }
+}
+
+/// [`dispatch_shared`]'s `session/prompt`/`session/resume`/`session/load`/
+/// `session/close`/`session/set_mode`/`session/cancel` path. Mirrors
+/// `Router::dispatch_proxied` exactly (session resolution, sessionId
+/// rewrite, transcript persistence, `session/close` bookkeeping) but
+/// restructured to release `router`'s lock before the backend round trip.
+async fn dispatch_proxied_shared(
+    router: &SharedRouterHandle,
+    mut request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let method = request
+        .get("method")
+        .and_then(|m| m.as_str())
+        .ok_or(RouterError::MissingMethod)?
+        .to_string();
+    let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+    let gateway_session_id = request
+        .get("params")
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .ok_or(RouterError::MissingSessionId)?
+        .to_string();
+
+    let (backend, persistence) = {
+        let mut r = router.lock().await;
+        let entry = r
+            .sessions
+            .resolve(&acpx_proto::session::GatewaySessionId(
+                gateway_session_id.clone(),
+            ))
+            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
+        let agent_id = entry.agent_id.clone();
+        let backend_session_id = entry.backend_session_id.0.clone();
+        if let Some(params) = request.get_mut("params") {
+            params["sessionId"] = serde_json::Value::String(backend_session_id);
+        }
+        let backend = r.supervisor.ensure_running(&agent_id).await?;
+        (backend, r.persistence.clone())
+    };
+
+    spawn_transcript_fn(
+        persistence.clone(),
+        gateway_session_id.clone(),
+        Direction::ClientToAgent,
+        request.clone(),
+    );
+
+    let response = {
+        let mut proc = backend.lock().await;
+        proc.writer.write_value(&request).await?;
+        read_matching_response(&mut proc, &id).await?
+    };
+
+    spawn_transcript_fn(
+        persistence.clone(),
+        gateway_session_id.clone(),
+        Direction::AgentToClient,
+        response.clone(),
+    );
+
+    if method == "session/close" {
+        if let Some(store) = persistence {
+            tokio::spawn(async move {
+                if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
+                    tracing::warn!(%err, "failed to persist session close");
+                }
+            });
+        }
+    }
+    Ok(response)
+}
+
+/// [`dispatch_shared`]'s `session/new` path. Mirrors
+/// `Router::dispatch_session_new` exactly (`_acpx.profile` resolution,
+/// central MCP server merge, gateway session id issuance, session
+/// persistence) but restructured to release `router`'s lock before the
+/// backend round trip.
+async fn dispatch_session_new_shared(
+    router: &SharedRouterHandle,
+    mut request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+
+    let (agent_id, profile, backend, persistence) = {
+        let mut r = router.lock().await;
+        let params = request
+            .get_mut("params")
+            .ok_or(RouterError::MissingParams)?;
+        let profile_name = params
+            .get("_acpx")
+            .and_then(|ext| ext.get("profile"))
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("_acpx");
+        }
+
+        let (agent_id, profile) = match &profile_name {
+            Some(name) => {
+                let (supervisor_key, profile) = r.resolve_profile(name).await?;
+                (supervisor_key, Some(profile))
+            }
+            None => (r.default_agent_id.clone(), None),
+        };
+
+        if let Some(profile) = &profile {
+            if !profile.mcp_servers.is_empty() {
+                let central = r.mcp_servers.list_named(&profile.mcp_servers);
+                let params = request
+                    .get_mut("params")
+                    .ok_or(RouterError::MissingParams)?;
+                let client_servers = params
+                    .get("mcpServers")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let merged = crate::mcp_servers::merge_mcp_servers(&client_servers, &central);
+                if let Some(obj) = params.as_object_mut() {
+                    obj.insert("mcpServers".to_string(), serde_json::json!(merged));
+                }
+            }
+        }
+
+        let backend = r.supervisor.ensure_running(&agent_id).await?;
+        (agent_id, profile, backend, r.persistence.clone())
+    };
+
+    let mut response = {
+        let mut proc = backend.lock().await;
+        proc.writer.write_value(&request).await?;
+        read_matching_response(&mut proc, &id).await?
+    };
+
+    let backend_session_id = response
+        .get("result")
+        .and_then(|r| r.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .ok_or(RouterError::MissingBackendSessionId)?
+        .to_string();
+
+    let (gateway_session_id_str, persist_args) = {
+        let mut r = router.lock().await;
+        let gateway_id = r
+            .sessions
+            .register(agent_id, BackendSessionId(backend_session_id));
+        let gateway_session_id_str = gateway_id.0.clone();
+        if let Some(result) = response.get_mut("result") {
+            result["sessionId"] = serde_json::Value::String(gateway_id.0);
+        }
+        // Re-resolve (mirrors `Router::dispatch_session_new`'s own
+        // approach) rather than threading `agent_id`/`backend_session_id`
+        // back out through the closure -- `agent_id` was just moved into
+        // `register` above, and this is the same lock acquisition anyway.
+        let persist_args = r
+            .sessions
+            .resolve(&acpx_proto::session::GatewaySessionId(
+                gateway_session_id_str.clone(),
+            ))
+            .map(|entry| (entry.agent_id.clone(), entry.backend_session_id.0.clone()));
+        (gateway_session_id_str, persist_args)
+    };
+
+    if let Some((persisted_agent_id, persisted_backend_session_id)) = persist_args {
+        spawn_session_persistence_fn(
+            persistence,
+            gateway_session_id_str,
+            persisted_agent_id,
+            persisted_backend_session_id,
+            profile.map(|p| p.name),
+            request,
+            response.clone(),
+        );
+    }
+
+    Ok(response)
 }
 
 /// Wall-clock timestamp for persistence rows, RFC 3339 via `SystemTime` (no
