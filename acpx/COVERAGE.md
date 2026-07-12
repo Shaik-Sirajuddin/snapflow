@@ -9,7 +9,7 @@ sync with the code. Every row reflects a real `cargo test --workspace`
 run and an actual read of the referenced test file(s) -- not an
 aspirational claim of what should exist.
 
-As of this update: `cargo test --workspace` passes **95 tests, 0
+As of this update: `cargo test --workspace` passes **101 tests, 0
 failures, 1 explicitly `#[ignore]`d** (the live-registry network test, see
 Phase 4 below). `cargo build --workspace` and `cargo fmt --all --check`
 are both clean.
@@ -60,11 +60,27 @@ them yet, so a real deployment currently has no way to configure a
 provider/profile without writing Rust. Tracked as a followup, not silently
 missing.
 
+## Phase 4 -- deferred adapter installation
+
+| Step | Feature | Implementation | Test coverage | Status |
+|---|---|---|---|---|
+| 18 | Registry client (live fetch + bundled `registry.fallback.json` fallback) | `acpx-registry/src/index.rs` | `fallback_registry.rs` (1), `index_fixtures.rs` (1); `live_registry.rs`'s live-network test is `#[ignore]`d by design (no network dependency in the default run) | Done -- pulled forward into Phase 2's work (commit `f502245`), not built as a separate later pass |
+| 19 | `agents/install`: npx/uvx runtime-on-PATH confirmation, `binary` archive download+extract (format sniffed from URL, `cmd` treated as opaque) | `acpx-registry/src/install.rs`, wired into `router.rs`'s `dispatch_native` `agents/install` handler | `install_runtime.rs` (3, real `node`/`npm`/`uv` checks against this environment's actual PATH); `install.rs`'s own unit tests (8, zip/tar.gz/tgz sniffing, opaque `cmd` joining, unsupported-platform/missing-runtime error paths); `acpx-client/tests/gateway_client_test.rs`'s `ext_registry_agents_list_and_status_and_install_round_trip` (full client -> gateway -> real `node`/`npm` `RuntimeConfirmed` round trip, this environment has a real node/npm on `PATH`) | Done for `npx`/`uvx`/`binary`-format-sniffing; **not verified on Windows/macOS** (see gaps) |
+
+## Phase 5 -- acpx-client SDK
+
+| Step | Feature | Implementation | Test coverage | Status |
+|---|---|---|---|---|
+| 20 | Raw ACP client transport (JSON-RPC-over-HTTP against the gateway's `POST /rpc`) | `acpx-client/src/raw.rs` (`GatewayClient::call`, `ClientError`) -- see the file's doc comment for the documented deviation from the plan's literal wording (a hand-rolled HTTP transport rather than adopting the official `agent-client-protocol` crate's subprocess-stdio-oriented `Client` trait, justified since acpx is a remote-gateway architecture, not a library that owns its own child process) | `gateway_client_test.rs`'s `raw_call_round_trips_a_gateway_native_method`, `raw_call_surfaces_json_rpc_errors_as_client_errors` | Done |
+| 21 | `ext/` extension namespace layered additively on top of `raw` -- profile selection/listing, aggregated `session/list`, registry queries | `acpx-client/src/ext/{sessions,profiles,registry}.rs` | `gateway_client_test.rs`: `ext_sessions_list_aggregates_across_the_gateway`, `ext_profiles_create_list_delete_round_trip`, `ext_profiles_create_via_client_then_session_new_via_header_uses_it` (profile header precedence, exercising the real production `X-Acpx-Profile` path end to end from the client) | Done |
+| 22 | `ext::registry::install(agent_id)` -- client-initiated installer calling the gateway's `agents/install` | `acpx-client/src/ext/registry.rs` (`agents_list`, `agents_status`, `install`) | `gateway_client_test.rs`'s `ext_registry_agents_list_and_status_and_install_round_trip` -- runs for real against this environment's actual `node`/`npm` (`RuntimeConfirmed` outcome, not mocked) | Done for the blocking request/response shape. **The progress/job-model question from `05-open-risks.md` is NOT resolved** -- `install` is a single blocking call that returns success/failure once the runtime check completes; there is no polling/streamed feedback for a slow first `npx` fetch or a `binary` download+extract, so a caller has no way to show incremental progress. This is a known gap, not an oversight (see Gaps below) |
+
 ## Gaps / not yet covered
 
 Pulled from `memory/acpx/gen/plans/acp-gateway-daemon/05-open-risks.md` --
 these are acknowledged, not newly discovered:
 
+- **`ext::registry::install`'s progress/job model is still undecided** (Phase 5 step 22) -- the client can now trigger installation for real, but a slow `npx`/`binary` install has no way to report incremental progress back to a waiting caller; `05-open-risks.md`'s "client-initiated installer needs a progress/job model" item is directly relevant now that this call path exists, not just a future concern.
 - **No live-registry test runs by default.** `acpx-registry/tests/live_registry.rs`'s `live_registry_matches_expected_shape` is `#[ignore]`d (hits the real network); only `registry.fallback.json` parsing is covered in the default test run.
 - **No real `npx`-installed-agent end-to-end test.** Every test in this workspace uses a synthetic `sh -c '...'` stand-in backend (see `router_dispatch_test.rs`'s doc comment for the pattern) rather than a real `codex-acp`/`claude-agent-acp`/gemini adapter -- Phase 6 step 26 (detection -> installation -> use, for real, per agent) is not started.
 - **No Windows/macOS test coverage for the `binary` distribution's download+extract path** -- `install.rs`'s zip/tar.gz sniffing is unit-tested, but only exercised on Linux in this environment; `05-open-risks.md` explicitly calls out that this path needs testing on all three OSes before being considered done.
@@ -74,4 +90,4 @@ these are acknowledged, not newly discovered:
 - **No transport security (auth/TLS) for the HTTP/WS remote-access transport** -- binds to `127.0.0.1:8790` by default; `05-open-risks.md`'s "Transport security for remote access" item is unresolved.
 - **No reverse-direction (agent-initiated) message routing** -- `session/update` notifications, `session/request_permission`, etc. arriving on a backend's stdout without a matching request id are logged and dropped (`router.rs`'s `read_matching_response` doc comment), not routed back to the owning client connection; `05-open-risks.md` flags this as unresolved.
 - **No provider/profile provisioning surface in `acpx-server` yet** -- see Phase 3's "Not yet built" note above.
-- Phases 4 (deferred adapter installation beyond the npx-runtime-check path already covered), 5 (`acpx-client` SDK), and 6 (end-to-end test suite spanning all phases) are not started.
+- Phase 6 (end-to-end test suite spanning all phases -- the official `agent-client-protocol-test` crate's actual API is still unverified per `05-open-risks.md`, and the reusable Zed-style `common_e2e_tests!`-pattern harness across Claude/Codex/Gemini has not been started) is the only remaining unstarted phase.

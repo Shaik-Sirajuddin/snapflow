@@ -11,3 +11,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Compile acpx-server's transport modules directly into test binaries via
+# #[path] (same trick acpx-server/tests/http_ws_transport_test.rs uses --
+# it's a bin-only crate with no lib target) so client-SDK tests exercise a
+# real running gateway instead of a hand-rolled fake HTTP server.
+acpx-core = { workspace = true }
+acpx-conductor = { workspace = true }
+axum = { version = "0.7", features = ["ws"] }
+tracing = { workspace = true }

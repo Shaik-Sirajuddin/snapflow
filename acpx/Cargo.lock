@@ -6,11 +6,17 @@ version = 4
 name = "acpx-client"
 version = "0.1.0"
 dependencies = [
+ "acpx-conductor",
+ "acpx-core",
  "acpx-proto",
  "anyhow",
+ "axum",
+ "reqwest",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
