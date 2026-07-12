@@ -66,6 +66,28 @@ impl FfiBackend {
         }
         Ok((undo as usize, redo as usize))
     }
+
+    /// Parses the `"t{trackIndex}c{clipIndex}"` clip-id format the C++
+    /// side (`sap_ffi.cpp`) mints for every clip it hands back (see
+    /// `sap_append_clip`/`sap_move_clip`), so filter.* calls (which take a
+    /// `clip_id` rather than a track/clip-index pair per
+    /// `01-jsonrpc-spec.md`) can resolve back to the FFI's index-based
+    /// calls.
+    fn parse_clip_id(clip_id: &str) -> BackendResult<(usize, usize)> {
+        let rest = clip_id
+            .strip_prefix('t')
+            .ok_or_else(|| BackendError::InvalidParams(format!("malformed clip id: {clip_id}")))?;
+        let (track_part, clip_part) = rest
+            .split_once('c')
+            .ok_or_else(|| BackendError::InvalidParams(format!("malformed clip id: {clip_id}")))?;
+        let track_index = track_part
+            .parse::<usize>()
+            .map_err(|_| BackendError::InvalidParams(format!("malformed clip id: {clip_id}")))?;
+        let clip_index = clip_part
+            .parse::<usize>()
+            .map_err(|_| BackendError::InvalidParams(format!("malformed clip id: {clip_id}")))?;
+        Ok((track_index, clip_index))
+    }
 }
 
 impl Backend for FfiBackend {
@@ -220,8 +242,12 @@ impl Backend for FfiBackend {
             .ok_or_else(|| BackendError::NotFound(format!("track {track_index}")))
     }
 
-    fn edit_set_track_height(&mut self, _project_id: &str, _height: i64) -> BackendResult<()> {
-        Err(BackendError::Unsupported("edit.setTrackHeight not wired to real FFI yet".into()))
+    fn edit_set_track_height(&mut self, _project_id: &str, height: i64) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_set_track_height(self.main_window, height as c_int) };
+        if rc != 0 {
+            return Err(BackendError::NotFound("track height unavailable".into()));
+        }
+        Ok(())
     }
 
     fn edit_remove_clip(&mut self, _project_id: &str, track_index: usize, clip_index: usize) -> BackendResult<()> {
@@ -463,25 +489,72 @@ impl Backend for FfiBackend {
     fn filter_add(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
-        _mlt_service: &str,
-        _properties: Value,
+        clip_id: &str,
+        mlt_service: &str,
+        properties: Value,
     ) -> BackendResult<FilterInfo> {
-        Err(BackendError::NotFound("filter.add not wired to real FFI yet".into()))
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let c_service = CString::new(mlt_service)
+            .map_err(|e| BackendError::InvalidParams(format!("bad mltService: {e}")))?;
+        let props_json = serde_json::to_string(&properties)
+            .map_err(|e| BackendError::InvalidParams(format!("bad properties: {e}")))?;
+        let c_props = CString::new(props_json)
+            .map_err(|e| BackendError::InvalidParams(format!("bad properties: {e}")))?;
+        let raw = unsafe {
+            ffi::sap_filter_add(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                c_service.as_ptr(),
+                c_props.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(format!(
+                "failed to attach filter {mlt_service} to clip {clip_id}"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<FilterInfo>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad filter-add JSON: {e}")))
     }
 
     fn filter_set_property(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
-        _filter_index: usize,
-        _property: &str,
-        _value: Value,
+        clip_id: &str,
+        filter_index: usize,
+        property: &str,
+        value: Value,
         _position: Option<i64>,
     ) -> BackendResult<()> {
-        Err(BackendError::Unsupported(
-            "filter.setProperty is unsupported: no Qt/MLT property-set shim is available".into(),
-        ))
+        // `_position` (keyframe position) isn't wired yet -- this always
+        // sets the filter's static/non-keyframed property value, same as
+        // filter_add_keyframe's own not-yet-wired status below.
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let c_property = CString::new(property)
+            .map_err(|e| BackendError::InvalidParams(format!("bad property name: {e}")))?;
+        let value_json = serde_json::to_string(&value)
+            .map_err(|e| BackendError::InvalidParams(format!("bad value: {e}")))?;
+        let c_value = CString::new(value_json)
+            .map_err(|e| BackendError::InvalidParams(format!("bad value: {e}")))?;
+        let rc = unsafe {
+            ffi::sap_filter_set_property(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                filter_index as c_int,
+                c_property.as_ptr(),
+                c_value.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "filter {filter_index} on clip {clip_id} unavailable"
+            )));
+        }
+        Ok(())
     }
 
     fn filter_add_keyframe(
@@ -500,9 +573,39 @@ impl Backend for FfiBackend {
     fn filter_list(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
+        clip_id: &str,
     ) -> BackendResult<Vec<FilterListEntry>> {
-        Err(BackendError::NotFound("filter.list not wired to real FFI yet".into()))
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let raw = unsafe {
+            ffi::sap_filter_list(self.main_window, track_index as c_int, clip_index as c_int)
+        };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(format!("clip {clip_id} unavailable")));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawFilterEntry {
+            filter_index: usize,
+            mlt_service: String,
+        }
+        let raw_entries: Vec<RawFilterEntry> = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad filter-list JSON: {e}")))?;
+        // NOTE: `properties` is not yet populated (Null) -- enumerating a
+        // real MLT filter's user-visible vs. internal properties needs a
+        // deny-list of reserved MLT keys (mlt_type, mlt_service, in, out,
+        // _unique_id, ...) that hasn't been implemented yet. filter_index/
+        // mlt_service are both real and live-read from the attached MLT
+        // filter chain.
+        Ok(raw_entries
+            .into_iter()
+            .map(|e| FilterListEntry {
+                index: e.filter_index,
+                mlt_service: e.mlt_service,
+                properties: Value::Null,
+            })
+            .collect())
     }
 
     fn filter_remove(
@@ -606,10 +709,11 @@ impl Backend for FfiBackend {
         Err(BackendError::NotFound("file.export not wired to real FFI yet".into()))
     }
 
-    fn file_probe(&mut self, _path: &str) -> BackendResult<FileProbe> {
-        Err(BackendError::Unsupported(
-            "file.probe is unsupported: no Qt/MLT probe shim is available".into(),
-        ))
+    fn file_probe(&mut self, path: &str) -> BackendResult<FileProbe> {
+        // Pure ffprobe-based probing, zero Qt/MLT dependency -- identical
+        // logic to `MltBackend::file_probe`, so reuse it directly rather
+        // than duplicating.
+        crate::mlt_backend::probe_media(path)
     }
 
     fn jobs_get(&mut self, _job_id: &str) -> BackendResult<JobStatus> {

@@ -88,6 +88,54 @@ extern "C" {
     /// -1 on error (invalid handle/index, or no blend transition present).
     pub fn sap_set_track_blend_mode(main_window_handle: *mut c_void, track_index: c_int, mode: *const c_char) -> c_int;
 
+    /// C++ side: `int sap_set_track_height(void* mainWindowHandle, int
+    /// height);` -- real `MultitrackModel::setTrackHeight()`, a single
+    /// project-wide `shotcut:trackHeight` tractor property (not per-track),
+    /// clamped to [10, 150] by the real setter. Returns 0 on success, -1 on
+    /// error (invalid handle).
+    pub fn sap_set_track_height(main_window_handle: *mut c_void, height: c_int) -> c_int;
+
+    /// C++ side: `char* sap_filter_add(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, const char* mltService, const char*
+    /// propertiesJson);` -- attaches a real MLT filter to the clip's
+    /// per-instance "cut" producer. NOT undoable via Ctrl+Z (no lightweight
+    /// QUndoCommand exists that doesn't also require the full
+    /// QmlMetadata-driven filter-panel machinery). Returns a heap-allocated
+    /// JSON object string `{"filterIndex":N,"mltService":"..."}`, or NULL
+    /// on error. Caller must free via `sap_free_string`.
+    pub fn sap_filter_add(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        mlt_service: *const c_char,
+        properties_json: *const c_char,
+    ) -> *mut c_char;
+
+    /// C++ side: `int sap_filter_set_property(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, int filterIndex, const char* property,
+    /// const char* valueJson);` -- `valueJson` is one JSON-encoded scalar.
+    /// Same non-undoable caveat as `sap_filter_add`. Returns 0 on success,
+    /// -1 on error.
+    pub fn sap_filter_set_property(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        filter_index: c_int,
+        property: *const c_char,
+        value_json: *const c_char,
+    ) -> c_int;
+
+    /// C++ side: `char* sap_filter_list(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex);` -- returns a heap-allocated JSON array
+    /// string `[{"filterIndex":0,"mltService":"..."},...]` in raw MLT
+    /// filter-chain order, or NULL on error. Caller must free via
+    /// `sap_free_string`.
+    pub fn sap_filter_list(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+    ) -> *mut c_char;
+
     /// C++ side: `char* sap_list_tracks(void* mainWindowHandle);` -- returns a
     /// heap-allocated, NUL-terminated JSON array string of the form
     /// `[{"index":0,"kind":"video"},...]` (built from the real

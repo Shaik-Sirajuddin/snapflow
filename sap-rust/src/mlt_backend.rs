@@ -1853,7 +1853,12 @@ fn resolve_ffprobe_binary() -> String {
 /// prefers `nb_frames` when the container reports it, else falls back to
 /// `duration * DEFAULT_FPS` (accurate as long as the source's real frame rate
 /// matches the project's fixed `DEFAULT_FPS`).
-fn probe_media(path: &str) -> BackendResult<FileProbe> {
+/// `pub(crate)` so `ffi_backend::file_probe` can reuse the exact same
+/// ffprobe-based probing logic -- probing is a pure external-process call
+/// with zero Qt/MLT dependency, so there is nothing FFI-specific to wire
+/// here; both backends should report identical probe results for the same
+/// file.
+pub(crate) fn probe_media(path: &str) -> BackendResult<FileProbe> {
     let output = Command::new(resolve_ffprobe_binary())
         .args([
             "-v",
