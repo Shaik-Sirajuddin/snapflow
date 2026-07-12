@@ -54,13 +54,13 @@ processes by design, not run by default). `cargo build --workspace` and
 | 17 | `session/new` resolves `_acpx.profile` -> agent + provider + spawn, falling back to native/unmanaged when omitted | `router.rs`'s `resolve_profile` + `dispatch_session_new` | `profile_resolution_test.rs`: `session_new_with_unknown_profile_errors`, `session_new_with_profile_injects_resolved_provider_env`, `session_new_native_mode_never_touches_profile_store`; `http_ws_transport_test.rs`'s `http_post_rpc_session_new_routes_via_profile_header` (header precedence over inline `_acpx.profile`) | Done |
 | 17a | Central MCP server registry, CRUD + merge-by-name into `session/new`'s `mcpServers` (client wins on collision) | `acpx-core/src/mcp_servers.rs` (`McpServerStore`, `merge_mcp_servers`), `router.rs`'s `dispatch_native` + `dispatch_session_new` | `mcp_servers.rs`'s own unit tests (9); `profile_resolution_test.rs`: `mcp_servers_crud_round_trips_via_dispatch`, `session_new_with_profile_merges_central_mcp_servers_with_client_ones_winning`, `session_new_profile_with_no_mcp_servers_leaves_params_untouched` (no-op guarantee for clients that opt out) | Done |
 
-**Not yet built in Phase 3:** a config-file/CLI/env surface for actually
-provisioning `ProviderConfig`s and secrets into a running `acpx-server` --
-`Router::register_provider`/`Router::store_key` exist as a programmatic
-seam (used by the tests above) but `acpx-server`'s `main.rs` doesn't call
-them yet, so a real deployment currently has no way to configure a
-provider/profile without writing Rust. Tracked as a followup, not silently
-missing.
+**Followup (now closed, see "Post-self-review" section below):** a
+config-file/env surface for actually provisioning `ProviderConfig`s,
+central MCP servers, and profiles into a running `acpx-server` --
+`ACPX_CONFIG_FILE`, applied in `main.rs` before either transport starts,
+built on the same `Router::register_provider`/`Router::dispatch`
+(`profiles/create`/`mcp_servers/create`) seams the tests above already
+used programmatically. See `acpx-server/src/provisioning.rs`.
 
 ## Phase 4 -- deferred adapter installation
 
@@ -298,7 +298,7 @@ these are acknowledged, not newly discovered:
 - **One process per profile, not one process per session.** Re-resolving an already-running profile (e.g. after a `profiles/update` changes its provider/key) does not restart its already-running supervised process -- documented as a known gap in `router.rs`'s `resolve_profile` doc comment, tracks `05-open-risks.md`'s "one process per backend vs. one process per session" item.
 - **Transport security for remote access: partially resolved.** Optional bearer-token auth now exists (`ACPX_AUTH_TOKEN`, see the "Post-Phase-6 self-review" section below) -- unset by default (binds to `127.0.0.1:8790` with no auth, matching prior behavior). TLS is still entirely unprovided by this transport; `05-open-risks.md`'s item is narrower than before, not closed.
 - **Partially resolved: `session/update` notifications are now delivered, agent-initiated *requests* are not.** `session/update` notifications arriving during a call are now aggregated into that call's response (`_acpx.updates`, see the "reverse-direction `session/update` aggregation fix" section above) rather than silently dropped. Still genuinely unresolved: a backend-initiated *request* expecting a reply (e.g. `session/request_permission`) has no way to get one in this request/response-shaped aggregation model -- there is still no live, out-of-band channel for the client to answer a backend's mid-call question. `05-open-risks.md` flags this as unresolved; narrower than before, not closed.
-- **No provider/profile provisioning surface in `acpx-server` yet** -- see Phase 3's "Not yet built" note above.
+- **Closed: provider/profile provisioning surface.** See the "Post-self-review -- `ACPX_CONFIG_FILE` startup provisioning" section below.
 - **`mcp_servers/list` does not redact its entries, unlike `profiles/list`'s `launch_overrides` (see the self-review section below).** Centrally-registered MCP server entries are opaque, schema-free `serde_json::Value` blobs (`mcp_servers.rs`'s own doc comment -- "acpx never interprets an MCP server entry's fields itself"), and the real MCP config shape can carry credentials in arbitrary fields (`env`, `headers`, etc. depending on the server's transport). Unlike `launch_overrides`, where the field name and semantics are fixed and known, there is no reliable way to heuristically redact an unconstrained JSON blob without either missing real secrets in an unexpected field or corrupting legitimate non-secret config. Left undone deliberately rather than shipping a fragile guess -- noted here so it isn't mistaken for "already covered by the launch_overrides fix."
 
 All six phases in `04-phased-plan.md` are now implemented. No phase remains unstarted; the gaps listed above are the honestly-tracked residual work, not missing phases.
@@ -410,5 +410,32 @@ passes end to end post-fix -- the real key still reaches the spawned
 backend, only the client-visible JSON-RPC response no longer echoes it.
 
 Combined workspace test count after all four fixes: **135 passed, 0
+failed, 2 ignored**, `cargo fmt --all --check` and `cargo build
+--workspace` both clean.
+
+## Post-self-review -- `ACPX_CONFIG_FILE` startup provisioning (closes the last Phase 3 followup)
+
+The one item Phase 3 explicitly left open (see that phase's "Followup"
+note above): `Router::register_provider`/`Router::store_key` existed only
+as a programmatic seam exercised by this workspace's own tests --
+deploying `acpx-server` with a real provider/profile required writing
+Rust, not configuring it. Closed by a new `ACPX_CONFIG_FILE` env var,
+applied in `main.rs` after persistence setup and before either transport
+(`stdio`/`HTTP`/`WS`) starts accepting requests.
+
+| What | Implementation | Test coverage | Status |
+|---|---|---|---|
+| JSON provisioning file: providers, central MCP servers, profiles (incl. `secret`/`secret_env` for keeping raw secrets out of the file itself) applied via `Router::register_provider` + the real `profiles/create`/`mcp_servers/create` JSON-RPC dispatch path (one validation code path, not a second one) | `acpx-server/src/provisioning.rs` (`load`, `apply`), wired into `main.rs` | 6 unit tests in `provisioning.rs` (apply order, `secret_env` resolution, both-secret-fields-set error, missing-env-var error, unknown-provider-ref deferred-to-resolve-time behavior documented explicitly, `load` round trip against a real temp file) | Done |
+| Fails startup outright (non-zero exit, before either transport opens) on a malformed file or a rejected entry (e.g. duplicate profile name) rather than booting a partially-configured gateway | `main.rs`'s `unwrap_or_else(\|err\| panic!(...))` around both `provisioning::load` and `provisioning::apply` | `acpx-server/tests/provisioning_binary_test.rs`'s `real_binary_refuses_to_start_with_an_invalid_provisioning_file` -- spawns the real compiled binary with a duplicate-profile-name config, asserts non-zero exit within 5s and that the HTTP listener never opened | Done |
+| End-to-end against the real compiled binary: a provisioned profile is actually usable via `session/new` | `acpx-server/tests/provisioning_binary_test.rs`'s `real_binary_applies_a_provisioning_file_at_startup` -- boots the real binary with a provisioning file, confirms `profiles/list` reflects it, then completes a real `session/new` against the provisioned profile through a real spawned stand-in backend | Same file | Done |
+
+Unset (the default) leaves every pre-existing deployment/test
+byte-for-byte unchanged -- `ACPX_CONFIG_FILE` is opt-in. Does not add
+encryption at rest for the keystore itself (still open, see Gaps above);
+`secret_env` only keeps the config *file* free of secrets, which is a
+narrower, more achievable win for the common env-injected-by-orchestrator
+deployment shape.
+
+Combined workspace test count after this addition: **143 passed, 0
 failed, 2 ignored**, `cargo fmt --all --check` and `cargo build
 --workspace` both clean.

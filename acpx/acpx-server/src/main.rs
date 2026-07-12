@@ -15,6 +15,7 @@
 //! `session/new`'s `_acpx.profile` select among more than one.
 
 mod config;
+mod provisioning;
 mod transport;
 
 use acpx_core::router::Router;
@@ -51,6 +52,29 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!(%err, %db_path, "failed to open ACPX_DB_PATH, continuing without persistence");
             }
         }
+    }
+
+    // Provisioning: providers/central-MCP-servers/profiles declared in a
+    // JSON file, applied before either transport starts accepting
+    // requests. See `provisioning.rs`'s doc comment -- closes the
+    // COVERAGE.md-tracked "no provisioning surface" gap. Unset (the
+    // default) leaves startup byte-for-byte unchanged from before this
+    // was added. A malformed/rejected file fails startup outright rather
+    // than booting a partially- or un-configured gateway silently.
+    if let Ok(config_path) = std::env::var("ACPX_CONFIG_FILE") {
+        let path = std::path::Path::new(&config_path);
+        let file = provisioning::load(path)
+            .unwrap_or_else(|err| panic!("ACPX_CONFIG_FILE={config_path}: {err}"));
+        let summary = provisioning::apply(&mut router, file)
+            .await
+            .unwrap_or_else(|err| panic!("ACPX_CONFIG_FILE={config_path}: {err}"));
+        tracing::info!(
+            %config_path,
+            providers = summary.providers,
+            mcp_servers = summary.mcp_servers,
+            profiles = summary.profiles,
+            "applied startup provisioning file"
+        );
     }
 
     let router: transport::SharedRouter = Arc::new(Mutex::new(router));

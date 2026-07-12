@@ -21,8 +21,53 @@ is being built out phase by phase per that plan; status is tracked below.
 
 ## Status
 
-Phase 0 (workspace skeleton) in progress. See the plan's
-`04-phased-plan.md` for the full phase breakdown.
+All six phases in `04-phased-plan.md` are implemented (workspace skeleton
+through the end-to-end test suite), plus a post-Phase-6 black-box
+self-test layer, a real multi-agent concurrency fix, a real
+`claude-agent-acp` adapter e2e test, and a self-review pass (concurrency/
+multi-client/auth/memory). See `COVERAGE.md` for the full phase-by-phase
+implementation/test-coverage matrix and the honestly-tracked residual
+gaps (encryption at rest for the keystore, TLS, install progress/job
+model, etc.) -- nothing below is aspirational, every row there reflects a
+real `cargo test --workspace` run.
+
+## Configuration
+
+`acpx-server` is configured entirely via environment variables (no config
+file is required for a minimal single-agent deployment):
+
+- `ACPX_BACKEND_CMD` -- space-separated program + args for the default/
+  native-mode backend (default: `npx -y @agentclientprotocol/codex-acp@1.1.2`).
+- `ACPX_DEFAULT_AGENT_ID` -- id that command is registered under (default: `default`).
+- `ACPX_HTTP_BIND` -- HTTP/WS bind address (default: `127.0.0.1:8790`, loopback only).
+- `ACPX_AUTH_TOKEN` -- if set, requires `Authorization: Bearer <token>` on `POST /rpc` and the `GET /ws` upgrade; unset means no auth (still no TLS -- pair with a TLS-terminating reverse proxy for any non-loopback bind).
+- `ACPX_DB_PATH` -- sqlite file for session metadata + transcripts; unset skips persistence entirely.
+- `ACPX_CONFIG_FILE` -- path to a JSON file declaring providers/central MCP servers/profiles to provision at startup, before either transport starts accepting requests. See `acpx-server/src/provisioning.rs`'s doc comment for the full schema and the `secret`/`secret_env` distinction (`secret_env` -- reading the actual value from an env var rather than the file -- is the recommended shape for anything beyond local testing). A malformed or rejected file fails startup outright rather than booting a partially-configured gateway. Example:
+
+  ```json
+  {
+    "providers": [
+      {"name": "anthropic-default", "kind": "anthropic", "base_url": null}
+    ],
+    "mcp_servers": [
+      {"name": "fs", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]}
+    ],
+    "profiles": [
+      {
+        "name": "work-claude",
+        "agent_id": "claude-agent-acp",
+        "provider": "anthropic-default",
+        "secret_env": "ANTHROPIC_API_KEY",
+        "mcp_servers": ["fs"]
+      }
+    ]
+  }
+  ```
+
+  Before this, `Router::register_provider`/`Router::store_key` were
+  programmatic-only seams exercised solely by this workspace's own tests
+  -- a real deployment had no way to provision a provider/profile without
+  writing Rust. This closes that gap.
 
 ## Self-test
 
