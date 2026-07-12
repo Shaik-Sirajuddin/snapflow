@@ -1438,7 +1438,7 @@ impl Backend for MltBackend {
             .map_err(|e| BackendError::InvalidParams(format!("failed to spawn `{melt_bin}`: {e} (is melt on PATH, or MELT_BIN set?)")))?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
-        {
+        let evicted = {
             let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
             jobs.insert(
                 job_id.clone(),
@@ -1450,8 +1450,13 @@ impl Backend for MltBackend {
                     error: None,
                 },
             );
-        }
+            prune_finished_jobs(&mut jobs)
+        };
         self.job_projects.insert(job_id.clone(), project_id.to_string());
+        for id in &evicted {
+            self.job_projects.remove(id);
+            self.job_children.remove(id);
+        }
 
         // Keep a kill handle so `jobs.stop` can terminate the melt process.
         // The waiter polls `try_wait` rather than taking ownership via
@@ -1910,6 +1915,50 @@ pub(crate) fn detect_unrecognised_codec(stderr: &str) -> Option<&str> {
     stderr
         .lines()
         .find(|line| line.contains("unrecognised - ignoring") || line.contains("unrecognized - ignoring"))
+}
+
+/// Cap on the number of `file.export` job records kept in memory at once.
+/// `MltBackend`/`FfiBackend` both keep every export job (running or
+/// terminal) in an `Arc<Mutex<HashMap<String, JobStatus>>>` for the entire
+/// lifetime of the process -- and per `snapshotd/internal/sapproxy/
+/// router.go`'s connection pooling, one sap-rust process stays alive for
+/// one project *indefinitely* (until the daemon or the project itself
+/// exits), not just for one RPC session. Before `prune_finished_jobs`
+/// existed, nothing ever removed a finished/errored/stopped job from this
+/// map, so an agent that calls `file.export` repeatedly over a long
+/// project lifetime (retries, iterative preview exports, ...) grew it
+/// without bound. `pub(crate)` so `FfiBackend::file_export`
+/// (`ffi_backend.rs`) can share this instead of duplicating it -- same
+/// reuse rationale as `normalize_vcodec`/`detect_unrecognised_codec`.
+pub(crate) const MAX_TRACKED_JOBS: usize = 200;
+
+/// Evicts terminal (non-`"running"`) jobs from `jobs` until its size is
+/// back at or under `MAX_TRACKED_JOBS`, and returns the evicted ids so a
+/// caller holding other per-job state keyed the same way (`job_children`,
+/// `MltBackend::job_projects`) can drop those entries too and stay in
+/// sync. A job still `"running"` is never evicted -- even if that
+/// temporarily leaves `jobs` above the cap -- because its real outcome
+/// must stay retrievable via `jobs.get` until the export actually
+/// finishes; only already-finished bookkeeping is bounded. Which terminal
+/// jobs get evicted first when there are more than needed is unspecified
+/// (arbitrary among terminal entries): `jobs.get` on a very old finished
+/// job was never a guaranteed-forever contract, only "until we needed the
+/// memory back".
+pub(crate) fn prune_finished_jobs(jobs: &mut HashMap<String, JobStatus>) -> Vec<String> {
+    if jobs.len() <= MAX_TRACKED_JOBS {
+        return Vec::new();
+    }
+    let over = jobs.len() - MAX_TRACKED_JOBS;
+    let evict: Vec<String> = jobs
+        .iter()
+        .filter(|(_, job)| job.status != "running")
+        .map(|(id, _)| id.clone())
+        .take(over)
+        .collect();
+    for id in &evict {
+        jobs.remove(id);
+    }
+    evict
 }
 
 /// `pub(crate)` -- see `normalize_vcodec`, same reuse rationale.
@@ -2585,6 +2634,82 @@ mod tests {
             other => panic!("expected NotFound, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression test for the unbounded-`jobs`-map growth finding
+    /// (`prune_finished_jobs`): a long-lived project that calls
+    /// `file.export` many times over its lifetime must not keep every
+    /// terminal job record forever, but a still-`"running"` job must
+    /// never be evicted, even once the map is well over the cap.
+    #[test]
+    fn prune_finished_jobs_bounds_the_map_without_evicting_running_jobs() {
+        let mut jobs: HashMap<String, JobStatus> = HashMap::new();
+        for i in 0..(MAX_TRACKED_JOBS + 50) {
+            jobs.insert(
+                format!("done-{i}"),
+                JobStatus {
+                    job_id: format!("done-{i}"),
+                    status: "done".into(),
+                    percent: 100.0,
+                    result_path: Some(format!("/tmp/out-{i}.mp4")),
+                    error: None,
+                },
+            );
+        }
+        jobs.insert(
+            "still-running".into(),
+            JobStatus {
+                job_id: "still-running".into(),
+                status: "running".into(),
+                percent: 40.0,
+                result_path: Some("/tmp/out-running.mp4".into()),
+                error: None,
+            },
+        );
+        assert_eq!(jobs.len(), MAX_TRACKED_JOBS + 51);
+
+        let evicted = prune_finished_jobs(&mut jobs);
+
+        assert_eq!(jobs.len(), MAX_TRACKED_JOBS);
+        assert_eq!(evicted.len(), 51);
+        assert!(!evicted.contains(&"still-running".to_string()));
+        assert!(jobs.contains_key("still-running"));
+        for id in &evicted {
+            assert!(!jobs.contains_key(id));
+        }
+
+        // A map already at/under the cap is left untouched.
+        let mut small: HashMap<String, JobStatus> = HashMap::new();
+        small.insert(
+            "only-one".into(),
+            JobStatus {
+                job_id: "only-one".into(),
+                status: "done".into(),
+                percent: 100.0,
+                result_path: None,
+                error: None,
+            },
+        );
+        assert!(prune_finished_jobs(&mut small).is_empty());
+        assert_eq!(small.len(), 1);
+
+        // Every job still running: nothing evictable, map stays over cap
+        // rather than dropping a live job's status.
+        let mut all_running: HashMap<String, JobStatus> = HashMap::new();
+        for i in 0..(MAX_TRACKED_JOBS + 5) {
+            all_running.insert(
+                format!("run-{i}"),
+                JobStatus {
+                    job_id: format!("run-{i}"),
+                    status: "running".into(),
+                    percent: 0.0,
+                    result_path: None,
+                    error: None,
+                },
+            );
+        }
+        assert!(prune_finished_jobs(&mut all_running).is_empty());
+        assert_eq!(all_running.len(), MAX_TRACKED_JOBS + 5);
     }
 
     /// Proof for playlist.insert/remove/move/get, mirroring the existing

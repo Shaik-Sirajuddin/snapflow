@@ -1308,7 +1308,7 @@ impl Backend for FfiBackend {
             .map_err(|e| BackendError::InvalidParams(format!("failed to spawn `{melt_bin}`: {e} (is melt on PATH, or MELT_BIN set?)")))?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
-        {
+        let evicted = {
             let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
             jobs.insert(
                 job_id.clone(),
@@ -1320,6 +1320,15 @@ impl Backend for FfiBackend {
                     error: None,
                 },
             );
+            // Shares `MltBackend`'s eviction policy/constant rather than
+            // duplicating it -- see `prune_finished_jobs`'s doc comment in
+            // `mlt_backend.rs` for why this map needs bounding at all
+            // (this backend's `jobs`/`job_children` have the exact same
+            // unbounded-growth shape MltBackend's did).
+            crate::mlt_backend::prune_finished_jobs(&mut jobs)
+        };
+        for id in &evicted {
+            self.job_children.remove(id);
         }
 
         // Same kill-handle-plus-polling-thread shape as MltBackend::
