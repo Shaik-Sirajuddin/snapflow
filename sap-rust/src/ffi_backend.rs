@@ -149,8 +149,14 @@ impl Backend for FfiBackend {
         }
     }
 
-    fn edit_reorder_track(&mut self, _project_id: &str, _from_index: usize, _to_index: usize) -> BackendResult<Vec<Track>> {
-        Err(BackendError::Unsupported("edit.reorderTrack not wired to real FFI yet".into()))
+    fn edit_reorder_track(&mut self, project_id: &str, from_index: usize, to_index: usize) -> BackendResult<Vec<Track>> {
+        let rc = unsafe {
+            ffi::sap_reorder_track(self.main_window, from_index as c_int, to_index as c_int)
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("track {from_index} or {to_index}")));
+        }
+        self.edit_list_tracks(project_id)
     }
 
     fn edit_set_track_properties(
@@ -168,11 +174,6 @@ impl Backend for FfiBackend {
         // the qtblend/cairoblend *transition* between adjacent video
         // tracks (trackpropertieswidget.cpp), which needs its own
         // transition-lookup C-ABI function not yet added here.
-        if blend_mode.is_some() {
-            return Err(BackendError::Unsupported(
-                "edit.setTrackProperties: blendMode not wired to real FFI yet (mute/hidden/locked are)".into(),
-            ));
-        }
         if let Some(v) = muted {
             let rc = unsafe { ffi::sap_set_track_muted(self.main_window, track_index as c_int, v as c_int) };
             if rc != 0 {
@@ -191,6 +192,22 @@ impl Backend for FfiBackend {
                 return Err(BackendError::NotFound(format!("track {track_index}")));
             }
         }
+        if let Some(v) = blend_mode {
+            // Real Timeline::ChangeBlendModeCommand via the qtblend/
+            // movit.overlay/cairoblend transition lookup in sap_ffi.cpp
+            // (duplicated from TrackPropertiesWidget::getTransition() since
+            // MultitrackModel's own lookup is private -- see sap_ffi.cpp).
+            let c_mode = CString::new(v)
+                .map_err(|e| BackendError::InvalidParams(format!("bad blendMode: {e}")))?;
+            let rc = unsafe {
+                ffi::sap_set_track_blend_mode(self.main_window, track_index as c_int, c_mode.as_ptr())
+            };
+            if rc != 0 {
+                return Err(BackendError::NotFound(format!(
+                    "track {track_index} has no blend transition"
+                )));
+            }
+        }
         // `sap_list_tracks` now reads muted/hidden/locked back from the
         // real MultitrackModel::IsMute/Hidden/LockedRole (genuine current
         // Qt/MLT state, not an echo), so re-querying after the writes
@@ -207,19 +224,64 @@ impl Backend for FfiBackend {
         Err(BackendError::Unsupported("edit.setTrackHeight not wired to real FFI yet".into()))
     }
 
-    fn edit_remove_clip(&mut self, _project_id: &str, _track_index: usize, _clip_index: usize) -> BackendResult<()> {
-        Err(BackendError::Unsupported("edit.removeClip not wired to real FFI yet".into()))
+    fn edit_remove_clip(&mut self, _project_id: &str, track_index: usize, clip_index: usize) -> BackendResult<()> {
+        let rc = unsafe {
+            ffi::sap_remove_clip(self.main_window, track_index as c_int, clip_index as c_int)
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("clip {track_index}/{clip_index}")));
+        }
+        Ok(())
     }
 
     fn edit_move_clip(
         &mut self,
         _project_id: &str,
-        _from_track_index: usize,
-        _from_clip_index: usize,
-        _to_track_index: usize,
-        _to_clip_index: usize,
+        from_track_index: usize,
+        from_clip_index: usize,
+        to_track_index: usize,
+        to_clip_index: usize,
     ) -> BackendResult<Clip> {
-        Err(BackendError::Unsupported("edit.moveClip not wired to real FFI yet".into()))
+        // Protocol-level edit.moveClip has no ripple param (see
+        // server.rs/backend.rs) -- MockBackend/MltBackend's Vec-based move
+        // semantics are non-rippling too, so pass ripple=false here to
+        // match that behavior rather than shifting downstream clips.
+        let raw = unsafe {
+            ffi::sap_move_clip(
+                self.main_window,
+                from_track_index as c_int,
+                from_clip_index as c_int,
+                to_track_index as c_int,
+                to_clip_index as c_int,
+                0,
+            )
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "moveClip {from_track_index}/{from_clip_index} -> {to_track_index}/{to_clip_index} rejected"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        #[derive(serde::Deserialize)]
+        struct MoveClipResult {
+            #[serde(rename = "clipId")]
+            clip_id: String,
+            index: usize,
+            #[serde(rename = "inFrame")]
+            in_frame: i64,
+            #[serde(rename = "outFrame")]
+            out_frame: i64,
+        }
+        let parsed: MoveClipResult = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad moveClip JSON: {e}")))?;
+        Ok(Clip {
+            clip_id: parsed.clip_id,
+            index: parsed.index,
+            source: Value::Null,
+            in_frame: parsed.in_frame,
+            out_frame: parsed.out_frame,
+        })
     }
 
     fn edit_list_tracks(&mut self, _project_id: &str) -> BackendResult<Vec<Track>> {

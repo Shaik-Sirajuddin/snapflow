@@ -45,6 +45,49 @@ extern "C" {
     pub fn sap_set_track_hidden(main_window_handle: *mut c_void, track_index: c_int, hidden: c_int) -> c_int;
     pub fn sap_set_track_locked(main_window_handle: *mut c_void, track_index: c_int, locked: c_int) -> c_int;
 
+    /// C++ side: `int sap_reorder_track(void* mainWindowHandle, int
+    /// fromTrackIndex, int toTrackIndex);` -- real
+    /// `TimelineDock::moveTrack()`/`Timeline::MoveTrackCommand` (undoable).
+    /// Returns 0 on success, -1 on error (invalid handle/index, or
+    /// mismatched track types).
+    pub fn sap_reorder_track(main_window_handle: *mut c_void, from_track_index: c_int, to_track_index: c_int) -> c_int;
+
+    /// C++ side: `int sap_remove_clip(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex);` -- real
+    /// `TimelineDock::remove()`/`Timeline::RemoveCommand` (undoable).
+    /// Returns 0 on success, -1 on error (invalid handle/index, locked
+    /// track).
+    pub fn sap_remove_clip(main_window_handle: *mut c_void, track_index: c_int, clip_index: c_int) -> c_int;
+
+    /// C++ side: `char* sap_move_clip(void* mainWindowHandle, int
+    /// fromTrackIndex, int fromClipIndex, int toTrackIndex, int
+    /// toClipIndex, int ripple);` -- real
+    /// `TimelineDock::moveClip()`/`Timeline::MoveClipCommand` (undoable).
+    /// Returns a heap-allocated JSON object string describing the clip at
+    /// its final position, re-read from the real destination playlist, or
+    /// NULL on error/rejected move. Caller must free via `sap_free_string`.
+    pub fn sap_move_clip(
+        main_window_handle: *mut c_void,
+        from_track_index: c_int,
+        from_clip_index: c_int,
+        to_track_index: c_int,
+        to_clip_index: c_int,
+        ripple: c_int,
+    ) -> *mut c_char;
+
+    /// C++ side: `char* sap_get_track_blend_mode(void* mainWindowHandle,
+    /// int trackIndex);` -- real per-track qtblend/movit.overlay/
+    /// cairoblend transition mode property, read back live. Returns a
+    /// heap-allocated string, or NULL if the track has no blend transition
+    /// or on error. Caller must free via `sap_free_string`.
+    pub fn sap_get_track_blend_mode(main_window_handle: *mut c_void, track_index: c_int) -> *mut c_char;
+
+    /// C++ side: `int sap_set_track_blend_mode(void* mainWindowHandle, int
+    /// trackIndex, const char* mode);` -- real
+    /// `Timeline::ChangeBlendModeCommand` (undoable). Returns 0 on success,
+    /// -1 on error (invalid handle/index, or no blend transition present).
+    pub fn sap_set_track_blend_mode(main_window_handle: *mut c_void, track_index: c_int, mode: *const c_char) -> c_int;
+
     /// C++ side: `char* sap_list_tracks(void* mainWindowHandle);` -- returns a
     /// heap-allocated, NUL-terminated JSON array string of the form
     /// `[{"index":0,"kind":"video"},...]` (built from the real
