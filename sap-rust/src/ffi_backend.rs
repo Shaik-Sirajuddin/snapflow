@@ -89,6 +89,36 @@ impl FfiBackend {
             .map_err(|_| BackendError::InvalidParams(format!("malformed clip id: {clip_id}")))?;
         Ok((track_index, clip_index))
     }
+
+    /// Parses one `sap_playlist_*` JSON object result (`{"index":N,
+    /// "name":"...","path":"...","durationFrames":N}`) into a `PlaylistEntry`,
+    /// with the caller-supplied `source` value (so `playlist.append`/
+    /// `insert` echo back the exact source JSON the caller sent, while
+    /// `playlist.list`/`get` synthesize `{"path": ...}` from the live
+    /// re-read resource, matching MltBackend's own echo-vs-derive split).
+    fn parse_playlist_entry(json_str: &str, source: Value) -> BackendResult<PlaylistEntry> {
+        let value: Value = serde_json::from_str(json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad playlist-entry JSON: {e}")))?;
+        Self::parse_playlist_entry_value(value, source)
+    }
+
+    fn parse_playlist_entry_value(value: Value, source: Value) -> BackendResult<PlaylistEntry> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            index: usize,
+            name: String,
+            duration_frames: i64,
+        }
+        let raw: Raw = serde_json::from_value(value)
+            .map_err(|e| BackendError::InvalidParams(format!("bad playlist-entry JSON: {e}")))?;
+        Ok(PlaylistEntry {
+            index: raw.index,
+            name: raw.name,
+            source,
+            duration_frames: raw.duration_frames,
+        })
+    }
 }
 
 impl Backend for FfiBackend {
@@ -428,14 +458,47 @@ impl Backend for FfiBackend {
     fn playlist_append(
         &mut self,
         _project_id: &str,
-        _source: Value,
+        source: Value,
         _name: Option<String>,
     ) -> BackendResult<PlaylistEntry> {
-        Err(BackendError::NotFound("playlist.append not wired to real FFI yet".into()))
+        // `_name` is intentionally ignored -- real playlist entries derive
+        // their display name from the live shotcut:caption MLT property or
+        // the resource's file basename (see playlistEntryToJson in
+        // sap_ffi.cpp), same as MltBackend accepting but not honoring it
+        // for probe-derived entries.
+        let path = source
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
+        let raw = unsafe { ffi::sap_playlist_append(self.main_window, c_path.as_ptr()) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "failed to append {path} to playlist (did not open as a valid MLT producer)"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        Self::parse_playlist_entry(&json_str, source)
     }
 
     fn playlist_list(&mut self, _project_id: &str) -> BackendResult<Vec<PlaylistEntry>> {
-        Ok(Vec::new())
+        let raw = unsafe { ffi::sap_playlist_list(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::NotFound("playlist unavailable".into()));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        let entries: Vec<Value> = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad playlist-list JSON: {e}")))?;
+        entries
+            .into_iter()
+            .map(|entry| {
+                let path = entry.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
+                Self::parse_playlist_entry_value(entry, json!({"path": path}))
+            })
+            .collect()
     }
 
     // --- Minimal stubs for the new playlist.* trait methods (task: keep
@@ -447,29 +510,72 @@ impl Backend for FfiBackend {
     fn playlist_insert(
         &mut self,
         _project_id: &str,
-        _index: usize,
-        _source: Value,
+        index: usize,
+        source: Value,
         _name: Option<String>,
     ) -> BackendResult<PlaylistEntry> {
-        Err(BackendError::NotFound("playlist.insert not wired to real FFI yet".into()))
+        let path = source
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
+        let c_path = CString::new(path)
+            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
+        let raw = unsafe { ffi::sap_playlist_insert(self.main_window, index as c_int, c_path.as_ptr()) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "failed to insert {path} at playlist index {index} (out of range, or not a valid MLT producer)"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        Self::parse_playlist_entry(&json_str, source)
     }
 
-    fn playlist_remove(&mut self, _project_id: &str, _index: usize) -> BackendResult<()> {
-        Err(BackendError::NotFound("playlist.remove not wired to real FFI yet".into()))
+    fn playlist_remove(&mut self, _project_id: &str, index: usize) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_playlist_remove(self.main_window, index as c_int) };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("playlist index {index}")));
+        }
+        Ok(())
     }
 
-    fn playlist_move(&mut self, _project_id: &str, _from_index: usize, _to_index: usize) -> BackendResult<()> {
-        Err(BackendError::NotFound("playlist.move not wired to real FFI yet".into()))
+    fn playlist_move(&mut self, _project_id: &str, from_index: usize, to_index: usize) -> BackendResult<()> {
+        let rc = unsafe {
+            ffi::sap_playlist_move(self.main_window, from_index as c_int, to_index as c_int)
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("playlist index {from_index} or {to_index}")));
+        }
+        Ok(())
     }
 
-    fn playlist_get(&mut self, _project_id: &str, _index: usize) -> BackendResult<PlaylistEntryDetail> {
-        Err(BackendError::NotFound("playlist.get not wired to real FFI yet".into()))
+    fn playlist_get(&mut self, _project_id: &str, index: usize) -> BackendResult<PlaylistEntryDetail> {
+        let raw = unsafe { ffi::sap_playlist_get(self.main_window, index as c_int) };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(format!("playlist index {index}")));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        let value: Value = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad playlist-get JSON: {e}")))?;
+        let path = value.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
+        let entry = Self::parse_playlist_entry_value(value, json!({"path": path.clone()}))?;
+        // Reuse the same real ffprobe-backed helper file.probe uses -- only
+        // meaningful for file-backed sources, same honesty policy as
+        // MltBackend::playlist_get (a generator/title/blank-spacer entry
+        // has no real file to probe, so `probe` is honestly `None`).
+        let probe = if path.is_empty() { None } else { crate::mlt_backend::probe_media(&path).ok() };
+        Ok(PlaylistEntryDetail {
+            index: entry.index,
+            name: entry.name,
+            source: entry.source,
+            duration_frames: entry.duration_frames,
+            probe,
+        })
     }
 
-    fn file_import(&mut self, _project_id: &str, _path: &str) -> BackendResult<PlaylistEntry> {
-        Err(BackendError::Unsupported(
-            "file.import is unsupported: no Qt/MLT import shim is available".into(),
-        ))
+    fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry> {
+        self.playlist_append(project_id, json!({"path": path}), None)
     }
 
     fn edit_trim_clip_in(

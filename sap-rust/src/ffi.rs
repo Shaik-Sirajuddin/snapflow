@@ -203,6 +203,19 @@ extern "C" {
         position: c_longlong,
     ) -> *mut c_char;
 
+    /// Playlist ("Source"/bin panel) operations via the real PlaylistModel
+    /// slots. NOT part of the undo stack in real Shotcut either (bin
+    /// management isn't undoable there). Each returns a heap-allocated
+    /// JSON object/array of the form `{"index":N,"name":"...","path":"...",
+    /// "durationFrames":N}`, or NULL/-1 on error. Caller must free string
+    /// results via `sap_free_string`.
+    pub fn sap_playlist_append(main_window_handle: *mut c_void, source_path: *const c_char) -> *mut c_char;
+    pub fn sap_playlist_insert(main_window_handle: *mut c_void, index: c_int, source_path: *const c_char) -> *mut c_char;
+    pub fn sap_playlist_remove(main_window_handle: *mut c_void, index: c_int) -> c_int;
+    pub fn sap_playlist_move(main_window_handle: *mut c_void, from_index: c_int, to_index: c_int) -> c_int;
+    pub fn sap_playlist_get(main_window_handle: *mut c_void, index: c_int) -> *mut c_char;
+    pub fn sap_playlist_list(main_window_handle: *mut c_void) -> *mut c_char;
+
     /// C++ side: `char* sap_list_tracks(void* mainWindowHandle);` -- returns a
     /// heap-allocated, NUL-terminated JSON array string of the form
     /// `[{"index":0,"kind":"video"},...]` (built from the real
