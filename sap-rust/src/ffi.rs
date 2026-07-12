@@ -159,6 +159,50 @@ extern "C" {
         to_index: c_int,
     ) -> c_int;
 
+    /// C++ side: `char* sap_list_clips(void* mainWindowHandle, int
+    /// trackIndex);` -- returns a heap-allocated JSON array string listing
+    /// every clip on trackIndex, in playlist order, of the form
+    /// `[{"clipId":"t0c0","index":0,"path":"...","inFrame":0,"outFrame":299},...]`,
+    /// or NULL on error (invalid handle/trackIndex). Caller must free via
+    /// `sap_free_string`.
+    pub fn sap_list_clips(main_window_handle: *mut c_void, track_index: c_int) -> *mut c_char;
+
+    /// C++ side: `int sap_trim_clip_in(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, long long newInFrame);` -- real
+    /// `Timeline::TrimClipInCommand` (undoable), non-ripple. Returns 0 on
+    /// success, -1 on error (invalid handle/track/clip/locked track, or
+    /// out-of-range newInFrame).
+    pub fn sap_trim_clip_in(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        new_in_frame: c_longlong,
+    ) -> c_int;
+
+    /// C++ side: `int sap_trim_clip_out(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, long long newOutFrame);` -- real
+    /// `Timeline::TrimClipOutCommand` (undoable), non-ripple. Returns 0 on
+    /// success, -1 on error.
+    pub fn sap_trim_clip_out(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        new_out_frame: c_longlong,
+    ) -> c_int;
+
+    /// C++ side: `char* sap_split_clip(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, long long position);` -- real
+    /// `Timeline::SplitCommand` (undoable). Returns a heap-allocated JSON
+    /// object string `{"leftClipId":...,"rightClipId":...,"leftIndex":...,
+    /// "rightIndex":...}`, or NULL on error. Caller must free via
+    /// `sap_free_string`.
+    pub fn sap_split_clip(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        position: c_longlong,
+    ) -> *mut c_char;
+
     /// C++ side: `char* sap_list_tracks(void* mainWindowHandle);` -- returns a
     /// heap-allocated, NUL-terminated JSON array string of the form
     /// `[{"index":0,"kind":"video"},...]` (built from the real

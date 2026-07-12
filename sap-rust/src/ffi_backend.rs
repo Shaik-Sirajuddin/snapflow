@@ -21,6 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 
 use serde_json::Value;
+use serde_json::json;
 
 use crate::backend::{
     Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo, FilterListEntry, JobStatus,
@@ -369,9 +370,34 @@ impl Backend for FfiBackend {
         })
     }
 
-    fn edit_list_clips(&mut self, _project_id: &str, _track_index: usize) -> BackendResult<Vec<Clip>> {
-        // Stub: no real FFI wrapper yet.
-        Ok(Vec::new())
+    fn edit_list_clips(&mut self, _project_id: &str, track_index: usize) -> BackendResult<Vec<Clip>> {
+        let raw = unsafe { ffi::sap_list_clips(self.main_window, track_index as c_int) };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawClip {
+            clip_id: String,
+            index: usize,
+            path: String,
+            in_frame: i64,
+            out_frame: i64,
+        }
+        let raw_clips: Vec<RawClip> = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad clip-list JSON: {e}")))?;
+        Ok(raw_clips
+            .into_iter()
+            .map(|c| Clip {
+                clip_id: c.clip_id,
+                index: c.index,
+                source: json!({"path": c.path}),
+                in_frame: c.in_frame,
+                out_frame: c.out_frame,
+            })
+            .collect())
     }
 
     fn playback_seek(&mut self, _project_id: &str, frame: i64) -> BackendResult<()> {
@@ -449,31 +475,72 @@ impl Backend for FfiBackend {
     fn edit_trim_clip_in(
         &mut self,
         _project_id: &str,
-        _track_index: usize,
-        _clip_index: usize,
-        _new_frame: i64,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
     ) -> BackendResult<()> {
-        Err(BackendError::NotFound("edit.trimClipIn not wired to real FFI yet".into()))
+        let rc = unsafe {
+            ffi::sap_trim_clip_in(self.main_window, track_index as c_int, clip_index as c_int, new_frame as i64)
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
+            )));
+        }
+        Ok(())
     }
 
     fn edit_trim_clip_out(
         &mut self,
         _project_id: &str,
-        _track_index: usize,
-        _clip_index: usize,
-        _new_frame: i64,
+        track_index: usize,
+        clip_index: usize,
+        new_frame: i64,
     ) -> BackendResult<()> {
-        Err(BackendError::NotFound("edit.trimClipOut not wired to real FFI yet".into()))
+        let rc = unsafe {
+            ffi::sap_trim_clip_out(self.main_window, track_index as c_int, clip_index as c_int, new_frame as i64)
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
+            )));
+        }
+        Ok(())
     }
 
     fn edit_split_clip(
         &mut self,
         _project_id: &str,
-        _track_index: usize,
-        _clip_index: usize,
-        _position: i64,
+        track_index: usize,
+        clip_index: usize,
+        position: i64,
     ) -> BackendResult<SplitClipResult> {
-        Err(BackendError::NotFound("edit.splitClip not wired to real FFI yet".into()))
+        let raw = unsafe {
+            ffi::sap_split_clip(self.main_window, track_index as c_int, clip_index as c_int, position)
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "split of clip {track_index}/{clip_index} at {position} rejected (invalid clip, or position not inside the clip)"
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawSplit {
+            left_clip_id: String,
+            right_clip_id: String,
+            left_index: usize,
+            right_index: usize,
+        }
+        let parsed: RawSplit = serde_json::from_str(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad split-clip JSON: {e}")))?;
+        Ok(SplitClipResult {
+            left_clip_id: parsed.left_clip_id,
+            right_clip_id: parsed.right_clip_id,
+            left_index: parsed.left_index,
+            right_index: parsed.right_index,
+        })
     }
 
     fn transitions_add_crossfade(
