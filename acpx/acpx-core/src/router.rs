@@ -694,13 +694,19 @@ impl Router {
                 } else {
                     self.profiles.update(profile.clone())?;
                 }
-                serde_json::to_value(&profile).expect("Profile always serializes")
+                redact_launch_overrides(
+                    serde_json::to_value(&profile).expect("Profile always serializes"),
+                )
             }
             "profiles/list" => {
                 let profiles: Vec<serde_json::Value> = self
                     .profiles
                     .list()
-                    .map(|p| serde_json::to_value(p).expect("Profile always serializes"))
+                    .map(|p| {
+                        redact_launch_overrides(
+                            serde_json::to_value(p).expect("Profile always serializes"),
+                        )
+                    })
                     .collect();
                 serde_json::json!({ "profiles": profiles })
             }
@@ -1249,6 +1255,39 @@ fn now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
+}
+
+/// Mask every value in a serialized `Profile`'s `launch_overrides` map
+/// before it's ever echoed back to a client (`profiles/create`/`update`'s
+/// own response, and every entry in `profiles/list`).
+///
+/// **Real bug this closes** (found in the same self-review pass as the
+/// `session/close` leak and `profiles/delete` process leak above):
+/// `launch_overrides` is documented (`profile.rs`, `resolve_profile`'s
+/// doc comment) as a raw env-var escape hatch specifically meant to carry
+/// things like `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL` directly -- the
+/// real-adapter e2e test uses exactly that. Unlike the `secret` field
+/// (which is deliberately never echoed back, only its opaque `KeyRef`),
+/// `launch_overrides` was returned byte-for-byte in every
+/// `profiles/create`/`update`/`list` response with no redaction at all.
+/// For a gateway explicitly designed to serve *multiple concurrent
+/// clients* (this workspace's own stated purpose) sharing one
+/// `ACPX_AUTH_TOKEN`, that meant any client able to call `profiles/list`
+/// could read every other client's raw API keys in plaintext, not just
+/// its own. Keys are left visible (so a client can still see *which*
+/// vars a profile overrides, useful for debugging) -- only values are
+/// masked, mirroring the existing "secret material is never echoed"
+/// precedent for `key_ref`/`Keystore`.
+fn redact_launch_overrides(mut profile_json: serde_json::Value) -> serde_json::Value {
+    if let Some(overrides) = profile_json
+        .get_mut("launch_overrides")
+        .and_then(|v| v.as_object_mut())
+    {
+        for value in overrides.values_mut() {
+            *value = serde_json::Value::String("***redacted***".to_string());
+        }
+    }
+    profile_json
 }
 
 /// Build a `SpawnSpec` for one of the official registry's `npx`-distributed

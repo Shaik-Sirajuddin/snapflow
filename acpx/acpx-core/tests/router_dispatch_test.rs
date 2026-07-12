@@ -305,3 +305,81 @@ async fn profiles_delete_stops_the_profiles_running_backend_process() {
         "profiles/delete must stop the profile's backend process, not leak it forever"
     );
 }
+
+/// **Regression test for a real bug**: `profiles/create`/`update`/`list`
+/// used to echo `launch_overrides` values back byte-for-byte -- for a
+/// gateway meant to serve multiple concurrent clients sharing one
+/// `ACPX_AUTH_TOKEN`, that meant any client able to call `profiles/list`
+/// could read another profile's raw secrets (e.g. an `ANTHROPIC_API_KEY`
+/// set via that documented escape hatch) in plaintext. Proves values are
+/// now masked in every response that echoes a profile back, while the
+/// stored profile itself (and therefore real backend spawning) still
+/// gets the real, unredacted value.
+#[tokio::test]
+async fn launch_overrides_values_are_redacted_in_every_profile_response() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+
+    let create = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "profiles/create",
+            "params": {
+                "name": "secret-holder",
+                "agent_id": "stand-in-agent",
+                "launch_overrides": {"ANTHROPIC_API_KEY": "sk-real-secret-value"}
+            }
+        }))
+        .await
+        .expect("profiles/create");
+    assert_eq!(
+        create["result"]["launch_overrides"]["ANTHROPIC_API_KEY"],
+        json!("***redacted***"),
+        "profiles/create must not echo the raw secret value back"
+    );
+
+    let list = router
+        .dispatch(json!({"jsonrpc": "2.0", "id": 2, "method": "profiles/list", "params": {}}))
+        .await
+        .expect("profiles/list");
+    let listed = &list["result"]["profiles"][0];
+    assert_eq!(
+        listed["launch_overrides"]["ANTHROPIC_API_KEY"],
+        json!("***redacted***"),
+        "profiles/list must not leak a raw secret to any other client that can list profiles"
+    );
+
+    let update = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "profiles/update",
+            "params": {
+                "name": "secret-holder",
+                "agent_id": "stand-in-agent",
+                "launch_overrides": {"ANTHROPIC_API_KEY": "sk-real-secret-value"}
+            }
+        }))
+        .await
+        .expect("profiles/update");
+    assert_eq!(
+        update["result"]["launch_overrides"]["ANTHROPIC_API_KEY"],
+        json!("***redacted***"),
+        "profiles/update must not echo the raw secret value back either"
+    );
+
+    // The stored profile itself must still carry the real value -- this
+    // is a response-serialization-only redaction, not data loss. Verified
+    // indirectly: `session/new` against this profile must still be able
+    // to inject the real env var into the spawned backend, which the
+    // observing stand-in backend in `profile_resolution_test.rs` already
+    // proves for the general env-injection path; here we just confirm
+    // `session/new` doesn't error, i.e. the profile is still fully usable.
+    let session = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "session/new",
+            "params": {"cwd": "/tmp", "_acpx": {"profile": "secret-holder"}}
+        }))
+        .await;
+    assert!(
+        session.is_ok(),
+        "profile must remain fully usable after redaction-on-echo: {session:?}"
+    );
+}

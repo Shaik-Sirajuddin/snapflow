@@ -380,3 +380,34 @@ passes end to end, ~33s wall-clock this run (network-latency variance
 from the ~11s seen in the original run, not a regression -- both
 conversations' real model replies were still verified correct and both
 profiles' processes still ran concurrently, not serialized).
+
+**Fourth bug found in the same pass, after the above three were
+already fixed and re-verified:** `profiles/create`/`update`/`list`
+echoed a profile's `launch_overrides` map back byte-for-byte, with no
+redaction, in every response. `launch_overrides` is documented
+(`profile.rs`, `resolve_profile`) as a raw env-var escape hatch
+specifically meant to carry things like `ANTHROPIC_API_KEY` directly --
+exactly what `real_claude_multi_agent_test.rs` itself uses, since no
+`ProviderConfig`/`keystore`-based Anthropic wiring test surface exists
+yet. Unlike the `secret` field (deliberately never echoed, only its
+opaque `KeyRef`), `launch_overrides` values had no equivalent
+protection. For a gateway explicitly designed to serve multiple
+concurrent clients sharing one `ACPX_AUTH_TOKEN` (see bug 3 above), that
+meant any client able to call `profiles/list` could read every other
+client's raw secrets in plaintext. Fixed: new
+`router::redact_launch_overrides` masks every `launch_overrides` value
+(keys stay visible) in the JSON echoed back by `profiles/create`,
+`profiles/update`, and every entry in `profiles/list` -- the stored
+`Profile` itself, and therefore real backend env injection at spawn
+time, is untouched (response-serialization-only redaction). Regression
+test: `launch_overrides_values_are_redacted_in_every_profile_response`
+(`acpx-core/tests/router_dispatch_test.rs`), which also asserts the
+profile stays fully usable (`session/new` still succeeds) after
+redaction. Re-verified live: `real_claude_multi_agent_test.rs` (which
+sets `ANTHROPIC_API_KEY` via exactly this `launch_overrides` path) still
+passes end to end post-fix -- the real key still reaches the spawned
+backend, only the client-visible JSON-RPC response no longer echoes it.
+
+Combined workspace test count after all four fixes: **135 passed, 0
+failed, 2 ignored**, `cargo fmt --all --check` and `cargo build
+--workspace` both clean.
