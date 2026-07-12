@@ -176,7 +176,7 @@ async fn start_server(tag: &str, projects_root: PathBuf) -> PathBuf {
     };
     let backend = MltBackend::new(projects_root);
     tokio::spawn(async move {
-        let _ = server::serve(config, backend).await;
+        let _ = server::serve(config, backend, None).await;
     });
     for _ in 0..100 {
         if socket_path.exists() {

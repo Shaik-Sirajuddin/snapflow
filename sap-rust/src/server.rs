@@ -2062,7 +2062,26 @@ async fn handle_connection(
 /// Binds `config.socket_path`, starts the shared dispatcher task that owns
 /// `backend`, then accepts connections forever, spawning one task pair per
 /// connection. Never returns except on a fatal listener error.
-pub async fn serve<B: Backend + 'static>(config: ServerConfig, backend: B) -> std::io::Result<()> {
+/// Runs the server. `external_notify_rx`, when `Some`, is a channel of
+/// notifications that did not originate from this process's own RPC
+/// dispatch -- currently only used by the FFI backend to bridge real
+/// Qt-side edits (`sap_ffi.cpp`'s `sap_emit_event`, which fires on
+/// `MultitrackModel::modified` regardless of whether the edit came from an
+/// RPC-driven `Backend` call or a direct human GUI edit in the same
+/// process) into every connected client's fan-out stream. Unlike normal
+/// dispatch-generated notifications (which are scoped to one project via
+/// `channel_for_project`), an external notification is broadcast to
+/// *every* currently-known project's channel: the FFI backend manages
+/// exactly one real open document, so any session bound to any project_id
+/// in this process is, in reality, looking at that same document. `None`
+/// (every non-FFI caller: `main.rs`, tests) means this fan-out is simply
+/// never spawned -- MockBackend/MltBackend generate their own
+/// per-mutation notifications through the normal dispatch path already.
+pub async fn serve<B: Backend + 'static>(
+    config: ServerConfig,
+    backend: B,
+    external_notify_rx: Option<mpsc::UnboundedReceiver<RpcNotification>>,
+) -> std::io::Result<()> {
     // A stale socket file from a previous run would otherwise make bind()
     // fail with AddrInUse.
     let _ = std::fs::remove_file(&config.socket_path);
@@ -2077,6 +2096,21 @@ pub async fn serve<B: Backend + 'static>(config: ServerConfig, backend: B) -> st
     let channels: ProjectChannels = Arc::new(Mutex::new(HashMap::new()));
     let token = config.token;
     let audio_enabled = config.audio_enabled;
+
+    if let Some(mut external_rx) = external_notify_rx {
+        let channels = channels.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = external_rx.recv().await {
+                let senders: Vec<_> = channels.lock().expect("project channel map poisoned").values().cloned().collect();
+                for sender in senders {
+                    // Fan-out only; no subscribers on a project yet is a
+                    // normal, silent no-op (matches every other notify
+                    // send site in this file).
+                    let _ = sender.send(notification.clone());
+                }
+            }
+        });
+    }
 
     loop {
         let (stream, _addr) = listener.accept().await?;

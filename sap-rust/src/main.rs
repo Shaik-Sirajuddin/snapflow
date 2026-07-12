@@ -71,7 +71,7 @@ async fn main() {
 }
 
 async fn run<B: Backend + 'static>(config: ServerConfig, backend: B) {
-    if let Err(e) = server::serve(config, backend).await {
+    if let Err(e) = server::serve(config, backend, None).await {
         eprintln!("sap-rust: server error: {e}");
         std::process::exit(1);
     }

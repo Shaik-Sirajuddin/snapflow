@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
+use tokio::sync::mpsc;
 
 use crate::backend::{
     Backend, BackendError, BackendResult, Clip, FileProbe, FilterInfo, FilterListEntry, JobStatus,
@@ -34,7 +35,19 @@ use crate::backend::{
     SubtitleTrackInfo, Track, TransitionInfo,
 };
 use crate::ffi;
+use crate::protocol::RpcNotification;
 use crate::server::{self, ServerConfig};
+
+/// Sender half of the external-notification bridge (see `serve`'s
+/// `external_notify_rx` doc comment in `server.rs`), set once by
+/// `sap_start_server` before the tokio runtime starts and read by
+/// `sap_ffi_notify_bridge` (called from C++'s `sap_emit_event`, which may
+/// fire before or after that point -- `None` here just means "server not
+/// up yet, drop it", the same best-effort semantics the prior stderr-only
+/// stub already had). A plain `std::sync::Mutex` is fine: this is set
+/// once and read rarely (only on real Qt-side edits), never on the hot
+/// per-RPC-call path.
+static NOTIFY_BRIDGE_TX: Mutex<Option<mpsc::UnboundedSender<RpcNotification>>> = Mutex::new(None);
 
 /// Wraps the opaque `MainWindow*` handle passed in from C++
 /// (`MainWindow::singleton()`/`MAIN`, cast to `void*`). The embedded process
@@ -1652,6 +1665,14 @@ pub unsafe extern "C" fn sap_start_server(
         audio_enabled,
     };
 
+    // Wire the external-notification bridge (real Qt-side edits, via
+    // sap_ffi.cpp's sap_emit_event) before the runtime starts, so a
+    // signal firing immediately after `sap_install_notification_bridge`'s
+    // connect() call (main.cpp connects it before spawning this very
+    // thread) has somewhere to land rather than racing the mutex init.
+    let (notify_tx, notify_rx) = mpsc::unbounded_channel::<RpcNotification>();
+    *NOTIFY_BRIDGE_TX.lock().expect("notify bridge mutex poisoned") = Some(notify_tx);
+
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -1660,8 +1681,54 @@ pub unsafe extern "C" fn sap_start_server(
         }
     };
     eprintln!("sap-rust: SAP server starting on {socket_path}");
-    if let Err(e) = rt.block_on(server::serve(config, backend)) {
+    if let Err(e) = rt.block_on(server::serve(config, backend, Some(notify_rx))) {
         eprintln!("sap-rust: server exited with error: {e}");
+    }
+}
+
+/// Called from C++ (`sap_ffi.cpp`'s `sap_emit_event`, itself connected to
+/// the real `MultitrackModel::modified` signal by
+/// `sap_install_notification_bridge`) whenever the live Shotcut document
+/// changes -- whether that change came from an RPC-driven `Backend` call
+/// (`edit.addTrack`, `edit.insertClip`, ...) or a direct human GUI edit in
+/// the same process. `json_payload` is a small JSON object with at least a
+/// `"type"` field naming the notification method to publish (currently
+/// always `"edit.changed"`, matching `sap_ffi.cpp`'s call site).
+///
+/// Fans out to every SAP client currently bound to any project in this
+/// process via `server::serve`'s `external_notify_rx` plumbing -- see that
+/// function's doc comment in `server.rs` for why "every project", not one.
+/// A malformed payload, a null pointer, or a call before `sap_start_server`
+/// has reached the point of populating `NOTIFY_BRIDGE_TX` are all silent
+/// no-ops (matches the pre-existing stderr-only stub's own best-effort
+/// semantics -- this bridge must never be allowed to panic or block the Qt
+/// main thread it runs on).
+///
+/// # Safety
+/// `json_payload`, if non-null, must be a valid NUL-terminated C string for
+/// the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn sap_ffi_notify_bridge(json_payload: *const c_char) {
+    if json_payload.is_null() {
+        return;
+    }
+    let payload = CStr::from_ptr(json_payload).to_string_lossy().into_owned();
+    #[derive(serde::Deserialize)]
+    struct EmitPayload {
+        #[serde(rename = "type")]
+        type_: String,
+    }
+    let Ok(parsed) = serde_json::from_str::<EmitPayload>(&payload) else {
+        return;
+    };
+    let notification = RpcNotification::new(parsed.type_, json!({"reason": "qtGuiEdit"}));
+    if let Ok(guard) = NOTIFY_BRIDGE_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            // Non-blocking by construction (unbounded channel); a send
+            // error just means the server task already shut down, a
+            // normal shutdown-race outcome, not something to surface.
+            let _ = tx.send(notification);
+        }
     }
 }
 
