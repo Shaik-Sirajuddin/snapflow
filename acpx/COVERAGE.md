@@ -9,7 +9,7 @@ sync with the code. Every row reflects a real `cargo test --workspace`
 run and an actual read of the referenced test file(s) -- not an
 aspirational claim of what should exist.
 
-As of this update: `cargo test --workspace` passes **123 tests, 0
+As of this update: `cargo test --workspace` passes **134 tests, 0
 failures, 2 explicitly `#[ignore]`d** (the live-registry network test,
 see Phase 4 below, and the real-adapter multi-agent e2e test, see the
 "real ACP adapter end-to-end" section below -- both hit real networks/
@@ -296,8 +296,87 @@ these are acknowledged, not newly discovered:
 - **No encryption at rest for the keystore.** `keystore.rs` is explicit in its own doc comment: secrets live in-memory only, process restart forgets them, and no encryption-at-rest mechanism has been chosen yet (`05-open-risks.md`'s "Key storage mechanism is unspecified" item is still open).
 - **`claude-agent-acp`'s `ANTHROPIC_BASE_URL` support is researched, not verified against a real running adapter** -- see Phase 3 step 16's row above and `05-open-risks.md`.
 - **One process per profile, not one process per session.** Re-resolving an already-running profile (e.g. after a `profiles/update` changes its provider/key) does not restart its already-running supervised process -- documented as a known gap in `router.rs`'s `resolve_profile` doc comment, tracks `05-open-risks.md`'s "one process per backend vs. one process per session" item.
-- **No transport security (auth/TLS) for the HTTP/WS remote-access transport** -- binds to `127.0.0.1:8790` by default; `05-open-risks.md`'s "Transport security for remote access" item is unresolved.
+- **Transport security for remote access: partially resolved.** Optional bearer-token auth now exists (`ACPX_AUTH_TOKEN`, see the "Post-Phase-6 self-review" section below) -- unset by default (binds to `127.0.0.1:8790` with no auth, matching prior behavior). TLS is still entirely unprovided by this transport; `05-open-risks.md`'s item is narrower than before, not closed.
 - **Partially resolved: `session/update` notifications are now delivered, agent-initiated *requests* are not.** `session/update` notifications arriving during a call are now aggregated into that call's response (`_acpx.updates`, see the "reverse-direction `session/update` aggregation fix" section above) rather than silently dropped. Still genuinely unresolved: a backend-initiated *request* expecting a reply (e.g. `session/request_permission`) has no way to get one in this request/response-shaped aggregation model -- there is still no live, out-of-band channel for the client to answer a backend's mid-call question. `05-open-risks.md` flags this as unresolved; narrower than before, not closed.
 - **No provider/profile provisioning surface in `acpx-server` yet** -- see Phase 3's "Not yet built" note above.
 
 All six phases in `04-phased-plan.md` are now implemented. No phase remains unstarted; the gaps listed above are the honestly-tracked residual work, not missing phases.
+
+## Post-Phase-6 self-review: concurrency, multi-client, auth, memory (real bugs found and fixed)
+
+A targeted self-review of concurrency, multi-client handling, auth, and
+memory behavior (prompted directly, not part of the original phased
+plan) found and fixed three real, concrete bugs -- not style nits. All
+three ship with regression tests; the full `cargo test --workspace` run
+and a fresh live run of `real_claude_multi_agent_test.rs` (see below)
+both stay green.
+
+1. **`session/close` never evicted the session from `SessionRegistry`
+   (unbounded memory leak + stale-session correctness bug).**
+   `Router::dispatch_proxied` and its concurrency-path twin
+   `dispatch_proxied_shared` (`acpx-core/src/router.rs`) both persisted a
+   `session/close` to sqlite but never called `SessionRegistry::remove`
+   -- a method that already existed and had test coverage of its own,
+   but was never called from anywhere in the dispatch path. Practical
+   impact for a long-running daemon: every session ever opened stayed in
+   the in-memory `HashMap` forever (unbounded growth over the process's
+   lifetime), `session/list` kept reporting closed sessions as live
+   indefinitely, and a `session/prompt` against an already-closed gateway
+   session id still resolved and forwarded to the backend instead of
+   erroring. Fixed in both dispatch paths; regression tests:
+   `session_close_evicts_session_from_registry_and_rejects_further_use`
+   and `dispatch_shared_session_close_evicts_session_too`
+   (`acpx-core/tests/router_dispatch_test.rs`).
+2. **`profiles/delete` never stopped the profile's supervised backend
+   process (orphaned child process leak).** `Router::dispatch_native`'s
+   `"profiles/delete"` arm removed the `ProfileStore` entry but left
+   whatever OS process had been spawned for that profile (supervisor key
+   `"profile:<name>"`, see `resolve_profile`) running indefinitely, with
+   no remaining way to ever stop it. Fixed: `profiles/delete` now also
+   calls `Supervisor::stop` on that key (best-effort/no-op if the
+   profile was never actually used). Regression test:
+   `profiles_delete_stops_the_profiles_running_backend_process`, which
+   asserts the process is genuinely `Running` after `session/new` and
+   genuinely `NotStarted` after `profiles/delete` via a new
+   `Router::process_status` test/observability seam.
+3. **No auth on the HTTP/WS transport -- closes (half of) the
+   previously-open "Transport security for remote access" gap.** Every
+   `POST /rpc` and `GET /ws` request was answerable by any client able to
+   reach the bound address, including full profile/provider/key
+   management and control over every other client's sessions -- a real
+   gap for a gateway explicitly designed to serve multiple concurrent
+   clients. Fixed: optional bearer-token auth, gated on `ACPX_AUTH_TOKEN`
+   (`acpx-server/src/config.rs`). Unset (the default) leaves every
+   pre-existing test and deployment byte-for-byte unauthenticated, as
+   before. When set: `POST /rpc` requires `Authorization: Bearer
+   <token>` or gets a `401` with a JSON-RPC-shaped `-32001` error body
+   (`transport::http::AppState`/`AuthConfig`); `GET /ws`'s upgrade
+   request is checked the same way (the only point in a WS connection's
+   lifetime headers are available) and a missing/wrong token gets the
+   upgrade rejected outright rather than completing then failing later.
+   Token comparison is constant-time (manual XOR-accumulate, no new
+   dependency). `acpx-client::raw::GatewayClient` gained
+   `with_auth_token(..)` so the client SDK can actually talk to an
+   authenticated gateway, not just the daemon gaining a feature nothing
+   in this workspace could exercise. New tests:
+   `acpx-server/tests/auth_test.rs` (7 tests: unauthenticated baseline,
+   correct/missing/wrong token on `POST /rpc`, correct/missing/wrong
+   token on the `GET /ws` upgrade) and
+   `acpx-client/tests/gateway_client_test.rs`'s
+   `client_with_auth_token_round_trips_against_an_authenticated_gateway`
+   (proves the client SDK's new auth support end to end, not just the
+   server side). **Still open:** no TLS -- a bearer token sent over
+   plaintext HTTP is only as safe as the transport it rides on; pair
+   `ACPX_AUTH_TOKEN` with a TLS-terminating reverse proxy for any
+   non-loopback deployment. The "Transport security for remote access"
+   gap bullet above is updated to reflect auth being closed, TLS still
+   open.
+
+Re-verified against a real backend after these fixes (not just the
+synthetic stand-ins the regression tests above use):
+`real_claude_multi_agent_test.rs` (two real `claude-agent-acp`
+processes, two profiles, concurrent two-turn conversations) still
+passes end to end, ~33s wall-clock this run (network-latency variance
+from the ~11s seen in the original run, not a regression -- both
+conversations' real model replies were still verified correct and both
+profiles' processes still ran concurrently, not serialized).

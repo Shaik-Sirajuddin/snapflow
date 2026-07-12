@@ -10,22 +10,40 @@
 //! that wants managed mode uses the existing `params._acpx.profile` field
 //! on its `session/new` frame instead -- `Router::dispatch` already
 //! handles that path with zero extra code needed here.
+//!
+//! **Auth**: same `AuthConfig`/`ACPX_AUTH_TOKEN` gate as `http.rs`'s
+//! `POST /rpc` (see that module's doc comment for the full contract).
+//! Checked once, here, against the upgrade request's own headers --
+//! that's the only point in a WS connection's lifetime where headers are
+//! even available, so a rejected upgrade (missing/wrong token) is the
+//! only enforcement point; there is no per-message re-check after that.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 
 use acpx_core::router::dispatch_shared;
 
-use super::http::{json_rpc_error, SharedRouter};
+use super::http::{json_rpc_error, AppState, SharedRouter};
 
 /// Axum handler for `GET /ws`: upgrades the connection, then hands off to
 /// `handle_socket` for the request/response loop.
 pub async fn ws_handler(
-    State(router): State<SharedRouter>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, router))
+) -> Response {
+    if !state.auth.authorize(&headers) {
+        // Reject the upgrade outright -- there is no later point in a WS
+        // connection's lifetime where an `Authorization` header is
+        // available again, so this is the only place auth can be
+        // enforced for this transport. `401` here means the handshake
+        // itself never completes (the client sees a plain HTTP 401
+        // response to its upgrade request, not a WS close frame).
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    ws.on_upgrade(move |socket| handle_socket(socket, state.router))
 }
 
 /// One WS connection's request/response loop: each inbound text/binary

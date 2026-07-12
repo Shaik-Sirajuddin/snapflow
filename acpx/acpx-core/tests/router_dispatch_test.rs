@@ -125,3 +125,183 @@ async fn session_list_aggregates_registered_sessions() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0]["agentId"], json!("stand-in-agent"));
 }
+
+/// **Regression test for a real bug**: `dispatch_proxied`'s `session/close`
+/// handling used to only persist the close to sqlite and never evict the
+/// gateway session id from the in-memory `SessionRegistry` -- meaning
+/// every session ever opened stayed in `session/list`'s output forever
+/// (and the registry's backing `HashMap` grew without bound over a
+/// long-running daemon's lifetime). Proves both halves of the fix: the
+/// session disappears from `session/list`, and a subsequent
+/// `session/prompt` against the now-closed gateway session id is
+/// rejected rather than silently forwarded to the backend.
+#[tokio::test]
+async fn session_close_evicts_session_from_registry_and_rejects_further_use() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+
+    let new_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        }))
+        .await
+        .expect("session/new");
+    let gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Sanity: session is visible before close.
+    let list_before = router
+        .dispatch(json!({"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": {}}))
+        .await
+        .expect("session/list");
+    assert_eq!(
+        list_before["result"]["sessions"].as_array().unwrap().len(),
+        1
+    );
+
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/close",
+            "params": {"sessionId": gateway_id}
+        }))
+        .await
+        .expect("session/close");
+
+    let list_after = router
+        .dispatch(json!({"jsonrpc": "2.0", "id": 4, "method": "session/list", "params": {}}))
+        .await
+        .expect("session/list");
+    assert_eq!(
+        list_after["result"]["sessions"].as_array().unwrap().len(),
+        0,
+        "closed session must be evicted from session/list, not linger forever"
+    );
+
+    let prompt_after_close = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 5, "method": "session/prompt",
+            "params": {"sessionId": gateway_id, "prompt": []}
+        }))
+        .await;
+    assert!(
+        prompt_after_close.is_err(),
+        "session/prompt against a closed gateway session id must error, not silently proxy"
+    );
+}
+
+/// Same regression, exercised through `dispatch_shared`/`SharedRouterHandle`
+/// -- the real multi-agent-concurrency dispatch path every transport
+/// (`acpx-server`'s HTTP/WS/stdio) actually uses in production. Kept as a
+/// separate test rather than assuming the plain `dispatch` path above
+/// proves this one too, since the fix had to be applied independently in
+/// `dispatch_proxied_shared` (see that function's own doc comment).
+#[tokio::test]
+async fn dispatch_shared_session_close_evicts_session_too() {
+    use acpx_core::router::dispatch_shared;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let router = Arc::new(Mutex::new(router));
+
+    let new_response = dispatch_shared(
+        &router,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+    )
+    .await
+    .expect("session/new");
+    let gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    dispatch_shared(
+        &router,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/close",
+            "params": {"sessionId": gateway_id}
+        }),
+    )
+    .await
+    .expect("session/close");
+
+    let list_after = dispatch_shared(
+        &router,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "session/list", "params": {}}),
+    )
+    .await
+    .expect("session/list");
+    assert_eq!(
+        list_after["result"]["sessions"].as_array().unwrap().len(),
+        0,
+        "closed session must be evicted from session/list via dispatch_shared too"
+    );
+
+    let prompt_after_close = dispatch_shared(
+        &router,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+            "params": {"sessionId": gateway_id, "prompt": []}
+        }),
+    )
+    .await;
+    assert!(
+        prompt_after_close.is_err(),
+        "session/prompt against a closed gateway session id must error via dispatch_shared too"
+    );
+}
+
+/// **Regression test for a real bug**: `dispatch_native`'s
+/// `"profiles/delete"` arm used to only remove the `ProfileStore` entry,
+/// never stopping whatever backend process had been spawned for that
+/// profile (under supervisor key `"profile:<name>"`) -- an orphaned OS
+/// child process leaked forever on every delete of a profile that had
+/// ever actually been used. Proves the process is genuinely running
+/// after `session/new`, then genuinely stopped after `profiles/delete`.
+#[tokio::test]
+async fn profiles_delete_stops_the_profiles_running_backend_process() {
+    use acpx_conductor::supervisor::ProcessStatus;
+
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "profiles/create",
+            "params": {"name": "leak-test", "agent_id": "stand-in-agent"}
+        }))
+        .await
+        .expect("profiles/create");
+
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/tmp", "_acpx": {"profile": "leak-test"}}
+        }))
+        .await
+        .expect("session/new");
+
+    assert_eq!(
+        router.process_status("profile:leak-test"),
+        ProcessStatus::Running,
+        "backend process should be running for the profile after session/new"
+    );
+
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "profiles/delete",
+            "params": {"name": "leak-test"}
+        }))
+        .await
+        .expect("profiles/delete");
+
+    assert_eq!(
+        router.process_status("profile:leak-test"),
+        ProcessStatus::NotStarted,
+        "profiles/delete must stop the profile's backend process, not leak it forever"
+    );
+}

@@ -235,6 +235,20 @@ impl Router {
         self.keystore.store(secret)
     }
 
+    /// Test/observability seam: live-process status for a given
+    /// supervisor key (a native mode agent id, or a profile's
+    /// `"profile:<name>"` key -- see `resolve_profile`). Distinct from the
+    /// `agents/status` JSON-RPC method, which answers a different
+    /// question (whether the runtime/binary needed to launch an agent is
+    /// present at all, via `crate::detect`), not "is a process currently
+    /// running under this exact supervisor key right now".
+    pub fn process_status(
+        &mut self,
+        supervisor_key: &str,
+    ) -> acpx_conductor::supervisor::ProcessStatus {
+        self.supervisor.status(supervisor_key)
+    }
+
     /// Fire-and-forget one transcript append, if persistence is attached.
     /// Never awaited by the caller -- spawned onto the runtime so a slow
     /// sqlite write can't add latency to the client-visible request path.
@@ -554,6 +568,17 @@ impl Router {
             response.clone(),
         );
         if method == "session/close" {
+            // Evict the closed session from the in-memory registry --
+            // **real bug fix**: this used to never happen, so every
+            // session ever opened over a long-running daemon's lifetime
+            // stayed in `SessionRegistry`'s `HashMap` forever (an
+            // unbounded memory leak) and `session/list` kept reporting
+            // closed sessions as still live indefinitely. `remove` already
+            // existed on `SessionRegistry` but was never called from
+            // anywhere in this file until now.
+            self.sessions.remove(&acpx_proto::session::GatewaySessionId(
+                gateway_session_id.clone(),
+            ));
             if let Some(store) = self.persistence.clone() {
                 tokio::spawn(async move {
                     if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
@@ -687,6 +712,21 @@ impl Router {
                     .ok_or(RouterError::MissingParams)?
                     .to_string();
                 self.profiles.delete(&name)?;
+                // **Real bug fix**: this used to only remove the
+                // `ProfileStore` entry, leaving whatever backend process
+                // was spawned for it (under supervisor key
+                // `"profile:<name>"`, see `resolve_profile`) running
+                // forever with no way to ever stop it again -- an orphaned
+                // OS child process leaked on every `profiles/delete` call
+                // against a profile that had ever actually been used in a
+                // `session/new`. Best-effort: `Supervisor::stop` is a
+                // no-op (not an error) if no process was ever spawned
+                // under this key, so this is safe to call unconditionally
+                // regardless of whether the profile was ever used.
+                let supervisor_key = format!("profile:{name}");
+                if let Err(err) = self.supervisor.stop(&supervisor_key).await {
+                    tracing::warn!(%err, profile = %name, "failed to stop profile's backend process on delete");
+                }
                 serde_json::json!({ "name": name, "deleted": true })
             }
             "mcp_servers/create" | "mcp_servers/update" => {
@@ -1075,6 +1115,18 @@ async fn dispatch_proxied_shared(
     );
 
     if method == "session/close" {
+        // Same leak/correctness fix as `Router::dispatch_proxied` above --
+        // see that call site's comment. Re-acquire the router lock
+        // briefly (bookkeeping only, no backend I/O held) to evict the
+        // closed session from the shared `SessionRegistry` too, so the
+        // two dispatch paths never drift apart on this behavior.
+        router
+            .lock()
+            .await
+            .sessions
+            .remove(&acpx_proto::session::GatewaySessionId(
+                gateway_session_id.clone(),
+            ));
         if let Some(store) = persistence {
             tokio::spawn(async move {
                 if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {

@@ -41,13 +41,21 @@ fn stand_in_backend_spec() -> SpawnSpec {
 /// Same ephemeral-port bind-then-serve trick as
 /// `http_ws_transport_test.rs`'s `spawn_server` -- see that file for why.
 async fn spawn_server(router: SharedRouter) -> SocketAddr {
+    spawn_server_with_auth(router, None).await
+}
+
+/// Same bring-up, but lets a test opt into `ACPX_AUTH_TOKEN`-style
+/// bearer-token auth on the gateway it spins up.
+async fn spawn_server_with_auth(router: SharedRouter, auth_token: Option<String>) -> SocketAddr {
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = probe.local_addr().expect("local_addr");
     drop(probe);
     tokio::spawn(async move {
-        http::serve(router, addr).await.expect("transport::serve");
+        http::serve(router, addr, auth_token)
+            .await
+            .expect("transport::serve");
     });
     for _ in 0..50 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
@@ -200,4 +208,46 @@ async fn ext_registry_agents_list_and_status_and_install_round_trip() {
         .as_str()
         .unwrap()
         .contains("RuntimeConfirmed"));
+}
+
+/// **acpx client + acpx daemon auth, end to end**: proves
+/// `GatewayClient::with_auth_token` genuinely round-trips a real call
+/// against a gateway started with `ACPX_AUTH_TOKEN`-style auth enabled
+/// (`http::serve(.., Some(token))`), and that a client with no/wrong
+/// token is rejected -- closing the gap where server-side auth landed
+/// without any client-side way to actually use it.
+#[tokio::test]
+async fn client_with_auth_token_round_trips_against_an_authenticated_gateway() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let router: SharedRouter = Arc::new(Mutex::new(router));
+    let addr = spawn_server_with_auth(router, Some("s3cret-token".to_string())).await;
+
+    let authed_client =
+        GatewayClient::new(format!("http://{addr}")).with_auth_token("s3cret-token");
+    let result = authed_client
+        .call("session/list", serde_json::json!({}), None)
+        .await
+        .expect("authenticated call should succeed");
+    assert_eq!(result["sessions"], serde_json::json!([]));
+
+    let unauthed_client = GatewayClient::new(format!("http://{addr}"));
+    let err = unauthed_client
+        .call("session/list", serde_json::json!({}), None)
+        .await
+        .expect_err("call with no token against an authenticated gateway must fail");
+    assert!(matches!(
+        err,
+        acpx_client::raw::ClientError::Rpc { code: -32001, .. }
+    ));
+
+    let wrong_client = GatewayClient::new(format!("http://{addr}")).with_auth_token("wrong");
+    let err = wrong_client
+        .call("session/list", serde_json::json!({}), None)
+        .await
+        .expect_err("call with wrong token must fail");
+    assert!(matches!(
+        err,
+        acpx_client::raw::ClientError::Rpc { code: -32001, .. }
+    ));
 }

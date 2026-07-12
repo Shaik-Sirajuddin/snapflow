@@ -71,7 +71,7 @@ async fn spawn_server(router: SharedRouter) -> SocketAddr {
     drop(probe);
 
     tokio::spawn(async move {
-        serve(router, addr).await.expect("transport::serve");
+        serve(router, addr, None).await.expect("transport::serve");
     });
 
     for _ in 0..50 {

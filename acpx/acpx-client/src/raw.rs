@@ -56,6 +56,12 @@ pub struct GatewayClient {
     http: reqwest::Client,
     base_url: String,
     next_id: AtomicI64,
+    /// Optional bearer token sent as `Authorization: Bearer <token>` on
+    /// every call -- matches `acpx-server`'s optional `ACPX_AUTH_TOKEN`
+    /// gate (`transport::http::AuthConfig`). `None` by default (every
+    /// pre-existing caller of [`Self::new`] is unaffected), set via
+    /// [`Self::with_auth_token`].
+    auth_token: Option<String>,
 }
 
 impl GatewayClient {
@@ -66,6 +72,23 @@ impl GatewayClient {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
             next_id: AtomicI64::new(1),
+            auth_token: None,
+        }
+    }
+
+    /// Attach a bearer token to send as `Authorization: Bearer <token>` on
+    /// every subsequent call -- required when the target gateway was
+    /// started with `ACPX_AUTH_TOKEN` set. Builder-style, so callers write
+    /// `GatewayClient::new(url).with_auth_token(token)`.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth_token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
         }
     }
 
@@ -95,6 +118,7 @@ impl GatewayClient {
         if let Some(profile) = profile {
             request = request.header("X-Acpx-Profile", profile);
         }
+        request = self.apply_auth(request);
         let body: serde_json::Value = request.send().await?.json().await?;
         if let Some(error) = body.get("error") {
             return Err(ClientError::Rpc {
@@ -138,6 +162,7 @@ impl GatewayClient {
         if let Some(profile) = profile {
             request = request.header("X-Acpx-Profile", profile);
         }
+        request = self.apply_auth(request);
         let body: serde_json::Value = request.send().await?.json().await?;
         if let Some(error) = body.get("error") {
             return Err(ClientError::Rpc {
