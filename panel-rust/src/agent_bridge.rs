@@ -520,4 +520,98 @@ mod tests {
         assert_eq!(slug("Fix timeline crash"), "fix-timeline-crash");
         assert_eq!(slug("Export pipeline bug!"), "export-pipeline-bug");
     }
+
+    /// End-to-end: a jsonl cache file seeded up front with a varied mix
+    /// of message kinds (thinking/tool-call/user/agent, i.e. not just plain
+    /// user/agent turns) renders immediately via `history(0)`, and once
+    /// the live mock agent streams a real reply for a new prompt, the
+    /// pre-seeded entries are neither lost nor reordered -- the live
+    /// messages land strictly after them. This is the concrete
+    /// "json loading renders smoothly, no conflict with later async live
+    /// reload" contract this module's docs describe.
+    #[test]
+    fn varied_seeded_json_and_live_reload_compose_without_conflict() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let names = ["Fix timeline crash"];
+        let thread_id = slug(names[0]);
+
+        // Seed the cache directly (as if written by a prior run) with a
+        // deliberately varied mix of message kinds, independent of this
+        // bridge -- mirrors "content varies in json".
+        let seed_store = JsonlStore::open(cache_dir.path()).expect("open store for seeding");
+        let seeded_messages = vec![
+            ChatMessage {
+                kind: MessageKind::User,
+                text: "add a crossfade".into(),
+            },
+            ChatMessage {
+                kind: MessageKind::Thinking,
+                text: "considering the timeline structure".into(),
+            },
+            ChatMessage {
+                kind: MessageKind::ToolCall,
+                text: "edit.add_transition(...)".into(),
+            },
+            ChatMessage {
+                kind: MessageKind::Agent,
+                text: "done, crossfade added".into(),
+            },
+        ];
+        seed_store
+            .overwrite(
+                &thread_id,
+                &seeded_messages,
+                &ThreadTrailer {
+                    acp_session_id: "prior-run-session".into(),
+                    title: Some(thread_id.clone()),
+                    updated_at: Some("unix:1".into()),
+                    message_count: seeded_messages.len(),
+                },
+            )
+            .expect("seed cache file");
+
+        let bridge = AgentBridge::new_with_agent_cmd_and_cache_dir(
+            &names,
+            mock_agent_cmd(),
+            Some(cache_dir.path().to_path_buf()),
+        )
+        .expect("bridge");
+
+        // Renders smoothly from disk immediately, before any live
+        // connection work has necessarily completed.
+        let initial = bridge.history(0);
+        assert_eq!(initial, seeded_messages);
+
+        // Drive one real live turn through the mock agent subprocess and
+        // wait (bounded) for its events to land via poll().
+        bridge.send_prompt(0, "second look".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_turn_ended = false;
+        while std::time::Instant::now() < deadline && !saw_turn_ended {
+            for ev in bridge.poll() {
+                if let AgentEvent::TurnEnded(_) = ev.event {
+                    saw_turn_ended = true;
+                }
+            }
+            if !saw_turn_ended {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(saw_turn_ended, "timed out waiting for the mock agent's turn to end");
+
+        let after = bridge.history(0);
+        // The four pre-seeded, varied-kind messages are untouched and
+        // still first, in original order.
+        assert_eq!(&after[..4], &seeded_messages[..]);
+        // The mock agent's reply (uppercased echo, per mock_agent.rs) is
+        // appended strictly after them, not interleaved or overwriting.
+        assert!(after.len() > 4);
+        assert!(after.iter().skip(4).any(|m| m.text == "SECOND LOOK"));
+
+        // And the on-disk file reflects the same merged, non-conflicting
+        // view after the TurnEnded-triggered trailer overwrite.
+        let reloaded = seed_store.load(&thread_id).expect("reload from disk");
+        assert_eq!(&reloaded.messages[..4], &seeded_messages[..]);
+        assert!(reloaded.messages.len() > 4);
+    }
 }
