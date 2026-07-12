@@ -203,6 +203,21 @@ extern "C" {
         position: c_longlong,
     ) -> *mut c_char;
 
+    /// C++ side: `char* sap_transitions_add_crossfade(void*
+    /// mainWindowHandle, int trackIndex, int firstClipIndex, int
+    /// secondClipIndex, long long durationFrames);` -- real
+    /// `Timeline::AddTransitionCommand` (undoable). Returns
+    /// `{"trackIndex":N,"transitionIndex":N,"betweenClips":[a,b],
+    /// "durationFrames":N}`, or NULL on error. Caller must free via
+    /// `sap_free_string`.
+    pub fn sap_transitions_add_crossfade(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        first_clip_index: c_int,
+        second_clip_index: c_int,
+        duration_frames: c_longlong,
+    ) -> *mut c_char;
+
     /// C++ side: `long long sap_clip_length_frames(void* mainWindowHandle,
     /// int trackIndex, int clipIndex);` -- `Mlt::ClipInfo::frame_count`.
     /// Returns -1 on error.

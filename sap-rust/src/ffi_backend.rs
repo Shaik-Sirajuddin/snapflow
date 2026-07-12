@@ -692,11 +692,38 @@ impl Backend for FfiBackend {
     fn transitions_add_crossfade(
         &mut self,
         _project_id: &str,
-        _track_index: usize,
-        _between_clips: (usize, usize),
-        _duration_frames: i64,
+        track_index: usize,
+        between_clips: (usize, usize),
+        duration_frames: i64,
     ) -> BackendResult<TransitionInfo> {
-        Err(BackendError::NotFound("transitions.addCrossfade not wired to real FFI yet".into()))
+        if between_clips.1 != between_clips.0 + 1 {
+            return Err(BackendError::InvalidParams(
+                "transitions.addCrossfade requires adjacent clip indices".into(),
+            ));
+        }
+        if duration_frames <= 0 {
+            return Err(BackendError::InvalidParams("durationFrames must be positive".into()));
+        }
+        let raw = unsafe {
+            ffi::sap_transitions_add_crossfade(
+                self.main_window,
+                track_index as c_int,
+                between_clips.0 as c_int,
+                between_clips.1 as c_int,
+                duration_frames,
+            )
+        };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams(format!(
+                "crossfade between clips {}/{} on track {track_index} rejected (locked track, or \
+                 durationFrames >= either clip's length)",
+                between_clips.0, between_clips.1
+            )));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<TransitionInfo>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad crossfade JSON: {e}")))
     }
 
     fn filter_add(
