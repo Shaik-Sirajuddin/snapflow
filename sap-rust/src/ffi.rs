@@ -248,6 +248,35 @@ extern "C" {
         path: *const c_char,
     ) -> *mut c_char;
 
+    /// C++ side: `int sap_notes_set_text(void* mainWindowHandle, const
+    /// char* text);` -- real `NotesDock::setText()`. Returns 0 on
+    /// success, -1 on error.
+    pub fn sap_notes_set_text(main_window_handle: *mut c_void, text: *const c_char) -> c_int;
+
+    /// C++ side: `char* sap_notes_get_text(void* mainWindowHandle);` --
+    /// real `NotesDock::getText()`. Returns a heap-allocated copy of the
+    /// current text (empty, not NULL, when there is none), or NULL on
+    /// error. Caller must free via `sap_free_string`.
+    pub fn sap_notes_get_text(main_window_handle: *mut c_void) -> *mut c_char;
+
+    /// C++ side: `int sap_recent_add(void* mainWindowHandle, const char*
+    /// path);` -- real `RecentDock::add()` (app-wide `Settings`-backed
+    /// MRU list, not project-scoped). Returns 0 on success, -1 on error.
+    pub fn sap_recent_add(main_window_handle: *mut c_void, path: *const c_char) -> c_int;
+
+    /// C++ side: `char* sap_recent_remove(void* mainWindowHandle, const
+    /// char* path);` -- real `RecentDock::remove()`. Returns a
+    /// heap-allocated copy of path on success, or NULL on error (invalid
+    /// handle, or path was not present). Caller must free via
+    /// `sap_free_string`.
+    pub fn sap_recent_remove(main_window_handle: *mut c_void, path: *const c_char) -> *mut c_char;
+
+    /// C++ side: `char* sap_recent_list(void* mainWindowHandle);` --
+    /// returns a heap-allocated JSON array of strings from the real
+    /// `Settings.recent()` (newest first), or NULL on error. Caller must
+    /// free via `sap_free_string`.
+    pub fn sap_recent_list(main_window_handle: *mut c_void) -> *mut c_char;
+
     /// C++ side: `char* sap_filter_list(void* mainWindowHandle, int
     /// trackIndex, int clipIndex);` -- returns a heap-allocated JSON array
     /// string `[{"filterIndex":0,"mltService":"..."},...]` in raw MLT

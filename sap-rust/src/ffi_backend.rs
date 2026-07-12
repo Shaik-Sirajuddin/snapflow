@@ -480,12 +480,21 @@ impl Backend for FfiBackend {
     }
 
     fn notes_get_text(&mut self, _project_id: &str) -> BackendResult<String> {
-        // Stub: no real FFI wrapper yet.
-        Ok(String::new())
+        let raw = unsafe { ffi::sap_notes_get_text(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams("notes.getText failed (invalid handle)".into()));
+        }
+        let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        Ok(text)
     }
 
-    fn notes_set_text(&mut self, _project_id: &str, _text: &str) -> BackendResult<()> {
-        // Stub: no real FFI wrapper yet.
+    fn notes_set_text(&mut self, _project_id: &str, text: &str) -> BackendResult<()> {
+        let c_text = CString::new(text).map_err(|e| BackendError::InvalidParams(format!("bad text: {e}")))?;
+        let rc = unsafe { ffi::sap_notes_set_text(self.main_window, c_text.as_ptr()) };
+        if rc != 0 {
+            return Err(BackendError::InvalidParams("notes.setText failed (invalid handle)".into()));
+        }
         Ok(())
     }
 
@@ -1464,16 +1473,35 @@ impl Backend for FfiBackend {
         Ok(if frame < 0 { None } else { Some(frame) })
     }
 
-    fn recent_add(&mut self, _project_id: &str, _path: &str) -> BackendResult<()> {
-        Err(BackendError::Unsupported("recent.add not wired to real FFI yet".into()))
+    fn recent_add(&mut self, _project_id: &str, path: &str) -> BackendResult<()> {
+        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let rc = unsafe { ffi::sap_recent_add(self.main_window, c_path.as_ptr()) };
+        if rc != 0 {
+            return Err(BackendError::InvalidParams("recent.add failed (invalid handle)".into()));
+        }
+        Ok(())
     }
 
-    fn recent_remove(&mut self, _project_id: &str, _path: &str) -> BackendResult<String> {
-        Err(BackendError::Unsupported("recent.remove not wired to real FFI yet".into()))
+    fn recent_remove(&mut self, _project_id: &str, path: &str) -> BackendResult<String> {
+        let c_path = CString::new(path).map_err(|e| BackendError::InvalidParams(format!("bad path: {e}")))?;
+        let raw = unsafe { ffi::sap_recent_remove(self.main_window, c_path.as_ptr()) };
+        if raw.is_null() {
+            return Err(BackendError::NotFound(format!("recent path {path}")));
+        }
+        let out = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        Ok(out)
     }
 
     fn recent_list(&mut self, _project_id: &str) -> BackendResult<Vec<String>> {
-        Err(BackendError::Unsupported("recent.list not wired to real FFI yet".into()))
+        let raw = unsafe { ffi::sap_recent_list(self.main_window) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams("recent.list failed (invalid handle)".into()));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
+        serde_json::from_str::<Vec<String>>(&json_str)
+            .map_err(|e| BackendError::InvalidParams(format!("bad recent-list JSON: {e}")))
     }
 }
 
