@@ -11,6 +11,14 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+
+# Binary-distribution install path (Phase 4 step 19): download+extract
+# .tar.gz / .zip archives into ~/.acpx/adapters/<agent_id>/.
+flate2 = "1"
+tar = "0.4"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"

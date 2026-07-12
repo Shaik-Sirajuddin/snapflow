@@ -70,9 +70,20 @@ impl BackendProcess {
         })
     }
 
+    /// Returns the process's exit status if it has already exited
+    /// (non-blocking check). Tokio caches the reaped status internally, so
+    /// repeated calls after the process has exited keep returning the same
+    /// value rather than erroring on a second wait.
+    pub fn try_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        match self.child.try_wait() {
+            Ok(status) => status,
+            Err(_) => None,
+        }
+    }
+
     /// True if the process has exited (non-blocking check).
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        self.try_exit_status().is_some()
     }
 
     pub async fn kill(&mut self) -> Result<(), std::io::Error> {

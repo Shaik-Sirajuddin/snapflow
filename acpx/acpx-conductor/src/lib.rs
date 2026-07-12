@@ -3,9 +3,10 @@
 //! N processes keyed by agent name with restart/backoff. See
 //! `memory/acpx/gen/plans/acp-gateway-daemon/04-phased-plan.md`.
 
+pub mod backoff;
 pub mod framing;
 pub mod process;
 pub mod supervisor;
 
 pub use process::{BackendProcess, SpawnSpec};
-pub use supervisor::Supervisor;
+pub use supervisor::{ProcessStatus, Supervisor, SupervisorError};

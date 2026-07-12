@@ -1,0 +1,69 @@
+{
+  "schema_source": "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
+  "schema_version": "1.0.0",
+  "note": "Trimmed local fallback for acpx-registry: verbatim entries (Claude, Codex, Gemini) copied from the official ACP registry on 2026-07-12, used only when the remote registry URL is unreachable. Schema is NOT acpx-invented -- it matches the official registry's own per-agent shape exactly, so the same parser handles both the remote fetch and this fallback. Re-sync periodically; entries go stale as upstream publishes new versions.",
+  "fetched": "2026-07-12",
+  "version": "1.0.0",
+  "agents": [
+    {
+      "id": "claude-acp",
+      "name": "Claude Agent",
+      "version": "0.58.1",
+      "description": "ACP wrapper for Anthropic's Claude",
+      "repository": "https://github.com/agentclientprotocol/claude-agent-acp",
+      "authors": ["Anthropic", "Zed Industries", "JetBrains"],
+      "license": "proprietary",
+      "distribution": {
+        "npx": {
+          "package": "@agentclientprotocol/claude-agent-acp@0.58.1"
+        }
+      },
+      "icon": "https://cdn.agentclientprotocol.com/registry/v1/latest/claude-acp.svg",
+      "acpx_provider_hint": "anthropic"
+    },
+    {
+      "id": "codex-acp",
+      "name": "Codex",
+      "version": "1.1.2",
+      "description": "ACP adapter for OpenAI's coding assistant",
+      "repository": "https://github.com/agentclientprotocol/codex-acp",
+      "authors": ["OpenAI", "JetBrains s.r.o", "Zed Industries"],
+      "license": "Apache-2.0",
+      "distribution": {
+        "npx": {
+          "package": "@agentclientprotocol/codex-acp@1.1.2"
+        }
+      },
+      "icon": "https://cdn.agentclientprotocol.com/registry/v1/latest/codex-acp.svg",
+      "acpx_provider_hint": "openai",
+      "acpx_notes": "Custom OPENAI_BASE_URL / litellm-compatible endpoint support not yet verified against this exact npm-published adapter -- open risk, see plan's Open Risks section."
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini CLI",
+      "version": "0.50.0",
+      "description": "Google's official CLI for Gemini",
+      "repository": "https://github.com/google-gemini/gemini-cli",
+      "website": "https://geminicli.com",
+      "authors": ["Google"],
+      "license": "Apache-2.0",
+      "distribution": {
+        "npx": {
+          "package": "@google/gemini-cli@0.50.0",
+          "args": ["--acp"]
+        }
+      },
+      "icon": "https://cdn.agentclientprotocol.com/registry/v1/latest/gemini.svg",
+      "acpx_provider_hint": "gemini"
+    }
+  ],
+  "extensions": [],
+  "acpx_meta": {
+    "install_semantics": {
+      "npx": "No acpx-side install step needed beyond having Node/npm on PATH -- npx resolves/caches/runs the package on demand. agents/install for an npx-only entry can be a no-op that just verifies Node/npm availability.",
+      "binary": "Not exercised by claude/codex/gemini as of this snapshot (all npx-only in the official registry). Pick the distribution.binary key matching the host os-arch, download+extract 'archive' into ~/.acpx/adapters/<id>/, spawn 'cmd' with 'args'.",
+      "uvx": "Same on-demand idea as npx, via the uv Python tool. Not used by claude/codex/gemini as of this snapshot."
+    },
+    "acpx_provider_hint": "Non-standard field added by acpx on top of the official schema -- maps a registry entry to this plan's provider config model (openai/anthropic/gemini/litellm). Not present in the upstream registry.json; stripped/ignored if this file is ever diffed against a fresh upstream pull."
+  }
+}
