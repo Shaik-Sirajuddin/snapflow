@@ -73,6 +73,17 @@ impl Supervisor {
         self.specs.insert(agent_id.into(), spec);
     }
 
+    /// Look up the currently-registered `SpawnSpec` for `agent_id`, if
+    /// any. Lets a caller (namely `acpx-core::router`'s Phase 3 profile
+    /// resolution) reuse an already-registered spec as a base -- e.g. a
+    /// profile whose `agent_id` names something an operator (or a test)
+    /// registered directly via [`Self::register`] rather than something
+    /// resolved fresh from the ACP registry -- instead of mandating a
+    /// registry lookup on every `session/new`.
+    pub fn spec(&self, agent_id: &str) -> Option<&SpawnSpec> {
+        self.specs.get(agent_id)
+    }
+
     /// Override the "stayed alive long enough to reset backoff" threshold.
     /// Defaults to `backoff::STABLE_AFTER`.
     pub fn set_stable_after(&mut self, stable_after: Duration) {

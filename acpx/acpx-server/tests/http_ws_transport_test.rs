@@ -152,6 +152,25 @@ async fn http_post_rpc_session_new_routes_via_profile_header() {
 
     let client = reqwest::Client::new();
 
+    // `_acpx.profile` resolves through the Phase 3 `ProfileStore`, not a
+    // raw agent id directly (see `router.rs`'s `resolve_profile`) -- a
+    // profile whose `agent_id` names an already-registered spec (as
+    // "agent-b" is, above) reuses that spec directly rather than
+    // requiring a live registry entry, so this test double works
+    // unmodified as a profile target.
+    let create_profile = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "profiles/create",
+            "params": {"name": "agent-b", "agent_id": "agent-b"}
+        }))
+        .send()
+        .await
+        .expect("POST /rpc (profiles/create)");
+    assert!(create_profile.status().is_success());
+
     // No header -> falls back to the default agent ("agent-a").
     let default_response = client
         .post(format!("http://{addr}/rpc"))

@@ -5,6 +5,7 @@
 
 pub mod detect;
 pub mod keystore;
+pub mod launch;
 pub mod mcp_servers;
 pub mod persistence;
 pub mod profile;

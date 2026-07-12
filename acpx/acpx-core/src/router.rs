@@ -4,7 +4,11 @@
 //! resolution, MCP-server merge, and gateway-native handlers land in
 //! Phase 2/3.
 
+use crate::keystore::Keystore;
+use crate::mcp_servers::McpServerStore;
 use crate::persistence::{Direction, PersistenceStore};
+use crate::profile::{Profile, ProfileStore};
+use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry};
 
 /// Which bucket a given JSON-RPC method falls into. See the classification
@@ -33,6 +37,9 @@ pub fn classify(method: &str) -> MethodClass {
             MethodClass::GatewayNative
         }
         "profiles/create" | "profiles/list" | "profiles/update" | "profiles/delete" => {
+            MethodClass::GatewayNative
+        }
+        "mcp_servers/create" | "mcp_servers/list" | "mcp_servers/update" | "mcp_servers/delete" => {
             MethodClass::GatewayNative
         }
         _ => MethodClass::Unknown,
@@ -94,6 +101,21 @@ pub struct Router {
     /// "written asynchronously" design goal -- a slow/failed persistence
     /// write never delays or fails the client's actual request.
     persistence: Option<PersistenceStore>,
+    /// Phase 3 stores: provider config, secret material, and
+    /// {agent, provider, key-ref, launch overrides, mcp servers} profiles.
+    /// All in-memory only (see `crate::provider`/`crate::profile`'s doc
+    /// comments for why -- not persisted to the sqlite `persistence` path
+    /// used for sessions/transcripts). `session/new`'s `_acpx.profile`
+    /// resolves against `profiles`, which in turn references `providers`
+    /// and `keystore`.
+    providers: ProviderStore,
+    keystore: Keystore,
+    profiles: ProfileStore,
+    /// Centrally-registered MCP servers (Phase 3 step 17a), merged by
+    /// name into a resolved profile's `mcpServers` at `session/new` --
+    /// client entries always win on collision, see
+    /// `crate::mcp_servers::merge_mcp_servers`.
+    mcp_servers: McpServerStore,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +146,20 @@ pub enum RouterError {
     Install(#[from] acpx_registry::InstallError),
     #[error("agents/install: missing or non-string params.id")]
     MissingAgentId,
+    #[error("profile store: {0}")]
+    Profile(#[from] crate::profile::ProfileStoreError),
+    #[error("provider store: {0}")]
+    Provider(#[from] crate::provider::ProviderStoreError),
+    #[error("mcp server store: {0}")]
+    McpServer(#[from] crate::mcp_servers::McpServerStoreError),
+    #[error("keystore: {0}")]
+    Keystore(#[from] crate::keystore::KeystoreError),
+    #[error("session/new: no profile named {0}")]
+    UnknownProfile(String),
+    #[error("profile {profile} references unknown provider {provider}")]
+    UnknownProviderRef { profile: String, provider: String },
+    #[error("profile {profile}'s agent id {agent_id} has no npx/uvx distribution in the registry")]
+    NoLaunchableDistribution { profile: String, agent_id: String },
 }
 
 impl Router {
@@ -135,6 +171,10 @@ impl Router {
             http: reqwest::Client::new(),
             registry_cache: None,
             persistence: None,
+            providers: ProviderStore::new(),
+            keystore: Keystore::new(),
+            profiles: ProfileStore::new(),
+            mcp_servers: McpServerStore::new(),
         }
     }
 
@@ -151,6 +191,31 @@ impl Router {
     /// just owns the `Supervisor` instance.
     pub fn register_agent(&mut self, agent_id: impl Into<String>, spec: acpx_conductor::SpawnSpec) {
         self.supervisor.register(agent_id, spec);
+    }
+
+    /// Seed a provider config, overwriting any existing entry of the same
+    /// name. Server-side-only seam -- there is deliberately no
+    /// `providers/*` JSON-RPC method a remote client can call (per the
+    /// task draft's "keys are maintained by this intermediate proxy": a
+    /// provider's `base_url` plus whatever key a profile references are
+    /// gateway-provisioned configuration, not something a client should
+    /// ever be able to set for itself). `acpx-server`'s `main.rs` is the
+    /// intended caller, loading providers from its own startup config;
+    /// tests use it directly too.
+    pub fn register_provider(&mut self, provider: crate::provider::ProviderConfig) {
+        let name = provider.name.clone();
+        if self.providers.update(provider.clone()).is_err() {
+            let _ = self.providers.create(provider);
+            let _ = name; // update() already logged nothing; create() covers the fresh-entry case
+        }
+    }
+
+    /// Store a raw secret, returning its opaque [`crate::keystore::KeyRef`]
+    /// for a [`crate::profile::Profile::key_ref`]. Same server-side-only
+    /// rationale as [`Self::register_provider`] -- see that method's doc
+    /// comment.
+    pub fn store_key(&mut self, secret: impl Into<String>) -> crate::keystore::KeyRef {
+        self.keystore.store(secret)
     }
 
     /// Fire-and-forget one transcript append, if persistence is attached.
@@ -200,6 +265,7 @@ impl Router {
         gateway_session_id: impl Into<String>,
         agent_id: impl Into<String>,
         backend_session_id: impl Into<String>,
+        profile_name: Option<String>,
         client_request: serde_json::Value,
         agent_response: serde_json::Value,
     ) {
@@ -215,7 +281,7 @@ impl Router {
                     gateway_session_id.clone(),
                     agent_id,
                     backend_session_id,
-                    None,
+                    profile_name,
                     now_rfc3339(),
                 )
                 .await
@@ -290,19 +356,51 @@ impl Router {
             .ok_or(RouterError::MissingParams)?;
 
         // Precedence per 02-architecture.md: an explicit `_acpx.profile`
-        // selects managed mode (Phase 3 resolves profile -> agent/provider);
-        // until then it only picks which registered agent id to use, same
-        // as native mode's `default_agent_id` fallback. Either way `_acpx`
-        // is stripped before forwarding -- session/new stays a raw-ACP
-        // drop-in for a client that never set it.
-        let agent_id = params
+        // selects managed mode (Phase 3: profile -> agent/provider/key
+        // resolution, see `resolve_profile`); omitting it stays
+        // native/unmanaged, using `default_agent_id`'s already-registered
+        // spawn spec unchanged. Either way `_acpx` is stripped before
+        // forwarding -- session/new stays a raw-ACP drop-in for a client
+        // that never set it.
+        let profile_name = params
             .get("_acpx")
             .and_then(|ext| ext.get("profile"))
             .and_then(|p| p.as_str())
-            .unwrap_or(&self.default_agent_id)
-            .to_string();
+            .map(str::to_string);
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_acpx");
+        }
+
+        let (agent_id, profile) = match &profile_name {
+            Some(name) => {
+                let (supervisor_key, profile) = self.resolve_profile(name).await?;
+                (supervisor_key, Some(profile))
+            }
+            None => (self.default_agent_id.clone(), None),
+        };
+
+        // Merge the resolved profile's centrally-registered MCP servers
+        // into whatever the client itself sent, client entries winning on
+        // name collision -- see `crate::mcp_servers::merge_mcp_servers`.
+        // A no-op (params untouched) when the profile has no attached
+        // servers, so native mode and profiles with `mcp_servers: []`
+        // never see an `mcpServers` field appear out of nowhere.
+        if let Some(profile) = &profile {
+            if !profile.mcp_servers.is_empty() {
+                let central = self.mcp_servers.list_named(&profile.mcp_servers);
+                let params = request
+                    .get_mut("params")
+                    .ok_or(RouterError::MissingParams)?;
+                let client_servers = params
+                    .get("mcpServers")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let merged = crate::mcp_servers::merge_mcp_servers(&client_servers, &central);
+                if let Some(obj) = params.as_object_mut() {
+                    obj.insert("mcpServers".to_string(), serde_json::json!(merged));
+                }
+            }
         }
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
@@ -336,11 +434,96 @@ impl Router {
                 gateway_session_id_str,
                 entry.agent_id.clone(),
                 entry.backend_session_id.0.clone(),
+                profile.map(|p| p.name),
                 request,
                 response.clone(),
             );
         }
         Ok(response)
+    }
+
+    /// Resolve `_acpx.profile` for `session/new`'s managed mode: look up
+    /// the named `Profile`, resolve its `provider`/`key_ref` (if any) into
+    /// concrete env vars via `crate::launch::build_launch_env`, and
+    /// (re-)register a `SpawnSpec` for it under a per-profile supervisor
+    /// key (`"profile:<name>"`, distinct from any native-mode agent id so
+    /// the two never share -- or fight over -- one supervised process).
+    /// Returns `(supervisor_key, profile)` for the caller to spawn/proxy
+    /// against and to read `mcp_servers`/`name` off of.
+    ///
+    /// **Known Phase 3 gap** (see `05-open-risks.md`'s "one process per
+    /// backend vs. one process per session" item): re-resolving an
+    /// already-running profile's env here does *not* restart its
+    /// supervised process -- `Supervisor::ensure_running` only spawns a
+    /// fresh process when none is currently running under this key, so a
+    /// `profiles/update` that changes a profile's provider/key only takes
+    /// effect for the *next* profile that has no live process yet, not for
+    /// an already-running one. Not fixed here; flagged, not silently
+    /// wrong.
+    async fn resolve_profile(
+        &mut self,
+        profile_name: &str,
+    ) -> Result<(String, Profile), RouterError> {
+        let profile = self
+            .profiles
+            .get(profile_name)
+            .cloned()
+            .ok_or_else(|| RouterError::UnknownProfile(profile_name.to_string()))?;
+
+        let provider = match &profile.provider {
+            Some(name) => Some(self.providers.get(name).cloned().ok_or_else(|| {
+                RouterError::UnknownProviderRef {
+                    profile: profile.name.clone(),
+                    provider: name.clone(),
+                }
+            })?),
+            None => None,
+        };
+        let resolved_key = match &profile.key_ref {
+            Some(key_ref) => Some(self.keystore.resolve(key_ref)?.to_string()),
+            None => None,
+        };
+        let env =
+            crate::launch::build_launch_env(&profile, provider.as_ref(), resolved_key.as_deref());
+
+        // Prefer an already-registered `SpawnSpec` for `profile.agent_id`
+        // (e.g. the native default agent, or anything an operator/test
+        // registered directly via `Router::register_agent`) as the base
+        // to layer env onto -- only fall back to a fresh registry lookup
+        // (building an `npx`/`uvx` `SpawnSpec` from scratch) when nothing
+        // is registered under that id yet. This keeps profiles usable
+        // against both registry-listed agents (the common case) and
+        // manually-configured/non-registry backends, without forcing a
+        // registry fetch on every `session/new` for the latter.
+        let mut spec = match self.supervisor.spec(&profile.agent_id).cloned() {
+            Some(spec) => spec,
+            None => {
+                self.ensure_registry_loaded().await;
+                let agent = self
+                    .registry_cache
+                    .as_ref()
+                    .expect("just loaded")
+                    .agents
+                    .iter()
+                    .find(|a| a.id == profile.agent_id)
+                    .cloned()
+                    .ok_or_else(|| RouterError::UnknownAgentId(profile.agent_id.clone()))?;
+                npx_spawn_spec(&agent).ok_or_else(|| RouterError::NoLaunchableDistribution {
+                    profile: profile.name.clone(),
+                    agent_id: profile.agent_id.clone(),
+                })?
+            }
+        };
+        // Overlay (not replace) so a manually-registered base spec's own
+        // env (if any) survives for any var the profile doesn't itself
+        // derive/override.
+        for (key, value) in env {
+            spec.env.insert(key, value);
+        }
+
+        let supervisor_key = format!("profile:{}", profile.name);
+        self.supervisor.register(supervisor_key.clone(), spec);
+        Ok((supervisor_key, profile))
     }
 
     async fn dispatch_proxied(
@@ -484,10 +667,72 @@ impl Router {
                 let outcome = acpx_registry::install(&agent).await?;
                 serde_json::json!({ "id": agent.id, "outcome": format!("{outcome:?}") })
             }
-            "profiles/create" | "profiles/list" | "profiles/update" | "profiles/delete" => {
-                return Err(RouterError::NotImplemented(
-                    "profile CRUD (Phase 3 step 14)",
-                ))
+            "profiles/create" | "profiles/update" => {
+                let params = request
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let mut profile: Profile = serde_json::from_value(params.clone())
+                    .map_err(|_| RouterError::MissingParams)?;
+                // A raw `secret` field (never itself echoed back, see below)
+                // is stored via `Keystore::store` and the resulting
+                // opaque `KeyRef` wins over any `key_ref` the caller sent
+                // directly -- `profiles/create`/`update` is the only entry
+                // point for getting a secret into the keystore at all
+                // (Phase 3 scoped no separate `keys/*` JSON-RPC namespace,
+                // see `04-phased-plan.md` step 13/14).
+                if let Some(secret) = params.get("secret").and_then(|s| s.as_str()) {
+                    profile.key_ref = Some(self.keystore.store(secret));
+                }
+                if method == "profiles/create" {
+                    self.profiles.create(profile.clone())?;
+                } else {
+                    self.profiles.update(profile.clone())?;
+                }
+                serde_json::to_value(&profile).expect("Profile always serializes")
+            }
+            "profiles/list" => {
+                let profiles: Vec<serde_json::Value> = self
+                    .profiles
+                    .list()
+                    .map(|p| serde_json::to_value(p).expect("Profile always serializes"))
+                    .collect();
+                serde_json::json!({ "profiles": profiles })
+            }
+            "profiles/delete" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                self.profiles.delete(&name)?;
+                serde_json::json!({ "name": name, "deleted": true })
+            }
+            "mcp_servers/create" | "mcp_servers/update" => {
+                let entry = request
+                    .get("params")
+                    .cloned()
+                    .ok_or(RouterError::MissingParams)?;
+                if method == "mcp_servers/create" {
+                    self.mcp_servers.create(entry.clone())?;
+                } else {
+                    self.mcp_servers.update(entry.clone())?;
+                }
+                entry
+            }
+            "mcp_servers/list" => {
+                serde_json::json!({ "servers": self.mcp_servers.list() })
+            }
+            "mcp_servers/delete" => {
+                let name = request
+                    .get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .ok_or(RouterError::MissingParams)?
+                    .to_string();
+                self.mcp_servers.delete(&name)?;
+                serde_json::json!({ "name": name, "deleted": true })
             }
             other => return Err(RouterError::UnknownMethod(other.to_string())),
         };
@@ -530,6 +775,27 @@ fn now_rfc3339() -> String {
     format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
 }
 
+/// Build a `SpawnSpec` for one of the official registry's `npx`-distributed
+/// agents (Claude/Codex/Gemini today) -- `npx -y <package> <dist.args...>`.
+/// Falls back to `uvx <package> <dist.args...>` when only a `uvx`
+/// distribution is declared. Returns `None` for `binary`-only agents --
+/// managed-mode profile launches aren't wired to the `binary` install path
+/// (Phase 4 step 19) yet; no registry entry Claude/Codex/Gemini use today
+/// needs it, per `01-research.md`.
+fn npx_spawn_spec(agent: &acpx_registry::Agent) -> Option<acpx_conductor::SpawnSpec> {
+    if let Some(npx) = &agent.distribution.npx {
+        let mut args = vec!["-y".to_string(), npx.package.clone()];
+        args.extend(npx.args.iter().cloned());
+        return Some(acpx_conductor::SpawnSpec::new("npx", args));
+    }
+    if let Some(uvx) = &agent.distribution.uvx {
+        let mut args = vec![uvx.package.clone()];
+        args.extend(uvx.args.iter().cloned());
+        return Some(acpx_conductor::SpawnSpec::new("uvx", args));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +806,13 @@ mod tests {
         assert_eq!(classify("session/prompt"), MethodClass::Proxied);
         assert_eq!(classify("agents/list"), MethodClass::GatewayNative);
         assert_eq!(classify("bogus/method"), MethodClass::Unknown);
+    }
+
+    #[test]
+    fn classifies_mcp_server_methods_as_gateway_native() {
+        assert_eq!(classify("mcp_servers/create"), MethodClass::GatewayNative);
+        assert_eq!(classify("mcp_servers/list"), MethodClass::GatewayNative);
+        assert_eq!(classify("mcp_servers/update"), MethodClass::GatewayNative);
+        assert_eq!(classify("mcp_servers/delete"), MethodClass::GatewayNative);
     }
 }
