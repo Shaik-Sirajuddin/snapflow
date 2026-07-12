@@ -9,10 +9,12 @@ sync with the code. Every row reflects a real `cargo test --workspace`
 run and an actual read of the referenced test file(s) -- not an
 aspirational claim of what should exist.
 
-As of this update: `cargo test --workspace` passes **101 tests, 0
-failures, 1 explicitly `#[ignore]`d** (the live-registry network test, see
-Phase 4 below). `cargo build --workspace` and `cargo fmt --all --check`
-are both clean.
+As of this update: `cargo test --workspace` passes **123 tests, 0
+failures, 2 explicitly `#[ignore]`d** (the live-registry network test,
+see Phase 4 below, and the real-adapter multi-agent e2e test, see the
+"real ACP adapter end-to-end" section below -- both hit real networks/
+processes by design, not run by default). `cargo build --workspace` and
+`cargo fmt --all --check` are both clean.
 
 ## Phase 0 -- workspace skeleton
 
@@ -121,6 +123,167 @@ worth keeping in mind if a real init system/systemd unit is written later
 (not yet tracked as a `05-open-risks.md` item; added here since it's a
 concrete deployment gotcha discovered empirically, not a design risk).
 
+## Post-self-test -- real multi-agent concurrency fix
+
+Every test through the self-test layer above still used at most one
+in-flight request at a time per test, and the transport layer held one
+whole-`Router` `Arc<Mutex<Router>>` lock for an entire `dispatch()` call
+-- including backend LLM latency. Two concurrent `session/prompt` calls
+to *different* agents fully serialized behind that one lock, defeating
+the entire point of "multi-agent" for any real deployment with more than
+one client. Fixed:
+
+- `acpx-conductor/src/supervisor.rs`: `Supervisor::ensure_running` now
+  returns `SharedBackendProcess = Arc<tokio::sync::Mutex<BackendProcess>>`
+  instead of an exclusive `&mut BackendProcess` borrow tied to the
+  `Supervisor`'s own lifetime; `status()` uses `try_lock` to stay
+  non-blocking.
+- `acpx-core/src/router.rs`: added `dispatch_shared`/
+  `dispatch_session_new_shared`/`dispatch_proxied_shared` free functions
+  that lock the `Router` only for gateway-state bookkeeping (session
+  registry, profile resolution, `Supervisor::ensure_running`), then drop
+  that lock before doing the actual backend stdio round trip against just
+  that backend's own per-process mutex. The original `&mut self`
+  `Router::dispatch` (used by the ~100 in-process tests elsewhere in this
+  matrix) is untouched, so none of them needed to change.
+- `acpx-server/src/transport/{http,ws,stdio}.rs`: now call
+  `dispatch_shared` instead of `router.lock().await.dispatch(...)`.
+- `classify()` gained `session/set_config_option` -> `Proxied` (a real,
+  published ACP extension method used by `claude-agent-acp` for
+  in-session model selection -- discovered while building the
+  real-adapter e2e test below; previously unroutable as `Unknown`).
+
+| What | Implementation | Test coverage | Status |
+|---|---|---|---|
+| Two different agents' `session/prompt` calls run in parallel, not serialized behind one gateway-wide lock | `acpx-core/src/router.rs`'s `dispatch_shared` family | `acpx-server/tests/concurrency_test.rs` (1): two synthetic backends each sleeping 1.5s, asserts wall-clock stays near 1x, not 2x -- manually verified this test correctly fails (~3s) when reverted to the old single-lock pattern | Done |
+
+## Post-self-test -- reverse-direction `session/update` aggregation fix
+
+`read_matching_response` previously logged-and-dropped every backend
+message that didn't match the pending request's id -- i.e. every
+`session/update` notification. Discovered while building the real-adapter
+e2e test below: real ACP adapters (verified against
+`@agentclientprotocol/claude-agent-acp`) deliver the actual assistant
+reply text *only* via `session/update` `agent_message_chunk`
+notifications streamed during `session/prompt`; the JSON-RPC result
+itself is just `{stopReason, usage}`. A client talking to a real backend
+through acpx got a technically-successful response with **no visible
+reply text in it at all**, ever -- serious enough that it made "acpx
+client working end to end against a real backend" false regardless of
+anything else in the gateway working correctly.
+
+Fixed in `acpx-core/src/router.rs`:
+
+- `read_matching_response` now returns `(matched_response,
+  Vec<unmatched_notifications>)` instead of dropping unmatched messages.
+- `attach_updates(response, notifications)` folds notifications into
+  `response["_acpx"]["updates"]` -- a no-op (response left byte-for-byte
+  untouched) when nothing streamed, so every pre-existing synthetic-backend
+  test in this workspace continued to pass unmodified.
+- All four backend-round-trip call sites (`dispatch_session_new`,
+  `dispatch_proxied`, and their `_shared` twins) now destructure and call
+  `attach_updates`.
+- `acpx-client/src/raw.rs`: `GatewayClient::call_with_updates()` returns
+  `(result, updates)` alongside the existing `call()`.
+- `acpx-client/src/ext/prompt.rs` (new): `prompt::send()` convenience
+  wrapper plus `extract_message_text()`, concatenating every
+  `agent_message_chunk`'s text in streaming order.
+
+| What | Implementation | Test coverage | Status |
+|---|---|---|---|
+| Streamed `session/update` notifications are aggregated into the JSON-RPC response rather than silently dropped | `acpx-core/src/router.rs`'s `read_matching_response`/`attach_updates` | `acpx-core/tests/session_update_forwarding_test.rs` (2): aggregation actually works, and is a byte-for-byte no-op when nothing streamed | Done |
+| Client-side convenience extraction of the assistant's reply text | `acpx-client/src/ext/prompt.rs` | 3 unit tests in the same file: concatenation order, thought-chunks ignored, empty-updates-yields-empty-string | Done |
+
+## Post-self-test -- real ACP adapter end-to-end (closes this workspace's biggest remaining gap)
+
+Every test through every phase above, including the Phase 6 e2e harness,
+used a synthetic `sh -c '...'` stand-in backend -- never a real,
+published, `npx`-installed ACP adapter. `acpx-server/tests/
+real_claude_multi_agent_test.rs` (new, `#[ignore]`d + gated on
+`ACPX_LIVE_TEST_ANTHROPIC_BASE_URL`/`ACPX_LIVE_TEST_ANTHROPIC_API_KEY`,
+matching `live_registry.rs`'s existing skip-not-fail convention) closes
+this for real: it spawns the real, already-compiled `acpx-server` binary,
+which spawns two real `npx @agentclientprotocol/claude-agent-acp` child
+processes (one per profile), talking to a real
+Anthropic-Messages-API-compatible endpoint serving `claude-haiku-4-5`
+(the cheapest/fastest model available, selected via the real
+`session/set_config_option` extension), through the real `acpx-client`
+SDK (`raw::GatewayClient` + `ext::prompt`/`ext::profiles`) -- proving
+"acpx daemon + acpx client end to end" together, not the daemon alone.
+Both profiles hold independent two-turn conversations
+**concurrently** (`tokio::join!`), re-proving the multi-agent concurrency
+fix above against real backend processes and real network latency, not a
+synthetic `sleep`. Run:
+
+```
+ACPX_LIVE_TEST_ANTHROPIC_BASE_URL=<endpoint> \
+ACPX_LIVE_TEST_ANTHROPIC_API_KEY=<key> \
+cargo test -p acpx-server --test real_claude_multi_agent_test -- --ignored --nocapture
+```
+
+Getting this test to actually pass surfaced **three more real bugs**,
+none of which any synthetic-backend test in this workspace could ever
+have caught, since synthetic stand-in scripts answer any request
+uniformly regardless of protocol ordering or schema strictness:
+
+1. **`main.rs` exited the entire process, HTTP/WS included, if stdin hit
+   EOF.** `tokio::select!` between the stdio task and the HTTP task meant
+   any launch with closed/`/dev/null` stdin -- exactly what this e2e
+   test's `Stdio::null()` child does, and exactly what a real
+   daemonized/systemd/nohup deployment does -- tore the whole daemon down
+   within milliseconds of starting, before it could accept a single HTTP
+   connection. Every pre-existing binary test avoided tripping this only
+   by keeping stdin piped-and-open for the process's lifetime, masking
+   the bug rather than covering it. Fixed: stdio hitting clean EOF now
+   falls through to just awaiting the HTTP task instead of ending the
+   process; only a genuine stdio *error* still ends it early. Regression
+   test: `acpx-server/tests/binary_self_test.rs`'s
+   `real_binary_with_closed_stdin_still_serves_http`.
+2. **acpx never performed the ACP `initialize` handshake with backend
+   processes at all.** Every dispatch path wrote `session/new` as the
+   very first message on a freshly spawned backend's stdio. A real
+   adapter (verified against `claude-agent-acp`) won't return a proper
+   `session/new` result before it has seen `initialize` first --
+   surfaced through acpx as an opaque `MissingBackendSessionId`, not any
+   kind of protocol error. Fixed in `acpx-core/src/router.rs`:
+   `ensure_backend_initialized` performs the real `initialize`
+   request/response round trip against a backend process exactly once,
+   gated on a new `BackendProcess::handshake_done` flag (owned in
+   `acpx-conductor/src/process.rs`, deliberately just a generic
+   done/not-done flag with no ACP semantics baked into that
+   protocol-agnostic crate) that resets to `false` on every fresh spawn,
+   so a crash+respawn mid-session is naturally re-initialized too. Wired
+   into all four backend-round-trip call sites. Kept in `Router` rather
+   than `Supervisor` deliberately -- an earlier attempt at putting the
+   handshake in `Supervisor::ensure_running` itself broke that crate's
+   own protocol-agnostic crash/backoff unit tests, which intentionally
+   spawn processes that never speak any protocol at all
+   (`acpx-conductor/tests/supervisor_test.rs`).
+3. **A real backend's JSON-RPC `error` response to `session/new` was
+   masked as a generic "missing sessionId" error, hiding the actual
+   rejection reason.** Diagnosed by manually driving `claude-agent-acp`
+   outside of acpx and finding a real `-32602 Invalid params` error
+   (`mcpServers` is a required field in the real ACP schema, not
+   optional -- this workspace's own e2e test had omitted it, since
+   nothing about acpx's design injects fields a raw ACP client didn't
+   itself supply, per `session/new`'s "stays a raw-ACP drop-in" design
+   goal). Fixed defensively regardless: `router.rs`'s new
+   `extract_backend_session_id` helper now returns a proper
+   `RouterError::BackendSessionNewError` carrying the backend's actual
+   `error` object when one is present, instead of silently falling
+   through to the generic missing-field message.
+
+| What | Implementation | Test coverage | Status |
+|---|---|---|---|
+| Real `claude-agent-acp` adapter, two profiles, concurrent two-turn conversations, through the real `acpx-server` binary and the real `acpx-client` SDK | `acpx-server/tests/real_claude_multi_agent_test.rs` | 1 test (`#[ignore]`d, network/credential-gated): passed against a real Anthropic-Messages-API-compatible endpoint, both conversations' real model replies (`PONG`/`PANG`) verified, both profiles' real `npx` child processes ran and finished concurrently (~11s wall-clock for two full cold `npx` starts + 4 real model turns total -- not ~2x that, confirming genuine overlap, not serialization) | Done |
+| Daemon survives closed/absent stdin while still serving HTTP/WS (systemd/nohup/backgrounded-launch shape) | `acpx-server/src/main.rs` | `acpx-server/tests/binary_self_test.rs`'s `real_binary_with_closed_stdin_still_serves_http` | Done |
+| Real ACP `initialize` handshake performed before any other request reaches a freshly spawned backend | `acpx-core/src/router.rs`'s `ensure_backend_initialized`, `acpx-conductor/src/process.rs`'s `BackendProcess::handshake_done` | Exercised implicitly by every pre-existing synthetic-backend test (numeric request id `0`, chosen so those tests' id-echoing shell scripts keep working unmodified) plus the real-adapter e2e test above, which would fail immediately without it | Done |
+
+Combined workspace test count after this addition: **123 passed, 0
+failed, 2 ignored** (`live_registry`'s network test, unchanged; the new
+real-adapter test, gated on live credentials), `cargo fmt --all --check`
+clean, `cargo build --workspace` clean.
+
 ## Gaps / not yet covered
 
 Pulled from `memory/acpx/gen/plans/acp-gateway-daemon/05-open-risks.md` --
@@ -128,13 +291,13 @@ these are acknowledged, not newly discovered:
 
 - **`ext::registry::install`'s progress/job model is still undecided** (Phase 5 step 22) -- the client can now trigger installation for real, but a slow `npx`/`binary` install has no way to report incremental progress back to a waiting caller; `05-open-risks.md`'s "client-initiated installer needs a progress/job model" item is directly relevant now that this call path exists, not just a future concern.
 - **No live-registry test runs by default.** `acpx-registry/tests/live_registry.rs`'s `live_registry_matches_expected_shape` is `#[ignore]`d (hits the real network); only `registry.fallback.json` parsing is covered in the default test run.
-- **No real `npx`-installed-agent end-to-end test.** Every test in this workspace uses a synthetic `sh -c '...'` stand-in backend (see `router_dispatch_test.rs`'s doc comment for the pattern) rather than a real `codex-acp`/`claude-agent-acp`/gemini adapter -- Phase 6 step 26's harness (`acpx-server/tests/e2e_agent_lifecycle_harness.rs`) now exercises detection and installation for real per agent, but the "use" phase (`session/new`/`session/prompt`/`session/close`) still swaps in the synthetic stand-in, since no real API keys/adapter processes are available in this environment. This is documented explicitly in the harness file rather than silently mocked, but it means no real adapter has ever been driven end-to-end in this workspace.
+- **Resolved for `claude-agent-acp`, still open for `codex-acp`/gemini.** `acpx-server/tests/real_claude_multi_agent_test.rs` (see the "real ACP adapter end-to-end" section above) now drives a real, `npx`-installed `claude-agent-acp` process through the real gateway and client SDK, `#[ignore]`d and credential-gated. `codex-acp`'s bifrost `/v1/responses` route was unreliable in this environment (`wire_api="responses"` required, `"chat"` did not work) so it was not exercised live this session; Gemini was never attempted live at all. Phase 6 step 26's harness (`acpx-server/tests/e2e_agent_lifecycle_harness.rs`) still swaps in the synthetic stand-in for its "use" phase for all three agents, unchanged.
 - **No Windows/macOS test coverage for the `binary` distribution's download+extract path** -- `install.rs`'s zip/tar.gz sniffing is unit-tested, but only exercised on Linux in this environment; `05-open-risks.md` explicitly calls out that this path needs testing on all three OSes before being considered done.
 - **No encryption at rest for the keystore.** `keystore.rs` is explicit in its own doc comment: secrets live in-memory only, process restart forgets them, and no encryption-at-rest mechanism has been chosen yet (`05-open-risks.md`'s "Key storage mechanism is unspecified" item is still open).
 - **`claude-agent-acp`'s `ANTHROPIC_BASE_URL` support is researched, not verified against a real running adapter** -- see Phase 3 step 16's row above and `05-open-risks.md`.
 - **One process per profile, not one process per session.** Re-resolving an already-running profile (e.g. after a `profiles/update` changes its provider/key) does not restart its already-running supervised process -- documented as a known gap in `router.rs`'s `resolve_profile` doc comment, tracks `05-open-risks.md`'s "one process per backend vs. one process per session" item.
 - **No transport security (auth/TLS) for the HTTP/WS remote-access transport** -- binds to `127.0.0.1:8790` by default; `05-open-risks.md`'s "Transport security for remote access" item is unresolved.
-- **No reverse-direction (agent-initiated) message routing** -- `session/update` notifications, `session/request_permission`, etc. arriving on a backend's stdout without a matching request id are logged and dropped (`router.rs`'s `read_matching_response` doc comment), not routed back to the owning client connection; `05-open-risks.md` flags this as unresolved.
+- **Partially resolved: `session/update` notifications are now delivered, agent-initiated *requests* are not.** `session/update` notifications arriving during a call are now aggregated into that call's response (`_acpx.updates`, see the "reverse-direction `session/update` aggregation fix" section above) rather than silently dropped. Still genuinely unresolved: a backend-initiated *request* expecting a reply (e.g. `session/request_permission`) has no way to get one in this request/response-shaped aggregation model -- there is still no live, out-of-band channel for the client to answer a backend's mid-call question. `05-open-risks.md` flags this as unresolved; narrower than before, not closed.
 - **No provider/profile provisioning surface in `acpx-server` yet** -- see Phase 3's "Not yet built" note above.
 
 All six phases in `04-phased-plan.md` are now implemented. No phase remains unstarted; the gaps listed above are the honestly-tracked residual work, not missing phases.
