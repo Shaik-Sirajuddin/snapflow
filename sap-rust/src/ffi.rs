@@ -277,6 +277,17 @@ extern "C" {
     /// success, -1 on failure.
     pub fn sap_save_project(main_window_handle: *mut c_void) -> c_int;
 
+    /// C++ side: `int sap_export_project_xml(void* mainWindowHandle, const
+    /// char* outputXmlPath);` -- writes the current project (via the real
+    /// `MainWindow::saveXML()`) to an arbitrary scratch path as a
+    /// self-contained, absolute-path MLT XML file, for `file.export` to
+    /// hand to a standalone `melt` process. Returns 0 on success, -1 on
+    /// failure.
+    pub fn sap_export_project_xml(
+        main_window_handle: *mut c_void,
+        output_xml_path: *const c_char,
+    ) -> c_int;
+
     /// C++ side: `int sap_project_undo(void* mainWindowHandle);` -- applies
     /// the next undo command on `MAIN.undoStack()`. Returns 0 on success,
     /// -1 when the handle or undo stack is unavailable.

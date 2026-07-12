@@ -18,7 +18,12 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
@@ -38,6 +43,20 @@ use crate::server::{self, ServerConfig};
 /// `project_id` addresses the same running project.
 pub struct FfiBackend {
     main_window: *mut c_void,
+    /// Export job registry -- mirrors `MltBackend`'s (same `JobStatus`
+    /// shape, same background-thread-polls-`try_wait` pattern), because
+    /// there is no live Qt/QML-side "job" concept exposed via C-ABI to
+    /// wire instead: real Shotcut's own export path (`EncodeDock`/
+    /// `JobQueue`) is a large, QML-metadata-driven UI surface, not a thin
+    /// primitive worth shimming just for this. `file_export` here instead
+    /// exports the *real* current project to a real MLT XML file via
+    /// `sap_export_project_xml` (the same `MainWindow::saveXML()` "Save
+    /// As" uses), then spawns the same real `melt` CLI MltBackend does --
+    /// so the render itself is 100% real, only the job-tracking
+    /// bookkeeping is duplicated Rust-side state rather than a Qt-side
+    /// primitive.
+    jobs: Arc<Mutex<HashMap<String, JobStatus>>>,
+    job_children: HashMap<String, Arc<Mutex<Option<Child>>>>,
 }
 
 // SAFETY: `main_window` is never dereferenced directly on whatever thread
@@ -56,7 +75,11 @@ impl FfiBackend {
     /// `MainWindow::singleton()`) for as long as this backend is used --
     /// i.e. for the lifetime of the Qt process this crate is linked into.
     pub unsafe fn new(main_window: *mut c_void) -> Self {
-        Self { main_window }
+        Self {
+            main_window,
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            job_children: HashMap::new(),
+        }
     }
 
     fn undo_redo_depth(&self) -> BackendResult<(usize, usize)> {
@@ -921,11 +944,145 @@ impl Backend for FfiBackend {
     fn file_export(
         &mut self,
         _project_id: &str,
-        _output_path: &str,
-        _codec: &str,
-        _container: &str,
+        output_path: &str,
+        codec: &str,
+        container: &str,
     ) -> BackendResult<String> {
-        Err(BackendError::NotFound("file.export not wired to real FFI yet".into()))
+        // Real MLT XML of the actual live project (via the real "Save As"
+        // primitive, sap_export_project_xml), written to a scratch dir
+        // rather than the project's own file -- exporting must never
+        // clobber whatever the user has open.
+        let scratch_dir = std::env::temp_dir().join(format!("sap-ffi-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch_dir)
+            .map_err(|e| BackendError::InvalidParams(format!("failed to create export scratch dir: {e}")))?;
+        let mlt_path = scratch_dir.join("project.mlt");
+        let c_mlt_path = CString::new(mlt_path.to_string_lossy().into_owned())
+            .map_err(|e| BackendError::InvalidParams(format!("bad scratch path: {e}")))?;
+        let rc = unsafe { ffi::sap_export_project_xml(self.main_window, c_mlt_path.as_ptr()) };
+        if rc != 0 {
+            return Err(BackendError::InvalidParams(
+                "failed to export the current project to MLT XML (no clips/producer open?)".into(),
+            ));
+        }
+
+        let resolved_output = {
+            let p = std::path::Path::new(output_path);
+            let mut resolved = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(output_path)
+            };
+            if resolved.extension().is_none() {
+                resolved.set_extension(if container.is_empty() { "mp4" } else { container });
+            }
+            resolved
+        };
+        if let Some(parent) = resolved_output.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| BackendError::InvalidParams(format!("failed to create export dir: {e}")))?;
+        }
+
+        let vcodec = crate::mlt_backend::normalize_vcodec(codec);
+        let melt_bin = crate::mlt_backend::resolve_melt_binary();
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
+        let qt_platform = std::env::var("QT_QPA_PLATFORM").unwrap_or_else(|_| "offscreen".to_string());
+
+        let mut cmd = Command::new(&melt_bin);
+        cmd.arg(&mlt_path)
+            .arg("-consumer")
+            .arg(format!("avformat:{}", resolved_output.display()))
+            .arg(format!("vcodec={vcodec}"))
+            .arg("acodec=aac")
+            .env("DISPLAY", &display)
+            .env("QT_QPA_PLATFORM", &qt_platform)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| BackendError::InvalidParams(format!("failed to spawn `{melt_bin}`: {e} (is melt on PATH, or MELT_BIN set?)")))?;
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
+            jobs.insert(
+                job_id.clone(),
+                JobStatus {
+                    job_id: job_id.clone(),
+                    status: "running".into(),
+                    percent: 0.0,
+                    result_path: Some(resolved_output.to_string_lossy().into_owned()),
+                    error: None,
+                },
+            );
+        }
+
+        // Same kill-handle-plus-polling-thread shape as MltBackend::
+        // file_export -- see there for the full rationale (either
+        // jobs_stop or the poller can claim the Child; whichever gets
+        // there first wins).
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        self.job_children.insert(job_id.clone(), child_slot.clone());
+
+        let jobs = self.jobs.clone();
+        let job_id_bg = job_id.clone();
+        std::thread::spawn(move || {
+            let outcome = loop {
+                let mut guard = child_slot.lock().expect("job child mutex poisoned");
+                match guard.as_mut() {
+                    None => return, // jobs_stop already took it and set status.
+                    Some(child) => match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let mut finished = guard.take().expect("child present after try_wait");
+                            let mut stderr = String::new();
+                            if let Some(mut pipe) = finished.stderr.take() {
+                                let _ = pipe.read_to_string(&mut stderr);
+                            }
+                            break Ok((status, stderr));
+                        }
+                        Ok(None) => {
+                            drop(guard);
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(e) => {
+                            *guard = None;
+                            break Err(e);
+                        }
+                    },
+                }
+            };
+
+            let mut jobs = jobs.lock().expect("jobs mutex poisoned");
+            if let Some(job) = jobs.get_mut(&job_id_bg) {
+                if job.status != "running" {
+                    return; // Don't overwrite a client-initiated stop.
+                }
+                match outcome {
+                    Ok((status, stderr)) if status.success() => {
+                        if let Some(bad) = crate::mlt_backend::detect_unrecognised_codec(&stderr) {
+                            job.status = "error".into();
+                            job.error =
+                                Some(format!("melt exited 0 but dropped a stream: {bad} (stderr: {stderr})"));
+                        } else {
+                            job.status = "done".into();
+                            job.percent = 100.0;
+                        }
+                    }
+                    Ok((status, stderr)) => {
+                        job.status = "error".into();
+                        job.error = Some(format!("melt exited with {status}: {stderr}"));
+                    }
+                    Err(e) => {
+                        job.status = "error".into();
+                        job.error = Some(format!("failed to wait on melt: {e}"));
+                    }
+                }
+            }
+        });
+
+        Ok(job_id)
     }
 
     fn file_probe(&mut self, path: &str) -> BackendResult<FileProbe> {
@@ -936,15 +1093,41 @@ impl Backend for FfiBackend {
     }
 
     fn jobs_get(&mut self, _job_id: &str) -> BackendResult<JobStatus> {
-        Err(BackendError::NotFound("jobs.get not wired to real FFI yet".into()))
+        self.jobs
+            .lock()
+            .expect("jobs mutex poisoned")
+            .get(_job_id)
+            .cloned()
+            .ok_or_else(|| BackendError::NotFound(format!("job {_job_id}")))
     }
 
     fn jobs_list(&mut self, _project_id: &str) -> BackendResult<Vec<JobStatus>> {
-        Err(BackendError::Unsupported("jobs.list not wired to real FFI yet".into()))
+        // No per-project routing to filter by (see the `FfiBackend` doc
+        // comment -- the embedded process has exactly one live project),
+        // so this returns every job this backend has ever spawned, unlike
+        // MltBackend's project-scoped filter.
+        let mut jobs: Vec<JobStatus> = self.jobs.lock().expect("jobs mutex poisoned").values().cloned().collect();
+        jobs.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+        Ok(jobs)
     }
 
     fn jobs_stop(&mut self, _job_id: &str) -> BackendResult<()> {
-        Err(BackendError::Unsupported("jobs.stop not wired to real FFI yet".into()))
+        {
+            let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
+            let job = jobs.get_mut(_job_id).ok_or_else(|| BackendError::NotFound(format!("job {_job_id}")))?;
+            if job.status != "running" {
+                return Ok(()); // Already terminal -- idempotent success.
+            }
+            job.status = "stopped".into();
+            job.error = Some("stopped by client".into());
+        }
+        if let Some(slot) = self.job_children.remove(_job_id) {
+            if let Some(mut child) = slot.lock().expect("job child mutex poisoned").take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        Ok(())
     }
 
     fn playback_get_frame(

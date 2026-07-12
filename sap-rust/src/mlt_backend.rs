@@ -1805,7 +1805,10 @@ fn default_in_out(producer: &ProducerSpec) -> BackendResult<(i64, i64)> {
 /// export. Unknown/already-correct values (e.g. an operator passing
 /// "libx264" or "prores_ks" directly, as this crate's own tests do) pass
 /// through unchanged.
-fn normalize_vcodec(codec: &str) -> String {
+/// `pub(crate)` so `ffi_backend::file_export` can reuse the same codec
+/// normalization -- purely a string mapping with no Qt/MLT dependency, so
+/// both backends should accept the same spec-level codec aliases.
+pub(crate) fn normalize_vcodec(codec: &str) -> String {
     if codec.is_empty() {
         return "libx264".to_string();
     }
@@ -1826,13 +1829,15 @@ fn normalize_vcodec(codec: &str) -> String {
 /// can report the job as failed instead of "done" even for a codec value
 /// this module doesn't already know how to normalize. Returns the offending
 /// line if found.
-fn detect_unrecognised_codec(stderr: &str) -> Option<&str> {
+/// `pub(crate)` -- see `normalize_vcodec`, same reuse rationale.
+pub(crate) fn detect_unrecognised_codec(stderr: &str) -> Option<&str> {
     stderr
         .lines()
         .find(|line| line.contains("unrecognised - ignoring") || line.contains("unrecognized - ignoring"))
 }
 
-fn resolve_melt_binary() -> String {
+/// `pub(crate)` -- see `normalize_vcodec`, same reuse rationale.
+pub(crate) fn resolve_melt_binary() -> String {
     if let Ok(p) = std::env::var("MELT_BIN") {
         return p;
     }
