@@ -1,0 +1,19 @@
+[package]
+name = "panel-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 4+: real chat-panel crate. Renders a Slint UI (software renderer, CPU pixel buffer) driven by rui-acp-client's live ACP session data, exposed via a C ABI for a Qt QQuickItem to composite. See src/agent_bridge.rs for how the async agent connections are bridged onto panel-rust's single required OS thread, and its module docs for the jsonl cache / live-reload contract."
+
+[dependencies]
+slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
+rui-acp-client = { path = "../rui-acp-client" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std"] }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "panel_rust"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
