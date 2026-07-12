@@ -136,6 +136,29 @@ extern "C" {
         clip_index: c_int,
     ) -> *mut c_char;
 
+    /// C++ side: `int sap_filter_remove(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, int filterIndex);` -- real
+    /// `Mlt::Service::detach()`. Same non-undoable caveat as
+    /// `sap_filter_add`. Returns 0 on success, -1 on error.
+    pub fn sap_filter_remove(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        filter_index: c_int,
+    ) -> c_int;
+
+    /// C++ side: `int sap_filter_reorder(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, int fromIndex, int toIndex);` -- real
+    /// `Mlt::Service::move_filter()`. Same non-undoable caveat as
+    /// `sap_filter_add`. Returns 0 on success, -1 on error.
+    pub fn sap_filter_reorder(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        from_index: c_int,
+        to_index: c_int,
+    ) -> c_int;
+
     /// C++ side: `char* sap_list_tracks(void* mainWindowHandle);` -- returns a
     /// heap-allocated, NUL-terminated JSON array string of the form
     /// `[{"index":0,"kind":"video"},...]` (built from the real

@@ -611,20 +611,42 @@ impl Backend for FfiBackend {
     fn filter_remove(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
-        _filter_index: usize,
+        clip_id: &str,
+        filter_index: usize,
     ) -> BackendResult<()> {
-        Err(BackendError::NotFound("filter.remove not wired to real FFI yet".into()))
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let rc = unsafe {
+            ffi::sap_filter_remove(self.main_window, track_index as c_int, clip_index as c_int, filter_index as c_int)
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("filter {filter_index} on clip {clip_id} unavailable")));
+        }
+        Ok(())
     }
 
     fn filter_reorder(
         &mut self,
         _project_id: &str,
-        _clip_id: &str,
-        _filter_index: usize,
-        _new_index: usize,
+        clip_id: &str,
+        filter_index: usize,
+        new_index: usize,
     ) -> BackendResult<()> {
-        Err(BackendError::NotFound("filter.reorder not wired to real FFI yet".into()))
+        let (track_index, clip_index) = Self::parse_clip_id(clip_id)?;
+        let rc = unsafe {
+            ffi::sap_filter_reorder(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                filter_index as c_int,
+                new_index as c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!(
+                "filter reorder {filter_index}->{new_index} on clip {clip_id} unavailable"
+            )));
+        }
+        Ok(())
     }
 
     fn filter_list_keyframes(
