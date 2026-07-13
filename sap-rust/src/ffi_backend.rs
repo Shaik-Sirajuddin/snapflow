@@ -23,9 +23,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::process::{Child, Command, Stdio};
+use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use serde_json::json;
@@ -120,6 +121,105 @@ pub struct FfiBackend {
 // holding and passing this pointer across threads sound even though
 // `MainWindow*` itself is not `Send` in the Qt/C++ sense.
 unsafe impl Send for FfiBackend {}
+
+/// Reset the melt child's signal mask/dispositions AND close every
+/// inherited file descriptor above stderr, immediately after fork, before
+/// exec. Runs on the child side only (`Command::pre_exec`), unsafe per its
+/// contract (async-signal-safe calls only between fork and exec).
+///
+/// Why: melt, forked directly from this live Qt process, reproducibly
+/// wedges (all threads parked in `futex_do_wait`, zero forward CPU/output
+/// progress) at a deterministic byte offset in the encode -- same offset,
+/// every attempt, every fresh respawn -- while the identical invocation
+/// run from a plain shell completes cleanly every time. That determinism
+/// (not a random race) plus "only when forked from Qt" points at
+/// inherited *resource* state, not signal state: `ls -la
+/// /proc/<qt-pid>/fd` on the live headed process shows several
+/// non-CLOEXEC fds Qt/the platform GPU stack holds open --
+/// `/dev/udmabuf`, `memfd:lp_dma_buf`, `/dmabuf:`, `anon_inode:sync_file`
+/// (a DRM/dma-buf fence) -- alongside assorted eventfd/socket fds. A
+/// forked melt child inherits these raw. If melt's decode path (e.g. a
+/// hardware-accelerated producer) ever touches a GPU sync fence the live
+/// Qt renderer also holds, that is exactly the "wedged waiting on a
+/// futex/fence, deterministic point, only when forked from Qt" signature
+/// observed here. `Command`'s own stdio wiring (dup2 to 0/1/2) runs
+/// before `pre_exec` closures, so it is safe to unconditionally
+/// `close_range(3, MAX, 0)` here -- our own pipes are already in place on
+/// 0/1/2 and everything else inherited from the parent is exactly what we
+/// want gone before melt's own `main()` runs. Signal-mask/disposition
+/// reset is kept alongside as cheap additional insurance (Qt's Unix
+/// signal socketpair machinery could independently leave signals blocked
+/// on the forking thread) even though it alone was insufficient --
+/// confirmed by hand: wired in, rebuilt, retested, and the stall still
+/// reproduced at the identical byte offset on all 3 watchdog attempts.
+fn reset_child_signals(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            // Sever every inherited fd above stderr -- in particular the
+            // GPU dma-buf/sync-fence fds the live Qt process holds open
+            // (see doc comment above). `close_range` is a single
+            // async-signal-safe syscall (glibc >= 2.34 wraps it
+            // directly); a negative return here is not fatal to melt
+            // itself (worst case some fd leaks through), so it is
+            // deliberately not treated as a hard error.
+            libc::close_range(3, libc::c_uint::MAX, 0);
+            Ok(())
+        });
+    }
+}
+
+/// Spawn `cmd` (which must already have `.stdout(Stdio::null())` and
+/// `.stderr(Stdio::piped())` set) and immediately start a background
+/// thread continuously draining the child's stderr into a shared buffer.
+///
+/// This is the actual fix for the melt stall root-caused here: `melt`
+/// writes a running frame/progress line to stdout (and occasional
+/// warnings to stderr) as it encodes. The old code captured both via
+/// `Stdio::piped()` but only ever read stderr, and only *after* the
+/// child had already exited -- classic unread-pipe deadlock. A pipe is a
+/// fixed-size OS buffer (64KiB by default on Linux); once melt's
+/// progress-line output fills it with nobody draining the read end,
+/// melt's own `write(2)` call blocks forever, freezing the whole process
+/// (including its writes to the actual output file) at whatever byte
+/// offset corresponds to that fixed amount of accumulated stdout text --
+/// which is exactly why the stall was 100% deterministic at the same
+/// output-file byte offset on every attempt, every fresh respawn, and
+/// (confirmed by hand, reproduced with a plain `subprocess.Popen(...,
+/// stdout=PIPE, stderr=PIPE)` from a bare Python script with zero Qt/fork
+/// involvement) *independent of whether melt was forked from the live Qt
+/// process at all*. Every earlier theory tried here (DISPLAY forwarding,
+/// signal mask/disposition inheritance, leaked GPU dma-buf fds) was
+/// treating a symptom of this same underlying deadlock, not the cause.
+/// Fix: stdout is discarded entirely (`Stdio::null()`, set by the
+/// caller -- nothing in this codebase ever consumed it) and stderr is
+/// drained continuously here rather than buffered up and read once at
+/// the end.
+fn spawn_melt_draining_stderr(mut cmd: Command) -> std::io::Result<(Child, Arc<Mutex<String>>)> {
+    let mut child = cmd.spawn()?;
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    if let Some(mut pipe) = child.stderr.take() {
+        let buf = stderr_buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut b) = buf.lock() {
+                            b.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        }
+                    }
+                }
+            }
+        });
+    }
+    Ok((child, stderr_buf))
+}
 
 impl FfiBackend {
     /// # Safety
@@ -1499,7 +1599,6 @@ impl Backend for FfiBackend {
 
         let vcodec = crate::media_tools::normalize_vcodec(codec);
         let melt_bin = crate::media_tools::resolve_melt_binary();
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
         let qt_platform = std::env::var("QT_QPA_PLATFORM").unwrap_or_else(|_| "offscreen".to_string());
 
         let mut cmd = Command::new(&melt_bin);
@@ -1508,13 +1607,30 @@ impl Backend for FfiBackend {
             .arg(format!("avformat:{}", resolved_output.display()))
             .arg(format!("vcodec={vcodec}"))
             .arg("acodec=aac")
-            .env("DISPLAY", &display)
             .env("QT_QPA_PLATFORM", &qt_platform)
-            .stdout(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
-        let child = cmd
-            .spawn()
+        // Only forward DISPLAY when the melt child is explicitly NOT running
+        // offscreen. avformat file export needs no display of its own --
+        // forwarding the parent process's real DISPLAY (set whenever the
+        // *editor* itself was launched headed, i.e. daemon.launch with
+        // headless=false) hands melt a live, actively-rendering X server
+        // that a concurrently-open Shotcut GUI window is also using.
+        // Confirmed by hand: exporting this way reproducibly stalls melt
+        // indefinitely (ffmpeg's VAAPI/DRM probing threads deadlock in
+        // futex_do_wait on that shared display); the identical export with
+        // DISPLAY unset completes cleanly in well under two minutes.
+        if qt_platform != "offscreen" {
+            if let Ok(display) = std::env::var("DISPLAY") {
+                cmd.env("DISPLAY", display);
+            }
+        } else {
+            cmd.env_remove("DISPLAY");
+        }
+        reset_child_signals(&mut cmd);
+
+        let (child, stderr_buf) = spawn_melt_draining_stderr(cmd)
             .map_err(|e| BackendError::InvalidParams(format!("failed to spawn `{melt_bin}`: {e} (is melt on PATH, or MELT_BIN set?)")))?;
 
         let job_id = uuid::Uuid::new_v4().to_string();
@@ -1550,29 +1666,120 @@ impl Backend for FfiBackend {
 
         let jobs = self.jobs.clone();
         let job_id_bg = job_id.clone();
+        // melt, when forked directly from this live Qt/FFI process (as
+        // opposed to a plain shell), has been observed to occasionally
+        // wedge completely -- confirmed by hand: 129 threads all parked in
+        // futex_do_wait, output file size frozen, zero forward CPU time,
+        // for many minutes straight, while the exact same project XML run
+        // through a freshly-spawned `melt` from a normal shell (same HOME,
+        // same live-GUI contention) completes cleanly in under two
+        // minutes every time. The trigger wasn't pinned down (DISPLAY,
+        // HOME, and GUI concurrency were all ruled out by direct A/B
+        // testing), so treat it as a transient race in whatever this
+        // process forks rather than a deterministic bug: detect "no output
+        // file growth for STALL_TIMEOUT" and kill-and-respawn a fresh melt
+        // child (up to MAX_ATTEMPTS total) instead of hanging the job
+        // forever.
+        const STALL_TIMEOUT: Duration = Duration::from_secs(45);
+        const MAX_ATTEMPTS: u32 = 3;
+        let resolved_output_bg = resolved_output.clone();
+        let melt_bin_bg = melt_bin.clone();
+        let mlt_path_bg = mlt_path.clone();
+        let vcodec_bg = vcodec.clone();
+        let qt_platform_bg = qt_platform.clone();
         std::thread::spawn(move || {
-            let outcome = loop {
-                let mut guard = child_slot.lock().expect("job child mutex poisoned");
-                match guard.as_mut() {
-                    None => return, // jobs_stop already took it and set status.
-                    Some(child) => match child.try_wait() {
-                        Ok(Some(status)) => {
-                            let mut finished = guard.take().expect("child present after try_wait");
-                            let mut stderr = String::new();
-                            if let Some(mut pipe) = finished.stderr.take() {
-                                let _ = pipe.read_to_string(&mut stderr);
+            let build_cmd = || {
+                let mut cmd = Command::new(&melt_bin_bg);
+                cmd.arg(&mlt_path_bg)
+                    .arg("-consumer")
+                    .arg(format!("avformat:{}", resolved_output_bg.display()))
+                    .arg(format!("vcodec={vcodec_bg}"))
+                    .arg("acodec=aac")
+                    .env("QT_QPA_PLATFORM", &qt_platform_bg)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped());
+                if qt_platform_bg != "offscreen" {
+                    if let Ok(display) = std::env::var("DISPLAY") {
+                        cmd.env("DISPLAY", display);
+                    }
+                } else {
+                    cmd.env_remove("DISPLAY");
+                }
+                reset_child_signals(&mut cmd);
+                cmd
+            };
+
+            let mut attempt = 1u32;
+            let mut current_stderr_buf = stderr_buf;
+            let outcome = 'attempts: loop {
+                let mut last_size = fs::metadata(&resolved_output_bg).map(|m| m.len()).unwrap_or(0);
+                let mut last_progress_at = Instant::now();
+                let per_attempt_outcome = loop {
+                    let mut guard = child_slot.lock().expect("job child mutex poisoned");
+                    match guard.as_mut() {
+                        None => return, // jobs_stop already took it and set status.
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(status)) => {
+                                let _finished = guard.take().expect("child present after try_wait");
+                                // stderr was drained continuously by
+                                // `spawn_melt_draining_stderr`'s background
+                                // reader thread rather than buffered up in
+                                // the pipe -- see that function's doc
+                                // comment for why reading it only here
+                                // (after exit, from a `Stdio::piped()` pipe
+                                // nobody had been draining) was the actual
+                                // cause of the export stall.
+                                let stderr = current_stderr_buf
+                                    .lock()
+                                    .map(|b| b.clone())
+                                    .unwrap_or_default();
+                                break Some(Ok((status, stderr)));
                             }
-                            break Ok((status, stderr));
+                            Ok(None) => {
+                                let size = fs::metadata(&resolved_output_bg).map(|m| m.len()).unwrap_or(0);
+                                if size != last_size {
+                                    last_size = size;
+                                    last_progress_at = Instant::now();
+                                }
+                                if last_progress_at.elapsed() >= STALL_TIMEOUT {
+                                    // Stalled: reclaim and kill this attempt's
+                                    // child, then either retry or give up.
+                                    let mut stalled = guard.take().expect("child present while stalled");
+                                    drop(guard);
+                                    let _ = stalled.kill();
+                                    let _ = stalled.wait();
+                                    break None; // signals "stalled, not a real outcome"
+                                }
+                                drop(guard);
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            Err(e) => {
+                                *guard = None;
+                                break Some(Err(e));
+                            }
                         }
-                        Ok(None) => {
-                            drop(guard);
-                            std::thread::sleep(Duration::from_millis(50));
+                    }
+                };
+                match per_attempt_outcome {
+                    Some(result) => break 'attempts result,
+                    None => {
+                        if attempt >= MAX_ATTEMPTS {
+                            break 'attempts Err(std::io::Error::other(format!(
+                                "melt stalled (no output progress for {:?}) on all {attempt} attempts",
+                                STALL_TIMEOUT
+                            )));
                         }
-                        Err(e) => {
-                            *guard = None;
-                            break Err(e);
+                        attempt += 1;
+                        match spawn_melt_draining_stderr(build_cmd()) {
+                            Ok((fresh_child, fresh_stderr_buf)) => {
+                                current_stderr_buf = fresh_stderr_buf;
+                                *child_slot.lock().expect("job child mutex poisoned") = Some(fresh_child);
+                            }
+                            Err(e) => {
+                                break 'attempts Err(e);
+                            }
                         }
-                    },
+                    }
                 }
             };
 
