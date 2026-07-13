@@ -556,3 +556,206 @@ async fn ambient_claude_session_load_survives_a_real_gateway_restart() {
 
     let _ = std::fs::remove_file(&db_path);
 }
+
+/// **Phase 12 addition.** `session/resume` (real ACP spec method,
+/// `sessionCapabilities.resume`) shares `rehydrate_session`'s exact
+/// restart-survival fallback with `session/load` (see that function's
+/// doc comment and `classify`'s grouping of the two) but, unlike
+/// `session/load`, had never been exercised against a real backend
+/// adapter anywhere in this workspace -- carried as an open item across
+/// phases 8 through 11. Per the real schema (`ResumeSessionRequest`/
+/// `ResumeSessionResponse`, fetched in phase 9's
+/// `/tmp/acp_schema.json`), `session/resume` is deliberately a lighter
+/// operation than `session/load`: no history replay, just "resume
+/// without returning previous messages... useful for agents that can
+/// resume sessions but don't implement full session loading" -- but it
+/// goes through the identical gateway-side code path, so this test
+/// proves the same restart-survival contract for it that
+/// `ambient_claude_session_load_survives_a_real_gateway_restart` proved
+/// for `session/load`: kill the whole first `acpx-server` process, spawn
+/// a second independent one against the same sqlite file, and confirm
+/// `session/resume` alone (no `session/load` call anywhere in this test)
+/// can recover the session, re-register it with the second process's own
+/// `Supervisor`, and drive a real follow-up billed prompt turn through
+/// it.
+///
+/// **`#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1`**, same
+/// rationale as the rest of this file.
+///
+/// Run with:
+/// ```text
+/// ACPX_LIVE_TEST_AMBIENT=1 \
+/// cargo test -p acpx-server --test real_ambient_multi_agent_test \
+///   ambient_claude_session_resume_survives_a_real_gateway_restart -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn ambient_claude_session_resume_survives_a_real_gateway_restart() {
+    if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
+             machine's real, already-logged-in claude CLI session (see this file's \
+             top doc comment -- it makes a real billed API call)"
+        );
+        return;
+    }
+
+    let db_path = std::env::temp_dir().join(format!(
+        "acpx-session-resume-restart-test-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+
+    let gateway_session_id = {
+        let addr = ephemeral_addr().await;
+        let server = spawn_real_server_with_db(addr, Some(&db_path)).await;
+        let client = GatewayClient::new(format!("http://{addr}"));
+
+        profiles::create(
+            &client,
+            serde_json::json!({
+                "name": "ambient-claude-resume-restart",
+                "agent_id": "claude-acp",
+                "provider": null,
+                "key_ref": null,
+                "launch_overrides": {},
+                "mcp_servers": [],
+            }),
+        )
+        .await
+        .expect("profiles/create(ambient-claude-resume-restart)");
+
+        let new_result = client
+            .call(
+                "session/new",
+                serde_json::json!({"cwd": "/tmp", "mcpServers": [], "_acpx": {"profile": "ambient-claude-resume-restart"}}),
+                None,
+            )
+            .await
+            .expect("session/new");
+        let gateway_session_id = new_result["sessionId"]
+            .as_str()
+            .expect("session/new had no sessionId")
+            .to_string();
+
+        client
+            .call(
+                "session/set_config_option",
+                serde_json::json!({"sessionId": gateway_session_id, "configId": "model", "value": "haiku"}),
+                None,
+            )
+            .await
+            .expect("session/set_config_option");
+
+        let turn = prompt::send(
+            &client,
+            &gateway_session_id,
+            serde_json::json!([{"type": "text", "text": "Reply with exactly the single word OK and nothing else."}]),
+        )
+        .await
+        .expect("session/prompt");
+        assert!(
+            turn.message_text.to_uppercase().contains("OK"),
+            "expected a real model reply containing OK, got {:?}",
+            turn.message_text
+        );
+
+        // Deliberately no `session/close` here -- `session/resume`'s own
+        // doc says nothing about the session needing to have been closed
+        // first; the whole point is recovering a session whose owning
+        // process is simply gone. This exercises the more realistic
+        // "acpx crashed/restarted out from under a still-logically-open
+        // session" scenario rather than the tidier "client closed it
+        // first" one already covered by the `session/load` restart test.
+        drop(server); // kill_on_drop -- the whole first acpx-server process dies here.
+        gateway_session_id
+    };
+
+    // Give the OS a moment to actually finish tearing down the first
+    // process/port before standing up the second on a fresh address.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let addr2 = ephemeral_addr().await;
+    let _server2 = spawn_real_server_with_db(addr2, Some(&db_path)).await;
+    let client2 = GatewayClient::new(format!("http://{addr2}"));
+
+    // Same rationale as the `session/load` restart test: profile
+    // definitions are runtime state, not part of `ACPX_DB_PATH`, so
+    // re-declare it against the second process.
+    profiles::create(
+        &client2,
+        serde_json::json!({
+            "name": "ambient-claude-resume-restart",
+            "agent_id": "claude-acp",
+            "provider": null,
+            "key_ref": null,
+            "launch_overrides": {},
+            "mcp_servers": [],
+        }),
+    )
+    .await
+    .expect("profiles/create(ambient-claude-resume-restart) against the second process");
+
+    // No `session/load` anywhere in this test -- `session/resume` alone
+    // must recover the session from the durable sqlite row.
+    let resume_result = client2
+        .call(
+            "session/resume",
+            serde_json::json!({
+                "sessionId": gateway_session_id,
+                "cwd": "/tmp",
+                "mcpServers": [],
+            }),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "session/resume against the second, independent acpx-server process \
+                 failed to rehydrate a session created by the first process: {err}"
+            )
+        });
+    // Real `ResumeSessionResponse` schema: `modes`/`configOptions`/`_meta`
+    // only, no `sessionId` and (unlike `session/load`) no history replay
+    // at all -- this is the method's whole point per its own schema
+    // description ("without returning previous messages"). Nothing more
+    // specific to assert about the response shape than `session/load`'s
+    // own test already asserts.
+    assert!(
+        resume_result.get("modes").is_some() || resume_result.get("configOptions").is_some(),
+        "session/resume response should carry at least modes or configOptions per the real \
+         ResumeSessionResponse schema: {resume_result:?}"
+    );
+
+    // The gateway session id must still work for a real follow-up prompt
+    // in the *new* process -- proves `session/resume` genuinely
+    // re-registered the session with the second process's own
+    // `Supervisor`, not just answered the RPC call in isolation.
+    let turn2 = prompt::send(
+        &client2,
+        &gateway_session_id,
+        serde_json::json!([{"type": "text", "text": "Reply with exactly the single word RESUMED and nothing else."}]),
+    )
+    .await
+    .unwrap_or_else(|err| {
+        panic!("session/prompt after session/resume rehydration failed: {err}")
+    });
+    assert!(
+        turn2.message_text.to_uppercase().contains("RESUMED"),
+        "expected a real model reply containing RESUMED after resume, got {:?}",
+        turn2.message_text
+    );
+
+    let _ = client2
+        .call(
+            "session/close",
+            serde_json::json!({"sessionId": gateway_session_id}),
+            None,
+        )
+        .await;
+
+    let _ = std::fs::remove_file(&db_path);
+}

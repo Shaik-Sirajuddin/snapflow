@@ -1568,3 +1568,85 @@ ignored**, `cargo fmt --all --check` and `cargo build --workspace
    carried over" item ride indefinitely just because it sounds lower-risk
    than the phase's headline finding; phase 10 is direct proof that
    untested verbatim-forwarding claims are exactly where gaps hide.
+
+## 2026-07-13 -- ACP compatibility phase 12: `session/resume` verified end to end against a real gateway restart
+
+**Directive:** continuation of the same series, closing phase 8's
+recheck item (carried, untested, through phases 9/10/11): "`session/
+resume` still shares the rehydration path but remains untested end to
+end by a real adapter." Phase 11's lesson (don't let untested "shares
+the same code path" claims ride indefinitely) made this the direct next
+step.
+
+**Real schema check first** (`ResumeSessionRequest`/`ResumeSessionResponse`
+/`SessionResumeCapabilities`, `/tmp/acp_schema.json` from phase 9):
+`session/resume` is a real, stable v1 method, request shape nearly
+identical to `session/load`'s (`sessionId`/`cwd`/`additionalDirectories`/
+`mcpServers`/`_meta`), response deliberately lighter (`modes`/
+`configOptions`/`_meta` only, explicitly **no history replay** --
+"Resumes an existing session without returning previous messages...
+useful for agents that can resume sessions but don't implement full
+session loading"). `acpx-core::router::classify` already groups it with
+`session/load` under `Proxied`, and `rehydrate_session`'s restart-
+survival fallback (phase 8) already lists `"session/resume"` explicitly
+alongside `"session/load"`/`"session/delete"` -- so, per the code, this
+should already work; the open question was purely "has this actually
+been exercised against a real backend adapter," not "is there known-
+missing code."
+
+**Result: no code gap found -- the shared-path claim held on first real
+run.** New test `ambient_claude_session_resume_survives_a_real_gateway_
+restart` in `acpx-server/tests/real_ambient_multi_agent_test.rs` mirrors
+phase 8's `session/load` restart test almost exactly (spawn a real
+`acpx-server` process against a real sqlite file, create a real `claude-
+agent-acp` session, one billed prompt turn, kill the whole process, spawn
+a second independent process against the same sqlite file, re-declare the
+profile) but deliberately diverges in two ways to keep the two tests
+testing genuinely different things rather than duplicating one another:
+(1) the first process's session is **never closed** before the process is
+killed (exercises the more realistic "acpx died mid-session" scenario,
+vs. the `session/load` test's tidier "client closed it first" one), and
+(2) the second process calls **only** `session/resume` -- no `session/
+load` call anywhere in this test -- and then drives a real follow-up
+billed prompt turn through the resumed session to prove it was genuinely
+re-registered with the second process's own `Supervisor`, not just that
+the RPC call itself returned successfully. Ran for real (not simulated)
+via `ACPX_LIVE_TEST_AMBIENT=1`: passed on the first attempt, no fix
+needed.
+
+Workspace test count after this phase: **174 passed, 0 failed, 4
+ignored** (unchanged -- the new test is itself `#[ignore]`d/opt-in, like
+the rest of this file's real-ambient tests, so it doesn't move the
+default-run count; it was run manually with `--ignored` and confirmed
+passing against real ambient `claude` auth on this machine).
+`cargo fmt --all --check` and `cargo build --workspace --tests` both
+clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `session/resume` (carried since phase 8) is now closed -- verified for
+   real, no gap. This was the last remaining item in the "shares a code
+   path, never independently confirmed against a real backend" category
+   that this series had been tracking since phase 8.
+2. `session/list`'s shape mismatch (carried since phase 8) remains the
+   one open architectural item in this series. Decision made this phase
+   rather than deferred further (see below).
+3. `session/fork` (unstable) and `elicitation/create`/`elicitation/
+   complete` (unstable) remain out of scope per the stable v1 schema's
+   own stability contract, unchanged from phase 9's finding.
+
+**`session/list` architectural decision, made this phase:** three options
+were on the table since phase 8/9 (keep the gateway-scoped meaning as-is;
+forward to a single backend and lose the multi-agent aggregate view; or
+split the two concepts under different method names). The objective this
+whole series serves is explicit that ACP spec compatibility and acpx's
+multiplex-management value (the reason a gateway exists instead of a
+client talking to one backend adapter directly) must **both** hold, not
+trade one for the other -- so option 2 (silently reinterpreting the real
+`session/list` as single-backend-only) was rejected as a regression of
+acpx's core purpose, and option 1 (leaving it gateway-scoped forever)
+was rejected as leaving a real spec method permanently non-compliant
+when a real, non-breaking fix exists. **Chosen: split.** This is tracked
+as the concrete next phase (13) rather than done opportunistically here,
+since it touches wire-visible behavior (a real, spec-shaped, per-backend
+`Proxied` `session/list`) and deserves its own build/test/fmt/commit
+cycle like every other phase in this series.
