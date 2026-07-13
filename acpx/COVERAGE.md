@@ -572,3 +572,90 @@ hardcoded to `1` with no negotiation against what a backend reports back
 in its own `initialize` response -- noted here, not yet fixed, low
 priority relative to the above since no adapter tested so far has
 rejected it.
+
+## ACP compatibility hardening, phase 2 -- `session/request_permission` no longer deadlocks the backend
+
+Closes what phase 1 flagged as the single biggest remaining
+architectural gap. Real bug, not hypothetical: `read_matching_response`
+(the loop every dispatch path uses to read a backend's stdio until its
+own request's `id` shows up) classified *any* message without a matching
+`id` as a `session/update`-style notification, including an
+agent-initiated *request* like `session/request_permission` -- which
+carries its own `id` and a `method`, and, per the real ACP spec, blocks
+the backend from producing the outer call's own response until it gets
+an answer. Pre-fix, acpx never sent one, so a real backend that ever
+asked permission mid-turn (any adapter running a shell/edit tool under
+normal safety settings) would hang forever, and so would the client's
+own request to acpx.
+
+Fixed in `acpx-core/src/router.rs`: `read_matching_response` now checks
+every unmatched message for `id` *and* `method` together (a request, not
+a notification) before falling back to treating it as one. If the
+method is `session/request_permission`, a new `build_permission_reply`
+builds a real, schema-correct reply (`agentclientprotocol.com/protocol/
+schema`'s `RequestPermissionResponse`: `result.outcome` is either
+`{"outcome": "selected", "optionId": ..}` or `{"outcome": "cancelled"}`)
+per a new profile-scoped `crate::profile::PermissionPolicy`
+(`AutoAllow`/`AutoReject`, default `AutoReject`) and writes it straight
+back to the backend's stdin so it can proceed. Any other agent-initiated
+request method (none exist in this workspace yet, but the deadlock risk
+is identical for any future one, e.g. `fs/read_text_file`) gets a proper
+JSON-RPC `-32601` method-not-found error instead of silence, so it can
+never wedge a session even before its real handler exists. ACP's own
+spec explicitly sanctions automatic client-side decisions here ("Clients
+MAY automatically allow or reject permission requests according to user
+settings") -- this isn't a workaround, it's the documented alternative to
+a live, synchronous, out-of-band reply channel, which this gateway's
+HTTP-shaped transport doesn't have (see the still-open gap below).
+
+Every `{request, reply}` pair handled this way is surfaced, not hidden:
+`_acpx.agentRequests` (additive/namespaced, same convention as
+`_acpx.updates`/`_acpx.agentCapabilities`) on both `session/new`'s and
+every proxied method's response, via `attach_updates`/
+`attach_session_new_extras`, both extended with a third parameter.
+`SessionEntry` (`acpx-core/src/session_registry.rs`) gained a
+`profile_name: Option<String>` field (threaded through
+`SessionRegistry::register`'s new third parameter) so a later
+`session/prompt`/etc. call on an already-open session can still look its
+originating profile's policy back up -- this didn't exist before this
+phase; `session/new`'s own dispatch already had the resolved `Profile`
+in scope, but nothing downstream did.
+
+New test file: `acpx-core/tests/permission_request_test.rs`, a stand-in
+backend that -- on `session/prompt` -- sends a real-shaped
+`session/request_permission` request (both an `allow_once` and a
+`reject_once` option) and then blocks its own inner `while read` loop on
+seeing a reply with that request's id before answering the outer call.
+Two tests: default/native mode (no profile) auto-rejects (selects the
+`reject-once` option) and the outer call still completes; a profile
+created with `"permission_policy": "auto_allow"` auto-allows (selects
+`allow-once`) instead. Both wrapped in a 5-second `tokio::time::timeout`
+rather than a bare `.await` -- a regression of this fix is a genuine
+infinite hang, not a normal assertion failure, so the test needs to fail
+fast instead of wedging the whole binary.
+
+Workspace test count after this addition: **146 passed, 0 failed, 3
+ignored**, `cargo fmt --all --check` and `cargo build --workspace` both
+clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `fs/read_text_file`/`fs/write_text_file` -- still unimplemented,
+   client capabilities still unconditionally declare both `false`. Next
+   phase.
+2. `terminal/*` -- still entirely unimplemented, no `terminal`
+   capability declared.
+3. `authenticate` method -- still entirely unimplemented on the
+   backend-facing side.
+4. Client-facing `initialize`/`authenticate` handshake, and exposing
+   `agentCapabilities`/`permission_policy` as first-class `profiles/*`
+   fields rather than only inline on `session/new` -- still open.
+5. **Newly narrowed, not closed:** `session/request_permission` no
+   longer deadlocks, but there is still no live, interactive,
+   out-of-band channel for an actual human/client decision to reach a
+   backend mid-call -- every decision today is a static, pre-configured
+   policy, not a real ask. A true fix would need either a persistent
+   per-session push channel on the WS transport (the one transport that
+   could support it; `acpx-server/src/transport/ws.rs`'s current
+   request/response-per-frame loop doesn't) or an equivalent async
+   job/callback model on HTTP. Not attempted in this phase -- tracked
+   here as the honest residual, not silently declared done.

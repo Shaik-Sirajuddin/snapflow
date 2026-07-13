@@ -7,7 +7,7 @@
 use crate::keystore::Keystore;
 use crate::mcp_servers::McpServerStore;
 use crate::persistence::{Direction, PersistenceStore};
-use crate::profile::{Profile, ProfileStore};
+use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry};
 
@@ -393,18 +393,30 @@ impl Router {
         }
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
+        let permission_policy = profile
+            .as_ref()
+            .map(|p| p.permission_policy)
+            .unwrap_or_default();
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend).await?;
             backend.writer.write_value(&request).await?;
-            let (response, notifications) = read_matching_response(&mut backend, &id).await?;
-            attach_session_new_extras(response, notifications, backend.agent_capabilities.clone())
+            let (response, notifications, agent_requests) =
+                read_matching_response(&mut backend, &id, permission_policy).await?;
+            attach_session_new_extras(
+                response,
+                notifications,
+                agent_requests,
+                backend.agent_capabilities.clone(),
+            )
         };
 
         let backend_session_id = extract_backend_session_id(&response)?;
-        let gateway_id = self
-            .sessions
-            .register(agent_id, BackendSessionId(backend_session_id));
+        let gateway_id = self.sessions.register(
+            agent_id,
+            BackendSessionId(backend_session_id),
+            profile.as_ref().map(|p| p.name.clone()),
+        );
 
         // Rewrite the backend's own session id into the gateway-issued one
         // before it ever reaches the client -- the client only ever sees
@@ -542,6 +554,12 @@ impl Router {
             .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
+        let profile_name = entry.profile_name.clone();
+        let permission_policy = profile_name
+            .as_deref()
+            .and_then(|name| self.profiles.get(name))
+            .map(|p| p.permission_policy)
+            .unwrap_or_default();
 
         // Rewrite gateway id -> backend id in place; everything else in
         // `params` is forwarded untouched, per the proxied-method contract
@@ -559,8 +577,9 @@ impl Router {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend).await?;
             backend.writer.write_value(&request).await?;
-            let (response, notifications) = read_matching_response(&mut backend, &id).await?;
-            attach_updates(response, notifications)
+            let (response, notifications, agent_requests) =
+                read_matching_response(&mut backend, &id, permission_policy).await?;
+            attach_updates(response, notifications, agent_requests)
         };
         self.spawn_transcript(
             gateway_session_id.clone(),
@@ -899,39 +918,154 @@ fn extract_backend_session_id(response: &serde_json::Value) -> Result<String, Ro
         .ok_or(RouterError::MissingBackendSessionId)
 }
 
+/// Build the client's real ACP `session/request_permission` reply for a
+/// given `policy` -- the schema is `agentclientprotocol.com/protocol/
+/// schema`'s `RequestPermissionResponse`: `result.outcome` is a
+/// discriminated union, either `{"outcome": "selected", "optionId": ..}`
+/// or `{"outcome": "cancelled"}`. See [`crate::profile::PermissionPolicy`]'s
+/// doc comment for why acpx answers this automatically per profile
+/// config rather than leaving it unanswered (ACP's own spec explicitly
+/// allows this).
+fn build_permission_reply(
+    request: &serde_json::Value,
+    policy: PermissionPolicy,
+) -> serde_json::Value {
+    let id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let options: Vec<serde_json::Value> = request
+        .get("params")
+        .and_then(|p| p.get("options"))
+        .and_then(|o| o.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let kind_prefix = match policy {
+        PermissionPolicy::AutoAllow => "allow_",
+        PermissionPolicy::AutoReject => "reject_",
+    };
+    let by_kind = options.iter().find(|opt| {
+        opt.get("kind")
+            .and_then(|k| k.as_str())
+            .map(|k| k.starts_with(kind_prefix))
+            .unwrap_or(false)
+    });
+    // `AutoAllow` falls back to the backend's first offered option if
+    // none is explicitly labeled `allow_*` (matching the reference Go
+    // SDK's own "no preference -> first option" behavior) -- this policy
+    // is already an explicit opt-in to acpx deciding "yes" on the
+    // client's behalf. `AutoReject` never does the equivalent fallback:
+    // guessing an unlabeled option under the *safety-conservative*
+    // default policy could easily select something that isn't actually a
+    // rejection, so it replies `cancelled` instead when no `reject_*`
+    // option was offered.
+    let chosen = by_kind.or_else(|| match policy {
+        PermissionPolicy::AutoAllow => options.first(),
+        PermissionPolicy::AutoReject => None,
+    });
+    let outcome = match chosen.and_then(|opt| opt.get("optionId").and_then(|o| o.as_str())) {
+        Some(option_id) => serde_json::json!({"outcome": "selected", "optionId": option_id}),
+        None => serde_json::json!({"outcome": "cancelled"}),
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {"outcome": outcome}
+    })
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
-) -> Result<(serde_json::Value, Vec<serde_json::Value>), RouterError> {
+    permission_policy: PermissionPolicy,
+) -> Result<
+    (
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    ),
+    RouterError,
+> {
     let mut notifications = Vec::new();
+    let mut agent_requests = Vec::new();
     loop {
         let value = backend.reader.read_value().await?;
         if value.get("id") == Some(id) {
-            return Ok((value, notifications));
+            return Ok((value, notifications, agent_requests));
+        }
+        // An agent-initiated *request* (has both its own `id` and a
+        // `method`) is not a notification -- pre-fix, this loop treated
+        // it as one, pushing it into `notifications` and never replying,
+        // which left the backend deadlocked forever waiting for an
+        // answer that would never come (verified as a real hang, not a
+        // hypothetical, against `session/request_permission`: every real
+        // adapter that asks permission mid-turn blocks its own response
+        // to the *outer* call on getting one). `session/request_permission`
+        // is the only such method acpx knows how to answer today (see
+        // `build_permission_reply`); anything else gets a proper JSON-RPC
+        // method-not-found error instead of silence, so a backend that
+        // sends some other agent-initiated request acpx doesn't yet
+        // support still gets *a* reply and can decide how to proceed
+        // (e.g. treat it as declined) rather than hanging indefinitely.
+        if let (Some(_), Some(method)) = (
+            value.get("id"),
+            value.get("method").and_then(|m| m.as_str()),
+        ) {
+            let reply = if method == "session/request_permission" {
+                build_permission_reply(&value, permission_policy)
+            } else {
+                let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("acpx gateway does not support agent-initiated method '{method}'"),
+                    }
+                })
+            };
+            backend.writer.write_value(&reply).await?;
+            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
+            continue;
         }
         notifications.push(value);
     }
 }
 
-/// Fold `notifications` (as collected by [`read_matching_response`]) into
-/// `response`'s `_acpx.updates` array, if there are any. No-op (response
-/// left byte-for-byte untouched) when `notifications` is empty, so a
-/// stand-in backend that never emits `session/update` at all (every
-/// synthetic test double in this workspace) produces identical response
-/// shapes to before this fix -- verified by every pre-existing test in
-/// this workspace continuing to pass unmodified.
+/// Fold `notifications` and `agent_requests` (both as collected by
+/// [`read_matching_response`]) into `response`'s `_acpx.updates`/
+/// `_acpx.agentRequests` arrays, if there are any of either. `agentRequests`
+/// is new: every `{request, reply}` pair `read_matching_response` had to
+/// answer on the client's behalf mid-call (a `session/request_permission`
+/// auto-decision per `crate::profile::PermissionPolicy`, or a method-not-
+/// found error for any other agent-initiated request acpx doesn't yet
+/// support) -- surfaced so a client can see what was decided without
+/// acpx silently hiding it. No-op (response left byte-for-byte untouched)
+/// when both are empty, so a stand-in backend that never emits either
+/// (every synthetic test double in this workspace, until one is written
+/// specifically to exercise this) produces identical response shapes to
+/// before this fix -- verified by every pre-existing test in this
+/// workspace continuing to pass unmodified.
 fn attach_updates(
     mut response: serde_json::Value,
     notifications: Vec<serde_json::Value>,
+    agent_requests: Vec<serde_json::Value>,
 ) -> serde_json::Value {
-    if notifications.is_empty() {
+    if notifications.is_empty() && agent_requests.is_empty() {
         return response;
     }
     if let Some(obj) = response.as_object_mut() {
-        obj.insert(
-            "_acpx".to_string(),
-            serde_json::json!({ "updates": notifications }),
-        );
+        let mut extras = serde_json::Map::new();
+        if !notifications.is_empty() {
+            extras.insert("updates".to_string(), serde_json::json!(notifications));
+        }
+        if !agent_requests.is_empty() {
+            extras.insert(
+                "agentRequests".to_string(),
+                serde_json::json!(agent_requests),
+            );
+        }
+        obj.insert("_acpx".to_string(), serde_json::Value::Object(extras));
     }
     response
 }
@@ -952,15 +1086,22 @@ fn attach_updates(
 fn attach_session_new_extras(
     mut response: serde_json::Value,
     notifications: Vec<serde_json::Value>,
+    agent_requests: Vec<serde_json::Value>,
     agent_capabilities: Option<serde_json::Value>,
 ) -> serde_json::Value {
-    if notifications.is_empty() && agent_capabilities.is_none() {
+    if notifications.is_empty() && agent_requests.is_empty() && agent_capabilities.is_none() {
         return response;
     }
     if let Some(obj) = response.as_object_mut() {
         let mut extras = serde_json::Map::new();
         if !notifications.is_empty() {
             extras.insert("updates".to_string(), serde_json::json!(notifications));
+        }
+        if !agent_requests.is_empty() {
+            extras.insert(
+                "agentRequests".to_string(),
+                serde_json::json!(agent_requests),
+            );
         }
         if let Some(capabilities) = agent_capabilities {
             extras.insert("agentCapabilities".to_string(), capabilities);
@@ -1129,7 +1270,7 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence) = {
+    let (backend, persistence, permission_policy) = {
         let mut r = router.lock().await;
         let entry = r
             .sessions
@@ -1139,11 +1280,17 @@ async fn dispatch_proxied_shared(
             .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
+        let profile_name = entry.profile_name.clone();
         if let Some(params) = request.get_mut("params") {
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        (backend, r.persistence.clone())
+        let permission_policy = profile_name
+            .as_deref()
+            .and_then(|name| r.profiles.get(name))
+            .map(|p| p.permission_policy)
+            .unwrap_or_default();
+        (backend, r.persistence.clone(), permission_policy)
     };
 
     spawn_transcript_fn(
@@ -1157,8 +1304,9 @@ async fn dispatch_proxied_shared(
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc).await?;
         proc.writer.write_value(&request).await?;
-        let (response, notifications) = read_matching_response(&mut proc, &id).await?;
-        attach_updates(response, notifications)
+        let (response, notifications, agent_requests) =
+            read_matching_response(&mut proc, &id, permission_policy).await?;
+        attach_updates(response, notifications, agent_requests)
     };
 
     spawn_transcript_fn(
@@ -1251,17 +1399,29 @@ async fn dispatch_session_new_shared(
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc).await?;
         proc.writer.write_value(&request).await?;
-        let (response, notifications) = read_matching_response(&mut proc, &id).await?;
-        attach_session_new_extras(response, notifications, proc.agent_capabilities.clone())
+        let permission_policy = profile
+            .as_ref()
+            .map(|p| p.permission_policy)
+            .unwrap_or_default();
+        let (response, notifications, agent_requests) =
+            read_matching_response(&mut proc, &id, permission_policy).await?;
+        attach_session_new_extras(
+            response,
+            notifications,
+            agent_requests,
+            proc.agent_capabilities.clone(),
+        )
     };
 
     let backend_session_id = extract_backend_session_id(&response)?;
 
     let (gateway_session_id_str, persist_args) = {
         let mut r = router.lock().await;
-        let gateway_id = r
-            .sessions
-            .register(agent_id, BackendSessionId(backend_session_id));
+        let gateway_id = r.sessions.register(
+            agent_id,
+            BackendSessionId(backend_session_id),
+            profile.as_ref().map(|p| p.name.clone()),
+        );
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);

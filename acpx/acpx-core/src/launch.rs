@@ -116,6 +116,7 @@ mod tests {
             key_ref: None,
             launch_overrides: overrides,
             mcp_servers: vec![],
+            permission_policy: Default::default(),
         }
     }
 

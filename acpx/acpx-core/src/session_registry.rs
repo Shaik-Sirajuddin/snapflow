@@ -16,6 +16,14 @@ pub struct BackendSessionId(pub String);
 pub struct SessionEntry {
     pub agent_id: String,
     pub backend_session_id: BackendSessionId,
+    /// Which profile (if any) `session/new` resolved this session
+    /// through -- `None` for native/unmanaged mode. Threaded through so
+    /// later proxied calls on this same session (`session/prompt` etc.)
+    /// can look the profile back up for its
+    /// `crate::profile::PermissionPolicy` when a backend sends a
+    /// `session/request_permission` request mid-call; see
+    /// `crate::router::read_matching_response`.
+    pub profile_name: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -33,6 +41,7 @@ impl SessionRegistry {
         &mut self,
         agent_id: impl Into<String>,
         backend_session_id: BackendSessionId,
+        profile_name: Option<String>,
     ) -> GatewaySessionId {
         let gateway_id = GatewaySessionId(uuid::Uuid::new_v4().to_string());
         self.sessions.insert(
@@ -40,6 +49,7 @@ impl SessionRegistry {
             SessionEntry {
                 agent_id: agent_id.into(),
                 backend_session_id,
+                profile_name,
             },
         );
         gateway_id
@@ -66,7 +76,7 @@ mod tests {
     #[test]
     fn register_then_resolve_round_trips() {
         let mut reg = SessionRegistry::new();
-        let gid = reg.register("codex-acp", BackendSessionId("backend-1".to_string()));
+        let gid = reg.register("codex-acp", BackendSessionId("backend-1".to_string()), None);
         let entry = reg.resolve(&gid).expect("just registered");
         assert_eq!(entry.agent_id, "codex-acp");
         assert_eq!(entry.backend_session_id.0, "backend-1");
@@ -75,7 +85,7 @@ mod tests {
     #[test]
     fn remove_forgets_the_session() {
         let mut reg = SessionRegistry::new();
-        let gid = reg.register("codex-acp", BackendSessionId("backend-1".to_string()));
+        let gid = reg.register("codex-acp", BackendSessionId("backend-1".to_string()), None);
         assert!(reg.remove(&gid).is_some());
         assert!(reg.resolve(&gid).is_none());
     }

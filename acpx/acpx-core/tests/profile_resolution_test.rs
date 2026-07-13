@@ -55,6 +55,7 @@ fn sample_profile(name: &str, agent_id: &str) -> Profile {
         key_ref: None,
         launch_overrides: HashMap::new(),
         mcp_servers: vec![],
+        permission_policy: Default::default(),
     }
 }
 

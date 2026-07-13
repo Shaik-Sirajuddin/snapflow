@@ -39,6 +39,43 @@ pub struct Profile {
     /// whatever the client itself sent (client wins on name collision --
     /// see `crate::mcp_servers::merge_mcp_servers`).
     pub mcp_servers: Vec<String>,
+    /// How to answer a real ACP `session/request_permission` request from
+    /// this profile's backend -- see [`PermissionPolicy`]'s own doc
+    /// comment. `#[serde(default)]` so every pre-existing profile JSON
+    /// (persisted or provisioned) that predates this field parses
+    /// unchanged, defaulting to the conservative `AutoReject`.
+    pub permission_policy: PermissionPolicy,
+}
+
+/// How `crate::router` answers a backend's `session/request_permission`
+/// request on this profile's behalf. ACP's own spec explicitly sanctions
+/// this ("Clients MAY automatically allow or reject permission requests
+/// according to user settings" -- agentclientprotocol.com/protocol/
+/// tool-calls#requesting-permission): acpx has no live, out-of-band
+/// channel back to whichever client opened the session by the time a
+/// backend asks mid-turn (see `04-phased-plan.md`'s open-risks and
+/// `COVERAGE.md`'s ACP-compatibility-hardening notes for why), so an
+/// explicit, profile-scoped auto-decision policy is the honest
+/// alternative to either silently deadlocking the backend (the pre-fix
+/// behavior: the request was misclassified as a notification and simply
+/// never answered) or guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPolicy {
+    /// Auto-select an option whose `kind` starts with `allow_`
+    /// (`allow_once`/`allow_always`); if the backend offered no such
+    /// option, fall back to its first offered option (matching the
+    /// reference Go SDK's own fallback) rather than replying `cancelled`
+    /// -- this policy is an explicit opt-in to acpx deciding "yes" on the
+    /// client's behalf, so failing to find an `allow_*`-labeled option
+    /// specifically shouldn't itself block the operation.
+    AutoAllow,
+    /// Default: auto-select an option whose `kind` starts with `reject_`
+    /// (`reject_once`/`reject_always`); if the backend offered no such
+    /// option, reply with ACP's own `cancelled` outcome rather than
+    /// guessing an option that might actually be an `allow_*` one.
+    #[default]
+    AutoReject,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -106,6 +143,7 @@ mod tests {
             key_ref: None,
             launch_overrides: HashMap::new(),
             mcp_servers: vec![],
+            permission_policy: Default::default(),
         }
     }
 
