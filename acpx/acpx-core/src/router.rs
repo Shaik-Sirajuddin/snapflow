@@ -455,6 +455,7 @@ impl Router {
     /// guaranteeing the parent `sessions` row always lands first.
     fn spawn_session_persistence(
         &self,
+        tenant_id: &TenantId,
         gateway_session_id: impl Into<String>,
         agent_id: impl Into<String>,
         backend_session_id: impl Into<String>,
@@ -464,6 +465,7 @@ impl Router {
     ) {
         spawn_session_persistence_fn(
             self.persistence.clone(),
+            tenant_id.0.clone(),
             gateway_session_id,
             agent_id,
             backend_session_id,
@@ -626,6 +628,7 @@ impl Router {
             &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
         ) {
             self.spawn_session_persistence(
+                tenant_id,
                 gateway_session_id_str,
                 entry.agent_id.clone(),
                 entry.backend_session_id.0.clone(),
@@ -731,6 +734,7 @@ impl Router {
                 };
                 session["sessionId"] = serde_json::Value::String(gateway_id.clone());
                 self.spawn_session_persistence(
+                    tenant_id,
                     gateway_id,
                     agent_id.clone(),
                     backend_sid,
@@ -948,6 +952,24 @@ impl Router {
                 RouterError::SessionRehydrationFailed(gateway_session_id.to_string(), err)
             })?
             .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.to_string()))?;
+        // **Phase C (`acpx-tenant-isolation`).** A persisted row surviving
+        // a daemon restart belongs to whichever tenant created it (see
+        // `SessionRecord::tenant_id`'s doc comment) -- without this check
+        // any tenant could rehydrate *any other* tenant's session purely
+        // by guessing/reusing a gateway session id, completely bypassing
+        // the in-memory `SessionRegistry` nesting Phase A/B built,
+        // because `session/load` et al. only reach this path once the
+        // in-memory registry has already missed. Deliberately returned as
+        // the same `SessionNotPersisted` a genuinely-never-persisted id
+        // would produce (not a distinct "forbidden" error) -- matching
+        // `translate_or_register_backend_session`'s established rule
+        // that a cross-tenant hit must never be distinguishable from a
+        // cross-tenant miss.
+        if record.tenant_id != tenant_id.0 {
+            return Err(RouterError::SessionNotPersisted(
+                gateway_session_id.to_string(),
+            ));
+        }
         let entry = crate::session_registry::SessionEntry {
             agent_id: record.agent_id,
             backend_session_id: BackendSessionId(record.backend_session_id),
@@ -2489,6 +2511,7 @@ fn spawn_transcript_fn(
 #[allow(clippy::too_many_arguments)]
 fn spawn_session_persistence_fn(
     store: Option<PersistenceStore>,
+    tenant_id: impl Into<String>,
     gateway_session_id: impl Into<String>,
     agent_id: impl Into<String>,
     backend_session_id: impl Into<String>,
@@ -2502,6 +2525,7 @@ fn spawn_session_persistence_fn(
     let gateway_session_id = gateway_session_id.into();
     let agent_id = agent_id.into();
     let backend_session_id = backend_session_id.into();
+    let tenant_id = tenant_id.into();
     tokio::spawn(async move {
         if let Err(err) = store
             .record_session(
@@ -2510,6 +2534,7 @@ fn spawn_session_persistence_fn(
                 backend_session_id,
                 profile_name,
                 now_rfc3339(),
+                tenant_id,
             )
             .await
         {
@@ -2811,6 +2836,7 @@ async fn dispatch_session_list_real_shared(
             session["sessionId"] = serde_json::Value::String(gateway_id.clone());
             spawn_session_persistence_fn(
                 r.persistence.clone(),
+                tenant_id.0.clone(),
                 gateway_id,
                 agent_id.clone(),
                 backend_sid,
@@ -3049,6 +3075,7 @@ async fn dispatch_session_new_shared(
     if let Some((persisted_agent_id, persisted_backend_session_id)) = persist_args {
         spawn_session_persistence_fn(
             persistence,
+            tenant_id.0.clone(),
             gateway_session_id_str,
             persisted_agent_id,
             persisted_backend_session_id,

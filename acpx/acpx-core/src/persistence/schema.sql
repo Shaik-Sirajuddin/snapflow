@@ -8,7 +8,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     backend_session_id TEXT NOT NULL,
     profile_name TEXT,
     created_at TEXT NOT NULL,
-    closed_at TEXT
+    closed_at TEXT,
+    -- **Phase C (`acpx-tenant-isolation`).** Added after the table already
+    -- shipped, so `CREATE TABLE IF NOT EXISTS` alone never applies this to
+    -- a pre-existing on-disk database -- see `store.rs`'s
+    -- `migrate_tenant_id_column` for the idempotent `ALTER TABLE` that
+    -- covers upgrades. `NOT NULL DEFAULT 'default'` here only governs
+    -- brand-new databases created after this change.
+    tenant_id TEXT NOT NULL DEFAULT 'default'
 );
 
 CREATE TABLE IF NOT EXISTS transcripts (

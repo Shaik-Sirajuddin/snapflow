@@ -16,4 +16,13 @@ pub struct SessionRecord {
     pub profile_name: Option<String>,
     pub created_at: String,
     pub closed_at: Option<String>,
+    /// **Phase C (`acpx-tenant-isolation`).** The tenant that owns this
+    /// row, mirroring `crate::session_registry::TenantId`'s `String`
+    /// payload (kept as a plain `String` here, not the newtype itself, so
+    /// this crate's persistence module stays free of a dependency on
+    /// `session_registry` -- `router.rs` is what converts between the
+    /// two). Rows written before this field existed are backfilled to
+    /// `"default"` by `store.rs`'s migration, matching every other
+    /// tenant-unaware caller's implicit tenant.
+    pub tenant_id: String,
 }

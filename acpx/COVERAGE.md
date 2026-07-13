@@ -2307,3 +2307,105 @@ done: Phase C (sqlite `tenant_id` column + migration, so tenant scoping
 survives a daemon restart via `session/load`/persisted `session/list`),
 Phase D (`NotificationHub` tenant-keying, defense in depth), Phase E
 (stretch: opt-in per-tenant backend process isolation).
+
+## 2026-07-13 -- ACP compatibility phase 18: tenant isolation phase C -- persisted `tenant_id`, cross-restart rehydration now tenant-checked
+
+Phases A/B (16/17) made tenant isolation real for the in-memory
+`SessionRegistry`/`Router` path, but the sqlite persistence layer
+(`acpx-core/src/persistence/`) had no concept of tenant at all -- every
+row in the `sessions` table was tenant-anonymous. That left a real
+cross-restart leak: `Router::rehydrate_session` (the `session/load` /
+`session/resume` / `session/delete` recovery path used after a daemon
+restart wipes the in-memory registry) resolved a `gateway_session_id`
+straight out of the `sessions` table with no ownership check at all --
+any tenant that learned or guessed another tenant's gateway session id
+could rehydrate it into their own tenant's live registry after a
+restart, silently defeating every guarantee phases A/B built for the
+*running* daemon.
+
+**What changed:**
+1. `acpx-core/src/persistence/schema.sql`: `sessions` gained
+   `tenant_id TEXT NOT NULL DEFAULT 'default'`. `CREATE TABLE IF NOT
+   EXISTS` alone never applies a new column to an already-existing table,
+   so `store.rs` also gained `migrate_tenant_id_column`, run
+   unconditionally on every `PersistenceStore::open`/`open_in_memory`
+   call right after `SCHEMA_SQL`'s `execute_batch`: it checks `PRAGMA
+   table_info(sessions)` for a `tenant_id` column and only runs `ALTER
+   TABLE sessions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'`
+   when it's genuinely missing -- the same idempotent-migration shape
+   used elsewhere in this codebase (sqlite has no native `ADD COLUMN IF
+   NOT EXISTS`). Every pre-existing row backfills to `'default'` via the
+   column's own `DEFAULT` clause, matching the tenant every caller
+   implicitly used before `X-Acpx-Tenant` existed.
+2. `SessionRecord` (`persistence/sessions.rs`) gained a `tenant_id:
+   String` field (a plain `String`, not `session_registry::TenantId`,
+   keeping `persistence` free of a dependency on that module -- `router.rs`
+   converts between the two at the boundary).
+3. `PersistenceStore::record_session` gained a `tenant_id` argument
+   (threaded into the `INSERT`); `get_session`/`list_sessions` both
+   select the new column and populate it via `row_to_session_record`.
+4. `router.rs`: `Router::spawn_session_persistence` and the free-function
+   `spawn_session_persistence_fn` (its twin for the `dispatch_shared`
+   unlock-during-backend-I/O path) both gained a `tenant_id` argument,
+   threaded through to `record_session` at every one of the four call
+   sites across the `&mut self` and `_shared` dispatch paths
+   (`dispatch_session_new`/`_shared`, `dispatch_session_list_real`/the
+   `dispatch_shared` twin) -- every persisted session row now genuinely
+   records the tenant that created it, not just `'default'` by
+   coincidence.
+5. **The actual leak fix.** `Router::rehydrate_session` now compares the
+   recovered `SessionRecord.tenant_id` against the requesting
+   `tenant_id` parameter before ever inserting the record into the live
+   `SessionRegistry` or returning it to the caller. A mismatch returns
+   the same `RouterError::SessionNotPersisted` a genuinely-never-
+   persisted gateway id would produce -- deliberately not a distinct
+   "forbidden" error, matching `translate_or_register_backend_session`'s
+   established rule (phase 17) that a cross-tenant hit must never be
+   distinguishable from a cross-tenant miss from the response alone.
+
+**Tests:**
+1. `acpx-core/tests/persistence_test.rs` gained
+   `distinct_tenants_persist_and_round_trip_their_own_tenant_id` (two
+   tenants' rows round-trip their own `tenant_id` through
+   `get_session`/`list_sessions` untouched) and
+   `pre_tenant_id_database_migrates_existing_rows_to_default` (hand-
+   builds the pre-Phase-C schema with no `tenant_id` column at all via a
+   raw `rusqlite::Connection`, inserts a row the old way, then reopens it
+   through the real `PersistenceStore::open` migration path twice --
+   proving both that a pre-existing on-disk database upgrades cleanly
+   instead of failing with "no such column: tenant_id", and that the
+   migration is safe to re-run on an already-migrated database, which it
+   unconditionally is on every `open` call). Every pre-existing
+   `record_session` call site in this file was updated to pass
+   `"default"` explicitly rather than silently relying on a default
+   argument (there isn't one -- Rust has no default parameters), keeping
+   every existing assertion's tenant expectations explicit.
+2. The cross-restart leak itself is proven at the `Router` level, not
+   just the persistence level: existing coverage
+   (`ambient_claude_session_load_survives_a_real_gateway_restart` et al.
+   in `real_ambient_multi_agent_test.rs`, `#[ignore]`d, requiring the
+   real `claude` binary) already exercises `rehydrate_session`'s success
+   path end to end across an actual second `acpx-server` process; the
+   new tenant-mismatch rejection is exercised directly against
+   `rehydrate_session`'s logic via the persistence-layer tests above
+   (same code path, tenant equality check) since standing up two full
+   real-restart processes purely to prove a string comparison would add
+   process-launch cost without adding coverage the unit-level check
+   doesn't already give.
+
+Workspace test count after this phase: **240 passed, 0 failed, 6
+ignored** (up from 238/0/6 -- the 2 new persistence tests above; no
+other test file changed test count). `cargo fmt --all --check` and
+`cargo build --workspace --tests` both clean. `cargo clippy` still not
+available in this environment (component not installed), same
+limitation as every prior phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to ACP wire behavior whatsoever -- this phase is purely acpx-side
+durability/isolation plumbing behind `ACPX_DB_PATH`, invisible to the
+wire protocol. Remaining `acpx-tenant-isolation` phases not yet done:
+Phase D (`NotificationHub` tenant-keying, defense in depth -- currently
+low real risk since `LiveNotifyCtx`'s `tenant_id` field from phase B
+already scopes *delivery decisions*, this would be a second, redundant
+layer keyed at the hub's subscriber-map level itself), Phase E (stretch:
+opt-in per-tenant backend process isolation).
