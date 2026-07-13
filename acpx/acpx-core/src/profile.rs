@@ -58,6 +58,14 @@ pub struct Profile {
     /// `fs/read_text_file`/`fs/write_text_file` handling.
     #[serde(default)]
     pub allow_fs_access: bool,
+    /// Whether this profile's backend is allowed to run real
+    /// `terminal/*` commands (`create`/`output`/`wait_for_exit`/`kill`/
+    /// `release`) on acpx's own host -- arbitrary command execution, an
+    /// even more direct risk than `allow_fs_access`'s read/write. Same
+    /// opt-in-not-opt-out default (`false`) and same reasoning. See
+    /// `router::read_matching_response`'s `terminal/*` handling.
+    #[serde(default)]
+    pub allow_terminal_access: bool,
 }
 
 /// How `crate::router` answers a backend's `session/request_permission`
@@ -158,6 +166,7 @@ mod tests {
             mcp_servers: vec![],
             permission_policy: Default::default(),
             allow_fs_access: false,
+            allow_terminal_access: false,
         }
     }
 

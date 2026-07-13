@@ -64,6 +64,17 @@ pub struct BackendProcess {
     /// same rationale as `handshake_done` itself: this crate doesn't know
     /// or care what "agentCapabilities" means, `acpx-core::router` does.
     pub agent_capabilities: Option<serde_json::Value>,
+    /// Live `terminal/create`d commands for this process, keyed by the
+    /// terminal id acpx-core mints and hands back to the backend. Lives
+    /// here (not in acpx-core) for the same reason `handshake_done`/
+    /// `agent_capabilities` do: it's a piece of per-process state a
+    /// caller holding this process's own lock needs to check-and-mutate
+    /// atomically. Never reset on respawn (unlike `handshake_done`) --
+    /// a crash+respawn is a brand new `BackendProcess` instance with a
+    /// fresh, empty map, and any terminal ids the backend held from the
+    /// old instance are simply gone, matching a real terminal's lifetime
+    /// being tied to the process that created it.
+    pub terminals: HashMap<String, crate::terminal::TerminalHandle>,
 }
 
 impl BackendProcess {
@@ -90,6 +101,7 @@ impl BackendProcess {
             writer: FramedWriter::new(stdin),
             handshake_done: false,
             agent_capabilities: None,
+            terminals: HashMap::new(),
         })
     }
 

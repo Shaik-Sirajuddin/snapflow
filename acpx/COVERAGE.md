@@ -736,3 +736,97 @@ clean.
    auto-approved by profile config" is not the same as a client seeing
    and approving each individual file access. Same root cause, same
    honest non-fix as before.
+
+## ACP compatibility hardening, phase 4 -- real `terminal/*`
+
+Closes the next item from phase 3's recheck list. `terminal/create`,
+`terminal/output`, `terminal/wait_for_exit`, `terminal/kill`,
+`terminal/release` are agent-initiated requests with the same deadlock
+risk `fs/*` and `session/request_permission` had before phases 2/3.
+`read_matching_response`'s agent-initiated-request branch now recognizes
+all five methods, gated on a new `Profile::allow_terminal_access: bool`
+(default `false`, same opt-in-not-opt-out rationale as
+`allow_fs_access`: spawning arbitrary host processes is at least as
+dangerous as arbitrary file I/O). `BackendCallPolicy` gained
+`allow_terminal_access` alongside `allow_fs_access`/`permission_policy`.
+`ensure_backend_initialized` now declares the real value in
+`initialize`'s `clientCapabilities.terminal.{create,output,waitForExit,
+kill,release}` instead of omitting the `terminal` capability entirely.
+
+New `acpx-conductor::terminal` module owns the actual process
+supervision, kept protocol-agnostic on purpose (same crate-boundary
+split as `BackendProcess` itself): `TerminalHandle::spawn` launches a
+child with `Stdio::piped()` stdout+stderr, `kill_on_drop(true)`, and two
+background tasks that continuously drain both streams into a single
+interleaved in-memory buffer (matching real terminal semantics -- ACP
+doesn't separate stdout/stderr in `terminal/output`), truncated from the
+front to respect `outputByteLimit` if given. `BackendProcess` gained
+`terminals: HashMap<String, TerminalHandle>`, keyed by a `term-<uuid>`
+id acpx mints in `terminal/create`'s reply; `handle_terminal_request` in
+`acpx-core/src/router.rs` implements all five methods against it,
+including ACP's `env` param being an array of `{name, value}` objects
+(confirmed against the real schema, not JSON's usual object-map shape).
+`terminal/release` removes the handle from the map, which drops (and,
+via `kill_on_drop`, force-kills if still running) the underlying child --
+matching the spec's "id invalid for every other terminal/* method
+afterward" without a separate "invalidated" flag to track.
+
+**Real bug found and fixed in this phase, not by a subagent review but
+by the phase's own test suite failing on the very first `cargo test`
+run:** `wait_for_exit` only awaited `Child::wait()` (the process being
+reaped), not the two background capture tasks finishing draining
+stdout/stderr. `Child::wait()` resolving and a pipe-reader task being
+scheduled to read the child's last buffered bytes are two independent
+readiness notifications with no ordering guarantee between them, so a
+caller doing `wait_for_exit()` immediately followed by `output()` (the
+exact sequence any real ACP client/backend would use, and exactly what
+the new integration test does) could observe truncated or even
+completely empty output despite the process having already exited and
+printed something. Reproduced as a genuine non-deterministic unit-test
+failure (`captures_output_and_exit_status`, expected `"hello"` got
+`""`) on the first run after implementation, not a hypothetical. Fixed
+by keeping each capture task's `JoinHandle` on `TerminalHandle` and
+awaiting both in `wait_for_exit` after `Child::wait()` returns, before
+recording the exit status -- verified fixed with 20 consecutive clean
+runs of the previously-flaky test (`--test-threads=1`, no failures)
+after the fix, versus a reproducible failure before it.
+
+New tests: 3 unit tests in `acpx-conductor/src/terminal.rs` (captures
+real stdout and real exit code; byte-limit truncation keeps the most
+recent bytes, not the oldest; `kill` makes a `sleep 30` child's
+`wait_for_exit` return quickly with a non-zero-equivalent status rather
+than hanging, under a 5-second timeout guard). New
+`acpx-core/tests/terminal_request_test.rs`, mirroring
+`fs_request_test.rs`'s stand-in-backend-with-blocking-reply-loop
+pattern (5-second timeout guard): disabled-by-default gets a clear
+"disabled for this profile" error on `terminal/create` and the outer
+call still completes without spawning anything; a profile with
+`"allow_terminal_access": true` gets a real minted `terminalId`, the
+real exit code (`7`) from a real `sh -c "echo hello; exit 7"` child, the
+real captured stdout (`"hello"`), and a successful `terminal/release`,
+with all four request/reply pairs surfaced via `_acpx.agentRequests`.
+
+Workspace test count after this addition: **155 passed, 0 failed, 3
+ignored**, `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `authenticate` method -- still entirely unimplemented on the
+   backend-facing side. Next phase.
+2. Client-facing `initialize`/`authenticate` handshake, and exposing
+   `agentCapabilities`/`permission_policy`/`allow_fs_access`/
+   `allow_terminal_access` as first-class `profiles/*` fields rather
+   than only inline on `session/new` -- still open.
+3. `terminal/kill` is implemented but not yet exercised by an
+   integration test through the full `read_matching_response` dispatch
+   path (only the lower-level `TerminalHandle::kill` unit test and the
+   router-level `create`/`wait_for_exit`/`output`/`release` sequence).
+   Low risk (same code path as the other four methods, same policy
+   gate, same handler function) but noted honestly rather than silently
+   assumed covered.
+4. The live-interactive-decision gap from phases 2/3's recheck (no
+   out-of-band channel for a real human/client answer mid-call) applies
+   identically to `terminal/*` now too: every terminal spawn today is
+   "real process, but always auto-approved by profile config," not a
+   client seeing and approving each individual command before it runs.
+   Same root cause, same honest non-fix as before.

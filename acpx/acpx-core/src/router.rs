@@ -10,6 +10,7 @@ use crate::persistence::{Direction, PersistenceStore};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry};
+use std::collections::HashMap;
 
 /// Which bucket a given JSON-RPC method falls into. See the classification
 /// table in `02-architecture.md`.
@@ -396,7 +397,7 @@ impl Router {
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend, call_policy.allow_fs_access).await?;
+            ensure_backend_initialized(&mut backend, call_policy).await?;
             backend.writer.write_value(&request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy).await?;
@@ -572,7 +573,7 @@ impl Router {
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let response = {
             let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend, call_policy.allow_fs_access).await?;
+            ensure_backend_initialized(&mut backend, call_policy).await?;
             backend.writer.write_value(&request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy).await?;
@@ -839,6 +840,7 @@ const INITIALIZE_REQUEST_ID: i64 = 0;
 struct BackendCallPolicy {
     permission_policy: PermissionPolicy,
     allow_fs_access: bool,
+    allow_terminal_access: bool,
 }
 
 impl BackendCallPolicy {
@@ -847,6 +849,7 @@ impl BackendCallPolicy {
             Some(p) => Self {
                 permission_policy: p.permission_policy,
                 allow_fs_access: p.allow_fs_access,
+                allow_terminal_access: p.allow_terminal_access,
             },
             None => Self::default(),
         }
@@ -873,11 +876,13 @@ impl BackendCallPolicy {
 /// request itself.
 async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
-    allow_fs_access: bool,
+    call_policy: BackendCallPolicy,
 ) -> Result<(), RouterError> {
     if proc.handshake_done {
         return Ok(());
     }
+    let allow_fs_access = call_policy.allow_fs_access;
+    let allow_terminal_access = call_policy.allow_terminal_access;
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": INITIALIZE_REQUEST_ID,
@@ -893,7 +898,19 @@ async fn ensure_backend_initialized(
                 // (the default -- see `Profile::allow_fs_access`'s doc
                 // comment for why opt-in, not opt-out) keeps declaring
                 // both `false`, byte-for-byte the pre-phase-3 behavior.
-                "fs": { "readTextFile": allow_fs_access, "writeTextFile": allow_fs_access }
+                "fs": { "readTextFile": allow_fs_access, "writeTextFile": allow_fs_access },
+                // Phase 4: same treatment for the `terminal` capability
+                // group -- all five sub-methods tied to one profile-level
+                // opt-in (`Profile::allow_terminal_access`), since
+                // granular per-sub-method opt-in has no real security
+                // value (they're meaningless without each other).
+                "terminal": {
+                    "create": allow_terminal_access,
+                    "output": allow_terminal_access,
+                    "waitForExit": allow_terminal_access,
+                    "kill": allow_terminal_access,
+                    "release": allow_terminal_access
+                }
             }
         }
     });
@@ -1090,6 +1107,144 @@ async fn handle_fs_request(request: &serde_json::Value, method: &str) -> serde_j
     }
 }
 
+/// Answer a real `terminal/*` request against acpx's own host, backed by
+/// `acpx_conductor::TerminalHandle` (see that module's doc comment).
+/// Schema per `agentclientprotocol.com/protocol/v1/terminals`:
+/// `terminal/create`'s params are `{sessionId, command, args?, env?,
+/// cwd?, outputByteLimit?}` (`env` is ACP's usual array-of-`{name,value}`
+/// shape, not a JSON object map) -> `{terminalId}`; `terminal/output` ->
+/// `{output, exitStatus?}`; `terminal/wait_for_exit` -> `{exitStatus}`;
+/// `terminal/kill`/`terminal/release` -> `{}`. `exitStatus` is
+/// `{exitCode, signal}` (either may be `null`). Needs `&mut proc` (unlike
+/// `handle_fs_request`) since terminal state lives in
+/// `BackendProcess::terminals`, keyed by the terminal id acpx mints in
+/// `terminal/create`'s reply and the backend passes back on every
+/// subsequent call. Only reached when `allow_terminal_access` is already
+/// `true` for the calling profile -- see `read_matching_response`.
+async fn handle_terminal_request(
+    proc: &mut acpx_conductor::BackendProcess,
+    request: &serde_json::Value,
+    method: &str,
+) -> serde_json::Value {
+    let id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let params = request.get("params");
+    let error = |code: i64, message: String| serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}});
+
+    if method == "terminal/create" {
+        let Some(command) = params
+            .and_then(|p| p.get("command"))
+            .and_then(|c| c.as_str())
+        else {
+            return error(-32602, "missing required 'command' param".to_string());
+        };
+        let args: Vec<String> = params
+            .and_then(|p| p.get("args"))
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // ACP's `env` is an array of `{name, value}` objects (matching
+        // its use elsewhere in the schema), not a JSON object map.
+        let env: HashMap<String, String> = params
+            .and_then(|p| p.get("env"))
+            .and_then(|e| e.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let name = entry.get("name")?.as_str()?.to_string();
+                        let value = entry.get("value")?.as_str()?.to_string();
+                        Some((name, value))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cwd = params.and_then(|p| p.get("cwd")).and_then(|c| c.as_str());
+        let output_byte_limit = params
+            .and_then(|p| p.get("outputByteLimit"))
+            .and_then(|l| l.as_u64())
+            .map(|l| l as usize);
+
+        return match acpx_conductor::TerminalHandle::spawn(
+            command,
+            &args,
+            &env,
+            cwd,
+            output_byte_limit,
+        )
+        .await
+        {
+            Ok(handle) => {
+                let terminal_id = format!("term-{}", uuid::Uuid::new_v4());
+                proc.terminals.insert(terminal_id.clone(), handle);
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"terminalId": terminal_id}})
+            }
+            Err(err) => error(-32001, format!("terminal/create: {err}")),
+        };
+    }
+
+    // Every other `terminal/*` method references an existing terminal by
+    // id.
+    let Some(terminal_id) = params
+        .and_then(|p| p.get("terminalId"))
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+    else {
+        return error(-32602, "missing required 'terminalId' param".to_string());
+    };
+
+    match method {
+        "terminal/output" => match proc.terminals.get(&terminal_id) {
+            Some(handle) => {
+                let (output, exit_status) = handle.output().await;
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "output": String::from_utf8_lossy(&output),
+                        "exitStatus": exit_status.map(|s| serde_json::json!({"exitCode": s.exit_code, "signal": s.signal})),
+                    }
+                })
+            }
+            None => error(-32602, format!("unknown terminalId '{terminal_id}'")),
+        },
+        "terminal/wait_for_exit" => match proc.terminals.get_mut(&terminal_id) {
+            Some(handle) => match handle.wait_for_exit().await {
+                Ok(status) => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {"exitStatus": {"exitCode": status.exit_code, "signal": status.signal}}
+                }),
+                Err(err) => error(-32001, format!("terminal/wait_for_exit: {err}")),
+            },
+            None => error(-32602, format!("unknown terminalId '{terminal_id}'")),
+        },
+        "terminal/kill" => match proc.terminals.get_mut(&terminal_id) {
+            Some(handle) => match handle.kill().await {
+                Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                Err(err) => error(-32001, format!("terminal/kill: {err}")),
+            },
+            None => error(-32602, format!("unknown terminalId '{terminal_id}'")),
+        },
+        "terminal/release" => {
+            // Per spec, the id becomes invalid for every other terminal/*
+            // method after this -- dropping it from the map (which also
+            // drops the `TerminalHandle`, killing the child via
+            // `kill_on_drop` if it's still running) achieves exactly that.
+            if proc.terminals.remove(&terminal_id).is_some() {
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}})
+            } else {
+                error(-32602, format!("unknown terminalId '{terminal_id}'"))
+            }
+        }
+        other => error(-32601, format!("acpx gateway does not implement '{other}'")),
+    }
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
@@ -1147,6 +1302,31 @@ async fn read_matching_response(
                     "error": {
                         "code": -32601,
                         "message": format!("'{method}' is disabled for this profile (Profile::allow_fs_access is false)"),
+                    }
+                })
+            } else if (method == "terminal/create"
+                || method == "terminal/output"
+                || method == "terminal/wait_for_exit"
+                || method == "terminal/kill"
+                || method == "terminal/release")
+                && policy.allow_terminal_access
+            {
+                handle_terminal_request(backend, &value, method).await
+            } else if method == "terminal/create"
+                || method == "terminal/output"
+                || method == "terminal/wait_for_exit"
+                || method == "terminal/kill"
+                || method == "terminal/release"
+            {
+                // Same "disabled, not unsupported" distinction as the
+                // `fs/*` arm above, gated on `Profile::allow_terminal_access`.
+                let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("'{method}' is disabled for this profile (Profile::allow_terminal_access is false)"),
                     }
                 })
             } else {
@@ -1438,7 +1618,7 @@ async fn dispatch_proxied_shared(
 
     let response = {
         let mut proc = backend.lock().await;
-        ensure_backend_initialized(&mut proc, call_policy.allow_fs_access).await?;
+        ensure_backend_initialized(&mut proc, call_policy).await?;
         proc.writer.write_value(&request).await?;
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy).await?;
@@ -1534,7 +1714,7 @@ async fn dispatch_session_new_shared(
     let mut response = {
         let mut proc = backend.lock().await;
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
-        ensure_backend_initialized(&mut proc, call_policy.allow_fs_access).await?;
+        ensure_backend_initialized(&mut proc, call_policy).await?;
         proc.writer.write_value(&request).await?;
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy).await?;
