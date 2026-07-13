@@ -1521,3 +1521,50 @@ the count is unchanged from phase 9), `cargo fmt --all --check` and
    re-stating: "acpx forwards it verbatim" is a design claim, not yet a
    tested one, and this phase is a concrete reminder that untested
    claims in this codebase have had real gaps hiding behind them before.
+
+## 2026-07-13 -- ACP compatibility phase 11: `session/prompt`'s `ContentBlock`/`_meta` passthrough, tested for real
+
+**Directive:** continuation of the same series, closing phase 7's
+recheck item (carried, untested, through phases 8/9/10): "Any
+`ContentBlock` variant (image/audio/resource) plumbing gaps in `session/
+prompt` -- acpx claims to forward verbatim; confirm no accidental
+transformation." Phase 10's finding (a real gap hiding behind exactly
+this kind of untested "forwards it verbatim" claim, on a neighboring
+method) made leaving this one unverified any longer indefensible.
+
+**Result: no code gap found this time -- the passthrough claim held.**
+New `acpx-core/tests/prompt_content_passthrough_test.rs` sends a real
+`session/prompt` through a real (in-process, `Router::dispatch`,
+non-shared) dispatch with one of every real `ContentBlock` variant from
+the schema fetched in phase 9 (`text`, `image`, `audio`, `resource_link`,
+`resource`) in a single `prompt` array, each carrying its own
+`annotations`/`_meta` where the real schema allows it, plus a top-level
+`PromptRequest._meta`. A stand-in backend captures the exact raw line it
+receives; the test deserializes it and asserts the captured `params.
+prompt` deep-equals the original array exactly (`serde_json::Value`
+structural equality, not just a spot-check) and `params._meta` likewise,
+with only `sessionId` (the one field the router is *supposed* to
+rewrite, gateway id -> backend id) differing. All pass -- `dispatch_
+proxied`'s generic `params["sessionId"] = ...` rewrite-in-place, with
+everything else forwarded via the same `serde_json::Value` untouched,
+really does mean untouched, down to nested per-block `_meta`/
+`annotations`.
+
+Workspace test count after this phase: **174 passed, 0 failed, 4
+ignored**, `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `session/resume` (carried since phase 8) still shares the
+   rehydration path but remains untested end to end by a real adapter --
+   now the single most direct, concrete, and long-carried next step in
+   this list.
+2. `session/list`'s shape mismatch (carried since phase 8) remains an
+   open architectural decision, not a "next phase" item by itself
+   (deliberately deferred pending a decision, not forgotten).
+3. This phase closes the last item that had been carried unaddressed
+   across three consecutive phase recheck lists (7, 8, 9, 10) -- worth
+   noting for whoever continues this series: don't let a "still open,
+   carried over" item ride indefinitely just because it sounds lower-risk
+   than the phase's headline finding; phase 10 is direct proof that
+   untested verbatim-forwarding claims are exactly where gaps hide.
