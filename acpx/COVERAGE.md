@@ -2409,3 +2409,81 @@ low real risk since `LiveNotifyCtx`'s `tenant_id` field from phase B
 already scopes *delivery decisions*, this would be a second, redundant
 layer keyed at the hub's subscriber-map level itself), Phase E (stretch:
 opt-in per-tenant backend process isolation).
+
+## 2026-07-13 -- ACP compatibility phase 19: end-to-end test suite covering concurrency, multi-tenancy, and multi-client-per-tenant together
+
+Phases 16-18 built and proved tenant isolation; earlier phases proved
+real concurrency (`concurrency_test.rs`, `session_cancel_concurrency_
+test.rs`) and live notification delivery (`live_notification_hub_test.
+rs`). None of that prior coverage combined all three properties in one
+test: `tenant_isolation_test.rs`'s calls are all sequentially `await`ed
+(never two tenants' requests genuinely in flight at once), and nothing
+prior opened more than one client connection under the *same* tenant
+against the *same* session concurrently. New file `acpx-server/tests/
+multitenant_concurrency_e2e_test.rs` (4 new tests, real HTTP + WS
+transport via the same `#[path]`-compiled-real-transport-source
+technique as every other file in this directory):
+
+1. `multiple_http_clients_of_the_same_tenant_concurrently_share_one_
+   session` -- two independent `reqwest::Client` connections, same
+   tenant, concurrently `session/list` (both see the one session one of
+   them created) then concurrently `session/prompt` the same session
+   (both succeed, each response's `id` correctly matches its own
+   request, neither swapped/dropped/corrupted by the other's
+   concurrently in-flight call). Deliberately does *not* assert the two
+   concurrent same-session prompts complete in parallel wall-clock time
+   -- they legitimately queue behind each other at the single-threaded
+   stand-in backend process, exactly like a real conversational agent
+   can't process two simultaneous turns against one conversation
+   identity either; asserting otherwise would be asserting a bug.
+2. `concurrent_load_across_two_tenants_never_cross_leaks_under_real_
+   parallel_traffic` -- 8 interleaved `tokio::spawn` tasks (alternating
+   tenant-a/tenant-b, driven through `futures_util::future::join_all` so
+   they race rather than run batch-then-batch) each open a session and
+   list; final per-tenant `session/list` reads back and asserts an exact
+   match against what that tenant actually created, proving the tenant-
+   nested `SessionRegistry`'s locking holds up under genuine concurrent
+   cross-tenant contention, not just one-call-at-a-time interleaving.
+3. `two_ws_clients_of_the_same_tenant_share_sessions_while_a_third_
+   tenant_sees_none` -- WS-transport variant of (1): two WS connections
+   tagged the same tenant each open a session; either connection's own
+   `session/list` sees both (the tenant, not the connection, owns the
+   aggregate); a third WS connection tagged a different tenant sees
+   neither. Proves `ws.rs`'s upgrade-time tenant-header caching composes
+   correctly with concurrent multi-connection, multi-tenant traffic.
+4. `the_newest_same_tenant_connection_to_touch_a_session_becomes_its_
+   live_subscriber` -- pins down `notify.rs`'s documented "last touch
+   wins" `NotificationHub` ownership rule precisely, in the multi-client-
+   same-tenant scenario it exists for, correcting an easy mistake made
+   while first writing this test: `ws.rs`'s `handle_socket` only calls
+   `hub.subscribe` *after* `dispatch_shared_for_tenant` fully returns, so
+   a `session/update` streamed *during* connection B's own `session/
+   prompt` call is delivered live to whoever was *already* subscribed at
+   that instant (connection A, subscribed earlier via its own `session/
+   new`) -- not to B, even though B's call is what triggered the backend
+   to emit it. Only *after* B's call completes does B itself become the
+   subscriber (proven directly via `NotificationHub::publish` against a
+   kept `Arc` clone of the router, simulating the backend's next streamed
+   chunk) -- at which point a further notification for the same session
+   correctly routes to B, not A. Exists so this deliberate, documented
+   single-subscriber design (not a bug, and not the separate,
+   still-unimplemented `acp-session-multiplex` fan-out plan) stays
+   exactly what it claims to be rather than silently drifting.
+
+Workspace test count after this phase: **250 passed, 0 failed, 6
+ignored** (up from 240/0/6 -- the 4 new tests above; the remaining delta
+is the shared `live::tests` module this new integration test file
+compiles in via `#[path]`, same established pattern as every other
+`#[path]`-based integration test file in `acpx-server/tests/`, not new
+test functions). `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean. `cargo clippy` still not available in this
+environment (component not installed), same limitation as every prior
+phase. All 4 new tests re-run 3x consecutively with no flakes observed
+before being folded into the workspace suite.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to production code, wire behavior, or router logic at all -- this
+phase is test coverage only, proving properties (concurrency +
+multi-tenancy + multi-client-per-tenant composing correctly together)
+that phases 6/14/16-18 already implemented but had never been jointly
+exercised in one test run.
