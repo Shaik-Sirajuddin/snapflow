@@ -11,7 +11,8 @@ use crate::persistence::{Direction, PersistenceStore};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 /// Which bucket a given JSON-RPC method falls into. See the classification
 /// table in `02-architecture.md`.
@@ -220,6 +221,20 @@ pub struct Router {
     /// without that transport ever needing to come back through this
     /// `Router`'s own lock to subscribe/publish.
     notification_hub: NotificationHub,
+    /// **Phase 15 addition.** Identity (`Arc::as_ptr` cast to `usize`) of
+    /// every physical backend process instance that already has an idle
+    /// scavenger task (see [`spawn_idle_scavenger`]/[`backend_idle_
+    /// scavenger`]) running for it. Keyed by pointer identity rather than
+    /// `agent_id` on purpose: a crash+respawn hands back a brand new
+    /// `SharedBackendProcess` (a fresh `Arc`, per `Supervisor::
+    /// ensure_running`'s doc comment), which naturally yields a fresh,
+    /// not-yet-present key here, so a respawned process always gets its
+    /// own fresh scavenger rather than either leaking the crashed
+    /// process's now-pointless task forever or requiring any explicit
+    /// crash-detection bookkeeping of its own -- the stale task simply
+    /// notices its process has exited (`BackendProcess::has_exited`) and
+    /// returns on its own next tick, see that function's doc comment.
+    scavenged_backends: HashSet<usize>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -307,6 +322,7 @@ impl Router {
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
             notification_hub: NotificationHub::new(),
+            scavenged_backends: HashSet::new(),
         }
     }
 
@@ -316,6 +332,34 @@ impl Router {
     /// connection touches. See `crate::notify`'s module doc comment.
     pub fn notification_hub(&self) -> NotificationHub {
         self.notification_hub.clone()
+    }
+
+    /// **Phase 15.** Ensure exactly one idle scavenger task
+    /// ([`backend_idle_scavenger`]) is running for this exact physical
+    /// `backend` instance, spawning one the first time this backend is
+    /// ever seen and doing nothing on every later call against the same
+    /// still-running process. Called from every `_shared` dispatch path
+    /// right after `Supervisor::ensure_running` hands back a
+    /// `SharedBackendProcess`, while that call already holds `self`'s own
+    /// lock briefly for bookkeeping -- spawning a task is not backend
+    /// I/O, so doing it here doesn't violate this file's "release the
+    /// lock before any backend round trip" convention.
+    fn spawn_idle_scavenger_if_new(
+        &mut self,
+        router_handle: &SharedRouterHandle,
+        agent_id: &str,
+        backend: &acpx_conductor::supervisor::SharedBackendProcess,
+    ) {
+        let key = std::sync::Arc::as_ptr(backend) as usize;
+        if !self.scavenged_backends.insert(key) {
+            return;
+        }
+        let ctx = LiveNotifyCtx {
+            router: std::sync::Arc::clone(router_handle),
+            agent_id: agent_id.to_string(),
+        };
+        let backend = std::sync::Arc::clone(backend);
+        tokio::spawn(backend_idle_scavenger(backend, ctx));
     }
 
     /// Attach a [`PersistenceStore`] -- session metadata and transcripts
@@ -1993,6 +2037,130 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     hub.publish(&gateway_id.0, translated).await
 }
 
+/// **Phase 15.** The idle/background-reader gap phase 14 documented and
+/// deliberately left open: `read_matching_response`'s read loop only ever
+/// runs while one client call is in flight against a given backend, so a
+/// notification a backend emits while nothing is currently in flight
+/// against it sits unread in the OS pipe buffer until the next call
+/// happens to drain it -- and never arrives at all if no further call is
+/// ever made. One instance of this task is spawned (via
+/// [`Router::spawn_idle_scavenger_if_new`]) the first time each physical
+/// backend process is seen, and keeps running for that exact process
+/// instance's whole lifetime.
+///
+/// **How it avoids racing `read_matching_response`.** Both this task and
+/// every in-flight call read from the exact same `BackendProcess::reader`
+/// -- one child process's stdout is a single stream, so only one reader
+/// may ever be draining it at a time, or frames get corrupted/misrouted
+/// between two concurrent readers. `backend.try_lock()` is the mechanism
+/// that guarantees this: an in-flight call already holds this exact
+/// process's own lock for its entire `read_matching_response` loop (by
+/// design, see that function's doc comment), so `try_lock()` fails
+/// (`Err`) for the whole time a real call owns this backend, and this
+/// task simply backs off and retries later -- it never touches `reader`
+/// except during the strictly-idle windows where no call holds the lock
+/// at all. Conversely, while this task *does* hold the lock (briefly, one
+/// non-blocking drain pass), a new call's own `backend.lock().await`
+/// simply queues behind it for that same bounded moment, never anything
+/// close to a whole call's real-LLM-latency duration -- this preserves
+/// the "no lock held across backend I/O" discipline every other function
+/// in this file follows, it just adds one more brief, bounded holder of
+/// the same lock.
+///
+/// **What it does with what it finds.** Only a bare notification (a
+/// `method`, no `id`) is actionable outside of any call context; an
+/// id-bearing frame (an agent-initiated request, or a stray response with
+/// no waiting caller) has no in-flight call here to answer or hand it to,
+/// so it's logged and dropped rather than guessed at -- in practice this
+/// should never happen, since every agent-initiated request this
+/// codebase knows how to answer (`session/request_permission`, `fs/*`,
+/// `terminal/*`) is only ever sent by a well-behaved backend mid an
+/// already in-flight `session/prompt`, which means a real call already
+/// holds this exact lock throughout, so this task would never observe
+/// one in the first place; logging (not silently discarding) covers the
+/// case where that assumption turns out to be wrong against some real
+/// adapter. A `session/update` is delivered live via
+/// [`try_deliver_live`], the exact same path/translation/hub a call
+/// in-flight would have used -- if that succeeds, this closes the phase
+/// 14 gap precisely: an update that arrived between prompt turns now
+/// reaches a subscribed stdio/WS connection instead of waiting, possibly
+/// forever, for the next call to that backend. If no live subscriber is
+/// registered (or the notification isn't `session/update`) there is
+/// still nothing to buffer it into -- no in-flight call's `_acpx.updates`
+/// exists right now -- so it's logged and discarded, same as it always
+/// effectively was pre-phase-15 (silently sitting unread forever), except
+/// now it's observed rather than invisible. Extending idle notifications
+/// to also feed the *next* call's `_acpx.updates` bundle (for `POST
+/// /rpc`-style clients with no live connection to push to at all) is left
+/// out of scope on purpose -- `POST /rpc` was already excluded from live
+/// delivery entirely in phase 14 for the same "no persistent connection
+/// to push to" reason, and this phase's gap statement is specifically
+/// about the two transports capable of a live push in the first place.
+async fn backend_idle_scavenger(
+    backend: acpx_conductor::supervisor::SharedBackendProcess,
+    ctx: LiveNotifyCtx,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let Ok(mut proc) = backend.try_lock() else {
+            // A real call owns this backend right now -- its own
+            // `read_matching_response` loop is already draining
+            // `reader`, so there is nothing for this tick to do.
+            continue;
+        };
+        if proc.has_exited() {
+            // This physical process instance is gone for good (a
+            // respawn, if any, is a brand new `SharedBackendProcess`
+            // with its own fresh scavenger, see `Router::
+            // spawn_idle_scavenger_if_new`'s doc comment) -- nothing
+            // left to scavenge, stop the task rather than spin forever.
+            return;
+        }
+        // Drain every frame already sitting in the OS pipe buffer, but
+        // never block waiting for one that hasn't arrived yet -- a
+        // zero-duration `timeout` around one `read_value` call is this
+        // function's "try a non-blocking read" idiom: data already
+        // available resolves on the very first poll, exactly like a real
+        // read would; anything not yet available times out immediately
+        // instead of parking this task (and the process lock it's
+        // holding) waiting for it.
+        loop {
+            let attempt =
+                tokio::time::timeout(Duration::from_millis(0), proc.reader.read_value()).await;
+            let value = match attempt {
+                Ok(Ok(value)) => value,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        agent_id = %ctx.agent_id,
+                        %err,
+                        "acpx idle scavenger's backend read errored; stopping this backend's scavenger"
+                    );
+                    return;
+                }
+                Err(_) => break, // nothing ready right now -- hand the lock back
+            };
+            if value.get("id").is_some() {
+                tracing::warn!(
+                    agent_id = %ctx.agent_id,
+                    ?value,
+                    "acpx idle scavenger saw an id-bearing frame with no in-flight caller; ignoring"
+                );
+                continue;
+            }
+            if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
+                && try_deliver_live(&ctx, &value).await
+            {
+                continue;
+            }
+            tracing::debug!(
+                agent_id = %ctx.agent_id,
+                ?value,
+                "acpx idle scavenger drained a notification with no live subscriber to deliver it to; discarding"
+            );
+        }
+    }
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
@@ -2463,6 +2631,7 @@ async fn dispatch_session_list_real_shared(
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
         let backend = r.supervisor.ensure_running(&agent_id).await?;
+        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         (agent_id, profile_name, backend, call_policy)
     };
@@ -2564,6 +2733,7 @@ async fn dispatch_proxied_shared(
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
+        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
         let call_policy = BackendCallPolicy::from_profile(
             profile_name
                 .as_deref()
@@ -2679,6 +2849,7 @@ async fn dispatch_session_new_shared(
         }
 
         let backend = r.supervisor.ensure_running(&agent_id).await?;
+        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
         (agent_id, profile, backend, r.persistence.clone(), cwd)
     };
 

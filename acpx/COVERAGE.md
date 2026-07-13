@@ -1982,3 +1982,161 @@ that changed here. `cargo fmt --all --check` and `cargo build
    closing note is unaffected by this phase -- it's additive to
    `session/update`'s notification path only, no existing dispatch
    behavior for any request/response method changed.
+
+## 2026-07-13 -- ACP compatibility phase 15: idle/background reader closing the gap phase 14 documented but deliberately left open
+
+**Directive.** Same standing directive as every phase in this series:
+recheck the ACP spec surface after the previous phase's own fix landed,
+find the next real gap, close it, prove it with real tests against a
+real synthetic stand-in backend, log it here, commit.
+
+**The gap.** Phase 14's own closing note named this explicitly, not as
+an aside: `read_matching_response`'s read loop -- the only place a
+notification is ever read off a backend's stdout at all, before this
+phase -- only ever ran while one client call was in flight against that
+specific backend (`dispatch_proxied_shared` et al. invoke it per-
+request). A `session/update` (or any other unsolicited notification) a
+backend emitted while zero calls were currently in flight against it sat
+unread in the OS pipe buffer until the *next* call to that backend
+happened to drain it -- delayed, not corrupted, but genuinely lost
+forever if no further call was ever made to that backend for the rest of
+the connection's lifetime. Phase 14's live-delivery mechanism
+(`NotificationHub`/`try_deliver_live`) was real and correct as far as it
+went, but it could only ever fire from *inside* an in-flight call's own
+read loop -- exactly the scenario this gap says doesn't always hold for
+a real agent that pushes progress between prompt turns, not only during
+one.
+
+**Design decision: an idle scavenger task per physical backend process,
+not a full request/response demultiplexer rewrite.** The theoretically
+"complete" fix is a persistent per-backend reader task that owns
+`BackendProcess::reader` for the process's entire lifetime, correlating
+every frame to whichever call (if any) is currently waiting for it via
+oneshot channels, decoupling reading from any one call's lifetime
+entirely. That is a materially larger, riskier change than this phase
+took on: every backend I/O path in this codebase is call-shaped by
+design (see `acpx-conductor::supervisor`'s and `read_matching_response`'s
+own doc comments on why one process's stdio can't support two truly
+interleaved request/response pairs), and moving `terminals`/`handshake_
+done`/policy-scoped agent-request handling out from under the call-scoped
+lock to make a truly decoupled reader safe would touch correlation
+semantics for every single dispatch path in `router.rs`, not just
+`session/update`'s. Instead, this phase adds `backend_idle_scavenger`: a
+lightweight task, one per physical `SharedBackendProcess` instance
+(spawned once, the first time `Router::spawn_idle_scavenger_if_new` sees
+a given process -- keyed by `Arc::as_ptr` identity so a crash+respawn
+naturally gets its own fresh scavenger, no explicit crash-tracking
+needed), that wakes up every 75ms, `try_lock()`s that exact backend's own
+process mutex, and -- only when the lock is free, i.e. genuinely no call
+is in flight against it right now -- drains every frame already sitting
+in the OS pipe buffer (a zero-duration `tokio::time::timeout` around one
+`read_value()` call: data already available resolves immediately, like a
+real read would; anything not yet available times out on the very first
+poll instead of parking this task, and the lock it's holding, waiting).
+A bare `session/update` notification found this way goes through the
+exact same `try_deliver_live`/`NotificationHub` path an in-flight call's
+own read loop would have used -- if a live subscriber is registered
+(which it will be, for any WS/stdio connection that already touched this
+session, since phase 14's subscribe-after-response wiring keeps that
+subscription alive for the session's whole lifetime, not just one call),
+the update reaches it exactly as it would have during a call. If nothing
+is subscribed (or the frame isn't `session/update`), it's logged and
+discarded -- there is no in-flight call's `_acpx.updates` to buffer it
+into out here, so this honestly cannot do better than that without
+adding a second, genuinely new kind of state (a per-session pending-
+notifications queue for the *next* call to drain); see "still open"
+below for why that was deliberately left out of scope too.
+
+**Why `try_lock()` is safe against `read_matching_response`, not just
+convenient.** Both this task and any in-flight call read from the exact
+same `BackendProcess::reader` -- one child process's stdout is a single
+stream, so only one reader may ever drain it at a time or frames get
+corrupted/misrouted between two concurrent readers. An in-flight call
+already holds this exact process's own lock for its entire `read_
+matching_response` loop (unchanged, pre-existing behavior), so `try_
+lock()` fails for the whole time a real call owns this backend and the
+scavenger simply backs off and retries 75ms later -- it never touches
+`reader` except during a strictly-idle window where no call holds the
+lock at all. The reverse direction matters too: while the scavenger
+*does* hold the lock (briefly, one non-blocking drain pass), a new call's
+own `backend.lock().await` just queues behind it for that same bounded
+moment -- nothing close to a whole call's real-LLM-latency duration --
+preserving the "never hold a backend's lock across real I/O latency"
+discipline every other function in this file already follows; this adds
+one more brief, bounded holder of the same lock, not a new way to starve
+a caller.
+
+**What this phase deliberately does not attempt to fix, and why --
+`POST /rpc` clients still can't see an idle-period update at all.** A
+stateless HTTP client has no live connection to push to between calls in
+the first place (phase 14's own scoping decision, unchanged), and this
+phase's own gap statement is specifically about the two transports
+capable of a live push at all (stdio, WS) -- extending idle notifications
+to also feed the *next* call's `_acpx.updates` bundle for `POST /rpc`
+would require a new per-session pending-notifications buffer (keyed
+storage, a drain step added to `read_matching_response`'s call-start
+path, and its own tests) that has no live-transport analog to reuse and
+was judged out of scope for this specific, already-large-enough phase;
+worth a dedicated future phase if an HTTP-only client's use case ever
+specifically needs it.
+
+**Tests, in order of what they each prove (`acpx-core/tests/idle_
+scavenger_test.rs`, 2 new):**
+1. `an_idle_notification_between_calls_still_reaches_a_live_subscriber_
+   without_a_further_call` -- the core proof this phase exists for: a
+   real synthetic stand-in backend answers `session/prompt` immediately,
+   then emits its `session/update` from a backgrounded subshell *after*
+   that response was already written and `read_matching_response` had
+   already returned; no further call is ever made against that backend
+   for the rest of the test, yet the live subscriber still receives it,
+   correctly translated to the gateway session id, within the timeout --
+   proving the scavenger task, not any in-flight call, is what delivered
+   it.
+2. `an_idle_notification_with_no_live_subscriber_is_discarded_without_
+   wedging_the_backend` -- the discard path (no subscriber registered)
+   doesn't panic, hang, or desynchronize the backend's stdio framing: a
+   second, ordinary `session/prompt` call against the exact same backend
+   made after the idle update was silently drained still succeeds
+   normally, proving the scavenger's brief `try_lock` windows never leave
+   the process lock stuck or the stream out of sync for a subsequent real
+   caller.
+
+Workspace test count after this phase: **227 passed, 0 failed, 6
+ignored** (up from 225/0/6 -- 2 new tests, both described above; the
+ignored count is unchanged, none of the three `#[ignore]`d real-adapter
+files were touched this phase). `cargo fmt --all --check` and `cargo
+build --workspace --tests` both clean. `cargo clippy` was not available
+in this environment's toolchain (`clippy` component not installed) so it
+could not be run this phase either, same limitation as every prior phase
+in this series.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. The idle/background-reader gap phase 14 named and this phase closes
+   is now real, tested, and honestly scoped: live-transport (stdio/WS)
+   clients no longer lose a between-turn notification to an unread pipe
+   buffer, proved against a real stand-in backend that only ever gets
+   one call, not a contrived multi-call sequence that would have
+   accidentally flushed it anyway.
+2. Still open, by design, not oversight: `POST /rpc` clients still only
+   ever see `_acpx.updates` bundled into their own call's response --
+   unaffected by this phase, see the scoping note above. A future phase
+   specifically motivated by a real HTTP-only client needing between-
+   call visibility would need a genuinely new pending-notifications-
+   buffer mechanism, not an extension of this one.
+3. `session/fork` (unstable) and `elicitation/create`/`elicitation/
+   complete` (unstable) remain out of scope per the stable v1 schema's
+   own stability contract, unchanged since phase 9.
+4. A true per-backend request/response demultiplexer (decoupling
+   `terminals`/agent-request handling from the call-scoped lock
+   entirely) remains the only way to close the theoretical remainder of
+   this gap -- an agent-initiated request (`session/request_permission`,
+   `fs/*`, `terminal/*`) arriving while genuinely no call is in flight,
+   which this phase's scavenger only logs and does not answer. This was
+   assessed, not just assumed, to be unreachable in practice against
+   every well-behaved backend this codebase knows how to talk to (those
+   methods are only ever sent mid an already in-flight `session/prompt`,
+   which means a real call already holds the lock throughout, so the
+   scavenger's own `try_lock` would never even succeed in that window) --
+   logged with `tracing::warn!` rather than silently dropped specifically
+   so this assumption gets falsified loudly, not silently, if some real
+   adapter ever proves it wrong.
