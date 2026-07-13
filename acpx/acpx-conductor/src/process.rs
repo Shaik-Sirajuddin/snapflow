@@ -75,6 +75,18 @@ pub struct BackendProcess {
     /// old instance are simply gone, matching a real terminal's lifetime
     /// being tied to the process that created it.
     pub terminals: HashMap<String, crate::terminal::TerminalHandle>,
+    /// Whether a real ACP `authenticate` request has already succeeded
+    /// against this process instance. Only meaningful when the backend's
+    /// `initialize` response (`agent_capabilities`) advertised a
+    /// non-empty `authMethods` -- `acpx-core::router::ensure_backend_
+    /// initialized` is the sole reader/writer of this flag, deciding
+    /// from it whether `authenticate` still needs to be attempted (or
+    /// re-attempted, if it previously failed) before any session/*
+    /// call reaches this backend. `false` until a real `authenticate`
+    /// round trip returns a non-error result. Reset to `false` on every
+    /// fresh spawn alongside `handshake_done`/`agent_capabilities`, same
+    /// crash+respawn reasoning as those two fields.
+    pub authenticated: bool,
 }
 
 impl BackendProcess {
@@ -102,6 +114,7 @@ impl BackendProcess {
             handshake_done: false,
             agent_capabilities: None,
             terminals: HashMap::new(),
+            authenticated: false,
         })
     }
 

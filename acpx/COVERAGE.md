@@ -830,3 +830,103 @@ ignored**, `cargo fmt --all --check` and `cargo build --workspace
    "real process, but always auto-approved by profile config," not a
    client seeing and approving each individual command before it runs.
    Same root cause, same honest non-fix as before.
+
+## ACP compatibility hardening, phase 5 -- backend-facing `authenticate`
+
+Closes the next item from phase 4's recheck list. Unlike `fs/*`/
+`terminal/*`/`session/request_permission` (all agent-*initiated*
+requests acpx answers), `authenticate` is client-initiated -- acpx is
+the one calling out to the backend. Real ACP schema (agentclientprotocol
+.com/protocol/schema, `AuthenticateRequest`/`AuthenticateResponse`):
+`initialize`'s response may carry a non-empty `authMethods` array (each
+entry an `{id, name, description?}` object); if it does, a client is
+expected to send `authenticate` with `params.methodId` set to one of
+those ids before `session/new` is expected to succeed.
+
+`ensure_backend_initialized` is restructured: the `initialize` round
+trip itself stays gated on `BackendProcess::handshake_done` exactly as
+before (never re-sent), but a new second phase runs on *every* call,
+driven off the already-cached `initialize` result
+(`proc.agent_capabilities`) rather than the wire -- no second
+`initialize` is ever sent, since a real adapter has no obligation to
+tolerate that. If `authMethods` is empty, this phase is a one-time
+no-op (`BackendProcess` gained `authenticated: bool`, flipped `true`
+immediately so subsequent calls short-circuit without re-deriving
+anything). If non-empty and not yet authenticated: a new
+`Profile::auth_method_id: Option<String>` (default `None`, same
+opt-in-not-opt-out family as `permission_policy`/`allow_fs_access`/
+`allow_terminal_access`) is consulted. `None` -- the default -- means
+acpx refuses to even attempt `session/new` against an unauthenticated
+backend, returning a new `RouterError::BackendRequiresAuthentication`
+carrying every advertised method id, rather than letting the backend's
+own downstream rejection (if any -- some adapters might not even
+reject cleanly) stand in for a real diagnostic. `Some(method_id)`
+drives a real `authenticate` request/response round trip; a JSON-RPC
+`error` in the reply becomes `RouterError::BackendAuthenticationError`
+(the raw backend error object, not swallowed); success flips
+`proc.authenticated = true` and every later call on this process skips
+straight past. A failed attempt leaves `authenticated` `false`, so a
+later call (e.g. after an operator fixes a typo'd `auth_method_id`)
+retries for real rather than being permanently wedged for this
+process's lifetime.
+
+`BackendCallPolicy` gained `auth_method_id: Option<String>` alongside
+the other three per-profile knobs; picking up an owned `String` here
+meant it could no longer derive `Copy` (only `Clone`), so the four
+dispatch call sites that use one `BackendCallPolicy` value across both
+`ensure_backend_initialized` and `read_matching_response` now
+`.clone()` at the first use -- a real, deliberate behavior-preserving
+mechanical change, not a workaround for something deeper.
+
+New `acpx-core/tests/authenticate_test.rs`, three cases against a
+stand-in backend that advertises `authMethods: [{"id": "api-key", ...}]`
+and only answers `authenticate` successfully for that exact id (a
+wrong id gets a real JSON-RPC error, matching what a real adapter
+rejecting an unrecognized method id would send): (1) a backend that
+advertises no `authMethods` at all is unaffected -- `session/new`
+proceeds exactly as every pre-existing test already implicitly
+exercised; (2) a backend that requires auth, with no
+`Profile::auth_method_id` configured (native/unmanaged mode), gets
+`RouterError::BackendRequiresAuthentication` naming the one advertised
+method, and never reaches the backend's `session/new` handler at all;
+(3) a backend that requires auth, with the right `auth_method_id`
+configured via `profiles/create`, gets a real `authenticate` round trip
+performed for real and then a real, successful `session/new`. All three
+wrapped in the same 5-second `tokio::time::timeout` guard as every
+other agent-initiated/handshake test in this workspace, since a
+regression here is plausibly a hang (e.g. a malformed `authenticate`
+request the stand-in backend's `while read` loop never matches), not
+just a wrong assertion.
+
+Workspace test count after this addition: **158 passed, 0 failed, 3
+ignored**, `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. Client-facing `initialize`/`authenticate` handshake on acpx-server's
+   own endpoint (i.e. acpx itself advertising `authMethods` to *its*
+   callers, symmetric to what this phase just built for the
+   backend-facing side) -- still entirely unimplemented. Next phase,
+   alongside exposing `agentCapabilities`/`permission_policy`/
+   `allow_fs_access`/`allow_terminal_access`/`auth_method_id` as
+   first-class `profiles/*` response fields rather than only inline on
+   `session/new`.
+2. `authenticate`'s real schema also supports `AuthMethodEnvVar` (the
+   client passes credentials to the agent as environment variables) and
+   an implicit `AuthMethodAgent` (agent handles it entirely itself, no
+   client action needed) as documented method *kinds*, not just a bare
+   `{id, name}` pair -- acpx's `auth_method_id` only ever forwards the
+   id verbatim and never inspects or acts on a method's kind (e.g.
+   auto-injecting an env var for an `AuthMethodEnvVar` entry the way it
+   already does for `provider`/`key_ref` at spawn time). Not attempted
+   this phase; every real adapter checked so far (claude-agent-acp,
+   codex-acp) authenticates ambiently outside ACP entirely and
+   advertises no `authMethods`, so this has not yet been exercised
+   against a real backend, only the synthetic stand-in above -- noted
+   honestly rather than assumed equivalent.
+3. The live-interactive-decision gap from phases 2-4's recheck applies
+   here too, in a different shape: `auth_method_id` is a static,
+   pre-configured choice baked into the profile ahead of time, not a
+   client picking a method (or supplying a credential) interactively in
+   response to a backend's real advertised options. Same root cause,
+   same honest non-fix as before.

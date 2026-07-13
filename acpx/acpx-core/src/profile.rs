@@ -66,6 +66,25 @@ pub struct Profile {
     /// `router::read_matching_response`'s `terminal/*` handling.
     #[serde(default)]
     pub allow_terminal_access: bool,
+    /// Pre-configured ACP `authenticate` method id to use for this
+    /// profile's backend, if that backend's `initialize` response
+    /// advertises a non-empty `authMethods` list (e.g. `"api-key"`,
+    /// `"oauth-personal"` -- whatever id the backend itself offered;
+    /// acpx doesn't invent or validate one, it just passes it through
+    /// verbatim as `authenticate`'s `params.methodId` per the real ACP
+    /// schema). `None` (the default) means "this profile has nothing
+    /// pre-configured" -- a backend that requires auth then gets a
+    /// clear, immediate `RouterError::BackendRequiresAuthentication`
+    /// (naming every method id the backend offered) instead of acpx
+    /// either hanging, guessing a method id, or silently proceeding to
+    /// `session/new` and letting the backend's own rejection surface as
+    /// an opaque downstream error. There is deliberately no live,
+    /// interactive "ask the user which auth method and for what
+    /// credential" flow here -- same honest limitation as
+    /// `permission_policy`/`allow_fs_access`/`allow_terminal_access`,
+    /// see `router::ensure_backend_initialized`'s doc comment.
+    #[serde(default)]
+    pub auth_method_id: Option<String>,
 }
 
 /// How `crate::router` answers a backend's `session/request_permission`
@@ -167,6 +186,7 @@ mod tests {
             permission_policy: Default::default(),
             allow_fs_access: false,
             allow_terminal_access: false,
+            auth_method_id: None,
         }
     }
 

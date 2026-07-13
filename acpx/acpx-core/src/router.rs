@@ -178,6 +178,10 @@ pub enum RouterError {
     UnknownProviderRef { profile: String, provider: String },
     #[error("profile {profile}'s agent id {agent_id} has no npx/uvx distribution in the registry")]
     NoLaunchableDistribution { profile: String, agent_id: String },
+    #[error("backend requires authentication before session/new (advertised authMethods: {0}); configure Profile::auth_method_id to pick one")]
+    BackendRequiresAuthentication(serde_json::Value),
+    #[error("backend rejected authenticate: {0}")]
+    BackendAuthenticationError(serde_json::Value),
 }
 
 impl Router {
@@ -397,7 +401,7 @@ impl Router {
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend, call_policy).await?;
+            ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             backend.writer.write_value(&request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy).await?;
@@ -573,7 +577,7 @@ impl Router {
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let response = {
             let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend, call_policy).await?;
+            ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             backend.writer.write_value(&request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy).await?;
@@ -829,6 +833,14 @@ impl Router {
 /// request is ever written to the same backend.
 const INITIALIZE_REQUEST_ID: i64 = 0;
 
+/// Fixed request id for the ACP `authenticate` round trip performed
+/// against a backend process that advertised a non-empty `authMethods`
+/// in its `initialize` response -- same rationale as
+/// `INITIALIZE_REQUEST_ID` (numeric, for the synthetic `sh -c '...'`
+/// stand-in backends' regex-based id echo), distinct value so a test
+/// double can tell the two handshake requests apart if it needs to.
+const AUTHENTICATE_REQUEST_ID: i64 = -1;
+
 /// Everything about how `read_matching_response`/`ensure_backend_initialized`
 /// should answer a backend's mid-call agent-initiated requests on a given
 /// call's behalf, bundled so the growing set of "what is this profile
@@ -836,11 +848,12 @@ const INITIALIZE_REQUEST_ID: i64 = 0;
 /// parameter list at every one of the four dispatch call sites. Computed
 /// once per call from the resolved `Profile` (or defaulted for
 /// native/unmanaged mode, where there is no profile to consult at all).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct BackendCallPolicy {
     permission_policy: PermissionPolicy,
     allow_fs_access: bool,
     allow_terminal_access: bool,
+    auth_method_id: Option<String>,
 }
 
 impl BackendCallPolicy {
@@ -850,6 +863,7 @@ impl BackendCallPolicy {
                 permission_policy: p.permission_policy,
                 allow_fs_access: p.allow_fs_access,
                 allow_terminal_access: p.allow_terminal_access,
+                auth_method_id: p.auth_method_id.clone(),
             },
             None => Self::default(),
         }
@@ -874,73 +888,132 @@ impl BackendCallPolicy {
 /// which acpx surfaced as an opaque `RouterError::MissingBackendSessionId`
 /// with no indication the real problem was protocol ordering, not the
 /// request itself.
+/// **Phase 5 addition:** after the `initialize` handshake (whether
+/// performed just now or previously, per `handshake_done`), also check
+/// the backend's cached `authMethods` (from `proc.agent_capabilities`,
+/// so this never re-sends `initialize` on a retry) and drive a real ACP
+/// `authenticate` round trip if the backend requires one and hasn't
+/// already succeeded (`proc.authenticated`). No pre-configured
+/// `Profile::auth_method_id` -- or a backend that rejects the one
+/// configured -- surfaces as a clear [`RouterError`] instead of acpx
+/// either guessing a method id or silently proceeding to `session/new`
+/// and letting the backend's own downstream rejection stand in for a
+/// real error message about *why*.
 async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
     call_policy: BackendCallPolicy,
 ) -> Result<(), RouterError> {
-    if proc.handshake_done {
-        return Ok(());
-    }
-    let allow_fs_access = call_policy.allow_fs_access;
-    let allow_terminal_access = call_policy.allow_terminal_access;
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": INITIALIZE_REQUEST_ID,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                // Real -- not aspirational -- as of ACP compatibility
-                // hardening phase 3: `read_matching_response` genuinely
-                // implements both methods now (real disk I/O against
-                // acpx's own host filesystem) when `allow_fs_access` is
-                // `true` for the profile this process belongs to. `false`
-                // (the default -- see `Profile::allow_fs_access`'s doc
-                // comment for why opt-in, not opt-out) keeps declaring
-                // both `false`, byte-for-byte the pre-phase-3 behavior.
-                "fs": { "readTextFile": allow_fs_access, "writeTextFile": allow_fs_access },
-                // Phase 4: same treatment for the `terminal` capability
-                // group -- all five sub-methods tied to one profile-level
-                // opt-in (`Profile::allow_terminal_access`), since
-                // granular per-sub-method opt-in has no real security
-                // value (they're meaningless without each other).
-                "terminal": {
-                    "create": allow_terminal_access,
-                    "output": allow_terminal_access,
-                    "waitForExit": allow_terminal_access,
-                    "kill": allow_terminal_access,
-                    "release": allow_terminal_access
+    if !proc.handshake_done {
+        let allow_fs_access = call_policy.allow_fs_access;
+        let allow_terminal_access = call_policy.allow_terminal_access;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": INITIALIZE_REQUEST_ID,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    // Real -- not aspirational -- as of ACP compatibility
+                    // hardening phase 3: `read_matching_response` genuinely
+                    // implements both methods now (real disk I/O against
+                    // acpx's own host filesystem) when `allow_fs_access` is
+                    // `true` for the profile this process belongs to. `false`
+                    // (the default -- see `Profile::allow_fs_access`'s doc
+                    // comment for why opt-in, not opt-out) keeps declaring
+                    // both `false`, byte-for-byte the pre-phase-3 behavior.
+                    "fs": { "readTextFile": allow_fs_access, "writeTextFile": allow_fs_access },
+                    // Phase 4: same treatment for the `terminal` capability
+                    // group -- all five sub-methods tied to one profile-level
+                    // opt-in (`Profile::allow_terminal_access`), since
+                    // granular per-sub-method opt-in has no real security
+                    // value (they're meaningless without each other).
+                    "terminal": {
+                        "create": allow_terminal_access,
+                        "output": allow_terminal_access,
+                        "waitForExit": allow_terminal_access,
+                        "kill": allow_terminal_access,
+                        "release": allow_terminal_access
+                    }
                 }
             }
+        });
+        proc.writer.write_value(&request).await?;
+        loop {
+            let value = proc.reader.read_value().await?;
+            if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
+                // Capture the backend's real `initialize` result -- its
+                // actual `agentCapabilities`/`authMethods`/negotiated
+                // `protocolVersion` -- instead of discarding it. Surfaced to
+                // gateway clients via `session/new`'s `_acpx.agentCapabilities`
+                // (see `attach_session_new_extras`) so a client can find out
+                // what a given backend genuinely supports rather than acpx
+                // silently assuming. **Real gap this closes** (found during
+                // an ACP-compatibility self-review, not from a test failure):
+                // every dispatch path before this fix threw the `initialize`
+                // response away entirely once the id matched, so acpx never
+                // knew -- and never told a client -- whether a backend
+                // supports e.g. `loadSession`, image content, or any auth
+                // method at all.
+                proc.agent_capabilities = value.get("result").cloned();
+                break;
+            }
+            // A well-behaved adapter shouldn't emit anything unprompted
+            // before answering `initialize`, but stay defensive rather than
+            // assuming the very first line back is necessarily the match --
+            // `read_value`'s own `FramingError::Eof` on a closed pipe is
+            // still the hard stop if the backend never answers at all.
         }
-    });
-    proc.writer.write_value(&request).await?;
-    loop {
-        let value = proc.reader.read_value().await?;
-        if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
-            // Capture the backend's real `initialize` result -- its
-            // actual `agentCapabilities`/`authMethods`/negotiated
-            // `protocolVersion` -- instead of discarding it. Surfaced to
-            // gateway clients via `session/new`'s `_acpx.agentCapabilities`
-            // (see `attach_session_new_extras`) so a client can find out
-            // what a given backend genuinely supports rather than acpx
-            // silently assuming. **Real gap this closes** (found during
-            // an ACP-compatibility self-review, not from a test failure):
-            // every dispatch path before this fix threw the `initialize`
-            // response away entirely once the id matched, so acpx never
-            // knew -- and never told a client -- whether a backend
-            // supports e.g. `loadSession`, image content, or any auth
-            // method at all.
-            proc.agent_capabilities = value.get("result").cloned();
-            break;
-        }
-        // A well-behaved adapter shouldn't emit anything unprompted
-        // before answering `initialize`, but stay defensive rather than
-        // assuming the very first line back is necessarily the match --
-        // `read_value`'s own `FramingError::Eof` on a closed pipe is
-        // still the hard stop if the backend never answers at all.
+        proc.handshake_done = true;
     }
-    proc.handshake_done = true;
+
+    // Real ACP `authenticate` -- driven off the *cached* `initialize`
+    // result (`proc.agent_capabilities`), not a re-send of `initialize`
+    // itself, so this branch is safe to re-run on every call until it
+    // succeeds (e.g. after an operator fixes a misconfigured profile)
+    // without ever sending a second `initialize` on the same process,
+    // which a real adapter has no obligation to tolerate.
+    if !proc.authenticated {
+        let auth_methods = proc
+            .agent_capabilities
+            .as_ref()
+            .and_then(|r| r.get("authMethods"))
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !auth_methods.is_empty() {
+            let Some(method_id) = call_policy.auth_method_id.as_deref() else {
+                return Err(RouterError::BackendRequiresAuthentication(
+                    serde_json::Value::Array(auth_methods),
+                ));
+            };
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": AUTHENTICATE_REQUEST_ID,
+                "method": "authenticate",
+                "params": { "methodId": method_id }
+            });
+            proc.writer.write_value(&request).await?;
+            loop {
+                let value = proc.reader.read_value().await?;
+                if value.get("id").and_then(|v| v.as_i64()) == Some(AUTHENTICATE_REQUEST_ID) {
+                    if let Some(error) = value.get("error") {
+                        return Err(RouterError::BackendAuthenticationError(error.clone()));
+                    }
+                    proc.authenticated = true;
+                    break;
+                }
+                // Same defensive stance as the `initialize` loop above --
+                // a well-behaved adapter shouldn't emit anything
+                // unprompted before answering `authenticate` either.
+            }
+        } else {
+            // No auth required at all -- vacuously "authenticated" so
+            // this branch short-circuits on every subsequent call
+            // without re-deriving `auth_methods` from JSON each time.
+            proc.authenticated = true;
+        }
+    }
+
     Ok(())
 }
 
@@ -1618,7 +1691,7 @@ async fn dispatch_proxied_shared(
 
     let response = {
         let mut proc = backend.lock().await;
-        ensure_backend_initialized(&mut proc, call_policy).await?;
+        ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.write_value(&request).await?;
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy).await?;
@@ -1714,7 +1787,7 @@ async fn dispatch_session_new_shared(
     let mut response = {
         let mut proc = backend.lock().await;
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
-        ensure_backend_initialized(&mut proc, call_policy).await?;
+        ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.write_value(&request).await?;
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy).await?;

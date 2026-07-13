@@ -27,6 +27,7 @@ fn litellm_profile(name: &str, key_ref: acpx_core::keystore::KeyRef) -> Profile 
         permission_policy: Default::default(),
         allow_fs_access: false,
         allow_terminal_access: false,
+        auth_method_id: None,
     }
 }
 
@@ -122,6 +123,7 @@ fn multiple_profiles_can_share_one_provider_with_different_keys() {
             permission_policy: Default::default(),
             allow_fs_access: false,
             allow_terminal_access: false,
+            auth_method_id: None,
         })
         .unwrap();
     profiles
@@ -135,6 +137,7 @@ fn multiple_profiles_can_share_one_provider_with_different_keys() {
             permission_policy: Default::default(),
             allow_fs_access: false,
             allow_terminal_access: false,
+            auth_method_id: None,
         })
         .unwrap();
 
@@ -170,6 +173,7 @@ fn create_profile_referencing_provider_that_does_not_exist_yet_still_succeeds() 
         permission_policy: Default::default(),
         allow_fs_access: false,
         allow_terminal_access: false,
+        auth_method_id: None,
     };
     assert!(profiles.create(profile).is_ok());
 
@@ -199,6 +203,7 @@ fn profile_store_error_variants_are_distinguishable() {
         permission_policy: Default::default(),
         allow_fs_access: false,
         allow_terminal_access: false,
+        auth_method_id: None,
     };
     profiles.create(profile.clone()).unwrap();
     assert_eq!(

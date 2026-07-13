@@ -74,6 +74,7 @@ fn sample_profile(name: &str, agent_id: &str) -> Profile {
         permission_policy: Default::default(),
         allow_fs_access: false,
         allow_terminal_access: false,
+        auth_method_id: None,
     }
 }
 
