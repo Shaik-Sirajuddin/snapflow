@@ -4,7 +4,9 @@
 use crate::framing::{FramedReader, FramedWriter};
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
@@ -42,7 +44,26 @@ impl SpawnSpec {
 pub struct BackendProcess {
     child: Child,
     pub reader: FramedReader,
-    pub writer: FramedWriter,
+    /// Shared, independently-lockable -- **not** covered by whatever lock
+    /// a caller holds on the surrounding `Arc<Mutex<BackendProcess>>`
+    /// itself (`acpx_conductor::supervisor::SharedBackendProcess`). This
+    /// is deliberate, not an accident of convenience: `acpx-core::router`
+    /// needs to be able to write a real ACP `session/cancel` *notification*
+    /// onto this same process's stdin *while* a `session/prompt` call
+    /// against this exact process is still mid-flight, holding the outer
+    /// per-process lock for the whole duration of its blocking
+    /// `read_matching_response` loop (see that function's own doc
+    /// comment for why one child process's stdio can never support two
+    /// truly interleaved request/response pairs -- that constraint is
+    /// real and unavoidable, but a fire-and-forget *write* with no
+    /// matching read isn't a request/response pair at all, so it isn't
+    /// bound by it). `Supervisor` keeps its own independent clone of this
+    /// exact `Arc` (via `Self::writer_handle`, captured at spawn time,
+    /// *before* the fresh `BackendProcess` is ever wrapped in its own
+    /// outer `Arc<Mutex<..>>` and handed out), so a caller can obtain it
+    /// without ever touching the outer per-process lock at all -- see
+    /// `acpx_conductor::supervisor::Supervisor::cancel_writer`.
+    pub writer: Arc<Mutex<FramedWriter>>,
     /// Whether the ACP `initialize` handshake has already been performed
     /// against this process instance. Deliberately just a generic done/not
     /// flag owned here (not ACP-specific logic -- this crate stays
@@ -110,12 +131,19 @@ impl BackendProcess {
         Ok(Self {
             child,
             reader: FramedReader::new(stdout),
-            writer: FramedWriter::new(stdin),
+            writer: Arc::new(Mutex::new(FramedWriter::new(stdin))),
             handshake_done: false,
             agent_capabilities: None,
             terminals: HashMap::new(),
             authenticated: false,
         })
+    }
+
+    /// Clone of this process's shared writer handle -- see
+    /// [`Self::writer`]'s doc comment for why this exists and who's
+    /// meant to call it (`Supervisor`, once, at spawn time).
+    pub fn writer_handle(&self) -> Arc<Mutex<FramedWriter>> {
+        Arc::clone(&self.writer)
     }
 
     /// Returns the process's exit status if it has already exited

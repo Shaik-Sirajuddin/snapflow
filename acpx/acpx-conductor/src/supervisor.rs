@@ -17,6 +17,7 @@
 //! child process's stdio regardless of locking strategy.
 
 use crate::backoff;
+use crate::framing::FramedWriter;
 use crate::process::{BackendProcess, ProcessError, SpawnSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,6 +74,17 @@ struct BackoffState {
 pub struct Supervisor {
     specs: HashMap<String, SpawnSpec>,
     running: HashMap<String, SharedBackendProcess>,
+    /// Independent clone of each running process's `writer` handle,
+    /// captured at spawn time (see `BackendProcess::writer_handle`'s doc
+    /// comment) so [`Self::cancel_writer`] can hand it out without ever
+    /// touching `running`'s own per-process lock -- the entire point,
+    /// see that method's doc comment. Kept in lockstep with `running`:
+    /// inserted alongside every fresh spawn, removed on `stop`. A stale
+    /// entry surviving past a crash the caller hasn't yet noticed just
+    /// means a write into a dead process's closed stdin, which
+    /// `FramedWriter::write_value` surfaces as a normal I/O error, not a
+    /// hang or a panic.
+    write_handles: HashMap<String, Arc<Mutex<FramedWriter>>>,
     attempts: HashMap<String, BackoffState>,
     /// How long a process must stay alive before its consecutive-failure
     /// count resets. Defaults to `backoff::STABLE_AFTER`; overridable via
@@ -86,6 +98,7 @@ impl Supervisor {
         Self {
             specs: HashMap::new(),
             running: HashMap::new(),
+            write_handles: HashMap::new(),
             attempts: HashMap::new(),
             stable_after: backoff::STABLE_AFTER,
         }
@@ -224,6 +237,14 @@ impl Supervisor {
         state.last_spawn_at = Some(now);
         match BackendProcess::spawn(spec).await {
             Ok(proc) => {
+                // Captured *before* `proc` is ever wrapped in its own
+                // `Arc<Mutex<BackendProcess>>` and handed out -- so this
+                // clone is unconditionally cheap and uncontended, never a
+                // point where this could itself block on a lock some
+                // other caller already holds. See `write_handles`'s and
+                // `BackendProcess::writer`'s doc comments.
+                self.write_handles
+                    .insert(agent_id.to_string(), proc.writer_handle());
                 let handle: SharedBackendProcess = Arc::new(Mutex::new(proc));
                 self.running
                     .insert(agent_id.to_string(), Arc::clone(&handle));
@@ -238,6 +259,7 @@ impl Supervisor {
 
     pub async fn stop(&mut self, agent_id: &str) -> Result<(), SupervisorError> {
         if let Some(handle) = self.running.remove(agent_id) {
+            self.write_handles.remove(agent_id);
             // Waits for any in-flight request against this agent to finish
             // before killing it, rather than yanking the process out from
             // under a concurrent caller mid-I/O.
@@ -248,6 +270,23 @@ impl Supervisor {
         // a subsequent `ensure_running` spawns immediately.
         self.attempts.remove(agent_id);
         Ok(())
+    }
+
+    /// Real ACP `session/cancel` support's key primitive: an independent
+    /// clone of `agent_id`'s currently-running process's writer handle,
+    /// obtainable *without* ever touching that process's own per-process
+    /// lock (`SharedBackendProcess`'s `Arc<Mutex<BackendProcess>>`) --
+    /// see `write_handles`'s and `BackendProcess::writer`'s doc comments
+    /// for why that matters: a `session/prompt` call already in flight
+    /// against this exact process holds that per-process lock for its
+    /// entire duration, so anything routed through it (the pre-phase-7
+    /// behavior) can't ever deliver a cancel notification until *after*
+    /// the very call it was meant to interrupt has already finished --
+    /// at which point cancelling is moot. `None` if `agent_id` has never
+    /// been spawned (or was `stop`ped) -- a caller with nothing to
+    /// cancel, not an error in itself.
+    pub fn cancel_writer(&self, agent_id: &str) -> Option<Arc<Mutex<FramedWriter>>> {
+        self.write_handles.get(agent_id).cloned()
     }
 }
 

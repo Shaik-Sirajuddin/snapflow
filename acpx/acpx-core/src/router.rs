@@ -420,7 +420,7 @@ impl Router {
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.write_value(&request).await?;
+            backend.writer.lock().await.write_value(&request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy).await?;
             attach_session_new_extras(
@@ -556,6 +556,17 @@ impl Router {
             .and_then(|m| m.as_str())
             .ok_or(RouterError::MissingMethod)?
             .to_string();
+        // **Phase 7:** `session/cancel` is not shaped like every other
+        // `Proxied` method -- see `Self::dispatch_session_cancel`'s doc
+        // comment for the two real bugs this branch closes (a
+        // spec-compliant client's notification-shaped call, with no
+        // `id`, getting rejected by the generic `MissingId` check below;
+        // and the generic path's blocking wait for a reply the backend
+        // is never supposed to send). Must be checked before that `id`
+        // extraction, not after.
+        if method == "session/cancel" {
+            return self.dispatch_session_cancel(request).await;
+        }
         let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
         let params = request
             .get_mut("params")
@@ -596,7 +607,7 @@ impl Router {
         let response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.write_value(&request).await?;
+            backend.writer.lock().await.write_value(&request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy).await?;
             attach_updates(response, notifications, agent_requests)
@@ -627,6 +638,107 @@ impl Router {
             }
         }
         Ok(response)
+    }
+
+    /// Real ACP `session/cancel` -- a client-sent *notification* per
+    /// `agentclientprotocol.com`'s `CancelNotification` schema: no `id`,
+    /// no reply expected on the wire for it directly. The agent's only
+    /// observable reaction is that the already-in-flight `session/prompt`
+    /// call it's meant to interrupt eventually resolves with
+    /// `stopReason: "cancelled"` on its own -- that resolution flows back
+    /// through the *original* `session/prompt` call's own already-running
+    /// `dispatch_proxied`/`dispatch_proxied_shared` invocation, not
+    /// through anything this method does.
+    ///
+    /// **Two real, previously-undiscovered bugs this closes** (found
+    /// re-deriving the ACP spec surface for phase 7's recheck, not from a
+    /// test failure -- this workspace had zero tests exercising
+    /// `session/cancel` at all before this phase, despite it being one of
+    /// four methods the spec calls out as a baseline MUST for every
+    /// agent): (1) every other `Proxied` method unconditionally required
+    /// an `id` (`RouterError::MissingId` otherwise) -- a spec-compliant
+    /// client sending this as a true notification (no `id` at all) would
+    /// have been rejected before the request ever reached a backend; (2)
+    /// the generic proxied path blocks on `read_matching_response`
+    /// waiting for a reply carrying the forwarded request's own id -- a
+    /// spec-compliant backend never replies to `session/cancel` directly,
+    /// so that would hang forever: a real deadlock against any
+    /// correctly-implemented backend, not a hypothetical. Same category
+    /// of bug as phase 2's `session/request_permission` fix, in the
+    /// opposite direction: there, an agent-initiated *request* was
+    /// mistaken for a notification; here, a client-sent *notification*
+    /// was mistaken for a request awaiting a reply.
+    ///
+    /// **Third, deeper bug this closes -- the reason this isn't just a
+    /// shape fix:** even with (1)/(2) fixed, routing this through the
+    /// same per-process lock every other proxied method uses
+    /// (`SharedBackendProcess`'s `Arc<Mutex<BackendProcess>>`) would
+    /// still leave cancellation practically useless -- a `session/prompt`
+    /// call already in flight against this exact backend process holds
+    /// that lock for its *entire* duration (the whole point of the
+    /// "real multi-agent concurrency" design), so a cancel routed through
+    /// it could only ever be delivered *after* the very call it's meant
+    /// to interrupt has already finished, at which point cancelling is
+    /// moot. This writes through
+    /// `acpx_conductor::supervisor::Supervisor::cancel_writer` instead --
+    /// a handle independent of that per-process lock (see its and
+    /// `BackendProcess::writer`'s doc comments) -- so the notification
+    /// genuinely reaches the backend's stdin *while* the in-flight call
+    /// is still blocked reading, not only after.
+    ///
+    /// Writes the real ACP notification shape verbatim
+    /// (`{jsonrpc, method, params: {sessionId}}`, deliberately no `id`
+    /// key at all, regardless of whatever shape the client's own call
+    /// used) and returns immediately once that write succeeds, echoing
+    /// the client's own `id` back (or `null` if the client sent a true
+    /// notification) -- acpx's own client-facing transports are all
+    /// request/response-shaped regardless of what ACP itself calls this
+    /// method, so some reply is always sent, but nothing about it is a
+    /// real backend acknowledgment (there isn't one to wait for).
+    async fn dispatch_session_cancel(
+        &mut self,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
+        let client_id = request
+            .get("id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let gateway_session_id = request
+            .get("params")
+            .and_then(|p| p.get("sessionId"))
+            .and_then(|s| s.as_str())
+            .ok_or(RouterError::MissingSessionId)?
+            .to_string();
+        let entry = self
+            .sessions
+            .resolve(&acpx_proto::session::GatewaySessionId(
+                gateway_session_id.clone(),
+            ))
+            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
+        let agent_id = entry.agent_id.clone();
+        let backend_session_id = entry.backend_session_id.0.clone();
+
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": backend_session_id }
+        });
+        self.spawn_transcript(
+            gateway_session_id,
+            Direction::ClientToAgent,
+            notification.clone(),
+        );
+
+        // `None` means this agent's process was never spawned (or was
+        // `stop`ped) -- nothing is in flight to cancel, a benign no-op
+        // rather than an error: a client cancelling a session whose
+        // backend isn't even running has, definitionally, nothing left
+        // to interrupt.
+        if let Some(writer) = self.supervisor.cancel_writer(&agent_id) {
+            writer.lock().await.write_value(&notification).await?;
+        }
+
+        Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
     }
 
     async fn dispatch_native(
@@ -1022,7 +1134,7 @@ async fn ensure_backend_initialized(
                 }
             }
         });
-        proc.writer.write_value(&request).await?;
+        proc.writer.lock().await.write_value(&request).await?;
         loop {
             let value = proc.reader.read_value().await?;
             if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
@@ -1077,7 +1189,7 @@ async fn ensure_backend_initialized(
                 "method": "authenticate",
                 "params": { "methodId": method_id }
             });
-            proc.writer.write_value(&request).await?;
+            proc.writer.lock().await.write_value(&request).await?;
             loop {
                 let value = proc.reader.read_value().await?;
                 if value.get("id").and_then(|v| v.as_i64()) == Some(AUTHENTICATE_REQUEST_ID) {
@@ -1498,7 +1610,7 @@ async fn read_matching_response(
                     }
                 })
             };
-            backend.writer.write_value(&reply).await?;
+            backend.writer.lock().await.write_value(&reply).await?;
             agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
             continue;
         }
@@ -1715,11 +1827,85 @@ pub async fn dispatch_shared(
         .to_string();
     match classify(&method) {
         MethodClass::Hybrid => dispatch_session_new_shared(router, request).await,
+        // **Phase 7:** `session/cancel` needs `dispatch_session_cancel_shared`
+        // specifically, not the generic `dispatch_proxied_shared` --
+        // see `Router::dispatch_session_cancel`'s doc comment for why
+        // (id-optional notification shape, no blocking wait for a reply
+        // that will never come, and -- the part that actually makes
+        // cancellation *work*, not just avoid erroring -- a write path
+        // independent of the per-process lock a concurrent
+        // `session/prompt` against the same backend may be holding for
+        // its entire duration).
+        MethodClass::Proxied if method == "session/cancel" => {
+            dispatch_session_cancel_shared(router, request).await
+        }
         MethodClass::Proxied => dispatch_proxied_shared(router, request).await,
         MethodClass::GatewayNative | MethodClass::Unknown => {
             router.lock().await.dispatch(request).await
         }
     }
+}
+
+/// [`dispatch_shared`]'s `session/cancel` path -- mirrors
+/// `Router::dispatch_session_cancel` exactly (see that method's doc
+/// comment for the full rationale) but restructured the same way every
+/// other `_shared` function in this file is: resolve session/agent state
+/// under `router`'s own brief lock, then release it before touching a
+/// backend at all. The release matters even more here than for the
+/// generic proxied path: `Supervisor::cancel_writer`'s entire purpose is
+/// letting this write proceed without contending with a concurrent
+/// `session/prompt`'s per-process lock, so holding `router`'s own lock
+/// any longer than strictly necessary to look up the writer handle would
+/// undermine that (a `session/prompt` against a *different* agent, or a
+/// `session/new` for a brand new one, would otherwise queue up behind
+/// this cancel call for no reason).
+async fn dispatch_session_cancel_shared(
+    router: &SharedRouterHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let client_id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let gateway_session_id = request
+        .get("params")
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .ok_or(RouterError::MissingSessionId)?
+        .to_string();
+
+    let (backend_session_id, persistence, cancel_writer) = {
+        let r = router.lock().await;
+        let entry = r
+            .sessions
+            .resolve(&acpx_proto::session::GatewaySessionId(
+                gateway_session_id.clone(),
+            ))
+            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
+        let backend_session_id = entry.backend_session_id.0.clone();
+        let cancel_writer = r.supervisor.cancel_writer(&entry.agent_id);
+        (backend_session_id, r.persistence.clone(), cancel_writer)
+    };
+
+    let notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": { "sessionId": backend_session_id }
+    });
+    spawn_transcript_fn(
+        persistence,
+        gateway_session_id,
+        Direction::ClientToAgent,
+        notification.clone(),
+    );
+
+    // Same "nothing running, nothing to cancel" no-op as
+    // `Router::dispatch_session_cancel` -- see that method's comment.
+    if let Some(writer) = cancel_writer {
+        writer.lock().await.write_value(&notification).await?;
+    }
+
+    Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
 }
 
 /// [`dispatch_shared`]'s `session/prompt`/`session/resume`/`session/load`/
@@ -1777,7 +1963,7 @@ async fn dispatch_proxied_shared(
     let response = {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.write_value(&request).await?;
+        proc.writer.lock().await.write_value(&request).await?;
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy).await?;
         attach_updates(response, notifications, agent_requests)
@@ -1873,7 +2059,7 @@ async fn dispatch_session_new_shared(
         let mut proc = backend.lock().await;
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.write_value(&request).await?;
+        proc.writer.lock().await.write_value(&request).await?;
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy).await?;
         attach_session_new_extras(

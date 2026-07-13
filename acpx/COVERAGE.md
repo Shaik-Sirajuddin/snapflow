@@ -1054,3 +1054,123 @@ ignored**, `cargo fmt --all --check` and `cargo build --workspace
    real client needs it (`_acpx.agentCapabilities` on `session/new`
    already covers the "what does my actual backend support" question
    once a session exists).
+
+## ACP compatibility hardening, phase 7 -- real `session/cancel`
+
+Re-deriving the ACP spec surface from scratch for phase 6's "no further
+gaps identified" recheck turned out to be premature: `session/cancel`
+is one of exactly **four** methods the spec calls out as a baseline
+MUST for every agent (`session/new`, `session/prompt`, `session/cancel`,
+`session/update`), and this workspace had **zero** tests exercising it
+at all before this phase, across ~163 pre-existing tests. Real schema
+(agentclientprotocol.com/protocol/schema): `CancelNotification` is a
+client-sent *notification* -- no `id`, and the spec is explicit that
+the agent "MUST" eventually resolve the turn it interrupts by having
+the *original* `session/prompt` call return `stopReason: "cancelled"`,
+not by replying to the cancel itself.
+
+**Three real bugs found and fixed, not one:**
+1. Every `Proxied` method (including `session/cancel`, before this
+   phase) unconditionally required an `id`
+   (`RouterError::MissingId` otherwise). A spec-compliant client
+   sending a true notification (no `id` at all) would have been
+   rejected before the request ever reached a backend.
+2. The generic proxied path blocks on `read_matching_response` waiting
+   for a reply carrying the forwarded request's own id. A
+   spec-compliant backend never replies to `session/cancel` directly --
+   routing it through that path would hang forever against any
+   correctly-implemented backend. Same category of bug as phase 2's
+   `session/request_permission` deadlock fix, mirrored in the opposite
+   direction: there, an agent-initiated *request* was mistaken for a
+   notification; here, a client-sent *notification* was mistaken for a
+   request awaiting a reply.
+3. **The deepest one, and the reason this isn't just a shape fix:**
+   even with (1)/(2) fixed, routing `session/cancel` through the same
+   per-process lock (`SharedBackendProcess`'s
+   `Arc<Mutex<BackendProcess>>`) every other proxied method uses would
+   make cancellation practically useless. A `session/prompt` call
+   already in flight against that exact backend process holds that
+   lock for its *entire* duration (the whole point of the "real
+   multi-agent concurrency" design from earlier in this project) -- a
+   cancel routed through it could only ever be delivered *after* the
+   very call it's meant to interrupt has already finished, at which
+   point cancelling is moot. Confirmed by inspection of `Supervisor::
+   ensure_running`'s own liveness check (`self.running.get(agent_id)
+   .lock().await`), which blocks on that exact same per-process lock
+   before a second call against a busy agent can even proceed.
+
+Fixed by giving `session/cancel` a genuinely independent write path.
+`acpx_conductor::process::BackendProcess::writer` changed from a bare
+`FramedWriter` to `Arc<tokio::sync::Mutex<FramedWriter>>` -- every
+pre-existing write call site (7 of them across `router.rs`, plus one in
+`e2e_single_agent_test.rs`) now does one extra `.lock().await` on this
+small, fast, independent mutex, mechanically unchanged in behavior.
+`Supervisor` gained a second bookkeeping map, `write_handles`, populated
+with a clone of this exact `Arc` *at spawn time* -- before the fresh
+`BackendProcess` is ever wrapped in its own outer per-process
+`Arc<Mutex<..>>` and handed out -- so `Supervisor::cancel_writer(
+agent_id)` can hand out a working writer handle via only `Supervisor`'s
+own (already brief, already-existing) lock, never touching the
+per-process lock at all. `Router::dispatch_session_cancel`/the free
+`dispatch_session_cancel_shared` function (mirroring the existing
+`dispatch_proxied`/`dispatch_proxied_shared` split) resolve the
+session, build the real ACP notification shape verbatim (`{jsonrpc,
+method, params: {sessionId}}` -- deliberately no `id` key, regardless
+of whatever shape the client's own call used), write it through
+`cancel_writer`, and reply to the *client* immediately (echoing the
+client's own `id`, or `null` if it sent a true notification) without
+ever blocking on any backend reply. `classify` still routes
+`session/cancel` into the `Proxied` bucket (unchanged, so no
+`MethodClass` shape broke); `dispatch_proxied`/`dispatch_shared` now
+special-case it to the new path before the generic `id`-requiring code
+runs. A session whose backend was never spawned (or was `stop`ped) gets
+a benign no-op (`cancel_writer` returns `None`) rather than an error --
+nothing is in flight to interrupt.
+
+New `acpx-core/tests/session_cancel_test.rs` (3 tests, non-shared
+`Router::dispatch`, no real concurrency needed to prove these): a true
+notification (no `id` at all) completes without hanging even though the
+stand-in backend never replies, and the captured raw line the backend
+actually received has the real ACP shape (rewritten `sessionId`, no
+`id` key); a client that *does* attach an `id` still gets it echoed
+back in acpx's own reply, but the backend still receives the real
+id-less shape regardless; an unknown session gets a clear error. New
+`acpx-server/tests/session_cancel_concurrency_test.rs` (1 test) proves
+bug 3's fix specifically, against the real HTTP transport and the real
+concurrent (`dispatch_shared`) dispatch path: fires `session/prompt`
+(1.5s simulated latency) on its own task, waits 300ms to be sure it's
+genuinely in flight and holding the per-process lock, then measures
+`session/cancel` against the *same* session -- asserts it completes in
+under 700ms (versus the ~1.2s remaining latency a lock-serialized
+delivery would take), that the in-flight prompt still finishes normally
+afterward, and that the real notification's raw bytes landed on the
+backend's stdin (captured to a temp file) during the prompt's own sleep
+window, not after.
+
+Workspace test count after this addition: **167 passed, 0 failed, 3
+ignored**, `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `session/update`, the fourth baseline-MUST method, was already
+   real (delivered via `read_matching_response`'s notification
+   aggregation, `_acpx.updates` -- see the "real ACP content delivery"
+   section of this doc from earlier in the project). All four
+   baseline-MUST methods (`session/new`, `session/prompt`,
+   `session/cancel`, `session/update`) are now genuinely implemented,
+   not just present in `classify`'s dispatch table.
+2. `Supervisor::ensure_running`'s liveness check blocking the whole
+   `Router`-level lock whenever a *second* concurrent call (of any
+   kind, not just `session/cancel`) targets an agent that already has
+   one in flight -- noted above as how bug 3 was confirmed -- is a
+   real, adjacent concurrency/scalability concern, but it's not itself
+   an ACP wire-protocol compatibility gap (no client observes a
+   protocol violation from it, only added latency for unrelated
+   agents' concurrent requests while it's blocked). Deliberately left
+   unfixed in this phase, which is scoped to ACP compatibility per this
+   project's current directive -- tracked here honestly rather than
+   silently bundled in or silently ignored.
+3. The live-interactive-decision gap from every prior phase's recheck
+   is unaffected by this phase (still about mid-call backend-initiated
+   requests) -- still the honest, tracked, not-attempted-in-this-series
+   residual.

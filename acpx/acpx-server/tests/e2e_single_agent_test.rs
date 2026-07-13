@@ -24,6 +24,8 @@ async fn framed_roundtrip_through_a_stand_in_backend() {
     });
     backend
         .writer
+        .lock()
+        .await
         .write_value(&request)
         .await
         .expect("write request");
