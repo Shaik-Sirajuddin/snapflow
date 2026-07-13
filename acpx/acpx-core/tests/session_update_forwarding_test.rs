@@ -87,10 +87,17 @@ async fn session_prompt_response_aggregates_streamed_session_updates() {
 #[tokio::test]
 async fn session_new_response_has_no_acpx_updates_field_when_backend_emits_none() {
     // Regression guard for the "no-op when there's nothing to attach"
-    // contract documented on `attach_updates` -- every synthetic stand-in
-    // backend used elsewhere in this workspace's test suite never emits
-    // notifications, so their responses must stay byte-for-byte identical
-    // (no stray empty `_acpx` object appearing out of nowhere).
+    // contract documented on `attach_updates`/`attach_session_new_extras`
+    // -- every synthetic stand-in backend used elsewhere in this
+    // workspace's test suite never emits `session/update` notifications,
+    // so `_acpx.updates` must never appear out of nowhere. `_acpx` itself
+    // is no longer guaranteed absent, though: since acpx now performs a
+    // real ACP `initialize` handshake and captures whatever `result` the
+    // backend answers with as `_acpx.agentCapabilities` (see
+    // `ensure_backend_initialized`'s doc comment -- this closes a real
+    // ACP-compatibility gap, not a test artifact), and this stand-in's
+    // generic `{"ok": true}` reply to `initialize` becomes that captured
+    // value, `_acpx.agentCapabilities` is expected to be present here.
     let mut router = Router::new("streaming-agent");
     router.register_agent("streaming-agent", stand_in_streaming_backend_spec());
 
@@ -101,5 +108,79 @@ async fn session_new_response_has_no_acpx_updates_field_when_backend_emits_none(
         }))
         .await
         .expect("session/new");
-    assert!(new_response.get("_acpx").is_none());
+    assert!(new_response["_acpx"].get("updates").is_none());
+    assert_eq!(
+        new_response["_acpx"]["agentCapabilities"],
+        json!({"ok": true})
+    );
+}
+
+/// Answers `initialize` with a realistic-shaped `agentCapabilities`
+/// object (distinguishable from every other stand-in script's generic
+/// `{"ok": true}` reply), and everything else like the plain stand-in
+/// backend above.
+const STAND_IN_CAPABILITIES_BACKEND_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":true}},"authMethods":[]}}\n' "$id"
+  elif echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+
+fn stand_in_capabilities_backend_spec() -> acpx_conductor::SpawnSpec {
+    acpx_conductor::SpawnSpec::new(
+        "sh",
+        vec![
+            "-c".to_string(),
+            STAND_IN_CAPABILITIES_BACKEND_SCRIPT.to_string(),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn session_new_surfaces_the_backends_real_initialize_capabilities() {
+    // Closes the "initialize response discarded" ACP-compatibility gap:
+    // acpx used to perform the handshake purely to unblock `session/new`,
+    // throwing away everything the backend actually said it supports.
+    let mut router = Router::new("capable-agent");
+    router.register_agent("capable-agent", stand_in_capabilities_backend_spec());
+
+    let first = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        }))
+        .await
+        .expect("session/new");
+    assert_eq!(
+        first["_acpx"]["agentCapabilities"],
+        json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {"loadSession": true, "promptCapabilities": {"image": true}},
+            "authMethods": [],
+        })
+    );
+
+    // A second `session/new` against the same still-running backend
+    // process must keep surfacing the same captured capabilities -- the
+    // real `initialize` handshake only ever happens once per process
+    // (`BackendProcess::handshake_done`), so this proves the captured
+    // value survives past the one call that triggered it, not just a
+    // one-shot side effect of the handshake itself.
+    let second = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        }))
+        .await
+        .expect("second session/new");
+    assert_eq!(
+        second["_acpx"]["agentCapabilities"],
+        first["_acpx"]["agentCapabilities"]
+    );
 }

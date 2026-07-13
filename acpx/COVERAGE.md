@@ -492,3 +492,83 @@ in a shared/default `cargo test` invocation. Actually run and passed:
 Combined workspace test count after this addition: **144 passed, 0
 failed, 3 ignored** (adds this new opt-in test to the prior 2), `cargo
 fmt --all --check` and `cargo build --workspace` both clean.
+
+## ACP compatibility hardening, phase 1 -- real `agentCapabilities` surfaced from the `initialize` handshake
+
+Prompted by a direct user question ("what are the gaps in the ACP
+compatibility?") and a follow-up instruction to fix them phase-by-phase,
+treating spec compatibility as the priority. A review of the real ACP
+spec surface (not just this workspace's own test coverage) turned up
+several gaps distinct from the ops/hardening gaps already tracked below.
+This phase closes the first and most foundational one: acpx performed
+the real `initialize` handshake against every backend (see the
+"Post-self-test -- real ACP adapter end-to-end" section above) but threw
+away the response entirely once it had unblocked `session/new` --
+`ensure_backend_initialized` read up to the matching response `id` and
+discarded the value. That means acpx never knew, and never told a
+client, what a given backend actually supports: `agentCapabilities`
+(`loadSession`, `promptCapabilities`, `mcpCapabilities`), `authMethods`,
+or the negotiated `protocolVersion`. Every later compatibility fix
+(fs/terminal delegation, `authenticate`, permission requests) needs this
+first, since whether to even attempt those depends on what the specific
+backend claims to support.
+
+Fixed: `BackendProcess` (`acpx-conductor/src/process.rs`) gained an
+`agent_capabilities: Option<serde_json::Value>` field, reset to `None`
+alongside `handshake_done` on every fresh spawn (so a crash+respawn
+re-captures a fresh value, never serves a stale one). `Router`'s
+`ensure_backend_initialized` now stores the real `initialize` response's
+`result` object into it instead of discarding it. `session/new`'s two
+dispatch paths (`Router::dispatch_session_new` and its
+lock-released twin `dispatch_session_new_shared`) now attach it as
+`_acpx.agentCapabilities` in the response via a new
+`attach_session_new_extras` helper (a `session/new`-specific sibling of
+`attach_updates`, so `session/prompt`/etc. don't carry a backend's
+one-time `initialize` capabilities on every single call) -- additive and
+namespaced, so a raw ACP client that doesn't know about it is unaffected,
+matching this gateway's existing `_acpx.updates` convention.
+
+New test: `acpx-core/tests/session_update_forwarding_test.rs`'s
+`session_new_surfaces_the_backends_real_initialize_capabilities`, using
+a stand-in backend that answers `initialize` with a realistic
+`agentCapabilities`/`authMethods`/`protocolVersion` shape (distinguishable
+from every other stand-in's generic `{"ok": true}`), asserting
+`session/new`'s response carries it verbatim, and that a second
+`session/new` against the same still-running process keeps surfacing the
+same captured value (proving it survives past the one-shot handshake,
+not just a side effect of it). The pre-existing
+`session_new_response_has_no_acpx_updates_field_when_backend_emits_none`
+test's assertion was updated to match: `_acpx` is no longer guaranteed
+absent (its own stand-in's generic `initialize` reply now becomes a
+captured, if meaningless, `agentCapabilities` value), only `_acpx.updates`
+still is when the backend emits no `session/update` notifications.
+
+Workspace test count after this addition: **144 passed, 0 failed, 3
+ignored**, `cargo fmt --all --check` and `cargo build --workspace` both
+clean.
+
+**Recheck against the full ACP spec surface after this phase** -- gaps
+still open, in priority order for subsequent phases:
+1. Bidirectional `session/request_permission` (and any other
+   agent-initiated request expecting a reply) still has no reply
+   channel -- biggest remaining architectural gap.
+2. `fs/read_text_file`/`fs/write_text_file` still unimplemented;
+   client capabilities still unconditionally declare both `false`.
+3. `terminal/*` (`create`/`output`/`wait_for_exit`/`kill`/`release`)
+   still entirely unimplemented; no `terminal` capability declared.
+4. `authenticate` method still entirely unimplemented on the
+   backend-facing side (no code path exists for a backend that requires
+   it before `session/new`).
+5. Client-facing side (acpx-server as the endpoint external clients
+   talk to) still has no `initialize`/`authenticate` handshake of its
+   own, and doesn't yet expose the newly-captured `agentCapabilities` as
+   a first-class `profiles/*` field (only inline on each `session/new`
+   response) -- clients still can't ask "what does this profile support"
+   without first opening a session.
+
+These map directly to remaining phases 2-6 of this compatibility
+hardening effort. `protocolVersion` sent in the handshake also stays
+hardcoded to `1` with no negotiation against what a backend reports back
+in its own `initialize` response -- noted here, not yet fixed, low
+priority relative to the above since no adapter tested so far has
+rejected it.

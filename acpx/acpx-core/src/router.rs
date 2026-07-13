@@ -398,7 +398,7 @@ impl Router {
             ensure_backend_initialized(&mut backend).await?;
             backend.writer.write_value(&request).await?;
             let (response, notifications) = read_matching_response(&mut backend, &id).await?;
-            attach_updates(response, notifications)
+            attach_session_new_extras(response, notifications, backend.agent_capabilities.clone())
         };
 
         let backend_session_id = extract_backend_session_id(&response)?;
@@ -851,6 +851,20 @@ async fn ensure_backend_initialized(
     loop {
         let value = proc.reader.read_value().await?;
         if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
+            // Capture the backend's real `initialize` result -- its
+            // actual `agentCapabilities`/`authMethods`/negotiated
+            // `protocolVersion` -- instead of discarding it. Surfaced to
+            // gateway clients via `session/new`'s `_acpx.agentCapabilities`
+            // (see `attach_session_new_extras`) so a client can find out
+            // what a given backend genuinely supports rather than acpx
+            // silently assuming. **Real gap this closes** (found during
+            // an ACP-compatibility self-review, not from a test failure):
+            // every dispatch path before this fix threw the `initialize`
+            // response away entirely once the id matched, so acpx never
+            // knew -- and never told a client -- whether a backend
+            // supports e.g. `loadSession`, image content, or any auth
+            // method at all.
+            proc.agent_capabilities = value.get("result").cloned();
             break;
         }
         // A well-behaved adapter shouldn't emit anything unprompted
@@ -918,6 +932,40 @@ fn attach_updates(
             "_acpx".to_string(),
             serde_json::json!({ "updates": notifications }),
         );
+    }
+    response
+}
+
+/// `session/new`-specific twin of [`attach_updates`]: same additive,
+/// namespaced `_acpx` merge, plus the backend's real `agentCapabilities`
+/// (as captured by `ensure_backend_initialized`, see that function's doc
+/// comment for why this exists) under `_acpx.agentCapabilities`. Kept as
+/// a separate function rather than adding a third parameter to
+/// `attach_updates` -- every other proxied method (`session/prompt` etc.)
+/// has no use for a backend's `initialize`-time capabilities on every
+/// single call, only the one call that starts the session at all.
+/// No-op on both fronts (response left byte-for-byte untouched) when
+/// there are no notifications and no captured capabilities, so every
+/// pre-existing synthetic-backend test -- whose stand-in scripts don't
+/// answer `initialize` with anything resembling a real `agentCapabilities`
+/// object -- keeps producing identical response shapes.
+fn attach_session_new_extras(
+    mut response: serde_json::Value,
+    notifications: Vec<serde_json::Value>,
+    agent_capabilities: Option<serde_json::Value>,
+) -> serde_json::Value {
+    if notifications.is_empty() && agent_capabilities.is_none() {
+        return response;
+    }
+    if let Some(obj) = response.as_object_mut() {
+        let mut extras = serde_json::Map::new();
+        if !notifications.is_empty() {
+            extras.insert("updates".to_string(), serde_json::json!(notifications));
+        }
+        if let Some(capabilities) = agent_capabilities {
+            extras.insert("agentCapabilities".to_string(), capabilities);
+        }
+        obj.insert("_acpx".to_string(), serde_json::Value::Object(extras));
     }
     response
 }
@@ -1204,7 +1252,7 @@ async fn dispatch_session_new_shared(
         ensure_backend_initialized(&mut proc).await?;
         proc.writer.write_value(&request).await?;
         let (response, notifications) = read_matching_response(&mut proc, &id).await?;
-        attach_updates(response, notifications)
+        attach_session_new_extras(response, notifications, proc.agent_capabilities.clone())
     };
 
     let backend_session_id = extract_backend_session_id(&response)?;

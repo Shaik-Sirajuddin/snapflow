@@ -54,6 +54,16 @@ pub struct BackendProcess {
     /// `BackendProcess` instance's lifetime, so a crash + respawn (a
     /// brand new instance) naturally starts back at `false`.
     pub handshake_done: bool,
+    /// The real ACP `initialize` response's `result` object, captured the
+    /// first time [`Self::handshake_done`] flips to `true` -- i.e. the
+    /// backend's actual `agentCapabilities`/`authMethods`/negotiated
+    /// `protocolVersion`, not acpx's assumptions about them. `None` until
+    /// the handshake has actually run once. Reset to `None` on every
+    /// fresh spawn alongside `handshake_done`, for the same crash+respawn
+    /// reason. Protocol-agnostic storage only (an opaque JSON blob) --
+    /// same rationale as `handshake_done` itself: this crate doesn't know
+    /// or care what "agentCapabilities" means, `acpx-core::router` does.
+    pub agent_capabilities: Option<serde_json::Value>,
 }
 
 impl BackendProcess {
@@ -79,6 +89,7 @@ impl BackendProcess {
             reader: FramedReader::new(stdout),
             writer: FramedWriter::new(stdin),
             handshake_done: false,
+            agent_capabilities: None,
         })
     }
 
