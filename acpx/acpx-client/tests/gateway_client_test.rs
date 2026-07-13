@@ -8,6 +8,8 @@
 
 #[path = "../../acpx-server/src/transport/http.rs"]
 mod http;
+#[path = "../../acpx-server/src/transport/live.rs"]
+mod live;
 #[path = "../../acpx-server/src/transport/ws.rs"]
 mod ws;
 

@@ -28,6 +28,8 @@ use tokio::sync::Mutex;
 
 #[path = "../src/transport/http.rs"]
 mod http;
+#[path = "../src/transport/live.rs"]
+mod live;
 #[path = "../src/transport/ws.rs"]
 mod ws;
 

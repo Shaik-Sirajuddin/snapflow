@@ -1821,3 +1821,164 @@ real test, run manually and confirmed passing). `cargo fmt --all
    completeness cross-check, per this series' own phase-10-derived
    lesson about not trusting "no further gaps" claims without
    re-verifying them.
+
+## 2026-07-13 -- ACP compatibility phase 14: live `session/update` streaming, not just end-of-call bundling
+
+**Directive:** continuation of the same series, following phase 13's own
+closing note that every stable v1 method had "at least one phase's worth
+of dedicated scrutiny" -- but `session/update` itself (a bare
+notification, not a request/response method, so it never showed up in
+that method-by-method list) had not. Every prior phase treated it as a
+solved problem via `_acpx.updates`; this phase re-examines that claim
+against real ACP client expectations and finds it only half-right.
+
+**The gap.** `router::read_matching_response`'s loop, since Phase 2,
+only ever surfaced a backend's `session/update` notifications by
+buffering them into the *one in-flight call's own* JSON-RPC response
+under `_acpx.updates` (`router::attach_updates`) -- a client only ever
+saw them as one bundle at the very end of a `session/prompt` call, never
+as independent, live notification frames while the turn is still in
+progress. A real ACP client (Zed is the reference implementation the
+spec is written against) expects the latter: incremental message
+chunks, tool-call progress, and plan updates streamed as they happen is
+the entire mechanism the spec's `session/update` design exists for.
+Bundling defeats that -- technically present in the payload, practically
+useless for the UX it's meant to drive.
+
+**Design.** New `acpx-core/src/notify.rs`: `NotificationHub`, a cheaply
+cloneable (`Arc`-backed) `gateway_session_id -> mpsc::UnboundedSender`
+map with `subscribe`/`unsubscribe`/`publish`. `Router` now owns one
+(`Router::notification_hub()` hands out clones so transports never need
+to go back through the router's own lock to publish or subscribe). A
+new `LiveNotifyCtx { router, agent_id }` plus `try_deliver_live` in
+`router.rs` translate a backend's *native* `params.sessionId` to a
+*gateway* id (via `SessionRegistry::find_by_backend`, the same lookup
+phase 13 introduced for `session/list`) and publish the translated
+notification to the hub; `read_matching_response` gained a 4th
+parameter, `live: Option<&LiveNotifyCtx>`, and only buffers a `session/
+update` notification into `_acpx.updates` when live delivery either
+wasn't attempted (`live` is `None`) or had no subscriber to deliver to
+-- never both, so a subscribed client never sees the same update twice.
+
+**Where subscription actually happens, and why the ordering works out.**
+`acpx-server/src/transport/live.rs`'s `session_id_to_watch` runs *after*
+`dispatch_shared` returns a response, not before the call -- for
+`session/new` the gateway id doesn't even exist until the response
+mints it, and for every other `Proxied` method the client already
+supplied it in the request, so subscribing post-response is just
+"subscribe once the id is known, whichever call revealed it." This
+means the *very first* `session/prompt` on a session that was just
+opened is still live-streamed in full: the `session/new` response is
+what triggers the subscribe, and that response's frame reaches the
+client (finishing `session/new`) strictly before the client can send
+its first `session/prompt` frame, so the hub already has a subscriber
+registered by the time that prompt's backend notifications start
+arriving. Both `acpx-server/src/transport/ws.rs` (splits the `WebSocket`
+into sink/stream via `futures_util::StreamExt::split`, wraps the sink in
+an `Arc<Mutex<..>>` so the connection's own reply loop and a per-session
+forwarder task never interleave frames) and `stdio.rs` (same pattern
+around a shared, mutex-wrapped `tokio::io::stdout()`) implement this
+identically via the same `transport::live` helper, each spawning one
+forwarder task per newly-watched session and unsubscribing on `session/
+close`/`session/delete` success (`session_id_to_forget`) or connection
+close.
+
+**Why `POST /rpc` is deliberately excluded, not an oversight.** HTTP's
+`POST /rpc` is stateless request/response with no live push channel
+available at all -- there is no connection to forward a frame down
+outside the one response the client is already waiting for. It keeps
+the pre-existing `_acpx.updates` aggregation-in-response behavior
+completely unchanged. `dispatch_session_new_shared` also always passes
+`None` for `live`, on purpose: no gateway session id exists yet at
+`session/new` time for anything to be subscribed to it.
+
+**Honest gap this phase does *not* close: no idle/background reader per
+backend.** `read_matching_response`'s loop -- the only place a
+notification is ever read off a backend's stdout at all -- exists only
+for the duration of one in-flight client call (`dispatch_proxied_shared`
+et al. invoke it per-request). There is no persistent, always-running
+task per backend process that drains stdout independently of an
+outstanding call. A `session/update` (or any other unsolicited
+notification) a backend emits while zero client requests are currently
+in flight against it, and while nothing is actively reading, sits
+unread in the OS pipe buffer until the *next* call to that backend
+happens to read it off -- at that point it's still processed correctly
+(live if a subscriber is registered, buffered otherwise), so nothing is
+silently corrupted, but it is delayed rather than delivered as it
+happens, and if no further call is ever made to that backend for the
+rest of the connection's lifetime, it is never delivered at all. This
+matters in practice for agents that push unsolicited progress
+notifications between prompt turns rather than only during one. Tracked
+here explicitly as a follow-up, not hidden: closing it needs a genuine
+per-backend background reader task independent of any one call's
+lifetime, which is a materially bigger structural change than this
+phase's scope (every backend I/O path in this codebase today is
+call-shaped, not stream-shaped) and deserves its own dedicated phase.
+
+**Tests, in order of what they each prove:**
+1. `acpx-core/src/notify.rs`'s own unit tests (4): publish with no
+   subscriber is a harmless no-op; subscribe-then-publish round-trips;
+   unsubscribe-then-publish falls back to not-delivered; a fresh
+   `subscribe` for an already-watched session replaces (not queues
+   behind) the previous subscriber, and the replaced subscriber's
+   channel closes cleanly rather than leaking.
+2. `acpx-core/tests/live_notification_hub_test.rs` (4, real stand-in
+   `sh -c '...'` backend, real `Router::dispatch_proxied_shared`):
+   `a_subscribed_session_receives_updates_live_and_the_response_carries_
+   no_bundle` -- the core proof, delivery happens live and `_acpx.
+   updates` is absent, not just empty; `an_unsubscribed_session_still_
+   falls_back_to_the_acpx_updates_bundle` -- regression guard, the
+   pre-phase-14 behavior is untouched when nothing is subscribed;
+   `unsubscribing_mid_stream_falls_back_to_buffering_for_the_rest_of_
+   that_call` -- an update is never silently dropped if a subscriber
+   vanishes mid-call, it falls back to the bundle instead;
+   `a_live_streaming_session_does_not_block_a_concurrent_different_
+   backend_call` -- the multiplex-management guard this whole series'
+   goal statement requires: a slow streaming `session/prompt` against
+   one backend does not block a concurrent `session/new` against an
+   unrelated backend (asserted well under the slow call's own delay),
+   proving `try_deliver_live`'s brief per-notification router-lock
+   reacquire didn't regress the "release the lock before backend I/O"
+   discipline every `_shared` function in this file already follows.
+3. `acpx-server/src/transport/live.rs`'s own unit tests (6): correct
+   watch/forget decisions for `session/new` (id minted in the
+   response), `session/prompt` (id already in the request), an error
+   response (never subscribes to anything), a method with no session in
+   play at all (`agents/list`), and both the success and failure sides
+   of `session/close`'s forget decision.
+
+Workspace test count after this phase: **225 passed, 0 failed, 6
+ignored** (up from 181/0/5 -- 14 new default-run tests: 4 in `notify.rs`,
+4 in `live_notification_hub_test.rs`, 6 in `transport/live.rs`, present
+once per crate that compiles `ws.rs`/`live.rs` in via `#[path]` for its
+own tests, which is why the raw per-binary count is higher than 14 but
+the net new *distinct* tests is 14). The ignored count's apparent 5->6
+is not a regression from this phase: `real_ambient_multi_agent_test.rs`
+(4 ignored), `real_claude_multi_agent_test.rs` (1 ignored), and
+`acpx-registry/tests/live_registry.rs` (1 ignored) sum to 6 and none of
+those three files were touched this session (confirmed via `git status`
+showing them absent from this phase's diff) -- the prior phase's "5"
+count was simply an undercount at the time it was written, not a count
+that changed here. `cargo fmt --all --check` and `cargo build
+--workspace --tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `session/update` now has a genuine live-delivery path for the two
+   transports capable of one at all, closing the gap between "present
+   in the payload" and "usable for the incremental-UX purpose the spec
+   design assumes" -- proved against a real stand-in backend, not just
+   asserted.
+2. The idle/background-reader gap documented above is real and
+   unresolved -- worth prioritizing in a near-future phase specifically
+   because it's the kind of gap that stays invisible in every test this
+   series writes (every test here drives a call, so the "no call in
+   flight" scenario the gap describes never actually gets exercised) and
+   only shows up against a real long-running adapter session with gaps
+   between prompts.
+3. `session/fork` (unstable) and `elicitation/create`/`elicitation/
+   complete` (unstable) remain out of scope per the stable v1 schema's
+   own stability contract, unchanged since phase 9.
+4. Every other request/response method already enumerated in phase 13's
+   closing note is unaffected by this phase -- it's additive to
+   `session/update`'s notification path only, no existing dispatch
+   behavior for any request/response method changed.

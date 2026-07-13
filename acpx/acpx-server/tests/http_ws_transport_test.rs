@@ -31,6 +31,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 // `pub mod http; pub mod ws;` shape.
 #[path = "../src/transport/http.rs"]
 mod http;
+#[path = "../src/transport/live.rs"]
+mod live;
 #[path = "../src/transport/ws.rs"]
 mod ws;
 

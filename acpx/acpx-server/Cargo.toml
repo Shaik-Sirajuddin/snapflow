@@ -36,6 +36,13 @@ reqwest = { workspace = true }
 # endpoint and a WS upgrade endpoint on the same router/listener with
 # minimal glue code. `ws` feature enables `axum::extract::ws`.
 axum = { version = "0.7", features = ["ws"] }
+# **Phase 14 addition.** WS transport now needs to split a `WebSocket`
+# into independent sink/stream halves (`SinkExt::split`) so a live
+# `session/update` forwarder task can write frames concurrently with the
+# connection's own request/response loop -- promoted from dev-only (it
+# was already a test-only WS-client dependency below) since this is now
+# real, non-test code.
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -51,4 +58,3 @@ acpx-client = { path = "../acpx-client" }
 # enough since tests only ever connect to our own plaintext ws://
 # loopback listener, no TLS involved.
 tokio-tungstenite = "0.24"
-futures-util = "0.3"

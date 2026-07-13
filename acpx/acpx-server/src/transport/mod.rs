@@ -2,6 +2,7 @@
 //! `http`/`ws` alongside it -- see `04-phased-plan.md`.
 
 pub mod http;
+pub mod live;
 pub mod stdio;
 pub mod ws;
 

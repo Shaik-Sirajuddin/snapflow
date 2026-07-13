@@ -6,6 +6,7 @@
 
 use crate::keystore::Keystore;
 use crate::mcp_servers::McpServerStore;
+use crate::notify::NotificationHub;
 use crate::persistence::{Direction, PersistenceStore};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
@@ -211,6 +212,14 @@ pub struct Router {
     /// client entries always win on collision, see
     /// `crate::mcp_servers::merge_mcp_servers`.
     mcp_servers: McpServerStore,
+    /// **Phase 14 addition.** Live `session/update` fan-out to whichever
+    /// persistent transport connection (stdio/WS) currently owns a given
+    /// gateway session -- see `crate::notify`'s module doc comment for
+    /// the full rationale. Cheaply cloneable (an `Arc` internally), so
+    /// [`Self::notification_hub`] hands a clone straight to a transport
+    /// without that transport ever needing to come back through this
+    /// `Router`'s own lock to subscribe/publish.
+    notification_hub: NotificationHub,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -297,7 +306,16 @@ impl Router {
             keystore: Keystore::new(),
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
+            notification_hub: NotificationHub::new(),
         }
+    }
+
+    /// A clone of this router's live `session/update` notification hub
+    /// (Phase 14) -- `acpx-server`'s stdio/WS transports call this once
+    /// per connection to subscribe to whichever gateway sessions that
+    /// connection touches. See `crate::notify`'s module doc comment.
+    pub fn notification_hub(&self) -> NotificationHub {
+        self.notification_hub.clone()
     }
 
     /// Attach a [`PersistenceStore`] -- session metadata and transcripts
@@ -515,7 +533,7 @@ impl Router {
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             backend.writer.lock().await.write_value(&request).await?;
             let (response, notifications, agent_requests) =
-                read_matching_response(&mut backend, &id, call_policy).await?;
+                read_matching_response(&mut backend, &id, call_policy, None).await?;
             attach_session_new_extras(
                 response,
                 notifications,
@@ -604,7 +622,7 @@ impl Router {
             ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
             proc.writer.lock().await.write_value(&outbound).await?;
             let (response, _notifications, _agent_requests) =
-                read_matching_response(&mut proc, &id, call_policy).await?;
+                read_matching_response(&mut proc, &id, call_policy, None).await?;
             response
         };
 
@@ -919,7 +937,7 @@ impl Router {
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             backend.writer.lock().await.write_value(&request).await?;
             let (response, notifications, agent_requests) =
-                read_matching_response(&mut backend, &id, call_policy).await?;
+                read_matching_response(&mut backend, &id, call_policy, None).await?;
             attach_updates(response, notifications, agent_requests)
         };
         self.spawn_transcript(
@@ -1913,10 +1931,73 @@ async fn handle_terminal_request(
     }
 }
 
+/// **Phase 14 addition.** Context needed to route a `session/update`
+/// notification live to a subscribed transport connection instead of
+/// buffering it for `_acpx.updates` -- see `crate::notify`'s module doc
+/// comment for the full rationale. Only constructed by the `_shared`
+/// dispatch family (`dispatch_session_new_shared`/`dispatch_proxied_
+/// shared`), the production path every `acpx-server` transport actually
+/// uses. The plain `&mut self` dispatch path (`Router::dispatch_session_
+/// new`/`Router::dispatch_proxied`, used by most of this crate's own
+/// in-process tests, see e.g. `session_update_forwarding_test.rs`) has no
+/// `SharedRouterHandle` available at its call sites and keeps the
+/// pre-phase-14 buffer-only behavior unchanged by passing `None` -- this
+/// is a deliberate scope decision (those tests assert on `_acpx.updates`
+/// directly), not an oversight.
+struct LiveNotifyCtx {
+    router: SharedRouterHandle,
+    agent_id: String,
+}
+
+/// Attempt to deliver a real `session/update` notification (`value`,
+/// straight off a backend's stdout, still carrying its *backend-native*
+/// `params.sessionId`) live to whichever gateway session it belongs to,
+/// via `ctx`'s `NotificationHub`. Returns `true` if it was actually
+/// delivered (a live subscriber was registered for the translated gateway
+/// session id and the send succeeded) -- the caller must not also buffer
+/// `value` into the `_acpx.updates` fallback in that case, or the same
+/// client would see it twice.
+///
+/// Briefly re-locks `ctx.router` just to look up the backend-id ->
+/// gateway-id translation (`SessionRegistry::find_by_backend`) and clone
+/// the (cheaply cloneable) `NotificationHub` out -- consistent with every
+/// other `_shared` dispatch function's "lock briefly for a lookup, release
+/// before any actual I/O" convention in this file. The lock is held only
+/// for a synchronous `HashMap` lookup, never across the backend I/O this
+/// function itself doesn't perform.
+async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> bool {
+    let Some(backend_session_id) = value
+        .get("params")
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|s| s.as_str())
+    else {
+        return false;
+    };
+    let (gateway_id, hub) = {
+        let r = ctx.router.lock().await;
+        let gateway_id = r
+            .sessions
+            .find_by_backend(&ctx.agent_id, backend_session_id);
+        (gateway_id, r.notification_hub.clone())
+    };
+    let Some(gateway_id) = gateway_id else {
+        return false;
+    };
+    let mut translated = value.clone();
+    if let Some(session_id_field) = translated
+        .get_mut("params")
+        .and_then(|p| p.get_mut("sessionId"))
+    {
+        *session_id_field = serde_json::Value::String(gateway_id.0.clone());
+    }
+    hub.publish(&gateway_id.0, translated).await
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
     policy: BackendCallPolicy,
+    live: Option<&LiveNotifyCtx>,
 ) -> Result<
     (
         serde_json::Value,
@@ -2011,6 +2092,24 @@ async fn read_matching_response(
             backend.writer.lock().await.write_value(&reply).await?;
             agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
             continue;
+        }
+        // **Phase 14.** A real notification (`method`, no `id`) -- try
+        // live delivery first when a subscribed transport connection is
+        // known (`live.is_some()`) and this is the one notification type
+        // that's actually session-scoped and worth streaming live,
+        // `session/update`. Anything not delivered live (no `live` ctx at
+        // all, e.g. the plain `&mut self` dispatch path; no live
+        // subscriber currently registered for this session, e.g. an
+        // HTTP-only client; or a notification method other than
+        // `session/update`) falls through to the pre-existing buffering
+        // behavior unchanged, so `_acpx.updates` keeps working exactly as
+        // before for every case this phase doesn't newly handle.
+        if let Some(ctx) = live {
+            if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
+                && try_deliver_live(ctx, &value).await
+            {
+                continue;
+            }
         }
         notifications.push(value);
     }
@@ -2380,7 +2479,7 @@ async fn dispatch_session_list_real_shared(
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&outbound).await?;
         let (response, _notifications, _agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy).await?;
+            read_matching_response(&mut proc, &id, call_policy, None).await?;
         response
     };
 
@@ -2450,7 +2549,7 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence, call_policy) = {
+    let (backend, persistence, call_policy, agent_id) = {
         let mut r = router.lock().await;
         let entry = match r.sessions.resolve(&acpx_proto::session::GatewaySessionId(
             gateway_session_id.clone(),
@@ -2470,7 +2569,7 @@ async fn dispatch_proxied_shared(
                 .as_deref()
                 .and_then(|name| r.profiles.get(name)),
         );
-        (backend, r.persistence.clone(), call_policy)
+        (backend, r.persistence.clone(), call_policy, agent_id)
     };
 
     spawn_transcript_fn(
@@ -2484,8 +2583,12 @@ async fn dispatch_proxied_shared(
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&request).await?;
+        let live = LiveNotifyCtx {
+            router: std::sync::Arc::clone(router),
+            agent_id,
+        };
         let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy).await?;
+            read_matching_response(&mut proc, &id, call_policy, Some(&live)).await?;
         attach_updates(response, notifications, agent_requests)
     };
 
@@ -2584,8 +2687,21 @@ async fn dispatch_session_new_shared(
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&request).await?;
+        // No `LiveNotifyCtx` here, deliberately: this exact call is what
+        // *creates* the gateway session (`self.sessions.register` below,
+        // after this block returns) -- until that registration happens, no
+        // gateway session id exists yet for `try_deliver_live`'s
+        // `find_by_backend` lookup to ever find, and no transport
+        // connection could possibly have subscribed to it yet either (a
+        // connection only learns the gateway session id from *this*
+        // call's own response). Passing a live ctx here would be dead
+        // code that always falls back to buffering -- `session/prompt`/
+        // `session/resume`/`session/load` (`dispatch_proxied_shared`,
+        // which *does* pass one) are where live delivery actually
+        // matters, since those always target an already-registered
+        // session.
         let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy).await?;
+            read_matching_response(&mut proc, &id, call_policy, None).await?;
         attach_session_new_extras(
             response,
             notifications,
