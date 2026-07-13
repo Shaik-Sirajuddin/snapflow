@@ -1,5 +1,8 @@
 // Package procmgr implements the daemon's process manager: launching,
-// listing, health-checking, and closing per-project child (sap-rust)
+// listing, health-checking, and closing per-project child (real Qt/
+// real_ffi `shotcut` binary in production; a MockBackend-only `sap-rust`
+// standalone binary as a weaker fallback -- see
+// config.discoverSnapshotBinPath)
 // processes, per 06-daemon-mcp-proxy.md's ProcessManager primitives and
 // 08-lifecycle-and-cli.md's launch sequence.
 //
@@ -27,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +63,16 @@ type LaunchOptions struct {
 	// AudioEnabled is forwarded to sap-rust so server-side dispatch matches
 	// the MCP adapter's discoverability policy.
 	AudioEnabled bool
+
+	// MltFileName is the bound project's MLT filename (usually
+	// "project.mlt", registry.DefaultMltFileName, but honors a legacy
+	// project.open's existing filename), forwarded as
+	// SNAPSHOT_PROJECT_MLT_FILENAME so FfiBackend::new can bind
+	// MainWindow's current file to the exact real path project.save must
+	// persist to. Empty means "let the child default to project.mlt"
+	// (kept optional so callers that only care about ProjectRoot, e.g.
+	// older tests, don't need updating).
+	MltFileName string
 }
 
 // Manager launches and tracks per-project child processes.
@@ -70,6 +84,12 @@ type Manager struct {
 
 	// RunDir holds per-instance SAP socket files.
 	RunDir string
+
+	// LogDir holds per-instance stdout/stderr capture files (one
+	// "<instanceID>.log" per launched child), config.Config.LogDir. Empty
+	// means "discard" (kept for callers/tests that don't care about logs),
+	// matching the old nil-Stdout/Stderr behavior.
+	LogDir string
 
 	// ConnectTimeout bounds the poll-connect health check performed right
 	// after spawning (the v1 simplification described in the package doc).
@@ -87,11 +107,12 @@ type Manager struct {
 }
 
 // New constructs a Manager with sane defaults for unset fields.
-func New(reg *registry.Registry, binPath, runDir string) *Manager {
+func New(reg *registry.Registry, binPath, runDir, logDir string) *Manager {
 	return &Manager{
 		Reg:            reg,
 		BinPath:        binPath,
 		RunDir:         runDir,
+		LogDir:         logDir,
 		ConnectTimeout: 5 * time.Second,
 		PollInterval:   25 * time.Millisecond,
 		cmds:           make(map[string]*exec.Cmd),
@@ -104,6 +125,25 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// filterEnvKeys returns a copy of env (an os.Environ()-style "KEY=VALUE"
+// slice) with any entries matching the given keys removed.
+func filterEnvKeys(env []string, keys ...string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		skip := false
+		for _, k := range keys {
+			if strings.HasPrefix(kv, k+"=") {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // randomShortID returns a short (16 hex char) random identifier, used for
@@ -153,6 +193,27 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		return registry.ProcessInstance{}, fmt.Errorf("procmgr: socket path %q exceeds Unix domain socket path length limits; configure a shorter RunDir", sockPath)
 	}
 
+	// The real Qt binary reads $HOME to locate its QSettings config
+	// (~/.config/Meltytech/Shotcut.conf), qmlcache, and -- critically for
+	// this daemon's own operator -- the FilesDock's default browse root
+	// (ShotcutSettings::filesCurrentDir(), which defaults to
+	// QStandardPaths::HomeLocation and is remembered across runs). Handing
+	// a headless launch the daemon operator's *real* $HOME lets a
+	// long-lived, large real home directory (e.g. a dev checkout with
+	// thousands of files under it) make the FilesDock's background
+	// QFileSystemModel/QFileInfoGather scan take tens of seconds to
+	// minutes on first paint -- easily blowing past ConnectTimeout even
+	// though the SAP socket itself would otherwise be ready in ~1-2s. It
+	// also means concurrently launched instances would share and corrupt
+	// each other's Shotcut.conf/autosave/log state. Giving each *project*
+	// (not each launch -- reused across relaunches so Qt's qmlcache/font
+	// caches stay warm) its own isolated HOME under RunDir avoids both
+	// problems.
+	qtHomeDir := filepath.Join(m.RunDir, "homes", projectID)
+	if err := os.MkdirAll(qtHomeDir, 0o755); err != nil {
+		return registry.ProcessInstance{}, fmt.Errorf("procmgr: mkdir qt home dir: %w", err)
+	}
+
 	// Deliberately exec.Command, not exec.CommandContext(ctx, ...): ctx here
 	// is the inbound RPC request's context, which is cancelled the moment
 	// daemon.launch's response is sent. CommandContext kills the process
@@ -170,15 +231,43 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	if opts.AudioEnabled {
 		audioEnabledVal = "1"
 	}
-	cmd.Env = append(os.Environ(),
+	// Filter any pre-existing HOME from the inherited environment before
+	// appending our own: glibc's getenv returns the *first* match in
+	// envp, so simply appending a second "HOME=..." after os.Environ()'s
+	// original one would silently lose to it.
+	cmd.Env = append(filterEnvKeys(os.Environ(), "HOME"),
+		"HOME="+qtHomeDir,
 		"SNAPSHOT_SAP_SOCKET="+sockPath,
 		"SNAPSHOT_SAP_TOKEN="+token,
 		"SNAPSHOT_HEADLESS="+headlessVal,
 		"SNAPSHOT_PROJECT_ROOT="+opts.ProjectRoot,
+		"SNAPSHOT_PROJECT_MLT_FILENAME="+opts.MltFileName,
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	var logFile *os.File
+	if m.LogDir != "" {
+		if err := os.MkdirAll(m.LogDir, 0o755); err != nil {
+			return registry.ProcessInstance{}, fmt.Errorf("procmgr: mkdir log dir: %w", err)
+		}
+		logPath := filepath.Join(m.LogDir, instanceID+".log")
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return registry.ProcessInstance{}, fmt.Errorf("procmgr: open log file %s: %w", logPath, err)
+		}
+		logFile = f
+		// Both streams into one file: the real child's own diagnostics
+		// (e.g. shotcut/src/rustbridge/sap_ffi.cpp's "[sap_ffi] event: ..."
+		// lines proving a real edit reached the real C++ path, plus
+		// Qt/MLT/ffmpeg startup noise) all go to stderr; stdout carries
+		// only "sap-rust: ..." startup lines. Interleaving both in one
+		// file, in real chronological order, is more useful for debugging
+		// than two separate files.
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+	} else {
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+	}
 
 	if err := cmd.Start(); err != nil {
 		return registry.ProcessInstance{}, fmt.Errorf("procmgr: start child: %w", err)
@@ -187,6 +276,9 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	if !m.waitForSocket(ctx, sockPath) {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return registry.ProcessInstance{}, fmt.Errorf("procmgr: child did not open %s within %s", sockPath, m.ConnectTimeout)
 	}
 
@@ -202,6 +294,9 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	if err := m.Reg.CreateProcessInstance(&pi); err != nil {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return registry.ProcessInstance{}, fmt.Errorf("procmgr: persist instance: %w", err)
 	}
 	_ = m.Reg.Audit(projectID, registry.AuditLaunch, "launched pid="+fmt.Sprint(pi.PID))
@@ -214,6 +309,9 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// itself doesn't block on process exit.
 	go func() {
 		_ = cmd.Wait()
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 	}()
 
 	return pi, nil

@@ -76,8 +76,10 @@ The doc-11-Phase-A surface below is now also implemented and routed (via
 `filter.add`, `filter.addKeyframe`, `generator.createTitle`,
 `subtitles.addTrack`, `subtitles.appendItem`, `file.export`, `jobs.get`,
 `playback.getFrame`. These are additive `Backend` trait methods — see
-"MltBackend" below for the implementor that actually does something real
-with them.
+"Real FFI (shotcut integration)" below for `FfiBackend`, the one production
+implementor of these (a since-removed second, Qt-free `MltBackend`
+implementor used to also cover them for dev/CI purposes -- see git history
+if that standalone-testable path is needed again).
 
 ## Build / test
 
@@ -97,168 +99,57 @@ declarations into the build):
 cargo build --features real_ffi
 ```
 
-## MltBackend (doc 11 Phase A: real MLT rendering, no Qt required)
+## `media_tools.rs` (generic ffprobe/melt helpers)
 
-`src/mlt_backend.rs` is a **third** `Backend` implementor, independent of both
-`MockBackend` (pure in-memory) and `FfiBackend` (needs a live Shotcut/Qt
-process). It's always available — the only runtime requirements are `melt`
-and `ffprobe` on `PATH` (or the `MELT_BIN`/`FFPROBE_BIN` env overrides) — and
-it's what `tests/mlt_export_integration.rs` exercises end to end.
+`FfiBackend`'s `file.export`/`file.probe` shell out directly to `melt`/
+`ffprobe`, using real Shotcut's own `saveXML()`/`Controller::saveXML()` to
+generate the MLT XML (not a hand-rolled builder -- see "Real FFI" below).
+`src/media_tools.rs` holds the generic, backend-agnostic pieces of that:
+`probe_media` (ffprobe wrapper), `resolve_melt_binary`/`normalize_vcodec`/
+`detect_unrecognised_codec` (melt invocation + codec/stderr handling), and
+`prune_finished_jobs` (bounding the in-memory export-job map).
 
-### What's real
-
-- **The in-memory project model**: tracks, clips (with real `ffprobe`-derived
-  in/out frame counts, not guesses), a playlist/source-bin
-  (`playlist.append`/`generator.createTitle` both populate it), attached
-  filters with optional keyframes, and crossfade records — per project,
-  rooted at `<projectsRoot>/<projectId>/`, matching
-  `09-project-folder-layout.md`.
-- **MLT XML generation**: real producers (file-backed and
-  `color:`+`dynamictext`/`qtext`-filter title producers), one `<playlist>`
-  per track, a combining `<tractor>`, and — for `transitions.addCrossfade` —
-  a nested `<tractor>` splicing in real `luma` + `mix` MLT transitions. This
-  is genuinely valid `melt`-renderable XML (see the manual validation this
-  file's export path is built on: a hand-written 2-producer/1-playlist XML
-  rendered via `melt ... -consumer avformat:...` produced a real 7.0s
-  H.264/AAC file with visible rendered title text).
-- **Multi-track video compositing**: every pair of consecutive video tracks
-  gets a real `qtblend` `<transition>` in the top-level tractor (bottom
-  track as `a_track`, the next video track up as `b_track`) — the same real
-  primitive and bottom-up ordering `MultitrackModel::getVideoBlendTransition`/
-  `addVideoTrack` use in real Shotcut's `multitrackmodel.cpp` (confirmed by
-  reading that source), empirically verified against the installed
-  `melt 7.36.1` by rendering a two-track probe and pixel-diffing decoded
-  frames before/during/after the top track's visible window. Mid-timeline
-  positioning on an overlay track (no `position` param on
-  `edit.appendClip`) is done with a real transparent `color:#00000000`
-  spacer clip, addressable as `{"blank": <frames>}` through the existing
-  `source` tagged union — a real MLT `<blank>`-equivalent technique, not a
-  wire-protocol change.
-- **Chained crossfades on the same track**: `transitions.addCrossfade`
-  called twice on the same track sharing a middle clip (e.g. `(0,1)` and
-  `(1,2)`) is handled correctly — `build_track_playlist` computes each
-  clip's head/tail overlap independently rather than walking clip-pairs and
-  skipping past a consumed one, which is what an earlier version of this
-  file did (it silently dropped the second crossfade). Verified by
-  `tests/doc11_phase_a_full.rs`'s three-segment/two-crossfade export
-  actually rendering and its duration matching the exact expected frame
-  math (sum of trimmed segments minus both crossfade overlaps).
-- **Subtitle burn-in**: real pixel burn-in via ffmpeg's own
-  `avfilter.subtitles` MLT service (`av.filename=<srt path>`), attached as a
-  filter on the top-level tractor (post-composite). This was empirically
-  determined, not assumed, per doc 11's explicit instruction to test this
-  rather than guess: real Shotcut's own mechanism (`subtitle_feed` filter +
-  `subtitle.N.feed`/`subtitle.N.lang` **consumer** properties, see
-  `shotcut/src/models/subtitlesmodel.cpp`/`encodedock.cpp`) was tested
-  directly against `melt` with a real SRT file and only produced an *empty*
-  placeholder `mov_text` stream (0 real packets) — that mechanism depends on
-  a live Shotcut `Subtitles` QObject injecting per-frame cue text during
-  rendering, which doesn't exist when driving `melt` as a bare CLI
-  subprocess. `avfilter.subtitles` burns real, decodable text pixels in
-  standalone, confirmed by decoding frames inside vs. outside a cue window.
-- **`file.export`**: writes `project.mlt`, spawns a real `melt … -consumer
-  avformat:<outputPath> vcodec=<codec> acodec=aac` subprocess with
-  `DISPLAY` set (required for Qt-backed filters like `dynamictext`), and
-  returns a `jobId` immediately — the render itself runs on a plain OS
-  thread (not the shared single-writer dispatcher), so it never blocks
-  other clients. `jobs.get` polls real subprocess exit status.
-- **`playback.getFrame`**: a real single-frame `melt … in=N out=N -consumer
-  avformat:<file>.png` invocation, whose actual output bytes are read and
-  base64-encoded — not a placeholder.
-- **`subtitles.addTrack`/`appendItem`**: real `.srt` sidecar files under
-  `<projectRoot>/subtitles/trackN.srt` for storage (matching real Shotcut's
-  own SRT-based `SubtitlesModel`/`Subtitles` I/O), *and* real burn-in at
-  export time via the `avfilter.subtitles` mechanism described above — see
-  that bullet for what was tested and why it's the real mechanism, not
-  Shotcut's own player-only one.
-
-### What's simulated / simplified (documented, not hidden)
-
-- **No live Qt/QUndoStack**: `project_undo`/`project_redo` are depth
-  counters only, same caveat `MockBackend` already carries — no real
-  in-memory-model rewind happens.
-- **`transitions.addCrossfade`**'s nested-tractor XML uses real, standalone
-  MLT `luma` + `mix` transitions, not the literal `movit.luma_mix`/
-  `"mix:-2"` service-string details `01-jsonrpc-spec.md` cites from
-  `multitrackmodel.cpp` (that citation's exact call shape doesn't correspond
-  to a standalone registered MLT service name usable outside that call
-  site) — structurally a real, correct MLT crossfade, just not a
-  byte-for-byte reproduction of `MultitrackModel::addTransition`'s internal
-  command-splitting logic.
-- **Fixed project frame rate** (`DEFAULT_FPS = 30`): one profile fps for the
-  whole project rather than per-source detection: correct as long as
-  imported sources actually are 30fps (which the test suite controls at
-  generation time), an approximation otherwise.
-
-### Running the MltBackend integration tests
-
-Needs `melt`, `ffmpeg`, and `ffprobe` on `PATH`, plus a real (or Xvfb/VNC)
-`DISPLAY` for `melt`'s Qt-backed filters (`dynamictext`, used by
-`generator.createTitle`):
-
-```sh
-source "$HOME/.cargo/env"
-cd sap-rust
-DISPLAY=:1 cargo test --test mlt_export_integration
-```
-
-`tests/mlt_export_integration.rs` generates a synthetic `ffmpeg lavfi
-testsrc`+`sine` source at test setup (no checked-in fixture), drives the real
-server over a real Unix socket, and — in
-`full_export_pipeline_produces_a_real_playable_file` — calls `file.export`,
-polls `jobs.get` until the real `melt` subprocess finishes, then asserts
-with a real `ffprobe` run that the exported file exists with the expected
-H.264/AAC streams and a duration matching the title + clip length sum
-(verified locally: a 150-frame title + 60-frame/2s clip at 30fps produced a
-real 210-frame, exactly-7.000000s-video-duration MP4).
-
-### Full doc 11 Phase A workflow test
-
-`tests/doc11_phase_a_full.rs` drives the entire Phase A creative-session
-scenario from `11-e2e-scenario-tests.md` in one project: a title card, three
-trimmed ~1.5s highlight segments cut from one 9s source with two chained
-crossfades between them, a zoom-in-from-center `affine` filter, a second
-overlay video track with a slide-in `affine` + fade-out `brightness`
-animation positioned mid-timeline, two burned-in subtitle cues, a real
-export, and pixel-level verification of every visual claim by decoding real
-`playback.getFrame` grabs (not just checking that RPC calls succeeded).
-Run it the same way, needs the same `DISPLAY`:
-
-```sh
-DISPLAY=:1 cargo test --test doc11_phase_a_full -- --nocapture
-```
-
-Real numbers from a local run (also demonstrates the exact "sum of trimmed
-segments minus crossfade overlaps, not the original source length" duration
-math doc 11 asks for):
-
-```text
-phase A export: real ffprobe duration=8.512s codec=h264 expected=8.500s
-  (255f @ 30fps = title 150f + 3x45f segments - 2x15f crossfade overlap)
-zoom corner mean_abs_diff (early vs late) = 71.58
-title white-text fraction: in-window=0.0377 out-of-window=0.0000
-overlay deep-pink fraction in target rect: before=0.0000 during=0.9831 after=0.0000
-subtitle white-glyph fraction in bottom band: in-window=0.0148 out-of-window=0.0000
-```
-
-See that test file's module doc comment for the design decisions it makes
-(title placement, overlay positioning via a `{"blank": N}` spacer clip, the
-subtitle-mechanism finding, why the overlay uses a solid off-palette color,
-and the corner-diff zoom methodology) and for the two real MLT/melt
-behaviors discovered empirically while building it, both also documented in
-`mlt_backend.rs`'s module doc comment:
+These used to also back a second, Qt-free `Backend` implementor called
+`MltBackend` (its own in-memory project model + hand-built MLT XML
+generator, used only for `cargo test`-only coverage of doc 11's Phase A
+scenario before a real Shotcut/Qt build was validated). That implementor
+and its integration tests (`tests/mlt_export_integration.rs`,
+`tests/doc11_phase_a_full.rs`, `tests/file_probe.rs`) were removed once
+`FfiBackend` became the sole production backend -- see git history if
+that standalone-testable path is needed again. Two real MLT/melt
+behaviors it discovered empirically remain true and relevant to
+`FfiBackend`'s own `melt`-based export:
 
 1. **Multi-track video compositing** needs an explicit `qtblend`
-   `<transition>` between tracks — a bare `<tractor>` with multiple
+   `<transition>` between tracks -- a bare `<tractor>` with multiple
    `<track>` elements and no compositing transition only shows the top
-   track, confirmed by rendering a two-track probe with and without it.
+   track (confirmed by rendering a two-track probe with and without it).
+   Real Shotcut's own `MultitrackModel::getVideoBlendTransition`/
+   `addVideoTrack` already do this, so `FfiBackend` inherits it for free
+   via `saveXML()`.
 2. **MLT's legacy `rect`/`mlt_geometry`-typed properties** (e.g. `affine`'s
    `transition.rect`) tween back toward the *first* keyframe's value past
-   the last explicit keyframe if nothing pins the end — a 2-keyframe
+   the last explicit keyframe if nothing pins the end -- a 2-keyframe
    slide-in animation was observed sliding back out again with no third
    keyframe. A held end value needs an explicit keyframe at the last frame
    you want it to hold for. Numeric (non-rect) properties like
    `brightness`'s `level` do not have this quirk.
+3. **Subtitle burn-in**: real Shotcut's own mechanism (`subtitle_feed`
+   filter + `subtitle.N.feed`/`subtitle.N.lang` **consumer** properties)
+   depends on a live Shotcut `Subtitles` QObject injecting per-frame cue
+   text during rendering -- tested directly against `melt` with a real SRT
+   file and it only produced an *empty* placeholder `mov_text` stream (0
+   real packets) when driven as a bare CLI subprocess outside the GUI
+   session. `avfilter.subtitles` (`av.filename=<srt path>`, attached as a
+   post-composite filter) burns real, decodable text pixels in standalone,
+   confirmed by decoding frames inside vs. outside a cue window.
+
+Doc 11's Phase-A scenario (cut/arrange/crossfade/animate/title/subtitle/
+export, chained in one project) needs to be re-proven against the real
+`FfiBackend`/Qt build now (a live headless Shotcut process, not a plain
+`cargo test`) -- see
+`memory/exe/gen/plans/2026-07-13-plan-parity-alignment.md` and the
+`scripts/*-parity-check.py` scripts for that in-progress work.
 
 ## Running standalone
 
@@ -317,35 +208,20 @@ precise line between what's real and what's still stubbed for this pass.
 
 ### What's still stubbed
 
-- **`project_undo`/`project_redo`**: return a "not wired" error. No shim
-  wrapper for `QUndoStack::undo()`/`redo()` exists yet (analogous to the
-  undo/redo-*depth* readers that are wired) — mechanical, not architectural,
-  follow-up.
-- **`edit_append_clip`**: returns a "not wired" error. The real primitive
-  (`TimelineDock::append()`) reads from the system clipboard / "current
-  source" rather than accepting a source parameter directly, so a faithful
-  wrapper needs slightly more design (e.g. staging a producer first) than
-  this pass covers.
-- **`edit_list_clips`**, **`playback_seek`**, **`notes_get_text`**,
-  **`notes_set_text`**: no real primitive wired; return an empty/no-op
-  result rather than an error, since "no clips"/"no notes yet" are
-  themselves valid real states.
 - **`project_exit`**: idempotent no-op, same documented choice as
   `MockBackend`/`server.rs` — there's no real primitive that should mean
   "the agent asked to exit" while a live GUI session might still be in use.
-- **Notification fan-out from Qt to SAP clients**: `sap_emit_event(const
-  char* jsonPayload)` is a real, linkable `extern "C"` symbol, and
-  `sap_install_notification_bridge()` really does connect it to
-  `MultitrackModel::modified` (the nearest real, already-emitted aggregate
-  signal) on Shotcut startup — but `sap_emit_event`'s body is currently a
-  stub that just logs to stderr. It does **not** yet push into
-  `server.rs`'s per-project `broadcast` channel, so a real Shotcut edit made
-  outside of SAP (e.g. by the human user's mouse) does not yet reach
-  connected JSON-RPC clients as an `edit.changed` notification. Wiring that
-  fully requires a Rust-side global channel handle reachable from this
-  C symbol (e.g. a `once_cell`/`OnceLock`-held `mpsc::Sender` set up inside
-  `sap_start_server`) — flagged as follow-up, not attempted in this pass to
-  keep the change scoped.
+
+That is now the only deliberately-unwired method left: `edit_append_clip`,
+`edit_list_clips`, `playback_seek`, `notes_get_text`/`notes_set_text`,
+`project_undo`/`project_redo`, and Qt-to-SAP notification fan-out
+(`sap_emit_event` really does forward into `sap_ffi_notify_bridge` ->
+`server.rs`'s per-project broadcast channel now, logging `[sap_ffi] event:
+...` to stderr at the C++ call site on every real Shotcut edit -- SAP or
+GUI-originated) are all wired to real primitives as of this pass; see
+`ffi_backend.rs` for each method's call site. This list should be
+re-verified by re-reading the code before being trusted again -- it has
+drifted stale before.
 
 ### Build/test commands
 

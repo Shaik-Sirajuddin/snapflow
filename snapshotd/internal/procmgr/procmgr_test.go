@@ -52,7 +52,7 @@ func TestLaunch_SpawnsFixtureAndWiresEnvVars(t *testing.T) {
 	runDir := t.TempDir()
 	fixtureOut := filepath.Join(t.TempDir(), "fixture-out.txt")
 
-	mgr := New(reg, fixtureBin, runDir)
+	mgr := New(reg, fixtureBin, runDir, t.TempDir())
 	mgr.ConnectTimeout = 3 * time.Second
 
 	// Manager.Launch always appends os.Environ() plus the SAP vars; smuggle
@@ -130,7 +130,7 @@ func TestLaunch_MissingBinary_ReturnsCleanError(t *testing.T) {
 		t.Fatalf("create project: %v", err)
 	}
 
-	mgr := New(reg, filepath.Join(t.TempDir(), "does-not-exist-binary"), t.TempDir())
+	mgr := New(reg, filepath.Join(t.TempDir(), "does-not-exist-binary"), t.TempDir(), t.TempDir())
 
 	_, err := mgr.Launch(context.Background(), "proj-2", LaunchOptions{})
 	if err == nil {
@@ -148,7 +148,7 @@ func TestClose_StopsProcessAndMarksClosed(t *testing.T) {
 		t.Fatalf("create project: %v", err)
 	}
 
-	mgr := New(reg, fixtureBin, t.TempDir())
+	mgr := New(reg, fixtureBin, t.TempDir(), t.TempDir())
 	pi, err := mgr.Launch(context.Background(), "proj-3", LaunchOptions{})
 	if err != nil {
 		t.Fatalf("launch: %v", err)

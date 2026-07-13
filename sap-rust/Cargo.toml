@@ -2,7 +2,7 @@
 name = "sap-rust"
 version = "0.1.0"
 edition = "2021"
-description = "SAP (Snapshot App Protocol) JSON-RPC 2.0 server layer, per memory/head/gen/rust-fork/02-rust-embedding.md. Ships a MockBackend standing in for the real Qt/C-ABI FFI shim (not yet buildable in this sandbox); the wire protocol, multi-client dispatch, and notification fan-out are real and tested."
+description = "SAP (Snapshot App Protocol) JSON-RPC 2.0 server layer, per memory/head/gen/rust-fork/02-rust-embedding.md. This binary's default build uses MockBackend (no real media/Qt dependency, for manual/dev testing of the wire protocol). The real production backend is FfiBackend (behind the real_ffi feature), linked into the shotcut Qt binary via corrosion -- see shotcut/CMakeLists.txt and README.md's 'Real FFI' section."
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time"] }
@@ -28,8 +28,10 @@ path = "src/lib.rs"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-# Off by default: gates the *declarations* of the future real C-ABI bindings in
-# src/ffi.rs. There is no C library to link against in this sandbox yet (see
-# README.md) — enabling this feature alone does not link anything; it exists
-# so ffi.rs's intended shape can be reviewed/reused once sap_ffi.h/.cpp exist.
+# Off by default for this crate's own standalone `cargo build`/`cargo test`
+# (no C library to link against on their own). Turned on by
+# shotcut/CMakeLists.txt's corrosion_import_crate call, which links this
+# crate as a static lib into the real shotcut Qt binary alongside
+# shotcut/src/rustbridge/sap_ffi.{h,cpp} -- see README.md's "Real FFI"
+# section for what that path actually wires up.
 real_ffi = []

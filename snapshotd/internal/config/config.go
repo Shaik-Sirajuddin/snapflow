@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // Config is the daemon's runtime configuration. Defaults follow the
@@ -27,6 +28,13 @@ type Config struct {
 	// RunDir is where per-project SAP socket files are created by default,
 	// mirroring the "/run/snapshot/*.sock" convention from 03/06.
 	RunDir string
+
+	// LogDir is where each launched child process's stdout/stderr is
+	// captured, one file per ProcessInstance (named "<instanceID>.log").
+	// This is the only place the real Qt/C++ path's own diagnostics (e.g.
+	// sap_ffi.cpp's "[sap_ffi] event: ..." lines, Qt/MLT warnings) end up --
+	// previously discarded entirely (cmd.Stdout/Stderr were left nil).
+	LogDir string
 
 	// ProjectsRoot is the default parent directory for daemon-created project
 	// folders (project.new / daemon.createProject), per
@@ -82,6 +90,7 @@ func Default() Config {
 		DBPath:            filepath.Join(home, "registry.db"),
 		ControlSocketPath: filepath.Join(home, "control.sock"),
 		RunDir:            filepath.Join(home, "run"),
+		LogDir:            filepath.Join(home, "logs"),
 		ProjectsRoot:      filepath.Join(home, "projects"),
 		SnapshotBinPath:   binPath,
 		MCPSSEAddr:        mcpAddr,
@@ -89,21 +98,55 @@ func Default() Config {
 	}
 }
 
+// discoverShotcutBinPath is the primary lookup: the real, production
+// FfiBackend-linked Qt binary (`shotcut`, built by
+// `cmake -S shotcut -B <builddir> && ninja` per shotcut/CMakeLists.txt's
+// corrosion_import_crate(... FEATURES real_ffi) integration -- see
+// sap-rust/README.md's "Real FFI" section). Searches a small set of
+// `shotcut/build*/src/shotcut` glob candidates under each ancestor root,
+// preferring a build dir name containing "release" over any other match,
+// so a plain `cmake -B shotcut/build-real-ffi` (or similarly named)
+// checkout is found without extra configuration.
+func discoverShotcutBinPath(roots []string) string {
+	var fallback string
+	for _, root := range roots {
+		matches, err := filepath.Glob(filepath.Join(root, "shotcut", "build*", "src", "shotcut"))
+		if err != nil {
+			continue
+		}
+		for _, candidate := range matches {
+			info, err := os.Stat(candidate)
+			if err != nil || info.IsDir() {
+				continue
+			}
+			if strings.Contains(candidate, "release") {
+				return candidate
+			}
+			if fallback == "" {
+				fallback = candidate
+			}
+		}
+	}
+	return fallback
+}
+
 // discoverSnapshotBinPath implements the "default/dev config points at the
-// real sap-rust binary" requirement: it searches a handful of directories
-// derived from both the current working directory and the running
-// executable's own location (each walked a few levels up) for
-// "sap-rust/target/{release,debug}/sap-rust", preferring a release build
-// over a debug build wherever both exist under the same candidate root.
-// This makes `snapshotd serve`, run from either this repo's root or from
-// inside snapshotd/ (the two places someone would actually run it from in
-// this checkout), find the sibling sap-rust crate's build output without
-// any extra configuration.
+// real, production child binary" requirement. It searches a handful of
+// directories derived from both the current working directory and the
+// running executable's own location (each walked a few levels up).
 //
-// If nothing is found (sap-rust not built yet, or snapshotd installed
-// somewhere with no sap-rust checkout nearby), this falls back to the
-// original relative-to-executable guess -- procmgr.Launch treats a missing
-// binary at that path as a normal, clean "not found" error, never a startup
+// Preference order: the real Qt/`real_ffi` `shotcut` binary
+// (discoverShotcutBinPath) first -- that is the one production backend
+// (FfiBackend, calling into a real live Shotcut process; see
+// sap-rust/README.md). Only if no such build is found does this fall back
+// to the standalone `sap-rust/target/{release,debug}/sap-rust` binary,
+// which as of the MltBackend removal only runs MockBackend (no real
+// media/editing) -- suitable for wire-protocol smoke testing, not a
+// substitute for the real Qt build in production.
+//
+// If neither is found, this falls back to the original
+// relative-to-executable guess -- procmgr.Launch treats a missing binary
+// at that path as a normal, clean "not found" error, never a startup
 // failure. SNAPSHOT_BIN_PATH always overrides this entirely, per the
 // env-var documented above and in README.md.
 func discoverSnapshotBinPath() string {
@@ -113,6 +156,10 @@ func discoverSnapshotBinPath() string {
 	}
 	if exe, err := os.Executable(); err == nil {
 		roots = append(roots, ancestors(filepath.Dir(exe), 4)...)
+	}
+
+	if shotcutBin := discoverShotcutBinPath(roots); shotcutBin != "" {
+		return shotcutBin
 	}
 
 	for _, root := range roots {
@@ -148,8 +195,15 @@ func ancestors(dir string, depth int) []string {
 }
 
 // EnsureDirs creates the daemon's on-disk directories (idempotent).
+// EnsureDirs creates the daemon's on-disk directories (idempotent). Empty
+// entries (e.g. LogDir left unset by a test-constructed Config literal, per
+// its "empty means discard" doc comment) are skipped rather than treated
+// as an error.
 func (c Config) EnsureDirs() error {
-	for _, d := range []string{c.HomeDir, c.RunDir, c.ProjectsRoot} {
+	for _, d := range []string{c.HomeDir, c.RunDir, c.ProjectsRoot, c.LogDir} {
+		if d == "" {
+			continue
+		}
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}

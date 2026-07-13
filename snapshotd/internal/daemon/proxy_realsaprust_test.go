@@ -14,27 +14,35 @@ import (
 	"snapshotd/internal/config"
 )
 
-// realSapRustBinary locates the actual sap-rust binary built by the other
-// engineer's crate (sap-rust/target/{release,debug}/sap-rust, relative to
-// this repo's root -- three directories up from internal/daemon). If it
-// isn't built yet, the test is skipped rather than failed: sap-rust is
-// developed independently and this package must not require it to exist to
-// pass `go test ./...`. When it IS present (as it is in this checkout),
-// this test proves the generic proxy end-to-end against the real (if
-// currently Mock-backed) sap-rust server, not a fixture standing in for it.
+// realSapRustBinary locates the real, production child binary: the Qt/
+// `real_ffi`-linked `shotcut` binary (shotcut/CMakeLists.txt's
+// corrosion_import_crate(... FEATURES real_ffi), sap-rust/README.md's
+// "Real FFI" section), under shotcut/build*/src/shotcut relative to this
+// repo's root. This is deliberately NOT the standalone
+// sap-rust/target/{debug,release}/sap-rust binary -- since the MltBackend
+// removal, that binary only ever runs MockBackend (no real ffprobe/melt),
+// which cannot back this file's file.export/file.probe-touching
+// assertions. If no such build exists yet, the test is skipped, not
+// failed: this package's `go test ./...` must not require a full Qt build
+// to exist. In this checkout it does exist, so these tests actually prove
+// the daemon -> procmgr -> real headless Shotcut/FfiBackend chain end to
+// end.
 func realSapRustBinary(t *testing.T) string {
 	t.Helper()
-	for _, variant := range []string{"release", "debug"} {
-		candidate := filepath.Join("..", "..", "..", "sap-rust", "target", variant, "sap-rust")
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			abs, err := filepath.Abs(candidate)
-			if err != nil {
-				t.Fatalf("abs path: %v", err)
+	repoRoot := filepath.Join("..", "..", "..")
+	matches, err := filepath.Glob(filepath.Join(repoRoot, "shotcut", "build*", "src", "shotcut"))
+	if err == nil {
+		for _, candidate := range matches {
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+				abs, absErr := filepath.Abs(candidate)
+				if absErr != nil {
+					t.Fatalf("abs path: %v", absErr)
+				}
+				return abs
 			}
-			return abs
 		}
 	}
-	t.Skip("real sap-rust binary not found under sap-rust/target/{release,debug}/sap-rust; build sap-rust first to run this integration test")
+	t.Skip("real Qt/real_ffi shotcut binary not found under shotcut/build*/src/shotcut; run `cmake -S shotcut -B shotcut/build-real-ffi -G Ninja && ninja -C shotcut/build-real-ffi` first to run this integration test")
 	return ""
 }
 
@@ -585,6 +593,44 @@ func TestForwardSAP_RealSapRust_PhaseC_DifferentProjectsIsolation(t *testing.T) 
 		return id
 	}
 
+	// mkSecondClipSameTrack appends a second, distinct clip onto the SAME
+	// track mkClip's single addTrack call created, rather than calling
+	// addTrack again -- real Shotcut's MultitrackModel::addVideoTrack()
+	// always *prepends* new video tracks at model index 0 (shifting every
+	// existing track's index up by one, matching the GUI's "new track
+	// appears on top" convention), so a second addTrack call would target
+	// a brand-new, still-empty track at trackIndex 0 instead of adding a
+	// second clip next to the first -- silently defeating the "clip with
+	// no counterpart in the other project" setup below (both tracks'
+	// first clip mint the same positional "t0c0" id).
+	mkSecondClipSameTrack := func(session string, sink *fanoutSink, label string) string {
+		titleRaw, err := d.ForwardSAP(ctx, session, sink, "generator.createTitle", mustJSON(t, map[string]any{"text": label}))
+		if err != nil {
+			t.Fatalf("generator.createTitle (%s): %v", session, err)
+		}
+		var title map[string]any
+		if err := json.Unmarshal(titleRaw, &title); err != nil {
+			t.Fatalf("unmarshal title (%s): %v", session, err)
+		}
+		playlistIndex, _ := title["index"].(float64)
+		raw, err := d.ForwardSAP(ctx, session, sink, "edit.appendClip", mustJSON(t, map[string]any{
+			"trackIndex": 0,
+			"source":     map[string]any{"playlistIndex": int(playlistIndex)},
+		}))
+		if err != nil {
+			t.Fatalf("edit.appendClip (%s): %v", session, err)
+		}
+		var clip map[string]any
+		if err := json.Unmarshal(raw, &clip); err != nil {
+			t.Fatalf("unmarshal clip (%s): %v", session, err)
+		}
+		id, _ := clip["clipId"].(string)
+		if id == "" {
+			t.Fatalf("expected clipId (%s), got %+v", session, clip)
+		}
+		return id
+	}
+
 	// -- Notification isolation: session B must not see session A's edits,
 	// checked BEFORE session B does anything of its own. --
 	beforeB := sinkB.count()
@@ -595,14 +641,16 @@ func TestForwardSAP_RealSapRust_PhaseC_DifferentProjectsIsolation(t *testing.T) 
 	}
 
 	clipIDB := mkClip("phasec-b", sinkB, "clip-b")
-	// clip_id is generated as a per-project sequential "clip-<n>" counter
-	// (see sap-rust/src/mlt_backend.rs's next_clip_seq), not a globally
-	// unique id -- so project B's FIRST clip id can coincide textually with
-	// project A's first clip id (both are "clip-1"). A second clip on B
-	// gives an id with no counterpart at all in A, which is what genuinely
-	// exercises the "unknown clipId" rejection below rather than
-	// accidentally hitting A's own same-named clip.
-	clipIDB2 := mkClip("phasec-b", sinkB, "clip-b-2")
+	// FfiBackend's clip_id is "t{trackIndex}c{clipIndex}", a purely
+	// positional encoding (not a per-project sequential counter like the
+	// removed MltBackend's), so project B's FIRST clip id can coincide
+	// textually with project A's first clip id (both are single-track,
+	// single-clip projects, so both are "t0c0"). A second clip appended to
+	// B's SAME track gives "t0c1", an id with no counterpart at all in A
+	// (which only ever has one clip), genuinely exercising the "unknown
+	// clipId" rejection below rather than accidentally hitting A's own
+	// same-named clip.
+	clipIDB2 := mkSecondClipSameTrack("phasec-b", sinkB, "clip-b-2")
 
 	// -- file.import path rejection is per-bound-project, not global: a
 	// file that genuinely exists and is readable under project B's root is

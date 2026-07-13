@@ -4,7 +4,7 @@
 #   - 40 distinct numbered still images (color-cycled + drawtext)
 #   - 1 background audio track spanning the whole timeline
 #
-# Output layout under OUTDIR (default /tmp/sap-e2e-assets/gallery):
+# Output layout under OUTDIR (default /home/siraj/Desktop/content/edited_by_ai/gallery):
 #   clips/clip1.mp4 .. clip4.mp4
 #   images/img001.png .. img040.png
 #   audio/bgm.wav
@@ -12,7 +12,7 @@
 # Idempotent: re-running regenerates all assets from scratch.
 set -euo pipefail
 
-OUTDIR="${1:-/tmp/sap-e2e-assets/gallery}"
+OUTDIR="${1:-/home/siraj/Desktop/content/edited_by_ai/gallery}"
 FPS=25
 SIZE=1280x720
 FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
