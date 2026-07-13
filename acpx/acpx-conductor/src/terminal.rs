@@ -33,6 +33,24 @@ pub struct TerminalExitStatus {
 
 struct Shared {
     output: Vec<u8>,
+    /// **Phase 10 addition -- real, previously-undiscovered gap.** The
+    /// real ACP `TerminalOutputResponse` schema (`agentclientprotocol.
+    /// com`'s `schema/v1/schema.json`) marks `truncated` as a
+    /// **required** boolean field ("Whether the output was truncated
+    /// due to byte limits"), not optional -- before this phase,
+    /// `output_byte_limit`'s drain-from-the-front truncation
+    /// (`spawn_capture_task` below) happened silently: the byte limit
+    /// itself worked, but nothing recorded *that* it had fired, and
+    /// `acpx-core`'s `terminal/output` handler never emitted the field
+    /// at all. A strict, schema-validating backend deserializer could
+    /// reject that response outright for missing a required field; even
+    /// a lenient one would have no way to know its view of the output
+    /// was incomplete. Sticky once set -- per the field's own semantics
+    /// ("was truncated", not "is currently truncated relative to this
+    /// exact byte offset"), a caller that already missed some bytes on
+    /// an earlier read is still owed `true` on every later one, even if
+    /// the buffer has since drained below the limit again.
+    truncated: bool,
     exit_status: Option<TerminalExitStatus>,
 }
 
@@ -89,6 +107,7 @@ impl TerminalHandle {
         let stderr = child.stderr.take().expect("just requested Stdio::piped");
         let shared = Arc::new(Mutex::new(Shared {
             output: Vec::new(),
+            truncated: false,
             exit_status: None,
         }));
         let stdout_task = spawn_capture_task(stdout, shared.clone(), output_byte_limit);
@@ -108,9 +127,13 @@ impl TerminalHandle {
     /// `acpx-core` caller is responsible for polling `try_wait`-style if
     /// it wants non-blocking exit detection, which this type doesn't
     /// attempt to do on its own in a background task).
-    pub async fn output(&self) -> (Vec<u8>, Option<TerminalExitStatus>) {
+    pub async fn output(&self) -> (Vec<u8>, bool, Option<TerminalExitStatus>) {
         let shared = self.shared.lock().await;
-        (shared.output.clone(), shared.exit_status.clone())
+        (
+            shared.output.clone(),
+            shared.truncated,
+            shared.exit_status.clone(),
+        )
     }
 
     /// Block until the command exits, recording its exit status for
@@ -179,6 +202,7 @@ where
                         if shared.output.len() > limit {
                             let excess = shared.output.len() - limit;
                             shared.output.drain(0..excess);
+                            shared.truncated = true;
                         }
                     }
                 }
@@ -204,9 +228,13 @@ mod tests {
         .expect("spawn");
         let status = handle.wait_for_exit().await.expect("wait_for_exit");
         assert_eq!(status.exit_code, Some(3));
-        let (output, exit_status) = handle.output().await;
+        let (output, truncated, exit_status) = handle.output().await;
         assert_eq!(String::from_utf8_lossy(&output).trim_end(), "hello");
         assert_eq!(exit_status, Some(status));
+        assert!(
+            !truncated,
+            "no byte limit was set, nothing should be truncated"
+        );
     }
 
     #[tokio::test]
@@ -221,9 +249,14 @@ mod tests {
         .await
         .expect("spawn");
         handle.wait_for_exit().await.expect("wait_for_exit");
-        let (output, _) = handle.output().await;
+        let (output, truncated, _) = handle.output().await;
         // Oldest bytes ("012345") dropped, only the last 4 bytes remain.
         assert_eq!(String::from_utf8_lossy(&output), "6789");
+        assert!(
+            truncated,
+            "output exceeded output_byte_limit, truncated must be true per the real \
+             TerminalOutputResponse schema (required field)"
+        );
     }
 
     #[tokio::test]

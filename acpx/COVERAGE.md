@@ -1450,3 +1450,74 @@ ignored**, `cargo fmt --all --check` and `cargo build --workspace
    source (rather than the secondary summaries earlier phases relied on)
    is a good candidate for a future phase, purely as a confidence check
    rather than because any specific discrepancy is suspected.
+
+## 2026-07-13 -- ACP compatibility phase 10: `terminal/output`'s missing required `truncated` field
+
+**Directive:** continuation of the same series, acting on phase 9's
+recheck item 5 ("re-diff `terminal/*`/`fs/*` against the real schema").
+Diffed every `terminal/*`/`fs/*` request/response's real property list
+(from the same `schema/v1/schema.json` fetched in phase 9) against
+`acpx-core::router::handle_terminal_request`/`handle_fs_request`'s
+actual JSON shapes, field by field.
+
+**Real, previously-undiscovered gap found:** `TerminalOutputResponse`'s
+real schema marks `truncated` (boolean, "Whether the output was
+truncated due to byte limits") as a **required** property (`"required":
+["output", "truncated"]`) -- not optional. `acpx-conductor::terminal::
+TerminalHandle`'s `output_byte_limit` truncation (drain-from-the-front
+once the captured buffer exceeds the limit, phase 4) worked correctly,
+but nothing ever recorded *that* truncation had happened, and `acpx-
+core`'s `terminal/output` handler never emitted the field at all --
+every `terminal/output` reply acpx ever sent back to a real backend
+agent was missing a spec-required field. A strict, schema-validating
+deserializer on the backend side could reject the reply outright; even a
+lenient one would have no way to distinguish "the agent captured
+everything the command printed" from "the agent's buffer silently
+dropped some of the oldest output" -- which matters concretely for a
+long-running command an agent is polling `terminal/output` against
+repeatedly (a build log, a dev server, etc.).
+
+**Fix:** `terminal::Shared` gained a `truncated: bool` field, set (once
+set, sticky -- matches the field's own "was truncated" semantics rather
+than "is currently truncated relative to this exact byte offset")
+whenever `spawn_capture_task`'s drain-on-overflow branch actually fires.
+`TerminalHandle::output()`'s return type changed from `(Vec<u8>,
+Option<TerminalExitStatus>)` to `(Vec<u8>, bool,
+Option<TerminalExitStatus>)`; `handle_terminal_request`'s `"terminal/
+output"` arm now includes `"truncated": bool` in the JSON-RPC result.
+
+**Tests:** `acpx-conductor/src/terminal.rs`'s two existing unit tests
+(`captures_output_and_exit_status`, `output_byte_limit_truncates_from_
+the_front`) gained assertions on the new field (`false`/`true`
+respectively -- the second one specifically proves the byte-limit-
+exceeded path sets it). `acpx-core/tests/terminal_request_test.rs`'s
+existing real-subprocess-through-the-router integration test gained an
+assertion that a real `terminal/output` reply (no byte limit configured)
+carries `"truncated": false` explicitly, rather than the field being
+absent.
+
+Workspace test count after this phase: **173 passed, 0 failed, 4
+ignored** (no new tests added, only new assertions in existing ones, so
+the count is unchanged from phase 9), `cargo fmt --all --check` and
+`cargo build --workspace --tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. The rest of the `terminal/*`/`fs/*` field-by-field diff (`terminal/
+   create`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/
+   release`, `fs/read_text_file`, `fs/write_text_file`) found no further
+   discrepancies against the real schema -- every other field name/
+   optionality already matched exactly. This closes phase 9's recheck
+   item 5 as "checked, one real gap found and fixed," not "checked,
+   nothing found" -- worth noting given phase 6's recheck once declared
+   "no further gaps" only for phase 7 to find `session/cancel` entirely
+   missing; this phase's finding is the same category of lesson playing
+   out again on a narrower surface.
+2. `session/resume` (phase 8/9 carryover) still shares the rehydration
+   path but remains untested end to end by a real adapter.
+3. `session/list`'s shape mismatch (phase 8/9 carryover) remains an open
+   architectural decision.
+4. `ContentBlock`/`_meta` passthrough in `session/prompt` (phase 7/8/9
+   carryover) still open -- given this phase's finding, worth explicitly
+   re-stating: "acpx forwards it verbatim" is a design claim, not yet a
+   tested one, and this phase is a concrete reminder that untested
+   claims in this codebase have had real gaps hiding behind them before.

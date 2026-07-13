@@ -1563,7 +1563,9 @@ async fn handle_fs_request(request: &serde_json::Value, method: &str) -> serde_j
 /// `terminal/create`'s params are `{sessionId, command, args?, env?,
 /// cwd?, outputByteLimit?}` (`env` is ACP's usual array-of-`{name,value}`
 /// shape, not a JSON object map) -> `{terminalId}`; `terminal/output` ->
-/// `{output, exitStatus?}`; `terminal/wait_for_exit` -> `{exitStatus}`;
+/// `{output, truncated, exitStatus?}` (`truncated` is a **required**
+/// field per the real schema -- phase 10 fix, was silently omitted
+/// before); `terminal/wait_for_exit` -> `{exitStatus}`;
 /// `terminal/kill`/`terminal/release` -> `{}`. `exitStatus` is
 /// `{exitCode, signal}` (either may be `null`). Needs `&mut proc` (unlike
 /// `handle_fs_request`) since terminal state lives in
@@ -1652,11 +1654,12 @@ async fn handle_terminal_request(
     match method {
         "terminal/output" => match proc.terminals.get(&terminal_id) {
             Some(handle) => {
-                let (output, exit_status) = handle.output().await;
+                let (output, truncated, exit_status) = handle.output().await;
                 serde_json::json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {
                         "output": String::from_utf8_lossy(&output),
+                        "truncated": truncated,
                         "exitStatus": exit_status.map(|s| serde_json::json!({"exitCode": s.exit_code, "signal": s.signal})),
                     }
                 })

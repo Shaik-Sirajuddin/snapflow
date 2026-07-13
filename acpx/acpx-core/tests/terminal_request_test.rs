@@ -188,6 +188,15 @@ async fn terminal_requests_spawn_a_real_process_when_profile_opts_in() {
         .expect("terminal/output result.output");
     assert_eq!(output.trim_end(), "hello");
 
+    // **Phase 10.** `truncated` is a *required* field on the real
+    // `TerminalOutputResponse` schema -- must be present and `false`
+    // here (no `outputByteLimit` was set, output never exceeded
+    // anything).
+    assert_eq!(
+        prompt_response["result"]["outputReply"]["result"]["truncated"],
+        json!(false)
+    );
+
     // `terminal/release` must succeed once...
     assert_eq!(
         prompt_response["result"]["releaseReply"]["result"],
