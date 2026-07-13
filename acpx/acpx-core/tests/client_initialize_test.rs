@@ -49,10 +49,63 @@ async fn initialize_declares_real_capabilities_not_the_unknown_method_error() {
     );
     assert_eq!(response["result"]["agentInfo"]["name"], json!("acpx"));
 
+    // **Phase 9:** `sessionCapabilities.{close,delete,resume}` must be
+    // advertised (all three are genuinely `Proxied` end to end), and
+    // `list` deliberately must NOT be (acpx's own `session/list` handler
+    // answers a gateway-scoped shape, not the real per-backend
+    // `SessionInfo[]` schema -- see `COVERAGE.md`'s phase 8 recheck item
+    // 3 for why that's a known, tracked divergence rather than a claim
+    // this test should let silently regress into a false spec-compliance
+    // claim).
+    assert_eq!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["close"],
+        json!({})
+    );
+    assert_eq!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["delete"],
+        json!({})
+    );
+    assert_eq!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["resume"],
+        json!({})
+    );
+    assert!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_null(),
+        "must not advertise sessionCapabilities.list -- acpx's own session/list \
+         doesn't match the real per-backend schema (tracked divergence, not fixed \
+         yet -- advertising it here would misrepresent that)"
+    );
+
     // No backend process was ever spawned or even registered for this
     // router -- proves `initialize` really is gateway-native (Router::
     // classify's new `MethodClass::GatewayNative` arm), not accidentally
     // routed toward a nonexistent backend.
+}
+
+/// **Phase 9.** `logout` is a real, stable v1 ACP method
+/// (`agentclientprotocol.com`'s schema: `x-side: agent`, no `sessionId`)
+/// that fell through to `MethodClass::Unknown` before this phase --
+/// same category of gap as `authenticate`'s pre-phase-6 state. acpx's
+/// own `initialize` never advertises `agentCapabilities.auth.logout`
+/// (asserted above via its absence, indirectly -- `auth` itself isn't
+/// set at all), so a compliant client should never call this in the
+/// first place; one that does anyway must get a clear, specific error
+/// rather than a bare `UnknownMethod`.
+#[tokio::test]
+async fn logout_is_refused_with_a_clear_error_since_no_logout_capability_is_advertised() {
+    let mut router = Router::new("unused-agent");
+
+    let result = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "logout",
+            "params": {}
+        }))
+        .await;
+
+    assert!(
+        matches!(result, Err(RouterError::LogoutNotSupported)),
+        "expected LogoutNotSupported, got {result:?}"
+    );
 }
 
 #[tokio::test]

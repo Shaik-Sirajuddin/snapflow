@@ -46,7 +46,23 @@ pub fn classify(method: &str) -> MethodClass {
         // error on its first ever request, before `session/new` was
         // ever reached. See `dispatch_native`'s `"initialize"`/
         // `"authenticate"` arms for what acpx answers now.
-        "initialize" | "authenticate" => MethodClass::GatewayNative,
+        // **Phase 9 addition:** `logout` is a real, stable v1 ACP method
+        // (`agentclientprotocol.com`'s schema: `x-side: agent`, no
+        // `sessionId` -- it's connection-scoped, not session-scoped) that
+        // was entirely unclassified before this phase, same category as
+        // phase 6's pre-fix `initialize`/`authenticate` gap: it fell
+        // through to `MethodClass::Unknown` and any client that first
+        // checked `agentCapabilities.auth.logout` (correctly, since
+        // that's how the spec says to gate calling it at all) would
+        // never even try -- but a client that called it anyway got a
+        // generic `UnknownMethod` rather than a clear "not supported"
+        // answer. Routed `GatewayNative` (not `Proxied`) because it has
+        // no `sessionId` to resolve a specific backend from -- in
+        // acpx's multi-backend gateway there is no single unambiguous
+        // backend a bare `logout` could target, unlike a real
+        // single-agent ACP agent where there's exactly one connection.
+        // See `dispatch_native`'s `"logout"` arm for what acpx answers.
+        "initialize" | "authenticate" | "logout" => MethodClass::GatewayNative,
         "session/new" => MethodClass::Hybrid,
         "session/prompt" | "session/resume" | "session/load" | "session/close"
         | "session/set_mode" | "session/cancel"
@@ -62,7 +78,24 @@ pub fn classify(method: &str) -> MethodClass {
         // proxied method) so it fits this bucket exactly; omitting it
         // meant a real client had no way to ever pick a non-default model
         // for a claude-agent-acp-backed profile through the gateway.
-        | "session/set_config_option" => MethodClass::Proxied,
+        | "session/set_config_option"
+        // **Phase 9 addition:** `session/delete` -- real, stable v1 ACP
+        // method (`DeleteSessionRequest`/`DeleteSessionResponse`, `x-side:
+        // agent`, carries `sessionId`) found entirely unclassified during
+        // this phase's schema recheck (fetched the real `schema/v1/
+        // schema.json` off `agentclientprotocol/agent-client-protocol`
+        // directly rather than trusting secondary summaries, after phase
+        // 8's recheck flagged conflicting claims about its stability).
+        // `claude-agent-acp`'s own compiled `dist/acp-agent.js` implements
+        // `deleteSession` for real (confirmed by reading it in this
+        // phase), so this was a genuine, exercisable gap, not a
+        // theoretical one. Session-scoped like `session/close`, so it
+        // fits `Proxied` exactly, and shares `rehydrate_session`'s
+        // restart-survival fallback with `session/load`/`session/resume`
+        // below -- deleting a session a client knows about from a
+        // *previous* acpx process lifetime is exactly as legitimate a use
+        // case as loading/resuming one.
+        | "session/delete" => MethodClass::Proxied,
         "agents/list" | "agents/install" | "agents/status" | "session/list" => {
             MethodClass::GatewayNative
         }
@@ -210,6 +243,13 @@ pub enum RouterError {
         "session/load: gateway session {0} could not be recovered from the persistence store: {1}"
     )]
     SessionRehydrationFailed(String, crate::persistence::PersistenceError),
+    #[error(
+        "logout: acpx's own initialize response advertises no agentCapabilities.auth.logout \
+         (gateway-level auth is transport-level, not ACP-level -- see acpx-server's own \
+         HTTP/WS auth); acpx also has no single unambiguous backend a bare, session-less \
+         logout could target across its multiple managed profiles"
+    )]
+    LogoutNotSupported,
 }
 
 impl Router {
@@ -594,7 +634,7 @@ impl Router {
         method: &str,
         gateway_session_id: &str,
     ) -> Result<crate::session_registry::SessionEntry, RouterError> {
-        if !matches!(method, "session/load" | "session/resume") {
+        if !matches!(method, "session/load" | "session/resume" | "session/delete") {
             return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
         let store = self
@@ -884,6 +924,32 @@ impl Router {
                     "mcpCapabilities": {
                         "http": true,
                         "sse": true
+                    },
+                    // **Phase 9 addition.** Per the real v1 stable
+                    // schema's `SessionCapabilities`, advertises `close`/
+                    // `delete`/`resume` as supported -- honest, because
+                    // all three are genuinely `Proxied` methods forwarded
+                    // byte-for-byte to whatever backend a session
+                    // resolves to (see `classify`), same reasoning as
+                    // `loadSession`/`promptCapabilities`/`mcpCapabilities`
+                    // above. Deliberately **omits** `list`: acpx's own
+                    // `session/list` handler (`dispatch_native`'s arm
+                    // below) answers from its *own* gateway-scoped
+                    // `SessionRegistry`, not a real per-backend
+                    // `SessionInfo[]`/cursor-paginated shape per the real
+                    // `session/list` schema -- advertising `list: {}`
+                    // here would be a false claim of spec conformance for
+                    // a method whose current implementation is a known,
+                    // tracked, deliberate divergence (see `COVERAGE.md`'s
+                    // phase 8 recheck item 3). `additionalDirectories` is
+                    // also omitted: acpx forwards whatever a client sends
+                    // verbatim, but never itself inspects/validates that
+                    // field, so there's no acpx-level claim to make about
+                    // it either way.
+                    "sessionCapabilities": {
+                        "close": {},
+                        "delete": {},
+                        "resume": {}
                     }
                 },
                 "authMethods": [],
@@ -910,6 +976,24 @@ impl Router {
                     .and_then(|m| m.as_str())
                     .map(str::to_string);
                 return Err(RouterError::NoAuthMethodsAdvertised(method_id));
+            }
+            // **Phase 9 addition**, same reasoning as `authenticate`
+            // just above: acpx's own `initialize` response deliberately
+            // never sets `agentCapabilities.auth.logout` (omitted
+            // entirely, meaning "not supported" per the real schema's
+            // own stated default), because acpx-server's own access
+            // control is transport-level (HTTP bearer token / WS auth)
+            // and there is no ACP-level authenticated state at the
+            // *gateway* layer for a client-facing `logout` to
+            // meaningfully terminate -- forwarding it to some arbitrary
+            // one backend among potentially many active profiles would
+            // be actively misleading (which one?), and silently
+            // succeeding as a no-op would misrepresent that something
+            // real happened. A compliant client checks the capability
+            // before calling; one that calls anyway gets a clear,
+            // specific error instead of a bare method-not-found.
+            "logout" => {
+                return Err(RouterError::LogoutNotSupported);
             }
             "session/list" => {
                 let sessions: Vec<serde_json::Value> = self
@@ -2325,5 +2409,14 @@ mod tests {
         assert_eq!(classify("mcp_servers/list"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/update"), MethodClass::GatewayNative);
         assert_eq!(classify("mcp_servers/delete"), MethodClass::GatewayNative);
+    }
+
+    /// **Phase 9.** `session/delete` and `logout` were entirely
+    /// unclassified (fell through to `Unknown`) before this phase, same
+    /// category of gap as phase 6's pre-fix `initialize`/`authenticate`.
+    #[test]
+    fn classifies_phase_9_stable_methods() {
+        assert_eq!(classify("session/delete"), MethodClass::Proxied);
+        assert_eq!(classify("logout"), MethodClass::GatewayNative);
     }
 }

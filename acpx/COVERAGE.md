@@ -1340,3 +1340,113 @@ passes.
    field passthrough in `session/prompt` -- both still claimed-but-
    unverified-by-an-explicit-test per phase 7's recheck list. Not
    reached this phase; still open.
+
+## 2026-07-13 -- ACP compatibility phase 9: `session/delete` and `logout`, real v1 schema fetched directly
+
+**Directive:** continuation of the same phase-by-phase series, picking
+up phase 8's recheck items 3-4. Given phase 8 surfaced conflicting
+secondary-source claims about which methods are actually stable
+(`session/delete` described as both "still an RFD" and "promoted to
+stable" by different summaries), this phase fetched the real, current
+`schema/v1/schema.json` directly from `agentclientprotocol/agent-
+client-protocol` on GitHub rather than trusting search-summarized
+secondary sources any further -- the authoritative source for every
+claim below.
+
+**Confirmed from the real schema (`x-method`/`x-side` fields):**
+`session/delete` (`DeleteSessionRequest{sessionId}`/`DeleteSessionResponse`,
+`x-side: agent`) and `logout` (`LogoutRequest{}`/`LogoutResponse{}`,
+`x-side: agent`, no `sessionId` -- connection-scoped) are both real,
+stable v1 methods. Neither was classified anywhere in `classify` before
+this phase -- both fell through to `MethodClass::Unknown`, same category
+of gap as phase 6's pre-fix `initialize`/`authenticate`. `claude-agent-
+acp`'s own compiled `dist/acp-agent.js` was read directly in this phase
+and confirmed to implement `deleteSession` for real, so this was a
+concretely exercisable gap, not theoretical.
+
+**Fix:**
+1. `session/delete` classified `Proxied` (session-scoped, forwards
+   verbatim like `session/close`) and added to `rehydrate_session`'s
+   allowlist alongside `session/load`/`session/resume` from phase 8 --
+   deleting a session a client knows about from a previous acpx process
+   lifetime is exactly as legitimate as loading/resuming one.
+2. `logout` classified `GatewayNative`, not `Proxied` -- it has no
+   `sessionId`, so in acpx's multi-backend gateway there is no single
+   unambiguous backend it could target, unlike a real single-agent ACP
+   agent with exactly one connection. `dispatch_native`'s new `"logout"`
+   arm errors with a new, specific `RouterError::LogoutNotSupported`,
+   mirroring phase 6's `authenticate`/`NoAuthMethodsAdvertised` precedent
+   exactly: acpx's own gateway-level auth is transport-level (HTTP
+   bearer/WS), not ACP-level, so there is genuinely no authenticated
+   state at the gateway layer for `logout` to terminate; forwarding it
+   to one arbitrary backend among potentially many active profiles would
+   be actively misleading, and silently no-op-succeeding would
+   misrepresent that something real happened.
+3. Fetching the real schema also surfaced that acpx's own client-facing
+   `initialize` response's `agentCapabilities` was missing
+   `sessionCapabilities` entirely (a whole real v1 sub-object, distinct
+   from the already-correct top-level `loadSession` flag). Added
+   `sessionCapabilities: {close: {}, delete: {}, resume: {}}` -- honest,
+   since all three are genuinely `Proxied` end to end. Deliberately
+   **excludes** `list`: acpx's own `session/list` handler answers from
+   its own gateway-scoped `SessionRegistry` (`{sessionId, agentId}` per
+   entry, no pagination, no per-backend `SessionInfo` shape), not the
+   real per-backend, cursor-paginated `session/list` schema -- see
+   finding 4 below; advertising `list: {}` would be a false spec-
+   compliance claim about a method whose current shape is a known,
+   tracked divergence. Also excludes `additionalDirectories` (acpx
+   forwards whatever a client sends but never itself validates/acts on
+   it, so there's no acpx-level capability claim to make either way) and
+   `auth.logout` (matches finding 2 -- not actually supported).
+
+**Tests:** `acpx-core/src/router.rs`'s `classifies_phase_9_stable_
+methods` (classification only); new `acpx-core/tests/session_load_
+rehydration_test.rs` (4 tests) -- deterministic, no real subprocess/
+billing, using `session/close` (which phase 7 made evict the in-memory
+registry while leaving the durable row alone) as a cheap stand-in for "a
+restart happened": `session/load` rehydrates after close and the
+session is genuinely reusable for a real follow-up `session/prompt`
+afterward; `session/delete` rehydrates the same way; `session/prompt`
+(an ordinary, non-resumption `Proxied` method) does **not** rehydrate
+even with a matching persisted row present, proving the allowlist scope
+is real and enforced, not just documented; `session/load` with no
+`Router::with_persistence` configured at all fails with the specific
+`SessionNotPersisted` rather than a generic/misleading error.
+`acpx-core/tests/client_initialize_test.rs` gained assertions on the new
+`sessionCapabilities` fields (including asserting `list` is absent) and
+a new `logout_is_refused_with_a_clear_error_since_no_logout_capability_
+is_advertised` test.
+
+Workspace test count after this phase: **173 passed, 0 failed, 4
+ignored**, `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `session/resume` still shares the rehydration path but remains
+   untested by a real end-to-end test (carried over from phase 8,
+   unchanged -- still the most direct concrete next step).
+2. `session/list`'s real-vs-gateway-native shape mismatch (finding 3
+   above) remains unfixed -- now at least *honestly* unadvertised in
+   `initialize` rather than silently inconsistent, but the underlying
+   architectural decision (rename the gateway-native concept vs. make
+   `session/list` a real per-backend `Proxied` call vs. accept the
+   divergence permanently) is still open. Carried over from phase 8.
+3. `session/fork` (unstable, but `claude-agent-acp` implements
+   `unstable_forkSession`) and `elicitation/create`/`elicitation/
+   complete` (unstable) remain unclassified -- confirmed via the real
+   schema fetched this phase that these are genuinely absent from the
+   *stable* v1 schema (only present in an unstable/v2 schema this phase
+   didn't fetch), so lower priority than any remaining stable-method gap
+   by the spec's own stability contract. Worth a dedicated recheck once
+   stable-surface gaps are exhausted.
+4. `ContentBlock` variant (image/audio/resource) passthrough and `_meta`
+   field passthrough in `session/prompt` -- still open, carried over
+   unchanged from phases 7/8.
+5. Not yet re-verified this phase: whether `terminal/*`'s and `fs/*`'s
+   real schemas (phases 3/4) still match the v1 schema fetched this
+   phase exactly -- this phase's fetch was scoped to `session/*`/
+   `logout`/`agentCapabilities`; a full field-by-field diff against
+   every previously-implemented method using this same authoritative
+   source (rather than the secondary summaries earlier phases relied on)
+   is a good candidate for a future phase, purely as a confidence check
+   rather than because any specific discrepancy is suspected.
