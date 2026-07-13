@@ -31,6 +31,22 @@ pub enum MethodClass {
 /// state (session registry, profile store, conductor) lives in `Router`.
 pub fn classify(method: &str) -> MethodClass {
     match method {
+        // **Phase 6 addition -- closes a real, previously-undiscovered
+        // gap:** a spec-compliant ACP client always sends `initialize`
+        // as its very first call over the wire, before anything else
+        // (per agentclientprotocol.com's own documented handshake
+        // flow). Every dispatch path and every test in this workspace
+        // before this phase only ever implemented/exercised the
+        // *backend*-facing side of `initialize`/`authenticate` (acpx
+        // calling out to whatever process a profile spawns -- see
+        // `ensure_backend_initialized`); acpx's own client-facing
+        // endpoint never classified either method at all, so it fell
+        // through to `MethodClass::Unknown` and any real ACP editor/IDE
+        // connecting to acpx would get an immediate `UnknownMethod`
+        // error on its first ever request, before `session/new` was
+        // ever reached. See `dispatch_native`'s `"initialize"`/
+        // `"authenticate"` arms for what acpx answers now.
+        "initialize" | "authenticate" => MethodClass::GatewayNative,
         "session/new" => MethodClass::Hybrid,
         "session/prompt" | "session/resume" | "session/load" | "session/close"
         | "session/set_mode" | "session/cancel"
@@ -182,6 +198,8 @@ pub enum RouterError {
     BackendRequiresAuthentication(serde_json::Value),
     #[error("backend rejected authenticate: {0}")]
     BackendAuthenticationError(serde_json::Value),
+    #[error("authenticate: acpx's own initialize response advertises no authMethods (requested methodId: {0:?}); no transport-level bearer-token/session auth is bypassed by this -- see acpx-server's own HTTP/WS auth")]
+    NoAuthMethodsAdvertised(Option<String>),
 }
 
 impl Router {
@@ -618,6 +636,73 @@ impl Router {
     ) -> Result<serde_json::Value, RouterError> {
         let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
         let result = match method {
+            // **Phase 6:** acpx's own client-facing `initialize` --
+            // distinct from `ensure_backend_initialized`'s backend-facing
+            // handshake (that one negotiates with whatever process a
+            // profile spawns; this one is acpx itself answering as the
+            // ACP agent its clients think they're talking to). Real
+            // schema defaults confirmed against agentclientprotocol.com/
+            // protocol/schema: `agentCapabilities` defaults to
+            // `{loadSession:false, mcpCapabilities:{http:false,sse:false},
+            // promptCapabilities:{audio:false,embeddedContext:false,
+            // image:false}}`, `authMethods` to `[]`. acpx declares the
+            // permissive end of each flag instead of the spec's
+            // conservative defaults: as a transparent multiplexing proxy,
+            // acpx itself never inspects, transforms, or strips prompt
+            // content blocks, `mcpServers` transport kinds, or
+            // `session/load` calls -- it forwards every one of them
+            // verbatim to whichever backend a later `session/new`
+            // resolves to (see `classify`'s `Proxied`/`Hybrid` buckets),
+            // so it imposes no restriction of its own to advertise here.
+            // This is honestly *not* a promise that every backend a
+            // client might later select via `_acpx.profile` actually
+            // supports all of these -- that per-backend truth is only
+            // knowable after `session/new`, and already surfaced there
+            // via `_acpx.agentCapabilities` (phase 1). `authMethods`
+            // stays the spec default `[]`: acpx-server's own access
+            // control is transport-level (HTTP bearer token / WS auth,
+            // enforced before a request ever reaches this dispatcher),
+            // not an ACP-level `authenticate` exchange, so there is
+            // genuinely no method id to advertise.
+            "initialize" => serde_json::json!({
+                "protocolVersion": 1,
+                "agentCapabilities": {
+                    "loadSession": true,
+                    "promptCapabilities": {
+                        "image": true,
+                        "audio": true,
+                        "embeddedContext": true
+                    },
+                    "mcpCapabilities": {
+                        "http": true,
+                        "sse": true
+                    }
+                },
+                "authMethods": [],
+                "agentInfo": {
+                    "name": "acpx",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+            // **Phase 6:** a compliant client only ever calls
+            // `authenticate` in response to a non-empty `authMethods` in
+            // `initialize`'s result -- acpx's own `initialize` (just
+            // above) always advertises `[]`, so any `authenticate` call
+            // acpx receives here is, by definition, requesting a method
+            // id that was never offered. Reply with a clear, specific
+            // error rather than either silently succeeding (which would
+            // misrepresent that some real authentication happened) or a
+            // bare method-not-found (which would misrepresent
+            // `authenticate` itself as unsupported, when it's the
+            // *methodId* that's the problem).
+            "authenticate" => {
+                let method_id = request
+                    .get("params")
+                    .and_then(|p| p.get("methodId"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string);
+                return Err(RouterError::NoAuthMethodsAdvertised(method_id));
+            }
             "session/list" => {
                 let sessions: Vec<serde_json::Value> = self
                     .sessions

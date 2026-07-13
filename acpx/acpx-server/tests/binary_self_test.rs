@@ -317,3 +317,67 @@ async fn real_binary_serves_stdio_end_to_end() {
     assert_eq!(body["jsonrpc"], json!("2.0"));
     assert_eq!(body["id"], json!(1));
 }
+
+#[tokio::test]
+async fn real_binary_answers_the_client_facing_initialize_and_authenticate_handshake() {
+    // ACP compatibility hardening, phase 6: a spec-compliant ACP
+    // client/editor always sends `initialize` as its very first request,
+    // before anything else -- this proves the real, already-compiled
+    // `acpx-server` binary answers that correctly over its real HTTP
+    // transport (not just that `Router::dispatch` handles it
+    // in-process, which `acpx-core/tests/client_initialize_test.rs`
+    // already covers in more detail). Before this phase, `initialize`
+    // fell through `classify`'s `_ => MethodClass::Unknown` and this
+    // exact request would have come back as a JSON-RPC error instead --
+    // i.e. any real ACP editor connecting to this real binary would
+    // never have gotten past its own opening handshake.
+    let addr = ephemeral_addr().await;
+    let _server = spawn_real_server(addr).await;
+    let client = reqwest::Client::new();
+
+    let init_response = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {}}}))
+        .send()
+        .await
+        .expect("POST /rpc initialize against the real binary");
+    assert!(init_response.status().is_success());
+    let init_body: Value = init_response.json().await.expect("json body");
+    assert_eq!(init_body["result"]["protocolVersion"], json!(1));
+    assert_eq!(init_body["result"]["authMethods"], json!([]));
+    assert_eq!(
+        init_body["result"]["agentCapabilities"]["loadSession"],
+        json!(true)
+    );
+
+    // No `authMethods` were advertised above, so a real client has no
+    // legitimate reason to call `authenticate` -- but this proves that,
+    // if one does anyway, the real binary answers with a clear JSON-RPC
+    // error (not a hang, not a bare method-not-found, not a silent
+    // fake-success) rather than exposing an implementation detail like a
+    // Rust panic or a connection drop.
+    let auth_response = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({"jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {"methodId": "whatever"}}))
+        .send()
+        .await
+        .expect("POST /rpc authenticate against the real binary");
+    assert!(auth_response.status().is_success());
+    let auth_body: Value = auth_response.json().await.expect("json body");
+    assert!(
+        auth_body.get("error").is_some(),
+        "expected a JSON-RPC error for an unadvertised methodId, got {auth_body}"
+    );
+
+    // The real binary must still be fully usable afterward -- neither
+    // call should have left the process, its router, or the HTTP
+    // transport in any different state than before this test's first
+    // request.
+    let list_response = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/list", "params": {}}))
+        .send()
+        .await
+        .expect("POST /rpc session/list after the handshake exchange");
+    assert!(list_response.status().is_success());
+}

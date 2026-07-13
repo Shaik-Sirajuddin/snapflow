@@ -930,3 +930,127 @@ ignored**, `cargo fmt --all --check` and `cargo build --workspace
    client picking a method (or supplying a credential) interactively in
    response to a backend's real advertised options. Same root cause,
    same honest non-fix as before.
+
+## ACP compatibility hardening, phase 6 -- client-facing `initialize`/`authenticate`
+
+Closes the last item from phase 5's recheck list, and turns out to be
+the most consequential gap found across this entire hardening series:
+**a spec-compliant ACP client/editor always sends `initialize` as its
+very first request over the wire, before anything else** (per
+agentclientprotocol.com's own documented handshake flow). Every phase
+1-5 in this series, and every one of this workspace's ~155 pre-existing
+tests, only ever implemented/exercised the *backend*-facing side of
+`initialize`/`authenticate` (`ensure_backend_initialized` -- acpx
+calling out to whatever process a profile spawns). acpx's own
+client-facing endpoint never classified `initialize` or `authenticate`
+at all -- both fell through `classify`'s `_ => MethodClass::Unknown`,
+so any real ACP editor/IDE connecting to acpx (over any transport:
+stdio, HTTP, WS) would have gotten an immediate `UnknownMethod` error
+on the very first request it ever sent, before `session/new` was ever
+reached. Every other phase's real bug fixes were meaningless for such
+a client, since it would never have gotten that far.
+
+Both methods are now `MethodClass::GatewayNative` (no backend process
+involved -- this is acpx answering as the ACP agent its own clients
+think they're talking to, not anything to do with which backend a
+later `session/new` might resolve to). `initialize` returns real
+values confirmed against agentclientprotocol.com/protocol/schema's
+`InitializeResponse`: `protocolVersion: 1`, `authMethods: []` (acpx-
+server's own access control is transport-level -- HTTP bearer token /
+WS auth, enforced before a request ever reaches the router -- not an
+ACP-level exchange, so there is genuinely no method id to advertise),
+and `agentCapabilities` set to the *permissive* end of every flag
+(`loadSession: true`, `promptCapabilities.{image,audio,
+embeddedContext}: true`, `mcpCapabilities.{http,sse}: true`) rather
+than the spec's conservative all-`false` defaults -- deliberate: acpx
+is a transparent multiplexing proxy that never inspects, transforms,
+or strips prompt content blocks, `mcpServers` transport kinds, or
+`session/load` calls, it forwards every one of them verbatim to
+whichever backend a later `session/new` resolves to (`classify`'s
+`Proxied`/`Hybrid` buckets). Documented honestly as *not* a guarantee
+that whichever backend a client's later-chosen profile resolves to
+actually supports all of these -- that per-backend truth is only
+knowable after `session/new` and already surfaced there via
+`_acpx.agentCapabilities` (phase 1). `authenticate` -- since a
+compliant client only ever calls it in response to a non-empty
+`authMethods`, and acpx's own `initialize` always advertises `[]` --
+returns a new `RouterError::NoAuthMethodsAdvertised(Option<String>)`
+(carrying whatever `methodId` was requested) rather than silently
+succeeding (misrepresenting that real authentication happened) or a
+bare method-not-found (misrepresenting `authenticate` itself as
+unsupported, when it's the *methodId* that's the problem).
+
+**Second recheck item, verified rather than assumed:** phase 5's
+recheck asked whether `permission_policy`/`allow_fs_access`/
+`allow_terminal_access`/`auth_method_id` are exposed as first-class
+`profiles/*` response fields. Turns out this was already true by
+construction since each field was added in phases 3/4/5 -- `Profile`
+derives `Serialize` on every `pub` field with no `#[serde(skip)]`
+anywhere, so `profiles/create`/`profiles/list`/`profiles/update`'s
+responses (which serialize the whole stored `Profile` via
+`redact_launch_overrides(serde_json::to_value(&profile))`) already
+included all four fields the moment each was added. Nobody had
+actually asserted this with a test until now -- `client_initialize_
+test.rs`'s fourth test closes that verification gap, not a code gap.
+`agentCapabilities` is deliberately *not* added as a static `profiles/*`
+field: it's live, per-process runtime information from an actually
+spawned backend's real `initialize` response, not profile
+configuration that exists before any process is ever spawned -- adding
+a fake/stale placeholder value to `Profile` would misrepresent it as
+config. It stays exactly where phase 1 put it (`session/new`'s
+`_acpx.agentCapabilities`, populated once a backend is actually
+running), which is the only point in the request lifecycle where it's
+honestly knowable.
+
+New `acpx-core/tests/client_initialize_test.rs` (4 tests): `initialize`
+returns real capabilities (not an `UnknownMethod` error); `authenticate`
+with any `methodId` gets `RouterError::NoAuthMethodsAdvertised` carrying
+that exact id back; `session/new` still works without ever calling
+`initialize` first (phase 6 is additive, not a new hard prerequisite --
+every native/unmanaged-mode client in this workspace's pre-existing
+tests never called it); and the `profiles/*` field-exposure check
+described above, via both `profiles/create`'s own response and a
+separate `profiles/list` call. Plus a new test in `acpx-server/tests/
+binary_self_test.rs`, `real_binary_answers_the_client_facing_
+initialize_and_authenticate_handshake` -- the strongest proof available
+in this workspace, since it drives the real, already-compiled
+`acpx-server` binary over a real HTTP connection exactly the way a real
+ACP editor would: `initialize` first, `authenticate` with an arbitrary
+method id second (asserting a real JSON-RPC error body, HTTP 200 per
+this transport's existing error-envelope convention -- not a hang, not
+a connection drop), then `session/list` to prove the real process is
+still fully usable afterward.
+
+Workspace test count after this addition: **163 passed, 0 failed, 3
+ignored**, `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. This phase closes every item on phase 5's recheck list. Re-deriving
+   from scratch against the full spec surface (agentclientprotocol.com/
+   protocol/schema) rather than just prior phases' leftover lists: ACP
+   also defines `session/cancel` (already `Proxied`, forwarded
+   verbatim -- see `classify`), image/audio/resource `ContentBlock`
+   variants in prompts (acpx never inspects prompt content at all,
+   forwards every block type verbatim -- consistent with this phase's
+   permissive `promptCapabilities` declaration), and `_meta` fields on
+   most request/response shapes (acpx forwards `params`/`result`
+   objects verbatim in every `Proxied`/`Hybrid` path, so any `_meta` a
+   real client or backend sends already survives untouched -- not
+   something acpx needs to special-case). No further gaps identified
+   in the wire-protocol surface itself as of this phase.
+2. The live-interactive-decision gap from every prior phase's recheck
+   is unaffected by this phase (it's about mid-call backend-initiated
+   requests, not the opening handshake) -- still the honest, tracked,
+   not-attempted-in-this-series residual.
+3. What remains genuinely open is no longer "is a wire-protocol method
+   missing" but operational/hardening concerns one level up: TLS (see
+   `05-open-risks.md`, unchanged by this series), and whether acpx's
+   own `initialize` response should ever become backend-dependent
+   (e.g. narrower `agentCapabilities` for a client that's already told
+   acpx which profile/backend it intends to use via some future
+   pre-`session/new` signal) rather than the fixed, permissive-proxy
+   values this phase ships -- not attempted, no evidence yet that any
+   real client needs it (`_acpx.agentCapabilities` on `session/new`
+   already covers the "what does my actual backend support" question
+   once a session exists).
