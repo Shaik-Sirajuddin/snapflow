@@ -291,7 +291,7 @@ these are acknowledged, not newly discovered:
 
 - **`ext::registry::install`'s progress/job model is still undecided** (Phase 5 step 22) -- the client can now trigger installation for real, but a slow `npx`/`binary` install has no way to report incremental progress back to a waiting caller; `05-open-risks.md`'s "client-initiated installer needs a progress/job model" item is directly relevant now that this call path exists, not just a future concern.
 - **No live-registry test runs by default.** `acpx-registry/tests/live_registry.rs`'s `live_registry_matches_expected_shape` is `#[ignore]`d (hits the real network); only `registry.fallback.json` parsing is covered in the default test run.
-- **Resolved for `claude-agent-acp`, still open for `codex-acp`/gemini.** `acpx-server/tests/real_claude_multi_agent_test.rs` (see the "real ACP adapter end-to-end" section above) now drives a real, `npx`-installed `claude-agent-acp` process through the real gateway and client SDK, `#[ignore]`d and credential-gated. `codex-acp`'s bifrost `/v1/responses` route was unreliable in this environment (`wire_api="responses"` required, `"chat"` did not work) so it was not exercised live this session; Gemini was never attempted live at all. Phase 6 step 26's harness (`acpx-server/tests/e2e_agent_lifecycle_harness.rs`) still swaps in the synthetic stand-in for its "use" phase for all three agents, unchanged.
+- **Resolved for `claude-agent-acp` and `codex-acp` on this machine (via ambient CLI auth), still open for Gemini.** `acpx-server/tests/real_claude_multi_agent_test.rs` drives real `claude-agent-acp` with externally-supplied credentials; `acpx-server/tests/real_ambient_multi_agent_test.rs` (see "Post-provisioning" section above) drives both real `claude-agent-acp` *and* real `codex-acp` using this machine's own already-logged-in CLI sessions, no credentials supplied by acpx at all -- both passed for real. Gemini was never attempted live (no ambient `gemini` CLI login on this machine). Phase 6 step 26's harness (`acpx-server/tests/e2e_agent_lifecycle_harness.rs`) still swaps in the synthetic stand-in for its "use" phase for all three agents, unchanged -- that harness's job is detect/install coverage across all three registry ids uniformly, not real-conversation coverage, which now lives in the two `real_*` test files instead.
 - **No Windows/macOS test coverage for the `binary` distribution's download+extract path** -- `install.rs`'s zip/tar.gz sniffing is unit-tested, but only exercised on Linux in this environment; `05-open-risks.md` explicitly calls out that this path needs testing on all three OSes before being considered done.
 - **No encryption at rest for the keystore.** `keystore.rs` is explicit in its own doc comment: secrets live in-memory only, process restart forgets them, and no encryption-at-rest mechanism has been chosen yet (`05-open-risks.md`'s "Key storage mechanism is unspecified" item is still open).
 - **`claude-agent-acp`'s `ANTHROPIC_BASE_URL` support is researched, not verified against a real running adapter** -- see Phase 3 step 16's row above and `05-open-risks.md`.
@@ -439,3 +439,56 @@ deployment shape.
 Combined workspace test count after this addition: **143 passed, 0
 failed, 2 ignored**, `cargo fmt --all --check` and `cargo build
 --workspace` both clean.
+
+## Post-provisioning -- real `codex-acp` adapter end-to-end via ambient CLI auth (partially closes a Gaps-section item)
+
+The user pointed out this machine already has `claude`/`codex` CLIs
+installed and logged in ("we already have claude, codex binaries in this
+system, you can use that") -- no fabricated credentials needed to
+exercise a real adapter, unlike `real_claude_multi_agent_test.rs` which
+requires externally-supplied `ACPX_LIVE_TEST_ANTHROPIC_*` values. This
+closes the `codex-acp` half of the "resolved for claude-agent-acp, still
+open for codex-acp/gemini" gap below (Gemini remains open -- no ambient
+`gemini` CLI login available on this machine).
+
+Manually verified first via `curl` against a live `acpx-server` process
+started with an `ACPX_CONFIG_FILE`-provisioned `claude-ambient`/
+`codex-ambient` profile pair (no `provider`/`launch_overrides` at all):
+`agents/list` correctly reported both `claude-acp` and `codex-acp` as
+`installed` (real `node`/`npm` on `PATH`, live-registry-fetched entry
+list -- not just the 3-agent `registry.fallback.json`, confirming this
+environment has live network access to the real ACP registry too);
+`session/new` against each profile spawned the real `npx`-distributed
+adapter, which inherited this process's ambient environment and found
+its own already-authenticated session (`~/.claude/.credentials.json` for
+claude-agent-acp; the local codex CLI's bifrost-backed auth store for
+codex-acp) with zero acpx-supplied credentials; a real `haiku` call
+replied `PONG` (real cost `$0.046591` billed to the ambient Claude
+account -- a real, small, actual charge, not simulated); a real
+`codex/gpt-5.4-mini[low]` call (this machine's own bifrost model catalog,
+fetched live via `session/new`'s `models.availableModels`) replied
+`PANG`, streamed as `agent_message_chunk` updates (`"P"` + `"ANG"`) the
+same way `claude-agent-acp` does.
+
+Automated as `acpx-server/tests/real_ambient_multi_agent_test.rs` so this
+is reproducible rather than a one-off manual check: spawns the real
+`acpx-server` binary, asserts `agents/list` reports both `claude-acp`/
+`codex-acp` as `installed`, creates two profiles with **no `provider`/
+`launch_overrides`**, then runs one real conversation turn against each
+concurrently (`tokio::join!`), asserting the real model replies contain
+`PONG`/`PANG` respectively. `#[ignore]`d and gated on
+`ACPX_LIVE_TEST_AMBIENT=1` (not credential env vars, since the
+credentials are this machine's own ambient CLI login state, not
+something a caller supplies) -- makes real billed API calls and
+hardcodes a model id (`codex/gpt-5.4-mini`) specific to this machine's
+own bifrost-backed codex catalog, so it stays opt-in rather than running
+in a shared/default `cargo test` invocation. Actually run and passed:
+`ok. 1 passed; 0 failed` in 13.81s.
+
+| What | Implementation | Test coverage | Status |
+|---|---|---|---|
+| Real `claude-agent-acp` + real `codex-acp`, both via this machine's ambient CLI auth (no acpx-supplied credentials), detected + spawned + prompted concurrently through the real `acpx-server` binary and real `acpx-client` SDK | `acpx-server/tests/real_ambient_multi_agent_test.rs` | 1 test (`#[ignore]`d, opt-in via `ACPX_LIVE_TEST_AMBIENT=1`, no external credential vars needed): run and passed on this machine, both real model replies (`PONG`/`PANG`) verified | Done for `claude-acp`/`codex-acp` on this machine; Gemini still unattempted (no ambient `gemini` CLI login here) |
+
+Combined workspace test count after this addition: **144 passed, 0
+failed, 3 ignored** (adds this new opt-in test to the prior 2), `cargo
+fmt --all --check` and `cargo build --workspace` both clean.
