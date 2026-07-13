@@ -19,4 +19,4 @@ pub use persistence::{
     Direction, PersistenceError, PersistenceStore, SessionRecord, TranscriptRecord,
 };
 pub use router::{MethodClass, Router};
-pub use session_registry::{BackendSessionId, SessionRegistry};
+pub use session_registry::{BackendSessionId, SessionRegistry, TenantId};

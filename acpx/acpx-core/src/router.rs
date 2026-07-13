@@ -10,7 +10,7 @@ use crate::notify::NotificationHub;
 use crate::persistence::{Direction, PersistenceStore};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
-use crate::session_registry::{BackendSessionId, SessionRegistry};
+use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -588,6 +588,7 @@ impl Router {
 
         let backend_session_id = extract_backend_session_id(&response)?;
         let gateway_id = self.sessions.register(
+            &TenantId::default_tenant(),
             agent_id,
             BackendSessionId(backend_session_id),
             profile.as_ref().map(|p| p.name.clone()),
@@ -601,12 +602,10 @@ impl Router {
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
         }
-        if let Some(entry) = self
-            .sessions
-            .resolve(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id_str.clone(),
-            ))
-        {
+        if let Some(entry) = self.sessions.resolve(
+            &TenantId::default_tenant(),
+            &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
+        ) {
             self.spawn_session_persistence(
                 gateway_session_id_str,
                 entry.agent_id.clone(),
@@ -731,11 +730,15 @@ impl Router {
         profile_name: Option<String>,
         cwd: Option<String>,
     ) -> String {
-        if let Some(existing) = self.sessions.find_by_backend(agent_id, backend_session_id) {
+        if let Some(existing) =
+            self.sessions
+                .find_by_backend(&TenantId::default_tenant(), agent_id, backend_session_id)
+        {
             return existing.0;
         }
         self.sessions
             .register(
+                &TenantId::default_tenant(),
                 agent_id.to_string(),
                 BackendSessionId(backend_session_id.to_string()),
                 profile_name,
@@ -911,6 +914,7 @@ impl Router {
             self.resolve_profile(name).await?;
         }
         self.sessions.insert(
+            &TenantId::default_tenant(),
             acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
             entry.clone(),
         );
@@ -947,11 +951,10 @@ impl Router {
             .ok_or(RouterError::MissingSessionId)?
             .to_string();
 
-        let entry = match self
-            .sessions
-            .resolve(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id.clone(),
-            )) {
+        let entry = match self.sessions.resolve(
+            &TenantId::default_tenant(),
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        ) {
             Some(entry) => entry.clone(),
             None => self.rehydrate_session(&method, &gateway_session_id).await?,
         };
@@ -998,9 +1001,10 @@ impl Router {
             // closed sessions as still live indefinitely. `remove` already
             // existed on `SessionRegistry` but was never called from
             // anywhere in this file until now.
-            self.sessions.remove(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id.clone(),
-            ));
+            self.sessions.remove(
+                &TenantId::default_tenant(),
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            );
             if let Some(store) = self.persistence.clone() {
                 tokio::spawn(async move {
                     if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
@@ -1083,9 +1087,10 @@ impl Router {
             .to_string();
         let entry = self
             .sessions
-            .resolve(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id.clone(),
-            ))
+            .resolve(
+                &TenantId::default_tenant(),
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            )
             .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
@@ -1272,7 +1277,7 @@ impl Router {
                     None => {
                         let sessions: Vec<serde_json::Value> = self
                             .sessions
-                            .list()
+                            .list(&TenantId::default_tenant())
                             .map(|(gateway_id, entry)| {
                                 serde_json::json!({
                                     "sessionId": gateway_id,
@@ -2019,9 +2024,11 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     };
     let (gateway_id, hub) = {
         let r = ctx.router.lock().await;
-        let gateway_id = r
-            .sessions
-            .find_by_backend(&ctx.agent_id, backend_session_id);
+        let gateway_id = r.sessions.find_by_backend(
+            &TenantId::default_tenant(),
+            &ctx.agent_id,
+            backend_session_id,
+        );
         (gateway_id, r.notification_hub.clone())
     };
     let Some(gateway_id) = gateway_id else {
@@ -2567,9 +2574,10 @@ async fn dispatch_session_cancel_shared(
         let r = router.lock().await;
         let entry = r
             .sessions
-            .resolve(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id.clone(),
-            ))
+            .resolve(
+                &TenantId::default_tenant(),
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            )
             .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
         let backend_session_id = entry.backend_session_id.0.clone();
         let cancel_writer = r.supervisor.cancel_writer(&entry.agent_id);
@@ -2720,9 +2728,10 @@ async fn dispatch_proxied_shared(
 
     let (backend, persistence, call_policy, agent_id) = {
         let mut r = router.lock().await;
-        let entry = match r.sessions.resolve(&acpx_proto::session::GatewaySessionId(
-            gateway_session_id.clone(),
-        )) {
+        let entry = match r.sessions.resolve(
+            &TenantId::default_tenant(),
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        ) {
             Some(entry) => entry.clone(),
             None => r.rehydrate_session(&method, &gateway_session_id).await?,
         };
@@ -2775,13 +2784,10 @@ async fn dispatch_proxied_shared(
         // briefly (bookkeeping only, no backend I/O held) to evict the
         // closed session from the shared `SessionRegistry` too, so the
         // two dispatch paths never drift apart on this behavior.
-        router
-            .lock()
-            .await
-            .sessions
-            .remove(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id.clone(),
-            ));
+        router.lock().await.sessions.remove(
+            &TenantId::default_tenant(),
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        );
         if let Some(store) = persistence {
             tokio::spawn(async move {
                 if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
@@ -2886,6 +2892,7 @@ async fn dispatch_session_new_shared(
     let (gateway_session_id_str, persist_args) = {
         let mut r = router.lock().await;
         let gateway_id = r.sessions.register(
+            &TenantId::default_tenant(),
             agent_id,
             BackendSessionId(backend_session_id),
             profile.as_ref().map(|p| p.name.clone()),
@@ -2901,9 +2908,10 @@ async fn dispatch_session_new_shared(
         // `register` above, and this is the same lock acquisition anyway.
         let persist_args = r
             .sessions
-            .resolve(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id_str.clone(),
-            ))
+            .resolve(
+                &TenantId::default_tenant(),
+                &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
+            )
             .map(|entry| (entry.agent_id.clone(), entry.backend_session_id.0.clone()));
         (gateway_session_id_str, persist_args)
     };

@@ -2137,6 +2137,59 @@ in this series.
    methods are only ever sent mid an already in-flight `session/prompt`,
    which means a real call already holds the lock throughout, so the
    scavenger's own `try_lock` would never even succeed in that window) --
-   logged with `tracing::warn!` rather than silently dropped specifically
-   so this assumption gets falsified loudly, not silently, if some real
-   adapter ever proves it wrong.
+  logged with `tracing::warn!` rather than silently dropped specifically
+  so this assumption gets falsified loudly, not silently, if some real
+  adapter ever proves it wrong.
+
+## 2026-07-13 -- ACP compatibility phase 16: tenant isolation phase A -- `TenantId` plumbing, `SessionRegistry` nesting (behavior-preserving)
+
+**Series context.** First implementation phase of a new, separate plan,
+`memory/acpx/gen/plans/acpx-tenant-isolation/` (see that plan's `README.md`
+for the full index) -- multi-tenant session isolation *without*
+authentication (a tenant id is a self-declared partition key, not a
+credential; see that plan's `00-goal.md` for why auth is explicitly out
+of scope). This phase is pure, behavior-preserving plumbing: it
+introduces the `TenantId` type and nests `SessionRegistry`'s map by
+tenant, but every call site in `router.rs` still passes
+`&TenantId::default_tenant()` unconditionally -- no transport actually
+extracts or threads a real tenant id yet (that's Phase B, next).
+
+**What changed:**
+1. New `acpx_core::session_registry::TenantId(String)` newtype (also
+   re-exported from `acpx_core`'s crate root), with `TenantId::
+   default_tenant()` (`"default"`) as the implicit tenant every
+   pre-existing caller uses.
+2. `SessionRegistry`'s inner map changed from `HashMap<String,
+   SessionEntry>` to `HashMap<TenantId, HashMap<String, SessionEntry>>`.
+   Every method (`register`, `resolve`, `insert`, `remove`, `list`,
+   `find_by_backend`) gained a leading `tenant_id: &TenantId` parameter.
+3. Every one of the ~15 call sites across `acpx-core/src/router.rs`
+   (`dispatch_session_new`, `dispatch_proxied`, `dispatch_session_cancel`,
+   `dispatch_native`'s `session/list` aggregate, `translate_or_register_
+   backend_session`, `rehydrate_session`, `try_deliver_live`, and every
+   `_shared` equivalent: `dispatch_session_new_shared`, `dispatch_proxied_
+   shared`, `dispatch_session_cancel_shared`) now pass
+   `&TenantId::default_tenant()` explicitly.
+
+**Tests (`acpx-core/src/session_registry.rs`, 1 new):**
+`two_tenants_never_collide_even_with_identical_backend_identity` -- two
+different `TenantId`s registering sessions against the exact same
+`agent_id`/`backend_session_id` pair never resolve, list, or
+`find_by_backend`-match into each other's namespace; the 3 pre-existing
+`SessionRegistry` unit tests were updated to pass a tenant id (still
+`TenantId::default_tenant()`) and continue to pass unchanged.
+
+Workspace test count after this phase: **228 passed, 0 failed, 6
+ignored** (up from 227/0/6 -- 1 new test). `cargo fmt --all --check` and
+`cargo build --workspace --tests` both clean. `cargo clippy` still not
+available in this environment (component not installed), same
+limitation as every prior phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change -- this phase touches no wire behavior at all (every caller still
+resolves to the same single `"default"` tenant namespace as before), so
+every ACP-compatibility item tracked in the phases above remains exactly
+as it was. The next phase (Phase B: transport-level `X-Acpx-Tenant`
+extraction + closing the real per-backend `session/list` cross-tenant
+leak identified in `acpx-tenant-isolation/01-architecture.md`) is where
+tenant isolation actually becomes observable behavior.
