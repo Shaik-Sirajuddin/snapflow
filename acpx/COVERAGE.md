@@ -1650,3 +1650,174 @@ as the concrete next phase (13) rather than done opportunistically here,
 since it touches wire-visible behavior (a real, spec-shaped, per-backend
 `Proxied` `session/list`) and deserves its own build/test/fmt/commit
 cycle like every other phase in this series.
+
+## 2026-07-13 -- ACP compatibility phase 13: `session/list` split into a real per-backend proxy + acpx's own gateway aggregate
+
+**Directive:** continuation of the same series, executing phase 12's
+architectural decision (split, not rename-and-lose-either-half): both
+ACP spec compatibility for `session/list` and acpx's multi-agent
+aggregate view (the entire reason a multiplexing gateway exists over a
+client talking to one backend adapter directly) had to keep holding,
+not trade one for the other.
+
+**Design.** `session/list` is now dual-mode on the *same* method name,
+distinguished by the same `_acpx` extension convention `session/new`
+already established for `_acpx.profile` (managed-mode backend
+selection):
+- **No `_acpx.profile`/`_acpx.agentId` in `params`:** unchanged
+  behavior in spirit -- acpx's own gateway-scoped aggregate across every
+  backend it currently manages, from the in-memory `SessionRegistry`.
+  No real single backend could ever honestly answer this question on
+  its own. Gained one new field this phase: `cwd` (see below).
+- **With `_acpx.profile: <name>` or `_acpx.agentId: <id>`:** a real,
+  spec-shaped `Proxied` forward to that one specific backend's own
+  `session/list` (params minus `_acpx`), with every returned
+  `SessionInfo.sessionId` translated from the backend's native id into
+  a gateway id before it reaches the client.
+
+**Why the translation step is the real substance of this phase, not a
+detail.** The real `ListSessionsRequest`/`ListSessionsResponse`/
+`SessionInfo` schemas (fetched fresh, `/tmp/acp_schema.json`) have no
+`sessionId` field on the *request* at all -- `session/list` isn't scoped
+to an existing session the way most other ACP methods are, it's a
+connection-level query answered by whichever one backend agent
+connection the caller has. Forwarding the *response*'s raw
+backend-native `SessionInfo.sessionId`s straight through, unmodified,
+would have hand the client ids it could never use against any other
+acpx method again (`session/load`, `session/prompt`, ... all require a
+*gateway* id) -- technically schema-shaped, but practically useless
+through a proxy, and a dead end for `session/load`'s own restart-
+survival story (phase 8/9/12): an untranslated id has no
+`SessionRegistry`/persisted-`SessionRecord` row for `rehydrate_session`
+to find. New `Router::translate_or_register_backend_session` (paired
+with new `SessionRegistry::find_by_backend`, a reverse `(agent_id,
+backend_session_id) -> gateway_id` lookup) reuses an already-known
+gateway id when this exact backend session was already registered
+(typically because acpx itself opened it via `session/new` earlier in
+this process's lifetime), or mints and registers a fresh one on the
+spot for a genuinely new discovery -- e.g. a session `claude-agent-acp`
+reports from the real Claude Code SDK's own on-disk history that
+predates or falls outside this exact acpx process's own `session/new`
+calls. From that point on the discovered id is a first-class gateway
+session, `session/load`-able exactly like any other. Proved concretely,
+not just asserted: `session_list_real_test.rs`'s `...proxies_to_the_
+real_backend_and_translates_ids` calls `session/close` on a freshly-
+discovered id afterward and requires it to succeed (a bare opaque
+string that was never actually registered would fail `UnknownSession`).
+
+**Second real gap closed in passing: `SessionInfo.cwd` is a *required*
+field**, and nothing in `SessionRegistry` tracked a session's `cwd`
+before this phase -- so even acpx's own gateway-scoped aggregate could
+never have honestly included it (an omission that would have been a
+second, independent reason `sessionCapabilities.list` stayed
+unadvertised even after the real-proxy half was built). New
+`SessionEntry::cwd: Option<String>`, populated from `session/new`'s own
+`params.cwd` (both `dispatch_session_new` and its `_shared` twin) and
+from a real backend's `SessionInfo.cwd` when a session is discovered via
+the real `session/list` path. **Known, tracked limitation, not silently
+dropped:** the sqlite `sessions` table (`SessionRecord`) still doesn't
+carry `cwd`, so a session rehydrated via `rehydrate_session` (`session/
+load`/`session/resume`/`session/delete` surviving a restart) reports
+`cwd: null` in the aggregate view until a future phase extends that
+table -- an honest gap, not a regression this phase introduced (`cwd`
+was never tracked anywhere before this phase).
+
+**`initialize`'s `agentCapabilities.sessionCapabilities.list`** is now
+advertised (`{}`), closing the divergence phases 9-12 all deliberately
+left unadvertised and tracked. Honest in the same qualified sense
+`loadSession`/`promptCapabilities` already are: a real claim that the
+method can be genuinely spec-conformant, not that every unqualified
+call is (an unqualified call is, by design, answering a different,
+gateway-native question no single real backend could answer at all).
+
+**Concurrency, explicitly guarded, not just hoped to still hold.** The
+real per-backend path needed its own `dispatch_shared`-side variant
+(`dispatch_session_list_real_shared`), mirroring every other
+backend-talking `_shared` function in `router.rs`: resolve gateway state
+under `router`'s lock only briefly, release it, do the actual backend
+stdio round trip against just that backend's own per-process lock.
+Routing a real-per-backend `session/list` through the generic
+`MethodClass::GatewayNative => router.lock().await.dispatch(request)`
+arm instead (the obvious, lazy thing to do, since `session/list` was
+already classified `GatewayNative` and stays so) would have held the
+*entire* router lock for the whole backend round trip -- blocking every
+other concurrent client, including ones talking to entirely unrelated
+backends, for no reason. New `dispatch_shared_session_list_does_not_
+block_a_concurrent_different_backend_call` in `session_list_real_shared_
+test.rs` proves this isn't hypothetical: a synthetic slow backend
+(`sleep 0.3` inside its `session/list` reply) run concurrently with a
+`session/new` against a genuinely different, fast backend, asserting the
+fast call completes in well under 150ms rather than queuing up behind
+the slow one. This is the concrete guard for this whole goal's explicit
+"while multiplex management objectives of acpx are preserved" clause,
+not an incidental nice-to-have.
+
+**Tests, in order of what they each prove:**
+1. `acpx-core/tests/session_list_real_test.rs` (4 tests, synthetic
+   stand-in backend, `Router::dispatch`): no-selector aggregate mode
+   (now including `cwd`); selector mode forwards the real backend reply
+   and translates both an already-known id and a freshly-discovered one
+   correctly, the latter proven genuinely usable via a real `session/
+   close`; `_acpx.profile` and `_acpx.agentId` resolve through the exact
+   same code path; a backend `session/list` rejection surfaces as a real
+   `RouterError`, not a panic or silent empty result.
+2. `acpx-core/tests/session_list_real_shared_test.rs` (2 tests,
+   `dispatch_shared`): the same selector-mode translation proof through
+   the independently-written `_shared` code path (necessary duplication,
+   not assumed-covered by (1)); the concurrency non-blocking proof
+   described above.
+3. `acpx-core/tests/client_initialize_test.rs`: updated (not added --
+   this test previously *required* `sessionCapabilities.list` to be
+   absent) to require `{}` instead, matching the new honest claim.
+4. `acpx-server/tests/real_ambient_multi_agent_test.rs`'s new
+   `ambient_claude_session_list_translates_a_real_backend_session_id`
+   (`#[ignore]`d/opt-in, `ACPX_LIVE_TEST_AMBIENT=1`): real `claude-agent-
+   acp` (confirmed via its compiled `dist/acp-agent.js` to genuinely
+   implement `listSessions`, reading the real Claude Code SDK's on-disk
+   session history, not a stub), a real billed prompt turn in a
+   freshly-created uniquely-named `cwd` (to keep the real backend's own
+   `dir`-filtered response unambiguous against whatever unrelated real
+   session history already exists on this machine), then a real `session/
+   list` call whose translated response is asserted to contain exactly
+   this test's own known gateway session id with the right `cwd`. **Ran
+   for real and passed on the first attempt** -- no further gap found
+   against a genuine adapter's actual wire behavior beyond what the
+   synthetic tests already predicted.
+
+Workspace test count after this phase: **181 passed, 0 failed, 5
+ignored** (up from 174/0/4 -- 7 new default-run tests: 4 in
+`session_list_real_test.rs`, 2 in `session_list_real_shared_test.rs`, 1
+new `SessionRegistry::find_by_backend` unit test; 1 new ignored/opt-in
+real test, run manually and confirmed passing). `cargo fmt --all
+--check` and `cargo build --workspace --tests` both clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `session/list`'s architectural item (carried since phase 8) is now
+   closed -- both halves (real spec conformance and acpx's own
+   multi-agent aggregate) hold simultaneously, proved against a real
+   adapter, and the concurrency property the split's implementation
+   could have silently regressed is explicitly tested, not just assumed.
+2. The sqlite `sessions` table not carrying `cwd` (noted above) is a
+   new, small, honestly-tracked follow-up -- affects only the aggregate
+   view's `cwd` field for sessions recovered via `rehydrate_session`
+   after a restart, not the real per-backend path (which always gets
+   `cwd` fresh from the backend's own reply) or any correctness/
+   compatibility property already tested. Worth closing in a future
+   phase, but not spec-compatibility-blocking on its own.
+3. `session/fork` (unstable) and `elicitation/create`/`elicitation/
+   complete` (unstable) remain out of scope per the stable v1 schema's
+   own stability contract, unchanged since phase 9.
+4. With this phase, every method in the real stable v1 ACP schema this
+   series has been able to enumerate (`initialize`, `authenticate`,
+   `logout`, `session/new`, `session/load`, `session/resume`, `session/
+   prompt`, `session/cancel`, `session/close`, `session/delete`,
+   `session/list`, `session/set_mode`, `session/set_config_option`,
+   `terminal/*`, `fs/*`) has now had at least one phase's worth of
+   dedicated, real-schema-driven scrutiny, with a real (not just
+   synthetic) end-to-end test for every one of them where a real backend
+   genuinely supports it. Worth a dedicated future phase re-deriving the
+   schema's full method list fresh (rather than working from this
+   series' own running memory of what it's already covered) purely as a
+   completeness cross-check, per this series' own phase-10-derived
+   lesson about not trusting "no further gaps" claims without
+   re-verifying them.

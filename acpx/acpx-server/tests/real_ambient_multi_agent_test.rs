@@ -557,6 +557,169 @@ async fn ambient_claude_session_load_survives_a_real_gateway_restart() {
     let _ = std::fs::remove_file(&db_path);
 }
 
+/// **Phase 13 addition.** Real end-to-end proof of the `session/list`
+/// dual-mode split (see `acpx-core/src/router.rs`'s `session_list_
+/// selector`/`dispatch_session_list_real` and `COVERAGE.md`'s phase 13
+/// entry): calling `session/list` with an `_acpx.profile` selector must
+/// reach `claude-agent-acp`'s own real `listSessions` (it genuinely
+/// implements `session/list`, confirmed by reading its compiled
+/// `dist/acp-agent.js` directly -- it reads from the real Claude Code
+/// SDK's on-disk session history, not an in-memory-only stub), and the
+/// backend-native session id it reports for the session this test itself
+/// just created must translate back to the *exact* gateway id
+/// `session/new` issued for it -- proving `translate_or_register_
+/// backend_session`'s "reuse an already-known mapping" path against a
+/// real adapter's real id format, not just the synthetic stand-in
+/// backend `session_list_real_test.rs`/`session_list_real_shared_test.rs`
+/// use.
+///
+/// Uses a freshly-created, uniquely-named temp directory as this
+/// session's `cwd` (rather than the shared `/tmp` every other test in
+/// this file uses) specifically so `listSessions`' own `dir` filter
+/// returns exactly this one session -- this machine's real `~/.claude`
+/// history very likely has other real sessions already scoped to plain
+/// `/tmp` from this same test file's own prior runs, which would make a
+/// precise, unambiguous assertion here much harder without filtering.
+///
+/// **`#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1`**, same
+/// rationale as the rest of this file.
+///
+/// Run with:
+/// ```text
+/// ACPX_LIVE_TEST_AMBIENT=1 \
+/// cargo test -p acpx-server --test real_ambient_multi_agent_test \
+///   ambient_claude_session_list_translates_a_real_backend_session_id -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn ambient_claude_session_list_translates_a_real_backend_session_id() {
+    if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
+             machine's real, already-logged-in claude CLI session (see this file's \
+             top doc comment -- it makes a real billed API call)"
+        );
+        return;
+    }
+
+    let test_cwd = std::env::temp_dir().join(format!(
+        "acpx-session-list-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&test_cwd).expect("create unique test cwd");
+    let test_cwd_str = test_cwd.to_str().expect("utf8 path").to_string();
+
+    let addr = ephemeral_addr().await;
+    let _server = spawn_real_server(addr).await;
+    let client = GatewayClient::new(format!("http://{addr}"));
+
+    profiles::create(
+        &client,
+        serde_json::json!({
+            "name": "ambient-claude-list",
+            "agent_id": "claude-acp",
+            "provider": null,
+            "key_ref": null,
+            "launch_overrides": {},
+            "mcp_servers": [],
+        }),
+    )
+    .await
+    .expect("profiles/create(ambient-claude-list)");
+
+    let new_result = client
+        .call(
+            "session/new",
+            serde_json::json!({
+                "cwd": test_cwd_str,
+                "mcpServers": [],
+                "_acpx": {"profile": "ambient-claude-list"}
+            }),
+            None,
+        )
+        .await
+        .expect("session/new");
+    let known_gateway_id = new_result["sessionId"]
+        .as_str()
+        .expect("session/new had no sessionId")
+        .to_string();
+
+    client
+        .call(
+            "session/set_config_option",
+            serde_json::json!({"sessionId": known_gateway_id, "configId": "model", "value": "haiku"}),
+            None,
+        )
+        .await
+        .expect("session/set_config_option");
+
+    // A real prompt turn -- `claude-agent-acp`'s `listSessions` reads
+    // from the SDK's own on-disk session history, which (per its own
+    // implementation, read directly) is only written once a session has
+    // actually recorded some activity; an empty just-`session/new`'d
+    // session might not appear yet.
+    let turn = prompt::send(
+        &client,
+        &known_gateway_id,
+        serde_json::json!([{"type": "text", "text": "Reply with exactly the single word LISTED and nothing else."}]),
+    )
+    .await
+    .expect("session/prompt");
+    assert!(
+        turn.message_text.to_uppercase().contains("LISTED"),
+        "expected a real model reply containing LISTED, got {:?}",
+        turn.message_text
+    );
+
+    let list_result = client
+        .call(
+            "session/list",
+            serde_json::json!({
+                "cwd": test_cwd_str,
+                "_acpx": {"profile": "ambient-claude-list"}
+            }),
+            None,
+        )
+        .await
+        .expect("session/list");
+    let sessions = list_result["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !sessions.is_empty(),
+        "real session/list scoped to this test's own unique cwd found no sessions at all -- \
+         expected at least the one this test itself just created: {list_result:?}"
+    );
+    let matching = sessions
+        .iter()
+        .find(|s| s["sessionId"] == serde_json::Value::String(known_gateway_id.clone()));
+    assert!(
+        matching.is_some(),
+        "real backend session/list did not translate back to this test's own known gateway \
+         session id {known_gateway_id:?} -- got sessions: {sessions:?}"
+    );
+    let matching = matching.unwrap();
+    assert_eq!(
+        matching["cwd"],
+        serde_json::Value::String(test_cwd_str.clone()),
+        "translated SessionInfo should still carry the real backend's own reported cwd"
+    );
+
+    let _ = client
+        .call(
+            "session/close",
+            serde_json::json!({"sessionId": known_gateway_id}),
+            None,
+        )
+        .await;
+    let _ = std::fs::remove_dir_all(&test_cwd);
+}
+
 /// **Phase 12 addition.** `session/resume` (real ACP spec method,
 /// `sessionCapabilities.resume`) shares `rehydrate_session`'s exact
 /// restart-survival fallback with `session/load` (see that function's

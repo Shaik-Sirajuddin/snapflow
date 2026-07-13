@@ -24,6 +24,20 @@ pub struct SessionEntry {
     /// `session/request_permission` request mid-call; see
     /// `crate::router::read_matching_response`.
     pub profile_name: Option<String>,
+    /// The session's working directory, if known. Populated from the
+    /// client's own `session/new` request (`params.cwd`) or from a real
+    /// backend's `session/list` response (`SessionInfo.cwd`) when a
+    /// session is discovered that way -- see `Router::
+    /// translate_or_register_backend_session`/`dispatch_session_list_real`.
+    /// **Phase 13 addition**, closes part of a real spec gap: the real
+    /// `SessionInfo` schema marks `cwd` as *required*, but nothing in
+    /// this registry tracked it before this phase, so acpx's own
+    /// gateway-scoped `session/list` aggregate could never honestly
+    /// include it. `None` for sessions rehydrated from a persisted
+    /// `SessionRecord` predating this field (the sqlite `sessions` table
+    /// itself doesn't carry `cwd` yet -- a known, tracked follow-up, not
+    /// silently dropped) or from any other path that never learned it.
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +56,7 @@ impl SessionRegistry {
         agent_id: impl Into<String>,
         backend_session_id: BackendSessionId,
         profile_name: Option<String>,
+        cwd: Option<String>,
     ) -> GatewaySessionId {
         let gateway_id = GatewaySessionId(uuid::Uuid::new_v4().to_string());
         self.sessions.insert(
@@ -50,6 +65,7 @@ impl SessionRegistry {
                 agent_id: agent_id.into(),
                 backend_session_id,
                 profile_name,
+                cwd,
             },
         );
         gateway_id
@@ -84,6 +100,32 @@ impl SessionRegistry {
     pub fn list(&self) -> impl Iterator<Item = (&String, &SessionEntry)> {
         self.sessions.iter()
     }
+
+    /// Reverse lookup: does a gateway session id already exist for this
+    /// exact `(agent_id, backend_session_id)` pair? **Phase 13 addition.**
+    /// Backs the real, per-backend `session/list` path's backend-id ->
+    /// gateway-id translation (`Router::
+    /// translate_or_register_backend_session`): a real backend's
+    /// `session/list` response only ever carries its own native session
+    /// ids, per the ACP schema, but every other proxied method in this
+    /// router (`session/load`, `session/prompt`, ...) only ever accepts
+    /// a *gateway* id. This lets that translation reuse an already-known
+    /// gateway id (e.g. a session acpx itself opened earlier in this
+    /// process's lifetime) instead of minting a duplicate one every time
+    /// the same backend session is listed again.
+    pub fn find_by_backend(
+        &self,
+        agent_id: &str,
+        backend_session_id: &str,
+    ) -> Option<GatewaySessionId> {
+        self.sessions.iter().find_map(|(gid, entry)| {
+            if entry.agent_id == agent_id && entry.backend_session_id.0 == backend_session_id {
+                Some(GatewaySessionId(gid.clone()))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -93,7 +135,12 @@ mod tests {
     #[test]
     fn register_then_resolve_round_trips() {
         let mut reg = SessionRegistry::new();
-        let gid = reg.register("codex-acp", BackendSessionId("backend-1".to_string()), None);
+        let gid = reg.register(
+            "codex-acp",
+            BackendSessionId("backend-1".to_string()),
+            None,
+            None,
+        );
         let entry = reg.resolve(&gid).expect("just registered");
         assert_eq!(entry.agent_id, "codex-acp");
         assert_eq!(entry.backend_session_id.0, "backend-1");
@@ -102,8 +149,27 @@ mod tests {
     #[test]
     fn remove_forgets_the_session() {
         let mut reg = SessionRegistry::new();
-        let gid = reg.register("codex-acp", BackendSessionId("backend-1".to_string()), None);
+        let gid = reg.register(
+            "codex-acp",
+            BackendSessionId("backend-1".to_string()),
+            None,
+            None,
+        );
         assert!(reg.remove(&gid).is_some());
         assert!(reg.resolve(&gid).is_none());
+    }
+
+    #[test]
+    fn find_by_backend_locates_an_already_registered_session() {
+        let mut reg = SessionRegistry::new();
+        let gid = reg.register(
+            "codex-acp",
+            BackendSessionId("backend-1".to_string()),
+            None,
+            Some("/tmp".to_string()),
+        );
+        assert_eq!(reg.find_by_backend("codex-acp", "backend-1"), Some(gid));
+        assert_eq!(reg.find_by_backend("codex-acp", "backend-2"), None);
+        assert_eq!(reg.find_by_backend("other-agent", "backend-1"), None);
     }
 }

@@ -50,13 +50,15 @@ async fn initialize_declares_real_capabilities_not_the_unknown_method_error() {
     assert_eq!(response["result"]["agentInfo"]["name"], json!("acpx"));
 
     // **Phase 9:** `sessionCapabilities.{close,delete,resume}` must be
-    // advertised (all three are genuinely `Proxied` end to end), and
-    // `list` deliberately must NOT be (acpx's own `session/list` handler
-    // answers a gateway-scoped shape, not the real per-backend
-    // `SessionInfo[]` schema -- see `COVERAGE.md`'s phase 8 recheck item
-    // 3 for why that's a known, tracked divergence rather than a claim
-    // this test should let silently regress into a false spec-compliance
-    // claim).
+    // advertised (all three are genuinely `Proxied` end to end).
+    // **Phase 13:** `list` now belongs in this list too -- acpx's own
+    // `session/list` handler forwards to a real backend's own
+    // `session/list` (translating returned ids into gateway ids) once a
+    // caller supplies the `_acpx` backend-selector convention
+    // `session/new`'s `_acpx.profile` already established; see
+    // `router.rs`'s `session_list_selector`/`dispatch_session_list_real`
+    // and `COVERAGE.md`'s phase 13 entry for the full rationale on why
+    // this closes what phases 8-12 tracked as a deliberate divergence.
     assert_eq!(
         response["result"]["agentCapabilities"]["sessionCapabilities"]["close"],
         json!({})
@@ -69,11 +71,9 @@ async fn initialize_declares_real_capabilities_not_the_unknown_method_error() {
         response["result"]["agentCapabilities"]["sessionCapabilities"]["resume"],
         json!({})
     );
-    assert!(
-        response["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_null(),
-        "must not advertise sessionCapabilities.list -- acpx's own session/list \
-         doesn't match the real per-backend schema (tracked divergence, not fixed \
-         yet -- advertising it here would misrepresent that)"
+    assert_eq!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["list"],
+        json!({})
     );
 
     // No backend process was ever spawned or even registered for this

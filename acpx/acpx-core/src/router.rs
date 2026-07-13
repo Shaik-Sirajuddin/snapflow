@@ -109,6 +109,36 @@ pub fn classify(method: &str) -> MethodClass {
     }
 }
 
+/// **Phase 13 addition.** Which specific backend a dual-mode
+/// `session/list` call should be proxied to, per the `_acpx` extension
+/// convention already established by `session/new`'s `_acpx.profile`.
+/// `Profile` resolves through `Router::resolve_profile` exactly like
+/// `session/new`'s managed mode; `AgentId` names an already-registered
+/// supervisor key directly (most usefully `default_agent_id`, for
+/// native/unmanaged mode, which has no profile at all to name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionListSelector {
+    Profile(String),
+    AgentId(String),
+}
+
+/// Extracts a [`SessionListSelector`] from a `session/list` call's
+/// `params`, if any -- `None` means "no backend selector given," which
+/// is what routes the call to acpx's own gateway-scoped aggregate view
+/// instead of a real per-backend proxy (see `dispatch_native`'s
+/// `"session/list"` arm and `dispatch_shared`'s matching guard, which
+/// both call this to decide).
+fn session_list_selector(params: &serde_json::Value) -> Option<SessionListSelector> {
+    let ext = params.get("_acpx")?;
+    if let Some(name) = ext.get("profile").and_then(|p| p.as_str()) {
+        return Some(SessionListSelector::Profile(name.to_string()));
+    }
+    if let Some(id) = ext.get("agentId").and_then(|p| p.as_str()) {
+        return Some(SessionListSelector::AgentId(id.to_string()));
+    }
+    None
+}
+
 /// Phase 1 stub: the real `Router` composes `SessionRegistry` +
 /// `acpx-conductor::Supervisor` + (from Phase 3) `ProfileStore` to actually
 /// dispatch. Left unimplemented here; `acpx-server`'s Phase 1 spike talks to
@@ -250,6 +280,8 @@ pub enum RouterError {
          logout could target across its multiple managed profiles"
     )]
     LogoutNotSupported,
+    #[error("backend rejected session/list: {0}")]
+    BackendSessionListError(serde_json::Value),
 }
 
 impl Router {
@@ -417,6 +449,17 @@ impl Router {
             .get_mut("params")
             .ok_or(RouterError::MissingParams)?;
 
+        // **Phase 13 addition.** Captured before any further mutation
+        // below (the `_acpx` strip and `mcpServers` merge never touch
+        // `cwd`) so it can be threaded into `SessionEntry::cwd` --
+        // real per-backend `session/list`'s `SessionInfo.cwd` is a
+        // *required* field, so acpx's own gateway-scoped aggregate needs
+        // to actually know it to include it honestly.
+        let cwd = params
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+
         // Precedence per 02-architecture.md: an explicit `_acpx.profile`
         // selects managed mode (Phase 3: profile -> agent/provider/key
         // resolution, see `resolve_profile`); omitting it stays
@@ -486,6 +529,7 @@ impl Router {
             agent_id,
             BackendSessionId(backend_session_id),
             profile.as_ref().map(|p| p.name.clone()),
+            cwd,
         );
 
         // Rewrite the backend's own session id into the gateway-issued one
@@ -511,6 +555,131 @@ impl Router {
             );
         }
         Ok(response)
+    }
+
+    /// **Phase 13 addition.** The real, spec-shaped half of dual-mode
+    /// `session/list` (see `dispatch_native`'s `"session/list"` arm for
+    /// the branching, and `session_list_selector`/`SessionListSelector`
+    /// for how a client opts into this path). Resolves the requested
+    /// backend exactly like `dispatch_session_new` does (`_acpx.profile`
+    /// via `resolve_profile`, or a raw `_acpx.agentId` naming an
+    /// already-registered supervisor key directly -- e.g. `default_agent_id`
+    /// in native/unmanaged mode), forwards a real `session/list` request
+    /// (params minus `_acpx`) to that one backend, and translates every
+    /// returned `SessionInfo.sessionId` from the backend's own native id
+    /// into a gateway id via `translate_or_register_backend_session` --
+    /// without that translation step the response would hand the client
+    /// ids it could never use against any other acpx method again,
+    /// defeating the entire point of listing sessions through a proxy in
+    /// the first place.
+    async fn dispatch_session_list_real(
+        &mut self,
+        id: serde_json::Value,
+        selector: SessionListSelector,
+        mut params: serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
+        if let Some(obj) = params.as_object_mut() {
+            obj.remove("_acpx");
+        }
+        let (agent_id, profile) = match selector {
+            SessionListSelector::Profile(name) => {
+                let (key, profile) = self.resolve_profile(&name).await?;
+                (key, Some(profile))
+            }
+            SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
+        };
+        let profile_name = profile.as_ref().map(|p| p.name.clone());
+        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        let backend = self.supervisor.ensure_running(&agent_id).await?;
+
+        let outbound = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/list",
+            "params": params,
+        });
+
+        let response = {
+            let mut proc = backend.lock().await;
+            ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
+            proc.writer.lock().await.write_value(&outbound).await?;
+            let (response, _notifications, _agent_requests) =
+                read_matching_response(&mut proc, &id, call_policy).await?;
+            response
+        };
+
+        if let Some(error) = response.get("error") {
+            return Err(RouterError::BackendSessionListError(error.clone()));
+        }
+
+        let mut result = response
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "sessions": [] }));
+        if let Some(sessions) = result.get_mut("sessions").and_then(|s| s.as_array_mut()) {
+            for session in sessions.iter_mut() {
+                let Some(backend_sid) = session
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let session_cwd = session
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
+                let gateway_id = self.translate_or_register_backend_session(
+                    &agent_id,
+                    &backend_sid,
+                    profile_name.clone(),
+                    session_cwd,
+                );
+                session["sessionId"] = serde_json::Value::String(gateway_id.clone());
+                self.spawn_session_persistence(
+                    gateway_id,
+                    agent_id.clone(),
+                    backend_sid,
+                    profile_name.clone(),
+                    outbound.clone(),
+                    response.clone(),
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    /// See [`Self::dispatch_session_list_real`]'s doc comment and
+    /// `SessionRegistry::find_by_backend`'s. Reuses an already-known
+    /// gateway id for this exact `(agent_id, backend_session_id)` pair if
+    /// one exists (e.g. a session acpx itself opened earlier in this
+    /// process's lifetime via `session/new`); otherwise mints and
+    /// registers a fresh one on the spot -- the same "recover a backend
+    /// session into the live registry" move `rehydrate_session` makes for
+    /// `session/load`, just triggered by discovery through `session/list`
+    /// rather than an explicit client-supplied gateway id. From this
+    /// point on the returned id is a first-class gateway session,
+    /// `session/load`-able (and, once loaded, promptable) exactly like
+    /// any other -- **the concrete, testable proof this isn't just a
+    /// cosmetic id swap.**
+    fn translate_or_register_backend_session(
+        &mut self,
+        agent_id: &str,
+        backend_session_id: &str,
+        profile_name: Option<String>,
+        cwd: Option<String>,
+    ) -> String {
+        if let Some(existing) = self.sessions.find_by_backend(agent_id, backend_session_id) {
+            return existing.0;
+        }
+        self.sessions
+            .register(
+                agent_id.to_string(),
+                BackendSessionId(backend_session_id.to_string()),
+                profile_name,
+                cwd,
+            )
+            .0
     }
 
     /// Resolve `_acpx.profile` for `session/new`'s managed mode: look up
@@ -652,6 +821,11 @@ impl Router {
             agent_id: record.agent_id,
             backend_session_id: BackendSessionId(record.backend_session_id),
             profile_name: record.profile_name,
+            // The `sessions` sqlite table doesn't carry `cwd` yet (see
+            // `SessionEntry::cwd`'s doc comment) -- honestly `None` here
+            // rather than guessing, not a regression this phase
+            // introduced.
+            cwd: None,
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -925,31 +1099,44 @@ impl Router {
                         "http": true,
                         "sse": true
                     },
-                    // **Phase 9 addition.** Per the real v1 stable
-                    // schema's `SessionCapabilities`, advertises `close`/
-                    // `delete`/`resume` as supported -- honest, because
-                    // all three are genuinely `Proxied` methods forwarded
-                    // byte-for-byte to whatever backend a session
-                    // resolves to (see `classify`), same reasoning as
-                    // `loadSession`/`promptCapabilities`/`mcpCapabilities`
-                    // above. Deliberately **omits** `list`: acpx's own
-                    // `session/list` handler (`dispatch_native`'s arm
-                    // below) answers from its *own* gateway-scoped
-                    // `SessionRegistry`, not a real per-backend
-                    // `SessionInfo[]`/cursor-paginated shape per the real
-                    // `session/list` schema -- advertising `list: {}`
-                    // here would be a false claim of spec conformance for
-                    // a method whose current implementation is a known,
-                    // tracked, deliberate divergence (see `COVERAGE.md`'s
-                    // phase 8 recheck item 3). `additionalDirectories` is
-                    // also omitted: acpx forwards whatever a client sends
-                    // verbatim, but never itself inspects/validates that
-                    // field, so there's no acpx-level claim to make about
-                    // it either way.
+                    // **Phase 9 addition, `list` added phase 13.** Per
+                    // the real v1 stable schema's `SessionCapabilities`,
+                    // advertises `close`/`delete`/`resume`/`list` as
+                    // supported -- honest, because all four are
+                    // genuinely forwarded to whatever real backend a
+                    // caller selects (see `classify` for `close`/
+                    // `delete`/`resume`, and `dispatch_native`'s
+                    // `"session/list"` arm plus `session_list_selector`
+                    // for `list`'s dual-mode split). `list` specifically:
+                    // phase 9 through 12 deliberately omitted it because
+                    // acpx's own `session/list` answered *only* from its
+                    // gateway-scoped `SessionRegistry` (no `cwd`, no
+                    // per-backend `SessionInfo[]` shape at all) -- a
+                    // genuine, tracked divergence from the real schema.
+                    // Phase 13 closed that: `session/list` now forwards
+                    // to a real backend's own `session/list` (translating
+                    // returned session ids into gateway ids so they stay
+                    // usable through acpx afterward) whenever the caller
+                    // supplies the same `_acpx` backend-selector
+                    // convention `session/new`'s `_acpx.profile` already
+                    // established; an unqualified call keeps answering
+                    // the gateway-wide aggregate instead (no single real
+                    // backend could ever honestly answer *that* question
+                    // -- it's the entire reason a multiplexing gateway
+                    // exists), which is why this capability flag is an
+                    // honest "can be spec-conformant, not that every
+                    // unqualified call is" the same way `loadSession`/
+                    // `promptCapabilities` above already are for their
+                    // own per-backend caveats. `additionalDirectories` is
+                    // still omitted: acpx forwards whatever a client
+                    // sends verbatim but never itself inspects/validates
+                    // that field, so there's no acpx-level claim to make
+                    // about it either way.
                     "sessionCapabilities": {
                         "close": {},
                         "delete": {},
-                        "resume": {}
+                        "resume": {},
+                        "list": {}
                     }
                 },
                 "authMethods": [],
@@ -995,18 +1182,46 @@ impl Router {
             "logout" => {
                 return Err(RouterError::LogoutNotSupported);
             }
+            // **Phase 13.** `session/list` is dual-mode, distinguished by
+            // whether the client supplies a backend selector via the
+            // established `_acpx` extension convention (same one
+            // `session/new` already uses for `_acpx.profile`): with a
+            // selector (`_acpx.profile` or `_acpx.agentId`), this is a
+            // real, spec-shaped `Proxied` forward to that one specific
+            // backend's own `session/list` (see
+            // `Self::dispatch_session_list_real`); without one, it stays
+            // acpx's original gateway-scoped aggregate view across every
+            // backend this process manages -- the reason a multiplexing
+            // gateway is worth having in the first place, and something
+            // no single real backend's `session/list` could ever answer
+            // on its own. See `COVERAGE.md`'s phase 13 entry for the
+            // full rationale on why this is a split, not a rename or a
+            // one-or-the-other tradeoff.
             "session/list" => {
-                let sessions: Vec<serde_json::Value> = self
-                    .sessions
-                    .list()
-                    .map(|(gateway_id, entry)| {
-                        serde_json::json!({
-                            "sessionId": gateway_id,
-                            "agentId": entry.agent_id,
-                        })
-                    })
-                    .collect();
-                serde_json::json!({ "sessions": sessions })
+                let params = request
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                match session_list_selector(&params) {
+                    Some(selector) => {
+                        self.dispatch_session_list_real(id.clone(), selector, params)
+                            .await?
+                    }
+                    None => {
+                        let sessions: Vec<serde_json::Value> = self
+                            .sessions
+                            .list()
+                            .map(|(gateway_id, entry)| {
+                                serde_json::json!({
+                                    "sessionId": gateway_id,
+                                    "agentId": entry.agent_id,
+                                    "cwd": entry.cwd,
+                                })
+                            })
+                            .collect();
+                        serde_json::json!({ "sessions": sessions })
+                    }
+                }
             }
             "agents/list" => {
                 self.ensure_registry_loaded().await;
@@ -2023,6 +2238,30 @@ pub async fn dispatch_shared(
             dispatch_session_cancel_shared(router, request).await
         }
         MethodClass::Proxied => dispatch_proxied_shared(router, request).await,
+        // **Phase 13.** Mirrors `dispatch_native`'s `"session/list"`
+        // branching (see `session_list_selector`'s doc comment) but only
+        // when a selector is actually present -- an unqualified
+        // `session/list` stays on the generic `GatewayNative` path just
+        // below, cheap/local exactly as before. When a selector *is*
+        // present this is genuinely a backend round trip (a real
+        // `Proxied`-shaped call under the hood), so it gets its own
+        // lock-briefly-then-release `_shared` variant like every other
+        // backend-talking path in this function -- routing it through
+        // the generic `router.lock().await.dispatch(request).await`
+        // arm instead would hold the *entire* router lock for the whole
+        // backend round trip, blocking every other concurrent client
+        // (including ones talking to unrelated backends) for no reason,
+        // exactly the regression this function's own doc comment above
+        // exists to prevent.
+        MethodClass::GatewayNative
+            if method == "session/list"
+                && request
+                    .get("params")
+                    .and_then(session_list_selector)
+                    .is_some() =>
+        {
+            dispatch_session_list_real_shared(router, request).await
+        }
         MethodClass::GatewayNative | MethodClass::Unknown => {
             router.lock().await.dispatch(request).await
         }
@@ -2089,6 +2328,104 @@ async fn dispatch_session_cancel_shared(
     }
 
     Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
+}
+
+/// [`dispatch_shared`]'s real, per-backend `session/list` path -- see
+/// `Router::dispatch_session_list_real`'s doc comment for the full
+/// rationale (this mirrors it exactly: `_acpx` selector resolution,
+/// forward, backend-id -> gateway-id translation) restructured the same
+/// way every other `_shared` function in this file is, to release
+/// `router`'s lock before the backend round trip rather than holding it
+/// for the call's entire duration.
+async fn dispatch_session_list_real_shared(
+    router: &SharedRouterHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+    let mut params = request
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let selector = session_list_selector(&params).expect(
+        "dispatch_shared only routes to this function when session_list_selector(params) is Some",
+    );
+    if let Some(obj) = params.as_object_mut() {
+        obj.remove("_acpx");
+    }
+
+    let (agent_id, profile_name, backend, call_policy) = {
+        let mut r = router.lock().await;
+        let (agent_id, profile) = match selector {
+            SessionListSelector::Profile(name) => {
+                let (key, profile) = r.resolve_profile(&name).await?;
+                (key, Some(profile))
+            }
+            SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
+        };
+        let profile_name = profile.as_ref().map(|p| p.name.clone());
+        let backend = r.supervisor.ensure_running(&agent_id).await?;
+        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        (agent_id, profile_name, backend, call_policy)
+    };
+
+    let outbound = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/list",
+        "params": params,
+    });
+
+    let response = {
+        let mut proc = backend.lock().await;
+        ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
+        proc.writer.lock().await.write_value(&outbound).await?;
+        let (response, _notifications, _agent_requests) =
+            read_matching_response(&mut proc, &id, call_policy).await?;
+        response
+    };
+
+    if let Some(error) = response.get("error") {
+        return Err(RouterError::BackendSessionListError(error.clone()));
+    }
+
+    let mut result = response
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "sessions": [] }));
+    if let Some(sessions) = result.get_mut("sessions").and_then(|s| s.as_array_mut()) {
+        let mut r = router.lock().await;
+        for session in sessions.iter_mut() {
+            let Some(backend_sid) = session
+                .get("sessionId")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let session_cwd = session
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .map(str::to_string);
+            let gateway_id = r.translate_or_register_backend_session(
+                &agent_id,
+                &backend_sid,
+                profile_name.clone(),
+                session_cwd,
+            );
+            session["sessionId"] = serde_json::Value::String(gateway_id.clone());
+            spawn_session_persistence_fn(
+                r.persistence.clone(),
+                gateway_id,
+                agent_id.clone(),
+                backend_sid,
+                profile_name.clone(),
+                outbound.clone(),
+                response.clone(),
+            );
+        }
+    }
+
+    Ok(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
 /// [`dispatch_shared`]'s `session/prompt`/`session/resume`/`session/load`/
@@ -2194,11 +2531,15 @@ async fn dispatch_session_new_shared(
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
 
-    let (agent_id, profile, backend, persistence) = {
+    let (agent_id, profile, backend, persistence, cwd) = {
         let mut r = router.lock().await;
         let params = request
             .get_mut("params")
             .ok_or(RouterError::MissingParams)?;
+        let cwd = params
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
         let profile_name = params
             .get("_acpx")
             .and_then(|ext| ext.get("profile"))
@@ -2235,7 +2576,7 @@ async fn dispatch_session_new_shared(
         }
 
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        (agent_id, profile, backend, r.persistence.clone())
+        (agent_id, profile, backend, r.persistence.clone(), cwd)
     };
 
     let mut response = {
@@ -2261,6 +2602,7 @@ async fn dispatch_session_new_shared(
             agent_id,
             BackendSessionId(backend_session_id),
             profile.as_ref().map(|p| p.name.clone()),
+            cwd,
         );
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
