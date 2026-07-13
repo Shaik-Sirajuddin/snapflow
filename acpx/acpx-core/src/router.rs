@@ -200,6 +200,16 @@ pub enum RouterError {
     BackendAuthenticationError(serde_json::Value),
     #[error("authenticate: acpx's own initialize response advertises no authMethods (requested methodId: {0:?}); no transport-level bearer-token/session auth is bypassed by this -- see acpx-server's own HTTP/WS auth")]
     NoAuthMethodsAdvertised(Option<String>),
+    #[error(
+        "session/load: gateway session {0} not found in this process's live registry and \
+         no persistence store is configured to recover it from -- pass ACPX_DB_PATH so \
+         session/load can survive an acpx restart"
+    )]
+    SessionNotPersisted(String),
+    #[error(
+        "session/load: gateway session {0} could not be recovered from the persistence store: {1}"
+    )]
+    SessionRehydrationFailed(String, crate::persistence::PersistenceError),
 }
 
 impl Router {
@@ -547,6 +557,90 @@ impl Router {
         Ok((supervisor_key, profile))
     }
 
+    /// **Phase 8 addition -- closes a real gap.** `session/load` (and its
+    /// close cousin `session/resume`) exist in the real ACP spec
+    /// specifically so a client can resume a session it learned about
+    /// through some *other* channel than "I just called `session/new` in
+    /// this exact process's lifetime" -- most obviously, reconnecting
+    /// after the agent process (here, acpx itself) restarted and its
+    /// in-memory `SessionRegistry` was wiped clean. Before this phase,
+    /// every `Proxied` method -- `session/load` included -- required the
+    /// gateway session id to already be a live key in that in-memory
+    /// map, which made `session/load` in this gateway strictly *less*
+    /// capable than in a real single-agent ACP agent: it could only ever
+    /// re-request an already-open session, never genuinely resume one
+    /// that outlived acpx's own process. That defeats the entire purpose
+    /// of the method existing separately from `session/new`.
+    ///
+    /// This only fires as a fallback (the in-memory registry is always
+    /// checked first, unchanged, by both call sites) and only for
+    /// `session/load`/`session/resume` specifically -- every other
+    /// `Proxied` method (`session/prompt`, `session/cancel`, etc.) still
+    /// requires a live in-process session and correctly errors
+    /// `UnknownSession` otherwise; those aren't resumption calls, so
+    /// silently reviving one from a stale durable row on, say, a typo'd
+    /// `session/prompt` call would paper over a real client bug instead
+    /// of surfacing it.
+    ///
+    /// Requires `ACPX_DB_PATH`/`Router::with_persistence` to have been
+    /// configured; without it there is nowhere durable to recover from,
+    /// so this errors clearly (`SessionNotPersisted`) rather than
+    /// silently behaving as if the session never existed at all vs.
+    /// "recovery wasn't even possible here" -- the two are genuinely
+    /// different failure modes worth distinguishing for whoever reads
+    /// the error.
+    async fn rehydrate_session(
+        &mut self,
+        method: &str,
+        gateway_session_id: &str,
+    ) -> Result<crate::session_registry::SessionEntry, RouterError> {
+        if !matches!(method, "session/load" | "session/resume") {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+        }
+        let store = self
+            .persistence
+            .clone()
+            .ok_or_else(|| RouterError::SessionNotPersisted(gateway_session_id.to_string()))?;
+        let record = store
+            .get_session(gateway_session_id.to_string())
+            .await
+            .map_err(|err| {
+                RouterError::SessionRehydrationFailed(gateway_session_id.to_string(), err)
+            })?
+            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.to_string()))?;
+        let entry = crate::session_registry::SessionEntry {
+            agent_id: record.agent_id,
+            backend_session_id: BackendSessionId(record.backend_session_id),
+            profile_name: record.profile_name,
+        };
+        // **The real, second half of this bug.** `entry.agent_id` here is
+        // actually the *supervisor key* `profile:{name}` minted by
+        // `resolve_profile`/`dispatch_session_new` at the time this
+        // session was first created -- not a raw registry agent id. This
+        // process's own `Supervisor` has never seen that key before (it
+        // never ran the `session/new` that originally registered it), so
+        // `ensure_running` would otherwise fail with "no spawn spec
+        // registered for agent <key>" even though the session row itself
+        // resolved correctly. Re-running `resolve_profile` (idempotent --
+        // it just re-registers the same `SpawnSpec` under the same key,
+        // exactly like every ordinary `session/new` call already does)
+        // fixes that; a `None` `profile_name` (native/unmanaged mode)
+        // needs no such step since `default_agent_id`'s spec is already
+        // registered unconditionally at process startup. Caught by
+        // `ambient_claude_session_load_survives_a_real_gateway_restart`
+        // actually spawning a *second*, independent `acpx-server`
+        // process -- an in-process-only test would never have exercised
+        // a `Supervisor` that legitimately never saw this profile before.
+        if let Some(name) = entry.profile_name.as_deref() {
+            self.resolve_profile(name).await?;
+        }
+        self.sessions.insert(
+            acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
+            entry.clone(),
+        );
+        Ok(entry)
+    }
+
     async fn dispatch_proxied(
         &mut self,
         mut request: serde_json::Value,
@@ -577,12 +671,14 @@ impl Router {
             .ok_or(RouterError::MissingSessionId)?
             .to_string();
 
-        let entry = self
+        let entry = match self
             .sessions
             .resolve(&acpx_proto::session::GatewaySessionId(
                 gateway_session_id.clone(),
-            ))
-            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
+            )) {
+            Some(entry) => entry.clone(),
+            None => self.rehydrate_session(&method, &gateway_session_id).await?,
+        };
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
@@ -1932,12 +2028,12 @@ async fn dispatch_proxied_shared(
 
     let (backend, persistence, call_policy) = {
         let mut r = router.lock().await;
-        let entry = r
-            .sessions
-            .resolve(&acpx_proto::session::GatewaySessionId(
-                gateway_session_id.clone(),
-            ))
-            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
+        let entry = match r.sessions.resolve(&acpx_proto::session::GatewaySessionId(
+            gateway_session_id.clone(),
+        )) {
+            Some(entry) => entry.clone(),
+            None => r.rehydrate_session(&method, &gateway_session_id).await?,
+        };
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();

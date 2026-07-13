@@ -1174,3 +1174,169 @@ ignored**, `cargo fmt --all --check` and `cargo build --workspace
    is unaffected by this phase (still about mid-call backend-initiated
    requests) -- still the honest, tracked, not-attempted-in-this-series
    residual.
+
+## 2026-07-13 -- ACP compatibility phase 8: real `session/load` rehydration across a gateway restart
+
+**Directive:** continuation of the phase-by-phase ACP compatibility
+hardening series ("go ahead and phase wise fix there all compatibility
+one by one and recheck if any acp compatibility is missing at each
+stage"). Picked up phase 7's recheck list, specifically: "Whether
+`session/load` (resuming a persisted session) is genuinely implemented
+end-to-end or just classified -- verify actual backend round-trip
+behavior, not just dispatch routing."
+
+**Real, previously-undiscovered gap found and fixed:** `session/load`
+was classified `Proxied` (phase 1) and generically forwarded like every
+other session-scoped method, but `dispatch_proxied`/`dispatch_proxied_
+shared` resolved the caller's `sessionId` *only* against the in-memory
+`SessionRegistry`. That registry is wiped clean on every acpx process
+restart. `session/load` exists in the real ACP spec specifically so a
+client can resume a session it learned about through some channel other
+than "I just called `session/new` in this exact process's lifetime" --
+overwhelmingly, reconnecting after the agent process restarted. Before
+this phase, every `session/load` call against a gateway session id from
+a previous acpx process lifetime failed with `UnknownSession`, even
+though acpx's own sqlite (`ACPX_DB_PATH`, `persistence::sessions`
+table) already had a durable row proving the session existed and which
+real backend/profile it belonged to -- the exact data needed to recover
+was sitting right there, unused. This made acpx's `session/load` support
+strictly *less* capable than a real single-agent ACP agent's, defeating
+the entire reason the method exists as distinct from `session/new`.
+
+**Fix:** `Router::rehydrate_session` (new, `acpx-core/src/router.rs`) --
+invoked as a fallback by both `dispatch_proxied` and `dispatch_proxied_
+shared` only when the in-memory lookup misses, and only for `session/
+load`/`session/resume` specifically (every other `Proxied` method still
+requires a live in-process session and correctly errors `UnknownSession`
+otherwise -- those aren't resumption calls, so silently reviving one
+from a stale row on, say, a typo'd `session/prompt` call would paper
+over a real client bug). It reads the row from `PersistenceStore::
+get_session`, reconstructs a `SessionEntry`, and -- **the second, less
+obvious half of this bug, only caught by testing against a genuinely
+separate second process** -- re-runs `resolve_profile` for the
+persisted `profile_name` before returning. Without that second step the
+fix half-failed: the session row resolves fine, but the *new* process's
+`Supervisor` has never registered a `SpawnSpec` for that profile's
+`profile:{name}` key (that registration is normally a `session/new`-time
+side effect), so `ensure_running` errored "no spawn spec registered for
+agent profile:...". `resolve_profile` is idempotent (same code path
+`session/new` already calls every time), so re-running it here is safe.
+`SessionRegistry::insert` (new) re-inserts the recovered entry under the
+*original* gateway session id (not a freshly minted one -- the whole
+point is the client already knows this id) so it's usable for ordinary
+calls afterward, not just the one `session/load` request. Two new
+`RouterError` variants distinguish "no persistence configured at all"
+(`SessionNotPersisted`) from "persistence configured but the lookup
+itself failed" (`SessionRehydrationFailed`) from the pre-existing
+`UnknownSession` (genuinely never existed / not a resumption method) --
+three different failure modes worth telling apart for whoever reads the
+error.
+
+**Test:** `acpx-server/tests/real_ambient_multi_agent_test.rs`'s new
+`ambient_claude_session_load_survives_a_real_gateway_restart` (opt-in,
+`ACPX_LIVE_TEST_AMBIENT=1`, same real-ambient-auth-`claude`-CLI pattern
+as the rest of that file) is the real thing end to end, not a
+simulation: spawns one real `acpx-server` process against a real sqlite
+file, creates a real `claude-agent-acp` session via a profile, sends one
+real billed `session/prompt` turn, closes the session, **kills that
+whole process**, spawns a **second, fully independent** `acpx-server`
+process against the *same* sqlite file (fresh empty `SessionRegistry`,
+fresh empty `Supervisor` -- nothing carries over except the file), and
+calls `session/load` against it using the *first* process's gateway
+session id (never re-declared via `session/new` in the second process).
+Proves, all against real subprocesses: (1) the rehydration lookup finds
+the row, (2) it correctly resolves back to `claude-acp`/the right
+profile so the second process spawns a fresh real adapter for it, (3)
+the forwarded backend session id is right (the real adapter accepts it,
+no "Session not found"), (4) `session/set_mode` against that same
+rehydrated session works too (reusing the same live session rather than
+a second billed test -- picks a real, non-default `modeId` straight out
+of this exact adapter build's own `session/load` response, never
+hardcoded -- zero real-backend coverage of `session/set_mode` existed
+anywhere in this workspace before this phase either), and (5) the
+gateway session id is reusable afterward in the *new* process for a
+real follow-up `session/prompt` turn (the strongest proof -- rehydration
+didn't just answer one `session/load` call, it genuinely re-registered a
+working session). Also confirmed empirically and documented in the
+test's own comments: the real `LoadSessionResponse` schema (agentclient
+protocol.com/protocol/schema) has no `sessionId` field at all, so the
+test doesn't assert identity-consistency of `claude-agent-acp`'s own
+non-standard extra `sessionId` key in that response (acpx forwards it
+verbatim, transparent-proxy style, same as any other field it doesn't
+special-case); and that this specific adapter build emitted zero
+`session/update` history-replay notifications for this one-turn session
+(adapter-internal detail, not asserted on either way).
+
+`spawn_real_server_with_db` (new helper in the same test file) wires
+`ACPX_DB_PATH` through to the real binary for both processes; `spawn_
+real_server` (pre-existing, used by every other test in the file)
+becomes a thin wrapper delegating to it with `db_path: None`, unchanged
+behavior for every caller of the old function.
+
+Workspace test count after this phase: **167 passed, 0 failed, 4
+ignored** (the 4th ignored is this phase's new live test; the other 3
+are the pre-existing real-CLI-auth-needed tests), `cargo fmt --all
+--check` and `cargo build --workspace --tests` both clean. The new live
+test itself was run for real against this machine's ambient `claude`
+CLI auth (`ACPX_LIVE_TEST_AMBIENT=1 cargo test ... -- --ignored`) and
+passes.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `session/set_mode`/`session/set_config_option`'s real backend
+   forwarding is now confirmed correct post-phases-5-7's `BackendCall
+   Policy`/writer-lock refactors (per phase 7's recheck item) -- this
+   phase's live test exercises `session/set_mode` for real, and `real_
+   claude_multi_agent_test.rs`/`real_ambient_multi_agent_test.rs`
+   already exercised `session/set_config_option` for real before this
+   phase. Both closed.
+2. `session/resume` shares `rehydrate_session`'s fallback path with
+   `session/load` (both are spec-defined resumption methods with the
+   same "must survive not having a live in-process registry entry"
+   requirement) but has **not** been exercised by a real end-to-end test
+   the way `session/load` now has in this phase -- `claude-agent-acp`
+   does implement `resumeSession` (confirmed by reading its own compiled
+   `dist/acp-agent.js` in this phase's investigation), so this is
+   concretely testable, just not yet tested. Tracked as this phase's
+   most direct next step, not a "someday" item.
+3. `session/list`'s real ACP spec shape (per agentclientprotocol.com:
+   `{sessionId, cwd, title, updatedAt}` per entry, cursor-paginated,
+   gated behind an agent-advertised `listSessions` capability) does
+   **not** match what acpx currently answers for that same method name:
+   acpx's `dispatch_native`'s `"session/list"` arm (`router.rs`) returns
+   its own gateway-only shape (`{sessionId, agentId}`, no pagination, no
+   capability gate) sourced from the in-memory `SessionRegistry`, not
+   from any real backend agent's own session list at all. Found during
+   this phase's investigation but **not fixed** -- this is a real,
+   pre-existing naming collision between an acpx-native admin/management
+   concept (list what this multiplexing gateway itself currently has
+   open, across every backend) and the real ACP wire method of the same
+   name (ask **the one connected agent** what sessions **it** has
+   persisted), and fixing it cleanly is an architectural decision (does
+   acpx keep the gateway-scoped meaning under this name and accept the
+   spec-shape mismatch, forward it to the profile's backend instead and
+   lose the multi-agent aggregate view, or rename the gateway-native one
+   to something like `acpx/sessions/list` and make `session/list` a real
+   `Proxied` per-backend call) -- deliberately not decided unilaterally
+   in this phase, tracked here honestly rather than silently left as an
+   unlabeled inconsistency. Also not advertised in acpx's own `
+   initialize` response's `agentCapabilities` (no `listSessions` key at
+   all), which is at least internally consistent with *not* claiming
+   spec compliance for it.
+4. `session/delete` and `logout` (both promoted to stable in the ACP
+   spec per this phase's research, alongside `session/set_config_option`
+   /`session/set_mode`) are not classified anywhere in acpx's `classify`
+   function at all -- unlike phase 6's `initialize`/`authenticate` gap,
+   these fall through to `MethodClass::Unknown` today. `claude-agent-acp`
+   does implement `deleteSession` (confirmed in the same `dist/acp-
+   agent.js` read during this phase). Not fixed in this phase (found
+   late, budget-constrained) -- concrete next step.
+5. `session/fork` (unstable per spec, but `claude-agent-acp` does
+   implement `unstable_forkSession`) and `elicitation/create`/
+   `elicitation/complete` (unstable) are not classified either. Lower
+   priority than (3)/(4) since they're explicitly unstable in the spec
+   itself, but worth a follow-up recheck once the stable-method gaps
+   above are closed.
+6. `ContentBlock` variant (image/audio/resource) passthrough and `_meta`
+   field passthrough in `session/prompt` -- both still claimed-but-
+   unverified-by-an-explicit-test per phase 7's recheck list. Not
+   reached this phase; still open.

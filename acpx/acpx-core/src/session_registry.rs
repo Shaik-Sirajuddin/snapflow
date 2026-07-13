@@ -59,6 +59,23 @@ impl SessionRegistry {
         self.sessions.get(&gateway_id.0)
     }
 
+    /// Re-insert a session under an *already-known* gateway id, rather
+    /// than minting a fresh one via [`Self::register`]. Phase 8 addition:
+    /// backs `session/load`/`session/resume`'s rehydration path -- a
+    /// gateway process restart clears this in-memory map entirely, but a
+    /// spec-compliant client is fully entitled to call `session/load`
+    /// with a gateway session id it was handed by a *previous* acpx
+    /// process lifetime (that's the entire point of `session/load`
+    /// existing as a distinct method from `session/new`). The caller is
+    /// responsible for sourcing `entry` from durable storage (see
+    /// `crate::persistence::PersistenceStore::get_session`) before
+    /// calling this -- this method itself does no I/O, it only accepts
+    /// whatever the caller already resolved and makes it resolvable
+    /// in-memory again under the same id.
+    pub fn insert(&mut self, gateway_id: GatewaySessionId, entry: SessionEntry) {
+        self.sessions.insert(gateway_id.0, entry);
+    }
+
     pub fn remove(&mut self, gateway_id: &GatewaySessionId) -> Option<SessionEntry> {
         self.sessions.remove(&gateway_id.0)
     }
