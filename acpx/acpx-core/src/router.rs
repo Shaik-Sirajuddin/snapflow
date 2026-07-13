@@ -357,6 +357,7 @@ impl Router {
         let ctx = LiveNotifyCtx {
             router: std::sync::Arc::clone(router_handle),
             agent_id: agent_id.to_string(),
+            tenant_id: None,
         };
         let backend = std::sync::Arc::clone(backend);
         tokio::spawn(backend_idle_scavenger(backend, ctx));
@@ -489,21 +490,39 @@ impl Router {
         &mut self,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, RouterError> {
+        self.dispatch_for_tenant(&TenantId::default_tenant(), request)
+            .await
+    }
+
+    /// **Phase B (`acpx-tenant-isolation`).** Tenant-aware entry point --
+    /// the real dispatch logic, now scoped to `tenant_id`'s own
+    /// `SessionRegistry` submap throughout. [`Self::dispatch`] is kept as
+    /// a thin wrapper defaulting to [`TenantId::default_tenant`] so every
+    /// pre-existing (tenant-unaware) caller -- most of this workspace's
+    /// own test suite included -- keeps working byte-for-byte unchanged;
+    /// only `acpx-server`'s transports, which actually extract a real
+    /// `X-Acpx-Tenant` header, call this directly.
+    pub async fn dispatch_for_tenant(
+        &mut self,
+        tenant_id: &TenantId,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
         let method = request
             .get("method")
             .and_then(|m| m.as_str())
             .ok_or(RouterError::MissingMethod)?
             .to_string();
         match classify(&method) {
-            MethodClass::Hybrid => self.dispatch_session_new(request).await,
-            MethodClass::Proxied => self.dispatch_proxied(request).await,
-            MethodClass::GatewayNative => self.dispatch_native(&method, request).await,
+            MethodClass::Hybrid => self.dispatch_session_new(tenant_id, request).await,
+            MethodClass::Proxied => self.dispatch_proxied(tenant_id, request).await,
+            MethodClass::GatewayNative => self.dispatch_native(tenant_id, &method, request).await,
             MethodClass::Unknown => Err(RouterError::UnknownMethod(method)),
         }
     }
 
     async fn dispatch_session_new(
         &mut self,
+        tenant_id: &TenantId,
         mut request: serde_json::Value,
     ) -> Result<serde_json::Value, RouterError> {
         let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
@@ -588,7 +607,7 @@ impl Router {
 
         let backend_session_id = extract_backend_session_id(&response)?;
         let gateway_id = self.sessions.register(
-            &TenantId::default_tenant(),
+            tenant_id,
             agent_id,
             BackendSessionId(backend_session_id),
             profile.as_ref().map(|p| p.name.clone()),
@@ -603,7 +622,7 @@ impl Router {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
         }
         if let Some(entry) = self.sessions.resolve(
-            &TenantId::default_tenant(),
+            tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
         ) {
             self.spawn_session_persistence(
@@ -635,6 +654,7 @@ impl Router {
     /// the first place.
     async fn dispatch_session_list_real(
         &mut self,
+        tenant_id: &TenantId,
         id: serde_json::Value,
         selector: SessionListSelector,
         mut params: serde_json::Value,
@@ -677,25 +697,38 @@ impl Router {
             .get("result")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({ "sessions": [] }));
-        if let Some(sessions) = result.get_mut("sessions").and_then(|s| s.as_array_mut()) {
-            for session in sessions.iter_mut() {
+        if let Some(raw_sessions) = result.get("sessions").and_then(|s| s.as_array()) {
+            let mut filtered = Vec::with_capacity(raw_sessions.len());
+            for session in raw_sessions.iter().cloned() {
+                let mut session = session;
                 let Some(backend_sid) = session
                     .get("sessionId")
                     .and_then(|s| s.as_str())
                     .map(str::to_string)
                 else {
+                    filtered.push(session);
                     continue;
                 };
                 let session_cwd = session
                     .get("cwd")
                     .and_then(|c| c.as_str())
                     .map(str::to_string);
-                let gateway_id = self.translate_or_register_backend_session(
+                // **Phase B leak fix.** `None` means this exact backend
+                // session is already owned by a *different* tenant (see
+                // `Self::translate_or_register_backend_session`'s doc
+                // comment) -- it is dropped from the response entirely,
+                // not just left untranslated, so the requesting tenant
+                // never learns the backend-native id or anything else
+                // about a session it doesn't own.
+                let Some(gateway_id) = self.translate_or_register_backend_session(
+                    tenant_id,
                     &agent_id,
                     &backend_sid,
                     profile_name.clone(),
                     session_cwd,
-                );
+                ) else {
+                    continue;
+                };
                 session["sessionId"] = serde_json::Value::String(gateway_id.clone());
                 self.spawn_session_persistence(
                     gateway_id,
@@ -705,6 +738,10 @@ impl Router {
                     outbound.clone(),
                     response.clone(),
                 );
+                filtered.push(session);
+            }
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("sessions".to_string(), serde_json::json!(filtered));
             }
         }
         Ok(result)
@@ -723,28 +760,56 @@ impl Router {
     /// `session/load`-able (and, once loaded, promptable) exactly like
     /// any other -- **the concrete, testable proof this isn't just a
     /// cosmetic id swap.**
+    ///
+    /// **Phase B (`acpx-tenant-isolation`) addition -- closes a real
+    /// cross-tenant leak, corrected from this plan's original
+    /// `01-architecture.md` draft during implementation (see that plan's
+    /// updated text): a naive "never auto-register unless already known
+    /// to *this* tenant" rule was found, against
+    /// `session_list_real_test.rs`'s existing
+    /// `session_list_with_a_selector_proxies_to_the_real_backend_and_
+    /// translates_ids` test, to regress phase 13's own tested
+    /// first-discovery behavior (a session created directly against a
+    /// shared backend, never before seen by *any* tenant, must still be
+    /// discoverable and usable -- that is the entire point of this
+    /// function existing). The corrected rule: reuse an already-known id
+    /// if *this* tenant already owns it; if some *other* tenant already
+    /// owns this exact `(agent_id, backend_session_id)` pair
+    /// ([`SessionRegistry::find_owner`]), refuse -- return `None`, never
+    /// silently adopt someone else's session; only truly novel (nobody's)
+    /// backend sessions get freshly registered, and always under the
+    /// *requesting* tenant. `None` means "filter this entry out of the
+    /// `session/list` response entirely" to the caller.
     fn translate_or_register_backend_session(
         &mut self,
+        tenant_id: &TenantId,
         agent_id: &str,
         backend_session_id: &str,
         profile_name: Option<String>,
         cwd: Option<String>,
-    ) -> String {
+    ) -> Option<String> {
         if let Some(existing) =
             self.sessions
-                .find_by_backend(&TenantId::default_tenant(), agent_id, backend_session_id)
+                .find_by_backend(tenant_id, agent_id, backend_session_id)
         {
-            return existing.0;
+            return Some(existing.0);
         }
-        self.sessions
-            .register(
-                &TenantId::default_tenant(),
-                agent_id.to_string(),
-                BackendSessionId(backend_session_id.to_string()),
-                profile_name,
-                cwd,
-            )
-            .0
+        if let Some(owner) = self.sessions.find_owner(agent_id, backend_session_id) {
+            if owner != tenant_id {
+                return None;
+            }
+        }
+        Some(
+            self.sessions
+                .register(
+                    tenant_id,
+                    agent_id.to_string(),
+                    BackendSessionId(backend_session_id.to_string()),
+                    profile_name,
+                    cwd,
+                )
+                .0,
+        )
     }
 
     /// Resolve `_acpx.profile` for `session/new`'s managed mode: look up
@@ -865,6 +930,7 @@ impl Router {
     /// the error.
     async fn rehydrate_session(
         &mut self,
+        tenant_id: &TenantId,
         method: &str,
         gateway_session_id: &str,
     ) -> Result<crate::session_registry::SessionEntry, RouterError> {
@@ -914,7 +980,7 @@ impl Router {
             self.resolve_profile(name).await?;
         }
         self.sessions.insert(
-            &TenantId::default_tenant(),
+            tenant_id,
             acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
             entry.clone(),
         );
@@ -923,6 +989,7 @@ impl Router {
 
     async fn dispatch_proxied(
         &mut self,
+        tenant_id: &TenantId,
         mut request: serde_json::Value,
     ) -> Result<serde_json::Value, RouterError> {
         let method = request
@@ -939,7 +1006,7 @@ impl Router {
         // is never supposed to send). Must be checked before that `id`
         // extraction, not after.
         if method == "session/cancel" {
-            return self.dispatch_session_cancel(request).await;
+            return self.dispatch_session_cancel(tenant_id, request).await;
         }
         let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
         let params = request
@@ -952,11 +1019,14 @@ impl Router {
             .to_string();
 
         let entry = match self.sessions.resolve(
-            &TenantId::default_tenant(),
+            tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
         ) {
             Some(entry) => entry.clone(),
-            None => self.rehydrate_session(&method, &gateway_session_id).await?,
+            None => {
+                self.rehydrate_session(tenant_id, &method, &gateway_session_id)
+                    .await?
+            }
         };
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
@@ -1002,7 +1072,7 @@ impl Router {
             // existed on `SessionRegistry` but was never called from
             // anywhere in this file until now.
             self.sessions.remove(
-                &TenantId::default_tenant(),
+                tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             );
             if let Some(store) = self.persistence.clone() {
@@ -1073,6 +1143,7 @@ impl Router {
     /// real backend acknowledgment (there isn't one to wait for).
     async fn dispatch_session_cancel(
         &mut self,
+        tenant_id: &TenantId,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, RouterError> {
         let client_id = request
@@ -1088,7 +1159,7 @@ impl Router {
         let entry = self
             .sessions
             .resolve(
-                &TenantId::default_tenant(),
+                tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             )
             .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
@@ -1120,6 +1191,7 @@ impl Router {
 
     async fn dispatch_native(
         &mut self,
+        tenant_id: &TenantId,
         method: &str,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, RouterError> {
@@ -1271,13 +1343,13 @@ impl Router {
                     .unwrap_or(serde_json::json!({}));
                 match session_list_selector(&params) {
                     Some(selector) => {
-                        self.dispatch_session_list_real(id.clone(), selector, params)
+                        self.dispatch_session_list_real(tenant_id, id.clone(), selector, params)
                             .await?
                     }
                     None => {
                         let sessions: Vec<serde_json::Value> = self
                             .sessions
-                            .list(&TenantId::default_tenant())
+                            .list(tenant_id)
                             .map(|(gateway_id, entry)| {
                                 serde_json::json!({
                                     "sessionId": gateway_id,
@@ -1996,6 +2068,20 @@ async fn handle_terminal_request(
 struct LiveNotifyCtx {
     router: SharedRouterHandle,
     agent_id: String,
+    /// **Phase B (`acpx-tenant-isolation`) addition.** `try_deliver_live`
+    /// resolves the backend-native session id back to a gateway id via
+    /// `SessionRegistry::find_by_backend`, which is now tenant-scoped --
+    /// without this, a session created under a non-default tenant would
+    /// never be found (only the default tenant's submap would ever be
+    /// searched), silently breaking live delivery for every non-default
+    /// tenant. `Some` for a call-scoped context (`dispatch_proxied_shared`
+    /// knows the exact tenant the in-flight call belongs to); `None` for
+    /// the phase-15 idle-scavenger background task
+    /// ([`spawn_idle_scavenger_if_new`]), which runs once per physical
+    /// backend process (potentially shared across tenants) with no
+    /// per-call tenant context -- `None` means "search every tenant" via
+    /// `SessionRegistry::find_by_backend_any_tenant`.
+    tenant_id: Option<TenantId>,
 }
 
 /// Attempt to deliver a real `session/update` notification (`value`,
@@ -2024,11 +2110,16 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     };
     let (gateway_id, hub) = {
         let r = ctx.router.lock().await;
-        let gateway_id = r.sessions.find_by_backend(
-            &TenantId::default_tenant(),
-            &ctx.agent_id,
-            backend_session_id,
-        );
+        let gateway_id = match &ctx.tenant_id {
+            Some(tenant_id) => {
+                r.sessions
+                    .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
+            }
+            None => r
+                .sessions
+                .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id)
+                .map(|(_tenant, gid)| gid),
+        };
         (gateway_id, r.notification_hub.clone())
     };
     let Some(gateway_id) = gateway_id else {
@@ -2492,13 +2583,28 @@ pub async fn dispatch_shared(
     router: &SharedRouterHandle,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
+    dispatch_shared_for_tenant(router, &TenantId::default_tenant(), request).await
+}
+
+/// **Phase B (`acpx-tenant-isolation`).** Tenant-aware entry point for the
+/// shared (`Arc<Mutex<Router>>`-based) dispatch path -- mirrors
+/// [`Router::dispatch_for_tenant`]'s relationship to [`Router::dispatch`]:
+/// [`dispatch_shared`] stays a thin default-tenant wrapper so every
+/// pre-existing (tenant-unaware) caller keeps working unchanged; only
+/// `acpx-server`'s transports, which extract a real `X-Acpx-Tenant`
+/// header, call this directly.
+pub async fn dispatch_shared_for_tenant(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
     let method = request
         .get("method")
         .and_then(|m| m.as_str())
         .ok_or(RouterError::MissingMethod)?
         .to_string();
     match classify(&method) {
-        MethodClass::Hybrid => dispatch_session_new_shared(router, request).await,
+        MethodClass::Hybrid => dispatch_session_new_shared(router, tenant_id, request).await,
         // **Phase 7:** `session/cancel` needs `dispatch_session_cancel_shared`
         // specifically, not the generic `dispatch_proxied_shared` --
         // see `Router::dispatch_session_cancel`'s doc comment for why
@@ -2509,9 +2615,9 @@ pub async fn dispatch_shared(
         // `session/prompt` against the same backend may be holding for
         // its entire duration).
         MethodClass::Proxied if method == "session/cancel" => {
-            dispatch_session_cancel_shared(router, request).await
+            dispatch_session_cancel_shared(router, tenant_id, request).await
         }
-        MethodClass::Proxied => dispatch_proxied_shared(router, request).await,
+        MethodClass::Proxied => dispatch_proxied_shared(router, tenant_id, request).await,
         // **Phase 13.** Mirrors `dispatch_native`'s `"session/list"`
         // branching (see `session_list_selector`'s doc comment) but only
         // when a selector is actually present -- an unqualified
@@ -2534,10 +2640,14 @@ pub async fn dispatch_shared(
                     .and_then(session_list_selector)
                     .is_some() =>
         {
-            dispatch_session_list_real_shared(router, request).await
+            dispatch_session_list_real_shared(router, tenant_id, request).await
         }
         MethodClass::GatewayNative | MethodClass::Unknown => {
-            router.lock().await.dispatch(request).await
+            router
+                .lock()
+                .await
+                .dispatch_for_tenant(tenant_id, request)
+                .await
         }
     }
 }
@@ -2557,6 +2667,7 @@ pub async fn dispatch_shared(
 /// this cancel call for no reason).
 async fn dispatch_session_cancel_shared(
     router: &SharedRouterHandle,
+    tenant_id: &TenantId,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
     let client_id = request
@@ -2575,7 +2686,7 @@ async fn dispatch_session_cancel_shared(
         let entry = r
             .sessions
             .resolve(
-                &TenantId::default_tenant(),
+                tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             )
             .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.clone()))?;
@@ -2614,6 +2725,7 @@ async fn dispatch_session_cancel_shared(
 /// for the call's entire duration.
 async fn dispatch_session_list_real_shared(
     router: &SharedRouterHandle,
+    tenant_id: &TenantId,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
@@ -2668,26 +2780,34 @@ async fn dispatch_session_list_real_shared(
         .get("result")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({ "sessions": [] }));
-    if let Some(sessions) = result.get_mut("sessions").and_then(|s| s.as_array_mut()) {
+    if let Some(raw_sessions) = result.get("sessions").and_then(|s| s.as_array()) {
         let mut r = router.lock().await;
-        for session in sessions.iter_mut() {
+        let mut filtered = Vec::with_capacity(raw_sessions.len());
+        for session in raw_sessions.iter().cloned() {
+            let mut session = session;
             let Some(backend_sid) = session
                 .get("sessionId")
                 .and_then(|s| s.as_str())
                 .map(str::to_string)
             else {
+                filtered.push(session);
                 continue;
             };
             let session_cwd = session
                 .get("cwd")
                 .and_then(|c| c.as_str())
                 .map(str::to_string);
-            let gateway_id = r.translate_or_register_backend_session(
+            // **Phase B leak fix**, same rationale as
+            // `Router::dispatch_session_list_real`'s equivalent fix.
+            let Some(gateway_id) = r.translate_or_register_backend_session(
+                tenant_id,
                 &agent_id,
                 &backend_sid,
                 profile_name.clone(),
                 session_cwd,
-            );
+            ) else {
+                continue;
+            };
             session["sessionId"] = serde_json::Value::String(gateway_id.clone());
             spawn_session_persistence_fn(
                 r.persistence.clone(),
@@ -2698,6 +2818,10 @@ async fn dispatch_session_list_real_shared(
                 outbound.clone(),
                 response.clone(),
             );
+            filtered.push(session);
+        }
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("sessions".to_string(), serde_json::json!(filtered));
         }
     }
 
@@ -2711,6 +2835,7 @@ async fn dispatch_session_list_real_shared(
 /// restructured to release `router`'s lock before the backend round trip.
 async fn dispatch_proxied_shared(
     router: &SharedRouterHandle,
+    tenant_id: &TenantId,
     mut request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
     let method = request
@@ -2729,11 +2854,14 @@ async fn dispatch_proxied_shared(
     let (backend, persistence, call_policy, agent_id) = {
         let mut r = router.lock().await;
         let entry = match r.sessions.resolve(
-            &TenantId::default_tenant(),
+            tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
         ) {
             Some(entry) => entry.clone(),
-            None => r.rehydrate_session(&method, &gateway_session_id).await?,
+            None => {
+                r.rehydrate_session(tenant_id, &method, &gateway_session_id)
+                    .await?
+            }
         };
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
@@ -2765,6 +2893,7 @@ async fn dispatch_proxied_shared(
         let live = LiveNotifyCtx {
             router: std::sync::Arc::clone(router),
             agent_id,
+            tenant_id: Some(tenant_id.clone()),
         };
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, Some(&live)).await?;
@@ -2785,7 +2914,7 @@ async fn dispatch_proxied_shared(
         // closed session from the shared `SessionRegistry` too, so the
         // two dispatch paths never drift apart on this behavior.
         router.lock().await.sessions.remove(
-            &TenantId::default_tenant(),
+            tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
         );
         if let Some(store) = persistence {
@@ -2806,6 +2935,7 @@ async fn dispatch_proxied_shared(
 /// backend round trip.
 async fn dispatch_session_new_shared(
     router: &SharedRouterHandle,
+    tenant_id: &TenantId,
     mut request: serde_json::Value,
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
@@ -2892,7 +3022,7 @@ async fn dispatch_session_new_shared(
     let (gateway_session_id_str, persist_args) = {
         let mut r = router.lock().await;
         let gateway_id = r.sessions.register(
-            &TenantId::default_tenant(),
+            tenant_id,
             agent_id,
             BackendSessionId(backend_session_id),
             profile.as_ref().map(|p| p.name.clone()),
@@ -2909,7 +3039,7 @@ async fn dispatch_session_new_shared(
         let persist_args = r
             .sessions
             .resolve(
-                &TenantId::default_tenant(),
+                tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
             )
             .map(|entry| (entry.agent_id.clone(), entry.backend_session_id.0.clone()));

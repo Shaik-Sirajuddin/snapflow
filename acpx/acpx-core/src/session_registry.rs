@@ -207,6 +207,54 @@ impl SessionRegistry {
             }
         })
     }
+
+    /// **Phase B (`acpx-tenant-isolation`), closes the real per-backend
+    /// `session/list` cross-tenant leak flagged in this plan's
+    /// `01-architecture.md`.** Unlike [`Self::find_by_backend`] (scoped to
+    /// one caller-known tenant), this scans *every* tenant's submap to
+    /// answer "does some tenant -- any tenant -- already own this exact
+    /// `(agent_id, backend_session_id)` pair?", returning which one if so.
+    /// A physical backend process is shared across every tenant using the
+    /// same profile (see `01-architecture.md`'s "backend process sharing"
+    /// section), so a backend's own `session/list` reply can legitimately
+    /// include a session some *other* tenant created -- this is the check
+    /// that lets the caller refuse to hand that session to the requesting
+    /// tenant instead of silently adopting it.
+    pub fn find_owner(&self, agent_id: &str, backend_session_id: &str) -> Option<&TenantId> {
+        self.sessions.iter().find_map(|(tenant, inner)| {
+            inner.values().find_map(|entry| {
+                if entry.agent_id == agent_id && entry.backend_session_id.0 == backend_session_id {
+                    Some(tenant)
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    /// Like [`Self::find_owner`], but also returns the matching
+    /// [`GatewaySessionId`] rather than just which tenant owns it -- used
+    /// by the phase-15 idle-scavenger background task
+    /// ([`crate::router::backend_idle_scavenger`]), which has no
+    /// per-call tenant context of its own (it runs once per physical
+    /// backend process, which may be shared across tenants), so it must
+    /// search across every tenant to find whichever one (if any) owns a
+    /// given backend-native session id.
+    pub fn find_by_backend_any_tenant(
+        &self,
+        agent_id: &str,
+        backend_session_id: &str,
+    ) -> Option<(TenantId, GatewaySessionId)> {
+        self.sessions.iter().find_map(|(tenant, inner)| {
+            inner.iter().find_map(|(gid, entry)| {
+                if entry.agent_id == agent_id && entry.backend_session_id.0 == backend_session_id {
+                    Some((tenant.clone(), GatewaySessionId(gid.clone())))
+                } else {
+                    None
+                }
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +361,24 @@ mod tests {
         assert_eq!(reg.list(&tenant_a).count(), 1);
         assert_eq!(reg.list(&tenant_b).count(), 1);
         assert_eq!(reg.list(&TenantId::from("tenant-c")).count(), 0);
+    }
+
+    /// **Phase B.** `find_owner` is the cross-tenant lookup the
+    /// `session/list` leak fix relies on: it must find a session
+    /// regardless of which tenant registered it, so a caller can detect
+    /// "someone else already owns this" even without knowing who.
+    #[test]
+    fn find_owner_locates_a_session_regardless_of_which_tenant_registered_it() {
+        let mut reg = SessionRegistry::new();
+        let tenant_a = TenantId::from("tenant-a");
+        reg.register(
+            &tenant_a,
+            "codex-acp",
+            BackendSessionId("backend-1".to_string()),
+            None,
+            None,
+        );
+        assert_eq!(reg.find_owner("codex-acp", "backend-1"), Some(&tenant_a));
+        assert_eq!(reg.find_owner("codex-acp", "backend-2"), None);
     }
 }

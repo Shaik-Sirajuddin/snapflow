@@ -38,6 +38,19 @@
 //! `ACPX_AUTH_TOKEN` with a TLS-terminating reverse proxy for any
 //! non-loopback deployment, since a bearer token sent over plaintext HTTP
 //! is only as safe as the transport it rides on.
+//!
+//! **Tenant isolation (`acpx-tenant-isolation` Phase B).** Optional
+//! `X-Acpx-Tenant` header, read fresh on every `POST /rpc` request (no
+//! persistent connection state to cache it in, unlike WS -- see `ws.rs`'s
+//! doc comment for that transport's equivalent, read-once-at-upgrade
+//! handling). Absent means the implicit `"default"` tenant -- byte-for-
+//! byte the same behavior as before this feature existed. This is a
+//! self-declared partition key, **not** an authentication mechanism: see
+//! `memory/acpx/gen/plans/acpx-tenant-isolation/00-goal.md`'s "Why auth
+//! is out of scope" section. Applies to every method on this connection,
+//! not just `session/new` (unlike `X-Acpx-Profile`, which only matters
+//! for session creation) -- see that plan's `01-architecture.md` for why
+//! this is a header rather than an `_acpx.tenant` request field.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,7 +62,8 @@ use axum::routing::{get, post};
 use axum::Json;
 use tokio::sync::Mutex;
 
-use acpx_core::router::{dispatch_shared, Router, RouterError};
+use acpx_core::router::{dispatch_shared_for_tenant, Router, RouterError};
+use acpx_core::TenantId;
 
 /// Shared, lockable handle to the one `Router` instance serving every
 /// concurrent HTTP/WS client. The `Mutex` here is intentionally *not* held
@@ -138,6 +152,25 @@ pub struct AppState {
 /// regardless of how the client cases it.
 const PROFILE_HEADER: &str = "x-acpx-profile";
 
+/// Header carrying an explicit tenant selection (`acpx-tenant-isolation`
+/// Phase B). `axum`'s `HeaderMap` lookups are already case-insensitive.
+/// Absent means [`TenantId::default_tenant`].
+const TENANT_HEADER: &str = "x-acpx-tenant";
+
+/// Resolve this request's [`TenantId`] from `X-Acpx-Tenant`, defaulting to
+/// [`TenantId::default_tenant`] when absent or not valid UTF-8 -- a
+/// malformed header is treated the same as an absent one (fails open to
+/// the default tenant) rather than rejecting the request outright, since
+/// tenant scoping is a data partition, not an auth gate (see this
+/// module's doc comment).
+fn resolve_tenant(headers: &HeaderMap) -> TenantId {
+    headers
+        .get(TENANT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(TenantId::from)
+        .unwrap_or_default()
+}
+
 /// Start the HTTP/WS transport, serving `POST /rpc` and `GET /ws` against
 /// the given shared `Router` until the listener errors or the task is
 /// dropped/cancelled. Intended to be spawned as its own task (or awaited
@@ -182,10 +215,12 @@ async fn rpc_handler(
         return unauthorized_response(&request);
     }
     inject_profile_header(&headers, &mut request);
-    let response = match dispatch_shared(&state.router, request.clone()).await {
-        Ok(response) => response,
-        Err(err) => json_rpc_error(&request, err),
-    };
+    let tenant_id = resolve_tenant(&headers);
+    let response =
+        match dispatch_shared_for_tenant(&state.router, &tenant_id, request.clone()).await {
+            Ok(response) => response,
+            Err(err) => json_rpc_error(&request, err),
+        };
     Json(response).into_response()
 }
 

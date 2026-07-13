@@ -2193,3 +2193,117 @@ as it was. The next phase (Phase B: transport-level `X-Acpx-Tenant`
 extraction + closing the real per-backend `session/list` cross-tenant
 leak identified in `acpx-tenant-isolation/01-architecture.md`) is where
 tenant isolation actually becomes observable behavior.
+
+## 2026-07-13 -- ACP compatibility phase 17: tenant isolation phase B -- `X-Acpx-Tenant` transport extraction + real per-backend `session/list` cross-tenant leak closed
+
+**Series context.** Second implementation phase of
+`memory/acpx/gen/plans/acpx-tenant-isolation/`, building on phase 16's
+behavior-preserving `TenantId` plumbing. This is the phase where tenant
+isolation becomes real, observable behavior: every transport now extracts
+a caller-supplied tenant id and every dispatch path is scoped to it, and
+a genuine cross-tenant data leak found while implementing this phase (not
+hypothesized in the plan draft) is closed.
+
+**What changed:**
+1. `Router::dispatch`/`dispatch_shared` (module-level free fn) are now
+   thin wrappers around new tenant-aware entry points --
+   `Router::dispatch_for_tenant`/`dispatch_shared_for_tenant` -- so every
+   pre-existing (tenant-unaware) caller, including this workspace's own
+   test suite, keeps working byte-for-byte unchanged, defaulting to
+   `TenantId::default_tenant()`.
+2. Every dispatch helper (`dispatch_session_new`, `dispatch_proxied`,
+   `dispatch_native`, `dispatch_session_cancel`, `rehydrate_session`,
+   `dispatch_session_list_real`, and all five `_shared` equivalents) now
+   takes a `tenant_id: &TenantId` parameter, threaded from the transport
+   layer down to every `SessionRegistry` call.
+3. `acpx-server`'s three transports each extract a tenant id and pass it
+   through:
+   - `http.rs`: `X-Acpx-Tenant` header, read fresh per `POST /rpc` request
+     (mirrors the existing `X-Acpx-Profile` extraction pattern, but
+     applies to every method, not just `session/new`).
+   - `ws.rs`: `X-Acpx-Tenant` read once at upgrade time, fixed for that
+     connection's whole lifetime (same "headers only available at
+     upgrade" constraint auth already has on this transport).
+   - `stdio.rs`: `ACPX_STDIO_TENANT` env var, read once at process
+     startup (no per-message header concept exists on this transport at
+     all).
+   Absent/unset on any transport means the implicit `"default"` tenant --
+   zero behavior change for every deployment that doesn't opt in.
+4. **Real cross-tenant leak found and closed, corrected from the plan's
+   original draft during implementation.** `SessionRegistry` gained
+   `find_owner`/`find_by_backend_any_tenant` (search across every
+   tenant's submap). `Router::translate_or_register_backend_session` (the
+   function `dispatch_session_list_real`/`_shared` use to translate a
+   real backend's own `session/list` reply into gateway ids) now returns
+   `Option<String>`, not `String`: if the requesting tenant doesn't
+   already own a given `(agent_id, backend_session_id)` pair but some
+   *other* tenant does, it returns `None` and the caller drops that
+   session entirely from the response -- never silently adopting or even
+   revealing the existence of another tenant's session discovered via a
+   shared physical backend process. The plan's original `01-architecture.md`
+   draft proposed a simpler "only reuse if already known to *this*
+   tenant" rule; implementing it against the pre-existing
+   `session_list_real_test.rs` suite showed that rule would regress phase
+   13's own tested first-discovery behavior (a session created directly
+   against a shared backend, never seen by *any* tenant yet, must still
+   be discoverable) -- the corrected three-way rule (reuse if owned by
+   this tenant; refuse if owned by another tenant; register fresh under
+   this tenant if owned by nobody) is what's actually implemented and
+   tested.
+5. `LiveNotifyCtx` (phase 14's live `session/update` delivery context)
+   gained an `Option<TenantId>` field: `Some` for call-scoped delivery
+   (`dispatch_proxied_shared` knows the exact tenant), `None` for the
+   phase-15 idle-scavenger background task (which runs once per physical
+   backend process, potentially shared across tenants, with no per-call
+   tenant context) -- `None` searches every tenant via
+   `find_by_backend_any_tenant` rather than being newly and incorrectly
+   scoped to the default tenant only.
+
+**Tests (`acpx-server/tests/tenant_isolation_test.rs`, 3 new; real HTTP
+transport, two `reqwest::Client` callers with different `X-Acpx-Tenant`
+headers standing in for two separate ACP client processes):**
+1. `two_tenants_never_see_each_others_sessions_in_the_gateway_aggregate`
+   -- two tenants each create a session against the same registered
+   agent; each tenant's own gateway-scoped `session/list` aggregate
+   shows exactly its own session; the unscoped `"default"` tenant (no
+   header at all) sees neither -- proves default-tenant is a genuinely
+   separate, empty namespace, not an alias for "everyone."
+2. `real_per_backend_session_list_never_leaks_another_tenants_session`
+   -- the leak-fix proof: both tenants share one physical backend
+   process; the backend's own `session/list` reply legitimately
+   includes the session id either tenant's real per-backend
+   (`_acpx.agentId`) `session/list` would see verbatim, but only the
+   owning tenant's request actually returns it -- the other tenant's
+   request comes back with an empty `sessions` array, not a filtered-but-
+   still-partially-informative one.
+3. `a_tenant_cannot_prompt_against_another_tenants_gateway_session_id` --
+   `session/prompt` issued as tenant B against tenant A's gateway session
+   id fails with the same "no session registered" error a genuinely
+   unknown id would produce (no distinguishable cross-tenant existence
+   leak); the identical call issued as tenant A (the real owner)
+   succeeds, proving the rejection is genuinely tenant-scoped rather than
+   a general regression.
+
+Workspace test count after this phase: **238 passed, 0 failed, 6
+ignored** (up from 228/0/6 -- 10 new: the 3 tenant-isolation integration
+tests above, plus 1 `SessionRegistry::find_owner` unit test that landed
+alongside this phase's `find_by_backend`-family additions; the remaining
+delta is test-binary re-linking of the shared `live::tests` module the
+new integration test file compiles in via `#[path]`, not new test
+functions -- see `http_ws_transport_test.rs`'s established pattern for
+why that module is compiled per test binary). `cargo fmt --all --check`
+and `cargo build --workspace --tests` both clean. `cargo clippy` still
+not available in this environment (component not installed), same
+limitation as every prior phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to ACP wire behavior -- every individual request/response/
+notification frame is byte-for-byte identical to before this phase; the
+only difference is *which* sessions a given connection's calls can see
+and touch, gated by a purely acpx-side, out-of-band header/env var with
+no spec-defined meaning (see `00-goal.md`'s "Why this stays ACP-
+compatible" section). Remaining `acpx-tenant-isolation` phases not yet
+done: Phase C (sqlite `tenant_id` column + migration, so tenant scoping
+survives a daemon restart via `session/load`/persisted `session/list`),
+Phase D (`NotificationHub` tenant-keying, defense in depth), Phase E
+(stretch: opt-in per-tenant backend process isolation).

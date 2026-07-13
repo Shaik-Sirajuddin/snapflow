@@ -22,10 +22,20 @@
 //! so a live forwarder task can write standalone notification frames to
 //! it concurrently with this loop's own request/response writes, without
 //! either side's bytes interleaving mid-frame.
+//!
+//! **Tenant isolation (`acpx-tenant-isolation` Phase B).** No per-message
+//! header concept exists on this transport at all (it's a raw
+//! newline-delimited stream, not HTTP/WS). Resolved once, at process
+//! startup, from the optional `ACPX_STDIO_TENANT` env var (or
+//! [`acpx_core::TenantId::default_tenant`] if unset) and fixed for this
+//! process's entire stdio lifetime -- multi-tenant stdio use means
+//! launching separate `acpx-server` processes per tenant, not a
+//! mid-stream switch.
 
 use crate::transport::http::SharedRouter;
 use crate::transport::live::{session_id_to_forget, session_id_to_watch};
-use acpx_core::router::dispatch_shared;
+use acpx_core::router::dispatch_shared_for_tenant;
+use acpx_core::TenantId;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -38,6 +48,11 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
     let mut lines = BufReader::new(stdin).lines();
     let hub = { router.lock().await.notification_hub() };
     let mut watched: HashSet<String> = HashSet::new();
+    let tenant_id = std::env::var("ACPX_STDIO_TENANT")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(TenantId::from)
+        .unwrap_or_default();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -51,7 +66,7 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             }
         };
         let response = {
-            match dispatch_shared(&router, request.clone()).await {
+            match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                 Ok(response) => response,
                 Err(err) => {
                     tracing::warn!(%err, "dispatch error, returning JSON-RPC error response");

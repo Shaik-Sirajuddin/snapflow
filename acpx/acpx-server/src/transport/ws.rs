@@ -18,6 +18,13 @@
 //! even available, so a rejected upgrade (missing/wrong token) is the
 //! only enforcement point; there is no per-message re-check after that.
 //!
+//! **Tenant isolation (`acpx-tenant-isolation` Phase B).** `X-Acpx-Tenant`
+//! is read once at upgrade time (the only point in a WS connection's
+//! lifetime headers are available, same caveat as auth above) and cached
+//! for that connection's entire lifetime -- a WS client is one fixed
+//! tenant for its whole connection, never switchable mid-stream. Absent
+//! means [`acpx_core::TenantId::default_tenant`].
+//!
 //! **Live `session/update` streaming (ACP compatibility phase 14).** This
 //! is one of the two persistent, full-duplex transports (the other is
 //! `stdio.rs`) that subscribes to `acpx_core::notify::NotificationHub`
@@ -42,7 +49,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
-use acpx_core::router::dispatch_shared;
+use acpx_core::router::dispatch_shared_for_tenant;
+use acpx_core::TenantId;
 
 use super::http::{json_rpc_error, AppState, SharedRouter};
 use super::live::{session_id_to_forget, session_id_to_watch};
@@ -63,7 +71,12 @@ pub async fn ws_handler(
         // response to its upgrade request, not a WS close frame).
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    ws.on_upgrade(move |socket| handle_socket(socket, state.router))
+    let tenant_id = headers
+        .get("x-acpx-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(TenantId::from)
+        .unwrap_or_default();
+    ws.on_upgrade(move |socket| handle_socket(socket, state.router, tenant_id))
 }
 
 /// One WS connection's request/response loop: each inbound text/binary
@@ -76,7 +89,7 @@ pub async fn ws_handler(
 /// session_id_to_forget}`, spawning one small forwarder task per newly
 /// watched session that writes every live update out as its own
 /// standalone frame for as long as this connection (or the session) lasts.
-async fn handle_socket(socket: WebSocket, router: SharedRouter) {
+async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: TenantId) {
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(AsyncMutex::new(sink));
     let hub = { router.lock().await.notification_hub() };
@@ -133,7 +146,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter) {
         };
 
         let response = {
-            match dispatch_shared(&router, request.clone()).await {
+            match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                 Ok(response) => response,
                 Err(err) => json_rpc_error(&request, err),
             }
