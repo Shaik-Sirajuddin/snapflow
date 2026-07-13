@@ -25,7 +25,7 @@ import (
 	"encoding/json"
 	"image"
 	_ "image/jpeg"
-	_ "image/png"
+	"image/png"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -147,8 +147,21 @@ func decodeRealFrame(t *testing.T, result map[string]any) realFrame {
 	if err != nil {
 		t.Fatalf("decode playback frame image: %v", err)
 	}
-	if got := frame.Bounds().Size(); got.X != 1280 || got.Y != 720 {
-		t.Fatalf("expected 1280x720 playback frame, got %v", got)
+	// The real Qt binary's project profile for a brand-new project (no
+	// prior QSettings/Shotcut.conf under its HOME) is Shotcut's own
+	// built-in default ("atsc_1080p_2997", 1920x1080) -- confirmed live,
+	// not assumed -- until something in the edit sequence sets a
+	// different one explicitly. This test never does, so 1920x1080 is the
+	// deterministic value for a genuinely fresh environment. It used to
+	// read 1280x720 here because every prior run of this test (and every
+	// other live-Qt harness in this repo) happened to reuse a real,
+	// long-lived $HOME that had a leftover Shotcut.conf-stored profile
+	// preference from years of manual/agent use -- procmgr.go's
+	// per-project isolated HOME (added for a real, separate FilesDock
+	// startup-latency/QSettings-corruption bug) exposed that this was
+	// never actually a guaranteed value, just an incidental one.
+	if got := frame.Bounds().Size(); got.X != 1920 || got.Y != 1080 {
+		t.Fatalf("expected 1920x1080 playback frame (fresh-HOME default profile), got %v", got)
 	}
 	return realFrame{image: frame}
 }
@@ -165,6 +178,23 @@ func (f realFrame) fracMatching(x0, y0, x1, y1 int, pred func(r, g, b uint8) boo
 		}
 	}
 	return float64(hit) / float64(total)
+}
+
+// dumpRealFramePNG writes a decoded frame to disk under dir/name.png for
+// manual visual inspection; only used when SNAPSHOT_DEBUG_FRAME_DUMP is set.
+func dumpRealFramePNG(t *testing.T, dir, name string, f realFrame) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir debug dump dir: %v", err)
+	}
+	out, err := os.Create(filepath.Join(dir, name+".png"))
+	if err != nil {
+		t.Fatalf("create debug dump file: %v", err)
+	}
+	defer out.Close()
+	if err := png.Encode(out, f.image); err != nil {
+		t.Fatalf("encode debug dump PNG: %v", err)
+	}
 }
 
 func (f realFrame) cornerMeanAbsDiff(other realFrame, size int) float64 {
@@ -279,6 +309,19 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 		t.Fatalf("expected real ProjectState.projectId == %s, got %+v", proj.ID, sel)
 	}
 
+	// file.probe (media_tools.rs's probe_media) shells out to real
+	// ffprobe directly and reports the SOURCE's own native nb_frames --
+	// stateless, independent of any live MLT project profile, so a 9s
+	// 30fps-encoded source genuinely reports 270 here. playlist.append,
+	// by contrast, opens a real Mlt::Producer against the live project's
+	// profile (sap_playlist_append in sap_ffi.cpp), which this
+	// environment's real default profile fixes at exactly 25fps
+	// (confirmed via ffprobe on a real export) until something changes
+	// it -- so the SAME file reports a different (profile-relative)
+	// frame count once it's actually added to the project. Both numbers
+	// are correct for what each call actually measures; they are not
+	// expected to agree.
+	const fps = 25
 	probe := sapCall("file.probe", map[string]any{"path": source})
 	if probe["path"] != source || probe["codec"] != "h264" ||
 		probe["durationFrames"] != float64(270) {
@@ -289,12 +332,12 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	if appended["index"] != float64(0) {
 		t.Fatalf("expected source playlist index 0, got %+v", appended)
 	}
-	if appended["durationFrames"] != float64(270) {
-		t.Fatalf("expected 9s source to probe as 270 frames, got %+v", appended)
+	if appended["durationFrames"] != float64(9*fps) {
+		t.Fatalf("expected 9s source to probe as %d frames, got %+v", 9*fps, appended)
 	}
 
 	overlayEntry := sapCall("playlist.append", map[string]any{"source": map[string]any{"path": overlay}})
-	if overlayEntry["index"] != float64(1) || overlayEntry["durationFrames"] != float64(60) {
+	if overlayEntry["index"] != float64(1) || overlayEntry["durationFrames"] != float64(2*fps) {
 		t.Fatalf("expected 2s overlay playlist entry at index 1, got %+v", overlayEntry)
 	}
 
@@ -328,30 +371,50 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 
 	trim := func(clipIndex, inFrame, outFrame int) {
 		t.Helper()
-		sapCall("edit.trimClipIn", map[string]any{
-			"trackIndex": float64(0),
-			"clipIndex":  float64(clipIndex),
-			"newFrame":   float64(inFrame),
-		})
+		// Real MultitrackModel::trimClipOutValid checks
+		// (frame_out-delta) against the clip's *current* reported
+		// length, which a prior in-trim already narrows -- trimming
+		// out first (while length still reflects the full untrimmed
+		// producer) then trimming in avoids a spurious "out of range"
+		// rejection that the reverse order hits (confirmed via manual
+		// probe against the real binary).
 		sapCall("edit.trimClipOut", map[string]any{
 			"trackIndex": float64(0),
 			"clipIndex":  float64(clipIndex),
 			"newFrame":   float64(outFrame),
+			"ripple":     true,
+		})
+		sapCall("edit.trimClipIn", map[string]any{
+			"trackIndex": float64(0),
+			"clipIndex":  float64(clipIndex),
+			"newFrame":   float64(inFrame),
+			"ripple":     true,
 		})
 	}
-	trim(1, 0, 44)
-	trim(2, 90, 134)
-	trim(3, 200, 244)
+	// Three ~1.6s (40-frame, 25fps) windows sliced from the same 225-frame
+	// source, spread across it (early/mid/late) -- 45/30/1.5s numbers from
+	// an earlier 30fps-source assumption no longer fit inside the real
+	// 225-frame budget (200-244 alone exceeds it), so this schedule is a
+	// from-scratch 25fps-native one, not a mechanical rescale.
+	const segLen = 40
+	trim(1, 0, segLen-1)
+	trim(2, 90, 90+segLen-1)
+	trim(3, 180, 180+segLen-1)
 
+	const crossfadeLen = 15
 	sapCall("transitions.addCrossfade", map[string]any{
 		"trackIndex":     float64(0),
 		"betweenClips":   []int{1, 2},
-		"durationFrames": float64(15),
+		"durationFrames": float64(crossfadeLen),
 	})
+	// AddTransitionCommand inserts the transition as its own raw playlist
+	// entry between clip1 and clip2, shifting every later clip's index up
+	// by one (clip2 was 2, is now 3; clip3 was 3, is now 4) -- confirmed
+	// via manual probe against the real binary.
 	sapCall("transitions.addCrossfade", map[string]any{
 		"trackIndex":     float64(0),
-		"betweenClips":   []int{2, 3},
-		"durationFrames": float64(15),
+		"betweenClips":   []int{3, 4},
+		"durationFrames": float64(crossfadeLen),
 	})
 
 	seg1ClipID, _ := seg1["clipId"].(string)
@@ -363,7 +426,7 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	zoomIndex, _ := zoom["filterIndex"].(float64)
 	for _, keyframe := range []map[string]any{
 		{"position": 0, "value": "0% 0% 100% 100% 1"},
-		{"position": 44, "value": "-20% -20% 140% 140% 1"},
+		{"position": segLen - 1, "value": "-20% -20% 140% 140% 1"},
 	} {
 		sapCall("filter.addKeyframe", map[string]any{
 			"clipId":        seg1ClipID,
@@ -375,22 +438,52 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 		})
 	}
 
-	// V2 has a deterministic 190-frame lead and 5-frame trail. The real
-	// MltBackend serializes these as transparent MLT spacer producers, which
-	// positions the 60-frame overlay at the same timeline coordinates as the
-	// direct Rust doc-11 test.
+	// V2 has a deterministic 130-frame lead and 10-frame trail, sized so
+	// V2's total (130 + the 50-frame overlay + 10) exactly matches V1's
+	// own total length below, avoiding any ambiguity about which track's
+	// length governs the exported duration. There is no "blank"/spacer
+	// source form in the real spec (01-jsonrpc-spec.md's edit.appendClip
+	// union is strictly {playlistIndex}|{path}|{xml}) -- a real spacer is
+	// instead a fully transparent (#00000000) generator.createColor clip,
+	// appended then narrowed with edit.trimClipOut to the target length,
+	// which is real, undoable, and already spec'd (this schedule is
+	// bespoke to this test's real 25fps profile, see the segLen/
+	// crossfadeLen note above).
+	//
+	// Confirmed via manual probe: a freshly added video track is always
+	// inserted at real trackIndex 0 (topmost), shifting every existing
+	// video track's index up by one -- V1 (all its own appends/trims/
+	// crossfades/filters above are already done) shifts from trackIndex
+	// 0 to trackIndex 1 the instant this second edit.addTrack runs. V2
+	// (this new track) is trackIndex 0 from here on, which also happens
+	// to be exactly the topmost/compositing-on-top position it needs for
+	// the overlay to actually appear over V1 in the export.
+	const overlayLead = 130
+	const overlayTrail = 10
 	sapCall("edit.addTrack", map[string]any{"kind": "video"})
+	spacer := sapCall("generator.createColor", map[string]any{"hexColor": "#00000000"})
+	spacerIndex, _ := spacer["index"].(float64)
 	sapCall("edit.appendClip", map[string]any{
-		"trackIndex": float64(1),
-		"source":     map[string]any{"blank": float64(190)},
+		"trackIndex": float64(0),
+		"source":     map[string]any{"playlistIndex": spacerIndex},
+	})
+	sapCall("edit.trimClipOut", map[string]any{
+		"trackIndex": float64(0),
+		"clipIndex":  float64(0),
+		"newFrame":   float64(overlayLead - 1),
 	})
 	overlayClip := sapCall("edit.appendClip", map[string]any{
-		"trackIndex": float64(1),
+		"trackIndex": float64(0),
 		"source":     map[string]any{"playlistIndex": float64(1)},
 	})
 	sapCall("edit.appendClip", map[string]any{
-		"trackIndex": float64(1),
-		"source":     map[string]any{"blank": float64(5)},
+		"trackIndex": float64(0),
+		"source":     map[string]any{"playlistIndex": spacerIndex},
+	})
+	sapCall("edit.trimClipOut", map[string]any{
+		"trackIndex": float64(0),
+		"clipIndex":  float64(2),
+		"newFrame":   float64(overlayTrail - 1),
 	})
 	overlayClipID, _ := overlayClip["clipId"].(string)
 
@@ -400,13 +493,17 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 		"properties": map[string]any{"transition.distort": 1, "transition.fill": 1},
 	})
 	slideIndex, _ := slide["filterIndex"].(float64)
+	// overlay's own real (profile-relative) length is 2*fps == 50 frames
+	// (2s @ 25fps) -- local keyframe positions must stay within [0, 49],
+	// unlike the original 60-frame-native (30fps-source-assumed) schedule.
+	const overlayLocalLen = 2 * fps
 	for _, keyframe := range []struct {
 		position float64
 		value    string
 	}{
 		{0, "120% -20% 30% 30% 1"},
-		{10, "65% 5% 30% 30% 1"},
-		{59, "65% 5% 30% 30% 1"},
+		{overlayLocalLen * 0.16, "65% 5% 30% 30% 1"},
+		{overlayLocalLen - 1, "65% 5% 30% 30% 1"},
 	} {
 		sapCall("filter.addKeyframe", map[string]any{
 			"clipId":        overlayClipID,
@@ -427,7 +524,7 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 		position float64
 		value    float64
 	}{
-		{0, 1}, {40, 1}, {59, 0},
+		{0, 1}, {overlayLocalLen * 0.66, 1}, {overlayLocalLen - 1, 0},
 	} {
 		sapCall("filter.addKeyframe", map[string]any{
 			"clipId":        overlayClipID,
@@ -444,8 +541,20 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 		"trackIndex": 0, "startFrame": 60, "endFrame": 90, "text": "Highlight One",
 	})
 	sapCall("subtitles.appendItem", map[string]any{
-		"trackIndex": 0, "startFrame": 200, "endFrame": 230, "text": "Highlight Two",
+		// Was startFrame/endFrame 200/230 under the old 30fps-source
+		// assumption -- V1's real total is now only 190 frames (see
+		// expectedFrames below), so that window would fall entirely past
+		// the end of the exported video. Relocated inside clip3's span
+		// instead, still clear of both grab(165) (must stay
+		// subtitle-free) and "Highlight One" above.
+		"trackIndex": 0, "startFrame": 100, "endFrame": 120, "text": "Highlight Two",
 	})
+	// subtitles.appendItem alone only edits SubtitlesModel's cue data; it
+	// never makes cues visible in rendered/exported frames on its own
+	// (mirrors the real app: SubtitlesDock has a dedicated "Burn In
+	// Subtitles on Output" action that attaches a real MLT "subtitle"
+	// filter to the timeline output). subtitles.burnIn is that primitive.
+	sapCall("subtitles.burnIn", map[string]any{"trackIndex": 0})
 
 	exportDir := filepath.Join(workdir, "out")
 	if err := os.MkdirAll(exportDir, 0o755); err != nil {
@@ -492,10 +601,13 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	if !hasAudio {
 		t.Fatalf("exported file should have an audio stream")
 	}
-	expectedFrames := titleDurationFrames + (3*45 - 2*15)
-	expectedSecs := expectedFrames / 30
+	// V1 = title + 3 segLen-frame clips joined by 2 crossfadeLen-frame
+	// crossfades (each crossfade shortens the combined length by its own
+	// duration, since the two clips play blended, not back-to-back).
+	expectedFrames := titleDurationFrames + float64(3*segLen-2*crossfadeLen)
+	expectedSecs := expectedFrames / fps
 	if diff := duration - expectedSecs; diff > 0.5 || diff < -0.5 {
-		t.Fatalf("exported duration %.3fs should be close to expected %.3fs (%d frames: title %.0ff + three 45-frame clips - two 15-frame crossfades)", duration, expectedSecs, int(expectedFrames), titleDurationFrames)
+		t.Fatalf("exported duration %.3fs should be close to expected %.3fs (%d frames: title %.0ff + three %d-frame clips - two %d-frame crossfades)", duration, expectedSecs, int(expectedFrames), titleDurationFrames, segLen, crossfadeLen)
 	}
 
 	grab := func(frame int) realFrame {
@@ -507,27 +619,39 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 
 	// The claims below inspect decoded pixels from real melt frame renders,
 	// not merely successful RPC responses.
-	zoomEarly := grab(152)
-	zoomLate := grab(178)
+	// clip1 occupies absolute frames [100,139] (title is 100 frames, clip1
+	// is segLen=40 long); 105/135 sample near its local start/end.
+	zoomEarly := grab(105)
+	zoomLate := grab(135)
 	if diff := zoomEarly.cornerMeanAbsDiff(zoomLate, 80); diff <= 25 {
 		t.Fatalf("zoom keyframes should visibly shift the frame corners, mean RGB diff %.2f <= 25", diff)
 	}
 
 	titleIn := grab(50)
-	titleOut := grab(160)
+	titleOut := grab(150)
+	if dir := os.Getenv("SNAPSHOT_DEBUG_FRAME_DUMP"); dir != "" {
+		dumpRealFramePNG(t, dir, "title-in-50", titleIn)
+		dumpRealFramePNG(t, dir, "title-out-150", titleOut)
+	}
 	isNearWhite := func(r, g, b uint8) bool { return r > 200 && g > 200 && b > 200 }
-	titleInFrac := titleIn.fracMatching(320, 288, 960, 432, isNearWhite)
-	titleOutFrac := titleOut.fracMatching(320, 288, 960, 432, isNearWhite)
+	// Sample windows below are relative-position rects (25%-75% width,
+	// etc.) scaled for the real 1920x1080 default profile (1.5x the
+	// original 1280x720 pixel coordinates these were authored against --
+	// see decodeRealFrame's doc comment on why the resolution changed).
+	titleInFrac := titleIn.fracMatching(480, 432, 1440, 648, isNearWhite)
+	titleOutFrac := titleOut.fracMatching(480, 432, 1440, 648, isNearWhite)
 	if titleInFrac <= titleOutFrac+0.01 {
 		t.Fatalf("title should be visibly present at frame 50: in-window %.4f, out-of-window %.4f", titleInFrac, titleOutFrac)
 	}
 
-	overlayBefore := grab(100)
-	overlayDuring := grab(210)
-	overlayAfter := grab(253)
+	// Overlay (V2) is visible for absolute frames [overlayLead,
+	// overlayLead+overlayLocalLen) = [130,179].
+	overlayBefore := grab(110)
+	overlayDuring := grab(155)
+	overlayAfter := grab(185)
 	isDeepPink := func(r, g, b uint8) bool { return r > 200 && g < 90 && b > 90 && b < 200 }
 	overlayRect := func(frame realFrame) float64 {
-		return frame.fracMatching(832, 36, 1216, 252, isDeepPink)
+		return frame.fracMatching(1248, 54, 1824, 378, isDeepPink)
 	}
 	beforeFrac, duringFrac, afterFrac := overlayRect(overlayBefore), overlayRect(overlayDuring), overlayRect(overlayAfter)
 	if duringFrac <= 0.5 || beforeFrac >= 0.05 || afterFrac >= 0.05 {
@@ -537,8 +661,8 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	subtitleIn := grab(75)
 	subtitleOut := grab(165)
 	isSubtitleWhite := func(r, g, b uint8) bool { return r > 220 && g > 220 && b > 220 }
-	subtitleInFrac := subtitleIn.fracMatching(320, 576, 960, 691, isSubtitleWhite)
-	subtitleOutFrac := subtitleOut.fracMatching(320, 576, 960, 691, isSubtitleWhite)
+	subtitleInFrac := subtitleIn.fracMatching(480, 864, 1440, 1037, isSubtitleWhite)
+	subtitleOutFrac := subtitleOut.fracMatching(480, 864, 1440, 1037, isSubtitleWhite)
 	if subtitleInFrac <= subtitleOutFrac+0.01 {
 		t.Fatalf("subtitle burn-in should be visibly present at frame 75: in-window %.4f, out-of-window %.4f", subtitleInFrac, subtitleOutFrac)
 	}

@@ -183,12 +183,24 @@ extern "C" {
     /// `{"index":N,"name":"...","source":{...},"durationFrames":N}`
     /// matching `PlaylistEntry`'s wire shape, or NULL on error. Caller
     /// must free via `sap_free_string`.
-    pub fn sap_generator_create_title(
+   pub fn sap_generator_create_title(
+       main_window_handle: *mut c_void,
+       mode: *const c_char,
+       text: *const c_char,
+       fg_colour: *const c_char,
+       bg_colour: *const c_char,
+   ) -> *mut c_char;
+
+    /// C++ side: `char* sap_generator_create_color(void* mainWindowHandle,
+    /// const char* hexColor);` -- builds a plain real MLT `color:`
+    /// producer (no attached filter, unlike `sap_generator_create_title`)
+    /// and appends it to the real Playlist bin. Returns a heap-allocated
+    /// JSON object `{"index":N,"name":"...","source":{...},
+    /// "durationFrames":N}` matching `PlaylistEntry`'s wire shape, or
+    /// NULL on error. Caller must free via `sap_free_string`.
+    pub fn sap_generator_create_color(
         main_window_handle: *mut c_void,
-        mode: *const c_char,
-        text: *const c_char,
-        fg_colour: *const c_char,
-        bg_colour: *const c_char,
+        hex_colour: *const c_char,
     ) -> *mut c_char;
 
     /// C++ side: `char* sap_subtitles_add_track(void* mainWindowHandle);`
@@ -247,6 +259,14 @@ extern "C" {
         track_index: c_int,
         path: *const c_char,
     ) -> *mut c_char;
+
+    /// C++ side: `int sap_subtitles_burn_in(void* mainWindowHandle, int
+    /// trackIndex);` -- real `subtitle` MLT filter attached to the
+    /// timeline output (tractor), mirroring `SubtitlesDock::
+    /// burnInOnTimeline()`'s own filter setup. Idempotent per track.
+    /// Returns 0 on success, -1 on error (invalid handle/trackIndex, or
+    /// no multitrack producer loaded).
+    pub fn sap_subtitles_burn_in(main_window_handle: *mut c_void, track_index: c_int) -> c_int;
 
     /// C++ side: `int sap_notes_set_text(void* mainWindowHandle, const
     /// char* text);` -- real `NotesDock::setText()`. Returns 0 on
@@ -320,26 +340,32 @@ extern "C" {
     pub fn sap_list_clips(main_window_handle: *mut c_void, track_index: c_int) -> *mut c_char;
 
     /// C++ side: `int sap_trim_clip_in(void* mainWindowHandle, int
-    /// trackIndex, int clipIndex, long long newInFrame);` -- real
-    /// `Timeline::TrimClipInCommand` (undoable), non-ripple. Returns 0 on
-    /// success, -1 on error (invalid handle/track/clip/locked track, or
-    /// out-of-range newInFrame).
+    /// trackIndex, int clipIndex, long long newInFrame, int ripple);` --
+    /// real `Timeline::TrimClipInCommand` (undoable). ripple != 0 shifts
+    /// every downstream clip on the track to close/open the gap instead
+    /// of leaving a blank (real Ripple Trim); ripple == 0 keeps the
+    /// original non-ripple/single-clip behavior. Returns 0 on success, -1
+    /// on error (invalid handle/track/clip/locked track, or out-of-range
+    /// newInFrame).
     pub fn sap_trim_clip_in(
         main_window_handle: *mut c_void,
         track_index: c_int,
         clip_index: c_int,
         new_in_frame: c_longlong,
+        ripple: c_int,
     ) -> c_int;
 
     /// C++ side: `int sap_trim_clip_out(void* mainWindowHandle, int
-    /// trackIndex, int clipIndex, long long newOutFrame);` -- real
-    /// `Timeline::TrimClipOutCommand` (undoable), non-ripple. Returns 0 on
-    /// success, -1 on error.
+    /// trackIndex, int clipIndex, long long newOutFrame, int ripple);` --
+    /// real `Timeline::TrimClipOutCommand` (undoable). Same ripple
+    /// semantics as `sap_trim_clip_in`. Returns 0 on success, -1 on
+    /// error.
     pub fn sap_trim_clip_out(
         main_window_handle: *mut c_void,
         track_index: c_int,
         clip_index: c_int,
         new_out_frame: c_longlong,
+        ripple: c_int,
     ) -> c_int;
 
     /// C++ side: `char* sap_split_clip(void* mainWindowHandle, int
@@ -444,6 +470,15 @@ extern "C" {
     /// success, -1 on failure.
     pub fn sap_save_project(main_window_handle: *mut c_void) -> c_int;
 
+    /// C++ side: `int sap_set_project_file(void* mainWindowHandle, const
+    /// char* filename);` -- binds this session's "current file" (what
+    /// `sap_save_project` saves to) to `filename` without opening/loading
+    /// anything from disk. Called once at `FfiBackend::new()` time with
+    /// `<projectRoot>/<mltFileName>` so `project.save` persists to the
+    /// real project folder. Returns 0 on success, -1 if the handle or
+    /// filename is invalid.
+    pub fn sap_set_project_file(main_window_handle: *mut c_void, filename: *const c_char) -> c_int;
+
     /// C++ side: `int sap_export_project_xml(void* mainWindowHandle, const
     /// char* outputXmlPath);` -- writes the current project (via the real
     /// `MainWindow::saveXML()`) to an arbitrary scratch path as a
@@ -523,6 +558,51 @@ extern "C" {
         track_index: c_int,
         clip_index: c_int,
         source_path: *const c_char,
+    ) -> *mut c_char;
+
+    /// C++ side: `char* sap_playlist_get_xml(void* mainWindowHandle, int
+    /// index);` -- MLT XML serialization of the *live* producer sitting
+    /// at playlist bin `index` (attached filters intact, unlike
+    /// `sap_playlist_get`'s plain "path" field). Feed the result to
+    /// `sap_append_clip_xml`/`sap_insert_clip_xml`/
+    /// `sap_overwrite_clip_xml` to resolve a `{source:{playlistIndex}}`
+    /// clip source. NULL on error. Caller must free via
+    /// `sap_free_string`.
+    pub fn sap_playlist_get_xml(main_window_handle: *mut c_void, index: c_int) -> *mut c_char;
+
+    /// C++ side: `char* sap_append_clip_xml(void* mainWindowHandle, int
+    /// trackIndex, const char* xml);` -- identical to `sap_append_clip`
+    /// except it takes a ready-made MLT producer XML string directly
+    /// instead of opening a filesystem path, for `{source:{xml}}` and
+    /// resolved `{source:{playlistIndex}}` clip sources. Returns the same
+    /// JSON shape as `sap_append_clip`. NULL on error. Caller must free
+    /// via `sap_free_string`.
+    pub fn sap_append_clip_xml(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        xml: *const c_char,
+    ) -> *mut c_char;
+
+    /// C++ side: `char* sap_insert_clip_xml(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, const char* xml);` -- XML-sourced
+    /// sibling of `sap_insert_clip`; see `sap_append_clip_xml`. NULL on
+    /// error. Caller must free via `sap_free_string`.
+    pub fn sap_insert_clip_xml(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        xml: *const c_char,
+    ) -> *mut c_char;
+
+    /// C++ side: `char* sap_overwrite_clip_xml(void* mainWindowHandle, int
+    /// trackIndex, int clipIndex, const char* xml);` -- XML-sourced
+    /// sibling of `sap_overwrite_clip`; see `sap_append_clip_xml`. NULL on
+    /// error. Caller must free via `sap_free_string`.
+    pub fn sap_overwrite_clip_xml(
+        main_window_handle: *mut c_void,
+        track_index: c_int,
+        clip_index: c_int,
+        xml: *const c_char,
     ) -> *mut c_char;
 
     /// C++ side: `unsigned char* sap_get_frame(void* mainWindowHandle,

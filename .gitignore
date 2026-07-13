@@ -6,3 +6,9 @@
 /.idea/
 /.vscode/
 acpx/target/
+
+# Stray relative-path test export artifacts (some *_realsaprust_test.go
+# tests pass a relative outputPath to file.export; when run from the repo
+# root these land here instead of a tmp dir).
+/snapshotd/internal/daemon/*.mp4
+/snapshotd/internal/mcpadapter/*.mp4

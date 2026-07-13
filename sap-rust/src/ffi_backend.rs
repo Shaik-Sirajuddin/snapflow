@@ -20,8 +20,10 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_longlong, c_void};
 use std::collections::HashMap;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::fs;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,6 +51,33 @@ use crate::server::{self, ServerConfig};
 /// per-RPC-call path.
 static NOTIFY_BRIDGE_TX: Mutex<Option<mpsc::UnboundedSender<RpcNotification>>> = Mutex::new(None);
 
+/// Set to `true` by `run_dispatcher` (`server.rs`) for the duration of
+/// every single dispatched `Backend` call, regardless of method or which
+/// `Backend` impl is in use. `sap_ffi_notify_bridge` below checks this to
+/// decide whether to publish its own generic "qtGuiEdit"-reason
+/// `edit.changed` notification.
+///
+/// Why this exists: `MultitrackModel::modified` (and friends) fires
+/// synchronously on the Qt thread as a side effect of the *same*
+/// `Qt::BlockingQueuedConnection` call an RPC-driven `FfiBackend` method
+/// (e.g. `edit_add_track`) makes into C++ -- so a single `edit.addTrack`
+/// RPC produces two notifications without this flag: `build_op`'s own
+/// specific one (`{"reason": "addTrack", ...}`, attached to the RPC
+/// response and fanned out normally) *and* this bridge's generic one
+/// (`{"reason": "qtGuiEdit"}`, fanned out to every project via
+/// `external_notify_rx`). Both are real, but racing them means a
+/// subscriber sometimes observes the uninformative generic one first
+/// (see `TestMCPAdapter_PhaseB_SameProjectConcurrency`'s addTrack
+/// assertion). Since the dispatcher processes one op at a time (FIFO,
+/// `05-multi-client-concurrency.md`) and the Qt-side signal fires
+/// strictly within that op's own synchronous blocking call, wrapping
+/// each dispatch with `store(true)`/`store(false)` here reliably
+/// distinguishes "this Qt model change was already RPC-attributed" from
+/// "this Qt model change came from something else (e.g. a real human
+/// editing the same visible GUI)" -- only the latter still needs the
+/// generic bridge notification.
+pub static SUPPRESS_QT_BRIDGE_NOTIFICATION: AtomicBool = AtomicBool::new(false);
+
 /// Wraps the opaque `MainWindow*` handle passed in from C++
 /// (`MainWindow::singleton()`/`MAIN`, cast to `void*`). The embedded process
 /// has exactly one live project -- the window itself -- so unlike
@@ -70,6 +99,16 @@ pub struct FfiBackend {
     /// primitive.
     jobs: Arc<Mutex<HashMap<String, JobStatus>>>,
     job_children: HashMap<String, Arc<Mutex<Option<Child>>>>,
+    /// The bound project's sandbox root (per
+    /// `09-project-folder-layout.md`), read once from
+    /// `SNAPSHOT_PROJECT_ROOT` at construction time -- unlike
+    /// `MockBackend`/the removed `MltBackend`, this backend has no
+    /// per-`project_id` router of its own (one Qt process == one live
+    /// project), so there is nowhere else to source this from. `None`
+    /// when the env var is unset or empty (e.g. a manual dev launch not
+    /// going through `snapshotd`), in which case `file_import` skips the
+    /// containment check entirely rather than rejecting everything.
+    project_root: Option<PathBuf>,
 }
 
 // SAFETY: `main_window` is never dereferenced directly on whatever thread
@@ -88,10 +127,38 @@ impl FfiBackend {
     /// `MainWindow::singleton()`) for as long as this backend is used --
     /// i.e. for the lifetime of the Qt process this crate is linked into.
     pub unsafe fn new(main_window: *mut c_void) -> Self {
+        let project_root = std::env::var("SNAPSHOT_PROJECT_ROOT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        // Bind this session's "current file" to the real project's MLT
+        // path (default filename "project.mlt", per
+        // 09-project-folder-layout.md/registry.DefaultMltFileName,
+        // overridable via SNAPSHOT_PROJECT_MLT_FILENAME for legacy
+        // custom-named projects opened via project.open) *before* any
+        // edit happens, so `project.save` (sap_save_project ->
+        // saveXML(mw->fileName())) writes to `<projectRoot>/project.mlt`
+        // rather than MainWindow::untitledFileName()'s scratch default.
+        // A no-op (skipped) for manual dev launches with no
+        // SNAPSHOT_PROJECT_ROOT set, matching file_import's sandbox-check
+        // skip in that same case.
+        if let Some(root) = project_root.as_ref() {
+            let mlt_file_name = std::env::var("SNAPSHOT_PROJECT_MLT_FILENAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "project.mlt".to_string());
+            let mlt_path = root.join(mlt_file_name);
+            if let Some(path_str) = mlt_path.to_str() {
+                if let Ok(c_path) = CString::new(path_str) {
+                    unsafe { ffi::sap_set_project_file(main_window, c_path.as_ptr()) };
+                }
+            }
+        }
         Self {
             main_window,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             job_children: HashMap::new(),
+            project_root,
         }
     }
 
@@ -172,6 +239,52 @@ impl FfiBackend {
             duration_frames: raw.duration_frames,
         })
     }
+
+    /// Resolves an `edit.appendClip`/`insertClip`/`overwriteClip` `source`
+    /// value's tagged union (`{path}` | `{xml}` | `{playlistIndex}`, per
+    /// rust-fork/01-jsonrpc-spec.md) to a ready-to-use `CString`, tagged by
+    /// which of the `sap_*_clip`/`sap_*_clip_xml` C-ABI pairs it belongs
+    /// to. `{playlistIndex}` is resolved here via `sap_playlist_get_xml`
+    /// (the live producer's own MLT XML, filters intact) rather than
+    /// re-deriving a path from `sap_playlist_get`'s "path" field, which is
+    /// only the raw resource string and would silently drop e.g. a title
+    /// clip's attached dynamictext/qtext filter.
+    fn resolve_clip_source(&mut self, source: &Value) -> BackendResult<ClipSourceResolution> {
+        if let Some(path) = source.get("path").and_then(Value::as_str) {
+            let c_path = CString::new(path)
+                .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
+            return Ok(ClipSourceResolution::Path(c_path));
+        }
+        if let Some(xml) = source.get("xml").and_then(Value::as_str) {
+            let c_xml = CString::new(xml)
+                .map_err(|e| BackendError::InvalidParams(format!("invalid source xml: {e}")))?;
+            return Ok(ClipSourceResolution::Xml(c_xml));
+        }
+        if let Some(index) = source.get("playlistIndex").and_then(Value::as_u64) {
+            let raw = unsafe { ffi::sap_playlist_get_xml(self.main_window, index as c_int) };
+            if raw.is_null() {
+                return Err(BackendError::NotFound(format!("playlist index {index}")));
+            }
+            let xml = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+            unsafe { ffi::sap_free_string(raw) };
+            let c_xml = CString::new(xml).map_err(|e| {
+                BackendError::InvalidParams(format!("invalid resolved playlist xml: {e}"))
+            })?;
+            return Ok(ClipSourceResolution::Xml(c_xml));
+        }
+        Err(BackendError::InvalidParams(
+            "source must be {path: ...} | {xml: ...} | {playlistIndex: ...}".into(),
+        ))
+    }
+}
+
+/// Result of `FfiBackend::resolve_clip_source` -- which `sap_*_clip`
+/// (path-opening) vs `sap_*_clip_xml` (ready-made XML) C-ABI sibling to
+/// call, per `edit.appendClip`/`insertClip`/`overwriteClip`'s shared
+/// `source` union.
+enum ClipSourceResolution {
+    Path(CString),
+    Xml(CString),
 }
 
 impl Backend for FfiBackend {
@@ -411,23 +524,23 @@ impl Backend for FfiBackend {
         track_index: usize,
         source: Value,
     ) -> BackendResult<Clip> {
-        // Real wiring: `sap_append_clip` (sap_ffi.cpp) opens `source.path`
-        // as an actual Mlt::Producer and pushes it via the real,
-        // undoable Timeline::AppendCommand -- see that file for the full
-        // path. Unlike TimelineDock::append() (which only reads the
-        // clipboard/"current source"), this takes the path directly.
-        let path = source
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
-        let c_path = CString::new(path)
-            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
-
-        let raw =
-            unsafe { ffi::sap_append_clip(self.main_window, track_index as c_int, c_path.as_ptr()) };
+        // Real wiring: `sap_append_clip`/`sap_append_clip_xml` (sap_ffi.cpp)
+        // push the source via the real, undoable Timeline::AppendCommand
+        // -- see that file for the full path. Unlike TimelineDock::append()
+        // (which only reads the clipboard/"current source"), this takes
+        // any of `source`'s three forms directly (see resolve_clip_source).
+        let resolved = self.resolve_clip_source(&source)?;
+        let raw = match &resolved {
+            ClipSourceResolution::Path(c_path) => unsafe {
+                ffi::sap_append_clip(self.main_window, track_index as c_int, c_path.as_ptr())
+            },
+            ClipSourceResolution::Xml(c_xml) => unsafe {
+                ffi::sap_append_clip_xml(self.main_window, track_index as c_int, c_xml.as_ptr())
+            },
+        };
         if raw.is_null() {
             return Err(BackendError::InvalidParams(format!(
-                "failed to append clip from {path} to track {track_index} (invalid track, or {path} did not open as a valid MLT producer)"
+                "failed to append clip from {source} to track {track_index} (invalid track, or source did not resolve to a valid MLT producer)"
             )));
         }
         let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
@@ -460,24 +573,34 @@ impl Backend for FfiBackend {
         clip_index: usize,
         source: Value,
     ) -> BackendResult<Clip> {
-        // Real wiring: `sap_insert_clip` (sap_ffi.cpp) opens `source.path`
-        // as an actual Mlt::Producer and pushes it via the real, undoable
-        // Timeline::InsertCommand -- distinct from sap_append_clip's
-        // AppendCommand, this RIPPLES every downstream clip on the track
-        // forward, a genuine mid-track splice in one undo step.
-        let path = source
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
-        let c_path = CString::new(path)
-            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
-
-        let raw = unsafe {
-            ffi::sap_insert_clip(self.main_window, track_index as c_int, clip_index as c_int, c_path.as_ptr())
+        // Real wiring: `sap_insert_clip`/`sap_insert_clip_xml` (sap_ffi.cpp)
+        // push the source via the real, undoable Timeline::InsertCommand
+        // -- distinct from sap_append_clip's AppendCommand, this RIPPLES
+        // every downstream clip on the track forward, a genuine mid-track
+        // splice in one undo step. See resolve_clip_source for the three
+        // source forms accepted.
+        let resolved = self.resolve_clip_source(&source)?;
+        let raw = match &resolved {
+            ClipSourceResolution::Path(c_path) => unsafe {
+                ffi::sap_insert_clip(
+                    self.main_window,
+                    track_index as c_int,
+                    clip_index as c_int,
+                    c_path.as_ptr(),
+                )
+            },
+            ClipSourceResolution::Xml(c_xml) => unsafe {
+                ffi::sap_insert_clip_xml(
+                    self.main_window,
+                    track_index as c_int,
+                    clip_index as c_int,
+                    c_xml.as_ptr(),
+                )
+            },
         };
         if raw.is_null() {
             return Err(BackendError::InvalidParams(format!(
-                "failed to insert clip from {path} at {track_index}/{clip_index} (invalid track/clipIndex, locked track, or {path} did not open as a valid MLT producer)"
+                "failed to insert clip from {source} at {track_index}/{clip_index} (invalid track/clipIndex, locked track, or source did not resolve to a valid MLT producer)"
             )));
         }
         let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
@@ -510,25 +633,34 @@ impl Backend for FfiBackend {
         clip_index: usize,
         source: Value,
     ) -> BackendResult<Clip> {
-        // Real wiring: `sap_overwrite_clip` (sap_ffi.cpp) opens
-        // `source.path` as an actual Mlt::Producer and pushes it via the
-        // real, undoable Timeline::OverwriteCommand -- distinct from
-        // sap_insert_clip's InsertCommand, this does NOT ripple
-        // downstream clips; it drops and replaces whatever occupies
-        // clip-slot `clipIndex`.
-        let path = source
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| BackendError::InvalidParams("source must be {path: ...}".into()))?;
-        let c_path = CString::new(path)
-            .map_err(|e| BackendError::InvalidParams(format!("invalid source path: {e}")))?;
-
-        let raw = unsafe {
-            ffi::sap_overwrite_clip(self.main_window, track_index as c_int, clip_index as c_int, c_path.as_ptr())
+        // Real wiring: `sap_overwrite_clip`/`sap_overwrite_clip_xml`
+        // (sap_ffi.cpp) push the source via the real, undoable
+        // Timeline::OverwriteCommand -- distinct from sap_insert_clip's
+        // InsertCommand, this does NOT ripple downstream clips; it drops
+        // and replaces whatever occupies clip-slot `clipIndex`. See
+        // resolve_clip_source for the three source forms accepted.
+        let resolved = self.resolve_clip_source(&source)?;
+        let raw = match &resolved {
+            ClipSourceResolution::Path(c_path) => unsafe {
+                ffi::sap_overwrite_clip(
+                    self.main_window,
+                    track_index as c_int,
+                    clip_index as c_int,
+                    c_path.as_ptr(),
+                )
+            },
+            ClipSourceResolution::Xml(c_xml) => unsafe {
+                ffi::sap_overwrite_clip_xml(
+                    self.main_window,
+                    track_index as c_int,
+                    clip_index as c_int,
+                    c_xml.as_ptr(),
+                )
+            },
         };
         if raw.is_null() {
             return Err(BackendError::InvalidParams(format!(
-                "failed to overwrite clip at {track_index}/{clip_index} with {path} (invalid track/clipIndex, locked track, or {path} did not open as a valid MLT producer)"
+                "failed to overwrite clip at {track_index}/{clip_index} with {source} (invalid track/clipIndex, locked track, or source did not resolve to a valid MLT producer)"
             )));
         }
         let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
@@ -727,7 +859,7 @@ impl Backend for FfiBackend {
         // meaningful for file-backed sources, same honesty policy as
         // MltBackend::playlist_get (a generator/title/blank-spacer entry
         // has no real file to probe, so `probe` is honestly `None`).
-        let probe = if path.is_empty() { None } else { crate::mlt_backend::probe_media(&path).ok() };
+        let probe = if path.is_empty() { None } else { crate::media_tools::probe_media(&path).ok() };
         Ok(PlaylistEntryDetail {
             index: entry.index,
             name: entry.name,
@@ -738,42 +870,94 @@ impl Backend for FfiBackend {
     }
 
     fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry> {
-        self.playlist_append(project_id, json!({"path": path}), None)
+        // Per-bound-project sandbox, ported from the removed MltBackend's
+        // identical file_import check (git history:
+        // sap-rust/src/mlt_backend.rs) -- a path that resolves outside
+        // SNAPSHOT_PROJECT_ROOT is rejected even if it exists and is
+        // readable, so one session can never read another session's (or
+        // an arbitrary filesystem) files through this call. Skipped
+        // entirely when project_root is unset (manual dev launch outside
+        // snapshotd).
+        let canonical_path = if let Some(project_root) = &self.project_root {
+            let canonical_root = fs::canonicalize(project_root).map_err(|e| {
+                BackendError::InvalidParams(format!(
+                    "failed to resolve project root {}: {e}",
+                    project_root.display()
+                ))
+            })?;
+            let requested_path = Path::new(path);
+            let candidate = if requested_path.is_absolute() {
+                requested_path.to_path_buf()
+            } else {
+                project_root.join(requested_path)
+            };
+            let canonical_path = fs::canonicalize(&candidate).map_err(|e| {
+                BackendError::InvalidParams(format!(
+                    "file.import path {} is not readable: {e}",
+                    candidate.display()
+                ))
+            })?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err(BackendError::InvalidParams(format!(
+                    "file.import path {} is outside project root {}",
+                    canonical_path.display(),
+                    canonical_root.display()
+                )));
+            }
+            canonical_path.to_string_lossy().into_owned()
+        } else {
+            path.to_string()
+        };
+        self.playlist_append(project_id, json!({"path": canonical_path}), None)
     }
 
-    fn edit_trim_clip_in(
-        &mut self,
-        _project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()> {
-        let rc = unsafe {
-            ffi::sap_trim_clip_in(self.main_window, track_index as c_int, clip_index as c_int, new_frame as i64)
-        };
-        if rc != 0 {
-            return Err(BackendError::NotFound(format!(
-                "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
-            )));
-        }
-        Ok(())
-    }
+   fn edit_trim_clip_in(
+       &mut self,
+       _project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        ripple: bool,
+   ) -> BackendResult<()> {
+       let rc = unsafe {
+            ffi::sap_trim_clip_in(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                new_frame as i64,
+                ripple as c_int,
+            )
+       };
+       if rc != 0 {
+           return Err(BackendError::NotFound(format!(
+               "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
+           )));
+       }
+       Ok(())
+   }
 
-    fn edit_trim_clip_out(
-        &mut self,
-        _project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()> {
-        let rc = unsafe {
-            ffi::sap_trim_clip_out(self.main_window, track_index as c_int, clip_index as c_int, new_frame as i64)
-        };
-        if rc != 0 {
-            return Err(BackendError::NotFound(format!(
-                "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
-            )));
-        }
+   fn edit_trim_clip_out(
+       &mut self,
+       _project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        ripple: bool,
+   ) -> BackendResult<()> {
+       let rc = unsafe {
+            ffi::sap_trim_clip_out(
+                self.main_window,
+                track_index as c_int,
+                clip_index as c_int,
+                new_frame as i64,
+                ripple as c_int,
+            )
+       };
+       if rc != 0 {
+           return Err(BackendError::NotFound(format!(
+               "clip {track_index}/{clip_index} unavailable, or newFrame {new_frame} out of range"
+           )));
+       }
         Ok(())
     }
 
@@ -976,21 +1160,22 @@ impl Backend for FfiBackend {
         struct RawFilterEntry {
             filter_index: usize,
             mlt_service: String,
+            #[serde(default)]
+            properties: Value,
         }
         let raw_entries: Vec<RawFilterEntry> = serde_json::from_str(&json_str)
             .map_err(|e| BackendError::InvalidParams(format!("bad filter-list JSON: {e}")))?;
-        // NOTE: `properties` is not yet populated (Null) -- enumerating a
-        // real MLT filter's user-visible vs. internal properties needs a
-        // deny-list of reserved MLT keys (mlt_type, mlt_service, in, out,
-        // _unique_id, ...) that hasn't been implemented yet. filter_index/
-        // mlt_service are both real and live-read from the attached MLT
-        // filter chain.
+        // `properties` is the real, live-read MLT property store for each
+        // attached filter (sap_ffi.cpp's filterUserPropertiesToJson), with
+        // reserved/internal MLT keys (mlt_type, mlt_service, in, out,
+        // _unique_id, ...) filtered out -- not an echo of whatever
+        // filter.add/filter.setProperty happened to be called with.
         Ok(raw_entries
             .into_iter()
             .map(|e| FilterListEntry {
                 index: e.filter_index,
                 mlt_service: e.mlt_service,
-                properties: Value::Null,
+                properties: e.properties,
             })
             .collect())
     }
@@ -1141,11 +1326,28 @@ impl Backend for FfiBackend {
         }
         let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
         unsafe { ffi::sap_free_string(raw) };
+       serde_json::from_str::<PlaylistEntry>(&json_str)
+           .map_err(|e| BackendError::InvalidParams(format!("bad generator-create-title JSON: {e}")))
+   }
+
+    fn generator_create_color(&mut self, _project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+        let hex = params
+            .get("hexColor")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BackendError::InvalidParams("generator.createColor requires hexColor".into()))?
+            .to_string();
+        let c_hex = CString::new(hex).map_err(|e| BackendError::InvalidParams(format!("bad hexColor: {e}")))?;
+        let raw = unsafe { ffi::sap_generator_create_color(self.main_window, c_hex.as_ptr()) };
+        if raw.is_null() {
+            return Err(BackendError::InvalidParams("generator.createColor failed (no playlist bin?)".into()));
+        }
+        let json_str = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe { ffi::sap_free_string(raw) };
         serde_json::from_str::<PlaylistEntry>(&json_str)
-            .map_err(|e| BackendError::InvalidParams(format!("bad generator-create-title JSON: {e}")))
+            .map_err(|e| BackendError::InvalidParams(format!("bad generator-create-color JSON: {e}")))
     }
 
-    fn subtitles_add_track(&mut self, _project_id: &str) -> BackendResult<SubtitleTrackInfo> {
+   fn subtitles_add_track(&mut self, _project_id: &str) -> BackendResult<SubtitleTrackInfo> {
         let raw = unsafe { ffi::sap_subtitles_add_track(self.main_window) };
         if raw.is_null() {
             return Err(BackendError::NotFound(
@@ -1244,6 +1446,14 @@ impl Backend for FfiBackend {
         Ok(out)
     }
 
+    fn subtitles_burn_in(&mut self, _project_id: &str, track_index: usize) -> BackendResult<()> {
+        let rc = unsafe { ffi::sap_subtitles_burn_in(self.main_window, track_index as c_int) };
+        if rc != 0 {
+            return Err(BackendError::NotFound(format!("subtitle track {track_index} unavailable")));
+        }
+        Ok(())
+    }
+
     fn file_export(
         &mut self,
         _project_id: &str,
@@ -1287,8 +1497,8 @@ impl Backend for FfiBackend {
                 .map_err(|e| BackendError::InvalidParams(format!("failed to create export dir: {e}")))?;
         }
 
-        let vcodec = crate::mlt_backend::normalize_vcodec(codec);
-        let melt_bin = crate::mlt_backend::resolve_melt_binary();
+        let vcodec = crate::media_tools::normalize_vcodec(codec);
+        let melt_bin = crate::media_tools::resolve_melt_binary();
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
         let qt_platform = std::env::var("QT_QPA_PLATFORM").unwrap_or_else(|_| "offscreen".to_string());
 
@@ -1325,7 +1535,7 @@ impl Backend for FfiBackend {
             // `mlt_backend.rs` for why this map needs bounding at all
             // (this backend's `jobs`/`job_children` have the exact same
             // unbounded-growth shape MltBackend's did).
-            crate::mlt_backend::prune_finished_jobs(&mut jobs)
+            crate::media_tools::prune_finished_jobs(&mut jobs)
         };
         for id in &evicted {
             self.job_children.remove(id);
@@ -1373,7 +1583,7 @@ impl Backend for FfiBackend {
                 }
                 match outcome {
                     Ok((status, stderr)) if status.success() => {
-                        if let Some(bad) = crate::mlt_backend::detect_unrecognised_codec(&stderr) {
+                        if let Some(bad) = crate::media_tools::detect_unrecognised_codec(&stderr) {
                             job.status = "error".into();
                             job.error =
                                 Some(format!("melt exited 0 but dropped a stream: {bad} (stderr: {stderr})"));
@@ -1401,7 +1611,7 @@ impl Backend for FfiBackend {
         // Pure ffprobe-based probing, zero Qt/MLT dependency -- identical
         // logic to `MltBackend::file_probe`, so reuse it directly rather
         // than duplicating.
-        crate::mlt_backend::probe_media(path)
+        crate::media_tools::probe_media(path)
     }
 
     fn jobs_get(&mut self, _job_id: &str) -> BackendResult<JobStatus> {
@@ -1721,6 +1931,13 @@ pub unsafe extern "C" fn sap_ffi_notify_bridge(json_payload: *const c_char) {
     if json_payload.is_null() {
         return;
     }
+    // An RPC-driven call already in flight on the dispatcher will publish
+    // its own precisely-reasoned notification (see
+    // `SUPPRESS_QT_BRIDGE_NOTIFICATION`'s doc comment) -- skip the
+    // generic duplicate here rather than racing it.
+    if SUPPRESS_QT_BRIDGE_NOTIFICATION.load(Ordering::SeqCst) {
+        return;
+    }
     let payload = CStr::from_ptr(json_payload).to_string_lossy().into_owned();
     #[derive(serde::Deserialize)]
     struct EmitPayload {
@@ -1741,12 +1958,8 @@ pub unsafe extern "C" fn sap_ffi_notify_bridge(json_payload: *const c_char) {
     }
 }
 
-/// Standard base64 (RFC 4648, with `=` padding) -- a local copy of
-/// `mlt_backend::base64_encode`'s algorithm/alphabet, kept in sync
-/// deliberately (not imported: that function is private to
-/// `mlt_backend.rs`, and this file is restricted to touching
-/// `ffi_backend.rs`/`ffi.rs` only) so `playback_get_frame`'s wire format
-/// matches `MltBackend::playback_get_frame`'s byte-for-byte.
+/// Standard base64 (RFC 4648, with `=` padding), local to this file so
+/// `playback_get_frame`'s wire format needs no external crate dependency.
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();

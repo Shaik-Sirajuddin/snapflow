@@ -289,21 +289,23 @@ pub trait Backend: Send {
     /// `file.import` -- import a local file into the project's playlist bin.
     fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry>;
 
-    /// `edit.trimClipIn` / `edit.trimClipOut`.
-    fn edit_trim_clip_in(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()>;
-    fn edit_trim_clip_out(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()>;
+   /// `edit.trimClipIn` / `edit.trimClipOut`.
+   fn edit_trim_clip_in(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        ripple: bool,
+   ) -> BackendResult<()>;
+   fn edit_trim_clip_out(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        ripple: bool,
+   ) -> BackendResult<()>;
 
     /// `edit.splitClip` -- split a clip at a source frame strictly between
     /// `in_frame` and `out_frame`. Left keeps the original `clip_id` with
@@ -501,13 +503,21 @@ pub trait Backend: Send {
     /// to the clip end.
     fn clip_length_frames(&mut self, project_id: &str, clip_id: &str) -> BackendResult<i64>;
 
-    /// `generator.createTitle` -- constructs a title-card producer (color
-    /// background + `dynamictext`/`qtext` filter, per 01's `generator.*`
-    /// namespace) and adds it to the Playlist bin, ready for
-    /// `edit.appendClip({source:{playlistIndex}})` like any other source.
-    fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
+   /// `generator.createTitle` -- constructs a title-card producer (color
+   /// background + `dynamictext`/`qtext` filter, per 01's `generator.*`
+   /// namespace) and adds it to the Playlist bin, ready for
+   /// `edit.appendClip({source:{playlistIndex}})` like any other source.
+   fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
 
-    fn subtitles_add_track(&mut self, project_id: &str) -> BackendResult<SubtitleTrackInfo>;
+    /// `generator.createColor` -- constructs a plain `color:` producer
+    /// (`{hexColor}`, `#AARRGGBB`) and adds it to the Playlist bin, per
+    /// 01's `generator.*` namespace (`ColorProducerWidget::newProducer`).
+    /// Commonly used with a fully-transparent `#00000000` to build a
+    /// timeline spacer clip: append it, then `edit.trimClipOut` to the
+    /// desired length.
+    fn generator_create_color(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
+
+   fn subtitles_add_track(&mut self, project_id: &str) -> BackendResult<SubtitleTrackInfo>;
     fn subtitles_append_item(
         &mut self,
         project_id: &str,
@@ -543,6 +553,14 @@ pub trait Backend: Send {
         path: &str,
         track_index: usize,
     ) -> BackendResult<String>;
+
+    /// `subtitles.burnIn` -- attach (or, if already attached, leave in
+    /// place) a real burn-in filter on the timeline output rendering
+    /// `track_index`'s cues into every exported/rendered frame. Unlike the
+    /// other `subtitles.*` calls, this mutates the *output* rather than
+    /// the subtitle track data itself; `subtitles.appendItem`/`removeItems`
+    /// alone never make cues visible in rendered frames.
+    fn subtitles_burn_in(&mut self, project_id: &str, track_index: usize) -> BackendResult<()>;
 
     /// `file.export` -- returns a `jobId` immediately per 01's async-job
     /// convention; progress/completion is polled via `jobs_get`.
@@ -1150,41 +1168,43 @@ impl Backend for MockBackend {
         self.playlist_append(project_id, Value::from(json!({"path": path})), None)
     }
 
-    fn edit_trim_clip_in(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()> {
-        let data = self.project_mut(project_id);
-        let clip = data
-            .clips
-            .get_mut(&track_index)
-            .and_then(|c| c.get_mut(clip_index))
-            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
-        clip.in_frame = new_frame;
-        data.dirty = true;
-        Ok(())
-    }
+   fn edit_trim_clip_in(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        _ripple: bool,
+   ) -> BackendResult<()> {
+       let data = self.project_mut(project_id);
+       let clip = data
+           .clips
+           .get_mut(&track_index)
+           .and_then(|c| c.get_mut(clip_index))
+           .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+       clip.in_frame = new_frame;
+       data.dirty = true;
+       Ok(())
+   }
 
-    fn edit_trim_clip_out(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()> {
-        let data = self.project_mut(project_id);
-        let clip = data
-            .clips
-            .get_mut(&track_index)
-            .and_then(|c| c.get_mut(clip_index))
-            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
-        clip.out_frame = new_frame;
-        data.dirty = true;
-        Ok(())
-    }
+   fn edit_trim_clip_out(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        _ripple: bool,
+   ) -> BackendResult<()> {
+       let data = self.project_mut(project_id);
+       let clip = data
+           .clips
+           .get_mut(&track_index)
+           .and_then(|c| c.get_mut(clip_index))
+           .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+       clip.out_frame = new_frame;
+       data.dirty = true;
+       Ok(())
+   }
 
     fn edit_split_clip(
         &mut self,
@@ -1501,11 +1521,24 @@ impl Backend for MockBackend {
         Err(BackendError::NotFound(format!("clip {clip_id}")))
     }
 
-    fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+   fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+       let data = self.project_mut(project_id);
+       let entry = PlaylistEntry {
+           index: data.playlist.len(),
+           name: "title".to_string(),
+           source: params,
+           duration_frames: 0,
+       };
+       data.playlist.push(entry.clone());
+       data.dirty = true;
+       Ok(entry)
+   }
+
+    fn generator_create_color(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
         let data = self.project_mut(project_id);
         let entry = PlaylistEntry {
             index: data.playlist.len(),
-            name: "title".to_string(),
+            name: "color".to_string(),
             source: params,
             duration_frames: 0,
         };
@@ -1619,6 +1652,15 @@ impl Backend for MockBackend {
         })?;
         data.dirty = true;
         Ok(path.to_string())
+    }
+
+    fn subtitles_burn_in(&mut self, project_id: &str, track_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.subtitle_tracks {
+            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+        }
+        data.dirty = true;
+        Ok(())
     }
 
     fn file_export(
@@ -2138,8 +2180,8 @@ mod tests {
         let clip = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
-        b.edit_trim_clip_in("p", 0, 0, 10).unwrap();
-        b.edit_trim_clip_out("p", 0, 0, 100).unwrap();
+        b.edit_trim_clip_in("p", 0, 0, 10, false).unwrap();
+        b.edit_trim_clip_out("p", 0, 0, 100, false).unwrap();
 
         let result = b.edit_split_clip("p", 0, 0, 50).unwrap();
         assert_eq!(result.left_clip_id, clip.clip_id);
@@ -2166,8 +2208,8 @@ mod tests {
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
         b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
-        b.edit_trim_clip_in("p", 0, 0, 10).unwrap();
-        b.edit_trim_clip_out("p", 0, 0, 100).unwrap();
+        b.edit_trim_clip_in("p", 0, 0, 10, false).unwrap();
+        b.edit_trim_clip_out("p", 0, 0, 100, false).unwrap();
         assert!(b.edit_split_clip("p", 0, 0, 10).is_err());
         assert!(b.edit_split_clip("p", 0, 0, 101).is_err());
     }

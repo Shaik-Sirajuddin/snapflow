@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,20 @@ import (
 )
 
 var meanVolumePattern = regexp.MustCompile(`mean_volume:\s*(-?[0-9.]+)\s*dB`)
+
+// mltTimecode formats a frame number the way real MLT XML serializes
+// keyframe positions in animation properties: "HH:MM:SS.mmm", not a raw
+// frame number.
+func mltTimecode(frame int64, fps float64) string {
+	totalMs := int64(math.Round(float64(frame) / fps * 1000))
+	hh := totalMs / 3600000
+	totalMs %= 3600000
+	mm := totalMs / 60000
+	totalMs %= 60000
+	ss := totalMs / 1000
+	ms := totalMs % 1000
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", hh, mm, ss, ms)
+}
 
 func meanVolumeDB(t *testing.T, path string) float64 {
 	t.Helper()
@@ -168,12 +183,19 @@ func TestMCPAdapter_AudioSetGainWhenEnabled(t *testing.T) {
 			delta,
 		)
 	}
+	// project.save is what actually persists the live in-memory session
+	// to <projectRoot>/project.mlt (real Shotcut only writes on an
+	// explicit save, not on every mutating RPC), matching
+	// TestMCPAdapter_AudioRemainingHelpersWhenEnabled's own pattern below.
+	agent.sapCall("project.save", map[string]any{})
 	projectXML, err := os.ReadFile(filepath.Join(proj.RootDir, "project.mlt"))
 	if err != nil {
 		t.Fatalf("read serialized project: %v", err)
 	}
 	if !strings.Contains(string(projectXML), "<property name=\"mlt_service\">volume</property>") ||
-		!strings.Contains(string(projectXML), "<property name=\"level\">-9.0</property>") {
+		// Real MLT XML serialization of a whole-number double omits the
+		// trailing ".0" (confirmed live: "-9", not "-9.0").
+		!strings.Contains(string(projectXML), "<property name=\"level\">-9</property>") {
 		t.Fatalf("serialized MLT must contain audio.setGain's volume filter, XML=%s", projectXML)
 	}
 }
@@ -255,8 +277,17 @@ func TestMCPAdapter_AudioRemainingHelpersWhenEnabled(t *testing.T) {
 		t.Fatalf("edit.appendClip returned no clipId: %+v", clip)
 	}
 
-	// 2s @ 30fps → 60 frames (in=0, out=59 inclusive).
-	const clipLen = int64(60)
+	// clipLen (project-timeline frames, NOT the source's native 30fps
+	// encoding) is read back from the real edit.appendClip response
+	// rather than assumed: the real fresh-$HOME default project profile
+	// this environment resolves to is not guaranteed to be 30fps (see
+	// decodeRealFrame's doc comment in sapcall_export_realsaprust_test.go
+	// for the same lesson learned about resolution). generateTestSource's
+	// 2-second source thus yields clipLen = round(2 * projectFps) frames,
+	// whatever projectFps really is.
+	outFrame, _ := clip["outFrame"].(float64)
+	clipLen := int64(outFrame) + 1
+	projectFPS := float64(clipLen) / 2.0
 	const fadeIn = int64(15)
 	const fadeOut = int64(12)
 
@@ -320,14 +351,18 @@ func TestMCPAdapter_AudioRemainingHelpersWhenEnabled(t *testing.T) {
 		`<property name="channel">-1</property>`,
 		`<property name="split">0.75</property>`,
 		`<property name="mlt_service">dynamic_loudness</property>`,
-		`<property name="target_loudness">-18.0</property>`,
+		// Real MLT XML serialization of a whole-number double omits the
+		// trailing ".0" (confirmed live: "-18"/"-20", not "-18.0"/"-20.0").
+		`<property name="target_loudness">-18</property>`,
 		`<property name="mlt_service">loudness</property>`,
-		`<property name="program">-20.0</property>`,
+		`<property name="program">-20</property>`,
 		`<property name="mlt_service">volume</property>`,
-		// fade-in envelope: -60 @ 0, 0 @ fadeIn-1
-		fmt.Sprintf(`0=-60;%d=0`, fadeIn-1),
+		// fade-in envelope: -60 @ 0, 0 @ fadeIn-1. Real MLT XML
+		// serializes keyframe positions as HH:MM:SS.mmm timecodes, not
+		// raw frame numbers (confirmed live).
+		fmt.Sprintf(`%s=-60;%s=0`, mltTimecode(0, projectFPS), mltTimecode(fadeIn-1, projectFPS)),
 		// fade-out envelope: 0 @ (clipLen-fadeOut), -60 @ (clipLen-1)
-		fmt.Sprintf(`%d=0;%d=-60`, clipLen-fadeOut, clipLen-1),
+		fmt.Sprintf(`%s=0;%s=-60`, mltTimecode(clipLen-fadeOut, projectFPS), mltTimecode(clipLen-1, projectFPS)),
 		`<property name="mlt_service">autofade</property>`,
 		`<property name="fade_duration">500</property>`,
 	}
