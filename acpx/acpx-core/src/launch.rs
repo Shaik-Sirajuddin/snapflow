@@ -117,6 +117,7 @@ mod tests {
             launch_overrides: overrides,
             mcp_servers: vec![],
             permission_policy: Default::default(),
+            allow_fs_access: false,
         }
     }
 

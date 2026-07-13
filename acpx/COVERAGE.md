@@ -657,5 +657,82 @@ clean.
    per-session push channel on the WS transport (the one transport that
    could support it; `acpx-server/src/transport/ws.rs`'s current
    request/response-per-frame loop doesn't) or an equivalent async
-   job/callback model on HTTP. Not attempted in this phase -- tracked
-   here as the honest residual, not silently declared done.
+job/callback model on HTTP. Not attempted in this phase -- tracked
+here as the honest residual, not silently declared done.
+
+## ACP compatibility hardening, phase 3 -- real `fs/read_text_file`/`fs/write_text_file`
+
+Closes the next item from phase 2's recheck list. `fs/read_text_file`/
+`fs/write_text_file` are agent-initiated requests with the exact same
+deadlock risk `session/request_permission` had before phase 2 -- a
+backend that asks and gets no reply blocks forever. `read_matching_
+response`'s agent-initiated-request branch (added in phase 2) now
+recognizes both methods specifically instead of falling through to the
+generic method-not-found error.
+
+New `Profile::allow_fs_access: bool` (default `false`, opt-in not
+opt-out -- see that field's doc comment for why this one gets a stricter
+default than `permission_policy`: a backend being able to read/write
+arbitrary paths on whatever host runs acpx is a materially different
+risk than picking among options the backend itself already offered).
+`ensure_backend_initialized` now declares the *real* value in
+`initialize`'s `clientCapabilities.fs.{readTextFile,writeTextFile}`
+instead of unconditionally `false` -- both flip together per profile,
+matching the real ACP capability shape (no separate opt-in per
+direction; real adapters don't expect that granularity either based on
+the schema). A new `BackendCallPolicy` struct
+(`permission_policy` + `allow_fs_access`) replaces passing
+`PermissionPolicy` alone into `ensure_backend_initialized`/
+`read_matching_response`, computed once per call site via
+`BackendCallPolicy::from_profile` -- avoids the parameter list at all
+four dispatch call sites growing by one every time a new per-profile
+auto-decision knob is added.
+
+A new `handle_fs_request` performs real disk I/O against acpx's own host
+filesystem when enabled: `tokio::fs::read_to_string`/`tokio::fs::write`
+against the request's `path` verbatim (real ACP clients/editors always
+send absolute paths; acpx has no separate notion of a session's
+workspace root to resolve a relative one against, same as any other
+process). `fs/read_text_file`'s optional `line` (1-indexed start) and
+`limit` (max lines) params are honored by windowing the file's lines in
+memory. I/O errors (e.g. file not found) become a proper JSON-RPC error
+reply (`-32001`, carrying `data.path`) rather than a panic or a silently
+swallowed failure. When disabled for the profile (the default), a
+request gets a clear "disabled for this profile" error distinct from
+"acpx doesn't support this method at all" -- distinguishing a
+capability that's off from one that doesn't exist yet.
+
+New tests: `acpx-core/tests/fs_request_test.rs` (real temp files on real
+disk, via a stand-in backend using the same "inner `while read` loop
+blocks until it sees its request's reply id" trick as
+`permission_request_test.rs`, wrapped in the same 5-second timeout
+guard): disabled-by-default gets a clear error and the outer call still
+completes without touching disk (`write_path` asserted to not exist
+afterward); a profile with `"allow_fs_access": true` gets the *real*
+file content back (verified against the temp file's actual bytes) and a
+real write that's then verified by reading the temp file back directly,
+bypassing acpx entirely, to prove the write genuinely landed on disk.
+Plus two `acpx-core/src/router.rs`-internal unit tests for
+`handle_fs_request`'s `line`/`limit` windowing arithmetic and its
+missing-file error path.
+
+Workspace test count after this addition: **150 passed, 0 failed, 3
+ignored**, `cargo fmt --all --check` and `cargo build --workspace` both
+clean.
+
+**Recheck against the full ACP spec surface after this phase:**
+1. `terminal/*` (`create`/`output`/`wait_for_exit`/`kill`/`release`) --
+   still entirely unimplemented, no `terminal` capability declared. Next
+   phase.
+2. `authenticate` method -- still entirely unimplemented on the
+   backend-facing side.
+3. Client-facing `initialize`/`authenticate` handshake, and exposing
+   `agentCapabilities`/`permission_policy`/`allow_fs_access` as
+   first-class `profiles/*` fields rather than only inline on
+   `session/new` -- still open.
+4. The live-interactive-decision gap from phase 2's recheck (no
+   out-of-band channel for a real human/client answer mid-call) applies
+   identically to `fs/*` now too: today's "real I/O, but always
+   auto-approved by profile config" is not the same as a client seeing
+   and approving each individual file access. Same root cause, same
+   honest non-fix as before.

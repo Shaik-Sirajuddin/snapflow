@@ -26,3 +26,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"

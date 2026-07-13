@@ -393,16 +393,13 @@ impl Router {
         }
 
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let permission_policy = profile
-            .as_ref()
-            .map(|p| p.permission_policy)
-            .unwrap_or_default();
+        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend).await?;
+            ensure_backend_initialized(&mut backend, call_policy.allow_fs_access).await?;
             backend.writer.write_value(&request).await?;
             let (response, notifications, agent_requests) =
-                read_matching_response(&mut backend, &id, permission_policy).await?;
+                read_matching_response(&mut backend, &id, call_policy).await?;
             attach_session_new_extras(
                 response,
                 notifications,
@@ -555,11 +552,11 @@ impl Router {
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
-        let permission_policy = profile_name
-            .as_deref()
-            .and_then(|name| self.profiles.get(name))
-            .map(|p| p.permission_policy)
-            .unwrap_or_default();
+        let call_policy = BackendCallPolicy::from_profile(
+            profile_name
+                .as_deref()
+                .and_then(|name| self.profiles.get(name)),
+        );
 
         // Rewrite gateway id -> backend id in place; everything else in
         // `params` is forwarded untouched, per the proxied-method contract
@@ -575,10 +572,10 @@ impl Router {
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let response = {
             let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend).await?;
+            ensure_backend_initialized(&mut backend, call_policy.allow_fs_access).await?;
             backend.writer.write_value(&request).await?;
             let (response, notifications, agent_requests) =
-                read_matching_response(&mut backend, &id, permission_policy).await?;
+                read_matching_response(&mut backend, &id, call_policy).await?;
             attach_updates(response, notifications, agent_requests)
         };
         self.spawn_transcript(
@@ -831,6 +828,31 @@ impl Router {
 /// request is ever written to the same backend.
 const INITIALIZE_REQUEST_ID: i64 = 0;
 
+/// Everything about how `read_matching_response`/`ensure_backend_initialized`
+/// should answer a backend's mid-call agent-initiated requests on a given
+/// call's behalf, bundled so the growing set of "what is this profile
+/// allowed to auto-decide" knobs doesn't turn into an ever-longer
+/// parameter list at every one of the four dispatch call sites. Computed
+/// once per call from the resolved `Profile` (or defaulted for
+/// native/unmanaged mode, where there is no profile to consult at all).
+#[derive(Debug, Clone, Copy, Default)]
+struct BackendCallPolicy {
+    permission_policy: PermissionPolicy,
+    allow_fs_access: bool,
+}
+
+impl BackendCallPolicy {
+    fn from_profile(profile: Option<&Profile>) -> Self {
+        match profile {
+            Some(p) => Self {
+                permission_policy: p.permission_policy,
+                allow_fs_access: p.allow_fs_access,
+            },
+            None => Self::default(),
+        }
+    }
+}
+
 /// Perform the real ACP `initialize` request/response round trip against
 /// `proc` if it hasn't already happened for this exact process instance
 /// (`BackendProcess::handshake_done`, reset to `false` on every fresh
@@ -851,6 +873,7 @@ const INITIALIZE_REQUEST_ID: i64 = 0;
 /// request itself.
 async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
+    allow_fs_access: bool,
 ) -> Result<(), RouterError> {
     if proc.handshake_done {
         return Ok(());
@@ -862,7 +885,15 @@ async fn ensure_backend_initialized(
         "params": {
             "protocolVersion": 1,
             "clientCapabilities": {
-                "fs": { "readTextFile": false, "writeTextFile": false }
+                // Real -- not aspirational -- as of ACP compatibility
+                // hardening phase 3: `read_matching_response` genuinely
+                // implements both methods now (real disk I/O against
+                // acpx's own host filesystem) when `allow_fs_access` is
+                // `true` for the profile this process belongs to. `false`
+                // (the default -- see `Profile::allow_fs_access`'s doc
+                // comment for why opt-in, not opt-out) keeps declaring
+                // both `false`, byte-for-byte the pre-phase-3 behavior.
+                "fs": { "readTextFile": allow_fs_access, "writeTextFile": allow_fs_access }
             }
         }
     });
@@ -974,10 +1005,95 @@ fn build_permission_reply(
     })
 }
 
+/// Answer a real `fs/read_text_file` or `fs/write_text_file` request
+/// against acpx's own host filesystem -- real disk I/O, not a stub.
+/// Schema per `agentclientprotocol.com/protocol/file-system`:
+/// `fs/read_text_file`'s params are `{sessionId, path, line?, limit?}`
+/// (`line`: 1-indexed line to start from; `limit`: max number of lines),
+/// result `{content}`; `fs/write_text_file`'s params are
+/// `{sessionId, path, content}`, result `{}` (no data, success is the
+/// signal). `path` is used exactly as sent -- real ACP clients (editors)
+/// always send absolute paths, and acpx has no separate notion of a
+/// session's own "workspace root" to resolve a relative one against
+/// today, so a backend sending a relative path gets whatever
+/// `std::env::current_dir` resolves it against, same as any other
+/// process. Only reached when `allow_fs_access` is already `true` for
+/// the calling profile -- callers must check that first (see
+/// `read_matching_response`), since this function does no permission
+/// check of its own.
+async fn handle_fs_request(request: &serde_json::Value, method: &str) -> serde_json::Value {
+    let id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let params = request.get("params");
+    let path = match params.and_then(|p| p.get("path")).and_then(|p| p.as_str()) {
+        Some(path) => path.to_string(),
+        None => {
+            return serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32602, "message": "missing required 'path' param"}
+            })
+        }
+    };
+    match method {
+        "fs/read_text_file" => {
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => {
+                    let line = params.and_then(|p| p.get("line")).and_then(|l| l.as_u64());
+                    let limit = params.and_then(|p| p.get("limit")).and_then(|l| l.as_u64());
+                    let content = match (line, limit) {
+                        (None, None) => content,
+                        (line, limit) => {
+                            // `line` is 1-indexed per the ACP schema; absent
+                            // means start from the top. `limit` caps the
+                            // number of lines returned; absent means the
+                            // rest of the file.
+                            let start = line.map(|l| l.saturating_sub(1) as usize).unwrap_or(0);
+                            let lines: Vec<&str> = content.lines().collect();
+                            let end = match limit {
+                                Some(n) => (start + n as usize).min(lines.len()),
+                                None => lines.len(),
+                            };
+                            lines.get(start..end).unwrap_or(&[]).join("\n")
+                        }
+                    };
+                    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": content}})
+                }
+                Err(err) => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32001, "message": format!("fs/read_text_file: {err}"), "data": {"path": path}}
+                }),
+            }
+        }
+        "fs/write_text_file" => {
+            let content = params
+                .and_then(|p| p.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            match tokio::fs::write(&path, content).await {
+                Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                Err(err) => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32001, "message": format!("fs/write_text_file: {err}"), "data": {"path": path}}
+                }),
+            }
+        }
+        // Unreachable in practice -- `read_matching_response` only calls
+        // this for the two methods above -- but a `match` without a
+        // catch-all here would be a silent trap for a future third `fs/*`
+        // method added to that call site without updating this function.
+        other => serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "error": {"code": -32601, "message": format!("acpx gateway does not implement '{other}'")}
+        }),
+    }
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
-    permission_policy: PermissionPolicy,
+    policy: BackendCallPolicy,
 ) -> Result<
     (
         serde_json::Value,
@@ -1012,7 +1128,27 @@ async fn read_matching_response(
             value.get("method").and_then(|m| m.as_str()),
         ) {
             let reply = if method == "session/request_permission" {
-                build_permission_reply(&value, permission_policy)
+                build_permission_reply(&value, policy.permission_policy)
+            } else if (method == "fs/read_text_file" || method == "fs/write_text_file")
+                && policy.allow_fs_access
+            {
+                handle_fs_request(&value, method).await
+            } else if method == "fs/read_text_file" || method == "fs/write_text_file" {
+                // Capability wasn't enabled for this profile -- declared
+                // `false` in `initialize`, so a well-behaved backend
+                // shouldn't be asking at all, but reply with a clear
+                // "not enabled" error (not a plain method-not-found) if
+                // one does anyway, distinguishing "acpx doesn't have this
+                // handler" from "this profile turned it off".
+                let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("'{method}' is disabled for this profile (Profile::allow_fs_access is false)"),
+                    }
+                })
             } else {
                 let req_id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
                 serde_json::json!({
@@ -1270,7 +1406,7 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence, permission_policy) = {
+    let (backend, persistence, call_policy) = {
         let mut r = router.lock().await;
         let entry = r
             .sessions
@@ -1285,12 +1421,12 @@ async fn dispatch_proxied_shared(
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        let permission_policy = profile_name
-            .as_deref()
-            .and_then(|name| r.profiles.get(name))
-            .map(|p| p.permission_policy)
-            .unwrap_or_default();
-        (backend, r.persistence.clone(), permission_policy)
+        let call_policy = BackendCallPolicy::from_profile(
+            profile_name
+                .as_deref()
+                .and_then(|name| r.profiles.get(name)),
+        );
+        (backend, r.persistence.clone(), call_policy)
     };
 
     spawn_transcript_fn(
@@ -1302,10 +1438,10 @@ async fn dispatch_proxied_shared(
 
     let response = {
         let mut proc = backend.lock().await;
-        ensure_backend_initialized(&mut proc).await?;
+        ensure_backend_initialized(&mut proc, call_policy.allow_fs_access).await?;
         proc.writer.write_value(&request).await?;
         let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, permission_policy).await?;
+            read_matching_response(&mut proc, &id, call_policy).await?;
         attach_updates(response, notifications, agent_requests)
     };
 
@@ -1397,14 +1533,11 @@ async fn dispatch_session_new_shared(
 
     let mut response = {
         let mut proc = backend.lock().await;
-        ensure_backend_initialized(&mut proc).await?;
+        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        ensure_backend_initialized(&mut proc, call_policy.allow_fs_access).await?;
         proc.writer.write_value(&request).await?;
-        let permission_policy = profile
-            .as_ref()
-            .map(|p| p.permission_policy)
-            .unwrap_or_default();
         let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, permission_policy).await?;
+            read_matching_response(&mut proc, &id, call_policy).await?;
         attach_session_new_extras(
             response,
             notifications,
@@ -1529,6 +1662,41 @@ mod tests {
         assert_eq!(classify("session/prompt"), MethodClass::Proxied);
         assert_eq!(classify("agents/list"), MethodClass::GatewayNative);
         assert_eq!(classify("bogus/method"), MethodClass::Unknown);
+    }
+
+    #[tokio::test]
+    async fn handle_fs_request_windows_read_by_line_and_limit() {
+        // Unit-level coverage for the `line`/`limit` windowing math itself
+        // (1-indexed start, max-lines cap) -- `fs_request_test.rs` covers
+        // the no-params "whole file" path end to end through `Router`;
+        // this covers the windowing arithmetic directly since threading a
+        // `line`/`limit`-carrying request through a shell stand-in backend
+        // would be awkward to express.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("windowed.txt");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "fs/read_text_file",
+            "params": {"path": path.to_str().unwrap(), "line": 2, "limit": 2}
+        });
+        let reply = handle_fs_request(&request, "fs/read_text_file").await;
+        // 1-indexed `line: 2` starts at "two"; `limit: 2` caps it there.
+        assert_eq!(reply["result"]["content"], serde_json::json!("two\nthree"));
+    }
+
+    #[tokio::test]
+    async fn handle_fs_request_read_of_missing_file_is_a_clear_error_not_a_panic() {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "fs/read_text_file",
+            "params": {"path": "/definitely/does/not/exist.txt"}
+        });
+        let reply = handle_fs_request(&request, "fs/read_text_file").await;
+        assert!(reply.get("error").is_some());
+        assert_eq!(
+            reply["error"]["data"]["path"],
+            serde_json::json!("/definitely/does/not/exist.txt")
+        );
     }
 
     #[test]

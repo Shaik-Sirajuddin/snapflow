@@ -45,6 +45,19 @@ pub struct Profile {
     /// (persisted or provisioned) that predates this field parses
     /// unchanged, defaulting to the conservative `AutoReject`.
     pub permission_policy: PermissionPolicy,
+    /// Whether this profile's backend is allowed real `fs/read_text_file`/
+    /// `fs/write_text_file` access to acpx's own host filesystem.
+    /// Default `false` (declared `false`/`false` in the `initialize`
+    /// handshake's `clientCapabilities.fs`, and any attempt anyway gets a
+    /// capability-not-enabled error rather than performing I/O) -- a
+    /// backend process being able to read/write arbitrary paths on
+    /// whatever host is running acpx is a real, meaningfully dangerous
+    /// default to ship opt-out rather than opt-in, unlike
+    /// `permission_policy` (which only ever picks among options the
+    /// backend itself offered). See `router::read_matching_response`'s
+    /// `fs/read_text_file`/`fs/write_text_file` handling.
+    #[serde(default)]
+    pub allow_fs_access: bool,
 }
 
 /// How `crate::router` answers a backend's `session/request_permission`
@@ -144,6 +157,7 @@ mod tests {
             launch_overrides: HashMap::new(),
             mcp_servers: vec![],
             permission_policy: Default::default(),
+            allow_fs_access: false,
         }
     }
 

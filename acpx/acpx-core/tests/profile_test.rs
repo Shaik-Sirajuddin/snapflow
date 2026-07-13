@@ -25,6 +25,7 @@ fn litellm_profile(name: &str, key_ref: acpx_core::keystore::KeyRef) -> Profile 
         launch_overrides,
         mcp_servers: vec!["fs".to_string(), "git".to_string()],
         permission_policy: Default::default(),
+        allow_fs_access: false,
     }
 }
 
@@ -118,6 +119,7 @@ fn multiple_profiles_can_share_one_provider_with_different_keys() {
             launch_overrides: HashMap::new(),
             mcp_servers: vec![],
             permission_policy: Default::default(),
+            allow_fs_access: false,
         })
         .unwrap();
     profiles
@@ -129,6 +131,7 @@ fn multiple_profiles_can_share_one_provider_with_different_keys() {
             launch_overrides: HashMap::new(),
             mcp_servers: vec![],
             permission_policy: Default::default(),
+            allow_fs_access: false,
         })
         .unwrap();
 
@@ -162,6 +165,7 @@ fn create_profile_referencing_provider_that_does_not_exist_yet_still_succeeds() 
         launch_overrides: HashMap::new(),
         mcp_servers: vec![],
         permission_policy: Default::default(),
+        allow_fs_access: false,
     };
     assert!(profiles.create(profile).is_ok());
 
@@ -189,6 +193,7 @@ fn profile_store_error_variants_are_distinguishable() {
         launch_overrides: HashMap::new(),
         mcp_servers: vec![],
         permission_policy: Default::default(),
+        allow_fs_access: false,
     };
     profiles.create(profile.clone()).unwrap();
     assert_eq!(
