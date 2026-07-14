@@ -492,6 +492,7 @@ mod tests {
                 ChatMessage {
                     kind: MessageKind::User,
                     text: "hello from run one".into(),
+                    status: None,
                 },
             );
             assert_eq!(bridge.history(0).len(), 1);
@@ -526,6 +527,7 @@ mod tests {
             ChatMessage {
                 kind: MessageKind::User,
                 text: "a-only".into(),
+                status: None,
             },
         );
         bridge.push_local(
@@ -533,6 +535,7 @@ mod tests {
             ChatMessage {
                 kind: MessageKind::User,
                 text: "b-only".into(),
+                status: None,
             },
         );
         assert_eq!(bridge.history(0)[0].text, "a-only");
@@ -559,6 +562,7 @@ mod tests {
             ChatMessage {
                 kind: MessageKind::User,
                 text: "not persisted".into(),
+                status: None,
             },
         );
         assert_eq!(bridge.history(0).len(), 1);
@@ -593,18 +597,22 @@ mod tests {
             ChatMessage {
                 kind: MessageKind::User,
                 text: "add a crossfade".into(),
+                status: None,
             },
             ChatMessage {
                 kind: MessageKind::Thinking,
                 text: "considering the timeline structure".into(),
+                status: None,
             },
             ChatMessage {
                 kind: MessageKind::ToolCall,
                 text: "edit.add_transition(...)".into(),
+                status: None,
             },
             ChatMessage {
                 kind: MessageKind::Agent,
                 text: "done, crossfade added".into(),
+                status: None,
             },
         ];
         seed_store
@@ -696,6 +704,7 @@ mod tests {
                 &[ChatMessage {
                     kind: MessageKind::Agent,
                     text: "healthy scrollback".into(),
+                    status: None,
                 }],
                 &ThreadTrailer {
                     acp_session_id: "ok".into(),

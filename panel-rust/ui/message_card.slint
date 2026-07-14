@@ -2,42 +2,139 @@ import { Palette } from "palette.slint";
 import { MessageItem } from "types.slint";
 
 // One reusable message card, parameterized by kind (user/agent/tool-call/
-// thinking) -- Phase 3 of chat-panel-ui-theme-parity.md will extend this
-// with a `status` field for tool-call cards (text badge only, monochrome
-// -- see palette.slint's status note) without touching sidebar.slint or
-// chat-area.slint.
+// thinking) -- Phase 3 of chat-panel-ui-theme-parity.md. Visual source:
+// ui_html/index.html's `renderChatBubbles()` for user/agent/thinking
+// (plain bordered bubble, uppercase mono label header, no timestamp --
+// this crate's `ChatMessage` carries no timestamp field, an accepted
+// data-model gap not in this plan's scope) and `renderTimeline()`'s
+// tool_use card for tool-call (status badge + collapsible log body),
+// since the HTML's own bubble-layout tool rendering is a flat text dump
+// with no collapse affordance and this plan explicitly asks for one.
+//
+// Status stays deliberately monochrome (see palette.slint's note) --
+// `item.status` is already uppercased by `models::to_message_model`, so
+// this file only lays it out, never colors by value.
 export component MessageCard inherits Rectangle {
     in property <MessageItem> item;
+    callback toggle-expanded(int);
 
     property <bool> is-user: item.kind == "user";
+    property <bool> is-agent: item.kind == "agent";
     property <bool> is-tool-call: item.kind == "tool-call";
     property <bool> is-thinking: item.kind == "thinking";
+    property <string> header-label: is-user ? "USER" : is-agent ? "AGENT" : is-thinking ? "THINKING" : "TOOL";
 
-    background: is-user ? Palette.sys-user-bubble
-        : is-tool-call ? Palette.sys-terminal-bg
-        : Palette.sys-card;
+    // Thinking renders as plain muted/italic text, no bubble chrome at
+    // all -- matches the timeline view's "agent text stream" treatment
+    // for non-bubble content; user/agent/tool-call all get a bordered
+    // card.
+    background: is-thinking ? transparent
+        : is-user ? Palette.sys-user-bubble
+        : is-tool-call ? Palette.sys-card
+        : Palette.sys-agent-bubble;
     border-color: is-user ? Palette.sys-user-bubble-border
-        : is-tool-call ? Palette.sys-terminal-border
+        : is-tool-call ? Palette.sys-border
         : Palette.sys-agent-bubble-border;
-    border-width: 1px;
+    border-width: is-thinking ? 0px : 1px;
     border-radius: Palette.radius-md;
 
-    HorizontalLayout {
-        padding: 8px;
+    VerticalLayout {
+        padding: is-thinking ? 4px : 10px;
         spacing: 6px;
-        Rectangle {
-            width: is-tool-call ? 3px : 0px;
-            background: Palette.sys-text-muted;
+
+        // Header row -- uppercase mono label, plus tool-name/status
+        // badges for tool-call only.
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: header-label;
+                font-family: Palette.font-mono;
+                font-size: 9px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+                color: Palette.sys-text-muted;
+                vertical-alignment: center;
+            }
+            if is-tool-call && item.status != "" : Rectangle {
+                background: Palette.sys-sidebar;
+                border-color: Palette.sys-border;
+                border-width: 1px;
+                border-radius: Palette.radius-sm;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    padding-top: 2px;
+                    padding-bottom: 2px;
+                    Text {
+                        text: item.status;
+                        font-family: Palette.font-mono;
+                        font-size: 9px;
+                        color: Palette.sys-text-secondary;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Rectangle { }
         }
-        Text {
+
+        // Body -- plain wrapped text for user/agent/thinking; for
+        // tool-call, a clickable summary line that toggles the log box.
+        if !is-tool-call : Text {
             text: item.text;
             font-italic: is-thinking;
-            font-family: is-tool-call ? Palette.font-mono : Palette.font-sans;
+            font-family: Palette.font-sans;
+            font-size: is-thinking ? 11px : 12px;
             color: is-user ? Palette.sys-user-bubble-text
-                : is-tool-call ? Palette.sys-terminal-text
                 : is-thinking ? Palette.sys-text-muted
                 : Palette.sys-agent-bubble-text;
             wrap: word-wrap;
+        }
+        // Plain `Rectangle` (not a layout) so a sibling `TouchArea` can
+        // cover the whole clickable summary+toggle-label area -- same
+        // "TouchArea + Layout as siblings under a plain Rectangle" idiom
+        // already used for the sidebar's thread-row click targets.
+        if is-tool-call : Rectangle {
+            TouchArea {
+                clicked => { toggle-expanded(item.index); }
+            }
+            VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: item.text;
+                        font-family: Palette.font-sans;
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: Palette.sys-text-primary;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: item.expanded ? "[-] hide logs" : "[+] show logs";
+                        font-family: Palette.font-mono;
+                        font-size: 9px;
+                        color: Palette.sys-text-secondary;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { }
+                }
+                if item.expanded : Rectangle {
+                    background: Palette.sys-terminal-bg;
+                    border-color: Palette.sys-terminal-border;
+                    border-width: 1px;
+                    border-radius: Palette.radius-sm;
+                    HorizontalLayout {
+                        padding: 8px;
+                        Text {
+                            text: item.text;
+                            font-family: Palette.font-mono;
+                            font-size: 10px;
+                            color: Palette.sys-terminal-text;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
         }
     }
 }

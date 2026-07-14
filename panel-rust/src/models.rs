@@ -37,15 +37,50 @@ fn message_kind_str(kind: &MessageKind) -> &'static str {
     }
 }
 
-pub fn to_message_model(msgs: Vec<ChatMessage>) -> ModelRc<MessageItem> {
+/// Builds the message-list model shown by `ChatArea`/`MessageCard`.
+/// `expanded` is Rust-side, UI-only collapse state for tool-call log
+/// bodies (Phase 3), parallel to `msgs` by index -- out-of-range/missing
+/// entries default to collapsed (`false`), matching the HTML source's
+/// "new tool_use items default to collapsed" convention (see
+/// `PanelSingleton::expanded` in `lib.rs` for how the vec is kept in
+/// sync as history grows).
+pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<MessageItem> {
     let items: Vec<MessageItem> = msgs
         .into_iter()
-        .map(|m| MessageItem {
+        .enumerate()
+        .map(|(i, m)| MessageItem {
             kind: message_kind_str(&m.kind).into(),
             text: m.text.into(),
+            // Slint side uppercases nothing itself -- source HTML always
+            // renders `item.status.toUpperCase()`, so this crate does the
+            // same once here rather than duplicating casing logic in
+            // `.slint` markup.
+            status: m.status.map(|s| s.to_uppercase()).unwrap_or_default().into(),
+            expanded: expanded.get(i).copied().unwrap_or(false),
+            index: i as i32,
         })
         .collect();
     ModelRc::new(VecModel::from(items))
+}
+
+/// One-line preview text for a thread's sidebar card, synthesized from
+/// its latest message -- matches index.html's static `t.desc` field
+/// (Phase 2/3 note: no separate "thread description" concept exists in
+/// the data model, so this is derived, not stored). Empty string for a
+/// thread with no messages yet. Newlines are flattened to spaces and the
+/// result is truncated to `max_chars` with a trailing ellipsis so a long
+/// first line can't blow out the fixed-height thread card.
+pub fn describe_thread(msgs: &[ChatMessage], max_chars: usize) -> String {
+    let Some(last) = msgs.last() else {
+        return String::new();
+    };
+    let flattened: String = last.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= max_chars {
+        flattened
+    } else {
+        let truncated: String = flattened.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{truncated}\u{2026}") // "…"
+    }
 }
 
 /// One row of the (possibly filtered) sidebar list, paired with its
@@ -71,6 +106,7 @@ pub struct VisibleThreadItem {
 pub fn build_thread_items(
     names: &[&str],
     state: &[ThreadState],
+    descriptions: &[String],
     query: &str,
 ) -> Vec<VisibleThreadItem> {
     let query_lower = query.trim().to_lowercase();
@@ -86,6 +122,7 @@ pub fn build_thread_items(
             item: ThreadItem {
                 name: (*name).into(),
                 status: st.as_str().into(),
+                description: descriptions.get(real_index).cloned().unwrap_or_default().into(),
             },
         })
         .collect()
@@ -94,6 +131,7 @@ pub fn build_thread_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slint::Model;
 
     const NAMES: &[&str] = &[
         "Fix timeline crash",
@@ -107,10 +145,11 @@ mod tests {
         ThreadState::Error,
         ThreadState::Idle,
     ];
+    const NO_DESCRIPTIONS: &[String] = &[];
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
-        let items = build_thread_items(NAMES, STATE, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "");
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].item.name, "Fix timeline crash");
         assert_eq!(items[0].real_index, 0);
@@ -120,7 +159,7 @@ mod tests {
 
     #[test]
     fn substring_match_is_case_insensitive() {
-        let items = build_thread_items(NAMES, STATE, "FADE");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "FADE");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
         // Real index must survive filtering -- "Add fade transition" is
@@ -128,7 +167,7 @@ mod tests {
         // list. This is exactly the mismatch `real_index` exists to fix.
         assert_eq!(items[0].real_index, 1);
 
-        let items = build_thread_items(NAMES, STATE, "fade");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
     }
@@ -138,7 +177,7 @@ mod tests {
         // "x" appears in 2 non-adjacent names (index 0 and 3); must come
         // back in the same relative order as NAMES, not re-sorted, and
         // must skip the non-matching ones in between.
-        let items = build_thread_items(NAMES, STATE, "x");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "x");
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
         assert_eq!(matched_names, vec!["Fix timeline crash", "Export pipeline bug"]);
         let real_indices: Vec<usize> = items.iter().map(|i| i.real_index).collect();
@@ -147,20 +186,90 @@ mod tests {
 
     #[test]
     fn no_match_returns_empty_not_error() {
-        let items = build_thread_items(NAMES, STATE, "zzz-no-such-thread");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "zzz-no-such-thread");
         assert!(items.is_empty());
     }
 
     #[test]
     fn whitespace_only_query_behaves_like_empty() {
-        let items = build_thread_items(NAMES, STATE, "   ");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "   ");
         assert_eq!(items.len(), 4);
     }
 
     #[test]
     fn status_is_carried_through_unfiltered() {
-        let items = build_thread_items(NAMES, STATE, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "");
         assert_eq!(items[1].item.status, "loading");
         assert_eq!(items[2].item.status, "error");
+    }
+
+    #[test]
+    fn description_is_carried_through_by_real_index_when_filtered() {
+        let descriptions: Vec<String> = vec![
+            "Fixed the crash".into(),
+            "Added a fade".into(),
+            "".into(),
+            "Bug still open".into(),
+        ];
+        let items = build_thread_items(NAMES, STATE, &descriptions, "fade");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item.description, "Added a fade");
+    }
+
+    #[test]
+    fn description_defaults_to_empty_when_shorter_than_names() {
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "");
+        assert!(items.iter().all(|i| i.item.description.is_empty()));
+    }
+
+    fn chat_msg(kind: MessageKind, text: &str, status: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            kind,
+            text: text.to_string(),
+            status: status.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn describe_thread_uses_last_message_flattened_and_truncated() {
+        assert_eq!(describe_thread(&[], 40), "");
+        let msgs = vec![
+            chat_msg(MessageKind::User, "add a crossfade", None),
+            chat_msg(MessageKind::Agent, "line one\nline two   with   gaps", None),
+        ];
+        assert_eq!(describe_thread(&msgs, 40), "line one line two with gaps");
+
+        let long = vec![chat_msg(
+            MessageKind::Agent,
+            "this response is deliberately much longer than the truncation limit",
+            None,
+        )];
+        let desc = describe_thread(&long, 20);
+        assert_eq!(desc.chars().count(), 20);
+        assert!(desc.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn to_message_model_uppercases_status_and_defaults_expanded_false() {
+        let msgs = vec![
+            chat_msg(MessageKind::User, "hi", None),
+            chat_msg(MessageKind::ToolCall, "ffmpeg.export(...)", Some("in_progress")),
+        ];
+        let model = to_message_model(msgs, &[]);
+        assert_eq!(model.row_count(), 2);
+        let user_row = model.row_data(0).unwrap();
+        assert_eq!(user_row.status, "");
+        assert_eq!(user_row.index, 0);
+        let tool_row = model.row_data(1).unwrap();
+        assert_eq!(tool_row.status, "IN_PROGRESS");
+        assert!(!tool_row.expanded);
+        assert_eq!(tool_row.index, 1);
+    }
+
+    #[test]
+    fn to_message_model_honors_provided_expanded_state() {
+        let msgs = vec![chat_msg(MessageKind::ToolCall, "x", Some("completed"))];
+        let model = to_message_model(msgs, &[true]);
+        assert!(model.row_data(0).unwrap().expanded);
     }
 }

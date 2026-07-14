@@ -4,9 +4,30 @@
 export struct ThreadItem {
     name: string,
     status: string, // "idle" | "loading" | "error"
+    // Phase 3 (chat-panel-ui-theme-parity.md): one-line preview
+    // synthesized from the thread's latest message (Rust-side --
+    // `models::describe_thread`), matching index.html's `t.desc` field.
+    // Empty string for a thread with no messages yet.
+    description: string,
 }
 
 export struct MessageItem {
     kind: string, // "user" | "agent" | "tool-call" | "thinking"
     text: string,
+    // Phase 3: tool-call execution status, already-uppercased display
+    // text (e.g. "COMPLETED") or "" for non-tool-call kinds / messages
+    // cached before this field existed -- monochrome text badge only,
+    // see message_card.slint's doc comment.
+    status: string,
+    // Phase 3: UI-only collapse state for the tool-call log body --
+    // Rust-side `Vec<bool>` parallel to the message list (see
+    // `PanelSingleton::expanded` in lib.rs), not part of
+    // `rui_acp_client::ChatMessage` at all. Ignored for non-tool-call
+    // kinds.
+    expanded: bool,
+    // Phase 3: this message's position in the currently-displayed
+    // thread's message list -- round-tripped back through
+    // `toggle-expanded(index)` so Rust knows which entry in its
+    // `expanded: Vec<bool>` to flip.
+    index: int,
 }

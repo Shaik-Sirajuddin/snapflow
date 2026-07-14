@@ -80,29 +80,68 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
+        // Thread card -- Phase 3 adds the one-line description (see
+        // `models::describe_thread`) and an "ACTIVE" tag on the
+        // selected row, matching index.html's `renderThreads()` (title
+        // + truncated desc + state indicator + left accent border on
+        // the active row).
         for thread[i] in threads : Rectangle {
-            height: 44px;
-            background: i == selected-thread ? Palette.sys-primary-container : Palette.sys-sidebar;
+            height: 48px;
+            background: i == selected-thread ? Palette.sys-chat : Palette.sys-sidebar;
             TouchArea {
                 clicked => { thread-selected(i); }
             }
             HorizontalLayout {
-                padding: 8px;
-                spacing: 6px;
                 Rectangle {
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 4px;
-                    background: thread.status == "loading" ? Palette.sys-text-secondary
-                        : thread.status == "error" ? Palette.sys-text-muted
-                        : Palette.sys-primary;
+                    // Left accent border -- transparent when inactive so
+                    // text never shifts between selected/unselected
+                    // (same reasoning as the HTML's always-present
+                    // `border-l-4`).
+                    width: 3px;
+                    background: i == selected-thread ? Palette.sys-primary : transparent;
                 }
-                Text {
-                    text: thread.name;
-                    color: Palette.sys-text-primary;
-                    font-size: 12px;
-                    font-family: Palette.font-sans;
-                    vertical-alignment: center;
+                VerticalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    spacing: 2px;
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: thread.name;
+                            color: i == selected-thread ? Palette.sys-primary : Palette.sys-text-primary;
+                            font-size: 11px;
+                            font-weight: 700;
+                            font-family: Palette.font-sans;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Rectangle { }
+                        Text {
+                            text: i == selected-thread ? "ACTIVE" : "";
+                            color: Palette.sys-text-muted;
+                            font-size: 8px;
+                            font-family: Palette.font-mono;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: thread.status == "loading" ? Palette.sys-primary
+                                : thread.status == "error" ? Palette.sys-text-secondary
+                                : Palette.sys-text-muted;
+                        }
+                    }
+                    Text {
+                        text: thread.status == "error" ? "! " + thread.description : thread.description;
+                        color: Palette.sys-text-secondary;
+                        font-size: 10px;
+                        font-family: Palette.font-sans;
+                        overflow: elide;
+                    }
                 }
             }
         }

@@ -19,16 +19,21 @@ mod models;
 mod theme;
 
 use agent_bridge::AgentBridge;
-use models::{build_thread_items, to_message_model, ThreadState};
+use models::{build_thread_items, describe_thread, to_message_model, ThreadState};
 use rui_acp_client::{AgentEvent, ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
 use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{ModelRc, SharedString, VecModel};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
+
+/// Truncation length for `models::describe_thread`'s sidebar preview --
+/// matches the HTML source's short one-liners (e.g. "Trim clips and add
+/// fades…").
+const THREAD_DESCRIPTION_MAX_CHARS: usize = 48;
 
 /// Fixed v1 set of chat threads -- each gets its own bound agent
 /// connection via `AgentBridge` (Decision 4: per-thread static binding).
@@ -115,6 +120,19 @@ struct PanelSingleton {
     /// `refresh_threads_model` every time the filter or thread_state
     /// changes.
     visible_indices: RefCell<Vec<usize>>,
+    /// Phase 3 (chat-panel-ui-theme-parity.md): UI-only collapse state
+    /// for tool-call log bodies, parallel to whichever thread's messages
+    /// are currently displayed -- see `refresh_messages_for`/
+    /// `render_messages` below. Does not persist across a thread switch
+    /// or a jsonl reload (render concern only, not part of
+    /// `ChatMessage`).
+    expanded: RefCell<Vec<bool>>,
+    /// The real thread index whose history `expanded` currently
+    /// describes -- `None` before the first message render. Used to
+    /// decide whether switching to `real_idx` should reset `expanded`
+    /// (different thread) or just grow it in place (same thread, new
+    /// streamed messages).
+    displayed_thread: Cell<Option<usize>>,
 }
 
 impl PanelSingleton {
@@ -126,7 +144,19 @@ impl PanelSingleton {
     fn refresh_threads_model(&self) {
         let state = self.thread_state.borrow();
         let query = self.search_query.borrow();
-        let items = build_thread_items(THREAD_NAMES, &state, &query);
+        // Phase 3: sidebar description is synthesized from each
+        // thread's latest cached message (`models::describe_thread`) --
+        // recomputed here rather than cached, since it must track the
+        // live/bridge history, not just `thread_state`.
+        let descriptions: Vec<String> = THREAD_NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, _)| match &self.bridge {
+                Some(bridge) => describe_thread(&bridge.history(i), THREAD_DESCRIPTION_MAX_CHARS),
+                None => String::new(),
+            })
+            .collect();
+        let items = build_thread_items(THREAD_NAMES, &state, &descriptions, &query);
         *self.visible_indices.borrow_mut() = items.iter().map(|i| i.real_index).collect();
         let items: Vec<ThreadItem> = items.into_iter().map(|i| i.item).collect();
         self.component.set_threads(ModelRc::new(VecModel::from(items)));
@@ -139,6 +169,45 @@ impl PanelSingleton {
     /// selection).
     fn real_index(&self, filtered_idx: usize) -> Option<usize> {
         self.visible_indices.borrow().get(filtered_idx).copied()
+    }
+
+    /// Rebuilds the `messages` model for `real_idx` from the agent
+    /// bridge's current history plus whatever `expanded` state already
+    /// exists -- does not touch `expanded`/`displayed_thread` itself
+    /// (that's `refresh_messages_for`'s job). Used by the
+    /// `toggle-expanded` callback, which only flips one bool and must
+    /// not reset collapse state for every other message in the thread.
+    fn render_messages(&self, real_idx: usize) {
+        let Some(bridge) = &self.bridge else { return };
+        let history = bridge.history(real_idx);
+        let expanded = self.expanded.borrow();
+        self.component.set_messages(to_message_model(history, &expanded));
+    }
+
+    /// Displays `real_idx`'s messages, first reconciling `expanded`
+    /// against it: a genuine thread switch (different from
+    /// `displayed_thread`) resets collapse state to all-collapsed
+    /// (matches the HTML source's "new tool_use items default to
+    /// collapsed" convention); staying on the same thread (e.g. a
+    /// streamed message just arrived, growing history by one) only
+    /// grows the vec, preserving whatever the user already
+    /// expanded/collapsed. Every Rust-side call site that changes which
+    /// thread's messages are visible goes through this, not
+    /// `set_messages` directly.
+    fn refresh_messages_for(&self, real_idx: usize) {
+        let Some(bridge) = &self.bridge else { return };
+        let history_len = bridge.history(real_idx).len();
+        let is_thread_switch = self.displayed_thread.get() != Some(real_idx);
+        {
+            let mut expanded = self.expanded.borrow_mut();
+            if is_thread_switch {
+                *expanded = vec![false; history_len];
+            } else if expanded.len() < history_len {
+                expanded.resize(history_len, false);
+            }
+        }
+        self.displayed_thread.set(Some(real_idx));
+        self.render_messages(real_idx);
     }
 
     /// Applies queued agent-bridge events to `thread_state` and, if the
@@ -176,7 +245,7 @@ impl PanelSingleton {
         }
         self.refresh_threads_model();
         if let (true, Some(selected)) = (selected_touched, selected) {
-            self.component.set_messages(to_message_model(bridge.history(selected)));
+            self.refresh_messages_for(selected);
         }
         true
     }
@@ -256,25 +325,23 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             thread_state: RefCell::new(initial_state),
             search_query: RefCell::new(String::new()),
             visible_indices: RefCell::new(Vec::new()),
+            expanded: RefCell::new(Vec::new()),
+            displayed_thread: Cell::new(None),
         };
         panel.refresh_threads_model();
         if !THREAD_NAMES.is_empty() {
-            if let Some(bridge) = &panel.bridge {
-                panel.component.set_messages(to_message_model(bridge.history(0)));
-            }
+            panel.refresh_messages_for(0);
         }
 
         let component_weak = panel.component.as_weak();
         panel.component.on_thread_selected(move |idx| {
-            let Some(component) = component_weak.upgrade() else { return };
+            let Some(_component) = component_weak.upgrade() else { return };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     // `idx` is a filtered-list index (Phase 2) -- translate
                     // to the real thread index before touching the bridge.
                     let Some(real_idx) = panel.real_index(idx as usize) else { return };
-                    if let Some(bridge) = &panel.bridge {
-                        component.set_messages(to_message_model(bridge.history(real_idx)));
-                    }
+                    panel.refresh_messages_for(real_idx);
                 }
             });
         });
@@ -293,13 +360,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 if let Some(panel) = cell.borrow().as_ref() {
                     let Some(idx) = panel.real_index(filtered_idx) else { return };
                     let Some(bridge) = &panel.bridge else { return };
-                    bridge.push_local(idx, ChatMessage { kind: MessageKind::User, text: text.to_string() });
+                    bridge.push_local(idx, ChatMessage { kind: MessageKind::User, text: text.to_string(), status: None });
                     if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
                         *slot = ThreadState::Loading;
                     }
                     panel.refresh_threads_model();
                     if Some(idx) == panel.real_index(component.get_selected_thread() as usize) {
-                        component.set_messages(to_message_model(bridge.history(idx)));
+                        panel.refresh_messages_for(idx);
                     }
                     bridge.send_prompt(idx, text.to_string());
                 }
@@ -320,13 +387,26 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     // leaving a stale/out-of-range selection.
                     component.set_selected_thread(0);
                     match panel.real_index(0) {
-                        Some(real_idx) => {
-                            if let Some(bridge) = &panel.bridge {
-                                component.set_messages(to_message_model(bridge.history(real_idx)));
-                            }
-                        }
+                        Some(real_idx) => panel.refresh_messages_for(real_idx),
                         None => component.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new()))),
                     }
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_toggle_expanded(move |index| {
+            let Some(_component) = component_weak.upgrade() else { return };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(real_idx) = panel.displayed_thread.get() else { return };
+                    let idx = index as usize;
+                    let mut expanded = panel.expanded.borrow_mut();
+                    if let Some(slot) = expanded.get_mut(idx) {
+                        *slot = !*slot;
+                    }
+                    drop(expanded);
+                    panel.render_messages(real_idx);
                 }
             });
         });

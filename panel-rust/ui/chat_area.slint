@@ -3,84 +3,217 @@ import { MessageItem } from "types.slint";
 import { MessageCard } from "message_card.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
-// chat-panel-ui-theme-parity.md extends the header with an
-// icon/description and the compose bar with the multi-line/hint-text
-// treatment, without touching app.slint or sidebar.slint.
+// chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
+// "Thread Header" section (icon/title/desc/agent chip/layout label) and
+// "Input Area" section (textarea look, state dot, hint text, Send
+// Command button). v1 fixes on the HTML's "ltr" bubble alignment (user
+// right, everything else left) -- see `message_card.slint`'s doc comment
+// for why tool-call gets the richer timeline-style card instead of the
+// bubble layout's flat text dump.
 export component ChatArea inherits Rectangle {
     in property <string> active-thread-name: "";
+    in property <string> active-thread-description: "";
     in property <[MessageItem]> messages: [];
     in property <string> agent-badge: "agent . ask";
     in-out property <string> compose-text: "";
     callback send-requested();
+    callback toggle-expanded(int);
 
-    background: Palette.sys-outer;
+    background: Palette.sys-chat;
 
     VerticalLayout {
+        // Thread header -- icon glyph + title/description + right-hand
+        // agent-name chip and static layout label (HTML's layout
+        // switcher is out of scope, per the plan; this always reads
+        // "CHAT").
         Rectangle {
-            height: 40px;
-            background: Palette.sys-card;
+            height: 52px;
+            background: Palette.sys-chat;
             HorizontalLayout {
-                padding: 10px;
-                spacing: 8px;
+                padding: 12px;
+                spacing: 10px;
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    background: Palette.sys-primary-container;
+                    border-color: Palette.sys-border;
+                    border-width: 1px;
+                    border-radius: Palette.radius-sm;
+                    Text {
+                        text: "\u{276F}"; // heavy right-pointing angle, stand-in for the HTML's chevron/tool svg icon
+                        color: Palette.sys-primary;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    Text {
+                        text: active-thread-name;
+                        color: Palette.sys-text-primary;
+                        font-size: 13px;
+                        font-weight: 600;
+                        font-family: Palette.font-sans;
+                    }
+                    Text {
+                        text: active-thread-description;
+                        color: Palette.sys-text-muted;
+                        font-size: 10px;
+                        font-family: Palette.font-sans;
+                        visible: active-thread-description != "";
+                    }
+                }
+                Rectangle { }
                 Text {
-                    text: active-thread-name;
-                    color: Palette.sys-text-primary;
-                    font-size: 13px;
+                    text: "Agent:";
+                    color: Palette.sys-text-secondary;
+                    font-size: 10px;
                     font-family: Palette.font-sans;
                     vertical-alignment: center;
                 }
-                Rectangle { }
                 Rectangle {
-                    background: Palette.sys-primary-container;
+                    background: Palette.sys-outer;
+                    border-color: Palette.sys-border;
+                    border-width: 1px;
                     border-radius: Palette.radius-sm;
                     HorizontalLayout {
-                        padding: 4px;
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        padding-top: 2px;
+                        padding-bottom: 2px;
                         Text {
                             text: agent-badge;
-                            color: Palette.sys-text-secondary;
-                            font-size: 11px;
+                            color: Palette.sys-text-primary;
+                            font-size: 10px;
                             font-family: Palette.font-mono;
                             vertical-alignment: center;
                         }
                     }
                 }
-            }
-        }
-        Flickable {
-            VerticalLayout {
-                padding: 10px;
-                spacing: 8px;
-                for msg in messages : MessageCard {
-                    item: msg;
+                Rectangle {
+                    width: 1px;
+                    background: Palette.sys-border;
+                }
+                Text {
+                    text: "CHAT";
+                    color: Palette.sys-primary;
+                    font-size: 9px;
+                    font-weight: 700;
+                    font-family: Palette.font-mono;
+                    vertical-alignment: center;
                 }
             }
         }
         Rectangle {
-            height: 44px;
-            background: Palette.sys-card;
-            HorizontalLayout {
-                padding: 6px;
-                spacing: 6px;
-                compose := TextInput {
-                    text <=> compose-text;
-                    color: Palette.sys-text-primary;
-                    font-family: Palette.font-sans;
-                    vertical-alignment: center;
-                    accepted => { send-requested(); }
-                }
-                Rectangle {
-                    width: 60px;
-                    background: Palette.sys-primary;
-                    border-radius: Palette.radius-sm;
-                    TouchArea {
-                        clicked => { send-requested(); }
+            // Separator under the header -- Slint has no per-edge
+            // border, so a thin standalone Rectangle stands in for the
+            // HTML's `border-b border-sys-border`.
+            height: 1px;
+            background: Palette.sys-border;
+        }
+        Flickable {
+            VerticalLayout {
+                padding: 12px;
+                spacing: 10px;
+                for msg[i] in messages : HorizontalLayout {
+                    Rectangle { horizontal-stretch: msg.kind == "user" ? 1 : 0; }
+                    card := MessageCard {
+                        horizontal-stretch: 0;
+                        width: 260px;
+                        item: msg;
+                        toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
+                    Rectangle { horizontal-stretch: msg.kind == "user" ? 0 : 1; }
+                }
+            }
+        }
+        // Compose bar -- taller textarea-look box, state dot, hint
+        // text, Send Command button. Deliberately keeps `TextInput`'s
+        // default `single-line: true` so `accepted` still fires on
+        // Enter (the "press Enter to send" contract, unchanged
+        // behavior) -- `single-line: false` would need real shift-
+        // enter-for-newline key handling to avoid breaking that, which
+        // is new scope this phase doesn't add. The taller box is purely
+        // a visual approximation of the HTML's `rows="2" textarea`.
+        Rectangle {
+            // Separator above the compose bar -- stands in for the
+            // HTML's `border-t border-sys-border`, same reasoning as the
+            // header's separator above.
+            height: 1px;
+            background: Palette.sys-border;
+        }
+        Rectangle {
+            height: 64px;
+            background: Palette.sys-chat;
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        background: Palette.sys-sidebar;
+                        border-color: Palette.sys-border;
+                        border-width: 1px;
+                        border-radius: Palette.radius-lg;
+                        Text {
+                            text: "Ask the agent to execute tools or run tasks...";
+                            color: Palette.sys-text-muted;
+                            font-size: 10px;
+                            font-family: Palette.font-sans;
+                            visible: compose.text == "";
+                            x: 8px;
+                            y: 6px;
+                        }
+                        compose := TextInput {
+                            text <=> compose-text;
+                            color: Palette.sys-text-primary;
+                            font-family: Palette.font-sans;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                            x: 8px;
+                            y: 6px;
+                            width: parent.width - 16px;
+                            height: parent.height - 12px;
+                            accepted => { send-requested(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: start;
+                        Rectangle {
+                            width: 9px;
+                            height: 9px;
+                            border-radius: 4.5px;
+                            background: Palette.sys-text-secondary;
+                        }
+                    }
+                }
+                HorizontalLayout {
                     Text {
-                        text: "Send";
-                        color: Palette.sys-on-primary;
-                        font-family: Palette.font-sans;
+                        text: "Press Enter to send";
+                        color: Palette.sys-text-muted;
+                        font-size: 8px;
+                        font-family: Palette.font-mono;
                         vertical-alignment: center;
-                        horizontal-alignment: center;
+                    }
+                    Rectangle { }
+                    Rectangle {
+                        width: 100px;
+                        background: Palette.sys-primary;
+                        border-radius: Palette.radius-sm;
+                        TouchArea {
+                            clicked => { send-requested(); }
+                        }
+                        Text {
+                            text: "Send Command";
+                            color: Palette.sys-on-primary;
+                            font-family: Palette.font-sans;
+                            font-size: 10px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
                     }
                 }
             }

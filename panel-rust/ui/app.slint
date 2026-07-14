@@ -30,6 +30,7 @@ export component ChatPanel inherits Window {
     callback thread-selected(int);
     callback send-requested();
     callback search-changed(string);
+    callback toggle-expanded(int);
 
     HorizontalLayout {
         Sidebar {
@@ -43,10 +44,12 @@ export component ChatPanel inherits Window {
         }
         ChatArea {
             active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
+            active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
             messages: messages;
             agent-badge: agent-badge;
             compose-text <=> compose-text;
             send-requested => { send-requested(); }
+            toggle-expanded(i) => { toggle-expanded(i); }
         }
     }
 }
