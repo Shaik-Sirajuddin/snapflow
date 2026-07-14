@@ -15,6 +15,7 @@
 //! touches Slint state directly -- see `agent_bridge.rs`.
 
 mod agent_bridge;
+mod theme;
 
 use agent_bridge::AgentBridge;
 use rui_acp_client::{AgentEvent, ChatMessage, MessageKind};
