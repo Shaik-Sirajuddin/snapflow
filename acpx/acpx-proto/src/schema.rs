@@ -44,12 +44,6 @@ use agent_client_protocol::schema::v1::{
 /// could drift apart. This module's own test
 /// (`every_method_schema_ref_is_registered`) fails the moment a
 /// `methods.rs` entry names a type this function doesn't also register.
-// `#[allow(dead_code)]`: not yet called outside this file's own test --
-// `openrpc.rs` (phase C of the `acpx-openrpc-schema` plan, not yet
-// implemented) is the real consumer. Kept `pub(crate)` and exercised by
-// `every_method_schema_ref_is_registered` below so this phase's drift
-// guard is real even before that caller exists.
-#[allow(dead_code)]
 pub(crate) fn register_all_defs(generator: &mut SchemaGenerator) {
     // acpx-native types. Registering every type through the same
     // generator means shared substructure (e.g. `RequestId` appearing

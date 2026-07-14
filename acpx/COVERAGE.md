@@ -2655,3 +2655,47 @@ environment, same standing limitation as every prior phase.
 change to wire behavior or router logic -- purely additive schema
 metadata (a lookup table plus generator registrations) over
 already-existing dispatch behavior.
+
+## 2026-07-14 -- full transport schema pipeline phase C: OpenRPC document generator
+
+Third phase of the `acpx-openrpc-schema` plan. Adds `docs/schema/
+acpx.openrpc.json`: a real OpenRPC 1.3.2 document covering all 32
+methods in `methods.rs`'s `METHODS` table -- the first generated
+artifact that actually answers "why is the JSON Schema so little" with
+"it isn't anymore", rather than a doc-comment pointer to go find
+upstream's schema separately.
+
+`acpx-proto/src/openrpc.rs`: `build_openrpc_document()` calls
+`schema.rs`'s `register_all_defs` (phase B) for one shared generator,
+rewrites every `#/$defs/Name` `$ref` schemars emits to OpenRPC's own
+`#/components/schemas/Name` convention (`rewrite_refs_to_components`,
+recursive since a `$ref` can appear at any nesting depth), and emits
+one Method Object per `METHODS` entry. Two acpx-specific `x-*`
+extensions (OpenRPC's sanctioned escape hatch) carry information the
+base spec has no field for: `x-acpx-side` (`client-to-agent` vs.
+`agent-to-client` -- which of acpx-server's two duplex roles calls this
+method) and `x-acpx-alternate-result` (`session/list` only -- the real
+`ListSessionsResponse` shape returned when a selector is supplied,
+alongside the gateway-native default `result`). `session/cancel`
+(a true notification, no reply) gets `x-acpx-notification: true`
+instead of a `result` key, rather than a misleading `null` result.
+`servers` lists all three real transports (stdio, `http://127.0.0.1:
+8790/rpc`, `ws://127.0.0.1:8790/ws` -- the actual default bind address
+from `acpx-server/src/config.rs`, not a placeholder).
+
+New pieces: `acpx-proto/src/openrpc.rs`, `acpx-proto/src/bin/
+gen_openrpc.rs` (`cargo run -p acpx-proto --bin gen-openrpc`),
+`scripts/gen_openrpc.sh`, `acpx-proto/tests/openrpc_test.rs` (same
+drift-guard pattern as `schema_test.rs`).
+
+Workspace test count after this phase: **265 passed, 0 failed, 6
+ignored** (up from 261/0/6 -- three `openrpc::tests` unit tests plus
+the new `openrpc_test.rs` integration test). `cargo fmt --all --check`
+and `cargo build --workspace --tests` both clean. `cargo clippy` still
+not installed in this environment, same standing limitation as every
+prior phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to wire behavior or router logic -- purely additive generated
+documentation over already-existing dispatch behavior and (phase B's)
+method registry.

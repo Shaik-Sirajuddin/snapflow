@@ -15,3 +15,7 @@ schemars = { workspace = true }
 [[bin]]
 name = "gen-schema"
 path = "src/bin/gen_schema.rs"
+
+[[bin]]
+name = "gen-openrpc"
+path = "src/bin/gen_openrpc.rs"
