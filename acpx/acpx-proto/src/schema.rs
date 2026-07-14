@@ -10,6 +10,11 @@ use schemars::JsonSchema;
 use serde_json::{json, Map, Value};
 
 use crate::agent::{AgentListEntry, AgentStatus};
+use crate::gateway::{
+    AgentIdParams, AgentInstallResult, AgentStatusResult, AgentsListResult,
+    GatewaySessionListEntry, GatewaySessionListResult, McpServerEntry, McpServersListResult,
+    NameOnlyParams, NameOnlyResult, PermissionPolicySchema, ProfileSchema,
+};
 use crate::jsonrpc::{Request, RequestId, Response, RpcError};
 use crate::session::{AcpxExt, GatewaySessionId, NewSessionParams};
 
@@ -33,6 +38,18 @@ pub fn build_schema_document() -> Value {
     generator.subschema_for::<GatewaySessionId>();
     generator.subschema_for::<AgentStatus>();
     generator.subschema_for::<AgentListEntry>();
+    generator.subschema_for::<AgentIdParams>();
+    generator.subschema_for::<AgentsListResult>();
+    generator.subschema_for::<AgentInstallResult>();
+    generator.subschema_for::<AgentStatusResult>();
+    generator.subschema_for::<GatewaySessionListEntry>();
+    generator.subschema_for::<GatewaySessionListResult>();
+    generator.subschema_for::<McpServerEntry>();
+    generator.subschema_for::<McpServersListResult>();
+    generator.subschema_for::<NameOnlyParams>();
+    generator.subschema_for::<NameOnlyResult>();
+    generator.subschema_for::<PermissionPolicySchema>();
+    generator.subschema_for::<ProfileSchema>();
 
     let defs = generator.take_definitions(true);
 
@@ -101,6 +118,18 @@ mod tests {
             "AgentStatus",
             "AgentListEntry",
             "JsonRpcVersion",
+            "AgentIdParams",
+            "AgentsListResult",
+            "AgentInstallResult",
+            "AgentStatusResult",
+            "GatewaySessionListEntry",
+            "GatewaySessionListResult",
+            "McpServerEntry",
+            "McpServersListResult",
+            "NameOnlyParams",
+            "NameOnlyResult",
+            "PermissionPolicySchema",
+            "ProfileSchema",
         ] {
             assert!(defs.contains_key(name), "missing $defs entry: {name}");
         }

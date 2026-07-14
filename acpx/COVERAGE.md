@@ -2550,3 +2550,52 @@ standing limitation as every prior phase.
 change to wire behavior or router logic -- purely additive tooling
 (schema derivation + generation pipeline + drift test + docs) over
 already-existing wire types.
+
+## 2026-07-14 -- full transport schema pipeline phase A: type the remaining gateway-native gaps
+
+First phase of the `acpx-openrpc-schema` plan (see
+`memory/acpx/gen/plans/acpx-openrpc-schema/`), which answers "why is
+the JSON Schema so little -- tenant ids, all required params, etc.
+should be covered" by building out a full method-registry-driven
+OpenRPC + OpenAPI pipeline across five phases. This phase closes the
+part of that gap the *existing* bundled wire schema (phase 20) could
+already cover but didn't: most gateway-native methods
+(`agents/*`, `session/list`'s default branch, `profiles/*`,
+`mcp_servers/*`) were still implicit `serde_json::json!{}` literals in
+`acpx-core/src/router.rs`, not named, schema-derived Rust types.
+
+Added `acpx-proto/src/gateway.rs`: schema-only mirror types for every
+gap found (`AgentIdParams`, `AgentsListResult`, `AgentInstallResult`,
+`AgentStatusResult`, `GatewaySessionListEntry`/`Result`,
+`McpServerEntry`/`McpServersListResult`, `NameOnlyParams`/`Result`,
+`ProfileSchema`/`PermissionPolicySchema`). "Schema-only mirror" --
+`router.rs` itself is unchanged; each type is a `#[derive(JsonSchema)]`
+struct kept honest by a unit test asserting its shape matches a real
+`router.rs` response literal byte-for-byte, the same posture
+`NewSessionParams` already established. `ProfileSchema`/
+`PermissionPolicySchema` mirror `acpx-core::profile::{Profile,
+PermissionPolicy}` specifically (rather than deriving `JsonSchema` on
+those directly) because `acpx-core` depends on `acpx-proto`, not the
+reverse -- `acpx-proto` referencing `acpx-core` types would invert
+that layering.
+
+All new types registered into `acpx-proto/src/schema.rs`'s shared
+generator, so `docs/schema/acpx-wire.schema.json` (regenerated via
+`scripts/gen_schema.sh`) now has a named, documented `$defs` entry for
+every gateway-native method's params/result, not just the two
+`agents/*` types phase 20 added.
+
+Workspace test count after this phase: **257 passed, 0 failed, 6
+ignored** (up from 252/0/6 -- 5 new `gateway::tests` unit tests).
+`cargo fmt --all --check` and `cargo build --workspace --tests` both
+clean. `cargo clippy` still not installed in this environment, same
+standing limitation as every prior phase. One pre-existing, unrelated
+flaky test observed during this phase's verification run
+(`acpx-conductor`'s `terminal::tests::kill_stops_a_long_running_command`,
+a real-process-timing test) -- passed cleanly on immediate re-run in
+isolation and again in the final full-suite run above; not touched by
+this phase's changes.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to wire behavior or router logic -- purely additive schema
+types over already-existing gateway-native response shapes.

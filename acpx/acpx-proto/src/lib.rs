@@ -8,6 +8,7 @@
 //! raw ACP shape itself.
 
 pub mod agent;
+pub mod gateway;
 pub mod jsonrpc;
 pub mod schema;
 pub mod session;
