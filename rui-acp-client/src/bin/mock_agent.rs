@@ -29,6 +29,24 @@ use std::sync::Mutex;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// **acpx-gateway-integration addition.** When this process is spawned as
+/// one provider's backend behind an `acpx-server` (see
+/// `panel-rust/src/agent_bridge.rs`'s `resolve_gateway` /
+/// `ensure_gateway_running`), `RUI_MOCK_AGENT_PERSONA` names which
+/// provider it's standing in for (`"codex"`/`"claude"`). Prefixing every
+/// reply with `[<PERSONA>]` is the concrete, checkable signal the
+/// multi-provider isolation tests assert on: if two threads bound to two
+/// different gateway processes ever got cross-wired, the wrong persona
+/// tag would show up in a thread's transcript and the test would fail
+/// instead of passing unnoticed. Unset (the direct, non-gateway dev path)
+/// leaves replies byte-for-byte unchanged from before this existed.
+fn persona_prefix() -> String {
+    match std::env::var("RUI_MOCK_AGENT_PERSONA") {
+        Ok(p) if !p.is_empty() => format!("[{}] ", p.to_uppercase()),
+        _ => String::new(),
+    }
+}
+
 struct SessionState {
     title: String,
     updated_at: String,
@@ -71,7 +89,7 @@ async fn send_replay(
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-            TextContent::new(prompt_text.to_uppercase()),
+            TextContent::new(format!("{}{}", persona_prefix(), prompt_text.to_uppercase())),
         ))),
     ))?;
     Ok(())

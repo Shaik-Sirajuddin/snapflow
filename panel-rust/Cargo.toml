@@ -7,8 +7,14 @@ description = "Phase 4+: real chat-panel crate. Renders a Slint UI (software ren
 [dependencies]
 slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
 rui-acp-client = { path = "../rui-acp-client" }
+# Full acpx-gateway cutover (chat-panel-acpx-gateway-integration.md): every
+# thread's live agent connection is one of these, never a direct
+# rui-acp-client subprocess connection. rui-acp-client stays a dependency
+# for its jsonl cache + shared ChatMessage/AgentEvent types only.
+rui-acpx-client = { path = "../rui-acpx-client" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std"] }
 thiserror = "1"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,10 @@
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/autocfg-c38e0a650aba1060.d: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs
+
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/libautocfg-c38e0a650aba1060.rlib: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs
+
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/libautocfg-c38e0a650aba1060.rmeta: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs
+
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/lib.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/error.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/rustc.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/autocfg-1.5.1/src/version.rs:

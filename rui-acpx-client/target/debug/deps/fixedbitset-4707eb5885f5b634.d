@@ -1,0 +1,10 @@
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/fixedbitset-4707eb5885f5b634.d: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/mod.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/sse2.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/range.rs
+
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/libfixedbitset-4707eb5885f5b634.rlib: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/mod.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/sse2.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/range.rs
+
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/libfixedbitset-4707eb5885f5b634.rmeta: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/mod.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/sse2.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/range.rs
+
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/lib.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/mod.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/block/sse2.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fixedbitset-0.5.7/src/range.rs:

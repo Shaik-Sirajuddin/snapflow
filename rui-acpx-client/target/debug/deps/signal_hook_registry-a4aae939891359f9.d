@@ -1,0 +1,9 @@
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/signal_hook_registry-a4aae939891359f9.d: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/libsignal_hook_registry-a4aae939891359f9.rlib: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/.claude/worktrees/rust-slint-embed-trial/rui-acpx-client/target/debug/deps/libsignal_hook_registry-a4aae939891359f9.rmeta: /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs /home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs
+
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/lib.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/half_lock.rs:
+/home/siraj/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/signal-hook-registry-1.4.8/src/vec_map.rs:

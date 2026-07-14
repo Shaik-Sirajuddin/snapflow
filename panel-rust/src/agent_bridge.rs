@@ -59,12 +59,12 @@
 //!   with durable server-side session storage exists to validate
 //!   against.
 
-use rui_acp_client::{
-    spawn_thread, AcpAgent, AgentEvent, ChatMessage, JsonlStore, ThreadHandle, ThreadTrailer,
-};
+use rui_acp_client::{AgentEvent, ChatMessage, JsonlStore, ThreadTrailer};
+use rui_acpx_client::{spawn_acpx_thread, AcpxThreadHandle};
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,8 +74,8 @@ pub enum BridgeError {
     Runtime(#[source] std::io::Error),
     #[error("jsonl cache error: {0}")]
     Cache(#[source] rui_acp_client::CacheError),
-    #[error("invalid agent command {cmd:?}: {reason}")]
-    Agent { cmd: String, reason: String },
+    #[error("acpx gateway provisioning failed: {0}")]
+    Gateway(String),
 }
 
 /// One agent-bridge event, tagged with which UI thread index it belongs
@@ -93,7 +93,7 @@ pub struct BridgeEvent {
 /// session id once `open_session` resolves (used to fill the trailer).
 struct ThreadSlot {
     thread_id: String,
-    handle: Arc<ThreadHandle>,
+    handle: Arc<AcpxThreadHandle>,
     history: Mutex<Vec<ChatMessage>>,
     acp_session_id: Mutex<Option<String>>,
 }
@@ -127,20 +127,339 @@ fn slug(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Resolves the real agent subprocess command: `RUI_ACP_AGENT_CMD` env
-/// override (production/packaging path -- a real ACP-compliant agent
-/// binary), else the dev-checkout `rui-mock-agent` built alongside
-/// `rui-acp-client` (only usable from a source checkout, never in a
-/// packaged build -- matches this crate's own `CARGO_MANIFEST_DIR`).
-pub fn resolve_agent_command() -> String {
+/// Which acpx-gateway-backed provider a UI thread is bound to. v1's fixed
+/// four-thread list (`THREAD_NAMES` in `lib.rs`) alternates codex/claude
+/// by index, so both providers get real, concurrent, isolated coverage
+/// rather than only ever exercising one -- the multi-provider
+/// verification requirement from `chat-panel-acpx-gateway-integration.md`
+/// Phase 3 bullet 5 applies to the *real* running panel, not only its
+/// test suite.
+pub fn provider_for_index(idx: usize) -> &'static str {
+    if idx % 2 == 0 {
+        "codex"
+    } else {
+        "claude"
+    }
+}
+
+/// Resolves the dev-checkout `acpx-server` binary path: `RUI_ACPX_SERVER_BIN`
+/// env override, else a path relative to this crate's own
+/// `CARGO_MANIFEST_DIR`, matching the same convention
+/// `resolve_agent_command`'s successor (`provision_gateway` below)
+/// uses for the backend it spawns *inside* that gateway.
+fn resolve_acpx_server_bin() -> PathBuf {
+    if let Ok(bin) = std::env::var("RUI_ACPX_SERVER_BIN") {
+        return PathBuf::from(bin);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
+}
+
+/// Resolves the mock backend agent binary the locally-spawned gateway
+/// should proxy to: `RUI_ACP_AGENT_CMD` env override (a real
+/// ACP-compliant agent binary/command), else the dev-checkout
+/// `rui-mock-agent` built alongside `rui-acp-client` -- the same fallback
+/// `resolve_agent_command` used for the (now-retired) direct-subprocess
+/// path, kept as the acpx-gateway's own default backend for dev/test.
+fn resolve_backend_agent_command() -> String {
     if let Ok(cmd) = std::env::var("RUI_ACP_AGENT_CMD") {
         return cmd;
     }
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../rui-acp-client/target/debug/rui-mock-agent")
         .to_string_lossy()
         .into_owned()
+}
+
+/// Real (not just "is the TCP port open") liveness probe: issues an
+/// actual `session/list` JSON-RPC call over a hand-rolled HTTP/1.1
+/// request (no async runtime available yet at this point in
+/// construction, and pulling in `reqwest`'s blocking client just for a
+/// one-shot startup probe isn't worth the extra compiled dependency) and
+/// checks the response actually looks like a JSON-RPC envelope.
+///
+/// **Real bug this closes, found empirically, not assumed:** the naive
+/// version of this check (a bare `TcpStream::connect` with no HTTP
+/// request at all) was tried first and immediately produced a false
+/// positive against this dev machine's own unrelated service already
+/// listening on the fixed default port 8791 -- `panel-rust` happily
+/// "reused" it as if it were the claude acpx-gateway, then every
+/// `session/new` against it failed (`405 Method Not Allowed`, a
+/// completely different HTTP server). A bare port-open check can never
+/// distinguish "our gateway" from "any other service that happens to be
+/// listening here" on a shared dev machine; an actual protocol-shaped
+/// round trip can.
+///
+/// Single connect-and-probe attempt -- factored out from
+/// [`probe_acpx_gateway`] so that function can retry a couple times
+/// under real system load (see its own doc comment's "known limitation"
+/// note) without duplicating this request-building logic.
+fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
+    let request = if let Some(expected_agent) = expected_agent {
+        let _ = expected_agent;
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+    } else {
+        let body = r#"{"jsonrpc":"2.0","id":0,"method":"session/list","params":{}}"#;
+        format!(
+            "POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    };
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let Ok(text) = String::from_utf8(response) else {
+        return false;
+    };
+    let Some((headers, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let Some(status_line) = headers.lines().next() else {
+        return false;
+    };
+    let status = status_line.split_whitespace().nth(1);
+    if status != Some("200") {
+        return false;
+    }
+    let Ok(envelope): Result<serde_json::Value, _> = serde_json::from_str(body) else {
+        return false;
+    };
+    if envelope.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0")
+        || envelope.get("error").is_some()
+    {
+        if expected_agent.is_none() {
+            return false;
+        }
+    }
+    if let Some(expected_agent) = expected_agent {
+        envelope.get("status").and_then(|s| s.as_str()) == Some("ok")
+            && envelope.get("agentId").and_then(|id| id.as_str()) == Some(expected_agent)
+    } else {
+        envelope
+            .get("result")
+            .and_then(|r| r.get("sessions"))
+            .and_then(|s| s.as_array())
+            .is_some()
+    }
+}
+
+/// See [`probe_acpx_gateway_once`]. Retries up to 3 times (small,
+/// fixed backoff) before concluding "not a real acpx-server" -- **known
+/// limitation found empirically**: a single 200ms-connect/500ms-read
+/// attempt produced a false negative during this crate's own headless
+/// smoke test, spawning a redundant second gateway instead of reusing
+/// an already-live one, when the host machine was under heavy
+/// concurrent CPU load (Shotcut's own MLT filter-metadata loading
+/// competing with unrelated build/test processes on the same box). The
+/// redundant spawn was itself harmless (a second, independent, correctly
+/// working gateway -- no crash, no cross-provider mixup), but it defeats
+/// the "relaunch reattaches to the existing gateway" property this
+/// function exists for. Retrying trades a little startup latency in the
+/// already-rare "something is listening but isn't answering yet" case
+/// for a much higher chance of correctly reusing a live gateway.
+#[cfg(test)]
+fn probe_acpx_gateway(port: u16) -> bool {
+    probe_acpx_gateway_for_agent(port, None)
+}
+
+fn probe_acpx_gateway_for_agent(port: u16, expected_agent: Option<&str>) -> bool {
+    for attempt in 0..3 {
+        if probe_acpx_gateway_once(port, expected_agent) {
+            return true;
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+    }
+    false
+}
+
+/// Binds an ephemeral TCP port synchronously, then immediately drops the
+/// listener so `acpx-server` can bind the same port itself moments later
+/// -- same "probe a free port, hand the number to the real process"
+/// trick this workspace's own `rui-acpx-client`/`acpx-server` test suites
+/// use, reused here so a colliding fixed default port (see
+/// `probe_acpx_gateway`'s doc comment) never blocks startup.
+fn reserve_port(port: u16) -> io::Result<File> {
+    let path = std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock"));
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+fn reserve_ephemeral_port() -> Option<(u16, File)> {
+    for _ in 0..32 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let port = listener.local_addr().ok()?.port();
+        drop(listener);
+        if let Ok(lock) = reserve_port(port) {
+            return Some((port, lock));
+        }
+    }
+    None
+}
+
+/// Resolves and, if necessary, spawns `provider`'s acpx gateway,
+/// returning the base URL to actually dial:
+///
+/// 1. `RUI_ACPX_<PROVIDER>_URL` env override (real-deployment path -- an
+///    already-running acpx-server this process should just dial,
+///    trusted as-is with no liveness probe, matching
+///    `RUI_ACP_AGENT_CMD`'s established override-precedence convention).
+/// 2. Else, a fixed per-provider loopback default port (8790 codex /
+///    8791 claude) is probed with [`probe_acpx_gateway`] -- if a real
+///    acpx-server is already answering there (an operator-started one,
+///    *or this same panel process's own gateway surviving a prior
+///    thread's earlier call in this same construction loop, or -- the
+///    concrete "closing and relaunching reattaches" case -- a gateway
+///    left running by a now-closed prior panel process*), it's reused
+///    unchanged.
+/// 3. Else, spawns a fresh `acpx-server` child -- on the fixed default
+///    port if nothing at all is listening there yet, or on a freshly
+///    probed ephemeral port if something *is* listening but didn't pass
+///    the acpx-shaped check (an unrelated service already owns the
+///    default port on this machine).
+///
+/// Spawned with `RUI_MOCK_AGENT_PERSONA=provider` so its backend tags
+/// replies for the multi-provider isolation checks.
+///
+/// **Deliberately not tied to this process's lifetime**: the spawned
+/// `acpx-server` (and, transitively, its own backend subprocess) is a
+/// completely ordinary child of *this* process, inheriting this
+/// process's session/process-group rather than being placed in a new
+/// one -- so it is reparented to init and keeps running if this process
+/// (the panel / the whole host application) is killed by PID rather
+/// than by process-group signal. This is exactly the "window close does
+/// not imply session close" contract: the gateway process, and
+/// therefore every session it holds open, survives the panel
+/// window/process going away. See
+/// `gen/plans/chat-panel/chat-panel-acpx-gateway-integration.md` Phase 3
+/// bullet 8's verification requirement -- `Command::spawn` here with no
+/// special detachment call is the entire mechanism, not an oversight.
+fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<String, String> {
+    let env_key = format!("RUI_ACPX_{}_URL", provider.to_uppercase());
+    if let Ok(url) = std::env::var(&env_key) {
+        return Ok(url);
+    }
+
+    let default_port: u16 = if provider == "codex" { 8790 } else { 8791 };
+    if probe_acpx_gateway_for_agent(default_port, Some(provider)) {
+        return Ok(format!("http://127.0.0.1:{default_port}"));
+    }
+
+    // Nothing acpx-shaped answering the default port -- decide which
+    // port to actually spawn on. If the default port is genuinely free
+    // (no TCP listener at all, not just "didn't answer our probe"),
+    // spawn there directly (keeps the common case's URL predictable);
+    // otherwise it's occupied by some unrelated service, so probe for a
+    // real free ephemeral port instead of fighting over the default one.
+    let (port, lock) = if std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], default_port)),
+        std::time::Duration::from_millis(100),
+    )
+    .is_err()
+    {
+        match reserve_port(default_port) {
+            Ok(lock) => (default_port, lock),
+            Err(_) => reserve_ephemeral_port()
+                .ok_or_else(|| "could not reserve a loopback port".to_string())?,
+        }
+    } else {
+        reserve_ephemeral_port().ok_or_else(|| "could not reserve a loopback port".to_string())?
+    };
+
+    spawn_gateway_process(provider, port, lock, cache_dir)?;
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+/// The actual `Command::spawn` -- split from [`provision_gateway`] so the
+/// port-selection policy above stays readable. See that function's doc
+/// comment for the full reuse/fallback contract this is one step of.
+fn spawn_gateway_process(
+    provider: &str,
+    port: u16,
+    lock: File,
+    cache_dir: Option<&PathBuf>,
+) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(resolve_acpx_server_bin());
+    cmd.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+        .env("ACPX_BACKEND_CMD", resolve_backend_agent_command())
+        .env("ACPX_DEFAULT_AGENT_ID", provider)
+        .env("RUI_MOCK_AGENT_PERSONA", provider)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    // Persist session/transcript metadata to sqlite so a `session/load`
+    // after this whole panel process (and even this gateway process, if
+    // it's ever restarted by an operator) relaunches can still rehydrate
+    // -- the concrete mechanism behind "closing and relaunching the app
+    // auto-reloads session instances ... resuming continues the session
+    // from acpx-server" (Phase 3 bullet 6). Placed alongside the jsonl
+    // cache dir when one is configured, else a per-provider tempdir so a
+    // no-persistence dev run still gets a working (if ephemeral) db
+    // rather than silently disabling rehydration.
+    let db_path = match cache_dir {
+        Some(dir) => dir.join(format!("acpx-{provider}.sqlite3")),
+        None => std::env::temp_dir().join(format!(
+            "rui-acpx-{provider}-{}.sqlite3",
+            std::process::id()
+        )),
+    };
+    cmd.env("ACPX_DB_PATH", &db_path);
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ =
+            std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
+        format!("failed to spawn acpx-server for {provider} on port {port}: {e}")
+    })?;
+    for _ in 0..50 {
+        if probe_acpx_gateway_for_agent(port, Some(provider)) {
+            std::thread::spawn(move || {
+                let mut child = child;
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                    }
+                }
+                drop(lock);
+                let _ = std::fs::remove_file(
+                    std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
+                );
+            });
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed checking acpx-server startup: {e}"))?
+        {
+            let _ = std::fs::remove_file(
+                std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
+            );
+            return Err(format!(
+                "acpx-server exited during startup for {provider} on port {port}: {status}"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
+    Err(format!(
+        "acpx-server did not become ready for {provider} on port {port}"
+    ))
 }
 
 /// Resolves the jsonl cache directory: `RUI_ACP_CACHE_DIR` env override,
@@ -174,32 +493,55 @@ fn cwd_for_session() -> PathBuf {
 }
 
 impl AgentBridge {
-    /// Production constructor: real agent command + real (dev-checkout)
-    /// cache dir, both resolved via env-override-or-fallback.
+    /// Production constructor: every thread's acpx gateway URL resolved
+    /// (env-override-or-local-autospawn, see [`provision_gateway`]) +
+    /// real (dev-checkout) cache dir.
     pub fn new(thread_names: &[&str]) -> Result<Self, BridgeError> {
-        Self::new_with_agent_cmd_and_cache_dir(
+        let cache_dir = resolve_cache_dir();
+        let cache_dir_for_resolver = cache_dir.clone();
+        Self::new_with_gateway_resolver_and_cache_dir(
             thread_names,
-            resolve_agent_command(),
-            Some(resolve_cache_dir()),
+            move |provider| {
+                provision_gateway(provider, Some(&cache_dir_for_resolver))
+                    .map_err(BridgeError::Gateway)
+            },
+            Some(cache_dir),
         )
     }
 
-    /// Test/override constructor: caller-chosen agent command, no jsonl
-    /// persistence (in-memory history only) -- what the existing Rust
-    /// test suite used before this module had a cache dir parameter at
-    /// all, kept working unchanged.
-    pub fn new_with_agent_cmd(thread_names: &[&str], agent_cmd: String) -> Result<Self, BridgeError> {
-        Self::new_with_agent_cmd_and_cache_dir(thread_names, agent_cmd, None)
+    /// Test/override constructor: every thread dials the single given
+    /// gateway base URL (both "codex" and "claude" providers alike --
+    /// tests that specifically need two distinct gateways use
+    /// [`Self::new_with_gateway_resolver_and_cache_dir`] directly with a
+    /// resolver closure of their own), no jsonl persistence (in-memory
+    /// history only) -- what the existing Rust test suite used before
+    /// this module had a cache dir parameter at all, kept working with
+    /// the same call shape (one URL in, not an agent command) after the
+    /// acpx cutover.
+    pub fn new_with_gateway_url(
+        thread_names: &[&str],
+        base_url: String,
+    ) -> Result<Self, BridgeError> {
+        Self::new_with_gateway_resolver_and_cache_dir(
+            thread_names,
+            move |_provider| Ok(base_url.clone()),
+            None,
+        )
     }
 
-    /// The real constructor both of the above delegate to: caller-chosen
-    /// agent command and, optionally, a jsonl cache directory. `None`
-    /// disables persistence entirely (pure in-memory history, matching
-    /// pre-persistence behavior) rather than silently picking a
-    /// directory the caller didn't ask for.
-    pub fn new_with_agent_cmd_and_cache_dir(
+    /// The real constructor both of the above delegate to: a per-provider
+    /// gateway-URL resolver closure (`provider_for_index`'s output ->
+    /// already-provisioned `base_url`, matching [`provision_gateway`]'s
+    /// own return shape -- callers that want auto-spawn-if-unreachable
+    /// pass `provision_gateway` itself, as [`Self::new`] does; callers
+    /// that just want a fixed URL, like [`Self::new_with_gateway_url`],
+    /// pass a closure that ignores `provider` entirely) and, optionally, a
+    /// jsonl cache directory. `None` disables persistence entirely (pure
+    /// in-memory history, matching pre-persistence behavior) rather than
+    /// silently picking a directory the caller didn't ask for.
+    pub fn new_with_gateway_resolver_and_cache_dir(
         thread_names: &[&str],
-        agent_cmd: String,
+        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError>,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, BridgeError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -208,15 +550,35 @@ impl AgentBridge {
             .build()
             .map_err(BridgeError::Runtime)?;
 
-        let store = match cache_dir {
-            Some(dir) => Some(JsonlStore::open(dir).map_err(BridgeError::Cache)?),
+        let store = match &cache_dir {
+            Some(dir) => Some(JsonlStore::open(dir.clone()).map_err(BridgeError::Cache)?),
             None => None,
         };
-
         let events: Arc<Mutex<VecDeque<BridgeEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let mut slots = Vec::with_capacity(thread_names.len());
 
-        // `spawn_thread` calls the free-function `tokio::spawn` internally,
+        // Resolve (and, for the production resolver, auto-spawn if
+        // needed) every distinct provider's gateway once, up front --
+        // not inside the per-thread loop below, so two threads sharing a
+        // provider (the normal case: v1's four static threads alternate
+        // codex/claude, two threads per provider) never race each other
+        // spawning a duplicate `acpx-server`. `provision_gateway` is
+        // also independently idempotent (it probes reachability before
+        // ever spawning), so this cache is a belt-and-suspenders
+        // ordering guarantee -- and an efficiency win, since it means
+        // `resolve_gateway` (whose production implementation does a
+        // real, mildly expensive TCP probe) only runs once per distinct
+        // provider rather than once per thread.
+        let mut resolved_urls: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (idx, _name) in thread_names.iter().enumerate() {
+            let provider = provider_for_index(idx).to_string();
+            if !resolved_urls.contains_key(&provider) {
+                resolved_urls.insert(provider.clone(), resolve_gateway(&provider)?);
+            }
+        }
+
+        // `spawn_acpx_thread` calls the free-function `tokio::spawn` internally,
         // which needs an active runtime context on this (calling) thread --
         // `enter()` provides that for the duration of this loop. The tasks
         // it schedules then run on the runtime's own worker threads for the
@@ -254,11 +616,11 @@ impl AgentBridge {
                 None => Vec::new(),
             };
 
-            let transport = AcpAgent::from_str(&agent_cmd).map_err(|e| BridgeError::Agent {
-                cmd: agent_cmd.clone(),
-                reason: e.to_string(),
+            let provider = provider_for_index(idx);
+            let base_url = resolved_urls.get(provider).cloned().ok_or_else(|| {
+                BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
-            let mut handle = spawn_thread(transport);
+            let mut handle = spawn_acpx_thread(base_url);
             let mut events_rx = handle.take_events();
             let handle = Arc::new(handle);
 
@@ -418,7 +780,10 @@ impl AgentBridge {
             .push(msg.clone());
         if let Some(store) = &self.store {
             if let Err(e) = store.append(&slot.thread_id, &msg) {
-                eprintln!("panel-rust: jsonl append failed for {}: {e}", slot.thread_id);
+                eprintln!(
+                    "panel-rust: jsonl append failed for {}: {e}",
+                    slot.thread_id
+                );
             }
         }
     }
@@ -464,11 +829,93 @@ mod tests {
     use super::*;
     use rui_acp_client::MessageKind;
 
-    fn mock_agent_cmd() -> String {
-        env!("CARGO_MANIFEST_DIR")
-            .to_string()
-            .replace("panel-rust", "rui-acp-client")
-            + "/target/debug/rui-mock-agent"
+    /// Real, already-built `acpx-server` binary next to this crate's own
+    /// checkout -- same dev-checkout-relative-path convention
+    /// `resolve_acpx_server_bin` uses in production.
+    fn acpx_server_bin() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
+    }
+
+    fn mock_agent_bin() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rui-acp-client/target/debug/rui-mock-agent")
+    }
+
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        listener.local_addr().expect("local_addr").port()
+    }
+
+    /// A real, locally-spawned `acpx-server` process (with the real
+    /// `rui-mock-agent` as its backend) for this module's tests to dial
+    /// -- matches this project's established "spawn the real binary,
+    /// don't fake the gateway boundary" testing discipline (see
+    /// `rui-acpx-client`'s own `gateway_e2e_test.rs`). Killed on drop.
+    struct TestGateway {
+        child: std::process::Child,
+        pub base_url: String,
+    }
+
+    impl TestGateway {
+        fn spawn() -> Self {
+            Self::spawn_with_persona("test")
+        }
+
+        /// Same as [`Self::spawn`], but tags the backend's replies with
+        /// `persona` (via `RUI_MOCK_AGENT_PERSONA`) -- used by the
+        /// multi-provider isolation test below to prove which gateway a
+        /// reply actually came through.
+        fn spawn_with_persona(persona: &str) -> Self {
+            let port = free_port();
+            let child = std::process::Command::new(acpx_server_bin())
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env(
+                    "ACPX_BACKEND_CMD",
+                    mock_agent_bin().to_string_lossy().to_string(),
+                )
+                .env("ACPX_DEFAULT_AGENT_ID", persona)
+                .env("RUI_MOCK_AGENT_PERSONA", persona)
+                .env("RUST_LOG", "error")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn real acpx-server binary for test");
+            let base_url = format!("http://127.0.0.1:{port}");
+            for _ in 0..100 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            TestGateway { child, base_url }
+        }
+    }
+
+    impl Drop for TestGateway {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// `new_with_gateway_resolver_and_cache_dir` with every provider
+    /// pinned to the same single `TestGateway` -- the shape most of this
+    /// module's tests want (they're exercising jsonl-cache/bridge
+    /// behavior, not multi-provider routing itself, which
+    /// `two_threads_route_to_two_distinct_gateways_by_provider` below
+    /// covers separately).
+    fn bridge_with_single_gateway(
+        names: &[&str],
+        gateway: &TestGateway,
+        cache_dir: Option<PathBuf>,
+    ) -> Result<AgentBridge, BridgeError> {
+        let base_url = gateway.base_url.clone();
+        AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            names,
+            move |_provider| Ok(base_url.clone()),
+            cache_dir,
+        )
     }
 
     /// Cold-start persistence: a message written by one bridge instance
@@ -478,15 +925,13 @@ mod tests {
     #[test]
     fn history_persists_across_bridge_restarts_via_jsonl_cache() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
         let names = ["Thread One"];
 
         {
-            let bridge = AgentBridge::new_with_agent_cmd_and_cache_dir(
-                &names,
-                mock_agent_cmd(),
-                Some(cache_dir.path().to_path_buf()),
-            )
-            .expect("first bridge");
+            let bridge =
+                bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                    .expect("first bridge");
             bridge.push_local(
                 0,
                 ChatMessage {
@@ -498,12 +943,9 @@ mod tests {
             assert_eq!(bridge.history(0).len(), 1);
         }
 
-        let bridge2 = AgentBridge::new_with_agent_cmd_and_cache_dir(
-            &names,
-            mock_agent_cmd(),
-            Some(cache_dir.path().to_path_buf()),
-        )
-        .expect("second bridge");
+        let bridge2 =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("second bridge");
         let history = bridge2.history(0);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].text, "hello from run one");
@@ -515,13 +957,11 @@ mod tests {
     #[test]
     fn distinct_threads_get_isolated_cache_files() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
         let names = ["Thread A", "Thread B"];
-        let bridge = AgentBridge::new_with_agent_cmd_and_cache_dir(
-            &names,
-            mock_agent_cmd(),
-            Some(cache_dir.path().to_path_buf()),
-        )
-        .expect("bridge");
+        let bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge");
         bridge.push_local(
             0,
             ChatMessage {
@@ -549,14 +989,15 @@ mod tests {
         assert!(!b_file.contains("a-only"));
     }
 
-    /// `new_with_agent_cmd` (no cache dir) keeps working in-memory-only,
+    /// `new_with_gateway_url` (no cache dir) keeps working in-memory-only,
     /// so the pre-persistence test suite / call sites are unaffected.
     #[test]
     fn no_cache_dir_means_no_jsonl_file_written() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
         let names = ["Solo Thread"];
         let bridge =
-            AgentBridge::new_with_agent_cmd(&names, mock_agent_cmd()).expect("bridge");
+            AgentBridge::new_with_gateway_url(&names, gateway.base_url.clone()).expect("bridge");
         bridge.push_local(
             0,
             ChatMessage {
@@ -575,10 +1016,75 @@ mod tests {
         assert_eq!(slug("Export pipeline bug!"), "export-pipeline-bug");
     }
 
+    #[test]
+    fn provider_for_index_alternates_codex_and_claude() {
+        assert_eq!(provider_for_index(0), "codex");
+        assert_eq!(provider_for_index(1), "claude");
+        assert_eq!(provider_for_index(2), "codex");
+        assert_eq!(provider_for_index(3), "claude");
+    }
+
+    /// Regression guard for a real bug found by this session's own
+    /// headless smoke test: a bare TCP-connect "is something listening"
+    /// check treated an unrelated, non-acpx HTTP service already bound
+    /// to the default port as a reusable gateway, silently breaking
+    /// every session on that provider. `probe_acpx_gateway` must reject
+    /// a listener that doesn't actually speak acpx's JSON-RPC shape.
+    #[test]
+    fn probe_acpx_gateway_rejects_a_non_acpx_http_listener() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        std::thread::spawn(move || {
+            // A trivial, real (not acpx) HTTP server -- always answers
+            // "405 Method Not Allowed" with no JSON-RPC body, mirroring
+            // the real unrelated service this bug was found against.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        assert!(
+            !probe_acpx_gateway(port),
+            "a non-acpx HTTP listener must not be mistaken for a reusable gateway"
+        );
+    }
+
+    /// The positive control for the same probe: a real, locally-spawned
+    /// `acpx-server` must pass.
+    #[test]
+    fn probe_acpx_gateway_accepts_a_real_gateway() {
+        let gateway = TestGateway::spawn();
+        let port: u16 = gateway
+            .base_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("parse port from base_url");
+        assert!(
+            probe_acpx_gateway(port),
+            "a real acpx-server must pass its own liveness probe"
+        );
+    }
+
+    #[test]
+    fn probe_acpx_gateway_checks_provider_identity_when_requested() {
+        let gateway = TestGateway::spawn_with_persona("codex");
+        let port: u16 = gateway
+            .base_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("parse port from base_url");
+        assert!(probe_acpx_gateway_for_agent(port, Some("codex")));
+        assert!(!probe_acpx_gateway_for_agent(port, Some("claude")));
+    }
+
     /// End-to-end: a jsonl cache file seeded up front with a varied mix
     /// of message kinds (thinking/tool-call/user/agent, i.e. not just plain
     /// user/agent turns) renders immediately via `history(0)`, and once
-    /// the live mock agent streams a real reply for a new prompt, the
+    /// the live gateway-backed thread streams a real reply for a new prompt, the
     /// pre-seeded entries are neither lost nor reordered -- the live
     /// messages land strictly after them. This is the concrete
     /// "json loading renders smoothly, no conflict with later async live
@@ -586,6 +1092,7 @@ mod tests {
     #[test]
     fn varied_seeded_json_and_live_reload_compose_without_conflict() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
         let names = ["Fix timeline crash"];
         let thread_id = slug(names[0]);
 
@@ -628,26 +1135,23 @@ mod tests {
             )
             .expect("seed cache file");
 
-        let bridge = AgentBridge::new_with_agent_cmd_and_cache_dir(
-            &names,
-            mock_agent_cmd(),
-            Some(cache_dir.path().to_path_buf()),
-        )
-        .expect("bridge");
+        let bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge");
 
         // Renders smoothly from disk immediately, before any live
         // connection work has necessarily completed.
         let initial = bridge.history(0);
         assert_eq!(initial, seeded_messages);
 
-        // Drive one real live turn through the mock agent subprocess and
+        // Drive one real live turn through the gateway-backed thread and
         // wait (bounded) for its events to land via poll().
         bridge.send_prompt(0, "second look".into());
         // By construction, `AgentBridge::new*` only returns once every
         // thread's session is already open (see the constructor's own
         // comment on why), so this prompt is guaranteed to actually
         // reach the mock agent -- a short bound is enough.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut saw_turn_ended = false;
         while std::time::Instant::now() < deadline && !saw_turn_ended {
             for ev in bridge.poll() {
@@ -659,16 +1163,20 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        assert!(saw_turn_ended, "timed out waiting for the mock agent's turn to end");
+        assert!(
+            saw_turn_ended,
+            "timed out waiting for the mock agent's turn to end"
+        );
 
         let after = bridge.history(0);
         // The four pre-seeded, varied-kind messages are untouched and
         // still first, in original order.
         assert_eq!(&after[..4], &seeded_messages[..]);
-        // The mock agent's reply (uppercased echo, per mock_agent.rs) is
+        // The gateway-backed mock agent's reply (uppercased echo, per
+        // mock_agent.rs) is
         // appended strictly after them, not interleaved or overwriting.
         assert!(after.len() > 4);
-        assert!(after.iter().skip(4).any(|m| m.text == "SECOND LOOK"));
+        assert!(after.iter().skip(4).any(|m| m.text.contains("SECOND LOOK")));
 
         // And the on-disk file reflects the same merged, non-conflicting
         // view after the TurnEnded-triggered trailer overwrite.
@@ -685,6 +1193,7 @@ mod tests {
     #[test]
     fn malformed_jsonl_for_one_thread_does_not_break_construction_or_other_threads() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
         let names = ["Broken Thread", "Healthy Thread"];
 
         // Hand-write a cache file with a bogus trailer field name --
@@ -716,16 +1225,84 @@ mod tests {
             .expect("seed healthy thread");
 
         // Must not error out entirely just because thread 0's cache is bad.
-        let bridge = AgentBridge::new_with_agent_cmd_and_cache_dir(
-            &names,
-            mock_agent_cmd(),
-            Some(cache_dir.path().to_path_buf()),
-        )
-        .expect("bridge construction must survive one thread's bad cache file");
+        let bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge construction must survive one thread's bad cache file");
 
         // Broken thread degrades to empty history, not a fatal error.
         assert!(bridge.history(0).is_empty());
         // Healthy thread is completely unaffected.
         assert_eq!(bridge.history(1)[0].text, "healthy scrollback");
+    }
+
+    /// Real multi-provider routing: two distinct threads, resolved to two
+    /// distinct (locally-spawned) `acpx-server` gateway processes by
+    /// `provider_for_index`, each tagging its reply with its own persona
+    /// -- the concrete `AgentBridge`-level version of
+    /// `rui-acpx-client`'s own `two_gateways_stay_isolated_no_cross_provider_bleed`
+    /// test, proving the wiring in *this* crate's constructor (provider
+    /// resolution, per-provider gateway auto-spawn) also keeps threads
+    /// isolated, not just the lower-level transport.
+    #[test]
+    fn two_threads_route_to_two_distinct_gateways_by_provider() {
+        let codex_gateway = TestGateway::spawn_with_persona("codex");
+        let claude_gateway = TestGateway::spawn_with_persona("claude");
+        let codex_url = codex_gateway.base_url.clone();
+        let claude_url = claude_gateway.base_url.clone();
+        let names = ["Codex Thread", "Claude Thread"];
+
+        let bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &names,
+            move |provider| {
+                if provider == "codex" {
+                    Ok(codex_url.clone())
+                } else {
+                    Ok(claude_url.clone())
+                }
+            },
+            None,
+        )
+        .expect("bridge with two distinct gateways");
+
+        bridge.send_prompt(0, "ping".into());
+        bridge.send_prompt(1, "ping".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = [false, false];
+        while std::time::Instant::now() < deadline && !(ended[0] && ended[1]) {
+            for ev in bridge.poll() {
+                if let AgentEvent::TurnEnded(_) = ev.event {
+                    ended[ev.thread_index] = true;
+                }
+            }
+            if !(ended[0] && ended[1]) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            ended[0] && ended[1],
+            "timed out waiting for both threads' turns to end"
+        );
+
+        let codex_history = bridge.history(0);
+        let claude_history = bridge.history(1);
+        let codex_reply = codex_history
+            .iter()
+            .find(|m| m.text.contains("PING"))
+            .expect("codex thread reply");
+        let claude_reply = claude_history
+            .iter()
+            .find(|m| m.text.contains("PING"))
+            .expect("claude thread reply");
+        assert!(
+            codex_reply.text.starts_with("[CODEX]"),
+            "got: {:?}",
+            codex_reply.text
+        );
+        assert!(
+            claude_reply.text.starts_with("[CLAUDE]"),
+            "got: {:?}",
+            claude_reply.text
+        );
     }
 }
