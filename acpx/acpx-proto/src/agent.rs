@@ -3,9 +3,10 @@
 //! table). These have no raw-ACP equivalent; they only exist between an
 //! acpx-aware client and `acpx-server`.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     /// Registry entry known, nothing fetched/verified yet.
@@ -22,7 +23,7 @@ pub enum AgentStatus {
     RuntimeMissing,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentListEntry {
     pub id: String,
     pub name: String,

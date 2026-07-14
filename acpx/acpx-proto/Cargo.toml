@@ -10,3 +10,16 @@ agent-client-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+schemars = { workspace = true }
+
+[[bin]]
+name = "gen-schema"
+path = "src/bin/gen_schema.rs"
+
+[[bin]]
+name = "gen-openrpc"
+path = "src/bin/gen_openrpc.rs"
+
+[[bin]]
+name = "gen-openapi"
+path = "src/bin/gen_openapi.rs"

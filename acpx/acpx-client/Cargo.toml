@@ -23,3 +23,8 @@ acpx-core = { workspace = true }
 acpx-conductor = { workspace = true }
 axum = { version = "0.7", features = ["ws"] }
 tracing = { workspace = true }
+# **Phase 14 addition** -- `transport/ws.rs` (compiled in here via
+# `#[path]`, see this block's doc comment) now needs `futures_util::
+# {SinkExt, StreamExt}` to split the `WebSocket` for live-notification
+# forwarding.
+futures-util = "0.3"

@@ -7,6 +7,8 @@ pub mod backoff;
 pub mod framing;
 pub mod process;
 pub mod supervisor;
+pub mod terminal;
 
 pub use process::{BackendProcess, SpawnSpec};
-pub use supervisor::{ProcessStatus, Supervisor, SupervisorError};
+pub use supervisor::{ProcessStatus, SharedBackendProcess, Supervisor, SupervisorError};
+pub use terminal::{TerminalError, TerminalExitStatus, TerminalHandle};

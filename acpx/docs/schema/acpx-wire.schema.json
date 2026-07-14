@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://acpx.dev/schema/acpx-wire.schema.json",
+  "title": "acpx gateway wire schema (acpx-native additions)",
+  "description": "Covers the JSON-RPC 2.0 envelope every acpx-server transport (stdio/HTTP/WS) frames messages in, plus acpx-native extensions layered on top of raw ACP: the `_acpx` sibling field on `session/new` and the `agents/*` gateway-management methods. Raw ACP method param/result shapes (session/prompt, fs/*, etc.) are NOT redefined here -- see `docs/schema/ acpx.openrpc.json` (the full method registry, covering every method both this gateway-native document and raw ACP define) or docs/schema/README.md for the upstream agent-client-protocol-schema crate this pulls those `$ref`s from at the exact version acpx's Cargo.toml pins.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Request"
+    },
+    {
+      "$ref": "#/$defs/Response"
+    }
+  ],
+  "$defs": {
+    "Request": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "description": "A JSON-RPC 2.0 request or notification (notifications omit `id`)."
+    },
+    "JsonRpcVersion": {
+      "type": "string",
+      "const": "2.0",
+      "description": "Always the literal string \"2.0\"."
+    },
+    "RequestId": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "JSON-RPC ids are either a string or a number on the wire."
+    },
+    "Response": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "result": true,
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RpcError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id"
+      ],
+      "description": "A JSON-RPC 2.0 response: exactly one of `result`/`error` is present."
+    },
+    "RpcError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "message": {
+          "type": "string"
+        },
+        "data": true
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "AcpxExt": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "description": "Sibling extension object carried by `session/new` only: `{\"_acpx\": {\"profile\": \"...\"}}`.\nChosen as a single namespaced key (see architecture doc) so it can be\ntrivially stripped and can't collide with any current/future ACP field."
+    },
+    "NewSessionParams": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "mcp_servers": {
+          "type": "array",
+          "items": true
+        },
+        "_acpx": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcpxExt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "cwd"
+      ],
+      "additionalProperties": true,
+      "description": "`session/new` request params. `_acpx` is additive and stripped by the\nrouter prior to forwarding -- see `AcpxExt` above."
+    },
+    "GatewaySessionId": {
+      "type": "string",
+      "description": "Gateway-issued session id returned from a hybrid `session/new` call.\nDistinct type from the backend's own session id (see\n`acpx-core::session_registry`) so the two are never accidentally mixed up\nat a call site."
+    },
+    "AgentStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "not_installed",
+          "description": "Registry entry known, nothing fetched/verified yet."
+        },
+        {
+          "type": "string",
+          "const": "installed",
+          "description": "Runtime present, adapter installed/resolvable (e.g. `node`+`npm` on\n`PATH` for an npx-distributed entry, or a fetched binary present)."
+        },
+        {
+          "type": "string",
+          "const": "installed_no_session",
+          "description": "Installed, but no native session/credentials detected yet (distinct\nfrom `Installed` per `05-open-risks.md`'s \"native session by\ndefault\" note -- a third status, not a boolean)."
+        },
+        {
+          "type": "string",
+          "const": "runtime_missing",
+          "description": "The distribution method's runtime dependency is missing (e.g. no\n`node`/`npm` for an npx-only entry)."
+        }
+      ]
+    },
+    "AgentListEntry": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/AgentStatus"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "version",
+        "status"
+      ]
+    },
+    "AgentIdParams": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "description": "`agents/install` and `agents/status` params -- both are exactly\n`{\"id\": \"...\"}\"` in `router.rs`."
+    },
+    "AgentsListResult": {
+      "type": "object",
+      "properties": {
+        "agents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentListEntry"
+          }
+        }
+      },
+      "required": [
+        "agents"
+      ],
+      "description": "`agents/list` result envelope."
+    },
+    "AgentInstallResult": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "outcome"
+      ],
+      "description": "`agents/install` result envelope. `outcome` is `acpx_registry::\nInstallOutcome`'s `{outcome:?}`-formatted debug string (router.rs's\nown choice, not a typed enum on the wire) -- kept as a bare `String`\nhere rather than inventing a closed enum this schema would then have\nto keep in lockstep with `acpx-registry`'s."
+    },
+    "AgentStatusResult": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/AgentStatus"
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ],
+      "description": "`agents/status` result envelope."
+    },
+    "GatewaySessionListEntry": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "agentId": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "agentId",
+        "cwd"
+      ],
+      "description": "One entry in `session/list`'s default (no-selector) branch --\ndistinct from, and much smaller than, real ACP's `ListSessionsResponse`\nentries, since this branch answers \"which gateway sessions does this\nacpx process itself know about\", not a specific backend's own session\nhistory. See `router.rs`'s `\"session/list\"` arm doc comment for why\nthis method is a genuine dual-shape split, not a rename."
+    },
+    "GatewaySessionListResult": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GatewaySessionListEntry"
+          }
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "description": "`session/list`'s default (no-selector) result envelope. When the\ncaller supplies a selector instead, `router.rs` proxies to the real\nbackend's `ListSessionsRequest`/`ListSessionsResponse`\n(`dispatch_session_list_real`) -- the method registry\n(`methods.rs`) records both possibilities as a `oneOf`, this type\ncovers only the gateway-native half."
+    },
+    "McpServerEntry": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": true,
+      "description": "A centrally-registered MCP server entry (`mcp_servers/create|update|\nlist`). Deliberately opaque beyond the `name` key acpx actually reads\n(`acpx-core/src/mcp_servers.rs`'s doc comment: \"`acpx` never\ninterprets an MCP server entry's fields itself\") -- this is an\nintentional design decision restated in schema form, not a gap to\nclose further (see `00-goal.md`'s non-goals)."
+    },
+    "McpServersListResult": {
+      "type": "object",
+      "properties": {
+        "servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/McpServerEntry"
+          }
+        }
+      },
+      "required": [
+        "servers"
+      ],
+      "description": "`mcp_servers/list` result envelope."
+    },
+    "NameOnlyParams": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "description": "`profiles/delete` and `mcp_servers/delete` params -- both are exactly\n`{\"name\": \"...\"}\"` in `router.rs`."
+    },
+    "NameOnlyResult": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "deleted"
+      ],
+      "description": "`profiles/delete` and `mcp_servers/delete` result envelope -- both\nare exactly `{\"name\": \"...\", \"deleted\": true}\"` in `router.rs`."
+    },
+    "PermissionPolicySchema": {
+      "type": "string",
+      "enum": [
+        "auto_allow",
+        "auto_reject"
+      ],
+      "description": "Mirrors `acpx_core::profile::PermissionPolicy` -- see this module's\ndoc comment for why this is a mirror rather than a direct reference."
+    },
+    "ProfileSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": ""
+        },
+        "agent_id": {
+          "type": "string",
+          "default": ""
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "key_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "launch_overrides": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "mcp_servers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "permission_policy": {
+          "$ref": "#/$defs/PermissionPolicySchema",
+          "default": "auto_reject"
+        },
+        "allow_fs_access": {
+          "type": "boolean",
+          "default": false
+        },
+        "allow_terminal_access": {
+          "type": "boolean",
+          "default": false
+        },
+        "auth_method_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "description": "Mirrors `acpx_core::profile::Profile`'s wire shape exactly (field\nnames, optionality, defaults) -- the type `profiles/create`,\n`profiles/update`, and `profiles/list` (per-element) all serialize on\nthe wire, post `redact_launch_overrides` (which only ever replaces\n`launch_overrides` *values* with the literal string\n`\"***redacted***\"`, never changes the shape). `key_ref` mirrors\n`acpx_core::keystore::KeyRef`'s newtype-transparent wire\nrepresentation (a bare string) as `Option<String>` directly rather\nthan introducing a single-field wrapper type purely for this file."
+    },
+    "ProfilesListResult": {
+      "type": "object",
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProfileSchema"
+          }
+        }
+      },
+      "required": [
+        "profiles"
+      ],
+      "description": "`profiles/list` result envelope."
+    }
+  }
+}

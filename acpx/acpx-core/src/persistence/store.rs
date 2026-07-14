@@ -50,6 +50,7 @@ impl PersistenceStore {
 
     fn from_connection(conn: Connection) -> Result<Self, PersistenceError> {
         conn.execute_batch(super::SCHEMA_SQL)?;
+        migrate_tenant_id_column(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -66,24 +67,27 @@ impl PersistenceStore {
         backend_session_id: impl Into<String>,
         profile_name: Option<String>,
         created_at: impl Into<String>,
+        tenant_id: impl Into<String>,
     ) -> Result<(), PersistenceError> {
         let gateway_session_id = gateway_session_id.into();
         let agent_id = agent_id.into();
         let backend_session_id = backend_session_id.into();
         let created_at = created_at.into();
+        let tenant_id = tenant_id.into();
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
             conn.execute(
                 "INSERT INTO sessions \
-                 (gateway_session_id, agent_id, backend_session_id, profile_name, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (gateway_session_id, agent_id, backend_session_id, profile_name, created_at, tenant_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     gateway_session_id,
                     agent_id,
                     backend_session_id,
                     profile_name,
-                    created_at
+                    created_at,
+                    tenant_id
                 ],
             )?;
             Ok(())
@@ -126,7 +130,7 @@ impl PersistenceStore {
             let conn = lock(&conn)?;
             let mut stmt = conn.prepare(
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
-                        created_at, closed_at \
+                        created_at, closed_at, tenant_id \
                  FROM sessions WHERE gateway_session_id = ?1",
             )?;
             let mut rows = stmt.query_map(params![gateway_session_id], row_to_session_record)?;
@@ -148,7 +152,7 @@ impl PersistenceStore {
             let conn = lock(&conn)?;
             let mut stmt = conn.prepare(
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
-                        created_at, closed_at \
+                        created_at, closed_at, tenant_id \
                  FROM sessions ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
@@ -238,7 +242,38 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         profile_name: row.get(3)?,
         created_at: row.get(4)?,
         closed_at: row.get(5)?,
+        tenant_id: row.get(6)?,
     })
+}
+
+/// **Phase C (`acpx-tenant-isolation`).** Idempotent upgrade path for
+/// databases created before `tenant_id` existed: `CREATE TABLE IF NOT
+/// EXISTS` (in `SCHEMA_SQL`, applied unconditionally above) never touches
+/// an already-existing `sessions` table, so a pre-existing on-disk
+/// database would otherwise be missing the column entirely and every
+/// query above would fail with "no such column: tenant_id". Sqlite has no
+/// `ADD COLUMN IF NOT EXISTS`, so this checks `PRAGMA table_info` first
+/// (same pattern used everywhere else idempotent schema evolution is
+/// needed in this codebase) and only runs `ALTER TABLE` when the column
+/// is genuinely absent. Existing rows backfill to `'default'` via the
+/// column's own `DEFAULT` clause -- exactly the tenant every pre-tenant-
+/// isolation session implicitly belonged to, since `TenantId::default_tenant`
+/// is what every caller used before `X-Acpx-Tenant` existed.
+fn migrate_tenant_id_column(conn: &Connection) -> Result<(), PersistenceError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+    let has_tenant_id = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "tenant_id");
+    drop(stmt);
+    if !has_tenant_id {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn lock(

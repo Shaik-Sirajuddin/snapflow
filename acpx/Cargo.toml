@@ -27,6 +27,7 @@ acpx-core = { path = "acpx-core" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 thiserror = "1"

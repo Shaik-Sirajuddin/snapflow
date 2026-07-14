@@ -11,6 +11,7 @@ dependencies = [
  "acpx-proto",
  "anyhow",
  "axum",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
@@ -44,6 +45,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -55,6 +57,7 @@ name = "acpx-proto"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -80,6 +83,7 @@ dependencies = [
 name = "acpx-server"
 version = "0.1.0"
 dependencies = [
+ "acpx-client",
  "acpx-conductor",
  "acpx-core",
  "acpx-proto",
@@ -90,6 +94,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
  "tracing",

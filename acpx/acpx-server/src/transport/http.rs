@@ -6,12 +6,14 @@
 //! only. Do not bind this to a public interface in production without
 //! adding auth/TLS first.
 //!
-//! Exposes two endpoints on one axum router (WS lives in `ws.rs`, wired in
+//! Exposes three endpoints on one axum router (WS lives in `ws.rs`, wired in
 //! here so both share the same listener and `SharedRouter` state):
 //! - `POST /rpc`: JSON-RPC-over-HTTP. Body is a raw JSON-RPC request;
 //!   response body is the JSON-RPC response (success or error, both
 //!   `200 OK` -- JSON-RPC errors are reported via the body's `error`
 //!   field per convention, not via HTTP status).
+//! - `GET /health`: local identity/liveness response used by clients that
+//!   must distinguish one provider's gateway from another on a reused port.
 //! - `GET /ws`: WebSocket upgrade, see `ws.rs`.
 //!
 //! `X-Acpx-Profile` header handling (`POST /rpc` only -- WS has no
@@ -23,25 +25,129 @@
 //! unconditionally (overwriting any inline value), then let
 //! `Router::dispatch` do its normal `_acpx` resolution/stripping -- this
 //! module never needs to duplicate that stripping logic.
+//!
+//! **Auth (added post-Phase-6 self-review, closing the "No auth/TLS yet"
+//! gap this doc comment used to leave open):** optional bearer-token
+//! auth, gated on `ACPX_AUTH_TOKEN`. Unset (the default -- every
+//! pre-existing test and the real-adapter e2e test all construct servers
+//! without it) means fully unauthenticated, byte-for-byte the same
+//! behavior as before this change. When set, both `POST /rpc` and the
+//! `GET /ws` upgrade require `Authorization: Bearer <token>` matching
+//! exactly (checked in constant time, see [`tokens_match`]), else `401
+//! Unauthorized` with a JSON-RPC-shaped error body so a client parsing
+//! every acpx response as JSON-RPC never has to special-case auth
+//! failures. TLS is still not provided by this module -- pair
+//! `ACPX_AUTH_TOKEN` with a TLS-terminating reverse proxy for any
+//! non-loopback deployment, since a bearer token sent over plaintext HTTP
+//! is only as safe as the transport it rides on.
+//!
+//! **Tenant isolation (`acpx-tenant-isolation` Phase B).** Optional
+//! `X-Acpx-Tenant` header, read fresh on every `POST /rpc` request (no
+//! persistent connection state to cache it in, unlike WS -- see `ws.rs`'s
+//! doc comment for that transport's equivalent, read-once-at-upgrade
+//! handling). Absent means the implicit `"default"` tenant -- byte-for-
+//! byte the same behavior as before this feature existed. This is a
+//! self-declared partition key, **not** an authentication mechanism: see
+//! `memory/acpx/gen/plans/acpx-tenant-isolation/00-goal.md`'s "Why auth
+//! is out of scope" section. Applies to every method on this connection,
+//! not just `session/new` (unlike `X-Acpx-Profile`, which only matters
+//! for session creation) -- see that plan's `01-architecture.md` for why
+//! this is a header rather than an `_acpx.tenant` request field.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use tokio::sync::Mutex;
 
-use acpx_core::router::{Router, RouterError};
+use acpx_core::router::{dispatch_shared_for_tenant, Router, RouterError};
+use acpx_core::TenantId;
 
 /// Shared, lockable handle to the one `Router` instance serving every
-/// concurrent HTTP/WS client. `Router::dispatch` takes `&mut self`, so a
-/// whole-router `Mutex` (one dispatch in flight at a time across every
-/// connection) is the simplest correct choice for this phase -- see the
-/// Phase 2 step 11 task notes for why finer-grained locking isn't
-/// warranted yet.
+/// concurrent HTTP/WS client. The `Mutex` here is intentionally *not* held
+/// for the duration of a whole request anymore -- see
+/// `acpx_core::router::dispatch_shared`'s doc comment. Every transport in
+/// this file calls `dispatch_shared(&router, ...)` rather than
+/// `router.lock().await.dispatch(...)`, so this `Mutex` is only ever held
+/// briefly for gateway-state bookkeeping, never across a backend agent's
+/// real-LLM-latency stdio round trip -- concurrent requests against
+/// *different* backend agents now genuinely run in parallel.
 pub type SharedRouter = Arc<Mutex<Router>>;
+
+/// Optional bearer token required on every `POST /rpc` request and `GET
+/// /ws` upgrade. `None` (the default -- unset `ACPX_AUTH_TOKEN`) disables
+/// auth entirely, preserving this workspace's pre-existing unauthenticated
+/// behavior byte-for-byte. Cheaply `Clone`-able (`Arc<str>` inside) so it
+/// can ride alongside `SharedRouter` in axum's per-request `State`.
+#[derive(Clone, Default)]
+pub struct AuthConfig {
+    token: Option<Arc<str>>,
+}
+
+impl AuthConfig {
+    pub fn new(token: Option<String>) -> Self {
+        Self {
+            token: token.map(|t| t.into()),
+        }
+    }
+
+    /// True if this request's headers carry a valid bearer token, or auth
+    /// is disabled entirely. `headers` missing the header, or carrying a
+    /// non-`Bearer` / mismatched value, is unauthorized whenever a token
+    /// is configured.
+    pub(crate) fn authorize(&self, headers: &HeaderMap) -> bool {
+        let Some(expected) = &self.token else {
+            return true; // auth disabled
+        };
+        let Some(header_value) = headers.get(axum::http::header::AUTHORIZATION) else {
+            return false;
+        };
+        let Ok(header_value) = header_value.to_str() else {
+            return false;
+        };
+        let Some(presented) = header_value.strip_prefix("Bearer ") else {
+            return false;
+        };
+        tokens_match(presented, expected)
+    }
+}
+
+/// Constant-time byte comparison -- deliberately not `==`/`str::eq`, which
+/// short-circuit on the first mismatched byte and so leak timing
+/// information proportional to how many leading bytes of a guess happen
+/// to match the real token. No new dependency pulled in for this (no
+/// `subtle` crate in this workspace's `Cargo.toml` yet) -- a manual
+/// XOR-accumulate over every byte is a well-known, dependency-free
+/// constant-time-comparison idiom sufficient for a bearer token check.
+/// Differing lengths short-circuit (a length mismatch is not
+/// secret-dependent information worth hiding -- token length isn't
+/// itself sensitive).
+fn tokens_match(presented: &str, expected: &str) -> bool {
+    let (a, b) = (presented.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Combined axum `State` for both endpoints: the shared router plus the
+/// (usually-disabled) auth config. A plain tuple `(SharedRouter,
+/// AuthConfig)` would also implement `FromRef`, but a named struct keeps
+/// `ws.rs`'s handler signature self-documenting.
+#[derive(Clone)]
+pub struct AppState {
+    pub router: SharedRouter,
+    pub auth: AuthConfig,
+    pub agent_id: Arc<str>,
+}
 
 /// Header carrying an explicit profile selection, highest precedence per
 /// `02-architecture.md`. `axum`'s `HeaderMap` lookups are already
@@ -49,37 +155,113 @@ pub type SharedRouter = Arc<Mutex<Router>>;
 /// regardless of how the client cases it.
 const PROFILE_HEADER: &str = "x-acpx-profile";
 
+/// Header carrying an explicit tenant selection (`acpx-tenant-isolation`
+/// Phase B). `axum`'s `HeaderMap` lookups are already case-insensitive.
+/// Absent means [`TenantId::default_tenant`].
+const TENANT_HEADER: &str = "x-acpx-tenant";
+
+/// Resolve this request's [`TenantId`] from `X-Acpx-Tenant`, defaulting to
+/// [`TenantId::default_tenant`] when absent or not valid UTF-8 -- a
+/// malformed header is treated the same as an absent one (fails open to
+/// the default tenant) rather than rejecting the request outright, since
+/// tenant scoping is a data partition, not an auth gate (see this
+/// module's doc comment).
+fn resolve_tenant(headers: &HeaderMap) -> TenantId {
+    headers
+        .get(TENANT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(TenantId::from)
+        .unwrap_or_default()
+}
+
 /// Start the HTTP/WS transport, serving `POST /rpc` and `GET /ws` against
 /// the given shared `Router` until the listener errors or the task is
 /// dropped/cancelled. Intended to be spawned as its own task (or awaited
 /// directly) from `main.rs` alongside the stdio transport.
-pub async fn serve(router: SharedRouter, bind_addr: SocketAddr) -> anyhow::Result<()> {
+///
+/// `auth_token`: `None` (pass `None` for the pre-existing, unauthenticated
+/// behavior every test in this workspace already relies on) disables
+/// auth; `Some(token)` requires `Authorization: Bearer <token>` on every
+/// `POST /rpc` and the `GET /ws` upgrade. See this module's doc comment.
+pub async fn serve(
+    router: SharedRouter,
+    bind_addr: SocketAddr,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
+    let state = AppState {
+        router,
+        auth: AuthConfig::new(auth_token),
+        agent_id: std::env::var("ACPX_DEFAULT_AGENT_ID")
+            .unwrap_or_else(|_| "default".to_string())
+            .into(),
+    };
+    let auth_enabled = state.auth.token.is_some();
     let app = axum::Router::new()
         .route("/rpc", post(rpc_handler))
+        .route("/health", get(health_handler))
         .route("/ws", get(super::ws::ws_handler))
-        .with_state(router);
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(
         %bind_addr,
-        "acpx-server HTTP/WS transport listening (no auth/TLS -- see 05-open-risks.md)"
+        auth_enabled,
+        "acpx-server HTTP/WS transport listening (no TLS -- see 05-open-risks.md; \
+         set ACPX_AUTH_TOKEN for bearer-token auth)"
     );
     axum::serve(listener, app).await?;
     Ok(())
 }
 
+async fn health_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.authorize(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "status": "unauthorized",
+            })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "status": "ok",
+        "agentId": state.agent_id,
+    }))
+    .into_response()
+}
+
 async fn rpc_handler(
-    State(router): State<SharedRouter>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut request): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Response {
+    if !state.auth.authorize(&headers) {
+        return unauthorized_response(&request);
+    }
     inject_profile_header(&headers, &mut request);
-    let mut router = router.lock().await;
-    let response = match router.dispatch(request.clone()).await {
-        Ok(response) => response,
-        Err(err) => json_rpc_error(&request, err),
-    };
-    Json(response)
+    let tenant_id = resolve_tenant(&headers);
+    let response =
+        match dispatch_shared_for_tenant(&state.router, &tenant_id, request.clone()).await {
+            Ok(response) => response,
+            Err(err) => json_rpc_error(&request, err),
+        };
+    Json(response).into_response()
+}
+
+/// `401 Unauthorized` with a JSON-RPC-shaped error body (same envelope as
+/// [`json_rpc_error`]) rather than an empty 401 -- keeps the wire contract
+/// JSON-RPC-consistent for a client that always parses the response body
+/// as JSON-RPC, auth failure or not.
+fn unauthorized_response(request: &serde_json::Value) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "error": {
+            "code": -32001,
+            "message": "unauthorized: missing or invalid bearer token",
+        }
+    });
+    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
 }
 
 /// Per the precedence rule, an `X-Acpx-Profile` header on a `session/new`

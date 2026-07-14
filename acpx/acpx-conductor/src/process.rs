@@ -4,7 +4,9 @@
 use crate::framing::{FramedReader, FramedWriter};
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
@@ -42,7 +44,70 @@ impl SpawnSpec {
 pub struct BackendProcess {
     child: Child,
     pub reader: FramedReader,
-    pub writer: FramedWriter,
+    /// Shared, independently-lockable -- **not** covered by whatever lock
+    /// a caller holds on the surrounding `Arc<Mutex<BackendProcess>>`
+    /// itself (`acpx_conductor::supervisor::SharedBackendProcess`). This
+    /// is deliberate, not an accident of convenience: `acpx-core::router`
+    /// needs to be able to write a real ACP `session/cancel` *notification*
+    /// onto this same process's stdin *while* a `session/prompt` call
+    /// against this exact process is still mid-flight, holding the outer
+    /// per-process lock for the whole duration of its blocking
+    /// `read_matching_response` loop (see that function's own doc
+    /// comment for why one child process's stdio can never support two
+    /// truly interleaved request/response pairs -- that constraint is
+    /// real and unavoidable, but a fire-and-forget *write* with no
+    /// matching read isn't a request/response pair at all, so it isn't
+    /// bound by it). `Supervisor` keeps its own independent clone of this
+    /// exact `Arc` (via `Self::writer_handle`, captured at spawn time,
+    /// *before* the fresh `BackendProcess` is ever wrapped in its own
+    /// outer `Arc<Mutex<..>>` and handed out), so a caller can obtain it
+    /// without ever touching the outer per-process lock at all -- see
+    /// `acpx_conductor::supervisor::Supervisor::cancel_writer`.
+    pub writer: Arc<Mutex<FramedWriter>>,
+    /// Whether the ACP `initialize` handshake has already been performed
+    /// against this process instance. Deliberately just a generic done/not
+    /// flag owned here (not ACP-specific logic -- this crate stays
+    /// protocol-agnostic per `03-crate-and-folder-layout.md`'s crate
+    /// split, `acpx-core::router` owns what "initialize" actually means)
+    /// so callers holding this process's own lock can check-and-set it
+    /// atomically without a second, separate piece of bookkeeping keyed
+    /// off process identity: this flag's lifetime is exactly this
+    /// `BackendProcess` instance's lifetime, so a crash + respawn (a
+    /// brand new instance) naturally starts back at `false`.
+    pub handshake_done: bool,
+    /// The real ACP `initialize` response's `result` object, captured the
+    /// first time [`Self::handshake_done`] flips to `true` -- i.e. the
+    /// backend's actual `agentCapabilities`/`authMethods`/negotiated
+    /// `protocolVersion`, not acpx's assumptions about them. `None` until
+    /// the handshake has actually run once. Reset to `None` on every
+    /// fresh spawn alongside `handshake_done`, for the same crash+respawn
+    /// reason. Protocol-agnostic storage only (an opaque JSON blob) --
+    /// same rationale as `handshake_done` itself: this crate doesn't know
+    /// or care what "agentCapabilities" means, `acpx-core::router` does.
+    pub agent_capabilities: Option<serde_json::Value>,
+    /// Live `terminal/create`d commands for this process, keyed by the
+    /// terminal id acpx-core mints and hands back to the backend. Lives
+    /// here (not in acpx-core) for the same reason `handshake_done`/
+    /// `agent_capabilities` do: it's a piece of per-process state a
+    /// caller holding this process's own lock needs to check-and-mutate
+    /// atomically. Never reset on respawn (unlike `handshake_done`) --
+    /// a crash+respawn is a brand new `BackendProcess` instance with a
+    /// fresh, empty map, and any terminal ids the backend held from the
+    /// old instance are simply gone, matching a real terminal's lifetime
+    /// being tied to the process that created it.
+    pub terminals: HashMap<String, crate::terminal::TerminalHandle>,
+    /// Whether a real ACP `authenticate` request has already succeeded
+    /// against this process instance. Only meaningful when the backend's
+    /// `initialize` response (`agent_capabilities`) advertised a
+    /// non-empty `authMethods` -- `acpx-core::router::ensure_backend_
+    /// initialized` is the sole reader/writer of this flag, deciding
+    /// from it whether `authenticate` still needs to be attempted (or
+    /// re-attempted, if it previously failed) before any session/*
+    /// call reaches this backend. `false` until a real `authenticate`
+    /// round trip returns a non-error result. Reset to `false` on every
+    /// fresh spawn alongside `handshake_done`/`agent_capabilities`, same
+    /// crash+respawn reasoning as those two fields.
+    pub authenticated: bool,
 }
 
 impl BackendProcess {
@@ -66,8 +131,19 @@ impl BackendProcess {
         Ok(Self {
             child,
             reader: FramedReader::new(stdout),
-            writer: FramedWriter::new(stdin),
+            writer: Arc::new(Mutex::new(FramedWriter::new(stdin))),
+            handshake_done: false,
+            agent_capabilities: None,
+            terminals: HashMap::new(),
+            authenticated: false,
         })
+    }
+
+    /// Clone of this process's shared writer handle -- see
+    /// [`Self::writer`]'s doc comment for why this exists and who's
+    /// meant to call it (`Supervisor`, once, at spawn time).
+    pub fn writer_handle(&self) -> Arc<Mutex<FramedWriter>> {
+        Arc::clone(&self.writer)
     }
 
     /// Returns the process's exit status if it has already exited

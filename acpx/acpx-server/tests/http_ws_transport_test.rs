@@ -31,6 +31,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 // `pub mod http; pub mod ws;` shape.
 #[path = "../src/transport/http.rs"]
 mod http;
+#[path = "../src/transport/live.rs"]
+mod live;
 #[path = "../src/transport/ws.rs"]
 mod ws;
 
@@ -102,7 +104,7 @@ async fn spawn_server(router: SharedRouter) -> SocketAddr {
     drop(probe);
 
     tokio::spawn(async move {
-        serve(router, addr).await.expect("transport::serve");
+        serve(router, addr, None).await.expect("transport::serve");
     });
 
     // Give the listener a moment to come up before the test issues its

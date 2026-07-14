@@ -116,6 +116,10 @@ mod tests {
             key_ref: None,
             launch_overrides: overrides,
             mcp_servers: vec![],
+            permission_policy: Default::default(),
+            allow_fs_access: false,
+            allow_terminal_access: false,
+            auth_method_id: None,
         }
     }
 

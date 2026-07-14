@@ -9,6 +9,13 @@ description = "acpx daemon entrypoint: transport layer + gateway API"
 name = "acpx-server"
 path = "src/main.rs"
 
+# Standalone black-box health-check CLI (see the top-of-file doc comment
+# in `src/bin/selftest.rs`) -- a separate publishable binary from this
+# same package, not part of the `cargo test` suite.
+[[bin]]
+name = "acpx-selftest"
+path = "src/bin/selftest.rs"
+
 [dependencies]
 acpx-proto = { workspace = true }
 acpx-core = { workspace = true }
@@ -18,18 +25,36 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Real (non-dev) dependency, promoted from dev-dependencies below --
+# `src/bin/selftest.rs` makes real HTTP calls against a deployed
+# `acpx-server` instance and isn't test-only code.
+reqwest = { workspace = true }
 # Phase 2 step 11 (HTTP/WS transport): axum gives us a JSON-RPC POST
 # endpoint and a WS upgrade endpoint on the same router/listener with
 # minimal glue code. `ws` feature enables `axum::extract::ws`.
 axum = { version = "0.7", features = ["ws"] }
+# **Phase 14 addition.** WS transport now needs to split a `WebSocket`
+# into independent sink/stream halves (`SinkExt::split`) so a live
+# `session/update` forwarder task can write frames concurrently with the
+# connection's own request/response loop -- promoted from dev-only (it
+# was already a test-only WS-client dependency below) since this is now
+# real, non-test code.
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# Real-adapter multi-agent e2e test (tests/real_claude_multi_agent_test.rs)
+# drives the real, already-compiled acpx-server binary through the real
+# acpx-client SDK, not just raw reqwest calls -- proving "acpx daemon +
+# acpx client end to end" together, not just the daemon alone. No cycle:
+# acpx-client's own (non-dev) dependency graph never depends back on
+# acpx-server or acpx-core.
+acpx-client = { path = "../acpx-client" }
 # WS client for http_ws_transport_test.rs only -- default features are
 # enough since tests only ever connect to our own plaintext ws://
 # loopback listener, no TLS involved.
 tokio-tungstenite = "0.24"
-futures-util = "0.3"
