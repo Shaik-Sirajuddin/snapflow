@@ -14,6 +14,7 @@ fn agent_message(text: &str) -> ChatMessage {
     ChatMessage {
         kind: MessageKind::Agent,
         text: text.to_string(),
+        status: None,
     }
 }
 

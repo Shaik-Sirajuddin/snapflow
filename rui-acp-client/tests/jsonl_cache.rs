@@ -10,6 +10,7 @@ fn msg(kind: MessageKind, text: &str) -> ChatMessage {
     ChatMessage {
         kind,
         text: text.to_string(),
+        status: None,
     }
 }
 
@@ -168,4 +169,67 @@ fn multi_thread_caches_are_isolated_on_disk() {
 
     assert_eq!(store.load("thread-a").unwrap().messages[0].text, "a-only");
     assert_eq!(store.load("thread-b").unwrap().messages[0].text, "b-only");
+}
+
+/// Phase 3 (`chat-panel-ui-theme-parity.md`): `ChatMessage.status` must
+/// round-trip through an `overwrite`/`load` cycle exactly like every
+/// other field, including the `None` case (non-tool-call messages).
+#[test]
+fn tool_call_status_round_trips_through_overwrite_and_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonlStore::open(dir.path()).unwrap();
+    let messages = vec![
+        msg(MessageKind::User, "run the export"),
+        ChatMessage {
+            kind: MessageKind::ToolCall,
+            text: "ffmpeg.export(...)".to_string(),
+            status: Some("in_progress".to_string()),
+        },
+        ChatMessage {
+            kind: MessageKind::ToolCall,
+            text: "ffmpeg.export(...)".to_string(),
+            status: Some("completed".to_string()),
+        },
+    ];
+    let trailer = ThreadTrailer {
+        acp_session_id: "s-status".into(),
+        title: Some("Export timeline".into()),
+        updated_at: Some("2026-07-14T00:00:00Z".into()),
+        message_count: messages.len(),
+    };
+    store.overwrite("thread-status", &messages, &trailer).unwrap();
+
+    let cached = store.load("thread-status").unwrap();
+    assert_eq!(cached.messages, messages);
+    assert_eq!(cached.messages[0].status, None);
+    assert_eq!(cached.messages[1].status.as_deref(), Some("in_progress"));
+    assert_eq!(cached.messages[2].status.as_deref(), Some("completed"));
+}
+
+/// Backward compatibility: a `.jsonl` cache file written before the
+/// `status` field existed (no `status` key on the message line at all,
+/// as opposed to an explicit `null`) must still load without error,
+/// yielding `status: None` -- the whole point of `#[serde(default)]`
+/// rather than a plain `Option<String>` field. Hand-written fixture line,
+/// mirroring `agent_bridge.rs`'s own "malformed jsonl" robustness test's
+/// approach of writing the file directly instead of going through
+/// `overwrite`.
+#[test]
+fn old_format_jsonl_without_status_field_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonlStore::open(dir.path()).unwrap();
+    std::fs::write(
+        dir.path().join("legacy-thread.jsonl"),
+        b"{\"line_kind\":\"message\",\"kind\":\"user\",\"text\":\"hi from before status existed\"}\n\
+          {\"line_kind\":\"message\",\"kind\":\"tool_call\",\"text\":\"old.tool(...)\"}\n\
+          {\"line_kind\":\"trailer\",\"acpSessionId\":\"legacy\",\"title\":null,\"updatedAt\":null,\"messageCount\":2}\n",
+    )
+    .expect("write legacy-format cache file");
+
+    let cached = store.load("legacy-thread").expect("legacy file must still parse");
+    assert_eq!(cached.messages.len(), 2);
+    assert_eq!(cached.messages[0].text, "hi from before status existed");
+    assert_eq!(cached.messages[0].status, None);
+    assert_eq!(cached.messages[1].kind, MessageKind::ToolCall);
+    assert_eq!(cached.messages[1].status, None);
 }

@@ -72,6 +72,14 @@ pub enum MessageKind {
 pub struct ChatMessage {
     pub kind: MessageKind,
     pub text: String,
+    /// Tool-call execution status, rendered as an uppercased mono-font
+    /// text badge in the UI (Phase 3, `chat-panel-ui-theme-parity.md`)
+    /// -- `None` for non-tool-call kinds and for every message cached
+    /// before this field existed. `#[serde(default)]` so old `.jsonl`
+    /// cache lines (written before this field existed) still
+    /// deserialize without error.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// A summary of a session the bound agent already knows about, from
@@ -264,6 +272,22 @@ impl SessionClient {
     }
 }
 
+/// Stringifies ACP's `ToolCallStatus` for `ChatMessage.status` -- lower
+/// snake_case so `panel-rust`'s Slint side can uppercase it once for
+/// display (matching the HTML source's `statusText = item.status.
+/// toUpperCase()` convention) without this crate baking in a display
+/// casing choice.
+fn tool_call_status_str(status: agent_client_protocol::schema::v1::ToolCallStatus) -> &'static str {
+    use agent_client_protocol::schema::v1::ToolCallStatus;
+    match status {
+        ToolCallStatus::Pending => "pending",
+        ToolCallStatus::InProgress => "in_progress",
+        ToolCallStatus::Completed => "completed",
+        ToolCallStatus::Failed => "failed",
+        _ => "pending",
+    }
+}
+
 /// Maps a wire `SessionUpdate` into this crate's small `ChatMessage`
 /// vocabulary. Returns `None` for update kinds the chat UI doesn't render
 /// as a message yet (plan/available-commands/mode/config/usage updates) --
@@ -280,23 +304,41 @@ fn classify_update(update: SessionUpdate) -> Option<ChatMessage> {
         SessionUpdate::AgentMessageChunk(chunk) => extract_text(chunk).map(|text| ChatMessage {
             kind: MessageKind::Agent,
             text,
+            status: None,
         }),
         SessionUpdate::AgentThoughtChunk(chunk) => extract_text(chunk).map(|text| ChatMessage {
             kind: MessageKind::Thinking,
             text,
+            status: None,
         }),
         SessionUpdate::UserMessageChunk(chunk) => extract_text(chunk).map(|text| ChatMessage {
             kind: MessageKind::User,
             text,
+            status: None,
         }),
         SessionUpdate::ToolCall(tool_call) => Some(ChatMessage {
             kind: MessageKind::ToolCall,
             text: tool_call.title,
+            status: Some(tool_call_status_str(tool_call.status).to_string()),
         }),
-        SessionUpdate::ToolCallUpdate(update) => update.fields.title.map(|title| ChatMessage {
-            kind: MessageKind::ToolCall,
-            text: title,
-        }),
+        SessionUpdate::ToolCallUpdate(update) => {
+            // A `ToolCallUpdate` can carry a status change with no title
+            // change (e.g. pending -> completed on an already-titled
+            // call) -- the pre-Phase-3 code required `fields.title` to
+            // be present at all, silently dropping status-only updates
+            // as `None`/no message. Now emits a message whenever either
+            // field is present, falling back to an empty title string
+            // rather than losing the status update.
+            let status = update.fields.status.map(tool_call_status_str).map(String::from);
+            if update.fields.title.is_none() && status.is_none() {
+                return None;
+            }
+            Some(ChatMessage {
+                kind: MessageKind::ToolCall,
+                text: update.fields.title.unwrap_or_default(),
+                status,
+            })
+        }
         _ => None,
     }
 }
@@ -311,6 +353,63 @@ fn stop_reason_tag(reason: AcpStopReason) -> String {
         _ => "unknown",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod classify_update_tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{
+        ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    };
+
+    /// Phase 3 (`chat-panel-ui-theme-parity.md`): a fresh `ToolCall`
+    /// carries its `status` straight through into `ChatMessage.status`,
+    /// lower-snake-case per `tool_call_status_str`'s doc comment.
+    #[test]
+    fn tool_call_carries_status_into_chat_message() {
+        let tool_call = ToolCall::new("tc-1", "ffmpeg.export(...)").status(ToolCallStatus::InProgress);
+        let msg = classify_update(SessionUpdate::ToolCall(tool_call)).expect("message");
+        assert_eq!(msg.kind, MessageKind::ToolCall);
+        assert_eq!(msg.status.as_deref(), Some("in_progress"));
+    }
+
+    /// A `ToolCallUpdate` that only changes `status` (no `title`) must
+    /// still surface as a message -- the pre-Phase-3 code silently
+    /// dropped it (required `fields.title` to be `Some`). Regression
+    /// guard for that fix.
+    #[test]
+    fn status_only_tool_call_update_still_produces_a_message() {
+        let update = ToolCallUpdate::new(
+            "tc-1",
+            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+        );
+        let msg = classify_update(SessionUpdate::ToolCallUpdate(update)).expect("message");
+        assert_eq!(msg.kind, MessageKind::ToolCall);
+        assert_eq!(msg.status.as_deref(), Some("completed"));
+        assert_eq!(msg.text, "");
+    }
+
+    /// A `ToolCallUpdate` with neither `title` nor `status` set carries
+    /// no rendering-relevant change yet -- stays `None`, matching the
+    /// pre-Phase-3 behavior for genuinely empty updates (as opposed to
+    /// the status-only case above, which is the actual bug this phase
+    /// fixes).
+    #[test]
+    fn tool_call_update_with_no_title_and_no_status_is_none() {
+        let update = ToolCallUpdate::new("tc-1", ToolCallUpdateFields::default());
+        assert!(classify_update(SessionUpdate::ToolCallUpdate(update)).is_none());
+    }
+
+    /// Non-tool-call kinds never populate `status` -- the field is
+    /// deliberately tool-call-only (monochrome-status decision doesn't
+    /// apply to user/agent/thinking text at all, not even a hidden
+    /// value).
+    #[test]
+    fn non_tool_call_messages_have_no_status() {
+        let chunk = ContentChunk::new(ContentBlock::from("hi"));
+        let msg = classify_update(SessionUpdate::AgentMessageChunk(chunk)).expect("message");
+        assert_eq!(msg.status, None);
+    }
 }
 
 async fn run_thread_actor<T>(
