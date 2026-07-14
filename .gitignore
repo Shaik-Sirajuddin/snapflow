@@ -3,6 +3,7 @@
 /panel-rust/target/
 /panel-rust-spike/panel-rust/target/
 /rui-acp-client/target/
+/rui-acpx-client/target/
 /.rui-thread-cache/
 
 # Local test and editor artifacts
