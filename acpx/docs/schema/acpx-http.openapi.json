@@ -238,7 +238,7 @@
           "cwd": {
             "type": "string"
           },
-          "mcp_servers": {
+          "mcpServers": {
             "type": "array",
             "items": true
           },
@@ -257,7 +257,7 @@
           "cwd"
         ],
         "additionalProperties": true,
-        "description": "`session/new` request params. `_acpx` is additive and stripped by the\nrouter prior to forwarding -- see `AcpxExt` above."
+        "description": "`session/new` request params. `_acpx` is additive and stripped by the\nrouter prior to forwarding -- see `AcpxExt` above.\n\n**`#[serde(rename_all = \"camelCase\")]` (added post-real-e2e-schema-\nvalidation, `acpx-openrpc-schema` plan):** upstream's real\n`NewSessionRequest` (agent-client-protocol-schema 1.4.0,\n`src/v1/agent.rs`) carries this same container attribute, so\n`mcp_servers` is `mcpServers` on the actual wire -- every real ACP\nclient (including this workspace's own `real_ambient_multi_agent_\ntest.rs`) sends `\"mcpServers\"`, never `\"mcp_servers\"`. Before this\nfix, this struct's missing `rename_all` meant a real\n`{\"cwd\":..., \"mcpServers\": [...]}` request silently deserialized\nwith `mcp_servers` defaulted to empty and the real array captured by\n`rest` (the `#[serde(flatten)]` catch-all) instead -- functionally\nharmless *only* because nothing ever read `NewSessionParams.\nmcp_servers` at runtime (`router.rs` never uses this type at all,\noperating on raw `serde_json::Value` directly instead -- see this\nmodule's own doc comment on why `NewSessionParams` is schema/test\ntooling, not the live producer), but it meant the generated schema\ndocument was simply *wrong* about the real wire field name. Found by\nrunning the schema pipeline's own real-backend e2e validation\n(`acpx-proto::validate`) against this exact test's literal\n`\"mcpServers\": []` params."
       },
       "GatewaySessionId": {
         "type": "string",
