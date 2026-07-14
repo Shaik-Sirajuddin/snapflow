@@ -6,13 +6,14 @@
 //! wire, not folded into the ACP struct itself. The router strips `_acpx`
 //! before forwarding to a backend regardless of whether it was present.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Sibling extension object carried by `session/new` only: `{"_acpx": {"profile": "..."}}`.
 /// Chosen as a single namespaced key (see architecture doc) so it can be
 /// trivially stripped and can't collide with any current/future ACP field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AcpxExt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -20,7 +21,7 @@ pub struct AcpxExt {
 
 /// `session/new` request params. `_acpx` is additive and stripped by the
 /// router prior to forwarding -- see `AcpxExt` above.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NewSessionParams {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -37,7 +38,7 @@ pub struct NewSessionParams {
 /// Distinct type from the backend's own session id (see
 /// `acpx-core::session_registry`) so the two are never accidentally mixed up
 /// at a call site.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySessionId(pub String);
 
 #[cfg(test)]

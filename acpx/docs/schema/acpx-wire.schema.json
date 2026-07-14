@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://acpx.dev/schema/acpx-wire.schema.json",
+  "title": "acpx gateway wire schema (acpx-native additions)",
+  "description": "Covers the JSON-RPC 2.0 envelope every acpx-server transport (stdio/HTTP/WS) frames messages in, plus acpx-native extensions layered on top of raw ACP: the `_acpx` sibling field on `session/new` and the `agents/*` gateway-management methods. Raw ACP method param/result shapes (session/prompt, fs/*, etc.) are NOT redefined here -- see docs/schema/README.md for where to get those from the upstream agent-client-protocol-schema crate at the exact version acpx's Cargo.toml pins.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Request"
+    },
+    {
+      "$ref": "#/$defs/Response"
+    }
+  ],
+  "$defs": {
+    "Request": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": true
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "description": "A JSON-RPC 2.0 request or notification (notifications omit `id`)."
+    },
+    "JsonRpcVersion": {
+      "type": "string",
+      "const": "2.0",
+      "description": "Always the literal string \"2.0\"."
+    },
+    "RequestId": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "JSON-RPC ids are either a string or a number on the wire."
+    },
+    "Response": {
+      "type": "object",
+      "properties": {
+        "jsonrpc": {
+          "$ref": "#/$defs/JsonRpcVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "result": true,
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RpcError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id"
+      ],
+      "description": "A JSON-RPC 2.0 response: exactly one of `result`/`error` is present."
+    },
+    "RpcError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "message": {
+          "type": "string"
+        },
+        "data": true
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "AcpxExt": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "description": "Sibling extension object carried by `session/new` only: `{\"_acpx\": {\"profile\": \"...\"}}`.\nChosen as a single namespaced key (see architecture doc) so it can be\ntrivially stripped and can't collide with any current/future ACP field."
+    },
+    "NewSessionParams": {
+      "type": "object",
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "mcp_servers": {
+          "type": "array",
+          "items": true
+        },
+        "_acpx": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AcpxExt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "cwd"
+      ],
+      "additionalProperties": true,
+      "description": "`session/new` request params. `_acpx` is additive and stripped by the\nrouter prior to forwarding -- see `AcpxExt` above."
+    },
+    "GatewaySessionId": {
+      "type": "string",
+      "description": "Gateway-issued session id returned from a hybrid `session/new` call.\nDistinct type from the backend's own session id (see\n`acpx-core::session_registry`) so the two are never accidentally mixed up\nat a call site."
+    },
+    "AgentStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "not_installed",
+          "description": "Registry entry known, nothing fetched/verified yet."
+        },
+        {
+          "type": "string",
+          "const": "installed",
+          "description": "Runtime present, adapter installed/resolvable (e.g. `node`+`npm` on\n`PATH` for an npx-distributed entry, or a fetched binary present)."
+        },
+        {
+          "type": "string",
+          "const": "installed_no_session",
+          "description": "Installed, but no native session/credentials detected yet (distinct\nfrom `Installed` per `05-open-risks.md`'s \"native session by\ndefault\" note -- a third status, not a boolean)."
+        },
+        {
+          "type": "string",
+          "const": "runtime_missing",
+          "description": "The distribution method's runtime dependency is missing (e.g. no\n`node`/`npm` for an npx-only entry)."
+        }
+      ]
+    },
+    "AgentListEntry": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/AgentStatus"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "version",
+        "status"
+      ]
+    }
+  }
+}

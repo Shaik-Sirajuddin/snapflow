@@ -21,3 +21,7 @@ it" companion.
 - [`development.md`](./development.md) -- building, testing (unit, e2e,
   real-adapter, black-box selftest), formatting/linting, and the
   conventions this codebase's phase-by-phase history has established.
+- [`schema/README.md`](./schema/README.md) -- the generated,
+  server-side-derived JSON Schema for acpx's wire-protocol additions
+  (`schema/acpx-wire.schema.json`), how it's regenerated, and where to
+  get the raw-ACP schema it deliberately doesn't duplicate.

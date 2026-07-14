@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod jsonrpc;
+pub mod schema;
 pub mod session;
 
 /// Re-export of the official ACP SDK crate, so downstream crates can depend

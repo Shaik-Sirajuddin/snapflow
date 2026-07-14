@@ -2487,3 +2487,66 @@ phase is test coverage only, proving properties (concurrency +
 multi-tenancy + multi-client-per-tenant composing correctly together)
 that phases 6/14/16-18 already implemented but had never been jointly
 exercised in one test run.
+
+## 2026-07-14 -- server-side JSON Schema generation pipeline for acpx's wire-protocol additions
+
+Answers "do we have an acpx JSON Schema, and if not, a pipeline for it?"
+with: we didn't, now we do, generated from the Rust source rather than
+hand-written. `schemars` was already resolving into `Cargo.lock`
+transitively (`agent-client-protocol-schema` depends on it to publish
+*its own* schema), but nothing in this workspace derived `JsonSchema` on
+anything or wrote a schema file.
+
+Added `schemars` (workspace dep, `schemars = "1"`, resolves to the same
+`1.2.1` already in the lockfile -- no duplicate-version churn) to
+`acpx-proto` and derived `JsonSchema` on every acpx-*native* wire type:
+`Request`/`Response`/`RpcError`/`RequestId` (`jsonrpc.rs`), `AcpxExt`/
+`NewSessionParams`/`GatewaySessionId` (`session.rs`), `AgentStatus`/
+`AgentListEntry` (`agent.rs`). `JsonRpcVersion` (the type that
+serializes/deserializes as the literal string `"2.0"`) gets a hand-
+written `JsonSchema` impl instead of a derive, since its custom `Serialize`/
+`Deserialize` pair means the derived shape would describe the Rust unit
+struct, not the actual `{"const": "2.0"}` wire shape.
+
+Deliberately does **not** attempt to regenerate raw ACP method shapes
+(`session/prompt`, `fs/*`, ...) -- `acpx-proto/src/lib.rs`'s existing
+doc comment already establishes `agent_client_protocol` as the single
+source of truth for those, and upstream publishes its own generated
+`schema.json` per release. Duplicating that here would only risk drift
+against whatever version `[workspace.dependencies]` happens to be
+pinned to. `docs/schema/README.md` links to the upstream releases page
+instead and notes the "check `Cargo.lock`, not just `Cargo.toml`'s loose
+`\"1\"` range" caveat for finding the exact resolved version.
+
+New pieces:
+- `acpx-proto/src/schema.rs`: `build_schema_document()` -- builds one
+  `SchemaGenerator`, registers every native type through it (so shared
+  substructure like `RequestId` is `$ref`-deduplicated rather than
+  inlined per use site), and assembles a root document: a `oneOf`
+  (`Request` | `Response, the one invariant true of every transport's
+  framing) plus a `$defs` map holding every type.
+- `acpx-proto/src/bin/gen_schema.rs`: thin binary, `cargo run -p
+  acpx-proto --bin gen-schema`, prints the document to stdout.
+- `scripts/gen_schema.sh`: redirects that into the committed
+  `docs/schema/acpx-wire.schema.json`.
+- `acpx-proto/tests/schema_test.rs`: `committed_schema_file_matches_
+  current_wire_types` reads the committed file and compares it against
+  `build_schema_document()` called fresh -- fails the build the moment
+  someone changes a wire type's shape without re-running the script, so
+  the committed schema can't silently drift the way a hand-maintained
+  one would.
+- `docs/schema/README.md`: what's covered, what isn't (and why), how to
+  regenerate, and the document's `oneOf`/`$defs` layout. Linked from
+  `docs/README.md`'s index.
+
+Workspace test count after this phase: **252 passed, 0 failed, 6
+ignored** (up from 250/0/6 -- one new `schema::tests` unit test in
+`acpx-proto`'s lib plus the new `schema_test.rs` integration test).
+`cargo fmt --all --check` and `cargo build --workspace --tests` both
+clean. `cargo clippy` still not installed in this environment, same
+standing limitation as every prior phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to wire behavior or router logic -- purely additive tooling
+(schema derivation + generation pipeline + drift test + docs) over
+already-existing wire types.
