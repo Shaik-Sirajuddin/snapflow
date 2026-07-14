@@ -25,6 +25,6 @@
 //! generate (i.e. someone changed a wire type without regenerating).
 
 fn main() {
-    let doc = acpx_proto::schema::build_schema_document();
+    let doc = acpx_proto::schema::build_wire_schema_document();
     println!("{}", serde_json::to_string_pretty(&doc).unwrap());
 }

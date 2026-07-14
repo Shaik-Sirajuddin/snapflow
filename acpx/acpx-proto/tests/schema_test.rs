@@ -21,7 +21,7 @@ fn committed_schema_file_matches_current_wire_types() {
     let committed: serde_json::Value =
         serde_json::from_str(&committed_raw).expect("committed schema file is not valid JSON");
 
-    let current = acpx_proto::schema::build_schema_document();
+    let current = acpx_proto::schema::build_wire_schema_document();
 
     assert_eq!(
         committed, current,

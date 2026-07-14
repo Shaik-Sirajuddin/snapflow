@@ -2599,3 +2599,59 @@ this phase's changes.
 **Recheck against the full ACP spec surface after this phase:** no
 change to wire behavior or router logic -- purely additive schema
 types over already-existing gateway-native response shapes.
+
+## 2026-07-14 -- full transport schema pipeline phase B: method registry + unified `$defs`
+
+Second phase of the `acpx-openrpc-schema` plan. Adds
+`acpx-proto/src/methods.rs`: a static `METHODS` table (32 entries) that
+is the single source of truth for every JSON-RPC method `acpx-server`
+dispatches in either direction -- 24 client-to-agent methods (a real
+client calls acpx-server: `initialize`, `session/*`, `agents/*`,
+`profiles/*`, `mcp_servers/*`) plus 8 agent-to-client methods
+acpx-server itself calls back out to whichever real client is
+connected, relaying a request its own spawned backend made to acpx one
+hop further (`session/request_permission`, `fs/*`, `terminal/*`).
+Cross-checked directly against `acpx-core::router::classify` and
+`agent-client-protocol` 1.2.0's own `impl_jsonrpc_request!`/
+`impl_jsonrpc_notification!` macro invocations (read directly from the
+dependency's source this session, not a secondary summary), not
+estimated.
+
+Each entry names a `SchemaRef` (either `Native` -- an acpx-proto type --
+or `UpstreamAcp` -- a type from `agent_client_protocol::schema::v1`)
+for params and result, confirming this session's finding that upstream
+already derives `JsonSchema` on every v1 request/response struct: acpx
+can `$ref` those directly via `subschema_for` rather than re-authoring
+shapes it previously only pointed at by doc comment. `session/list` is
+recorded as a genuine dual-shape method (`result` the gateway-native
+aggregate, `alternate_result` upstream's own `ListSessionsResponse` for
+when a selector is supplied) rather than picking one and
+misdescribing the other. `session/cancel` is recorded with `result:
+None` -- it is a true notification on the wire (`CancelNotification`,
+no reply), not a request with a null result.
+
+`acpx-proto/src/schema.rs`: renamed `build_schema_document` ->
+`build_wire_schema_document` (updated `bin/gen_schema.rs` and
+`tests/schema_test.rs` accordingly; no behavior change, that document's
+`$defs` are exactly what they were after phase A). Added
+`register_all_defs`, a second registration function that additionally
+`subschema_for`s every upstream `agent_client_protocol::schema::v1`
+type any `METHODS` entry references, backing the (not-yet-built)
+OpenRPC document -- and a real drift guard,
+`every_method_schema_ref_is_registered`, which fails the moment a
+`methods.rs` entry names a type `register_all_defs` doesn't also
+register.
+
+Workspace test count after this phase: **261 passed, 0 failed, 6
+ignored** (up from 257/0/6 -- `methods::tests::{every_method_is_unique,
+matches_router_classify_client_to_agent_method_count}`,
+`schema::tests::every_method_schema_ref_is_registered`, and one more
+`gateway::tests` case for `ProfilesListResult` added alongside this
+phase's typing). `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean. `cargo clippy` still not installed in this
+environment, same standing limitation as every prior phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to wire behavior or router logic -- purely additive schema
+metadata (a lookup table plus generator registrations) over
+already-existing dispatch behavior.

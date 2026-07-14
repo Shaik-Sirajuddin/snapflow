@@ -10,6 +10,7 @@
 pub mod agent;
 pub mod gateway;
 pub mod jsonrpc;
+pub mod methods;
 pub mod schema;
 pub mod session;
 

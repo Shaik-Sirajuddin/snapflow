@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://acpx.dev/schema/acpx-wire.schema.json",
   "title": "acpx gateway wire schema (acpx-native additions)",
-  "description": "Covers the JSON-RPC 2.0 envelope every acpx-server transport (stdio/HTTP/WS) frames messages in, plus acpx-native extensions layered on top of raw ACP: the `_acpx` sibling field on `session/new` and the `agents/*` gateway-management methods. Raw ACP method param/result shapes (session/prompt, fs/*, etc.) are NOT redefined here -- see docs/schema/README.md for where to get those from the upstream agent-client-protocol-schema crate at the exact version acpx's Cargo.toml pins.",
+  "description": "Covers the JSON-RPC 2.0 envelope every acpx-server transport (stdio/HTTP/WS) frames messages in, plus acpx-native extensions layered on top of raw ACP: the `_acpx` sibling field on `session/new` and the `agents/*` gateway-management methods. Raw ACP method param/result shapes (session/prompt, fs/*, etc.) are NOT redefined here -- see `docs/schema/ acpx.openrpc.json` (the full method registry, covering every method both this gateway-native document and raw ACP define) or docs/schema/README.md for the upstream agent-client-protocol-schema crate this pulls those `$ref`s from at the exact version acpx's Cargo.toml pins.",
   "oneOf": [
     {
       "$ref": "#/$defs/Request"
@@ -408,6 +408,21 @@
         }
       },
       "description": "Mirrors `acpx_core::profile::Profile`'s wire shape exactly (field\nnames, optionality, defaults) -- the type `profiles/create`,\n`profiles/update`, and `profiles/list` (per-element) all serialize on\nthe wire, post `redact_launch_overrides` (which only ever replaces\n`launch_overrides` *values* with the literal string\n`\"***redacted***\"`, never changes the shape). `key_ref` mirrors\n`acpx_core::keystore::KeyRef`'s newtype-transparent wire\nrepresentation (a bare string) as `Option<String>` directly rather\nthan introducing a single-field wrapper type purely for this file."
+    },
+    "ProfilesListResult": {
+      "type": "object",
+      "properties": {
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProfileSchema"
+          }
+        }
+      },
+      "required": [
+        "profiles"
+      ],
+      "description": "`profiles/list` result envelope."
     }
   }
 }

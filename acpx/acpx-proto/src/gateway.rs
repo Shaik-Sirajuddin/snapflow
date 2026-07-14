@@ -162,6 +162,12 @@ impl Default for PermissionPolicySchema {
     }
 }
 
+/// `profiles/list` result envelope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfilesListResult {
+    pub profiles: Vec<ProfileSchema>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +241,14 @@ mod tests {
         });
         let entry: McpServerEntry = serde_json::from_value(router_literal.clone()).unwrap();
         assert_eq!(serde_json::to_value(&entry).unwrap(), router_literal);
+    }
+
+    /// Locks `ProfilesListResult` against the exact envelope
+    /// `router.rs`'s `"profiles/list"` arm constructs.
+    #[test]
+    fn profiles_list_result_matches_router_literal() {
+        let router_literal = serde_json::json!({"profiles": []});
+        let result: ProfilesListResult = serde_json::from_value(router_literal.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&result).unwrap(), router_literal);
     }
 }
