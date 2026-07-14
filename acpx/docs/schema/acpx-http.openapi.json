@@ -1,0 +1,3897 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "acpx gateway HTTP/WS transport envelope",
+    "version": "0.1.0",
+    "description": "Describes the HTTP transport envelope acpx-server wraps its JSON-RPC body in -- the two fixed paths (POST /rpc, GET /ws) and the three header-level contracts (Authorization, X-Acpx-Tenant, X-Acpx-Profile) a JSON Schema/OpenRPC body document has no place to describe. For the JSON-RPC body's own shape (every method's params/result), see docs/schema/acpx.openrpc.json. stdio is a separate transport with no headers and is not described here -- see acpx.openrpc.json's servers list."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8790",
+      "description": "default ACPX_HTTP_BIND"
+    }
+  ],
+  "paths": {
+    "/rpc": {
+      "post": {
+        "summary": "JSON-RPC-over-HTTP",
+        "description": "Body is a raw JSON-RPC 2.0 request; response body is the JSON-RPC response.",
+        "parameters": [
+          {
+            "name": "Authorization",
+            "in": "header",
+            "required": false,
+            "description": "Bearer token, checked in constant time against ACPX_AUTH_TOKEN when that env var is set on the server (acpx-server/src/transport/http.rs's AuthConfig). Unset ACPX_AUTH_TOKEN means auth is disabled entirely -- this header is then ignored if sent and not required if omitted. When ACPX_AUTH_TOKEN is set, a missing or mismatched header yields 401 Unauthorized with a JSON-RPC-shaped error body (see the shared errorResponse schema on this document's responses).",
+            "schema": {
+              "type": "string",
+              "pattern": "^Bearer .+$"
+            },
+            "example": "Bearer sk-acpx-..."
+          },
+          {
+            "name": "X-Acpx-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Self-declared tenant partition key (acpx-tenant-isolation plan) applied to every method on this request/connection, not just session/new. Absent or not valid UTF-8 is treated identically to the implicit default tenant (\"default\") -- this is a data partition, not an auth gate, so it fails open rather than rejecting the request. For WS, this header is read once at upgrade time and cached for the connection's entire lifetime (a WS client is one fixed tenant for its whole connection).",
+            "schema": {
+              "type": "string",
+              "default": "default"
+            },
+            "example": "acme-corp"
+          },
+          {
+            "name": "X-Acpx-Profile",
+            "in": "header",
+            "required": false,
+            "description": "Explicit profile selection for a session/new request on this transport -- POST /rpc only (no WS equivalent: WS headers are only present at the initial upgrade, not per-frame, so a WS client that wants managed mode must instead set params._acpx.profile inline on its session/new frame). Highest precedence: overwrites any inline params._acpx.profile value on the same request. Ignored on every method other than session/new.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "work-openai"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "JSON-RPC response (success or error). Always 200 OK -- JSON-RPC errors are reported via the body's error field, not the HTTP status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Response"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid Authorization header while ACPX_AUTH_TOKEN is set on the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Response"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ws": {
+      "get": {
+        "summary": "WebSocket upgrade",
+        "description": "Upgrades to a persistent, full-duplex JSON-RPC connection carrying the same Request/Response frames as POST /rpc, plus live session/update notification frames (acpx_core::notify::NotificationHub). Authorization and X-Acpx-Tenant are read once at upgrade time and apply for the connection's entire lifetime -- there is no per-message re-check after the upgrade succeeds. X-Acpx-Profile has no effect on this transport (see that parameter's own description).",
+        "parameters": [
+          {
+            "name": "Authorization",
+            "in": "header",
+            "required": false,
+            "description": "Bearer token, checked in constant time against ACPX_AUTH_TOKEN when that env var is set on the server (acpx-server/src/transport/http.rs's AuthConfig). Unset ACPX_AUTH_TOKEN means auth is disabled entirely -- this header is then ignored if sent and not required if omitted. When ACPX_AUTH_TOKEN is set, a missing or mismatched header yields 401 Unauthorized with a JSON-RPC-shaped error body (see the shared errorResponse schema on this document's responses).",
+            "schema": {
+              "type": "string",
+              "pattern": "^Bearer .+$"
+            },
+            "example": "Bearer sk-acpx-..."
+          },
+          {
+            "name": "X-Acpx-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Self-declared tenant partition key (acpx-tenant-isolation plan) applied to every method on this request/connection, not just session/new. Absent or not valid UTF-8 is treated identically to the implicit default tenant (\"default\") -- this is a data partition, not an auth gate, so it fails open rather than rejecting the request. For WS, this header is read once at upgrade time and cached for the connection's entire lifetime (a WS client is one fixed tenant for its whole connection).",
+            "schema": {
+              "type": "string",
+              "default": "default"
+            },
+            "example": "acme-corp"
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching Protocols -- upgrade succeeded."
+          },
+          "401": {
+            "description": "Missing or invalid Authorization header while ACPX_AUTH_TOKEN is set on the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Response"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Request": {
+        "type": "object",
+        "properties": {
+          "jsonrpc": {
+            "$ref": "#/components/schemas/JsonRpcVersion"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RequestId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "method": {
+            "type": "string"
+          },
+          "params": true
+        },
+        "required": [
+          "jsonrpc",
+          "method"
+        ],
+        "description": "A JSON-RPC 2.0 request or notification (notifications omit `id`)."
+      },
+      "JsonRpcVersion": {
+        "type": "string",
+        "const": "2.0",
+        "description": "Always the literal string \"2.0\"."
+      },
+      "RequestId": {
+        "anyOf": [
+          {
+            "type": "integer",
+            "format": "int64"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "JSON-RPC ids are either a string or a number on the wire."
+      },
+      "Response": {
+        "type": "object",
+        "properties": {
+          "jsonrpc": {
+            "$ref": "#/components/schemas/JsonRpcVersion"
+          },
+          "id": {
+            "$ref": "#/components/schemas/RequestId"
+          },
+          "result": true,
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RpcError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "id"
+        ],
+        "description": "A JSON-RPC 2.0 response: exactly one of `result`/`error` is present."
+      },
+      "RpcError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": true
+        },
+        "required": [
+          "code",
+          "message"
+        ]
+      },
+      "AcpxExt": {
+        "type": "object",
+        "properties": {
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "description": "Sibling extension object carried by `session/new` only: `{\"_acpx\": {\"profile\": \"...\"}}`.\nChosen as a single namespaced key (see architecture doc) so it can be\ntrivially stripped and can't collide with any current/future ACP field."
+      },
+      "NewSessionParams": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": "string"
+          },
+          "mcp_servers": {
+            "type": "array",
+            "items": true
+          },
+          "_acpx": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AcpxExt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "cwd"
+        ],
+        "additionalProperties": true,
+        "description": "`session/new` request params. `_acpx` is additive and stripped by the\nrouter prior to forwarding -- see `AcpxExt` above."
+      },
+      "GatewaySessionId": {
+        "type": "string",
+        "description": "Gateway-issued session id returned from a hybrid `session/new` call.\nDistinct type from the backend's own session id (see\n`acpx-core::session_registry`) so the two are never accidentally mixed up\nat a call site."
+      },
+      "AgentStatus": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "not_installed",
+            "description": "Registry entry known, nothing fetched/verified yet."
+          },
+          {
+            "type": "string",
+            "const": "installed",
+            "description": "Runtime present, adapter installed/resolvable (e.g. `node`+`npm` on\n`PATH` for an npx-distributed entry, or a fetched binary present)."
+          },
+          {
+            "type": "string",
+            "const": "installed_no_session",
+            "description": "Installed, but no native session/credentials detected yet (distinct\nfrom `Installed` per `05-open-risks.md`'s \"native session by\ndefault\" note -- a third status, not a boolean)."
+          },
+          {
+            "type": "string",
+            "const": "runtime_missing",
+            "description": "The distribution method's runtime dependency is missing (e.g. no\n`node`/`npm` for an npx-only entry)."
+          }
+        ]
+      },
+      "AgentListEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AgentStatus"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "version",
+          "status"
+        ]
+      },
+      "AgentIdParams": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "description": "`agents/install` and `agents/status` params -- both are exactly\n`{\"id\": \"...\"}\"` in `router.rs`."
+      },
+      "AgentsListResult": {
+        "type": "object",
+        "properties": {
+          "agents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgentListEntry"
+            }
+          }
+        },
+        "required": [
+          "agents"
+        ],
+        "description": "`agents/list` result envelope."
+      },
+      "AgentInstallResult": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "outcome"
+        ],
+        "description": "`agents/install` result envelope. `outcome` is `acpx_registry::\nInstallOutcome`'s `{outcome:?}`-formatted debug string (router.rs's\nown choice, not a typed enum on the wire) -- kept as a bare `String`\nhere rather than inventing a closed enum this schema would then have\nto keep in lockstep with `acpx-registry`'s."
+      },
+      "AgentStatusResult": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/AgentStatus"
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "description": "`agents/status` result envelope."
+      },
+      "GatewaySessionListEntry": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "agentId": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sessionId",
+          "agentId",
+          "cwd"
+        ],
+        "description": "One entry in `session/list`'s default (no-selector) branch --\ndistinct from, and much smaller than, real ACP's `ListSessionsResponse`\nentries, since this branch answers \"which gateway sessions does this\nacpx process itself know about\", not a specific backend's own session\nhistory. See `router.rs`'s `\"session/list\"` arm doc comment for why\nthis method is a genuine dual-shape split, not a rename."
+      },
+      "GatewaySessionListResult": {
+        "type": "object",
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GatewaySessionListEntry"
+            }
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "description": "`session/list`'s default (no-selector) result envelope. When the\ncaller supplies a selector instead, `router.rs` proxies to the real\nbackend's `ListSessionsRequest`/`ListSessionsResponse`\n(`dispatch_session_list_real`) -- the method registry\n(`methods.rs`) records both possibilities as a `oneOf`, this type\ncovers only the gateway-native half."
+      },
+      "McpServerEntry": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": true,
+        "description": "A centrally-registered MCP server entry (`mcp_servers/create|update|\nlist`). Deliberately opaque beyond the `name` key acpx actually reads\n(`acpx-core/src/mcp_servers.rs`'s doc comment: \"`acpx` never\ninterprets an MCP server entry's fields itself\") -- this is an\nintentional design decision restated in schema form, not a gap to\nclose further (see `00-goal.md`'s non-goals)."
+      },
+      "McpServersListResult": {
+        "type": "object",
+        "properties": {
+          "servers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/McpServerEntry"
+            }
+          }
+        },
+        "required": [
+          "servers"
+        ],
+        "description": "`mcp_servers/list` result envelope."
+      },
+      "NameOnlyParams": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "description": "`profiles/delete` and `mcp_servers/delete` params -- both are exactly\n`{\"name\": \"...\"}\"` in `router.rs`."
+      },
+      "NameOnlyResult": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "deleted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "deleted"
+        ],
+        "description": "`profiles/delete` and `mcp_servers/delete` result envelope -- both\nare exactly `{\"name\": \"...\", \"deleted\": true}\"` in `router.rs`."
+      },
+      "PermissionPolicySchema": {
+        "type": "string",
+        "enum": [
+          "auto_allow",
+          "auto_reject"
+        ],
+        "description": "Mirrors `acpx_core::profile::PermissionPolicy` -- see this module's\ndoc comment for why this is a mirror rather than a direct reference."
+      },
+      "ProfileSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "default": ""
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "key_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          },
+          "launch_overrides": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {}
+          },
+          "mcp_servers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          },
+          "permission_policy": {
+            "$ref": "#/components/schemas/PermissionPolicySchema",
+            "default": "auto_reject"
+          },
+          "allow_fs_access": {
+            "type": "boolean",
+            "default": false
+          },
+          "allow_terminal_access": {
+            "type": "boolean",
+            "default": false
+          },
+          "auth_method_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null
+          }
+        },
+        "description": "Mirrors `acpx_core::profile::Profile`'s wire shape exactly (field\nnames, optionality, defaults) -- the type `profiles/create`,\n`profiles/update`, and `profiles/list` (per-element) all serialize on\nthe wire, post `redact_launch_overrides` (which only ever replaces\n`launch_overrides` *values* with the literal string\n`\"***redacted***\"`, never changes the shape). `key_ref` mirrors\n`acpx_core::keystore::KeyRef`'s newtype-transparent wire\nrepresentation (a bare string) as `Option<String>` directly rather\nthan introducing a single-field wrapper type purely for this file."
+      },
+      "ProfilesListResult": {
+        "type": "object",
+        "properties": {
+          "profiles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileSchema"
+            }
+          }
+        },
+        "required": [
+          "profiles"
+        ],
+        "description": "`profiles/list` result envelope."
+      },
+      "InitializeRequest": {
+        "type": "object",
+        "properties": {
+          "protocolVersion": {
+            "$ref": "#/components/schemas/ProtocolVersion",
+            "description": "The latest protocol version supported by the client."
+          },
+          "clientCapabilities": {
+            "$ref": "#/components/schemas/ClientCapabilities",
+            "description": "Capabilities supported by the client.",
+            "default": {
+              "fs": {
+                "readTextFile": false,
+                "writeTextFile": false
+              },
+              "terminal": false
+            },
+            "x-deserialize-default-on-error": true
+          },
+          "clientInfo": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Implementation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Information about the Client name and version sent to the Agent.\n\nNote: in future versions of the protocol, this will be required.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "protocolVersion"
+        ],
+        "description": "Request parameters for the initialize method.\n\nSent by the client to establish connection and negotiate capabilities.\n\nSee protocol docs: [Initialization](https://agentclientprotocol.com/protocol/initialization)",
+        "x-side": "agent",
+        "x-method": "initialize"
+      },
+      "ProtocolVersion": {
+        "type": "integer",
+        "format": "uint16",
+        "minimum": 0,
+        "maximum": 65535,
+        "description": "Protocol version identifier.\n\nThis version is only bumped for breaking changes.\nNon-breaking changes should be introduced via capabilities."
+      },
+      "ClientCapabilities": {
+        "type": "object",
+        "properties": {
+          "fs": {
+            "$ref": "#/components/schemas/FileSystemCapabilities",
+            "description": "File system capabilities supported by the client.\nDetermines which file operations the agent can request.",
+            "default": {
+              "readTextFile": false,
+              "writeTextFile": false
+            },
+            "x-deserialize-default-on-error": true
+          },
+          "terminal": {
+            "type": "boolean",
+            "description": "Whether the Client support all `terminal/*` methods.",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "session": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClientSessionCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session-related capabilities supported by the client.\n\nOptional. Omitted or `null` both mean the client does not advertise any\nsession-related extensions.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities supported by the client.\n\nAdvertised during initialization to inform the agent about\navailable features and methods.\n\nSee protocol docs: [Client Capabilities](https://agentclientprotocol.com/protocol/initialization#client-capabilities)"
+      },
+      "FileSystemCapabilities": {
+        "type": "object",
+        "properties": {
+          "readTextFile": {
+            "type": "boolean",
+            "description": "Whether the Client supports `fs/read_text_file` requests.",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "writeTextFile": {
+            "type": "boolean",
+            "description": "Whether the Client supports `fs/write_text_file` requests.",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "File system capabilities that a client may support.\n\nSee protocol docs: [FileSystem](https://agentclientprotocol.com/protocol/initialization#filesystem)"
+      },
+      "ClientSessionCapabilities": {
+        "type": "object",
+        "properties": {
+          "configOptions": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionConfigOptionsCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Config option capabilities supported by the client.\n\nOmitted or `null` both mean the client does not advertise support for any\nconfig option extensions.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Session-related capabilities supported by the client."
+      },
+      "SessionConfigOptionsCapabilities": {
+        "type": "object",
+        "properties": {
+          "boolean": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BooleanConfigOptionCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the client supports boolean session configuration options.\n\nOptional. Omitted or `null` both mean the client does not advertise support.\nSupplying `{}` means agents may include `type: \"boolean\"` entries in\n`configOptions`, and the client may send `session/set_config_option`\nrequests with `type: \"boolean\"` and a boolean `value`.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Session configuration option capabilities supported by the client."
+      },
+      "BooleanConfigOptionCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities for boolean session configuration options.\n\nSupplying `{}` means the client supports boolean session configuration options."
+      },
+      "Implementation": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Intended for programmatic or logical use, but can be used as a display\nname fallback if title isn’t present."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Intended for UI and end-user contexts — optimized to be human-readable\nand easily understood.\n\nIf not provided, the name should be used for display.",
+            "x-deserialize-default-on-error": true
+          },
+          "version": {
+            "type": "string",
+            "description": "Version of the implementation. Can be displayed to the user or used\nfor debugging or metrics purposes. (e.g. \"1.0.0\")."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "name",
+          "version"
+        ],
+        "description": "Metadata about the implementation of the client or agent.\nDescribes the name and version of an ACP implementation, with an optional\ntitle for UI representation."
+      },
+      "InitializeResponse": {
+        "type": "object",
+        "properties": {
+          "protocolVersion": {
+            "$ref": "#/components/schemas/ProtocolVersion",
+            "description": "The protocol version the client specified if supported by the agent,\nor the latest protocol version supported by the agent.\n\nThe client should disconnect, if it doesn't support this version."
+          },
+          "agentCapabilities": {
+            "$ref": "#/components/schemas/AgentCapabilities",
+            "description": "Capabilities supported by the agent.",
+            "default": {
+              "loadSession": false,
+              "promptCapabilities": {
+                "image": false,
+                "audio": false,
+                "embeddedContext": false
+              },
+              "mcpCapabilities": {
+                "http": false,
+                "sse": false
+              },
+              "sessionCapabilities": {},
+              "auth": {}
+            },
+            "x-deserialize-default-on-error": true
+          },
+          "authMethods": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuthMethod"
+            },
+            "description": "Authentication methods supported by the agent.",
+            "default": [],
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "agentInfo": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Implementation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Information about the Agent name and version sent to the Client.\n\nNote: in future versions of the protocol, this will be required.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "protocolVersion"
+        ],
+        "description": "Response to the `initialize` method.\n\nContains the negotiated protocol version and agent capabilities.\n\nSee protocol docs: [Initialization](https://agentclientprotocol.com/protocol/initialization)",
+        "x-side": "agent",
+        "x-method": "initialize"
+      },
+      "AgentCapabilities": {
+        "type": "object",
+        "properties": {
+          "loadSession": {
+            "type": "boolean",
+            "description": "Whether the agent supports `session/load`.",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "promptCapabilities": {
+            "$ref": "#/components/schemas/PromptCapabilities",
+            "description": "Prompt capabilities supported by the agent.",
+            "default": {
+              "image": false,
+              "audio": false,
+              "embeddedContext": false
+            },
+            "x-deserialize-default-on-error": true
+          },
+          "mcpCapabilities": {
+            "$ref": "#/components/schemas/McpCapabilities",
+            "description": "MCP capabilities supported by the agent.",
+            "default": {
+              "http": false,
+              "sse": false
+            },
+            "x-deserialize-default-on-error": true
+          },
+          "sessionCapabilities": {
+            "$ref": "#/components/schemas/SessionCapabilities",
+            "description": "Session lifecycle and prompt capabilities advertised by the agent.",
+            "default": {},
+            "x-deserialize-default-on-error": true
+          },
+          "auth": {
+            "$ref": "#/components/schemas/AgentAuthCapabilities",
+            "description": "Authentication-related capabilities supported by the agent.",
+            "default": {},
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities supported by the agent.\n\nAdvertised during initialization to inform the client about\navailable features and content types.\n\nSee protocol docs: [Agent Capabilities](https://agentclientprotocol.com/protocol/initialization#agent-capabilities)"
+      },
+      "PromptCapabilities": {
+        "type": "object",
+        "properties": {
+          "image": {
+            "type": "boolean",
+            "description": "Agent supports [`ContentBlock::Image`].",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "audio": {
+            "type": "boolean",
+            "description": "Agent supports [`ContentBlock::Audio`].",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "embeddedContext": {
+            "type": "boolean",
+            "description": "Agent supports embedded context in `session/prompt` requests.\n\nWhen enabled, the Client is allowed to include [`ContentBlock::Resource`]\nin prompt requests for pieces of context that are referenced in the message.",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Prompt capabilities supported by the agent in `session/prompt` requests.\n\nBaseline agent functionality requires support for [`ContentBlock::Text`]\nand [`ContentBlock::ResourceLink`] in prompt requests.\n\nOther variants must be explicitly opted in to.\nCapabilities for different types of content in prompt requests.\n\nIndicates which content types beyond the baseline (text and resource links)\nthe agent can process.\n\nSee protocol docs: [Prompt Capabilities](https://agentclientprotocol.com/protocol/initialization#prompt-capabilities)"
+      },
+      "McpCapabilities": {
+        "type": "object",
+        "properties": {
+          "http": {
+            "type": "boolean",
+            "description": "Agent supports [`McpServer::Http`].",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "sse": {
+            "type": "boolean",
+            "description": "Agent supports [`McpServer::Sse`].",
+            "default": false,
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "MCP capabilities supported by the agent"
+      },
+      "SessionCapabilities": {
+        "type": "object",
+        "properties": {
+          "list": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionListCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the agent supports `session/list`.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports listing sessions.",
+            "x-deserialize-default-on-error": true
+          },
+          "delete": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionDeleteCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the agent supports `session/delete`.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports deleting sessions from `session/list`.",
+            "x-deserialize-default-on-error": true
+          },
+          "additionalDirectories": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionAdditionalDirectoriesCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the agent supports `additionalDirectories` on supported session lifecycle requests.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports `additionalDirectories` on\nsupported session lifecycle requests.\n\nAgents that also support `session/list` may return\n`SessionInfo.additionalDirectories` to report the complete ordered\nadditional-root list associated with a listed session.",
+            "x-deserialize-default-on-error": true
+          },
+          "resume": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionResumeCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the agent supports `session/resume`.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports resuming sessions.",
+            "x-deserialize-default-on-error": true
+          },
+          "close": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionCloseCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the agent supports `session/close`.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports closing sessions.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Session capabilities supported by the agent.\n\nAs a baseline, all Agents **MUST** support `session/new`, `session/prompt`, `session/cancel`, and `session/update`.\n\nOptionally, they **MAY** support other session methods and notifications by specifying additional capabilities.\n\nNote: `session/load` is still handled by the top-level `load_session` capability. This will be unified in future versions of the protocol.\n\nSee protocol docs: [Session Capabilities](https://agentclientprotocol.com/protocol/initialization#session-capabilities)"
+      },
+      "SessionListCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities for the `session/list` method.\n\nSupplying `{}` means the agent supports listing sessions."
+      },
+      "SessionDeleteCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities for the `session/delete` method.\n\nSupplying `{}` means the agent supports deleting sessions from `session/list`."
+      },
+      "SessionAdditionalDirectoriesCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities for additional session directories support.\n\nSupplying `{}` means the agent supports the `additionalDirectories` field on\nsupported session lifecycle requests. Agents that also support\n`session/list` may return `SessionInfo.additionalDirectories` to report the\ncomplete ordered additional-root list associated with a listed session."
+      },
+      "SessionResumeCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities for the `session/resume` method.\n\nSupplying `{}` means the agent supports resuming sessions."
+      },
+      "SessionCloseCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Capabilities for the `session/close` method.\n\nSupplying `{}` means the agent supports closing sessions."
+      },
+      "AgentAuthCapabilities": {
+        "type": "object",
+        "properties": {
+          "logout": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LogoutCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the agent supports the logout method.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports the logout method.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Authentication-related capabilities supported by the agent."
+      },
+      "LogoutCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Logout capabilities supported by the agent.\n\nSupplying `{}` means the agent supports the logout method."
+      },
+      "AuthMethod": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/AuthMethodAgent",
+            "description": "Agent handles authentication itself.\n\nThis is the default when no `type` is specified."
+          }
+        ],
+        "description": "Describes an available authentication method.\n\nThe `type` field acts as the discriminator in the serialized JSON form.\nWhen no `type` is present, the method is treated as `agent`."
+      },
+      "AuthMethodAgent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/AuthMethodId",
+            "description": "Unique identifier for this authentication method."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name of the authentication method."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description providing more details about this authentication method.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "description": "Agent handles authentication itself.\n\nThis is the default authentication method type."
+      },
+      "AuthMethodId": {
+        "type": "string",
+        "description": "Typed identifier used for auth method values on the wire."
+      },
+      "AuthenticateRequest": {
+        "type": "object",
+        "properties": {
+          "methodId": {
+            "$ref": "#/components/schemas/AuthMethodId",
+            "description": "The ID of the authentication method to use.\nMust be one of the methods advertised in the initialize response."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "methodId"
+        ],
+        "description": "Request parameters for the authenticate method.\n\nSpecifies which authentication method to use.",
+        "x-side": "agent",
+        "x-method": "authenticate"
+      },
+      "AuthenticateResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response to the `authenticate` method.",
+        "x-side": "agent",
+        "x-method": "authenticate"
+      },
+      "LogoutRequest": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Request parameters for the logout method.\n\nTerminates the current authenticated session.",
+        "x-side": "agent",
+        "x-method": "logout"
+      },
+      "LogoutResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response to the `logout` method.",
+        "x-side": "agent",
+        "x-method": "logout"
+      },
+      "NewSessionResponse": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "Unique identifier for the created session.\n\nUsed in all subsequent requests for this conversation."
+          },
+          "modes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionModeState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Initial mode state if supported by the Agent\n\nSee protocol docs: [Session Modes](https://agentclientprotocol.com/protocol/session-modes)",
+            "x-deserialize-default-on-error": true
+          },
+          "configOptions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigOption"
+            },
+            "description": "Initial session configuration options if supported by the Agent.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "description": "Response from creating a new session.\n\nSee protocol docs: [Creating a Session](https://agentclientprotocol.com/protocol/session-setup#creating-a-session)",
+        "x-side": "agent",
+        "x-method": "session/new"
+      },
+      "SessionId": {
+        "type": "string",
+        "description": "A unique identifier for a conversation session between a client and agent.\n\nSessions maintain their own context, conversation history, and state,\nallowing multiple independent interactions with the same agent.\n\nSee protocol docs: [Session ID](https://agentclientprotocol.com/protocol/session-setup#session-id)"
+      },
+      "SessionModeState": {
+        "type": "object",
+        "properties": {
+          "currentModeId": {
+            "$ref": "#/components/schemas/SessionModeId",
+            "description": "The current mode the Agent is in."
+          },
+          "availableModes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionMode"
+            },
+            "description": "The set of modes that the Agent can operate in",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "currentModeId",
+          "availableModes"
+        ],
+        "description": "The set of modes and the one currently active."
+      },
+      "SessionModeId": {
+        "type": "string",
+        "description": "Unique identifier for a Session Mode."
+      },
+      "SessionMode": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/SessionModeId",
+            "description": "Stable identifier used to refer to this protocol object in later messages."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name shown for this protocol object."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human-readable details shown with this protocol object.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "description": "A mode the agent can operate in.\n\nSee protocol docs: [Session Modes](https://agentclientprotocol.com/protocol/session-modes)"
+      },
+      "SessionConfigOption": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/SessionConfigId",
+            "description": "Unique identifier for the configuration option."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable label for the option."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description for the Client to display to the user.",
+            "x-deserialize-default-on-error": true
+          },
+          "category": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionConfigOptionCategory"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional semantic category for this option (UX only).",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SessionConfigSelect",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "select"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Single-value selector (dropdown)."
+          },
+          {
+            "$ref": "#/components/schemas/SessionConfigBoolean",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "boolean"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Boolean on/off toggle."
+          }
+        ],
+        "description": "A session configuration option selector and its current state.",
+        "discriminator": {
+          "propertyName": "type"
+        }
+      },
+      "SessionConfigId": {
+        "type": "string",
+        "description": "Unique identifier for a session configuration option."
+      },
+      "SessionConfigOptionCategory": {
+        "anyOf": [
+          {
+            "type": "string",
+            "const": "mode",
+            "description": "Session mode selector."
+          },
+          {
+            "type": "string",
+            "const": "model",
+            "description": "Model selector."
+          },
+          {
+            "type": "string",
+            "const": "model_config",
+            "description": "Model-related configuration parameter."
+          },
+          {
+            "type": "string",
+            "const": "thought_level",
+            "description": "Thought/reasoning level selector."
+          },
+          {
+            "type": "string",
+            "description": "Unknown / uncategorized selector."
+          }
+        ],
+        "description": "Semantic category for a session configuration option.\n\nThis is intended to help Clients distinguish broadly common selectors (e.g. model selector vs\nsession mode selector vs thought/reasoning level) for UX purposes (keyboard shortcuts, icons,\nplacement). It MUST NOT be required for correctness. Clients MUST handle missing or unknown\ncategories gracefully.\n\nCategory names beginning with `_` are free for custom use, like other ACP extension methods.\nCategory names that do not begin with `_` are reserved for the ACP spec."
+      },
+      "SessionConfigValueId": {
+        "type": "string",
+        "description": "Unique identifier for a session configuration option value."
+      },
+      "SessionConfigSelectOptions": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigSelectOption"
+            },
+            "description": "A flat list of options with no grouping."
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigSelectGroup"
+            },
+            "description": "A list of options grouped under headers."
+          }
+        ],
+        "description": "Possible values for a session configuration option."
+      },
+      "SessionConfigSelectOption": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/SessionConfigValueId",
+            "description": "Unique identifier for this option value."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable label for this option value."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description for this option value.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "value",
+          "name"
+        ],
+        "description": "A possible value for a session configuration option."
+      },
+      "SessionConfigSelectGroup": {
+        "type": "object",
+        "properties": {
+          "group": {
+            "$ref": "#/components/schemas/SessionConfigGroupId",
+            "description": "Unique identifier for this group."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable label for this group."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigSelectOption"
+            },
+            "description": "The set of option values in this group.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "group",
+          "name",
+          "options"
+        ],
+        "description": "A group of possible values for a session configuration option."
+      },
+      "SessionConfigGroupId": {
+        "type": "string",
+        "description": "Unique identifier for a session configuration option value group."
+      },
+      "SessionConfigSelect": {
+        "type": "object",
+        "properties": {
+          "currentValue": {
+            "$ref": "#/components/schemas/SessionConfigValueId",
+            "description": "The currently selected value."
+          },
+          "options": {
+            "$ref": "#/components/schemas/SessionConfigSelectOptions",
+            "description": "The set of selectable options."
+          }
+        },
+        "required": [
+          "currentValue",
+          "options"
+        ],
+        "description": "A single-value selector (dropdown) session configuration option payload."
+      },
+      "SessionConfigBoolean": {
+        "type": "object",
+        "properties": {
+          "currentValue": {
+            "type": "boolean",
+            "description": "The current value of the boolean option."
+          }
+        },
+        "required": [
+          "currentValue"
+        ],
+        "description": "A boolean on/off toggle session configuration option payload."
+      },
+      "PromptRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to send this user message to"
+          },
+          "prompt": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContentBlock"
+            },
+            "description": "The blocks of content that compose the user's message.\n\nAs a baseline, the Agent MUST support [`ContentBlock::Text`] and [`ContentBlock::ResourceLink`],\nwhile other variants are optionally enabled via [`PromptCapabilities`].\n\nThe Client MUST adapt its interface according to [`PromptCapabilities`].\n\nThe client MAY include referenced pieces of context as either\n[`ContentBlock::Resource`] or [`ContentBlock::ResourceLink`].\n\nWhen available, [`ContentBlock::Resource`] is preferred\nas it avoids extra round-trips and allows the message to include\npieces of context from sources the agent may not have access to."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "prompt"
+        ],
+        "description": "Request parameters for sending a user prompt to the agent.\n\nContains the user's message and any additional context.\n\nSee protocol docs: [User Message](https://agentclientprotocol.com/protocol/prompt-turn#1-user-message)",
+        "x-side": "agent",
+        "x-method": "session/prompt"
+      },
+      "ContentBlock": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TextContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "text"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Text content. May be plain text or formatted with Markdown.\n\nAll agents MUST support text content blocks in prompts.\nClients SHOULD render this text as Markdown."
+          },
+          {
+            "$ref": "#/components/schemas/ImageContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "image"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Images for visual context or analysis.\n\nRequires the `image` prompt capability when included in prompts."
+          },
+          {
+            "$ref": "#/components/schemas/AudioContent",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "audio"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Audio data for transcription or analysis.\n\nRequires the `audio` prompt capability when included in prompts."
+          },
+          {
+            "$ref": "#/components/schemas/ResourceLink",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "resource_link"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "References to resources that the agent can access.\n\nAll agents MUST support resource links in prompts."
+          },
+          {
+            "$ref": "#/components/schemas/EmbeddedResource",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "resource"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Complete resource contents embedded directly in the message.\n\nPreferred for including context as it avoids extra round-trips.\n\nRequires the `embeddedContext` prompt capability when included in prompts."
+          }
+        ],
+        "description": "Content blocks represent displayable information in the Agent Client Protocol.\n\nThey provide a structured way to handle various types of user-facing content—whether\nit's text from language models, images for analysis, or embedded resources for context.\n\nContent blocks appear in:\n- User prompts sent via `session/prompt`\n- Language model output streamed through `session/update` notifications\n- Progress updates and results from tool calls\n\nThis structure is compatible with the Model Context Protocol (MCP), enabling\nagents to seamlessly forward content from MCP tool outputs without transformation.\n\nSee protocol docs: [Content](https://agentclientprotocol.com/protocol/content)",
+        "discriminator": {
+          "propertyName": "type"
+        }
+      },
+      "Annotations": {
+        "type": "object",
+        "properties": {
+          "audience": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/Role"
+            },
+            "description": "Intended recipients for this content, such as the user or assistant.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "lastModified": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Timestamp indicating when the underlying resource was last modified.",
+            "x-deserialize-default-on-error": true
+          },
+          "priority": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Relative importance of this content when clients choose what to surface.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Optional annotations for the client. The client can use annotations to inform how objects are used or displayed"
+      },
+      "Role": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "assistant",
+            "description": "The assistant side of a conversation."
+          },
+          {
+            "type": "string",
+            "const": "user",
+            "description": "The user side of a conversation."
+          }
+        ],
+        "description": "The sender or recipient of messages and data in a conversation."
+      },
+      "TextContent": {
+        "type": "object",
+        "properties": {
+          "annotations": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Annotations"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional annotations that help clients decide how to display or route this content.",
+            "x-deserialize-default-on-error": true
+          },
+          "text": {
+            "type": "string",
+            "description": "Text payload carried by this content block."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "description": "Text provided to or from an LLM."
+      },
+      "ImageContent": {
+        "type": "object",
+        "properties": {
+          "annotations": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Annotations"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional annotations that help clients decide how to display or route this content.",
+            "x-deserialize-default-on-error": true
+          },
+          "data": {
+            "type": "string",
+            "description": "Base64-encoded media payload."
+          },
+          "mimeType": {
+            "type": "string",
+            "description": "MIME type describing the encoded media payload."
+          },
+          "uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "URI associated with this resource or media payload.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "data",
+          "mimeType"
+        ],
+        "description": "An image provided to or from an LLM."
+      },
+      "AudioContent": {
+        "type": "object",
+        "properties": {
+          "annotations": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Annotations"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional annotations that help clients decide how to display or route this content.",
+            "x-deserialize-default-on-error": true
+          },
+          "data": {
+            "type": "string",
+            "description": "Base64-encoded media payload."
+          },
+          "mimeType": {
+            "type": "string",
+            "description": "MIME type describing the encoded media payload."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "data",
+          "mimeType"
+        ],
+        "description": "Audio provided to or from an LLM."
+      },
+      "ResourceLink": {
+        "type": "object",
+        "properties": {
+          "annotations": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Annotations"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional annotations that help clients decide how to display or route this content.",
+            "x-deserialize-default-on-error": true
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human-readable details shown with this protocol object.",
+            "x-deserialize-default-on-error": true
+          },
+          "mimeType": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "MIME type describing the encoded media payload.",
+            "x-deserialize-default-on-error": true
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name shown for this protocol object."
+          },
+          "size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional size of the linked resource in bytes, if known.",
+            "x-deserialize-default-on-error": true
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional display title for end-user UI.",
+            "x-deserialize-default-on-error": true
+          },
+          "uri": {
+            "type": "string",
+            "description": "URI associated with this resource or media payload."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "name",
+          "uri"
+        ],
+        "description": "A resource that the server is capable of reading, included in a prompt or tool call result."
+      },
+      "EmbeddedResourceResource": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/TextResourceContents",
+            "description": "Text resource contents embedded directly in the message."
+          },
+          {
+            "$ref": "#/components/schemas/BlobResourceContents",
+            "description": "Binary resource contents embedded directly in the message."
+          }
+        ],
+        "description": "Resource content that can be embedded in a message."
+      },
+      "TextResourceContents": {
+        "type": "object",
+        "properties": {
+          "mimeType": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "MIME type describing the encoded media payload.",
+            "x-deserialize-default-on-error": true
+          },
+          "text": {
+            "type": "string",
+            "description": "Text payload carried by this content block."
+          },
+          "uri": {
+            "type": "string",
+            "description": "URI associated with this resource or media payload."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "text",
+          "uri"
+        ],
+        "description": "Text-based resource contents."
+      },
+      "BlobResourceContents": {
+        "type": "object",
+        "properties": {
+          "blob": {
+            "type": "string",
+            "description": "Base64-encoded bytes for a binary resource payload."
+          },
+          "mimeType": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "MIME type describing the encoded media payload.",
+            "x-deserialize-default-on-error": true
+          },
+          "uri": {
+            "type": "string",
+            "description": "URI associated with this resource or media payload."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "blob",
+          "uri"
+        ],
+        "description": "Binary resource contents."
+      },
+      "EmbeddedResource": {
+        "type": "object",
+        "properties": {
+          "annotations": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Annotations"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional annotations that help clients decide how to display or route this content.",
+            "x-deserialize-default-on-error": true
+          },
+          "resource": {
+            "$ref": "#/components/schemas/EmbeddedResourceResource",
+            "description": "Embedded resource payload, either text or binary data."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "resource"
+        ],
+        "description": "The contents of a resource, embedded into a prompt or tool call result."
+      },
+      "PromptResponse": {
+        "type": "object",
+        "properties": {
+          "stopReason": {
+            "$ref": "#/components/schemas/StopReason",
+            "description": "Indicates why the agent stopped processing the turn."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "stopReason"
+        ],
+        "description": "Response from processing a user prompt.\n\nSee protocol docs: [Check for Completion](https://agentclientprotocol.com/protocol/prompt-turn#4-check-for-completion)",
+        "x-side": "agent",
+        "x-method": "session/prompt"
+      },
+      "StopReason": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "end_turn",
+            "description": "The turn ended successfully."
+          },
+          {
+            "type": "string",
+            "const": "max_tokens",
+            "description": "The turn ended because the agent reached the maximum number of tokens."
+          },
+          {
+            "type": "string",
+            "const": "max_turn_requests",
+            "description": "The turn ended because the agent reached the maximum number of allowed\nagent requests between user turns."
+          },
+          {
+            "type": "string",
+            "const": "refusal",
+            "description": "The turn ended because the agent refused to continue. The user prompt\nand everything that comes after it won't be included in the next\nprompt, so this should be reflected in the UI."
+          },
+          {
+            "type": "string",
+            "const": "cancelled",
+            "description": "The turn was cancelled by the client via `session/cancel`.\n\nThis stop reason MUST be returned when the client sends a `session/cancel`\nnotification, even if the cancellation causes exceptions in underlying operations.\nAgents should catch these exceptions and return this semantically meaningful\nresponse to confirm successful cancellation."
+          }
+        ],
+        "description": "Reasons why an agent stops processing a prompt turn.\n\nSee protocol docs: [Stop Reasons](https://agentclientprotocol.com/protocol/prompt-turn#stop-reasons)"
+      },
+      "ResumeSessionRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to resume."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "The working directory for this session. Must be an absolute path."
+          },
+          "additionalDirectories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional workspace roots to activate for this session. Each path must be absolute.\n\nWhen omitted or empty, no additional roots are activated. When non-empty,\nthis is the complete resulting additional-root list for the resumed\nsession. It may differ from any previously used or reported list as long as\nthe request `cwd` matches the session's `cwd`.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "mcpServers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/McpServer"
+            },
+            "description": "List of MCP servers to connect to for this session.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "cwd"
+        ],
+        "description": "Request parameters for resuming an existing session.\n\nResumes an existing session without returning previous messages (unlike `session/load`).\nThis is useful for agents that can resume sessions but don't implement full session loading.\n\nOnly available if the Agent supports the `sessionCapabilities.resume` capability.",
+        "x-side": "agent",
+        "x-method": "session/resume"
+      },
+      "McpServer": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/McpServerHttp",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "http"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "HTTP transport configuration\n\nOnly available when the Agent capabilities indicate `mcp_capabilities.http` is `true`."
+          },
+          {
+            "$ref": "#/components/schemas/McpServerSse",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "sse"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "SSE transport configuration\n\nOnly available when the Agent capabilities indicate `mcp_capabilities.sse` is `true`."
+          },
+          {
+            "$ref": "#/components/schemas/McpServerStdio",
+            "description": "Stdio transport configuration\n\nAll Agents MUST support this transport."
+          }
+        ],
+        "description": "Configuration for connecting to an MCP (Model Context Protocol) server.\n\nMCP servers provide tools and context that the agent can use when\nprocessing prompts.\n\nSee protocol docs: [MCP Servers](https://agentclientprotocol.com/protocol/session-setup#mcp-servers)"
+      },
+      "HttpHeader": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the HTTP header."
+          },
+          "value": {
+            "type": "string",
+            "description": "The value to set for the HTTP header."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "description": "An HTTP header to set when making requests to the MCP server."
+      },
+      "McpServerHttp": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Human-readable name identifying this MCP server."
+          },
+          "url": {
+            "type": "string",
+            "description": "URL to the MCP server."
+          },
+          "headers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HttpHeader"
+            },
+            "description": "HTTP headers to set when making requests to the MCP server."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "name",
+          "url",
+          "headers"
+        ],
+        "description": "HTTP transport configuration for MCP."
+      },
+      "McpServerSse": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Human-readable name identifying this MCP server."
+          },
+          "url": {
+            "type": "string",
+            "description": "URL to the MCP server."
+          },
+          "headers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HttpHeader"
+            },
+            "description": "HTTP headers to set when making requests to the MCP server."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "name",
+          "url",
+          "headers"
+        ],
+        "description": "SSE transport configuration for MCP."
+      },
+      "McpServerStdio": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Human-readable name identifying this MCP server."
+          },
+          "command": {
+            "type": "string",
+            "description": "Absolute path to the MCP server executable."
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Command-line arguments to pass to the MCP server."
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvVariable"
+            },
+            "description": "Environment variables to set when launching the MCP server."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "name",
+          "command",
+          "args",
+          "env"
+        ],
+        "description": "Stdio transport configuration for MCP."
+      },
+      "EnvVariable": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the environment variable."
+          },
+          "value": {
+            "type": "string",
+            "description": "The value to set for the environment variable."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "description": "An environment variable to set when launching an MCP server."
+      },
+      "ResumeSessionResponse": {
+        "type": "object",
+        "properties": {
+          "modes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionModeState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Initial mode state if supported by the Agent\n\nSee protocol docs: [Session Modes](https://agentclientprotocol.com/protocol/session-modes)",
+            "x-deserialize-default-on-error": true
+          },
+          "configOptions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigOption"
+            },
+            "description": "Initial session configuration options if supported by the Agent.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response from resuming an existing session.",
+        "x-side": "agent",
+        "x-method": "session/resume"
+      },
+      "LoadSessionRequest": {
+        "type": "object",
+        "properties": {
+          "mcpServers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/McpServer"
+            },
+            "description": "List of MCP servers to connect to for this session.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "cwd": {
+            "type": "string",
+            "description": "The working directory for this session. Must be an absolute path."
+          },
+          "additionalDirectories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional workspace roots to activate for this session. Each path must be absolute.\n\nWhen omitted or empty, no additional roots are activated. When non-empty,\nthis is the complete resulting additional-root list for the loaded\nsession. It may differ from any previously used or reported list as long as\nthe request `cwd` matches the session's `cwd`.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to load."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "mcpServers",
+          "cwd",
+          "sessionId"
+        ],
+        "description": "Request parameters for loading an existing session.\n\nOnly available if the Agent supports the `loadSession` capability.\n\nSee protocol docs: [Loading Sessions](https://agentclientprotocol.com/protocol/session-setup#loading-sessions)",
+        "x-side": "agent",
+        "x-method": "session/load"
+      },
+      "LoadSessionResponse": {
+        "type": "object",
+        "properties": {
+          "modes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionModeState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Initial mode state if supported by the Agent\n\nSee protocol docs: [Session Modes](https://agentclientprotocol.com/protocol/session-modes)",
+            "x-deserialize-default-on-error": true
+          },
+          "configOptions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigOption"
+            },
+            "description": "Initial session configuration options if supported by the Agent.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response from loading an existing session.",
+        "x-side": "agent",
+        "x-method": "session/load"
+      },
+      "CloseSessionRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to close."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "description": "Request parameters for closing an active session.\n\nIf supported, the agent **must** cancel any ongoing work related to the session\n(treat it as if `session/cancel` was called) and then free up any resources\nassociated with the session.\n\nOnly available if the Agent supports the `sessionCapabilities.close` capability.",
+        "x-side": "agent",
+        "x-method": "session/close"
+      },
+      "CloseSessionResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response from closing a session.",
+        "x-side": "agent",
+        "x-method": "session/close"
+      },
+      "SetSessionModeRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to set the mode for."
+          },
+          "modeId": {
+            "$ref": "#/components/schemas/SessionModeId",
+            "description": "The ID of the mode to set."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "modeId"
+        ],
+        "description": "Request parameters for setting a session mode.",
+        "x-side": "agent",
+        "x-method": "session/set_mode"
+      },
+      "SetSessionModeResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response to `session/set_mode` method.",
+        "x-side": "agent",
+        "x-method": "session/set_mode"
+      },
+      "SetSessionConfigOptionRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to set the configuration option for."
+          },
+          "configId": {
+            "$ref": "#/components/schemas/SessionConfigId",
+            "description": "The ID of the configuration option to set."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "configId"
+        ],
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "boolean",
+                "description": "The boolean value."
+              },
+              "type": {
+                "type": "string",
+                "const": "boolean"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "description": "A boolean value (`type: \"boolean\"`)."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "value": {
+                "$ref": "#/components/schemas/SessionConfigValueId",
+                "description": "The value ID."
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "description": "A [`SessionConfigValueId`] string value.\n\nThis is the default when `type` is absent on the wire. Unknown `type`\nvalues with string payloads also gracefully deserialize into this\nvariant."
+          }
+        ],
+        "description": "Request parameters for setting a session configuration option.",
+        "x-side": "agent",
+        "x-method": "session/set_config_option"
+      },
+      "SetSessionConfigOptionResponse": {
+        "type": "object",
+        "properties": {
+          "configOptions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigOption"
+            },
+            "description": "The full set of configuration options and their current values.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "configOptions"
+        ],
+        "description": "Response to `session/set_config_option` method.",
+        "x-side": "agent",
+        "x-method": "session/set_config_option"
+      },
+      "CancelNotification": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to cancel operations for."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "description": "Notification to cancel ongoing operations for a session.\n\nSee protocol docs: [Cancellation](https://agentclientprotocol.com/protocol/prompt-turn#cancellation)",
+        "x-side": "agent",
+        "x-method": "session/cancel"
+      },
+      "DeleteSessionRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to delete."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "description": "Request parameters for deleting an existing session from `session/list`.\n\nOnly available if the Agent supports the `sessionCapabilities.delete` capability.",
+        "x-side": "agent",
+        "x-method": "session/delete"
+      },
+      "DeleteSessionResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response from deleting a session.",
+        "x-side": "agent",
+        "x-method": "session/delete"
+      },
+      "ListSessionsRequest": {
+        "type": "object",
+        "properties": {
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Filter sessions by working directory. Must be an absolute path."
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque cursor token from a previous response's nextCursor field for cursor-based pagination"
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Request parameters for listing existing sessions.\n\nOnly available if the Agent supports the `sessionCapabilities.list` capability.",
+        "x-side": "agent",
+        "x-method": "session/list"
+      },
+      "ListSessionsResponse": {
+        "type": "object",
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionInfo"
+            },
+            "description": "Array of session information objects",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque cursor token. If present, pass this in the next request's cursor parameter\nto fetch the next page. If absent, there are no more results.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "description": "Response from listing sessions.",
+        "x-side": "agent",
+        "x-method": "session/list"
+      },
+      "SessionInfo": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "Unique identifier for the session"
+          },
+          "cwd": {
+            "type": "string",
+            "description": "The working directory for this session. Must be an absolute path."
+          },
+          "additionalDirectories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional workspace roots reported for this session. Each path must be absolute.\n\nWhen present, this is the complete ordered additional-root list reported\nby the Agent. Omitted and empty values are equivalent: the response\nreports no additional roots.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable title for the session",
+            "x-deserialize-default-on-error": true
+          },
+          "updatedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "ISO 8601 timestamp of last activity",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "cwd"
+        ],
+        "description": "Information about a session returned by session/list"
+      },
+      "RequestPermissionRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "toolCall": {
+            "$ref": "#/components/schemas/ToolCallUpdate",
+            "description": "Details about the tool call requiring permission."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PermissionOption"
+            },
+            "description": "Available permission options for the user to choose from."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "toolCall",
+          "options"
+        ],
+        "description": "Request for user permission to execute a tool call.\n\nSent when the agent needs authorization before performing a sensitive operation.\n\nSee protocol docs: [Requesting Permission](https://agentclientprotocol.com/protocol/tool-calls#requesting-permission)",
+        "x-side": "client",
+        "x-method": "session/request_permission"
+      },
+      "ToolCallUpdate": {
+        "type": "object",
+        "properties": {
+          "toolCallId": {
+            "$ref": "#/components/schemas/ToolCallId",
+            "description": "The ID of the tool call being updated."
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Update the tool kind.",
+            "x-deserialize-default-on-error": true
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolCallStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Update the execution status.",
+            "x-deserialize-default-on-error": true
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Update the human-readable title.",
+            "x-deserialize-default-on-error": true
+          },
+          "content": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ToolCallContent"
+            },
+            "description": "Replace the content collection.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "locations": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ToolCallLocation"
+            },
+            "description": "Replace the locations collection.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "rawInput": {
+            "description": "Update the raw input.",
+            "x-deserialize-default-on-error": true
+          },
+          "rawOutput": {
+            "description": "Update the raw output.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "toolCallId"
+        ],
+        "description": "An update to an existing tool call.\n\nUsed to report progress and results as tools execute. All fields except\nthe tool call ID are optional - only changed fields need to be included.\n\nSee protocol docs: [Updating](https://agentclientprotocol.com/protocol/tool-calls#updating)"
+      },
+      "ToolCallId": {
+        "type": "string",
+        "description": "Unique identifier for a tool call within a session."
+      },
+      "ToolKind": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "read",
+            "description": "Reading files or data."
+          },
+          {
+            "type": "string",
+            "const": "edit",
+            "description": "Modifying files or content."
+          },
+          {
+            "type": "string",
+            "const": "delete",
+            "description": "Removing files or data."
+          },
+          {
+            "type": "string",
+            "const": "move",
+            "description": "Moving or renaming files."
+          },
+          {
+            "type": "string",
+            "const": "search",
+            "description": "Searching for information."
+          },
+          {
+            "type": "string",
+            "const": "execute",
+            "description": "Running commands or code."
+          },
+          {
+            "type": "string",
+            "const": "think",
+            "description": "Internal reasoning or planning."
+          },
+          {
+            "type": "string",
+            "const": "fetch",
+            "description": "Retrieving external data."
+          },
+          {
+            "type": "string",
+            "const": "switch_mode",
+            "description": "Switching the current session mode."
+          },
+          {
+            "type": "string",
+            "const": "other",
+            "description": "Other tool types (default)."
+          }
+        ],
+        "description": "Categories of tools that can be invoked.\n\nTool kinds help clients choose appropriate icons and optimize how they\ndisplay tool execution progress.\n\nSee protocol docs: [Creating](https://agentclientprotocol.com/protocol/tool-calls#creating)"
+      },
+      "ToolCallStatus": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "pending",
+            "description": "The tool call hasn't started running yet because the input is either\nstreaming or we're awaiting approval."
+          },
+          {
+            "type": "string",
+            "const": "in_progress",
+            "description": "The tool call is currently running."
+          },
+          {
+            "type": "string",
+            "const": "completed",
+            "description": "The tool call completed successfully."
+          },
+          {
+            "type": "string",
+            "const": "failed",
+            "description": "The tool call failed with an error."
+          }
+        ],
+        "description": "Execution status of a tool call.\n\nTool calls progress through different statuses during their lifecycle.\n\nSee protocol docs: [Status](https://agentclientprotocol.com/protocol/tool-calls#status)"
+      },
+      "ToolCallContent": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/Content",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "content"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Standard content block (text, images, resources)."
+          },
+          {
+            "$ref": "#/components/schemas/Diff",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "diff"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "File modification shown as a diff."
+          },
+          {
+            "$ref": "#/components/schemas/Terminal",
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "terminal"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "description": "Embed a terminal created with `terminal/create` by its id.\n\nThe terminal must be added before calling `terminal/release`.\n\nSee protocol docs: [Terminal](https://agentclientprotocol.com/protocol/terminals)"
+          }
+        ],
+        "description": "Content produced by a tool call.\n\nTool calls can produce different types of content including\nstandard content blocks (text, images) or file diffs.\n\nSee protocol docs: [Content](https://agentclientprotocol.com/protocol/tool-calls#content)",
+        "discriminator": {
+          "propertyName": "type"
+        }
+      },
+      "Content": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/ContentBlock",
+            "description": "The actual content block."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "description": "Standard content block (text, images, resources)."
+      },
+      "Diff": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The absolute file path being modified."
+          },
+          "oldText": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The original content (None for new files).",
+            "x-deserialize-default-on-error": true
+          },
+          "newText": {
+            "type": "string",
+            "description": "The new content after modification."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "path",
+          "newText"
+        ],
+        "description": "A diff representing file modifications.\n\nShows changes to files in a format suitable for display in the client UI.\n\nSee protocol docs: [Content](https://agentclientprotocol.com/protocol/tool-calls#content)"
+      },
+      "TerminalId": {
+        "type": "string",
+        "description": "Typed identifier used for terminal values on the wire."
+      },
+      "Terminal": {
+        "type": "object",
+        "properties": {
+          "terminalId": {
+            "$ref": "#/components/schemas/TerminalId",
+            "description": "Identifier of the terminal instance to embed in the content stream."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "terminalId"
+        ],
+        "description": "Embed a terminal created with `terminal/create` by its id.\n\nThe terminal must be added before calling `terminal/release`.\n\nSee protocol docs: [Terminal](https://agentclientprotocol.com/protocol/terminals)"
+      },
+      "ToolCallLocation": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The absolute file path being accessed or modified."
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Optional line number within the file.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "description": "A file location being accessed or modified by a tool.\n\nEnables clients to implement \"follow-along\" features that track\nwhich files the agent is working with in real-time.\n\nSee protocol docs: [Following the Agent](https://agentclientprotocol.com/protocol/tool-calls#following-the-agent)"
+      },
+      "PermissionOption": {
+        "type": "object",
+        "properties": {
+          "optionId": {
+            "$ref": "#/components/schemas/PermissionOptionId",
+            "description": "Unique identifier for this permission option."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable label to display to the user."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PermissionOptionKind",
+            "description": "Hint about the nature of this permission option."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "optionId",
+          "name",
+          "kind"
+        ],
+        "description": "An option presented to the user when requesting permission."
+      },
+      "PermissionOptionId": {
+        "type": "string",
+        "description": "Unique identifier for a permission option."
+      },
+      "PermissionOptionKind": {
+        "oneOf": [
+          {
+            "type": "string",
+            "const": "allow_once",
+            "description": "Allow this operation only this time."
+          },
+          {
+            "type": "string",
+            "const": "allow_always",
+            "description": "Allow this operation and remember the choice."
+          },
+          {
+            "type": "string",
+            "const": "reject_once",
+            "description": "Reject this operation only this time."
+          },
+          {
+            "type": "string",
+            "const": "reject_always",
+            "description": "Reject this operation and remember the choice."
+          }
+        ],
+        "description": "The type of permission option being presented to the user.\n\nHelps clients choose appropriate icons and UI treatment."
+      },
+      "RequestPermissionResponse": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "$ref": "#/components/schemas/RequestPermissionOutcome",
+            "description": "The user's decision on the permission request."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "description": "Response to a permission request.",
+        "x-side": "client",
+        "x-method": "session/request_permission"
+      },
+      "RequestPermissionOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "cancelled"
+              }
+            },
+            "required": [
+              "outcome"
+            ],
+            "description": "The prompt turn was cancelled before the user responded.\n\nWhen a client sends a `session/cancel` notification to cancel an ongoing\nprompt turn, it MUST respond to all pending `session/request_permission`\nrequests with this `Cancelled` outcome.\n\nSee protocol docs: [Cancellation](https://agentclientprotocol.com/protocol/prompt-turn#cancellation)"
+          },
+          {
+            "$ref": "#/components/schemas/SelectedPermissionOutcome",
+            "type": "object",
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "const": "selected"
+              }
+            },
+            "required": [
+              "outcome"
+            ],
+            "description": "The user selected one of the provided options."
+          }
+        ],
+        "description": "The outcome of a permission request.",
+        "discriminator": {
+          "propertyName": "outcome"
+        }
+      },
+      "SelectedPermissionOutcome": {
+        "type": "object",
+        "properties": {
+          "optionId": {
+            "$ref": "#/components/schemas/PermissionOptionId",
+            "description": "The ID of the option the user selected."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "optionId"
+        ],
+        "description": "The user selected one of the provided options."
+      },
+      "ReadTextFileRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path to the file to read."
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Line number to start reading from (1-based).",
+            "x-deserialize-default-on-error": true
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0,
+            "description": "Maximum number of lines to read.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "path"
+        ],
+        "description": "Request to read content from a text file.\n\nOnly available if the client supports the `fs.readTextFile` capability.",
+        "x-side": "client",
+        "x-method": "fs/read_text_file"
+      },
+      "ReadTextFileResponse": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "Content payload returned by this response."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "description": "Response containing the contents of a text file.",
+        "x-side": "client",
+        "x-method": "fs/read_text_file"
+      },
+      "WriteTextFileRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path to the file to write."
+          },
+          "content": {
+            "type": "string",
+            "description": "The text content to write to the file."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "path",
+          "content"
+        ],
+        "description": "Request to write content to a text file.\n\nOnly available if the client supports the `fs.writeTextFile` capability.",
+        "x-side": "client",
+        "x-method": "fs/write_text_file"
+      },
+      "WriteTextFileResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response to `fs/write_text_file`",
+        "x-side": "client",
+        "x-method": "fs/write_text_file"
+      },
+      "CreateTerminalRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "command": {
+            "type": "string",
+            "description": "The command to execute."
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Array of command arguments.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvVariable"
+            },
+            "description": "Environment variables for the command.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Working directory for the command. Must be an absolute path.",
+            "x-deserialize-default-on-error": true
+          },
+          "outputByteLimit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Maximum number of output bytes to retain.\n\nWhen the limit is exceeded, the Client truncates from the beginning of the output\nto stay within the limit.\n\nThe Client MUST ensure truncation happens at a character boundary to maintain valid\nstring output, even if this means the retained output is slightly less than the\nspecified limit.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "command"
+        ],
+        "description": "Request to create a new terminal and execute a command.",
+        "x-side": "client",
+        "x-method": "terminal/create"
+      },
+      "CreateTerminalResponse": {
+        "type": "object",
+        "properties": {
+          "terminalId": {
+            "$ref": "#/components/schemas/TerminalId",
+            "description": "The unique identifier for the created terminal."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "terminalId"
+        ],
+        "description": "Response containing the ID of the created terminal.",
+        "x-side": "client",
+        "x-method": "terminal/create"
+      },
+      "TerminalOutputRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "terminalId": {
+            "$ref": "#/components/schemas/TerminalId",
+            "description": "The ID of the terminal to get output from."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "terminalId"
+        ],
+        "description": "Request to get the current output and status of a terminal.",
+        "x-side": "client",
+        "x-method": "terminal/output"
+      },
+      "TerminalOutputResponse": {
+        "type": "object",
+        "properties": {
+          "output": {
+            "type": "string",
+            "description": "The terminal output captured so far."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether the output was truncated due to byte limits."
+          },
+          "exitStatus": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TerminalExitStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exit status if the command has completed.",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "output",
+          "truncated"
+        ],
+        "description": "Response containing the terminal output and exit status.",
+        "x-side": "client",
+        "x-method": "terminal/output"
+      },
+      "TerminalExitStatus": {
+        "type": "object",
+        "properties": {
+          "exitCode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0,
+            "description": "The process exit code (may be null if terminated by signal).",
+            "x-deserialize-default-on-error": true
+          },
+          "signal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The signal that terminated the process (may be null if exited normally).",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Exit status of a terminal command."
+      },
+      "ReleaseTerminalRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "terminalId": {
+            "$ref": "#/components/schemas/TerminalId",
+            "description": "The ID of the terminal to release."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "terminalId"
+        ],
+        "description": "Request to release a terminal and free its resources.",
+        "x-side": "client",
+        "x-method": "terminal/release"
+      },
+      "ReleaseTerminalResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response to terminal/release method",
+        "x-side": "client",
+        "x-method": "terminal/release"
+      },
+      "WaitForTerminalExitRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "terminalId": {
+            "$ref": "#/components/schemas/TerminalId",
+            "description": "The ID of the terminal to wait for."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "terminalId"
+        ],
+        "description": "Request to wait for a terminal command to exit.",
+        "x-side": "client",
+        "x-method": "terminal/wait_for_exit"
+      },
+      "WaitForTerminalExitResponse": {
+        "type": "object",
+        "properties": {
+          "exitCode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint32",
+            "minimum": 0,
+            "description": "The process exit code (may be null if terminated by signal).",
+            "x-deserialize-default-on-error": true
+          },
+          "signal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The signal that terminated the process (may be null if exited normally).",
+            "x-deserialize-default-on-error": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response containing the exit status of a terminal command.",
+        "x-side": "client",
+        "x-method": "terminal/wait_for_exit"
+      },
+      "KillTerminalRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The session ID for this request."
+          },
+          "terminalId": {
+            "$ref": "#/components/schemas/TerminalId",
+            "description": "The ID of the terminal to kill."
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "terminalId"
+        ],
+        "description": "Request to kill a terminal without releasing it.",
+        "x-side": "client",
+        "x-method": "terminal/kill"
+      },
+      "KillTerminalResponse": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "Response to `terminal/kill` method",
+        "x-side": "client",
+        "x-method": "terminal/kill"
+      }
+    }
+  }
+}

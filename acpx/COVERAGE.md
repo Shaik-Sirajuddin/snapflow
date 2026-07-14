@@ -2699,3 +2699,51 @@ prior phase.
 change to wire behavior or router logic -- purely additive generated
 documentation over already-existing dispatch behavior and (phase B's)
 method registry.
+
+## 2026-07-14 -- full transport schema pipeline phase D: OpenAPI companion document (header contracts finally schema'd)
+
+Fourth phase of the `acpx-openrpc-schema` plan, and the one that
+actually closes phase 21's explicit deferral: `Authorization`,
+`X-Acpx-Tenant`, `X-Acpx-Profile` now have a real, checkable schema
+representation for the first time. Neither `acpx-wire.schema.json` (a
+bare JSON Schema body document) nor `acpx.openrpc.json` (OpenRPC has no
+header-parameter concept either) can structurally represent a transport
+header; OpenAPI's native `parameters: [{"in": "header"}]` object model
+can, so this phase adds a small, hand-composed OpenAPI 3.1 companion
+document for exactly that -- not folded into the OpenRPC document, kept
+deliberately separate per `00-goal.md`'s "Why OpenRPC, not OpenAPI"
+rationale.
+
+`docs/schema/acpx-http.openapi.json`: two paths (`POST /rpc`, `GET
+/ws`, the only two `acpx-server/src/transport/http.rs` exposes -- hand-
+composed rather than derived, not worth path-discovery tooling for
+exactly two fixed paths), each with real header `parameters` objects
+for the three contracts above (`X-Acpx-Profile` correctly omitted from
+`/ws`'s parameter list, matching `ws.rs`'s own doc comment: "No
+`X-Acpx-Profile` header equivalent on this transport"), `$ref`-ing the
+same `Request`/`Response` envelope types phases B/C already registered
+via `schema.rs`'s `register_all_defs` -- one schema registry, three
+documents, never three different descriptions of the same body shape.
+stdio is explicitly out of scope for this document (no headers exist on
+that transport at all); `acpx.openrpc.json`'s `servers` array remains
+the one place stdio is listed as a reachable transport.
+
+New pieces: `acpx-proto/src/openapi.rs`, `acpx-proto/src/bin/
+gen_openapi.rs` (`cargo run -p acpx-proto --bin gen-openapi`),
+`scripts/gen_openapi.sh`, `acpx-proto/tests/openapi_test.rs` (same
+drift-guard pattern as the other two generated documents). Also made
+`openrpc.rs`'s `rewrite_refs_to_components` helper `pub(crate)` so this
+new module can reuse it rather than duplicating the `$defs` ->
+`components/schemas` rewrite logic a third time.
+
+Workspace test count after this phase: **268 passed, 0 failed, 6
+ignored** (up from 265/0/6 -- two `openapi::tests` unit tests plus the
+new `openapi_test.rs` integration test). `cargo fmt --all --check` and
+`cargo build --workspace --tests` both clean. `cargo clippy` still not
+installed in this environment, same standing limitation as every prior
+phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to wire behavior or router logic -- purely additive generated
+documentation over already-existing transport behavior
+(`http.rs`/`ws.rs`'s header handling was not touched, only described).

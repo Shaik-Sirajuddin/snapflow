@@ -19,3 +19,7 @@ path = "src/bin/gen_schema.rs"
 [[bin]]
 name = "gen-openrpc"
 path = "src/bin/gen_openrpc.rs"
+
+[[bin]]
+name = "gen-openapi"
+path = "src/bin/gen_openapi.rs"

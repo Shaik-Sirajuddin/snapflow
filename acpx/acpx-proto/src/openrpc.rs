@@ -31,7 +31,7 @@ use crate::schema::register_all_defs;
 /// schemas` map (borrowed from OpenAPI 3) is addressed the latter way.
 /// Recurses into every object/array since a `$ref` can appear at any
 /// nesting depth (inside `properties`, `items`, `anyOf`, ...).
-fn rewrite_refs_to_components(value: &mut Value) {
+pub(crate) fn rewrite_refs_to_components(value: &mut Value) {
     match value {
         Value::Object(map) => {
             if let Some(Value::String(s)) = map.get_mut("$ref") {
