@@ -8,6 +8,7 @@ export component Sidebar inherits Rectangle {
     in property <[ThreadItem]> threads: [];
     in property <int> selected-thread: 0;
     callback thread-selected(int);
+    callback search-changed(string);
 
     width: 220px;
     background: Palette.sys-sidebar;
@@ -31,11 +32,51 @@ export component Sidebar inherits Rectangle {
                     // Visual-only placeholder pending the dynamic
                     // thread-list gap (settings-gear real behavior),
                     // tracked separately -- unchanged from pre-reskin.
-                    text: "settings";
+                    text: "\u{2699}"; // gear glyph -- placement-only, per
+                                       // Phase 2's scope (still no click
+                                       // behavior, dynamic-thread-list gap
+                                       // tracked separately).
                     color: Palette.sys-text-muted;
-                    font-size: 11px;
+                    font-size: 13px;
                     font-family: Palette.font-sans;
                     vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle {
+            height: 32px;
+            background: Palette.sys-sidebar;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 4px;
+                Text {
+                    text: "\u{2315}"; // magnifier glyph
+                    color: Palette.sys-text-muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    // TextInput has no built-in placeholder support
+                    // (that's std-widgets' LineEdit, which pulls in a
+                    // heavier widget style dependency this crate doesn't
+                    // otherwise use) -- a manually-overlaid Text shown
+                    // only while empty reproduces the HTML's "Search
+                    // active threads..." placeholder with no new deps.
+                    Text {
+                        text: "Search active threads...";
+                        color: Palette.sys-text-muted;
+                        font-family: Palette.font-sans;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        visible: search-input.text == "";
+                    }
+                    search-input := TextInput {
+                        color: Palette.sys-text-primary;
+                        font-family: Palette.font-sans;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        edited => { search-changed(self.text); }
+                    }
                 }
             }
         }
@@ -61,6 +102,34 @@ export component Sidebar inherits Rectangle {
                     color: Palette.sys-text-primary;
                     font-size: 12px;
                     font-family: Palette.font-sans;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle { } // spacer -- pushes the footer chip to the bottom
+        Rectangle {
+            height: 40px;
+            background: Palette.sys-card;
+            border-color: Palette.sys-border;
+            border-width: 1px;
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 6px;
+                Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Palette.sys-text-secondary;
+                }
+                Text {
+                    // Static identity chip -- distinct from the header's
+                    // per-thread `agent-badge` (Phase 3, in ChatArea);
+                    // this is the workspace-level identity, unchanged
+                    // regardless of which thread is selected.
+                    text: "Media Conductor";
+                    color: Palette.sys-text-secondary;
+                    font-family: Palette.font-sans;
+                    font-size: 11px;
                     vertical-alignment: center;
                 }
             }

@@ -29,6 +29,7 @@ export component ChatPanel inherits Window {
 
     callback thread-selected(int);
     callback send-requested();
+    callback search-changed(string);
 
     HorizontalLayout {
         Sidebar {
@@ -38,6 +39,7 @@ export component ChatPanel inherits Window {
                 selected-thread = i;
                 thread-selected(i);
             }
+            search-changed(q) => { search-changed(q); }
         }
         ChatArea {
             active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";

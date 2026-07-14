@@ -15,9 +15,11 @@
 //! touches Slint state directly -- see `agent_bridge.rs`.
 
 mod agent_bridge;
+mod models;
 mod theme;
 
 use agent_bridge::AgentBridge;
+use models::{build_thread_items, to_message_model, ThreadState};
 use rui_acp_client::{AgentEvent, ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -38,43 +40,6 @@ const THREAD_NAMES: &[&str] = &[
     "Refactor filters",
     "Export pipeline bug",
 ];
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ThreadState {
-    Idle,
-    Loading,
-    Error,
-}
-
-impl ThreadState {
-    fn as_str(self) -> &'static str {
-        match self {
-            ThreadState::Idle => "idle",
-            ThreadState::Loading => "loading",
-            ThreadState::Error => "error",
-        }
-    }
-}
-
-fn message_kind_str(kind: &MessageKind) -> &'static str {
-    match kind {
-        MessageKind::User => "user",
-        MessageKind::Agent => "agent",
-        MessageKind::Thinking => "thinking",
-        MessageKind::ToolCall => "tool-call",
-    }
-}
-
-fn to_message_model(msgs: Vec<ChatMessage>) -> ModelRc<MessageItem> {
-    let items: Vec<MessageItem> = msgs
-        .into_iter()
-        .map(|m| MessageItem {
-            kind: message_kind_str(&m.kind).into(),
-            text: m.text.into(),
-        })
-        .collect();
-    ModelRc::new(VecModel::from(items))
-}
 
 /// Maps a Qt key event (`QKeyEvent::key()`'s `int` plus `QKeyEvent::text()`)
 /// to a Slint key-event `SharedString`. Qt::Key special codes below are the
@@ -136,23 +101,44 @@ struct PanelSingleton {
     height: u32,
     bridge: Option<AgentBridge>,
     thread_state: RefCell<Vec<ThreadState>>,
+    /// Phase 2 (chat-panel-ui-theme-parity.md): current sidebar search
+    /// filter, empty means "show all". `THREAD_NAMES` never changes at
+    /// runtime, so this is enough state to fully rebuild the filtered
+    /// model on every keystroke -- see `refresh_threads_model`.
+    search_query: RefCell<String>,
+    /// Maps each currently-*visible* (post-filter) row index back to its
+    /// real index into `THREAD_NAMES`/`thread_state`/the agent bridge --
+    /// filtering means `threads[i]` in Slint is no longer the same `i` as
+    /// `bridge.history(i)`; every Rust-side handler that receives a
+    /// `selected-thread`/`thread-selected(i)` value from Slint must
+    /// translate it through this map first (`real_index`). Rebuilt by
+    /// `refresh_threads_model` every time the filter or thread_state
+    /// changes.
+    visible_indices: RefCell<Vec<usize>>,
 }
 
 impl PanelSingleton {
     /// Rebuilds and pushes the `threads` model from `THREAD_NAMES` +
-    /// current `thread_state`. Called any time a thread's status changes
-    /// (send in flight, turn ended, error).
+    /// current `thread_state`, narrowed by `search_query` (Phase 2's
+    /// real client-side filter -- see `models::build_thread_items`).
+    /// Called any time a thread's status changes (send in flight, turn
+    /// ended, error) or the search box is edited.
     fn refresh_threads_model(&self) {
         let state = self.thread_state.borrow();
-        let items: Vec<ThreadItem> = THREAD_NAMES
-            .iter()
-            .zip(state.iter())
-            .map(|(name, st)| ThreadItem {
-                name: (*name).into(),
-                status: st.as_str().into(),
-            })
-            .collect();
+        let query = self.search_query.borrow();
+        let items = build_thread_items(THREAD_NAMES, &state, &query);
+        *self.visible_indices.borrow_mut() = items.iter().map(|i| i.real_index).collect();
+        let items: Vec<ThreadItem> = items.into_iter().map(|i| i.item).collect();
         self.component.set_threads(ModelRc::new(VecModel::from(items)));
+    }
+
+    /// Translates a Slint-side filtered-list index (what `thread-selected`
+    /// callbacks and `get_selected_thread()` hand back) into the real
+    /// index the agent bridge/`thread_state` use. `None` if out of range
+    /// (e.g. the filter just emptied the list out from under a stale
+    /// selection).
+    fn real_index(&self, filtered_idx: usize) -> Option<usize> {
+        self.visible_indices.borrow().get(filtered_idx).copied()
     }
 
     /// Applies queued agent-bridge events to `thread_state` and, if the
@@ -166,13 +152,17 @@ impl PanelSingleton {
         if events.is_empty() {
             return false;
         }
-        let selected = self.component.get_selected_thread() as usize;
+        // `selected-thread` is a *filtered-list* index (Phase 2) --
+        // translate to the real thread index before comparing against
+        // `ev.thread_index`, which always refers to the real index the
+        // agent bridge knows about.
+        let selected = self.real_index(self.component.get_selected_thread() as usize);
         let mut selected_touched = false;
         {
             let mut state = self.thread_state.borrow_mut();
             for ev in &events {
                 let idx = ev.thread_index;
-                if idx == selected {
+                if Some(idx) == selected {
                     selected_touched = true;
                 }
                 if let Some(slot) = state.get_mut(idx) {
@@ -185,7 +175,7 @@ impl PanelSingleton {
             }
         }
         self.refresh_threads_model();
-        if selected_touched {
+        if let (true, Some(selected)) = (selected_touched, selected) {
             self.component.set_messages(to_message_model(bridge.history(selected)));
         }
         true
@@ -264,6 +254,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             height,
             bridge,
             thread_state: RefCell::new(initial_state),
+            search_query: RefCell::new(String::new()),
+            visible_indices: RefCell::new(Vec::new()),
         };
         panel.refresh_threads_model();
         if !THREAD_NAMES.is_empty() {
@@ -277,8 +269,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             let Some(component) = component_weak.upgrade() else { return };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
+                    // `idx` is a filtered-list index (Phase 2) -- translate
+                    // to the real thread index before touching the bridge.
+                    let Some(real_idx) = panel.real_index(idx as usize) else { return };
                     if let Some(bridge) = &panel.bridge {
-                        component.set_messages(to_message_model(bridge.history(idx as usize)));
+                        component.set_messages(to_message_model(bridge.history(real_idx)));
                     }
                 }
             });
@@ -292,20 +287,46 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             if text.is_empty() {
                 return;
             }
-            let idx = component.get_selected_thread() as usize;
+            let filtered_idx = component.get_selected_thread() as usize;
             component.set_compose_text("".into());
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(idx) = panel.real_index(filtered_idx) else { return };
                     let Some(bridge) = &panel.bridge else { return };
                     bridge.push_local(idx, ChatMessage { kind: MessageKind::User, text: text.to_string() });
                     if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
                         *slot = ThreadState::Loading;
                     }
                     panel.refresh_threads_model();
-                    if idx == component.get_selected_thread() as usize {
+                    if Some(idx) == panel.real_index(component.get_selected_thread() as usize) {
                         component.set_messages(to_message_model(bridge.history(idx)));
                     }
                     bridge.send_prompt(idx, text.to_string());
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_search_changed(move |query| {
+            let Some(component) = component_weak.upgrade() else { return };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    *panel.search_query.borrow_mut() = query.to_string();
+                    panel.refresh_threads_model();
+                    // The filter can move/remove the previously-selected
+                    // row entirely -- reset to the first still-visible
+                    // thread (Phase 2 UX decision, documented in the
+                    // theme-parity plan's Phase 2 section) rather than
+                    // leaving a stale/out-of-range selection.
+                    component.set_selected_thread(0);
+                    match panel.real_index(0) {
+                        Some(real_idx) => {
+                            if let Some(bridge) = &panel.bridge {
+                                component.set_messages(to_message_model(bridge.history(real_idx)));
+                            }
+                        }
+                        None => component.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new()))),
+                    }
                 }
             });
         });
