@@ -1,0 +1,43 @@
+import { Palette } from "palette.slint";
+import { MessageItem } from "types.slint";
+
+// One reusable message card, parameterized by kind (user/agent/tool-call/
+// thinking) -- Phase 3 of chat-panel-ui-theme-parity.md will extend this
+// with a `status` field for tool-call cards (text badge only, monochrome
+// -- see palette.slint's status note) without touching sidebar.slint or
+// chat-area.slint.
+export component MessageCard inherits Rectangle {
+    in property <MessageItem> item;
+
+    property <bool> is-user: item.kind == "user";
+    property <bool> is-tool-call: item.kind == "tool-call";
+    property <bool> is-thinking: item.kind == "thinking";
+
+    background: is-user ? Palette.sys-user-bubble
+        : is-tool-call ? Palette.sys-terminal-bg
+        : Palette.sys-card;
+    border-color: is-user ? Palette.sys-user-bubble-border
+        : is-tool-call ? Palette.sys-terminal-border
+        : Palette.sys-agent-bubble-border;
+    border-width: 1px;
+    border-radius: Palette.radius-md;
+
+    HorizontalLayout {
+        padding: 8px;
+        spacing: 6px;
+        Rectangle {
+            width: is-tool-call ? 3px : 0px;
+            background: Palette.sys-text-muted;
+        }
+        Text {
+            text: item.text;
+            font-italic: is-thinking;
+            font-family: is-tool-call ? Palette.font-mono : Palette.font-sans;
+            color: is-user ? Palette.sys-user-bubble-text
+                : is-tool-call ? Palette.sys-terminal-text
+                : is-thinking ? Palette.sys-text-muted
+                : Palette.sys-agent-bubble-text;
+            wrap: word-wrap;
+        }
+    }
+}

@@ -1,0 +1,89 @@
+import { Palette } from "palette.slint";
+import { MessageItem } from "types.slint";
+import { MessageCard } from "message_card.slint";
+
+// Header + message stream + compose bar -- Phase 3 of
+// chat-panel-ui-theme-parity.md extends the header with an
+// icon/description and the compose bar with the multi-line/hint-text
+// treatment, without touching app.slint or sidebar.slint.
+export component ChatArea inherits Rectangle {
+    in property <string> active-thread-name: "";
+    in property <[MessageItem]> messages: [];
+    in property <string> agent-badge: "agent . ask";
+    in-out property <string> compose-text: "";
+    callback send-requested();
+
+    background: Palette.sys-outer;
+
+    VerticalLayout {
+        Rectangle {
+            height: 40px;
+            background: Palette.sys-card;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 8px;
+                Text {
+                    text: active-thread-name;
+                    color: Palette.sys-text-primary;
+                    font-size: 13px;
+                    font-family: Palette.font-sans;
+                    vertical-alignment: center;
+                }
+                Rectangle { }
+                Rectangle {
+                    background: Palette.sys-primary-container;
+                    border-radius: Palette.radius-sm;
+                    HorizontalLayout {
+                        padding: 4px;
+                        Text {
+                            text: agent-badge;
+                            color: Palette.sys-text-secondary;
+                            font-size: 11px;
+                            font-family: Palette.font-mono;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+        Flickable {
+            VerticalLayout {
+                padding: 10px;
+                spacing: 8px;
+                for msg in messages : MessageCard {
+                    item: msg;
+                }
+            }
+        }
+        Rectangle {
+            height: 44px;
+            background: Palette.sys-card;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 6px;
+                compose := TextInput {
+                    text <=> compose-text;
+                    color: Palette.sys-text-primary;
+                    font-family: Palette.font-sans;
+                    vertical-alignment: center;
+                    accepted => { send-requested(); }
+                }
+                Rectangle {
+                    width: 60px;
+                    background: Palette.sys-primary;
+                    border-radius: Palette.radius-sm;
+                    TouchArea {
+                        clicked => { send-requested(); }
+                    }
+                    Text {
+                        text: "Send";
+                        color: Palette.sys-on-primary;
+                        font-family: Palette.font-sans;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

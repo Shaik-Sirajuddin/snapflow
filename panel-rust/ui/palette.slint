@@ -1,0 +1,62 @@
+// Phase 1 (chat-panel-ui-theme-parity.md): Slint-side palette + radius
+// tokens. Values here are transcribed verbatim from
+// `panel-rust/src/theme.rs` (Phase 0, unit-tested against
+// `ui_html/index.html`'s `:root`/`.dark` CSS blocks) -- kept as a
+// second, Slint-native source of truth rather than plumbed across the
+// Rust/Slint FFI boundary at runtime, since Slint has no mechanism to
+// import a Rust `const` table at compile time. If either file changes,
+// the other must be updated to match -- `theme.rs`'s doc comment cross
+// references this file for the same reason.
+//
+// Status is deliberately monochrome (see theme.rs's module doc) -- no
+// status-color properties are defined here by design.
+export global Palette {
+    in property <string> theme: "dark";
+    in property <string> radius-preset: "classic";
+
+    property <bool> is-dark: theme != "light";
+
+    // sys.* role aliases, dark value first / light value second per role
+    // -- table + md-sys-color source names documented in theme.rs.
+    out property <color> sys-outer: is-dark ? #000000 : #ffffff;
+    out property <color> sys-sidebar: is-dark ? #09090b : #f4f4f7;
+    out property <color> sys-card: is-dark ? #09090b : #ffffff;
+    out property <color> sys-chat: is-dark ? #131313 : #fafafc8c;
+    out property <color> sys-border: is-dark ? #ffffff3c : #0000000f;
+    out property <color> sys-border-strong: is-dark ? #ffffff78 : #0000001f;
+    out property <color> sys-text-primary: is-dark ? #f2f2f7 : #121212;
+    out property <color> sys-text-secondary: is-dark ? #a1a1a6 : #555558;
+    out property <color> sys-text-muted: is-dark ? #636366 : #8a8a8f;
+    out property <color> sys-primary: is-dark ? #ffffff : #000000;
+    out property <color> sys-primary-container: is-dark ? #1c1c1e : #e5e5ea;
+    out property <color> sys-on-primary: is-dark ? #000000 : #ffffff;
+    out property <color> sys-on-primary-container: is-dark ? #ffffff : #000000;
+    // Same-value aliases per theme.rs's SysRoles mapping table.
+    out property <color> sys-user-bubble: is-dark ? #151518 : #eaeaea;
+    out property <color> sys-user-bubble-border: sys-border;
+    out property <color> sys-user-bubble-text: sys-text-primary;
+    out property <color> sys-agent-bubble: sys-sidebar;
+    out property <color> sys-agent-bubble-border: sys-border;
+    out property <color> sys-agent-bubble-text: sys-text-primary;
+    out property <color> sys-terminal-bg: sys-sidebar;
+    out property <color> sys-terminal-border: sys-border;
+    out property <color> sys-terminal-text: sys-text-secondary;
+
+    // Radius "finish" presets -- verbatim from index.html's
+    // `radiusPresets` object (theme.rs::RadiusPreset::scale()).
+    property <bool> is-sharp: radius-preset == "sharp";
+    property <bool> is-organic: radius-preset == "organic";
+    out property <length> radius-sm: is-sharp ? 0px : is-organic ? 12px : 6px;
+    out property <length> radius-md: is-sharp ? 0px : is-organic ? 18px : 10px;
+    out property <length> radius-lg: is-sharp ? 0px : is-organic ? 28px : 16px;
+
+    // Font families -- theme.rs::FontTokens. Registered at startup via
+    // `slint::register_font_from_memory` in `panel_rust_create` (Phase 1
+    // note: bundling the actual .ttf bytes is a separate, explicitly
+    // tracked sub-step -- see the theme-parity plan's Phase 1 acceptance
+    // criteria; until the fonts are bundled, these names fall back to
+    // Slint's default font, which is an accepted interim state, not
+    // silently pretending the fonts are embedded).
+    out property <string> font-sans: "Plus Jakarta Sans";
+    out property <string> font-mono: "JetBrains Mono";
+}

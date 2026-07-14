@@ -1,0 +1,69 @@
+import { Palette } from "palette.slint";
+import { ThreadItem } from "types.slint";
+
+// Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
+// extend this with a real search box + filtered model and a footer
+// identity chip, without touching app.slint or chat-area.slint.
+export component Sidebar inherits Rectangle {
+    in property <[ThreadItem]> threads: [];
+    in property <int> selected-thread: 0;
+    callback thread-selected(int);
+
+    width: 220px;
+    background: Palette.sys-sidebar;
+
+    VerticalLayout {
+        Rectangle {
+            height: 36px;
+            background: Palette.sys-card;
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 6px;
+                Text {
+                    text: "Chats";
+                    color: Palette.sys-text-primary;
+                    font-size: 14px;
+                    font-family: Palette.font-sans;
+                    vertical-alignment: center;
+                }
+                Rectangle { }
+                Text {
+                    // Visual-only placeholder pending the dynamic
+                    // thread-list gap (settings-gear real behavior),
+                    // tracked separately -- unchanged from pre-reskin.
+                    text: "settings";
+                    color: Palette.sys-text-muted;
+                    font-size: 11px;
+                    font-family: Palette.font-sans;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        for thread[i] in threads : Rectangle {
+            height: 44px;
+            background: i == selected-thread ? Palette.sys-primary-container : Palette.sys-sidebar;
+            TouchArea {
+                clicked => { thread-selected(i); }
+            }
+            HorizontalLayout {
+                padding: 8px;
+                spacing: 6px;
+                Rectangle {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: thread.status == "loading" ? Palette.sys-text-secondary
+                        : thread.status == "error" ? Palette.sys-text-muted
+                        : Palette.sys-primary;
+                }
+                Text {
+                    text: thread.name;
+                    color: Palette.sys-text-primary;
+                    font-size: 12px;
+                    font-family: Palette.font-sans;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

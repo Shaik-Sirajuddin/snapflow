@@ -1,0 +1,50 @@
+import { Palette } from "palette.slint";
+import { ThreadItem, MessageItem } from "types.slint";
+import { Sidebar } from "sidebar.slint";
+import { ChatArea } from "chat_area.slint";
+
+export { ThreadItem, MessageItem, Palette }
+
+// Root window -- Rust-facing public API (property/callback names) is
+// unchanged from the pre-reskin inline-macro version so
+// `panel-rust/src/lib.rs`'s generated `ChatPanel` bindings (set_threads,
+// set_messages, on_thread_selected, on_send_requested, etc.) needed zero
+// changes for this phase. `theme` and `radius-preset` moved from
+// `ChatPanel` properties (pre-reskin: only `theme` existed, driving a
+// single `is-dark` bool) onto the `Palette` global directly -- Rust code
+// now reads/writes them via the generated `Palette::get(&component)`
+// accessor (see `panel_rust_set_theme` in lib.rs) rather than
+// `component.set_theme(...)`, since Slint globals' `in` properties are
+// set through their own accessor, not by binding `Global.prop: expr;`
+// from a plain component property (that syntax does not parse -- tried
+// and rejected during this phase). `radius-preset` is new in this phase
+// (Phase 0/1 addition), default-only for now -- no settings UI wires it
+// yet, tracked separately.
+export component ChatPanel inherits Window {
+    in-out property <int> selected-thread: 0;
+    in-out property <[ThreadItem]> threads: [];
+    in-out property <[MessageItem]> messages: [];
+    in-out property <string> compose-text: "";
+    in-out property <string> agent-badge: "agent . ask";
+
+    callback thread-selected(int);
+    callback send-requested();
+
+    HorizontalLayout {
+        Sidebar {
+            threads: threads;
+            selected-thread: selected-thread;
+            thread-selected(i) => {
+                selected-thread = i;
+                thread-selected(i);
+            }
+        }
+        ChatArea {
+            active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
+            messages: messages;
+            agent-badge: agent-badge;
+            compose-text <=> compose-text;
+            send-requested => { send-requested(); }
+        }
+    }
+}

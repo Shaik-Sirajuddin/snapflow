@@ -1,0 +1,12 @@
+// Shared data-model structs, split out of app.slint so sidebar.slint /
+// chat-area.slint / message-card.slint can each `import` just the types
+// they need without a circular dependency on the root window component.
+export struct ThreadItem {
+    name: string,
+    status: string, // "idle" | "loading" | "error"
+}
+
+export struct MessageItem {
+    kind: string, // "user" | "agent" | "tool-call" | "thinking"
+    text: string,
+}

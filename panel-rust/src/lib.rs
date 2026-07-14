@@ -110,174 +110,13 @@ fn map_qt_key(qt_key: c_int, text: &str) -> Option<SharedString> {
     }
 }
 
-slint::slint! {
-    struct ThreadItem {
-        name: string,
-        status: string, // "idle" | "loading" | "error"
-    }
-
-    struct MessageItem {
-        kind: string, // "user" | "agent" | "tool-call" | "thinking"
-        text: string,
-    }
-
-    export component ChatPanel inherits Window {
-        in-out property <int> selected-thread: 0;
-        in-out property <[ThreadItem]> threads: [];
-        in-out property <[MessageItem]> messages: [];
-        in-out property <string> compose-text: "";
-        in-out property <string> theme: "dark";
-        in-out property <string> agent-badge: "agent . ask";
-
-        callback thread-selected(int);
-        callback send-requested();
-
-        property <bool> is-dark: theme != "light";
-        property <color> bg-sidebar: is-dark ? #1a1a1a : #f0f0f0;
-        property <color> bg-header: is-dark ? #262626 : #e2e2e2;
-        property <color> bg-main: is-dark ? #141414 : #ffffff;
-        property <color> bg-compose: is-dark ? #202020 : #e8e8e8;
-        property <color> fg-primary: is-dark ? white : #1a1a1a;
-        property <color> fg-muted: is-dark ? #a0aec0 : #4a5568;
-
-        HorizontalLayout {
-            Rectangle {
-                width: 220px;
-                background: bg-sidebar;
-                VerticalLayout {
-                    Rectangle {
-                        height: 36px;
-                        background: bg-header;
-                        HorizontalLayout {
-                            padding: 8px;
-                            spacing: 6px;
-                            Text {
-                                text: "Chats";
-                                color: fg-primary;
-                                font-size: 14px;
-                                vertical-alignment: center;
-                            }
-                            Rectangle { }
-                            Text {
-                                text: "settings";
-                                color: fg-muted;
-                                font-size: 11px;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                    for thread[i] in threads : Rectangle {
-                        height: 44px;
-                        background: i == selected-thread ? #2f855a : bg-sidebar;
-                        TouchArea {
-                            clicked => { selected-thread = i; thread-selected(i); }
-                        }
-                        HorizontalLayout {
-                            padding: 8px;
-                            spacing: 6px;
-                            Rectangle {
-                                width: 8px;
-                                height: 8px;
-                                border-radius: 4px;
-                                background: thread.status == "loading" ? #c05621 : thread.status == "error" ? #e53e3e : #2f855a;
-                            }
-                            Text {
-                                text: thread.name;
-                                color: fg-primary;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-            }
-
-            Rectangle {
-                background: bg-main;
-                VerticalLayout {
-                    Rectangle {
-                        height: 40px;
-                        background: bg-header;
-                        HorizontalLayout {
-                            padding: 10px;
-                            spacing: 8px;
-                            Text {
-                                text: threads.length > 0 ? threads[selected-thread].name : "";
-                                color: fg-primary;
-                                font-size: 13px;
-                                vertical-alignment: center;
-                            }
-                            Rectangle { }
-                            Rectangle {
-                                background: #2b6cb0;
-                                border-radius: 4px;
-                                Text {
-                                    text: agent-badge;
-                                    color: white;
-                                    font-size: 11px;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                    Flickable {
-                        VerticalLayout {
-                            padding: 10px;
-                            spacing: 8px;
-                            for msg in messages : Rectangle {
-                                background: msg.kind == "tool-call" ? #2d3748 : msg.kind == "thinking" ? #322659 : msg.kind == "user" ? #234e39 : transparent;
-                                border-radius: 6px;
-                                HorizontalLayout {
-                                    padding: 6px;
-                                    spacing: 6px;
-                                    Rectangle {
-                                        width: msg.kind == "tool-call" ? 3px : 0px;
-                                        background: #63b3ed;
-                                    }
-                                    Text {
-                                        text: msg.text;
-                                        font-italic: msg.kind == "thinking";
-                                        font-family: msg.kind == "tool-call" ? "monospace" : "";
-                                        color: msg.kind == "user" ? white : msg.kind == "tool-call" ? #90cdf4 : msg.kind == "thinking" ? #b794f4 : fg-primary;
-                                        wrap: word-wrap;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Rectangle {
-                        height: 44px;
-                        background: bg-compose;
-                        HorizontalLayout {
-                            padding: 6px;
-                            spacing: 6px;
-                            compose := TextInput {
-                                text <=> compose-text;
-                                color: fg-primary;
-                                vertical-alignment: center;
-                                accepted => { send-requested(); }
-                            }
-                            Rectangle {
-                                width: 60px;
-                                background: #2f855a;
-                                border-radius: 4px;
-                                TouchArea {
-                                    clicked => { send-requested(); }
-                                }
-                                Text {
-                                    text: "Send";
-                                    color: white;
-                                    vertical-alignment: center;
-                                    horizontal-alignment: center;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+// Slint UI markup moved to `panel-rust/ui/*.slint` (Phase 1 of
+// chat-panel-ui-theme-parity.md's modularity requirement) -- compiled by
+// `build.rs` via `slint_build::compile`. `ChatPanel`, `ThreadItem`, and
+// `MessageItem` below are the same generated Rust bindings the inline
+// `slint::slint! { ... }` macro used to produce; nothing downstream in
+// this file needed to change.
+slint::include_modules!();
 
 struct SpikePlatform {
     window: Rc<MinimalSoftwareWindow>,
@@ -561,7 +400,7 @@ pub extern "C" fn panel_rust_set_theme(
             let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
             std::str::from_utf8(bytes).unwrap_or("dark")
         };
-        panel.component.set_theme(text.into());
+        Palette::get(&panel.component).set_theme(text.into());
         true
     })
 }
