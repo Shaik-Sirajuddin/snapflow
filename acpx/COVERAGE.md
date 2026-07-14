@@ -2747,3 +2747,49 @@ phase.
 change to wire behavior or router logic -- purely additive generated
 documentation over already-existing transport behavior
 (`http.rs`/`ws.rs`'s header handling was not touched, only described).
+
+## 2026-07-14 -- full transport schema pipeline phase E: docs wrap-up, `acpx-openrpc-schema` plan complete
+
+Fifth and final phase of the `acpx-openrpc-schema` plan. Writes
+`docs/schema/README.md` -- a file phase 20's own `COVERAGE.md` entry
+and `docs/README.md`'s index both already linked to, but which (found
+while doing this phase's wrap-up, not previously flagged) had never
+actually been authored, a real doc gap distinct from the still-open
+`docs/development.md` one. Now describes all three generated
+artifacts this five-phase plan produced: `acpx.openrpc.json` (the
+full 32-method registry, described as the "start here" document),
+`acpx-http.openapi.json` (the HTTP envelope + header contracts),
+`acpx-wire.schema.json` (the original, deliberately-narrower
+acpx-native-only bare JSON Schema) -- what each covers, how it's
+regenerated, and where to fetch the standalone upstream raw-ACP schema
+none of the three vendor a copy of. Updated `docs/README.md`'s index
+entry for `schema/README.md` to describe all three artifacts instead
+of just the original one.
+
+**Plan summary (phases A-E, all five now implemented and committed):**
+phase A typed the gateway-native shapes phase 20 had left implicit in
+`router.rs` (`acpx-proto/src/gateway.rs`); phase B built a
+method-registry cross-checked against both `router.rs`'s `classify()`
+and upstream `agent-client-protocol`'s own macro invocations
+(`acpx-proto/src/methods.rs`), plus confirmed and exploited the
+finding that upstream already derives `JsonSchema` on every v1
+request/response struct, so raw ACP shapes can be `$ref`'d rather than
+redefined; phase C generated the primary OpenRPC document covering all
+32 methods; phase D generated the OpenAPI companion that finally gives
+`Authorization`/`X-Acpx-Tenant`/`X-Acpx-Profile` a real schema
+representation, closing phase 21's explicit deferral; phase E is this
+wrap-up. Net result: the original question ("do we have an acpx JSON
+Schema... tenant ids etc. all covered?") now has a complete answer --
+every dispatched method, both request directions, and every
+transport-level header contract are represented across the three
+generated, drift-guarded documents in `docs/schema/`.
+
+Workspace test count after this phase: **268 passed, 0 failed, 6
+ignored** -- unchanged from phase D (docs-only phase, no source
+changes). `cargo fmt --all --check` and `cargo build --workspace
+--tests` both clean. `cargo clippy` still not installed in this
+environment, same standing limitation as every prior phase.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to wire behavior, router logic, or generated schema content --
+documentation only.
