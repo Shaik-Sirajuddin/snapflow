@@ -39,7 +39,10 @@
 
 mod thread_actor;
 
-pub use rui_acp_client::{AgentEvent, ChatMessage, MessageKind};
+pub use rui_acp_client::{
+    AgentEvent, ChatMessage, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
+    SessionModesEvent,
+};
 pub use thread_actor::{
     spawn_acpx_thread, AcpxThreadError, AcpxThreadHandle, ProfileSummary, RemoteThreadInfo,
 };

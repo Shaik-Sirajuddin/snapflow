@@ -1,10 +1,10 @@
 import { Palette } from "palette.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow } from "types.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "terminal_card.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, Palette }
+export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, Palette }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -42,6 +42,13 @@ export component ChatPanel inherits Window {
     // equivalent to typing that exact name into the existing free-text
     // field, just without the user needing to know exact profile names.
     in property <[ProfileOption]> available-profiles: [];
+    // Mode/config selector addition -- see chat_area.slint's own doc
+    // comment on these properties; passed straight through to `ChatArea`
+    // below (this root component owns no mode/config state of its own,
+    // same "just plumbing" role it plays for every other ChatArea prop).
+    in property <[ModeOption]> available-modes: [];
+    in property <string> current-mode-id: "";
+    in property <[ConfigOptionRow]> config-option-rows: [];
     // Set by Rust whenever `expand-terminal` fires (looked up from
     // `terminals` at that moment, since Slint has no `for`-as-expression
     // find/filter construct) -- an empty `terminal-id` means no overlay
@@ -62,6 +69,8 @@ export component ChatPanel inherits Window {
     callback reject-request();
     callback expand-terminal(string);
     callback close-terminal-overlay();
+    callback mode-selected(string);
+    callback config-option-selected(string, string);
 
     HorizontalLayout {
         Sidebar {
@@ -102,6 +111,11 @@ export component ChatPanel inherits Window {
             reject-request => { reject-request(); }
             terminals: terminals;
             expand-terminal(id) => { expand-terminal(id); }
+            available-modes: available-modes;
+            current-mode-id: current-mode-id;
+            config-option-rows: config-option-rows;
+            mode-selected(id) => { mode-selected(id); }
+            config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
         }
     }
     if expanded-terminal.terminal-id != "" : TerminalOverlay {

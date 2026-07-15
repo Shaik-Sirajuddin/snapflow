@@ -1,5 +1,5 @@
 import { Palette } from "palette.slint";
-import { MessageItem, PendingRequestItem, TerminalItem } from "types.slint";
+import { MessageItem, PendingRequestItem, TerminalItem, ModeOption, ConfigOptionRow } from "types.slint";
 import { MessageCard } from "message_card.slint";
 import { PermissionCard } from "permission_card.slint";
 import { TerminalCard } from "terminal_card.slint";
@@ -21,6 +21,17 @@ export component ChatArea inherits Rectangle {
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
     in-out property <string> compose-text: "";
+    // Mode/config selector addition: the *currently displayed* thread's
+    // live capability advertisement (`AgentBridge::session_modes`/
+    // `config_options`, flattened via `models::to_mode_options`/
+    // `to_config_option_rows`). Both default to empty, which hides the
+    // whole row below -- see [`ModeOption`]/[`ConfigOptionRow`]'s doc
+    // comments in types.slint for the capability-gating contract.
+    in property <[ModeOption]> available-modes: [];
+    in property <string> current-mode-id: "";
+    in property <[ConfigOptionRow]> config-option-rows: [];
+    callback mode-selected(string);
+    callback config-option-selected(string, string);
     callback send-requested();
     callback stop-requested();
     callback settings-requested();
@@ -144,6 +155,82 @@ export component ChatArea inherits Rectangle {
             // HTML's `border-b border-sys-border`.
             height: 1px;
             background: Palette.sys-border;
+        }
+        // Mode/config selector addition: capability-gated chip rows --
+        // each `Flickable` collapses to 0px (no visual trace, no wasted
+        // layout space) when its own list is empty, matching the
+        // settings sheet's profile-picker chip row's own "0px when
+        // available-profiles is empty" convention in app.slint. Modes
+        // and config options are two independent ACP advertisements
+        // (see `ConfigOptionRow`'s doc comment on why config options
+        // supersede modes per the real spec but real backends observed
+        // in this workspace still send both during the transition
+        // period) -- both render, gated independently, rather than one
+        // hiding the other.
+        Flickable {
+            height: available-modes.length > 0 ? 26px : 0px;
+            viewport-width: mode-chip-row.preferred-width;
+            mode-chip-row := HorizontalLayout {
+                padding-left: compact ? 6px : 12px;
+                padding-right: compact ? 6px : 12px;
+                padding-top: 2px;
+                padding-bottom: 2px;
+                spacing: 6px;
+                for mode in available-modes : Rectangle {
+                    width: mode-chip-label.preferred-width + 14px;
+                    height: 20px;
+                    background: mode.id == current-mode-id ? Palette.sys-primary : Palette.sys-outer;
+                    border-color: Palette.sys-border;
+                    border-width: 1px;
+                    border-radius: Palette.radius-sm;
+                    TouchArea { clicked => { mode-selected(mode.id); } }
+                    mode-chip-label := Text {
+                        text: mode.name;
+                        color: mode.id == current-mode-id ? Palette.sys-on-primary : Palette.sys-text-primary;
+                        font-family: Palette.font-mono;
+                        font-size: 10px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        Flickable {
+            height: config-option-rows.length > 0 ? 26px : 0px;
+            viewport-width: config-chip-row.preferred-width;
+            config-chip-row := HorizontalLayout {
+                padding-left: compact ? 6px : 12px;
+                padding-right: compact ? 6px : 12px;
+                padding-top: 2px;
+                padding-bottom: 2px;
+                spacing: 6px;
+                for row in config-option-rows : Rectangle {
+                    width: row.is-header
+                        ? config-row-label.preferred-width + 6px
+                        : config-row-label.preferred-width + 14px;
+                    height: 20px;
+                    background: row.is-header
+                        ? transparent
+                        : (row.is-current ? Palette.sys-primary : Palette.sys-outer);
+                    border-color: row.is-header ? transparent : Palette.sys-border;
+                    border-width: row.is-header ? 0px : 1px;
+                    border-radius: Palette.radius-sm;
+                    if !row.is-header : TouchArea {
+                        clicked => { config-option-selected(row.option-id, row.value); }
+                    }
+                    config-row-label := Text {
+                        text: row.is-header ? row.name + ":" : row.name;
+                        color: row.is-header
+                            ? Palette.sys-text-secondary
+                            : (row.is-current ? Palette.sys-on-primary : Palette.sys-text-primary);
+                        font-family: Palette.font-mono;
+                        font-size: 10px;
+                        font-weight: row.is-header ? 700 : 400;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
         }
         Flickable {
             VerticalLayout {

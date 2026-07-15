@@ -77,3 +77,39 @@ export struct ProfileOption {
     terminal-enabled: bool,
     fs-enabled: bool,
 }
+
+// Mode/config selector addition: one entry of the *currently selected
+// thread's* live session mode advertisement (`AgentBridge::
+// session_modes`, see `rui_acp_client::SessionModesEvent`). Only ever
+// non-empty once `session/new`/`session/load` has actually resolved and
+// the backend advertised at least one mode -- an empty `available-modes`
+// list (Coverage Matrix's "capability-gated selection") means the
+// selector renders nothing at all, not a disabled/greyed control.
+export struct ModeOption {
+    id: string,
+    name: string,
+    description: string,
+}
+
+// Mode/config selector addition: one *row* of the currently selected
+// thread's live `configOptions[]` advertisement (`AgentBridge::
+// config_options`, see `rui_acp_client::ConfigOptionInfo`). Slint has no
+// nested-array-in-struct-in-array construct convenient for a `for`
+// loop, so Rust flattens each `ConfigOptionInfo` into one `is-header`
+// row (the option's own name/description, not clickable) followed by
+// one row per `ConfigOptionInfo::options` entry (`is-header: false`,
+// clickable, `is-current` highlighted) -- `chat_area.slint`/`app.slint`
+// render this as a single flat `for` loop, switching row visuals on
+// `is-header`.
+export struct ConfigOptionRow {
+    option-id: string,
+    is-header: bool,
+    // Header row: the option's own display name/description.
+    // Value row: the selectable value's own display name/description.
+    name: string,
+    description: string,
+    // Value row only: the literal value string sent back to
+    // `session/set_config_option`'s own `value` field.
+    value: string,
+    is-current: bool,
+}

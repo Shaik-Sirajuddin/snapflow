@@ -9,7 +9,10 @@
 use crate::{classify_raw_update, AgentEvent};
 use acpx_client::raw::ClientError;
 use acpx_client::{AgentRequest, Gateway};
-use rui_acp_client::{AgentRequestEvent, TerminalOutputEvent};
+use rui_acp_client::{
+    AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
+    TerminalOutputEvent,
+};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -82,6 +85,19 @@ enum Command {
     /// (a future per-thread "close on exit" setting) should ever send
     /// this.
     CloseSession {
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `session/set_mode` -- see [`AcpxThreadHandle::set_mode`]'s doc
+    /// comment.
+    SetMode {
+        mode_id: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `session/set_config_option` -- see [`AcpxThreadHandle::
+    /// set_config_option`]'s doc comment.
+    SetConfigOption {
+        config_id: String,
+        value: serde_json::Value,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     Shutdown,
@@ -201,6 +217,47 @@ impl AcpxThreadHandle {
     /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
     pub async fn close_session(&self) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::CloseSession { resp }).await
+    }
+
+    /// `session/set_mode` against this thread's bound session --
+    /// `mode_id` must be one of the ids [`AgentEvent::SessionModes`]
+    /// most recently advertised (a real backend rejects an unknown
+    /// mode id, per `session-modes` schema's own "must be one of the
+    /// modes advertised" wording). Fails with [`AcpxThreadError::
+    /// NoActiveSession`] if no session is open yet on this handle --
+    /// mode selection is meaningless before `session/new`/`session/
+    /// load` has bound one.
+    pub async fn set_mode(&self, mode_id: impl Into<String>) -> Result<(), AcpxThreadError> {
+        let mode_id = mode_id.into();
+        self.call(|resp| Command::SetMode { mode_id, resp }).await
+    }
+
+    /// `session/set_config_option` against this thread's bound session
+    /// -- `config_id` must be one of the ids [`AgentEvent::
+    /// ConfigOptions`] most recently advertised, `value` one of that
+    /// option's own `options[].value` entries for a `select`-kind
+    /// option (see `ConfigOptionInfo::kind`'s doc comment on other
+    /// kinds). The gateway forwards the full updated `configOptions[]`
+    /// list in this call's own response -- the run loop re-emits it as
+    /// a fresh [`AgentEvent::ConfigOptions`] the same way a live
+    /// `config_option_update` notification would, so callers only need
+    /// to watch `events`, not this method's `Ok(())` return, to learn
+    /// the option's new resolved state (which may differ from `value`
+    /// verbatim, and may also change *other* options' current values
+    /// or availability -- both real, documented ACP behaviors, not a
+    /// defect in this wrapper).
+    pub async fn set_config_option(
+        &self,
+        config_id: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<(), AcpxThreadError> {
+        let config_id = config_id.into();
+        self.call(|resp| Command::SetConfigOption {
+            config_id,
+            value,
+            resp,
+        })
+        .await
     }
 
     /// Sends `session/cancel` through an independent gateway connection, so
@@ -337,7 +394,168 @@ fn forward_updates(updates: &[serde_json::Value], event_tx: &mpsc::UnboundedSend
     for update in updates {
         if let Some(msg) = classify_raw_update(update) {
             let _ = event_tx.send(AgentEvent::Message(msg));
+        } else if let Some(event) = parse_capability_update(update) {
+            let _ = event_tx.send(event);
         }
+    }
+}
+
+/// Recognizes a live `current_mode_update`/`config_option_update`
+/// `session/update` notification (see [`AgentEvent::CurrentModeChanged`]/
+/// [`AgentEvent::ConfigOptions`]'s doc comments for the wire shapes) and
+/// maps it to the matching event. `None` for anything else, same
+/// "operate on the raw JSON shape, tolerate unrecognized input"
+/// convention `classify_raw_update`/`parse_terminal_output` both follow
+/// -- called as a `classify_raw_update` fallback in [`forward_updates`]
+/// so a session-capability notification isn't silently dropped just
+/// because it isn't a chat-message-shaped update.
+fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
+    if update.get("method").and_then(|m| m.as_str()) != Some("session/update") {
+        return None;
+    }
+    let session_update = update.get("params")?.get("update")?;
+    match session_update.get("sessionUpdate").and_then(|k| k.as_str())? {
+        "current_mode_update" => {
+            let mode_id = session_update.get("currentModeId")?.as_str()?.to_string();
+            Some(AgentEvent::CurrentModeChanged(mode_id))
+        }
+        "config_option_update" => {
+            let options = parse_config_options(session_update.get("configOptions")?)?;
+            Some(AgentEvent::ConfigOptions(options))
+        }
+        _ => None,
+    }
+}
+
+/// Parses a `session/new`/`session/load`/`session/resume` response's
+/// (or a live `config_option_update` notification's) `modes` field into
+/// a [`SessionModesEvent`] -- `{currentModeId, availableModes: [{id,
+/// name, description?}]}` per agentclientprotocol.com's real schema
+/// (verified directly, not assumed -- see this crate's own e2e coverage
+/// test for the exact fixture this was checked against). `None` if
+/// `modes` is absent/null (an agent that doesn't advertise modes at
+/// all) or missing `currentModeId`/`availableModes` entirely; an agent
+/// advertising an *empty* `availableModes` array still produces
+/// `Some(..)` with an empty `available` -- that is meaningfully
+/// different from "no modes field at all" for a UI deciding whether to
+/// show a selector at all.
+fn parse_session_modes(modes: &serde_json::Value) -> Option<SessionModesEvent> {
+    if modes.is_null() {
+        return None;
+    }
+    let current_mode_id = modes.get("currentModeId")?.as_str()?.to_string();
+    let available = modes
+        .get("availableModes")?
+        .as_array()?
+        .iter()
+        .filter_map(|mode| {
+            Some(SessionModeInfo {
+                id: mode.get("id")?.as_str()?.to_string(),
+                name: mode
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                description: mode
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    Some(SessionModesEvent {
+        current_mode_id,
+        available,
+    })
+}
+
+/// Parses a `configOptions[]` array (a `session/new`/`session/load`/
+/// `session/resume` response's `configOptions` field, a live `config_
+/// option_update` notification's `configOptions`, or a `session/set_
+/// config_option` response's `configOptions`) into this crate's
+/// [`ConfigOptionInfo`] vocabulary -- `{id, name, description?,
+/// category?, type, currentValue?, options?}` per
+/// agentclientprotocol.com/protocol/session-config-options's documented
+/// response shape. `None` if `list` isn't a JSON array at all; an entry
+/// missing `id` is skipped (nothing usable to key a `session/set_
+/// config_option` call on) rather than failing the whole list, same
+/// per-entry tolerance `parse_session_modes` applies to `availableModes`.
+fn parse_config_options(list: &serde_json::Value) -> Option<Vec<ConfigOptionInfo>> {
+    let entries = list.as_array()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry.get("id")?.as_str()?.to_string();
+                let options = entry
+                    .get("options")
+                    .and_then(|o| o.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| {
+                                Some(ConfigOptionValue {
+                                    value: value.get("value")?.as_str()?.to_string(),
+                                    name: value
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    description: value
+                                        .get("description")
+                                        .and_then(|d| d.as_str())
+                                        .map(str::to_string),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(ConfigOptionInfo {
+                    name: entry
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or(&id)
+                        .to_string(),
+                    id,
+                    description: entry
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .map(str::to_string),
+                    category: entry
+                        .get("category")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string),
+                    kind: entry
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("select")
+                        .to_string(),
+                    current_value: entry
+                        .get("currentValue")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    options,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Emits [`AgentEvent::SessionModes`]/[`AgentEvent::ConfigOptions`] for
+/// whichever of a `session/new`/`session/load`/`session/resume`
+/// response's `modes`/`configOptions` fields are actually present --
+/// shared by [`run_thread_actor`]'s `OpenSession`/`ResumeSession` arms
+/// so both the fresh-session and resumed-session paths advertise
+/// capability state identically.
+fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedSender<AgentEvent>) {
+    if let Some(modes) = value.get("modes").and_then(parse_session_modes) {
+        let _ = event_tx.send(AgentEvent::SessionModes(modes));
+    }
+    if let Some(options) = value
+        .get("configOptions")
+        .and_then(parse_config_options)
+    {
+        let _ = event_tx.send(AgentEvent::ConfigOptions(options));
     }
 }
 
@@ -470,6 +688,7 @@ async fn run_thread_actor(
                             Some(sid) => {
                                 session_id = Some(sid.to_string());
                                 let _ = session_tx.send(Some(sid.to_string()));
+                                emit_capability_events(&value, &event_tx);
                                 Ok(sid.to_string())
                             }
                             None => Err(AcpxThreadError::MissingSessionId),
@@ -512,7 +731,8 @@ async fn run_thread_actor(
                         .call_with_updates("session/load", params.clone(), None)
                         .await
                     {
-                        Ok((_, updates)) => {
+                        Ok((value, updates)) => {
+                            emit_capability_events(&value, &event_tx);
                             forward_updates(&updates, &event_tx);
                             if let Ok(Some(update)) = tokio::time::timeout(
                                 std::time::Duration::from_millis(50),
@@ -651,6 +871,45 @@ async fn run_thread_actor(
                 let result = client.call("session/close", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
+            Command::SetMode { mode_id, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let params = serde_json::json!({ "sessionId": sid, "modeId": mode_id });
+                let result = client.call("session/set_mode", params, None).await;
+                let _ = resp.send(result.map(|_| ()).map_err(Into::into));
+            }
+            Command::SetConfigOption {
+                config_id,
+                value,
+                resp,
+            } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let params = serde_json::json!({
+                    "sessionId": sid,
+                    "configId": config_id,
+                    "value": value,
+                });
+                let result = client.call("session/set_config_option", params, None).await;
+                match result {
+                    Ok(value) => {
+                        // The response carries the full updated
+                        // `configOptions[]` -- see `set_config_option`'s
+                        // own doc comment on why this crate re-emits it
+                        // as a fresh event rather than leaving the
+                        // caller to inspect this call's own `Ok(())`.
+                        emit_capability_events(&value, &event_tx);
+                        let _ = resp.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = resp.send(Err(e.into()));
+                    }
+                }
+            }
             Command::Shutdown => break,
         }
     }
@@ -692,4 +951,130 @@ pub struct ProfileSummary {
     pub agent_id: String,
     pub allow_terminal_access: bool,
     pub allow_fs_access: bool,
+}
+
+#[cfg(test)]
+mod capability_parsing_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_session_modes_reads_current_and_available() {
+        let modes = json!({
+            "currentModeId": "ask",
+            "availableModes": [
+                {"id": "ask", "name": "Ask"},
+                {"id": "code", "name": "Code", "description": "Autonomous coding"}
+            ]
+        });
+        let parsed = parse_session_modes(&modes).expect("parses");
+        assert_eq!(parsed.current_mode_id, "ask");
+        assert_eq!(parsed.available.len(), 2);
+        assert_eq!(parsed.available[1].id, "code");
+        assert_eq!(parsed.available[1].description.as_deref(), Some("Autonomous coding"));
+    }
+
+    #[test]
+    fn parse_session_modes_is_none_for_null_or_missing_fields() {
+        assert!(parse_session_modes(&serde_json::Value::Null).is_none());
+        assert!(parse_session_modes(&json!({"currentModeId": "ask"})).is_none());
+        assert!(parse_session_modes(&json!({"availableModes": []})).is_none());
+    }
+
+    #[test]
+    fn parse_session_modes_accepts_an_empty_available_list() {
+        let modes = json!({"currentModeId": "ask", "availableModes": []});
+        let parsed = parse_session_modes(&modes).expect("parses");
+        assert_eq!(parsed.current_mode_id, "ask");
+        assert!(parsed.available.is_empty());
+    }
+
+    #[test]
+    fn parse_config_options_reads_select_options_and_current_value() {
+        let options = json!([{
+            "id": "model",
+            "name": "Model",
+            "description": "Which model to use",
+            "category": "model",
+            "type": "select",
+            "currentValue": "gpt-5",
+            "options": [
+                {"value": "gpt-5", "name": "GPT-5"},
+                {"value": "gpt-5-mini", "name": "GPT-5 mini", "description": "Cheaper"}
+            ]
+        }]);
+        let parsed = parse_config_options(&options).expect("parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "model");
+        assert_eq!(parsed[0].kind, "select");
+        assert_eq!(parsed[0].current_value.as_deref(), Some("gpt-5"));
+        assert_eq!(parsed[0].options.len(), 2);
+        assert_eq!(parsed[0].options[1].description.as_deref(), Some("Cheaper"));
+    }
+
+    #[test]
+    fn parse_config_options_skips_entries_without_an_id_but_keeps_the_rest() {
+        let options = json!([
+            {"name": "no id here"},
+            {"id": "model", "currentValue": "gpt-5"}
+        ]);
+        let parsed = parse_config_options(&options).expect("parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "model");
+        // Falls back to `id` when `name` is absent, and defaults `kind`
+        // to "select" (every real backend observed in this workspace
+        // only ever emits that kind today).
+        assert_eq!(parsed[0].name, "model");
+        assert_eq!(parsed[0].kind, "select");
+    }
+
+    #[test]
+    fn parse_config_options_is_none_for_a_non_array_value() {
+        assert!(parse_config_options(&json!({"id": "model"})).is_none());
+    }
+
+    #[test]
+    fn parse_capability_update_recognizes_current_mode_update() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "current_mode_update",
+                "currentModeId": "code"
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::CurrentModeChanged(id) => assert_eq!(id, "code"),
+            other => panic!("expected CurrentModeChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_recognizes_config_option_update() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{"id": "model", "currentValue": "gpt-5-mini"}]
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::ConfigOptions(options) => {
+                assert_eq!(options.len(), 1);
+                assert_eq!(options[0].current_value.as_deref(), Some("gpt-5-mini"));
+            }
+            other => panic!("expected ConfigOptions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_ignores_unrelated_session_updates() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {"sessionUpdate": "plan"}}
+        });
+        assert!(parse_capability_update(&update).is_none());
+    }
 }

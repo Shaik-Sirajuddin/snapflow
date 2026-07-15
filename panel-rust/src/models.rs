@@ -8,8 +8,8 @@
 //! `ChatPanel` component.
 
 use crate::agent_bridge::TerminalBuffer;
-use crate::{MessageItem, ProfileOption, TerminalItem, ThreadItem};
-use rui_acp_client::{ChatMessage, MessageKind};
+use crate::{ConfigOptionRow, MessageItem, ModeOption, ProfileOption, TerminalItem, ThreadItem};
+use rui_acp_client::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::{ModelRc, VecModel};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,6 +67,61 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
             index: i as i32,
         })
         .collect();
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Builds the mode-selector's chip row model from a thread's currently
+/// advertised `AgentBridge::session_modes` -- `None` (no `modes` field
+/// advertised at all, or `session/new` hasn't resolved yet) maps to an
+/// empty model, which the Slint side's capability-gating (`available-
+/// modes.length > 0`) treats as "hide the selector entirely."
+pub fn to_mode_options(modes: Option<SessionModesEvent>) -> ModelRc<ModeOption> {
+    let items: Vec<ModeOption> = modes
+        .map(|m| {
+            m.available
+                .into_iter()
+                .map(|mode| ModeOption {
+                    id: mode.id.into(),
+                    name: mode.name.into(),
+                    description: mode.description.unwrap_or_default().into(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Builds the config-option selector's flat row model from a thread's
+/// currently advertised `AgentBridge::config_options` -- see
+/// `ConfigOptionRow`'s doc comment for the header-then-values flattening
+/// this performs. An option with no `options[]` entries at all (a
+/// `select`-kind option a backend advertised with an empty choice list,
+/// or a future non-`select` `kind` this UI doesn't render values for
+/// yet) still emits its header row, so its `current_value` remains
+/// visible even though nothing is clickable for it.
+pub fn to_config_option_rows(options: Vec<ConfigOptionInfo>) -> ModelRc<ConfigOptionRow> {
+    let mut items: Vec<ConfigOptionRow> = Vec::new();
+    for option in options {
+        items.push(ConfigOptionRow {
+            option_id: option.id.clone().into(),
+            is_header: true,
+            name: option.name.into(),
+            description: option.description.unwrap_or_default().into(),
+            value: String::new().into(),
+            is_current: false,
+        });
+        for value in option.options {
+            let is_current = option.current_value.as_deref() == Some(value.value.as_str());
+            items.push(ConfigOptionRow {
+                option_id: option.id.clone().into(),
+                is_header: false,
+                name: value.name.into(),
+                description: value.description.unwrap_or_default().into(),
+                value: value.value.into(),
+                is_current,
+            });
+        }
+    }
     ModelRc::new(VecModel::from(items))
 }
 

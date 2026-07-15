@@ -242,6 +242,31 @@ impl PanelSingleton {
         self.render_messages(real_idx);
         self.refresh_pending_request_for(real_idx);
         self.refresh_terminals_for(real_idx);
+        self.refresh_capabilities_for(real_idx);
+    }
+
+    /// Rebuilds the `available-modes`/`current-mode-id`/`config-option-
+    /// rows` properties for `real_idx` from `AgentBridge::session_modes`/
+    /// `config_options` -- see [`Self::refresh_terminals_for`]'s doc
+    /// comment for the shared "this thread became the displayed one"
+    /// hook convention this follows. Both a genuine `session/new`-time
+    /// advertisement and any later live `current_mode_update`/`config_
+    /// option_update` notification reach the UI purely by this being
+    /// re-called on every event that touches the selected thread (see
+    /// `apply_bridge_events`'s `AgentEvent::SessionModes`/`Current
+    /// ModeChanged`/`ConfigOptions` arms).
+    fn refresh_capabilities_for(&self, real_idx: usize) {
+        let Some(bridge) = &self.bridge else { return };
+        let modes = bridge.session_modes(real_idx);
+        let current_mode_id = modes
+            .as_ref()
+            .map(|m| m.current_mode_id.clone())
+            .unwrap_or_default();
+        self.component
+            .set_available_modes(models::to_mode_options(modes));
+        self.component.set_current_mode_id(current_mode_id.into());
+        self.component
+            .set_config_option_rows(models::to_config_option_rows(bridge.config_options(real_idx)));
     }
 
     /// Rebuilds the `pending-request` property for `real_idx` from the
@@ -394,6 +419,18 @@ impl PanelSingleton {
                         // `selected_touched` covers a terminal thread's
                         // events like every other variant.
                         AgentEvent::TerminalOutput(_) => {}
+                        // Same "re-read the bridge's own source of
+                        // truth" convention -- `AgentBridge::
+                        // session_modes`/`config_options` are what the
+                        // settings-sheet mode/config selector polls;
+                        // these arms exist only so the match stays
+                        // exhaustive and `selected_touched` covers a
+                        // capability-advertisement event on the
+                        // currently-selected thread like every other
+                        // variant.
+                        AgentEvent::SessionModes(_)
+                        | AgentEvent::CurrentModeChanged(_)
+                        | AgentEvent::ConfigOptions(_) => {}
                     }
                 }
             }
@@ -814,6 +851,61 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
             });
         });
+
+        // Mode/config selector addition: dispatch `session/set_mode`/
+        // `session/set_config_option` on the *currently displayed*
+        // thread. Neither callback optimistically updates `current-
+        // mode-id`/`config-option-rows` itself -- both wait for the
+        // real backend's own confirmation (`AgentEvent::
+        // CurrentModeChanged`/`ConfigOptions`, applied by `apply_bridge_
+        // events` -> `refresh_capabilities_for`), matching `AgentBridge::
+        // set_mode`/`set_config_option`'s own "requested, not applied"
+        // doc comment -- a backend can reject/ignore the request or
+        // resolve to a different value than requested (config options
+        // especially: changing one can change others), and this UI
+        // should never show a selection the backend didn't actually
+        // confirm.
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mode_selected(move |mode_id| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else { return };
+                    let Some(real_idx) =
+                        panel.real_index(component.get_selected_thread() as usize)
+                    else {
+                        return;
+                    };
+                    bridge.set_mode(real_idx, mode_id.to_string());
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_config_option_selected(move |option_id, value| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        let Some(bridge) = &panel.bridge else { return };
+                        let Some(real_idx) =
+                            panel.real_index(component.get_selected_thread() as usize)
+                        else {
+                            return;
+                        };
+                        bridge.set_config_option(
+                            real_idx,
+                            option_id.to_string(),
+                            serde_json::Value::String(value.to_string()),
+                        );
+                    }
+                });
+            });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_search_changed(move |query| {

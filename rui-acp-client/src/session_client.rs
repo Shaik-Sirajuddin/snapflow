@@ -134,7 +134,89 @@ pub enum AgentEvent {
     /// byte delta -- the gateway's own poller already collapses
     /// no-change ticks, and a client displaying this is expected to
     /// simply replace its shown contents each time, not append.
-    TerminalOutput(TerminalOutputEvent),
+   TerminalOutput(TerminalOutputEvent),
+    /// Session modes advertised by a `session/new`/`session/load`/
+    /// `session/resume` response's `modes` field -- only ever produced
+    /// by `rui-acpx-client`'s actor today (the direct-ACP path's own
+    /// `classify_update` has no equivalent; see that crate's module doc
+    /// comment). Per agentclientprotocol.com's "Session Config Options"
+    /// doc, `modes` is a legacy, superseded-by-`configOptions` shape
+    /// that real backends (`claude-agent-acp`, confirmed against its
+    /// compiled source per `acpx-core::router::classify`'s doc comment)
+    /// still emit during the ACP ecosystem's transition period, so this
+    /// crate tracks it as a real, currently-exercised capability rather
+    /// than dead protocol surface.
+    SessionModes(SessionModesEvent),
+    /// A live `current_mode_update` notification's new `currentModeId`
+    /// -- narrower than [`AgentEvent::SessionModes`]: per
+    /// `protocol-view-model.md`'s wire table, this notification carries
+    /// only the new id, not a refreshed `availableModes` list, so it is
+    /// kept as its own event rather than folded into a re-sent
+    /// `SessionModesEvent` with a guessed/stale `available` list.
+    CurrentModeChanged(String),
+    /// Session config options advertised by a `session/new`/`session/
+    /// load`/`session/resume` response's `configOptions` field, or the
+    /// *complete* replacement list carried by a live `config_option_
+    /// update` notification or a `session/set_config_option` response
+    /// (per agentclientprotocol.com: always the full current
+    /// configuration state, never a delta -- so a consumer should
+    /// simply replace its previously-held list on every occurrence of
+    /// this variant, same "replace, don't append" contract
+    /// [`AgentEvent::TerminalOutput`] documents for its own buffer).
+    /// Only ever produced by `rui-acpx-client`'s actor today, same
+    /// caveat as [`AgentEvent::SessionModes`].
+    ConfigOptions(Vec<ConfigOptionInfo>),
+}
+
+/// One mode an ACP agent advertises as selectable for a session. See
+/// [`AgentEvent::SessionModes`]'s doc comment for the wire origin and
+/// why this crate still tracks the older `modes` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModeInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// The full `modes` advertisement from a `session/new`/`session/load`/
+/// `session/resume` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionModesEvent {
+    pub current_mode_id: String,
+    pub available: Vec<SessionModeInfo>,
+}
+
+/// One selectable value inside a `select`-kind [`ConfigOptionInfo::
+/// options`] list -- `{value, name, description?}` per
+/// agentclientprotocol.com/protocol/session-config-options's documented
+/// example response shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOptionValue {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// One entry of a `configOptions[]` list -- `{id, name, description?,
+/// category?, type, currentValue?, options?}` per the real ACP spec
+/// (verified against agentclientprotocol.com/protocol/session-config-
+/// options directly, not assumed). `kind` is `"select"` for every
+/// option type this crate has real backend coverage for today; a
+/// `"boolean"` kind exists as an accepted-but-not-yet-stable ACP RFD,
+/// so `kind` is kept as a plain `String` (not a closed enum) to accept
+/// it or any future kind without a parse failure -- a UI that doesn't
+/// recognize a `kind` can still fall back to a generic read-only
+/// display of `current_value` rather than dropping the option
+/// silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOptionInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub kind: String,
+    pub current_value: Option<String>,
+    pub options: Vec<ConfigOptionValue>,
 }
 
 /// See [`AgentEvent::TerminalOutput`]'s doc comment.

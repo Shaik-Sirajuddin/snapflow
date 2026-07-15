@@ -60,7 +60,8 @@
 //!   against.
 
 use rui_acp_client::{
-    AgentEvent, AgentRequestEvent, ChatMessage, JsonlStore, TerminalOutputEvent, ThreadTrailer,
+    AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, JsonlStore, SessionModesEvent,
+    TerminalOutputEvent, ThreadTrailer,
 };
 use rui_acpx_client::{spawn_acpx_thread, AcpxThreadHandle};
 use std::collections::HashMap;
@@ -125,6 +126,17 @@ struct ThreadSlot {
     /// depending on hash iteration). Appended to exactly once per new
     /// terminal id, in [`store_terminal_output`].
     terminal_order: Mutex<Vec<String>>,
+    /// Most recently advertised `modes`/`configOptions` for this thread
+    /// -- see [`AgentEvent::SessionModes`]/[`AgentEvent::
+    /// CurrentModeChanged`]/[`AgentEvent::ConfigOptions`]'s doc
+    /// comments. `None`/empty means the backend hasn't advertised any
+    /// (either it genuinely has none, or `session/new`/`session/load`
+    /// hasn't resolved yet) -- the settings-sheet mode/config selector
+    /// (Coverage Matrix's `session/set_mode`, `session/set_config_
+    /// option` row) is capability-gated on this being non-empty, not
+    /// shown as a dead/always-present control.
+    session_modes: Mutex<Option<SessionModesEvent>>,
+    config_options: Mutex<Vec<ConfigOptionInfo>>,
 }
 
 /// One terminal's current known state, as last observed via
@@ -193,6 +205,36 @@ fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
                 exit_status: ev.exit_status,
             },
         );
+}
+
+/// Applies one [`AgentEvent::SessionModes`]/[`AgentEvent::
+/// CurrentModeChanged`]/[`AgentEvent::ConfigOptions`] event to `slot`'s
+/// own capability state -- shared by both forwarder loops, same role
+/// [`store_terminal_output`] plays for terminal buffers.
+fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
+    match ev {
+        AgentEvent::SessionModes(modes) => {
+            *slot.session_modes.lock().expect("session_modes mutex poisoned") =
+                Some(modes.clone());
+        }
+        AgentEvent::CurrentModeChanged(mode_id) => {
+            if let Some(modes) = slot
+                .session_modes
+                .lock()
+                .expect("session_modes mutex poisoned")
+                .as_mut()
+            {
+                modes.current_mode_id = mode_id.clone();
+            }
+        }
+        AgentEvent::ConfigOptions(options) => {
+            *slot
+                .config_options
+                .lock()
+                .expect("config_options mutex poisoned") = options.clone();
+        }
+        _ => {}
+    }
 }
 
 fn slug(name: &str) -> String {
@@ -814,6 +856,8 @@ impl AgentBridge {
                 pending_requests: Mutex::new(Vec::new()),
                 terminal_buffers: Mutex::new(HashMap::new()),
                 terminal_order: Mutex::new(Vec::new()),
+                session_modes: Mutex::new(None),
+                config_options: Mutex::new(Vec::new()),
             });
             slots.push(slot.clone());
 
@@ -947,6 +991,11 @@ impl AgentBridge {
                         AgentEvent::TerminalOutput(term_ev) => {
                             store_terminal_output(&slot_for_task, term_ev);
                         }
+                        AgentEvent::SessionModes(_)
+                        | AgentEvent::CurrentModeChanged(_)
+                        | AgentEvent::ConfigOptions(_) => {
+                            store_capability_event(&slot_for_task, &ev);
+                        }
                     }
                     events_out
                         .lock()
@@ -1042,6 +1091,8 @@ impl AgentBridge {
             pending_requests: Mutex::new(Vec::new()),
             terminal_buffers: Mutex::new(HashMap::new()),
             terminal_order: Mutex::new(Vec::new()),
+            session_modes: Mutex::new(None),
+            config_options: Mutex::new(Vec::new()),
         });
        let cwd = cwd_for_session();
        let session_id = if let Some(session_id) = cached_session_id.clone() {
@@ -1114,6 +1165,11 @@ impl AgentBridge {
                     }
                     AgentEvent::TerminalOutput(term_ev) => {
                         store_terminal_output(&slot_for_task, term_ev);
+                    }
+                    AgentEvent::SessionModes(_)
+                    | AgentEvent::CurrentModeChanged(_)
+                    | AgentEvent::ConfigOptions(_) => {
+                        store_capability_event(&slot_for_task, &event);
                     }
                 }
                 events_out
@@ -1326,6 +1382,93 @@ impl AgentBridge {
             }
         });
     }
+
+    /// Most recently advertised `modes` for thread `idx` -- what the
+    /// settings-sheet mode selector reads to decide whether to show
+    /// itself at all (`None`/empty `available` -> hidden, matching the
+    /// Coverage Matrix's "capability-gated selection" requirement, not
+    /// a control that's always present and silently no-ops). Read-only
+    /// snapshot of [`ThreadSlot::session_modes`], updated by
+    /// [`store_capability_event`] as `AgentEvent::SessionModes`/
+    /// `CurrentModeChanged` events are drained through `poll()`.
+    pub fn session_modes(&self, idx: usize) -> Option<SessionModesEvent> {
+        let slot = self.slots.get(idx)?;
+        slot.session_modes
+            .lock()
+            .expect("session_modes mutex poisoned")
+            .clone()
+    }
+
+    /// Most recently advertised `configOptions` for thread `idx` -- see
+    /// [`Self::session_modes`]'s doc comment for the same capability-
+    /// gating rationale (empty vec -> selector hidden).
+    pub fn config_options(&self, idx: usize) -> Vec<ConfigOptionInfo> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        slot.config_options
+            .lock()
+            .expect("config_options mutex poisoned")
+            .clone()
+    }
+
+    /// Dispatches `session/set_mode` on the background runtime. Fire-
+    /// and-forget like [`Self::send_prompt`]/[`Self::cancel_prompt`]:
+    /// the caller is the synchronous UI thread, and a failure surfaces
+    /// as a queued `AgentEvent::Error` rather than a return value. A
+    /// successful call has no immediate visible effect on `session_
+    /// modes(idx)` -- a real backend still owns `currentModeId` and
+    /// confirms the change via a live `current_mode_update`
+    /// notification (see `AgentEvent::CurrentModeChanged`'s doc
+    /// comment), so the settings sheet should treat this as
+    /// "requested", not "applied", until that event arrives.
+    pub fn set_mode(&self, idx: usize, mode_id: String) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = handle.set_mode(mode_id).await {
+                events
+                    .lock()
+                    .expect("event queue mutex poisoned")
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("session/set_mode failed: {e}")),
+                    });
+            }
+        });
+    }
+
+    /// Dispatches `session/set_config_option` on the background
+    /// runtime. Unlike [`Self::set_mode`], a successful call's own
+    /// response carries the full updated `configOptions[]` -- the actor
+    /// (`rui_acpx_client::thread_actor`) already re-emits that as a
+    /// fresh `AgentEvent::ConfigOptions`, which `poll()`/`store_
+    /// capability_event` apply the same as any other occurrence, so
+    /// `config_options(idx)` reflects the change shortly after this
+    /// call resolves without any extra plumbing here.
+    pub fn set_config_option(&self, idx: usize, config_id: String, value: serde_json::Value) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = handle.set_config_option(config_id, value).await {
+                events
+                    .lock()
+                    .expect("event queue mutex poisoned")
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!(
+                            "session/set_config_option failed: {e}"
+                        )),
+                    });
+            }
+        });
+    }
 }
 
 impl Drop for AgentBridge {
@@ -1359,6 +1502,79 @@ mod tests {
     fn free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         listener.local_addr().expect("local_addr").port()
+    }
+
+    /// Spawns a real `acpx-server` child process on a fresh ephemeral
+    /// port, retrying the whole pick-port/spawn/wait-for-connect cycle
+    /// (bounded at 5 attempts) if the process never becomes reachable
+    /// within one attempt's own shorter window.
+    ///
+    /// **Why this exists.** `free_port()`'s own "bind a listener, read
+    /// its port, then immediately drop the listener" trick has an
+    /// unavoidable TOCTOU gap: the port is released back to the OS the
+    /// instant the listener drops, and nothing stops a *different*
+    /// concurrently-running test's own `free_port()` call (this crate's
+    /// real-process tests each spawn their own `acpx-server`, and the
+    /// default `cargo test` runner runs many of them in parallel) from
+    /// claiming the exact same port before this function's own spawned
+    /// process gets to bind it. When that race is lost, `acpx-server`
+    /// fails its own bind and exits immediately, and the previous single-
+    /// shot 100x30ms connect-retry loop just spun for its full ~3s doing
+    /// nothing before every caller of it (this function's predecessor)
+    /// silently proceeded anyway with a `base_url` nothing was listening
+    /// on -- surfacing later as a confusing "gateway request timed out"
+    /// failure in whichever test happened to run at the time, not a
+    /// clear "port collision" signal. **Observed directly**: re-running
+    /// this crate's full `--lib` suite back-to-back under the default
+    /// parallel runner rotates which real-process test fails from run to
+    /// run, while every test passes cleanly under `--test-threads=1` --
+    /// exactly the signature of port contention, not a logic bug in any
+    /// one test (documented in this plan's own Progress Log across two
+    /// prior sessions before this fix).
+    fn spawn_acpx_server_with_retry(
+        configure: impl Fn(&mut std::process::Command, u16),
+    ) -> (std::process::Child, String) {
+        for attempt in 0..5 {
+            let port = free_port();
+            let mut command = std::process::Command::new(acpx_server_bin());
+            configure(&mut command, port);
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut child = command
+                .spawn()
+                .expect("spawn real acpx-server binary for test");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            let mut reachable = false;
+            while std::time::Instant::now() < deadline {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    reachable = true;
+                    break;
+                }
+                if let Ok(Some(_status)) = child.try_wait() {
+                    // The process already exited (most likely: lost the
+                    // bind race for this exact port) -- no point
+                    // continuing to poll a socket nothing will ever
+                    // listen on.
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            if reachable {
+                return (child, format!("http://127.0.0.1:{port}"));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            if attempt < 4 {
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+            }
+        }
+        panic!(
+            "acpx-server never became reachable after 5 fresh-port attempts -- \
+             this looks like more than ordinary port contention"
+        );
     }
 
     /// A real, locally-spawned `acpx-server` process (with the real
@@ -1404,30 +1620,17 @@ mod tests {
             persona: &str,
             db_path: Option<&std::path::Path>,
         ) -> Self {
-            let port = free_port();
-            let mut command = std::process::Command::new(acpx_server_bin());
-            command
-                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", backend_cmd)
-                .env("ACPX_DEFAULT_AGENT_ID", persona)
-                .env("RUI_MOCK_AGENT_PERSONA", persona)
-                .env("RUST_LOG", "error")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            if let Some(db_path) = db_path {
-                command.env("ACPX_DB_PATH", db_path);
-            }
-            let child = command
-                .spawn()
-                .expect("spawn real acpx-server binary for test");
-            let base_url = format!("http://127.0.0.1:{port}");
-            for _ in 0..100 {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
+            let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+                command
+                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                    .env("ACPX_BACKEND_CMD", backend_cmd)
+                    .env("ACPX_DEFAULT_AGENT_ID", persona)
+                    .env("RUI_MOCK_AGENT_PERSONA", persona)
+                    .env("RUST_LOG", "error");
+                if let Some(db_path) = db_path {
+                    command.env("ACPX_DB_PATH", db_path);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
+            });
             TestGateway { child, base_url }
         }
     }
@@ -2221,26 +2424,13 @@ done
         .expect("write stand-in backend script");
 
         let gateway = {
-            let port = free_port();
-            let mut command = std::process::Command::new(acpx_server_bin());
-            command
-                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-                .env("ACPX_DEFAULT_AGENT_ID", "relay-test")
-                .env("RUST_LOG", "error")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            let child = command
-                .spawn()
-                .expect("spawn real acpx-server binary for test");
-            let base_url = format!("http://127.0.0.1:{port}");
-            for _ in 0..100 {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
+            let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+                command
+                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_AGENT_ID", "relay-test")
+                    .env("RUST_LOG", "error");
+            });
             TestGateway { child, base_url }
         };
 
@@ -2336,26 +2526,13 @@ done
         .expect("write stand-in backend script");
 
         let gateway = {
-            let port = free_port();
-            let mut command = std::process::Command::new(acpx_server_bin());
-            command
-                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-                .env("ACPX_DEFAULT_AGENT_ID", "cancel-test")
-                .env("RUST_LOG", "error")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            let child = command
-                .spawn()
-                .expect("spawn real acpx-server binary for test");
-            let base_url = format!("http://127.0.0.1:{port}");
-            for _ in 0..100 {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
+            let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+                command
+                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_AGENT_ID", "cancel-test")
+                    .env("RUST_LOG", "error");
+            });
             TestGateway { child, base_url }
         };
 
@@ -2530,6 +2707,154 @@ done
             "expected a terminal/create relay on the profile-selected thread -- \
              a thread opened without this profile would never see one, since \
              the default profile has allow_terminal_access=false"
+        );
+    }
+
+    /// Coverage-matrix `session/set_mode`/`session/set_config_option`
+    /// row: proves (a) a real `session/new` response's `modes`/
+    /// `configOptions` fields reach `AgentBridge::session_modes`/
+    /// `config_options`, (b) `AgentBridge::set_mode` actually sends
+    /// `session/set_mode` with the exact chosen `modeId` (proven by the
+    /// stand-in backend only writing a marker file once it observes
+    /// that call -- if `set_mode` silently no-opped or targeted the
+    /// wrong session, the marker would never appear and this test would
+    /// hang to its own deadline and fail), and (c) `AgentBridge::
+    /// set_config_option`'s round trip re-emits the backend's *own*
+    /// updated `configOptions[]` (with the new `currentValue`) as a
+    /// fresh `AgentEvent::ConfigOptions` that `config_options(idx)`
+    /// then reflects -- not just a client-side echo of the value this
+    /// test sent.
+    #[test]
+    fn set_mode_and_set_config_option_reach_a_real_backend_and_update_bridge_state() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("mode_config_backend.sh");
+        let set_mode_marker = script_dir.path().join("set_mode_id");
+        let set_config_marker = script_dir.path().join("set_config_option_call");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"backend-mc","modes":{{"currentModeId":"ask","availableModes":[{{"id":"ask","name":"Ask"}},{{"id":"code","name":"Code","description":"Autonomous coding"}}]}},"configOptions":[{{"id":"model","name":"Model","type":"select","currentValue":"gpt-5","options":[{{"value":"gpt-5","name":"GPT-5"}},{{"value":"gpt-5-mini","name":"GPT-5 mini"}}]}}]}}}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/set_mode"'; then
+    mode_id=$(echo "$line" | grep -o '"modeId":"[^"]*"' | head -1 | cut -d: -f2 | tr -d '"')
+    echo "$mode_id" > {set_mode_marker}
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/set_config_option"'; then
+    config_id=$(echo "$line" | grep -o '"configId":"[^"]*"' | head -1 | cut -d: -f2 | tr -d '"')
+    value=$(echo "$line" | grep -o '"value":"[^"]*"' | head -1 | cut -d: -f2 | tr -d '"')
+    printf '%s %s\n' "$config_id" "$value" > {set_config_marker}
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"configOptions":[{{"id":"model","name":"Model","type":"select","currentValue":"%s","options":[{{"value":"gpt-5","name":"GPT-5"}},{{"value":"gpt-5-mini","name":"GPT-5 mini"}}]}}]}}}}\n' "$id" "$value"
+  else
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"ok":true}}}}\n' "$id"
+  fi
+done
+"#,
+                set_mode_marker = set_mode_marker.display(),
+                set_config_marker = set_config_marker.display(),
+            ),
+        )
+        .expect("write stand-in backend script");
+
+        let gateway = {
+            let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+                command
+                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_AGENT_ID", "mode-config-test")
+                    .env("RUST_LOG", "error");
+            });
+            TestGateway { child, base_url }
+        };
+
+        let names = ["Mode Config Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        // (a) session/new's own modes/configOptions reached bridge
+        // state. `session/new` itself resolves synchronously (via
+        // `block_on` inside `AgentBridge::new`), but the forwarder task
+        // that applies `SessionModes`/`ConfigOptions` to `ThreadSlot`
+        // (`store_capability_event`) is a separate spawned task racing
+        // this assertion -- poll with a deadline, same convention every
+        // other event-driven assertion in this module already follows
+        // (see the cancel/terminal-relay tests above), rather than
+        // assuming synchronous availability.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut modes = None;
+        while std::time::Instant::now() < deadline && modes.is_none() {
+            modes = bridge.session_modes(0);
+            if modes.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let modes = modes.expect("session/new's modes should have been captured by now");
+        assert_eq!(modes.current_mode_id, "ask");
+        assert_eq!(
+            modes.available.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["ask", "code"]
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut options = Vec::new();
+        while std::time::Instant::now() < deadline && options.is_empty() {
+            options = bridge.config_options(0);
+            if options.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, "model");
+        assert_eq!(options[0].current_value.as_deref(), Some("gpt-5"));
+        assert_eq!(options[0].options.len(), 2);
+
+        // (b) set_mode reaches the real backend with the exact modeId.
+        bridge.set_mode(0, "code".to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !set_mode_marker.is_file() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed_mode_id =
+            std::fs::read_to_string(&set_mode_marker).unwrap_or_default();
+        assert_eq!(
+            observed_mode_id.trim(),
+            "code",
+            "backend never observed session/set_mode with modeId=code"
+        );
+
+        // (c) set_config_option reaches the backend, and the bridge's
+        // config_options(0) is refreshed from that call's own response
+        // (the backend's *chosen* currentValue, not a client echo).
+        bridge.set_config_option(0, "model".to_string(), serde_json::json!("gpt-5-mini"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !set_config_marker.is_file() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed_call = std::fs::read_to_string(&set_config_marker).unwrap_or_default();
+        assert_eq!(
+            observed_call.trim(),
+            "model gpt-5-mini",
+            "backend never observed session/set_config_option(configId=model, value=gpt-5-mini)"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut updated_value = None;
+        while std::time::Instant::now() < deadline && updated_value.is_none() {
+            updated_value = bridge
+                .config_options(0)
+                .into_iter()
+                .find(|o| o.id == "model")
+                .and_then(|o| o.current_value)
+                .filter(|v| v == "gpt-5-mini");
+            if updated_value.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            updated_value.as_deref(),
+            Some("gpt-5-mini"),
+            "config_options(0) should reflect the backend's own updated currentValue \
+             after session/set_config_option resolves"
         );
     }
 }
