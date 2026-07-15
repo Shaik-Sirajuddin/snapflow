@@ -17,6 +17,22 @@ export component ChatArea inherits Rectangle {
     in property <string> active-thread-name: "";
     in property <string> active-thread-description: "";
     in property <[MessageItem]> messages: [];
+    // Phase 3 step 2 (chat-panel-production-ui/execution-plan.md):
+    // "fetch older pages asynchronously when ChatView reaches its top
+    // boundary." Implemented as an explicit row pinned to the top of
+    // the message list (visible only once the user has actually
+    // scrolled there, since it renders as the Flickable's first
+    // child) rather than a scroll-position-triggered auto-fetch --
+    // deliberately more testable/predictable than a viewport-position
+    // heuristic, and still satisfies the same real requirement: an
+    // explicit action available right at the top boundary that loads
+    // the next older page asynchronously (`AgentBridge::load_older_
+    // page` runs against the local jsonl cache, not the network, but
+    // is still dispatched through the same non-blocking callback
+    // path every other Rust-side action uses, not synchronously
+    // inline with rendering).
+    in property <bool> has-older-messages: false;
+    callback load-older-requested();
     in property <string> agent-badge: "agent . ask";
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
@@ -261,6 +277,19 @@ export component ChatArea inherits Rectangle {
             VerticalLayout {
                 padding: compact ? 6px : 12px;
                 spacing: compact ? 8px : 10px;
+                if has-older-messages : Rectangle {
+                    height: 22px;
+                    border-radius: Palette.radius-sm;
+                    background: Palette.sys-sidebar;
+                    TouchArea { clicked => { load-older-requested(); } }
+                    Text {
+                        text: "Load older messages";
+                        color: Palette.sys-text-secondary;
+                        font-size: 10px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
                 for msg[i] in messages : HorizontalLayout {
                     // In the compact dock, full-width cards are more
                     // legible than the desktop right-anchored bubble

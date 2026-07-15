@@ -227,6 +227,10 @@ impl PanelSingleton {
         let expanded = self.expanded.borrow();
         self.component
             .set_messages(to_message_model_from_transcript(transcript, &expanded));
+        // Phase 3 step 2: whether an explicit "Load older messages"
+        // affordance should show at the top of the list.
+        self.component
+            .set_has_older_messages(bridge.has_older_page(real_idx));
     }
 
     /// Displays `real_idx`'s messages, first reconciling `expanded`
@@ -1145,6 +1149,46 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     }
                     drop(expanded);
                     panel.render_messages(real_idx);
+                }
+            });
+        });
+
+        // Phase 3 step 2: "Load older messages" row, explicit-action
+        // counterpart to a scroll-to-top auto-fetch -- see `chat_area.
+        // slint`'s own doc comment. `AgentBridge::load_older_page`
+        // prepends the next older jsonl-cache page into `history`
+        // (local disk read, but still dispatched off the render path
+        // through this callback rather than inline during a redraw).
+        let component_weak = panel.component.as_weak();
+        panel.component.on_load_older_requested(move || {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else { return };
+                    let Some(real_idx) = panel.displayed_thread.get() else {
+                        return;
+                    };
+                    let before_len = bridge.transcript(real_idx).len();
+                    if bridge.load_older_page(real_idx) {
+                        let after_len = bridge.transcript(real_idx).len();
+                        // The new rows were prepended at the *front* --
+                        // grow `expanded` from the front too, so every
+                        // pre-existing collapse-state entry stays
+                        // attached to the same logical message it
+                        // described before this reload, not silently
+                        // shifted onto whatever now occupies its old
+                        // index.
+                        let grown_by = after_len.saturating_sub(before_len);
+                        if grown_by > 0 {
+                            let mut expanded = panel.expanded.borrow_mut();
+                            let mut prefixed = vec![false; grown_by];
+                            prefixed.append(&mut expanded);
+                            *expanded = prefixed;
+                        }
+                        panel.render_messages(real_idx);
+                    }
                 }
             });
         });

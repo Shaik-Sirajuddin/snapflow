@@ -102,6 +102,21 @@ struct ThreadSlot {
     handle: Arc<AcpxThreadHandle>,
     history: Mutex<Vec<ChatMessage>>,
     acp_session_id: Mutex<Option<String>>,
+    /// Phase 3 (chat-panel-production-ui/execution-plan.md): whether
+    /// `history`'s current in-memory content is missing older messages
+    /// still available in the jsonl cache -- set from the seeding
+    /// `JsonlStore::tail()` call's own `older_available` flag, cleared
+    /// once [`AgentBridge::load_older_page`] walks all the way back to
+    /// the thread's real start. `false` unconditionally when there is
+    /// no cache dir at all (nothing on disk to page through).
+    older_available: Mutex<bool>,
+    /// The 0-based index (into the thread's full ordered cached message
+    /// list) of the oldest message currently loaded into `history` --
+    /// what the next [`AgentBridge::load_older_page`] call passes to
+    /// [`crate::jsonl_store::JsonlStore::predecessor_page`] to keep
+    /// paging further back. Meaningless (always `0`) once
+    /// `older_available` is `false`.
+    oldest_loaded_index: Mutex<usize>,
     /// Live interactive requests (`session/request_permission`,
     /// `fs/read_text_file`, `fs/write_text_file`, `terminal/create`)
     /// awaiting a UI decision -- populated by
@@ -297,6 +312,66 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
         }
         _ => {}
     }
+}
+
+/// Phase 3 step 2: how many of a thread's newest cached messages a
+/// cold-start seed loads before requiring an explicit [`AgentBridge::
+/// load_older_page`] call to see further back -- generous enough that
+/// every existing test's small hand-seeded fixture (a handful of
+/// messages) still loads in full within one page (unchanged test
+/// behavior), while still genuinely bounding memory/IO for a real
+/// long-lived thread with thousands of cached messages (see `jsonl_
+/// store.rs`'s own 10,000-message test for the underlying primitive's
+/// own bound proof).
+const HISTORY_PAGE_SIZE: usize = 500;
+
+/// Cold-start seeding for one thread (Phase 3 steps 1-2): loads only
+/// the newest `page_size` cached messages plus the standalone trailer
+/// file -- never a full-file read of a potentially large jsonl file --
+/// and derives the same `cached_session_id` `load()`'s trailer field
+/// used to. Returns `(seeded_messages, cached_session_id,
+/// older_available, oldest_loaded_index)`, ready to populate a new
+/// `ThreadSlot`. A load failure on either the tail page or the trailer
+/// degrades this *one* thread to an empty seed (same "don't take down
+/// every other thread's live connection over one bad cache file"
+/// posture the pre-existing `load()`-based seeding always had) rather
+/// than propagating a fatal `BridgeError`.
+fn seed_thread_from_cache(
+    store: Option<&JsonlStore>,
+    thread_id: &str,
+    page_size: usize,
+) -> (Vec<ChatMessage>, Option<String>, bool, usize) {
+    let Some(store) = store else {
+        return (Vec::new(), None, false, 0);
+    };
+    let page = match store.tail(thread_id, page_size) {
+        Ok(page) => page,
+        Err(e) => {
+            eprintln!(
+                "panel-rust: jsonl cache tail load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge"
+            );
+            return (Vec::new(), None, false, 0);
+        }
+    };
+    let cached_session_id = match store.trailer(thread_id) {
+        Ok(trailer) => trailer
+            .as_ref()
+            .map(|t| t.acp_session_id.trim())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        Err(e) => {
+            eprintln!(
+                "panel-rust: jsonl trailer load failed for thread {thread_id:?} ({e}); treating as no prior session"
+            );
+            None
+        }
+    };
+    (
+        page.messages,
+        cached_session_id,
+        page.older_available,
+        page.oldest_loaded_index,
+    )
 }
 
 fn slug(name: &str) -> String {
@@ -726,31 +801,6 @@ fn cwd_for_session() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn persist_thread_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot, updated_at: String) {
-    let Some(store) = store else {
-        return;
-    };
-    let history = slot.history.lock().expect("history mutex poisoned").clone();
-    let session_id = slot
-        .acp_session_id
-        .lock()
-        .expect("acp_session_id mutex poisoned")
-        .clone()
-        .unwrap_or_default();
-    let trailer = ThreadTrailer {
-        acp_session_id: session_id,
-        title: Some(slot.thread_id.clone()),
-        updated_at: Some(updated_at),
-        message_count: history.len(),
-    };
-    if let Err(e) = store.overwrite(&slot.thread_id, &history, &trailer) {
-        eprintln!(
-            "panel-rust: jsonl trailer overwrite failed for {}: {e}",
-            slot.thread_id
-        );
-    }
-}
-
 fn replay_matches_cached_position(
     history: &[ChatMessage],
     cached_index: &mut usize,
@@ -900,26 +950,8 @@ impl AgentBridge {
             // able to disable the whole chat panel -- it degrades to an
             // empty scrollback for *that thread only*, same as any other
             // cache miss.
-            let (seeded, cached_session_id) = match &store {
-                Some(s) => match s.load(&thread_id) {
-                    Ok(cached) => {
-                        let session_id = cached
-                            .trailer
-                            .as_ref()
-                            .map(|trailer| trailer.acp_session_id.trim())
-                            .filter(|session_id| !session_id.is_empty())
-                            .map(str::to_owned);
-                        (cached.messages, session_id)
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "panel-rust: jsonl cache load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge"
-                        );
-                        (Vec::new(), None)
-                    }
-                },
-                None => (Vec::new(), None),
-            };
+            let (seeded, cached_session_id, older_available, oldest_loaded_index) =
+                seed_thread_from_cache(store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
 
             let provider = provider_for_index(idx);
             let base_url = resolved_urls.get(provider).cloned().ok_or_else(|| {
@@ -940,6 +972,8 @@ impl AgentBridge {
                 )),
                 history: Mutex::new(seeded),
                 acp_session_id: Mutex::new(None),
+                older_available: Mutex::new(older_available),
+                oldest_loaded_index: Mutex::new(oldest_loaded_index),
                 pending_requests: Mutex::new(Vec::new()),
                 terminal_buffers: Mutex::new(HashMap::new()),
                 terminal_order: Mutex::new(Vec::new()),
@@ -1166,24 +1200,8 @@ impl AgentBridge {
         let gateway = self.gateways.get(&base_url).cloned().ok_or_else(|| {
             BridgeError::Gateway(format!("gateway connection missing for {base_url}"))
         })?;
-        let (seeded, cached_session_id) = match &self.store {
-            Some(store) => match store.load(&thread_id) {
-                Ok(cached) => (
-                    cached.messages,
-                    cached
-                        .trailer
-                        .as_ref()
-                        .map(|trailer| trailer.acp_session_id.trim())
-                        .filter(|id| !id.is_empty())
-                        .map(str::to_owned),
-                ),
-                Err(error) => {
-                    eprintln!("panel-rust: new thread cache load failed for {thread_id}: {error}");
-                    (Vec::new(), None)
-                }
-            },
-            None => (Vec::new(), None),
-        };
+        let (seeded, cached_session_id, older_available, oldest_loaded_index) =
+            seed_thread_from_cache(self.store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
 
         let mut handle = {
             let _guard = self.runtime.enter();
@@ -1199,6 +1217,8 @@ impl AgentBridge {
             )),
             history: Mutex::new(seeded),
             acp_session_id: Mutex::new(None),
+            older_available: Mutex::new(older_available),
+            oldest_loaded_index: Mutex::new(oldest_loaded_index),
             pending_requests: Mutex::new(Vec::new()),
             terminal_buffers: Mutex::new(HashMap::new()),
             terminal_order: Mutex::new(Vec::new()),
@@ -1638,6 +1658,76 @@ impl AgentBridge {
                     .to_vec()
             })
             .unwrap_or_default()
+    }
+
+    /// `true` if thread `idx` has older cached messages beyond what is
+    /// currently loaded into memory -- what a `ChatView` scroll-to-top
+    /// handler checks before bothering to call [`Self::load_older_page`]
+    /// at all (Phase 3 step 2).
+    pub fn has_older_page(&self, idx: usize) -> bool {
+        self.slots
+            .get(idx)
+            .map(|s| *s.older_available.lock().expect("older_available mutex poisoned"))
+            .unwrap_or(false)
+    }
+
+    /// Loads the next older page of thread `idx`'s cached transcript
+    /// from disk and prepends it to `history` (oldest-first order
+    /// preserved -- the page's own messages are already oldest-to-
+    /// newest, and they all precede everything already in `history`),
+    /// then rebuilds the merged `transcript` view from the new,
+    /// larger `history`. Returns `false` (a no-op) if there is no
+    /// cache configured, no older page available, or the thread index
+    /// is out of range -- callers should stop calling this once it
+    /// returns `false` rather than needing to separately poll
+    /// [`Self::has_older_page`] first (though doing so to decide
+    /// whether to show a "load more" affordance at all is still
+    /// correct and cheap).
+    pub fn load_older_page(&self, idx: usize) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        let Some(store) = &self.store else {
+            return false;
+        };
+        if !*slot.older_available.lock().expect("older_available mutex poisoned") {
+            return false;
+        }
+        let before_index = *slot
+            .oldest_loaded_index
+            .lock()
+            .expect("oldest_loaded_index mutex poisoned");
+        let page = match store.predecessor_page(&slot.thread_id, before_index, HISTORY_PAGE_SIZE) {
+            Ok(page) => page,
+            Err(e) => {
+                eprintln!(
+                    "panel-rust: load_older_page failed for thread {:?}: {e}",
+                    slot.thread_id
+                );
+                return false;
+            }
+        };
+        if page.messages.is_empty() {
+            // Nothing actually came back (e.g. the cache file shrank
+            // out from under this index somehow) -- treat as exhausted
+            // rather than looping forever on a caller that keeps
+            // retrying.
+            *slot.older_available.lock().expect("older_available mutex poisoned") = false;
+            return false;
+        }
+        {
+            let mut history = slot.history.lock().expect("history mutex poisoned");
+            let mut prepended = page.messages;
+            prepended.extend(history.drain(..));
+            *history = prepended;
+        }
+        *slot.older_available.lock().expect("older_available mutex poisoned") = page.older_available;
+        *slot
+            .oldest_loaded_index
+            .lock()
+            .expect("oldest_loaded_index mutex poisoned") = page.oldest_loaded_index;
+        refresh_transcript(slot);
+        true
     }
 
     /// Fire-and-forget: dispatches `text` to the given thread's bound
@@ -3379,6 +3469,167 @@ done
         assert_eq!(
             assistant_count, 1,
             "expected the transcript to have exactly one merged Assistant row, not one per chunk"
+        );
+    }
+
+    /// Phase 3 steps 1-2 (chat-panel-production-ui/execution-plan.md),
+    /// through the real `AgentBridge` construction path, not just
+    /// `JsonlStore`'s own unit tests directly: a thread whose real
+    /// jsonl cache holds far more than `HISTORY_PAGE_SIZE` messages
+    /// cold-starts with only the newest page loaded, and repeated
+    /// `load_older_page` calls walk backward through the rest in the
+    /// correct order, ending with `has_older_page` reporting `false`
+    /// and `history` holding every seeded message.
+    #[test]
+    fn cold_start_loads_only_the_newest_page_and_load_older_page_walks_back_to_the_start() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
+        let names = ["Long History Thread"];
+        let thread_id = slug(names[0]);
+
+        // Seed a real cache file with more than one page's worth of
+        // messages, independent of this bridge (mirrors a prior run's
+        // accumulated scrollback).
+        let total_messages = HISTORY_PAGE_SIZE * 2 + 37;
+        let seeded_messages: Vec<ChatMessage> = (0..total_messages)
+            .map(|i| ChatMessage {
+                // Alternating User/Agent -- a realistic shape (unlike an
+                // uninterrupted run of same-kind chunks, which this
+                // reducer's own synthetic-id merge heuristic is
+                // *designed* to collapse into one growing message, see
+                // `conversation::rebuild_from_chat_messages`'s doc
+                // comment) so this test's own `transcript(0)` assertion
+                // below is meaningful rather than incidentally
+                // exercising the merge behavior a different, dedicated
+                // test already covers.
+                kind: if i % 2 == 0 { MessageKind::User } else { MessageKind::Agent },
+                text: format!("message-{i}"),
+                status: None,
+                id: None,
+            })
+            .collect();
+        let seed_store = JsonlStore::open(cache_dir.path()).expect("open store for seeding");
+        seed_store
+            .overwrite(
+                &thread_id,
+                &seeded_messages,
+                &ThreadTrailer {
+                    acp_session_id: "prior-run-session".into(),
+                    title: Some(thread_id.clone()),
+                    updated_at: Some("unix:1".into()),
+                    message_count: seeded_messages.len(),
+                },
+            )
+            .expect("seed cache file");
+
+        let bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge");
+
+        // Cold start loaded only the newest page, not the full 1037.
+        let initial = bridge.history(0);
+        assert_eq!(
+            initial.len(),
+            HISTORY_PAGE_SIZE,
+            "cold start should load exactly one page, not the full cached history"
+        );
+        assert_eq!(initial[0].text, format!("message-{}", total_messages - HISTORY_PAGE_SIZE));
+        assert_eq!(initial[HISTORY_PAGE_SIZE - 1].text, format!("message-{}", total_messages - 1));
+        assert!(bridge.has_older_page(0));
+
+        // First load_older_page call adds the next page back.
+        assert!(bridge.load_older_page(0));
+        let after_one = bridge.history(0);
+        assert_eq!(after_one.len(), HISTORY_PAGE_SIZE * 2);
+        assert_eq!(after_one[0].text, format!("message-{}", total_messages - HISTORY_PAGE_SIZE * 2));
+        assert!(bridge.has_older_page(0));
+
+        // Second call reaches the real start (37 remaining messages).
+        assert!(bridge.load_older_page(0));
+        let after_two = bridge.history(0);
+        assert_eq!(after_two.len(), total_messages);
+        assert_eq!(after_two[0].text, "message-0");
+        assert!(!bridge.has_older_page(0));
+
+        // Further calls are a genuine no-op, not an error/duplicate.
+        assert!(!bridge.load_older_page(0));
+        assert_eq!(bridge.history(0).len(), total_messages);
+
+        // The merged transcript view grew to match -- proves
+        // `load_older_page` actually refreshed `transcript`, not just
+        // `history`.
+        assert_eq!(bridge.transcript(0).len(), total_messages);
+    }
+}
+/// Refreshes `slot`'s trailer (`acp_session_id`/`updated_at`), taking
+/// into account whether `history` currently holds the thread's *full*
+/// cached content or only a bounded newest page (Phase 3 cold-start
+/// paging, see `seed_thread_from_cache`/`AgentBridge::load_older_page`).
+///
+/// **Real bug this function's `older_available` check exists to
+/// prevent**: [`JsonlStore::overwrite`] always replaces a thread's
+/// *entire* on-disk jsonl content with whatever `messages` slice it is
+/// given. Before bounded cold-start loading existed, `slot.history`
+/// always held a thread's complete cached scrollback, so calling
+/// `overwrite(thread_id, &history, ..)` here was a safe, if slightly
+/// wasteful, way to refresh the trailer. Once cold start only loads the
+/// newest page, calling `overwrite` with that partial `history` would
+/// silently and permanently discard every older cached message still
+/// sitting on disk the moment any thread that hasn't had `load_older_
+/// page` called on it opens its session (caught by this exact scenario
+/// in `agent_bridge::tests::cold_start_loads_only_the_newest_page_and_
+/// load_older_page_walks_back_to_the_start` during development -- the
+/// first `load_older_page` call came back with a page indistinguishable
+/// from the already-loaded tail, because the file it was reading from
+/// had already been truncated down to just that tail page by this exact
+/// path). So: if `older_available` is true, only the small standalone
+/// trailer file is touched ([`JsonlStore::update_trailer`], message
+/// count computed as `history.len() + oldest_loaded_index` without
+/// needing to read the index file at all); the jsonl file and its index
+/// are left completely untouched. Only once the *entire* thread is
+/// loaded into memory (`older_available: false` -- either it always fit
+/// in one page, or `load_older_page` walked all the way back) is a full
+/// `overwrite` safe again, matching this function's pre-paging
+/// behavior exactly.
+fn persist_thread_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot, updated_at: String) {
+    let Some(store) = store else {
+        return;
+    };
+    let history = slot.history.lock().expect("history mutex poisoned").clone();
+    let session_id = slot
+        .acp_session_id
+        .lock()
+        .expect("acp_session_id mutex poisoned")
+        .clone()
+        .unwrap_or_default();
+    let older_available = *slot
+        .older_available
+        .lock()
+        .expect("older_available mutex poisoned");
+    let real_message_count = if older_available {
+        history.len()
+            + *slot
+                .oldest_loaded_index
+                .lock()
+                .expect("oldest_loaded_index mutex poisoned")
+    } else {
+        history.len()
+    };
+    let trailer = ThreadTrailer {
+        acp_session_id: session_id,
+        title: Some(slot.thread_id.clone()),
+        updated_at: Some(updated_at),
+        message_count: real_message_count,
+    };
+    let result = if older_available {
+        store.update_trailer(&slot.thread_id, &trailer)
+    } else {
+        store.overwrite(&slot.thread_id, &history, &trailer)
+    };
+    if let Err(e) = result {
+        eprintln!(
+            "panel-rust: jsonl trailer persist failed for {}: {e}",
+            slot.thread_id
         );
     }
 }
