@@ -28,7 +28,7 @@ mod theme;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge};
 use appearance::{AppearanceState, ColorScheme, HostAppearance};
-use models::{build_thread_items, describe_thread, to_message_model, ThreadState};
+use models::{build_thread_items, describe_thread, to_message_model_from_transcript, ThreadState};
 use protocol_types::{AgentEvent, ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
@@ -218,10 +218,15 @@ impl PanelSingleton {
     /// not reset collapse state for every other message in the thread.
     fn render_messages(&self, real_idx: usize) {
         let Some(bridge) = &self.bridge else { return };
-        let history = bridge.history(real_idx);
+        // Phase 2 step 3: render the *merged* transcript view
+        // (`AgentBridge::transcript`, streamed chunks/tool-status
+        // updates already merged by id), not the raw per-chunk
+        // `history` feed -- see `models::to_message_model_from_
+        // transcript`'s doc comment.
+        let transcript = bridge.transcript(real_idx);
         let expanded = self.expanded.borrow();
         self.component
-            .set_messages(to_message_model(history, &expanded));
+            .set_messages(to_message_model_from_transcript(transcript, &expanded));
     }
 
     /// Displays `real_idx`'s messages, first reconciling `expanded`
@@ -236,7 +241,12 @@ impl PanelSingleton {
     /// `set_messages` directly.
     fn refresh_messages_for(&self, real_idx: usize) {
         let Some(bridge) = &self.bridge else { return };
-        let history_len = bridge.history(real_idx).len();
+        // Sized against the *merged* transcript's row count, not raw
+        // `history`'s chunk count -- `toggle-expanded(index)` callbacks
+        // (see `on_toggle_expanded` below) index into this same vec by
+        // the row index `render_messages`'s `MessageItem::index` field
+        // assigns, which is a transcript row index post-merge.
+        let history_len = bridge.transcript(real_idx).len();
         let is_thread_switch = self.displayed_thread.get() != Some(real_idx);
         {
             let mut expanded = self.expanded.borrow_mut();
@@ -857,6 +867,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                             kind: MessageKind::User,
                             text: text.to_string(),
                             status: None,
+                            id: None,
                         },
                     );
                     if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {

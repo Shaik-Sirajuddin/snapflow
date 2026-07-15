@@ -73,6 +73,61 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
     ModelRc::new(VecModel::from(items))
 }
 
+/// Builds the message-list model from the *merged* transcript view
+/// (Phase 2 step 3, `AgentBridge::transcript`) rather than the raw
+/// per-chunk `ChatMessage` feed -- streamed chunks already merged by
+/// message id, tool-call status updates already replacing their row
+/// instead of duplicating it (see `crate::conversation::
+/// ConversationState`'s own doc comment). This is the function real
+/// call sites (`lib.rs::render_messages`) use; [`to_message_model`]
+/// above stays available for the raw-feed case and is still covered by
+/// its own unit tests, since `ChatMessage`'s shape hasn't changed.
+///
+/// `Terminal`/`Notice` transcript items are silently skipped -- no
+/// production code path constructs either variant yet (`rebuild_from_
+/// chat_messages` only ever emits `User`/`Assistant`/`Thought`/`Tool`
+/// from a `ChatMessage` feed, which has no terminal/notice kind of its
+/// own), so this is a forward-compatible no-op today, not a silent
+/// data loss; a future `ConversationEvent::TerminalCreated`/`Notice`
+/// producer would need its own dedicated Slint row type anyway, not a
+/// `MessageItem` reuse.
+pub fn to_message_model_from_transcript(
+    items: Vec<crate::conversation::TranscriptItem>,
+    expanded: &[bool],
+) -> ModelRc<MessageItem> {
+    use crate::conversation::TranscriptItem;
+
+    let mut index = 0i32;
+    let rows: Vec<MessageItem> = items
+        .into_iter()
+        .filter_map(|item| {
+            let (kind, text, status) = match item {
+                TranscriptItem::User { text, .. } => ("user", text, String::new()),
+                TranscriptItem::Assistant { text, .. } => ("agent", text, String::new()),
+                TranscriptItem::Thought { text, .. } => ("thinking", text, String::new()),
+                TranscriptItem::Tool { title, status, .. } => (
+                    "tool-call",
+                    title,
+                    // Same uppercasing convention `to_message_model`
+                    // documents above.
+                    status.map(|s| s.to_uppercase()).unwrap_or_default(),
+                ),
+                TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. } => return None,
+            };
+            let row = MessageItem {
+                kind: kind.into(),
+                text: text.into(),
+                status: status.into(),
+                expanded: expanded.get(index as usize).copied().unwrap_or(false),
+                index,
+            };
+            index += 1;
+            Some(row)
+        })
+        .collect();
+    ModelRc::new(VecModel::from(rows))
+}
+
 /// Builds the mode-selector's chip row model from a thread's currently
 /// advertised `AgentBridge::session_modes` -- `None` (no `modes` field
 /// advertised at all, or `session/new` hasn't resolved yet) maps to an
@@ -443,6 +498,7 @@ mod tests {
             kind,
             text: text.to_string(),
             status: status.map(str::to_string),
+            id: None,
         }
     }
 

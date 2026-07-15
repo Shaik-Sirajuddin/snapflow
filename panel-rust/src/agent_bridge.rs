@@ -60,6 +60,7 @@
 //!   against.
 
 use crate::jsonl_store::{JsonlStore, ThreadTrailer};
+use crate::conversation::ConversationState;
 use crate::protocol_types::{
     AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
     TerminalOutputEvent,
@@ -138,6 +139,19 @@ struct ThreadSlot {
     /// shown as a dead/always-present control.
     session_modes: Mutex<Option<SessionModesEvent>>,
     config_options: Mutex<Vec<ConfigOptionInfo>>,
+    /// Phase 2 step 3 (chat-panel-production-ui/execution-plan.md):
+    /// typed, merged conversation view -- `history` above stays the
+    /// raw, unmerged, append-only `ChatMessage` feed (JSONL cache
+    /// format, exact-count-preserving for every test/consumer that
+    /// already depends on it); this is the *rendered* view real UI
+    /// code should read from instead, where streamed chunks are merged
+    /// by message id and tool-call status updates replace their
+    /// existing row instead of appending a duplicate -- see
+    /// `crate::conversation::ConversationState`'s own doc comment.
+    /// Rebuilt from `history`'s full contents on every mutation via
+    /// [`rebuild_transcript`] rather than maintained incrementally --
+    /// see that function's doc comment for why.
+    transcript: Mutex<ConversationState>,
 }
 
 /// One terminal's current known state, as last observed via
@@ -217,6 +231,17 @@ async fn open_session_maybe_profiled(
         Some(profile) => handle.open_session_with_profile(cwd, profile).await,
         None => handle.open_session(cwd).await,
     }
+}
+
+/// Recomputes `slot.transcript` from `slot.history`'s current full
+/// contents -- call this after any mutation of `history` (a new
+/// message pushed, live or replayed). See `ThreadSlot::transcript`'s
+/// own doc comment on why this is a full rebuild rather than an
+/// incremental merge.
+fn refresh_transcript(slot: &ThreadSlot) {
+    let history = slot.history.lock().expect("history mutex poisoned").clone();
+    let rebuilt = crate::conversation::rebuild_from_chat_messages(&slot.thread_id, &history);
+    *slot.transcript.lock().expect("transcript mutex poisoned") = rebuilt;
 }
 
 fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
@@ -910,6 +935,9 @@ impl AgentBridge {
             let slot = Arc::new(ThreadSlot {
                 thread_id: thread_id.clone(),
                 handle: handle.clone(),
+                transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
+                    &thread_id, &seeded,
+                )),
                 history: Mutex::new(seeded),
                 acp_session_id: Mutex::new(None),
                 pending_requests: Mutex::new(Vec::new()),
@@ -976,6 +1004,7 @@ impl AgentBridge {
                     // legitimate repeated messages.
                     if cached_session_id.is_some() {
                         let mut cached_index = 0usize;
+                        let mut replayed_any = false;
                         while let Ok(ev) = events_rx.try_recv() {
                             if let AgentEvent::Message(message) = &ev {
                                 let mut history = slot_for_task
@@ -988,6 +1017,7 @@ impl AgentBridge {
                                     message,
                                 ) {
                                     history.push(message.clone());
+                                    replayed_any = true;
                                     if let Some(store) = &store_for_task {
                                         if let Err(e) =
                                             store.append(&slot_for_task.thread_id, message)
@@ -1000,6 +1030,14 @@ impl AgentBridge {
                                     }
                                 }
                             }
+                        }
+                        if replayed_any {
+                            // `history` above is a `MutexGuard`, already
+                            // dropped by end-of-loop-body scope each
+                            // iteration -- safe to reacquire it (via
+                            // `refresh_transcript`) here without
+                            // deadlocking.
+                            refresh_transcript(&slot_for_task);
                         }
                     }
                 }
@@ -1023,6 +1061,7 @@ impl AgentBridge {
                                 .lock()
                                 .expect("history mutex poisoned")
                                 .push(msg.clone());
+                            refresh_transcript(&slot_for_task);
                             if let Some(store) = &store_for_task {
                                 if let Err(e) = store.append(&slot_for_task.thread_id, msg) {
                                     eprintln!(
@@ -1038,6 +1077,11 @@ impl AgentBridge {
                                 &slot_for_task,
                                 now_token(),
                             );
+                            slot_for_task
+                                .transcript
+                                .lock()
+                                .expect("transcript mutex poisoned")
+                                .mark_all_streaming_completed();
                         }
                         AgentEvent::Error(_) => {}
                         AgentEvent::PermissionRequest(req) => {
@@ -1150,6 +1194,9 @@ impl AgentBridge {
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
             handle: handle.clone(),
+            transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
+                &thread_id, &seeded,
+            )),
             history: Mutex::new(seeded),
             acp_session_id: Mutex::new(None),
             pending_requests: Mutex::new(Vec::new()),
@@ -1183,16 +1230,21 @@ impl AgentBridge {
 
         if cached_session_id.is_some() {
             let mut cached_index = 0usize;
+            let mut replayed_any = false;
             while let Ok(event) = events_rx.try_recv() {
                 if let AgentEvent::Message(message) = event {
                     let mut history = slot.history.lock().expect("history mutex poisoned");
                     if !replay_matches_cached_position(&history, &mut cached_index, &message) {
                         history.push(message.clone());
+                        replayed_any = true;
                         if let Some(store) = &self.store {
                             let _ = store.append(&slot.thread_id, &message);
                         }
                     }
                 }
+            }
+            if replayed_any {
+                refresh_transcript(&slot);
             }
         }
 
@@ -1208,6 +1260,7 @@ impl AgentBridge {
                             .lock()
                             .expect("history mutex poisoned")
                             .push(message.clone());
+                        refresh_transcript(&slot_for_task);
                         if let Some(store) = &store_for_task {
                             let _ = store.append(&slot_for_task.thread_id, message);
                         }
@@ -1218,6 +1271,11 @@ impl AgentBridge {
                             &slot_for_task,
                             now_token(),
                         );
+                        slot_for_task
+                            .transcript
+                            .lock()
+                            .expect("transcript mutex poisoned")
+                            .mark_all_streaming_completed();
                     }
                     AgentEvent::Error(_) => {}
                     AgentEvent::PermissionRequest(req) => {
@@ -1552,6 +1610,7 @@ impl AgentBridge {
             .lock()
             .expect("history mutex poisoned")
             .push(msg.clone());
+        refresh_transcript(slot);
         if let Some(store) = &self.store {
             if let Err(e) = store.append(&slot.thread_id, &msg) {
                 eprintln!(
@@ -1560,6 +1619,25 @@ impl AgentBridge {
                 );
             }
         }
+    }
+
+    /// Snapshot of a thread's *merged* transcript view (Phase 2 step 3)
+    /// -- streamed chunks merged by message id, tool-call status
+    /// updates replaced in place rather than duplicated. This is what
+    /// UI-facing code should read from instead of [`Self::history`]'s
+    /// raw per-chunk feed; see [`crate::conversation::ConversationState`]
+    /// and `ThreadSlot::transcript`'s own doc comments.
+    pub fn transcript(&self, idx: usize) -> Vec<crate::conversation::TranscriptItem> {
+        self.slots
+            .get(idx)
+            .map(|s| {
+                s.transcript
+                    .lock()
+                    .expect("transcript mutex poisoned")
+                    .items()
+                    .to_vec()
+            })
+            .unwrap_or_default()
     }
 
     /// Fire-and-forget: dispatches `text` to the given thread's bound
@@ -1909,6 +1987,7 @@ mod tests {
                 kind: MessageKind::User,
                 text: "hello from a new thread".into(),
                 status: None,
+                id: None,
             },
         );
         bridge.send_prompt(index, "hello from a new thread".into());
@@ -1951,6 +2030,7 @@ mod tests {
                     kind: MessageKind::User,
                     text: "hello from run one".into(),
                     status: None,
+                    id: None,
                 },
             );
             assert_eq!(bridge.history(0).len(), 1);
@@ -1992,6 +2072,7 @@ mod tests {
                     kind: MessageKind::User,
                     text: "first turn".into(),
                     status: None,
+                    id: None,
                 },
             );
             bridge.send_prompt(0, "first turn".into());
@@ -2037,6 +2118,7 @@ mod tests {
                 kind: MessageKind::User,
                 text: "second turn".into(),
                 status: None,
+                id: None,
             },
         );
         bridge.send_prompt(0, "second turn".into());
@@ -2067,6 +2149,7 @@ mod tests {
             kind: MessageKind::Agent,
             text: "same answer".into(),
             status: None,
+            id: None,
         };
         let mut history = vec![message.clone(), message.clone()];
         let mut cached_index = 0;
@@ -2099,11 +2182,13 @@ mod tests {
             kind: MessageKind::User,
             text: "same answer".into(),
             status: None,
+            id: None,
         };
         let agent = ChatMessage {
             kind: MessageKind::Agent,
             text: "same answer".into(),
             status: None,
+            id: None,
         };
         let history = vec![user, agent.clone()];
         let mut cached_index = 0;
@@ -2189,6 +2274,7 @@ mod tests {
                 kind: MessageKind::User,
                 text: "a-only".into(),
                 status: None,
+                id: None,
             },
         );
         bridge.push_local(
@@ -2197,6 +2283,7 @@ mod tests {
                 kind: MessageKind::User,
                 text: "b-only".into(),
                 status: None,
+                id: None,
             },
         );
         assert_eq!(bridge.history(0)[0].text, "a-only");
@@ -2225,6 +2312,7 @@ mod tests {
                 kind: MessageKind::User,
                 text: "not persisted".into(),
                 status: None,
+                id: None,
             },
         );
         assert_eq!(bridge.history(0).len(), 1);
@@ -2404,21 +2492,25 @@ mod tests {
                 kind: MessageKind::User,
                 text: "add a crossfade".into(),
                 status: None,
+                id: None,
             },
             ChatMessage {
                 kind: MessageKind::Thinking,
                 text: "considering the timeline structure".into(),
                 status: None,
+                id: None,
             },
             ChatMessage {
                 kind: MessageKind::ToolCall,
                 text: "edit.add_transition(...)".into(),
                 status: None,
+                id: None,
             },
             ChatMessage {
                 kind: MessageKind::Agent,
                 text: "done, crossfade added".into(),
                 status: None,
+                id: None,
             },
         ];
         seed_store
@@ -2513,6 +2605,7 @@ mod tests {
                     kind: MessageKind::Agent,
                     text: "healthy scrollback".into(),
                     status: None,
+                    id: None,
                 }],
                 &ThreadTrailer {
                     acp_session_id: "ok".into(),
@@ -3192,5 +3285,100 @@ done
         bridge.close_local_terminal(0);
         assert!(!bridge.has_local_terminal(0));
         assert!(bridge.local_terminal_snapshot(0).is_none());
+    }
+
+    /// Phase 2 step 3 (chat-panel-production-ui/execution-plan.md):
+    /// proves `AgentBridge::transcript` actually reflects a real
+    /// backend's multi-chunk streaming reply merged into one row, while
+    /// `AgentBridge::history` keeps every raw chunk -- the exact
+    /// contract `to_message_model_from_transcript` depends on. A stand-
+    /// in backend sends three separate `agent_message_chunk`
+    /// notifications all carrying the same real `messageId`, exactly
+    /// how a real streaming backend would split one growing reply
+    /// across several `session/update` pushes.
+    #[test]
+    fn transcript_merges_a_real_multi_chunk_streamed_reply_by_message_id() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("stand_in_backend.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-stream"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"backend-stream","update":{"sessionUpdate":"agent_message_chunk","messageId":"reply-1","content":{"type":"text","text":"Hello"}}}}\n'
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"backend-stream","update":{"sessionUpdate":"agent_message_chunk","messageId":"reply-1","content":{"type":"text","text":", "}}}}\n'
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"backend-stream","update":{"sessionUpdate":"agent_message_chunk","messageId":"reply-1","content":{"type":"text","text":"world"}}}}\n'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#,
+        )
+        .expect("write stand-in backend script");
+
+        let gateway = {
+            let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+                command
+                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_AGENT_ID", "stream-merge-test")
+                    .env("RUST_LOG", "error");
+            });
+            TestGateway { child, base_url }
+        };
+
+        let names = ["Stream Merge Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+        bridge.send_prompt(0, "say hello world".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut turn_ended = false;
+        while std::time::Instant::now() < deadline && !turn_ended {
+            for event in bridge.poll() {
+                if let AgentEvent::TurnEnded(_) = event.event {
+                    turn_ended = true;
+                }
+            }
+            if !turn_ended {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(turn_ended, "backend never completed the streamed turn");
+
+        let raw_history = bridge.history(0);
+        assert_eq!(
+            raw_history.iter().filter(|m| m.text.contains("Hello") || m.text == ", " || m.text == "world").count(),
+            3,
+            "expected 3 separate raw chunks in history, got {raw_history:?}"
+        );
+
+        let transcript = bridge.transcript(0);
+        let merged = transcript
+            .iter()
+            .find_map(|item| match item {
+                crate::conversation::TranscriptItem::Assistant { text, message_id, .. }
+                    if message_id == "reply-1" =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("expected exactly one merged Assistant transcript item for reply-1");
+        assert_eq!(
+            merged, "Hello, world",
+            "expected the three chunks merged into one row in real messageId-arrival order"
+        );
+        let assistant_count = transcript
+            .iter()
+            .filter(|item| matches!(item, crate::conversation::TranscriptItem::Assistant { .. }))
+            .count();
+        assert_eq!(
+            assistant_count, 1,
+            "expected the transcript to have exactly one merged Assistant row, not one per chunk"
+        );
     }
 }

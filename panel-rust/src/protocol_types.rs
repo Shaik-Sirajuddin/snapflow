@@ -40,6 +40,21 @@ pub struct ChatMessage {
     /// this field existed) still deserialize without error.
     #[serde(default)]
     pub status: Option<String>,
+    /// Phase 2 step 3 addition: the wire's own `messageId` (for
+    /// `agent_message_chunk`/`agent_thought_chunk`) or `toolCallId`
+    /// (for `tool_call`/`tool_call_update`), when the backend provided
+    /// one -- `None` for `user_message_chunk` (never carries an id in
+    /// this crate's usage) and for every message cached before this
+    /// field existed. Lets `AgentBridge`'s transcript reducer
+    /// (`conversation::ConversationState`) merge streamed chunks/tool
+    /// updates by id instead of treating every chunk as its own
+    /// message -- see `agent_bridge.rs`'s ingestion logic for the
+    /// synthetic-id fallback this crate uses when a real v1 backend
+    /// omits `messageId` (an RFD, not required in v1 --
+    /// agentclientprotocol.com/rfds/message-id). `#[serde(default)]`
+    /// for the same old-cache-line compatibility reason as `status`.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Events flowing out of a bound thread's gateway actor, consumed from

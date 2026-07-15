@@ -3,6 +3,27 @@
 //! Raw ACP/ACPX JSON is normalized before it reaches this module. The reducer
 //! owns stable merge semantics for streamed message chunks, tool updates, and
 //! terminal output so Slint projections never need to infer protocol state.
+//!
+//! [`rebuild_from_chat_messages`] is this module's one real production
+//! entry point (Phase 2 step 3, chat-panel-production-ui/execution-
+//! plan.md): `AgentBridge` keeps `protocol_types::ChatMessage` as its
+//! raw, append-only, per-chunk feed (unchanged -- it is also the JSONL
+//! cache's on-disk row format, and many existing tests/consumers
+//! already depend on its exact per-chunk shape/count), and calls this
+//! function to derive a *merged* [`ConversationState`] from that feed
+//! for anything UI-facing. `ChatMessage` itself only carries `kind`/
+//! `text`/`status`/an optional `id` (the wire's own `messageId`/
+//! `toolCallId` when a backend provides one -- an RFD, not required in
+//! ACP v1, see agentclientprotocol.com/rfds/message-id) -- not the
+//! full `ConversationEvent` vocabulary this module defines, so this
+//! function also owns the synthetic-id-when-absent heuristic real v1
+//! backends need: consecutive Assistant/Thought chunks with no real id
+//! share one synthetic id (so they still merge into one growing
+//! message), and that synthetic run resets the moment a different
+//! event kind interrupts it (a `ToolCall`, a `User` message, or the
+//! end of `history`) -- matching the "clients infer message boundaries
+//! by detection heuristics" convention the RFD itself describes for
+//! backends that omit the field.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptItem {
@@ -115,6 +136,23 @@ impl ConversationState {
 
     pub fn items(&self) -> &[TranscriptItem] {
         &self.items
+    }
+
+    /// Flips every currently-streaming `Assistant`/`Thought` item's
+    /// `streaming` flag to `false`. Called on `AgentEvent::TurnEnded` --
+    /// v1 ACP has no explicit "this is the final chunk" marker on
+    /// `agent_message_chunk`/`agent_thought_chunk` themselves (only an
+    /// RFD-status, v1-optional `messageId`, see agentclientprotocol.com/
+    /// rfds/message-id), so turn-end is this reducer's only definitive
+    /// "nothing more will be appended to this message" signal.
+    pub fn mark_all_streaming_completed(&mut self) {
+        for item in &mut self.items {
+            match item {
+                TranscriptItem::Assistant { streaming, .. }
+                | TranscriptItem::Thought { streaming, .. } => *streaming = false,
+                _ => {}
+            }
+        }
     }
 
     /// Returns false for an event belonging to another thread. This makes a
@@ -282,6 +320,103 @@ impl ConversationState {
             exit_code,
         });
     }
+}
+
+/// See this module's own doc comment. Pure function -- always rebuilds
+/// a fresh [`ConversationState`] from the full ordered `history` slice
+/// rather than mutating one incrementally, so a caller (`AgentBridge`)
+/// gets a correct-by-construction merged view on every call with no
+/// risk of incremental-merge state drifting out of sync with the raw
+/// feed (e.g. after a jsonl-cache reload replaces `history` wholesale).
+/// `thread_id` is only needed because [`ConversationEvent`]/
+/// [`ConversationState::apply`] carry one for their own cross-thread
+/// safety check (irrelevant here, since every event this function
+/// constructs is for the one `history` it was given) -- any non-empty
+/// string works; callers typically pass the real thread id for
+/// debuggability.
+pub fn rebuild_from_chat_messages(
+    thread_id: &str,
+    history: &[crate::protocol_types::ChatMessage],
+) -> ConversationState {
+    use crate::protocol_types::MessageKind as ChatKind;
+
+    let mut state = ConversationState::new(thread_id);
+    // The kind + id of the currently-open synthetic streaming run, if
+    // any -- `None` means the next Assistant/Thought chunk with no real
+    // id starts a fresh one. Cleared by any interruption (ToolCall,
+    // User message) or when a chunk arrives with a *real* id (which
+    // needs no synthetic fallback of its own).
+    let mut open_run: Option<(ChatKind, String)> = None;
+    let mut synthetic_counter: u64 = 0;
+    let next_synthetic = |synthetic_counter: &mut u64| {
+        *synthetic_counter += 1;
+        format!("synthetic-{synthetic_counter}")
+    };
+
+    for msg in history {
+        match msg.kind {
+            ChatKind::User => {
+                open_run = None;
+                let message_id = msg.id.clone().unwrap_or_else(|| next_synthetic(&mut synthetic_counter));
+                state.apply(ConversationEvent::UserMessage {
+                    thread_id: thread_id.to_string(),
+                    message_id,
+                    text: msg.text.clone(),
+                });
+            }
+            ChatKind::Agent | ChatKind::Thinking => {
+                let message_id = match &msg.id {
+                    Some(real_id) => {
+                        open_run = Some((msg.kind.clone(), real_id.clone()));
+                        real_id.clone()
+                    }
+                    None => match &open_run {
+                        Some((kind, id)) if *kind == msg.kind => id.clone(),
+                        _ => {
+                            let id = next_synthetic(&mut synthetic_counter);
+                            open_run = Some((msg.kind.clone(), id.clone()));
+                            id
+                        }
+                    },
+                };
+                let event = if msg.kind == ChatKind::Thinking {
+                    ConversationEvent::ThoughtChunk {
+                        thread_id: thread_id.to_string(),
+                        message_id,
+                        text: msg.text.clone(),
+                        // See this function's doc comment: `streaming`
+                        // isn't wired to any Slint-visible field yet in
+                        // this version, so every rebuild treats the
+                        // whole history as fully resolved rather than
+                        // tracking genuine mid-turn "still streaming"
+                        // state (which `history` alone cannot express --
+                        // it has no turn-boundary markers of its own).
+                        completed: true,
+                    }
+                } else {
+                    ConversationEvent::AssistantChunk {
+                        thread_id: thread_id.to_string(),
+                        message_id,
+                        text: msg.text.clone(),
+                        completed: true,
+                    }
+                };
+                state.apply(event);
+            }
+            ChatKind::ToolCall => {
+                open_run = None;
+                let tool_call_id = msg.id.clone().unwrap_or_else(|| next_synthetic(&mut synthetic_counter));
+                state.apply(ConversationEvent::ToolCall {
+                    thread_id: thread_id.to_string(),
+                    tool_call_id,
+                    title: (!msg.text.is_empty()).then(|| msg.text.clone()),
+                    status: msg.status.clone(),
+                    detail: None,
+                });
+            }
+        }
+    }
+    state
 }
 
 #[cfg(test)]

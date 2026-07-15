@@ -77,22 +77,37 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
             .and_then(|t| t.as_str())
             .map(str::to_string)
     };
+    // `messageId` (chunks) / `toolCallId` (tool calls) -- an RFD-status,
+    // v1-optional field on the real wire (agentclientprotocol.com/rfds/
+    // message-id); when present, this lets `AgentBridge`'s transcript
+    // reducer merge by real id instead of falling back to its own
+    // synthetic-adjacency heuristic (see `agent_bridge.rs`'s ingestion
+    // logic).
+    let id_of = |field: &str| -> Option<String> {
+        session_update
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
 
     match kind {
         "agent_message_chunk" => text_of(session_update).map(|text| ChatMessage {
             kind: MessageKind::Agent,
             text,
             status: None,
+            id: id_of("messageId"),
         }),
         "agent_thought_chunk" => text_of(session_update).map(|text| ChatMessage {
             kind: MessageKind::Thinking,
             text,
             status: None,
+            id: id_of("messageId"),
         }),
         "user_message_chunk" => text_of(session_update).map(|text| ChatMessage {
             kind: MessageKind::User,
             text,
             status: None,
+            id: None,
         }),
         // `tool_call`'s wire shape carries `toolCallId`/`title`/`status`
         // directly under `update` (not nested under a separate "fields"
@@ -114,6 +129,7 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
                 kind: MessageKind::ToolCall,
                 text: title,
                 status,
+                id: id_of("toolCallId"),
             })
         }
         // A status-only update (no title change) must still surface --
@@ -137,6 +153,7 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
                 kind: MessageKind::ToolCall,
                 text: title.unwrap_or_default(),
                 status,
+                id: id_of("toolCallId"),
             })
         }
         _ => None,
@@ -166,6 +183,30 @@ mod classify_raw_update_tests {
         assert_eq!(msg.kind, MessageKind::Agent);
         assert_eq!(msg.text, "hello");
         assert_eq!(msg.status, None);
+        assert_eq!(msg.id, None);
+    }
+
+    #[test]
+    fn agent_message_chunk_extracts_message_id_when_present() {
+        let update = update_notification(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "msg-42",
+            "content": {"type": "text", "text": "hello"}
+        }));
+        let msg = classify_raw_update(&update).expect("message");
+        assert_eq!(msg.id.as_deref(), Some("msg-42"));
+    }
+
+    #[test]
+    fn tool_call_extracts_tool_call_id() {
+        let update = update_notification(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-7",
+            "title": "ffmpeg.export(...)",
+            "status": "in_progress"
+        }));
+        let msg = classify_raw_update(&update).expect("message");
+        assert_eq!(msg.id.as_deref(), Some("tc-7"));
     }
 
     #[test]
