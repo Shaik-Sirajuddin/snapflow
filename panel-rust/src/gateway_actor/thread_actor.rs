@@ -107,7 +107,7 @@ enum Command {
     /// no session binding involved, same "safe before `OpenSession`"
     /// shape as `ListProfiles`.
     ListMcpServers {
-        resp: oneshot::Sender<Result<Vec<serde_json::Value>, AcpxThreadError>>,
+        resp: oneshot::Sender<Result<Vec<crate::protocol_types::McpServerEntry>, AcpxThreadError>>,
     },
     /// `mcp_servers/create`. `entry` must include a `"name"` field (the
     /// merge key `acpx-core::mcp_servers::McpServerStore` uses).
@@ -129,12 +129,12 @@ enum Command {
     /// gateway's live detection status per entry, for an agent-catalog
     /// UI (installed/not-installed/runtime-missing chips). Read-only.
     ListAgents {
-        resp: oneshot::Sender<Result<Vec<serde_json::Value>, AcpxThreadError>>,
+        resp: oneshot::Sender<Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError>>,
     },
     /// `agents/status` for one agent id.
     AgentStatus {
         agent_id: String,
-        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+        resp: oneshot::Sender<Result<crate::protocol_types::AgentCatalogEntry, AcpxThreadError>>,
     },
     /// `agents/install` -- client-initiated installer trigger, see
     /// `acpx_client::ext::registry::install`'s doc comment: this blocks
@@ -307,8 +307,13 @@ impl AcpxThreadHandle {
     /// `mcp_servers/list` against this thread's bound gateway -- what a
     /// settings-gear MCP server list populates from. Safe before
     /// `open_session`/`open_session_with_profile` (no session-dependent
-    /// state), same shape as `list_profiles`.
-    pub async fn list_mcp_servers(&self) -> Result<Vec<serde_json::Value>, AcpxThreadError> {
+    /// state), same shape as `list_profiles`. Returns typed `McpServer
+    /// Entry` rows (Phase 2 step 3: "no Slint-adjacent code sees raw
+    /// JSON"), parsed once here rather than left for `panel-rust::
+    /// models` to hand-parse.
+    pub async fn list_mcp_servers(
+        &self,
+    ) -> Result<Vec<crate::protocol_types::McpServerEntry>, AcpxThreadError> {
         self.call(|resp| Command::ListMcpServers { resp }).await
     }
 
@@ -336,16 +341,20 @@ impl AcpxThreadHandle {
 
     /// `agents/list` -- the registry's agent catalogue with this
     /// gateway's live detection status per entry. Safe before a session
-    /// is open, same shape as `list_profiles`/`list_mcp_servers`.
-    pub async fn list_agents(&self) -> Result<Vec<serde_json::Value>, AcpxThreadError> {
+    /// is open, same shape as `list_profiles`/`list_mcp_servers`. Typed
+    /// `AgentCatalogEntry` rows, same reasoning as `list_mcp_servers`.
+    pub async fn list_agents(
+        &self,
+    ) -> Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError> {
         self.call(|resp| Command::ListAgents { resp }).await
     }
 
-    /// `agents/status` for one agent id.
+    /// `agents/status` for one agent id. Typed `AgentCatalogEntry`, same
+    /// reasoning as `list_agents`.
     pub async fn agent_status(
         &self,
         agent_id: impl Into<String>,
-    ) -> Result<serde_json::Value, AcpxThreadError> {
+    ) -> Result<crate::protocol_types::AgentCatalogEntry, AcpxThreadError> {
         let agent_id = agent_id.into();
         self.call(|resp| Command::AgentStatus { agent_id, resp }).await
     }
@@ -1100,7 +1109,12 @@ async fn run_thread_actor(
                         value
                             .get("servers")
                             .and_then(|s| s.as_array())
-                            .cloned()
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter_map(crate::protocol_types::McpServerEntry::from_json)
+                                    .collect()
+                            })
                             .unwrap_or_default()
                     });
                 let _ = resp.send(result.map_err(Into::into));
@@ -1128,7 +1142,12 @@ async fn run_thread_actor(
                         value
                             .get("agents")
                             .and_then(|a| a.as_array())
-                            .cloned()
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter_map(crate::protocol_types::AgentCatalogEntry::from_json)
+                                    .collect()
+                            })
                             .unwrap_or_default()
                     });
                 let _ = resp.send(result.map_err(Into::into));
@@ -1136,7 +1155,12 @@ async fn run_thread_actor(
             Command::AgentStatus { agent_id, resp } => {
                 let result = client
                     .call("agents/status", serde_json::json!({ "id": agent_id }), None)
-                    .await;
+                    .await
+                    .and_then(|value| {
+                        crate::protocol_types::AgentCatalogEntry::from_json(&value).ok_or_else(
+                            || acpx_client::raw::ClientError::MalformedResponse,
+                        )
+                    });
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::InstallAgent { agent_id, resp } => {

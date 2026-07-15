@@ -1343,7 +1343,7 @@ impl AgentBridge {
     /// the settings sheet's MCP-server list populates from. Same
     /// blocking/degrade-gracefully-on-error convention as
     /// [`Self::list_profiles`].
-    pub fn list_mcp_servers(&self, idx: usize) -> Vec<serde_json::Value> {
+    pub fn list_mcp_servers(&self, idx: usize) -> Vec<crate::protocol_types::McpServerEntry> {
         let Some(slot) = self.slots.get(idx) else {
             return Vec::new();
         };
@@ -1392,7 +1392,7 @@ impl AgentBridge {
     /// status per entry) an agent-catalog UI section populates from.
     /// Same blocking/degrade-gracefully-on-error convention as
     /// [`Self::list_profiles`].
-    pub fn list_agents(&self, idx: usize) -> Vec<serde_json::Value> {
+    pub fn list_agents(&self, idx: usize) -> Vec<crate::protocol_types::AgentCatalogEntry> {
         let Some(slot) = self.slots.get(idx) else {
             return Vec::new();
         };
@@ -3110,7 +3110,7 @@ done
         ));
         let after_create = bridge.list_mcp_servers(0);
         assert_eq!(after_create.len(), 1);
-        assert_eq!(after_create[0]["name"], "bridge-fs");
+        assert_eq!(after_create[0].name, "bridge-fs");
 
         assert!(bridge.update_mcp_server(
             0,
@@ -3118,7 +3118,7 @@ done
         ));
         let after_update = bridge.list_mcp_servers(0);
         assert_eq!(after_update.len(), 1);
-        assert_eq!(after_update[0]["command"], "mcp-bridge-fs-v2");
+        assert_eq!(after_update[0].command.as_deref(), Some("mcp-bridge-fs-v2"));
 
         assert!(bridge.delete_mcp_server(0, "bridge-fs"));
         assert!(
@@ -3130,7 +3130,7 @@ done
         // a real detection status -- not a client-side stub.
         let agents = bridge.list_agents(0);
         assert!(
-            agents.iter().any(|a| a["id"] == "codex-acp"),
+            agents.iter().any(|a| a.id == "codex-acp"),
             "expected a codex-acp entry from the registry, got {agents:?}"
         );
         assert!(

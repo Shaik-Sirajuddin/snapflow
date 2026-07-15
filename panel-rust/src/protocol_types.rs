@@ -178,3 +178,195 @@ pub struct AgentRequestEvent {
     /// `params`, and the backend's own `id`).
     pub raw_request: serde_json::Value,
 }
+
+/// One centrally-registered MCP server, as returned by `mcp_servers/
+/// list` -- typed narrowly to the two fields a settings-gear list view
+/// actually renders (`McpServerOption` in `panel-rust::models`), per
+/// Phase 2 step 3's "no Slint-adjacent code sees raw JSON" goal.
+/// `extra` retains the full original entry (env/args/url/whatever else
+/// a real MCP server entry carries) as an opaque JSON object for a
+/// future settings-sheet edit dialog that needs the complete payload --
+/// `acpx-core::McpServerStore` itself never interprets more than
+/// `"name"`, so this crate has no more reason to hand-type every field
+/// than the server does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpServerEntry {
+    pub name: String,
+    pub command: Option<String>,
+    pub extra: serde_json::Value,
+}
+
+impl McpServerEntry {
+    /// Parses one `mcp_servers/list` array entry. `None` only for an
+    /// entry missing the required `"name"` field -- `acpx-core::
+    /// McpServerStore::create`/`update` both reject such an entry
+    /// server-side, so a well-behaved gateway never actually returns
+    /// one, but this stays tolerant (skip, don't panic) rather than
+    /// assuming that invariant holds forever.
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let name = value.get("name")?.as_str()?.to_string();
+        let command = value
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        Some(Self {
+            name,
+            command,
+            extra: value.clone(),
+        })
+    }
+}
+
+/// Registry-reported install/detection status for one agent catalog
+/// entry (`agents/list`/`agents/status`) -- mirrors `acpx_proto::
+/// AgentStatus`'s own four-variant snake_case wire tag exactly
+/// (`not_installed`/`installed`/`installed_no_session`/`runtime_
+/// missing`, see that type's own doc comment for what each means).
+/// Kept as this crate's own type (not a dependency on `acpx-proto`,
+/// which `panel-rust` has no other reason to depend on) with an
+/// `Unknown(String)` fallback so an unrecognized future status string
+/// still displays as literal text instead of being dropped or causing
+/// a parse failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentStatus {
+    NotInstalled,
+    Installed,
+    InstalledNoSession,
+    RuntimeMissing,
+    Unknown(String),
+}
+
+impl AgentStatus {
+    pub fn from_str(raw: &str) -> Self {
+        match raw {
+            "not_installed" => Self::NotInstalled,
+            "installed" => Self::Installed,
+            "installed_no_session" => Self::InstalledNoSession,
+            "runtime_missing" => Self::RuntimeMissing,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    /// The same snake_case wire tag `from_str` accepts -- round-trips
+    /// verbatim through this type rather than a UI-invented label, same
+    /// "the panel has no independent opinion about what a real
+    /// gateway's detection means" posture the pre-typed version of this
+    /// data documented.
+    pub fn as_wire_str(&self) -> &str {
+        match self {
+            Self::NotInstalled => "not_installed",
+            Self::Installed => "installed",
+            Self::InstalledNoSession => "installed_no_session",
+            Self::RuntimeMissing => "runtime_missing",
+            Self::Unknown(s) => s,
+        }
+    }
+}
+
+/// One agent-registry catalogue entry, as returned by `agents/list`
+/// (each entry) or `agents/status` (one entry, keyed by the requested
+/// id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub status: AgentStatus,
+}
+
+impl AgentCatalogEntry {
+    /// `None` only for an entry missing the required `"id"` field --
+    /// `acpx-registry`'s own schema requires it on every entry
+    /// (verified against `registry.fallback.json`), so a well-behaved
+    /// gateway never actually returns one, but this stays tolerant
+    /// rather than assuming that invariant holds forever.
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let id = value.get("id")?.as_str()?.to_string();
+        let name = value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let version = value
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let status = value
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(AgentStatus::from_str)
+            .unwrap_or(AgentStatus::Unknown(String::new()));
+        Some(Self {
+            id,
+            name,
+            version,
+            status,
+        })
+    }
+}
+
+#[cfg(test)]
+mod parsing_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_server_entry_parses_name_and_command() {
+        let value = json!({"name": "central-fs", "command": "mcp-central-fs"});
+        let entry = McpServerEntry::from_json(&value).expect("entry");
+        assert_eq!(entry.name, "central-fs");
+        assert_eq!(entry.command.as_deref(), Some("mcp-central-fs"));
+    }
+
+    #[test]
+    fn mcp_server_entry_none_without_command_is_still_valid() {
+        let value = json!({"name": "url-only"});
+        let entry = McpServerEntry::from_json(&value).expect("entry");
+        assert_eq!(entry.command, None);
+    }
+
+    #[test]
+    fn mcp_server_entry_is_none_without_a_name() {
+        assert!(McpServerEntry::from_json(&json!({"command": "x"})).is_none());
+    }
+
+    #[test]
+    fn agent_status_round_trips_every_known_wire_tag() {
+        for tag in [
+            "not_installed",
+            "installed",
+            "installed_no_session",
+            "runtime_missing",
+        ] {
+            assert_eq!(AgentStatus::from_str(tag).as_wire_str(), tag);
+        }
+    }
+
+    #[test]
+    fn agent_status_unknown_tag_round_trips_as_literal_text() {
+        let status = AgentStatus::from_str("future_status");
+        assert_eq!(status, AgentStatus::Unknown("future_status".to_string()));
+        assert_eq!(status.as_wire_str(), "future_status");
+    }
+
+    #[test]
+    fn agent_catalog_entry_parses_full_shape() {
+        let value = json!({
+            "id": "codex-acp",
+            "name": "Codex Agent",
+            "version": "1.0.0",
+            "status": "installed"
+        });
+        let entry = AgentCatalogEntry::from_json(&value).expect("entry");
+        assert_eq!(entry.id, "codex-acp");
+        assert_eq!(entry.name, "Codex Agent");
+        assert_eq!(entry.version, "1.0.0");
+        assert_eq!(entry.status, AgentStatus::Installed);
+    }
+
+    #[test]
+    fn agent_catalog_entry_is_none_without_an_id() {
+        assert!(AgentCatalogEntry::from_json(&json!({"name": "x"})).is_none());
+    }
+}

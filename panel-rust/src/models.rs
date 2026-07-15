@@ -260,20 +260,14 @@ pub fn to_profile_options(profiles: Vec<crate::gateway_actor::ProfileSummary>) -
 /// back to an empty string for an entry that omits it (still a valid
 /// MCP server entry per ACP's own schema, e.g. a URL-based server with
 /// no `command` field at all).
-pub fn to_mcp_server_options(servers: Vec<serde_json::Value>) -> ModelRc<McpServerOption> {
+pub fn to_mcp_server_options(
+    servers: Vec<crate::protocol_types::McpServerEntry>,
+) -> ModelRc<McpServerOption> {
     let items: Vec<McpServerOption> = servers
         .into_iter()
         .map(|entry| McpServerOption {
-            name: entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .into(),
-            command: entry
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .into(),
+            name: entry.name.into(),
+            command: entry.command.unwrap_or_default().into(),
         })
         .collect();
     ModelRc::new(VecModel::from(items))
@@ -285,26 +279,16 @@ pub fn to_mcp_server_options(servers: Vec<serde_json::Value>) -> ModelRc<McpServ
 /// (see `AgentCatalogEntry`'s doc comment) rather than re-mapped to a
 /// UI-specific string -- the panel has no independent opinion about
 /// what a real gateway's detection means.
-pub fn to_agent_catalog_entries(agents: Vec<serde_json::Value>) -> ModelRc<AgentCatalogEntry> {
+pub fn to_agent_catalog_entries(
+    agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+) -> ModelRc<AgentCatalogEntry> {
     let items: Vec<AgentCatalogEntry> = agents
         .into_iter()
         .map(|entry| AgentCatalogEntry {
-            id: entry.get("id").and_then(|v| v.as_str()).unwrap_or_default().into(),
-            name: entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .into(),
-            version: entry
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .into(),
-            status: entry
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .into(),
+            id: entry.id.into(),
+            name: entry.name.into(),
+            version: entry.version.into(),
+            status: entry.status.as_wire_str().into(),
         })
         .collect();
     ModelRc::new(VecModel::from(items))
@@ -512,10 +496,16 @@ mod tests {
     #[test]
     fn to_mcp_server_options_extracts_name_and_command_falling_back_to_empty() {
         let servers = vec![
-            serde_json::json!({ "name": "central-fs", "command": "mcp-central-fs" }),
+            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
+                "name": "central-fs", "command": "mcp-central-fs"
+            }))
+            .unwrap(),
             // No "command" field at all -- still a valid MCP server
             // entry (e.g. URL-based), must not panic or drop the row.
-            serde_json::json!({ "name": "url-only" }),
+            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
+                "name": "url-only"
+            }))
+            .unwrap(),
         ];
         let model = to_mcp_server_options(servers);
         assert_eq!(model.row_count(), 2);
@@ -529,12 +519,13 @@ mod tests {
 
     #[test]
     fn to_agent_catalog_entries_forwards_registry_fields_verbatim() {
-        let agents = vec![serde_json::json!({
+        let agents = vec![crate::protocol_types::AgentCatalogEntry::from_json(&serde_json::json!({
             "id": "codex-acp",
             "name": "Codex Agent",
             "version": "1.0.0",
             "status": "installed"
-        })];
+        }))
+        .unwrap()];
         let model = to_agent_catalog_entries(agents);
         assert_eq!(model.row_count(), 1);
         let entry = model.row_data(0).unwrap();

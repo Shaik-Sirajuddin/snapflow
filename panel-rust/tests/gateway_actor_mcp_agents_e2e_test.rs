@@ -171,7 +171,7 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
 
     let after_create = handle.list_mcp_servers().await.expect("list_mcp_servers");
     assert_eq!(after_create.len(), 1);
-    assert_eq!(after_create[0]["command"], "mcp-central-fs");
+    assert_eq!(after_create[0].command.as_deref(), Some("mcp-central-fs"));
 
     handle
         .update_mcp_server(serde_json::json!({
@@ -183,7 +183,7 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
     let after_update = handle.list_mcp_servers().await.expect("list_mcp_servers");
     assert_eq!(after_update.len(), 1);
     assert_eq!(
-        after_update[0]["command"], "mcp-central-fs-v2",
+        after_update[0].command.as_deref(), Some("mcp-central-fs-v2"),
         "expected update to have replaced the entry, not appended a second one"
     );
 
@@ -271,11 +271,11 @@ async fn agent_catalog_list_status_and_install_reach_the_real_registry() {
     );
     let codex_entry = agents
         .iter()
-        .find(|a| a["id"] == "codex-acp")
+        .find(|a| a.id == "codex-acp")
         .cloned()
         .expect("expected a codex-acp entry from the registry (live or fallback)");
     assert!(
-        codex_entry.get("status").is_some(),
+        !codex_entry.status.as_wire_str().is_empty(),
         "expected each catalogue entry to carry a live detection status, got {codex_entry:?}"
     );
 
@@ -283,9 +283,9 @@ async fn agent_catalog_list_status_and_install_reach_the_real_registry() {
         .agent_status("codex-acp")
         .await
         .expect("agent_status");
-    assert_eq!(status["id"], "codex-acp");
+    assert_eq!(status.id, "codex-acp");
     assert!(
-        status.get("status").is_some(),
+        !status.status.as_wire_str().is_empty(),
         "expected agent_status to carry a real detection status, got {status:?}"
     );
 
