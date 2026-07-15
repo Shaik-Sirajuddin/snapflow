@@ -1,0 +1,92 @@
+// VS Code/Slint Live Preview entry point.
+// This file is intentionally renderer-only: it does not start ACPX or
+// require the Qt FFI bridge. Open it with the Slint extension to review the
+// complete narrow side-panel composition using representative data.
+import { Palette } from "palette.slint";
+import { ThreadItem, MessageItem } from "types.slint";
+import { Sidebar } from "sidebar.slint";
+import { ChatArea } from "chat_area.slint";
+
+export component ChatPanelPreview inherits Window {
+    width: 420px;
+    height: 720px;
+    title: "Chat Panel Preview";
+    in property <bool> preview-compact: true;
+
+    property <[ThreadItem]> preview-threads: [
+        {
+            name: "Fix timeline crash",
+            status: "idle",
+            busy: false,
+            open: true,
+            description: "The timeline no longer crashes at frame 900."
+        },
+        {
+            name: "Add fade transition",
+            status: "loading",
+            busy: true,
+            open: true,
+            description: "Applying a crossfade to the selected clips..."
+        },
+        {
+            name: "Refactor filters",
+            status: "error",
+            busy: false,
+            open: true,
+            description: "The last tool call needs another attempt."
+        },
+        {
+            name: "Export pipeline bug",
+            status: "idle",
+            busy: false,
+            open: true,
+            description: "Export settings are ready to review."
+        }
+    ];
+
+    property <[MessageItem]> preview-messages: [
+        {
+            kind: "user",
+            text: "The timeline crashes when I scrub past frame 900. Can you investigate?",
+            status: "",
+            expanded: false,
+            index: 0
+        },
+        {
+            kind: "thinking",
+            text: "Checking the timeline state and recent edits...",
+            status: "",
+            expanded: false,
+            index: 1
+        },
+        {
+            kind: "tool-call",
+            text: "timeline.inspect",
+            status: "COMPLETED",
+            expanded: false,
+            index: 2
+        },
+        {
+            kind: "agent",
+            text: "The crash is caused by an invalid frame range. I can patch the guard and rerun the timeline check.",
+            status: "",
+            expanded: false,
+            index: 3
+        }
+    ];
+
+    HorizontalLayout {
+        Sidebar {
+            threads: preview-threads;
+            selected-thread: 0;
+            compact: preview-compact;
+        }
+        ChatArea {
+            active-thread-name: "Fix timeline crash";
+            active-thread-description: "The timeline no longer crashes at frame 900.";
+            messages: preview-messages;
+            compact: preview-compact;
+            sending: false;
+        }
+    }
+}

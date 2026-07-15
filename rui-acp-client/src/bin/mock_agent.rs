@@ -51,6 +51,12 @@ struct SessionState {
     title: String,
     updated_at: String,
     turn_count: u64,
+    replay_turns: Vec<ReplayTurn>,
+}
+
+#[derive(Clone)]
+struct ReplayTurn {
+    prompt_text: String,
 }
 
 static SESSIONS: Mutex<Option<HashMap<String, SessionState>>> = Mutex::new(None);
@@ -71,26 +77,26 @@ fn now_iso() -> String {
 async fn send_replay(
     connection: &ConnectionTo<Client>,
     session_id: &SessionId,
-    prompt_text: &str,
+    turn: &ReplayTurn,
 ) -> Result<()> {
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
-        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
-            TextContent::new(format!("considering: {prompt_text}")),
-        ))),
+        SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+            format!("considering: {}", turn.prompt_text),
+        )))),
     ))?;
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
         SessionUpdate::ToolCall(ToolCall::new(
             ToolCallId::new("mock-tool-1"),
-            format!("mock_tool(input={prompt_text})"),
+            format!("mock_tool(input={})", turn.prompt_text),
         )),
     ))?;
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
-        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-            TextContent::new(format!("{}{}", persona_prefix(), prompt_text.to_uppercase())),
-        ))),
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+            format!("{}{}", persona_prefix(), turn.prompt_text.to_uppercase()),
+        )))),
     ))?;
     Ok(())
 }
@@ -123,6 +129,7 @@ async fn main() -> Result<()> {
                             title: "New session".to_string(),
                             updated_at: now_iso(),
                             turn_count: 0,
+                            replay_turns: Vec::new(),
                         },
                     );
                 });
@@ -143,14 +150,18 @@ async fn main() -> Result<()> {
                     })
                     .unwrap_or_default();
                 let session_id = request.session_id.clone();
-                send_replay(&connection, &session_id, &text).await?;
                 with_sessions(|sessions| {
                     if let Some(s) = sessions.get_mut(session_id.0.as_ref()) {
                         s.turn_count += 1;
                         s.title = format!("Turn {}: {}", s.turn_count, text);
                         s.updated_at = now_iso();
+                        s.replay_turns.push(ReplayTurn {
+                            prompt_text: text.clone(),
+                        });
                     }
                 });
+                let turn = ReplayTurn { prompt_text: text };
+                send_replay(&connection, &session_id, &turn).await?;
                 responder.respond(PromptResponse::new(StopReason::EndTurn))
             },
             agent_client_protocol::on_receive_request!(),
@@ -177,13 +188,22 @@ async fn main() -> Result<()> {
             async move |request: agent_client_protocol::schema::v1::LoadSessionRequest,
                         responder,
                         connection: ConnectionTo<Client>| {
-                let known = with_sessions(|sessions| sessions.contains_key(request.session_id.0.as_ref()));
+                let known =
+                    with_sessions(|sessions| sessions.contains_key(request.session_id.0.as_ref()));
                 if !known {
-                    return responder.respond_with_error(agent_client_protocol::util::internal_error(
-                        "unknown session id",
-                    ));
+                    return responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unknown session id"),
+                    );
                 }
-                send_replay(&connection, &request.session_id, "replayed history").await?;
+                let turns = with_sessions(|sessions| {
+                    sessions
+                        .get(request.session_id.0.as_ref())
+                        .map(|session| session.replay_turns.clone())
+                        .unwrap_or_default()
+                });
+                for turn in turns {
+                    send_replay(&connection, &request.session_id, &turn).await?;
+                }
                 responder.respond(LoadSessionResponse::new())
             },
             agent_client_protocol::on_receive_request!(),

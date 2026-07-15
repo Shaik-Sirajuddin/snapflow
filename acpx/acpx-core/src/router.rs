@@ -383,6 +383,8 @@ impl Router {
             tenant_id: None,
             agent_relay: self.agent_request_hub.clone(),
             gateway_session_id: None,
+            notification_hub: self.notification_hub.clone(),
+            backend: std::sync::Arc::clone(backend),
         };
         let backend = std::sync::Arc::clone(backend);
         tokio::spawn(backend_idle_scavenger(backend, ctx));
@@ -2151,6 +2153,24 @@ struct LiveNotifyCtx {
     /// a relay attempt against `None` is skipped and falls straight
     /// through to the policy auto-answer, same as `live: None` entirely.
     gateway_session_id: Option<String>,
+    /// **Interactive fs/terminal approval + terminal streaming
+    /// addition.** A clone of the same `NotificationHub`
+    /// `Router::notification_hub()` hands to transports -- reused here
+    /// (rather than re-locking `router` to fetch it, `try_deliver_live`'s
+    /// own pattern) so `spawn_terminal_output_stream` can push directly
+    /// without an extra async round trip through the router lock on
+    /// every poll tick.
+    notification_hub: NotificationHub,
+    /// **Terminal streaming addition.** The exact physical backend
+    /// process this call is dispatched against -- `Arc` clone, cheap.
+    /// `terminal/create`'s success arm in [`read_matching_response`]
+    /// uses this to spawn [`spawn_terminal_output_stream`], which needs
+    /// its own independent lock acquisitions on the same
+    /// `BackendProcess` (to reach `terminals`) across many poll ticks
+    /// long after the `session/prompt` call that created the terminal
+    /// has already returned -- it cannot borrow the `&mut proc` guard
+    /// the in-flight call itself holds.
+    backend: acpx_conductor::supervisor::SharedBackendProcess,
 }
 
 /// Attempt to deliver a real `session/update` notification (`value`,
@@ -2355,6 +2375,146 @@ async fn try_relay_agent_request(
         .await
 }
 
+/// Ask a live client to approve or reject an `fs/read_text_file`,
+/// `fs/write_text_file`, or `terminal/create` action that is already
+/// gated on for this profile (`allow_fs_access`/`allow_terminal_access`
+/// is `true`) -- the Coverage Matrix's "profile gate, approve/reject,
+/// real disk result" / "approval, terminal ID, command metadata
+/// sanitization" rows. Unlike [`try_relay_agent_request`] (which
+/// forwards a live client's answer straight through as the *backend's*
+/// own native ACP reply), this relays the same raw request frame but
+/// expects back a small acpx-local decision envelope, `{"approved":
+/// bool}` -- not a native `fs/*`/`terminal/*` result, since the
+/// real disk/process I/O still happens here in acpx-server either way
+/// (see the plan's Phase 1 progress-log note: the client only approves
+/// or denies, it never performs the I/O itself). `None` covers every
+/// "no live decision was made" case (no `live` ctx, no live subscriber,
+/// timeout, or a malformed/missing `approved` field) -- callers must
+/// treat that exactly like the pre-relay behavior: the profile's own
+/// capability toggle being `true` is already itself an auto-allow,
+/// unchanged. Only an explicit `Some(false)` denies the action.
+async fn try_relay_approval(
+    live: Option<&LiveNotifyCtx>,
+    value: &serde_json::Value,
+    timeout: Duration,
+) -> Option<bool> {
+    let ctx = live?;
+    let gateway_session_id = ctx.gateway_session_id.as_deref()?;
+    let decision = ctx
+        .agent_relay
+        .relay(gateway_session_id, value.clone(), timeout)
+        .await?;
+    decision.get("approved").and_then(|a| a.as_bool())
+}
+
+/// Build the JSON-RPC error reply for an `fs/*`/`terminal/create`
+/// request a live client explicitly rejected via [`try_relay_approval`]
+/// -- distinct error code/message from the "capability disabled for
+/// this profile" arms above it, so a client-side log can tell "this
+/// profile never allows it" apart from "a human said no this time".
+fn build_approval_rejected_reply(request: &serde_json::Value, method: &str) -> serde_json::Value {
+    let req_id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {
+            "code": -32002,
+            "message": format!("'{method}' was rejected by the interactive client"),
+        }
+    })
+}
+
+/// Poll interval for [`spawn_terminal_output_stream`] -- see that
+/// function's doc comment for why polling (not a delta-subscribe API)
+/// is this task's own mechanism.
+const TERMINAL_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Live-stream `terminal_id`'s output to whichever connection is
+/// currently subscribed to `gateway_session_id` (Coverage Matrix:
+/// `terminal/output`'s "live chunks before turn end, truncation, exit
+/// code" row) -- pushed as a bare `acpx/terminal_output` notification
+/// (`{sessionId, terminalId, output, truncated, exitStatus}`, the exact
+/// same result shape `handle_terminal_request`'s own `terminal/output`
+/// reply already uses, so a client's parsing code is identical for
+/// both) over the same `NotificationHub` `session/update` already uses.
+/// `TerminalHandle` has no delta-subscribe API of its own (see its doc
+/// comment), so this task re-polls its whole-buffer `output()` snapshot
+/// on a fixed interval and republishes only when the buffer length,
+/// truncation flag, or exit status actually changed since the last
+/// tick -- this bounds publish volume without needing real byte-level
+/// diffing (a client always receives the full current buffer, cheap to
+/// just replace its displayed contents with). Stops permanently once
+/// the process has exited and one final snapshot has gone out, or once
+/// the terminal id is no longer present in `backend`'s registry at all
+/// (released or killed-and-removed) -- whichever happens first. Not
+/// gated on whether a subscriber is actually present: `NotificationHub::
+/// publish` is a harmless no-op for an HTTP-only or momentarily-
+/// unsubscribed session, exactly like every other live-notification
+/// path in this file, and a short-lived command may exit before any
+/// connection ever subscribes.
+fn spawn_terminal_output_stream(
+    backend: acpx_conductor::supervisor::SharedBackendProcess,
+    hub: NotificationHub,
+    gateway_session_id: String,
+    terminal_id: String,
+) {
+    tokio::spawn(async move {
+        let mut last_len = 0usize;
+        let mut last_truncated = false;
+        loop {
+            tokio::time::sleep(TERMINAL_STREAM_POLL_INTERVAL).await;
+            let (output, truncated, exit_status) = {
+                let mut proc = backend.lock().await;
+                match proc.terminals.get_mut(&terminal_id) {
+                    Some(handle) => {
+                        // Non-blocking exit check every tick -- `output()`
+                        // alone never observes exit on its own (see
+                        // `TerminalHandle::output`'s doc comment); only
+                        // `wait_for_exit`/`try_wait_for_exit` record it.
+                        // Ignoring the `Err` here (a `waitpid`-level OS
+                        // error, not "not exited yet") intentionally
+                        // matches this poller's own best-effort delivery
+                        // contract -- the same as every other
+                        // `NotificationHub::publish` caller in this
+                        // file, a failed tick just tries again next
+                        // interval rather than tearing anything down.
+                        let _ = handle.try_wait_for_exit().await;
+                        handle.output().await
+                    }
+                    None => return,
+                }
+            };
+            let changed = output.len() != last_len || truncated != last_truncated;
+            let is_final = exit_status.is_some();
+            if changed || is_final {
+                last_len = output.len();
+                last_truncated = truncated;
+                hub.publish(
+                    &gateway_session_id,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "acpx/terminal_output",
+                        "params": {
+                            "sessionId": gateway_session_id,
+                            "terminalId": terminal_id,
+                            "output": String::from_utf8_lossy(&output),
+                            "truncated": truncated,
+                            "exitStatus": exit_status.map(|s| serde_json::json!({
+                                "exitCode": s.exit_code,
+                                "signal": s.signal,
+                            })),
+                        }
+                    }),
+                )
+                .await;
+            }
+            if is_final {
+                return;
+            }
+        }
+    });
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
@@ -2410,7 +2570,18 @@ async fn read_matching_response(
             } else if (method == "fs/read_text_file" || method == "fs/write_text_file")
                 && policy.allow_fs_access
             {
-                handle_fs_request(&value, method).await
+                // **Interactive approval addition.** Same relay
+                // machinery as `session/request_permission` above, but
+                // the client answers a lightweight `{"approved": bool}`
+                // decision rather than a native ACP reply -- the real
+                // disk I/O always happens here in acpx-server either
+                // way (see `try_relay_approval`'s doc comment). No live
+                // decision (`None`) preserves this arm's pre-existing
+                // auto-allow-because-capability-is-on behavior exactly.
+                match try_relay_approval(live, &value, PERMISSION_RELAY_TIMEOUT).await {
+                    Some(false) => build_approval_rejected_reply(&value, method),
+                    _ => handle_fs_request(&value, method).await,
+                }
             } else if method == "fs/read_text_file" || method == "fs/write_text_file" {
                 // Capability wasn't enabled for this profile -- declared
                 // `false` in `initialize`, so a well-behaved backend
@@ -2427,8 +2598,38 @@ async fn read_matching_response(
                         "message": format!("'{method}' is disabled for this profile (Profile::allow_fs_access is false)"),
                     }
                 })
-            } else if (method == "terminal/create"
-                || method == "terminal/output"
+            } else if method == "terminal/create" && policy.allow_terminal_access {
+                // **Interactive approval + live streaming addition.**
+                // Same approval relay as the `fs/*` arm above; a
+                // successful creation additionally starts
+                // `spawn_terminal_output_stream` so a subscribed live
+                // client sees this terminal's output as it happens,
+                // not only via the backend's own polling
+                // `terminal/output` calls.
+                match try_relay_approval(live, &value, PERMISSION_RELAY_TIMEOUT).await {
+                    Some(false) => build_approval_rejected_reply(&value, method),
+                    _ => {
+                        let reply = handle_terminal_request(backend, &value, method).await;
+                        if let (Some(ctx), Some(terminal_id)) = (
+                            live,
+                            reply
+                                .get("result")
+                                .and_then(|r| r.get("terminalId"))
+                                .and_then(|t| t.as_str()),
+                        ) {
+                            if let Some(gateway_session_id) = ctx.gateway_session_id.clone() {
+                                spawn_terminal_output_stream(
+                                    std::sync::Arc::clone(&ctx.backend),
+                                    ctx.notification_hub.clone(),
+                                    gateway_session_id,
+                                    terminal_id.to_string(),
+                                );
+                            }
+                        }
+                        reply
+                    }
+                }
+            } else if (method == "terminal/output"
                 || method == "terminal/wait_for_exit"
                 || method == "terminal/kill"
                 || method == "terminal/release")
@@ -2963,7 +3164,7 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence, call_policy, agent_id, agent_relay) = {
+    let (backend, persistence, call_policy, agent_id, agent_relay, notification_hub) = {
         let mut r = router.lock().await;
         let entry = match r.sessions.resolve(
             tenant_id,
@@ -2994,6 +3195,7 @@ async fn dispatch_proxied_shared(
             call_policy,
             agent_id,
             r.agent_request_hub.clone(),
+            r.notification_hub.clone(),
         )
     };
 
@@ -3014,6 +3216,8 @@ async fn dispatch_proxied_shared(
             tenant_id: Some(tenant_id.clone()),
             agent_relay,
             gateway_session_id: Some(gateway_session_id.clone()),
+            notification_hub,
+            backend: std::sync::Arc::clone(&backend),
         };
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, Some(&live)).await?;

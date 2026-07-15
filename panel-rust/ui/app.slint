@@ -1,9 +1,9 @@
 import { Palette } from "palette.slint";
-import { ThreadItem, MessageItem } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem } from "types.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 
-export { ThreadItem, MessageItem, Palette }
+export { ThreadItem, MessageItem, PendingRequestItem, Palette }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -25,31 +25,105 @@ export component ChatPanel inherits Window {
     in-out property <[ThreadItem]> threads: [];
     in-out property <[MessageItem]> messages: [];
     in-out property <string> compose-text: "";
+    in-out property <bool> settings-open: false;
+    in-out property <string> default-profile: "";
+    in-out property <string> permission-profile: "";
+    in-out property <bool> background-default: false;
     in-out property <string> agent-badge: "agent . ask";
+    in property <bool> compact: true;
+    in property <PendingRequestItem> pending-request;
 
     callback thread-selected(int);
+    callback new-thread-requested();
     callback send-requested();
+    callback stop-requested();
+    callback settings-requested();
+    callback settings-save();
+    callback settings-close();
     callback search-changed(string);
     callback toggle-expanded(int);
+    callback approve-request();
+    callback reject-request();
 
     HorizontalLayout {
         Sidebar {
             threads: threads;
             selected-thread: selected-thread;
+            compact: compact;
             thread-selected(i) => {
                 selected-thread = i;
                 thread-selected(i);
             }
+            new-thread-requested => { new-thread-requested(); }
             search-changed(q) => { search-changed(q); }
         }
         ChatArea {
+            // The native dock is intentionally narrow. Force the chat
+            // column to consume the remaining width instead of allowing
+            // long message text to expand the root layout beyond the
+            // QQuick item's viewport.
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            compact: compact;
             active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
             active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
             messages: messages;
             agent-badge: agent-badge;
+            sending: threads.length > 0
+                ? threads[selected-thread].status == "loading"
+                    || threads[selected-thread].status == "cancelling"
+                : false;
             compose-text <=> compose-text;
             send-requested => { send-requested(); }
+            stop-requested => { stop-requested(); }
+            settings-requested => { settings-requested(); }
             toggle-expanded(i) => { toggle-expanded(i); }
+            pending-request: pending-request;
+            approve-request => { approve-request(); }
+            reject-request => { reject-request(); }
+        }
+    }
+    if settings-open : Rectangle {
+        x: 8px;
+        y: 8px;
+        width: parent.width - 16px;
+        height: parent.height - 16px;
+        background: Palette.sys-card;
+        border-color: Palette.sys-border-strong;
+        border-width: 1px;
+        border-radius: Palette.radius-md;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+            Text { text: "Chat Defaults"; color: Palette.sys-text-primary; font-size: 16px; font-weight: 700; }
+            Text { text: "Profile"; color: Palette.sys-text-secondary; font-size: 11px; }
+            TextInput { text <=> default-profile; color: Palette.sys-text-primary; font-size: 12px; }
+            Text { text: "Permission profile"; color: Palette.sys-text-secondary; font-size: 11px; }
+            TextInput { text <=> permission-profile; color: Palette.sys-text-primary; font-size: 12px; }
+            Rectangle {
+                height: 28px;
+                background: Palette.sys-sidebar;
+                border-radius: Palette.radius-sm;
+                TouchArea { clicked => { background-default = !background-default; } }
+                Text {
+                    text: background-default ? "Background sessions: enabled" : "Background sessions: disabled";
+                    color: Palette.sys-text-primary; x: 8px; vertical-alignment: center; font-size: 11px;
+                }
+            }
+            Rectangle { }
+            HorizontalLayout {
+                Rectangle {
+                    width: 72px; height: 30px; background: Palette.sys-primary; border-radius: Palette.radius-sm;
+                    TouchArea { clicked => { settings-save(); } }
+                    Text { text: "Save"; color: Palette.sys-on-primary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 72px; height: 30px; background: Palette.sys-sidebar; border-radius: Palette.radius-sm;
+                    TouchArea { clicked => { settings-close(); } }
+                    Text { text: "Close"; color: Palette.sys-text-primary; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
         }
     }
 }

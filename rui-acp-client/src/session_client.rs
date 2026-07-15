@@ -112,6 +112,44 @@ pub enum AgentEvent {
     /// re-exporting the wire enum.
     TurnEnded(String),
     Error(String),
+    /// A live agent-initiated request needing an interactive client
+    /// decision -- `session/request_permission`, `fs/read_text_file`,
+    /// `fs/write_text_file`, or `terminal/create`. Only ever produced by
+    /// `rui-acpx-client`'s actor today (the acpx gateway's interactive
+    /// relay, see `acpx_core::agent_relay`'s module doc comment) -- this
+    /// crate's own direct-ACP path answers `session/request_permission`
+    /// with its own static policy and has no equivalent relay for
+    /// `fs/*`/`terminal/*` at all, so it never emits this variant. Kept
+    /// on the shared `AgentEvent` type (rather than a second, acpx-only
+    /// event enum) so `panel-rust`'s single event-queue/reducer/UI
+    /// wiring handles both crates' actors uniformly, matching this
+    /// type's existing "shared vocabulary across both client crates"
+    /// role for `Message`/`TurnEnded`/`Error`.
+    PermissionRequest(AgentRequestEvent),
+}
+
+/// A pending interactive decision the UI must render and answer. Carries
+/// the *raw* backend-native ACP request verbatim (`raw_request`) so a
+/// panel reducer can pull out method-specific detail (permission
+/// options + tool-call summary; `fs/*`'s `path`/`content`; `terminal/
+/// create`'s `command`/`args`) without this crate needing a bespoke
+/// typed field per request kind -- consistent with `rui_acpx_client`'s
+/// own `classify_raw_update`'s "operate on the raw JSON shape, don't
+/// re-derive a typed ACP schema" convention for the acpx path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRequestEvent {
+    /// Echoed back unchanged to whichever `respond_*` call answers this
+    /// request -- the relay's own correlation id, distinct from
+    /// `raw_request`'s own JSON-RPC `id` (which belongs to the backend).
+    pub relay_id: String,
+    /// The relayed request's own ACP method name (`session/request_
+    /// permission`, `fs/read_text_file`, `fs/write_text_file`, or
+    /// `terminal/create`) -- the discriminator a reducer switches on to
+    /// choose which request-card UI to render.
+    pub method: String,
+    /// Verbatim backend-native JSON-RPC request frame (`method`,
+    /// `params`, and the backend's own `id`).
+    pub raw_request: serde_json::Value,
 }
 
 enum Command {

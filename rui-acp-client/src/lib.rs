@@ -16,8 +16,8 @@ mod session_client;
 
 pub use jsonl::{CacheError, CachedThread, JsonlStore, ThreadTrailer};
 pub use session_client::{
-    spawn_thread, AgentEvent, ChatMessage, MessageKind, SessionClient, SessionClientError,
-    ThreadHandle, ThreadId,
+    spawn_thread, AgentEvent, AgentRequestEvent, ChatMessage, MessageKind, SessionClient,
+    SessionClientError, ThreadHandle, ThreadId,
 };
 
 // Re-exported so callers can construct transports (`AcpAgent`, `Channel`,

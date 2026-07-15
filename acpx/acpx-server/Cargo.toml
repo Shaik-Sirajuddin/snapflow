@@ -47,6 +47,10 @@ futures-util = "0.3"
 [dev-dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# Real temp-file/temp-dir fixtures for agent_request_fs_terminal_relay_test.rs
+# (fs/read_text_file approve/reject against a real file on disk) -- same
+# crate acpx-core's own dev-dependencies already use for the same purpose.
+tempfile = "3"
 # Real-adapter multi-agent e2e test (tests/real_claude_multi_agent_test.rs)
 # drives the real, already-compiled acpx-server binary through the real
 # acpx-client SDK, not just raw reqwest calls -- proving "acpx daemon +

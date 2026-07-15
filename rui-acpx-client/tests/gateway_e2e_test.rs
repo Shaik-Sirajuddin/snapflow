@@ -48,6 +48,10 @@ impl GatewayProcess {
     /// production, just parameterized for a test's own tempdir.
     async fn spawn(persona: &str, db_path: &std::path::Path) -> Self {
         let port = free_port();
+        Self::spawn_on_port(persona, db_path, port).await
+    }
+
+    async fn spawn_on_port(persona: &str, db_path: &std::path::Path, port: u16) -> Self {
         let child = Command::new(acpx_server_bin())
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
             .env(
@@ -158,6 +162,10 @@ async fn resume_session_replays_history_via_session_load() {
         .open_session(std::env::current_dir().unwrap())
         .await
         .expect("open_session");
+    opener
+        .send_prompt("history before relaunch")
+        .await
+        .expect("seed session history");
     opener.shutdown();
 
     // Fresh handle/actor, same gateway -- proves resume works against a
@@ -170,13 +178,76 @@ async fn resume_session_replays_history_via_session_load() {
         .await
         .expect("resume_session");
 
-    let reply =
-        wait_for_message_containing(&mut events_rx, "replayed history", Duration::from_secs(10))
-            .await;
+    let reply = wait_for_message_containing(
+        &mut events_rx,
+        "HISTORY BEFORE RELAUNCH",
+        Duration::from_secs(10),
+    )
+    .await;
     assert!(
         reply.is_some(),
         "expected session/load's replayed-history reply via the gateway"
     );
+}
+
+#[tokio::test]
+async fn resume_session_retries_after_transient_gateway_errors() {
+    // This narrow transport regression uses a deterministic HTTP peer:
+    // the first two session/load calls return JSON-RPC errors, then the
+    // third succeeds. The real-gateway relaunch test above covers the
+    // success path; this peer isolates the startup-race retry contract
+    // without depending on the mock agent retaining native state across a
+    // replacement backend process.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind transient peer");
+    let port = listener.local_addr().expect("peer address").port();
+    let peer = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for attempt in 0..4 {
+            let (mut stream, _) = listener.accept().expect("accept transient request");
+            let mut request = [0u8; 8192];
+            let _ = stream.read(&mut request);
+            let body = if attempt < 2 {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": attempt + 1,
+                    "error": {"code": -32603, "message": "gateway starting"}
+                })
+            } else if attempt == 2 {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": attempt + 1,
+                    "result": {"modes": {"availableModes": [], "currentModeId": "default"}},
+                    "_acpx": {"updates": []}
+                })
+            } else {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": attempt + 1,
+                    "result": {"stopReason": "end_turn"},
+                    "_acpx": {"updates": []}
+                })
+            }
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write transient response");
+        }
+    });
+
+    let handle = spawn_acpx_thread(format!("http://127.0.0.1:{port}"));
+    handle
+        .resume_session("persisted-session", std::env::current_dir().unwrap())
+        .await
+        .expect("resume_session should retry transient gateway errors");
+    handle
+        .send_prompt("continues after retry")
+        .await
+        .expect("send_prompt should use the resumed session");
+    peer.join().expect("transient peer");
 }
 
 #[tokio::test]

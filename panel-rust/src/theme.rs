@@ -243,7 +243,11 @@ impl RadiusPreset {
 
     pub fn scale(self) -> RadiusScale {
         match self {
-            RadiusPreset::Sharp => RadiusScale { sm: 0, md: 0, lg: 0 },
+            RadiusPreset::Sharp => RadiusScale {
+                sm: 0,
+                md: 0,
+                lg: 0,
+            },
             RadiusPreset::Classic => RadiusScale {
                 sm: 6,
                 md: 10,
@@ -339,7 +343,11 @@ mod tests {
     fn radius_presets_match_index_html_verbatim() {
         assert_eq!(
             RadiusPreset::Sharp.scale(),
-            RadiusScale { sm: 0, md: 0, lg: 0 }
+            RadiusScale {
+                sm: 0,
+                md: 0,
+                lg: 0
+            }
         );
         assert_eq!(
             RadiusPreset::Classic.scale(),

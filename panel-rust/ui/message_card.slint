@@ -88,6 +88,10 @@ export component MessageCard inherits Rectangle {
                 : is-thinking ? Palette.sys-text-muted
                 : Palette.sys-agent-bubble-text;
             wrap: word-wrap;
+            overflow: elide;
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
         }
         // Plain `Rectangle` (not a layout) so a sibling `TouchArea` can
         // cover the whole clickable summary+toggle-label area -- same
@@ -108,6 +112,10 @@ export component MessageCard inherits Rectangle {
                         font-weight: 600;
                         color: Palette.sys-text-primary;
                         wrap: word-wrap;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
                     }
                     Text {
                         text: item.expanded ? "[-] hide logs" : "[+] show logs";
@@ -131,6 +139,10 @@ export component MessageCard inherits Rectangle {
                             font-size: 10px;
                             color: Palette.sys-terminal-text;
                             wrap: word-wrap;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
                         }
                     }
                 }

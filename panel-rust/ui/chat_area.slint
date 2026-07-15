@@ -1,6 +1,7 @@
 import { Palette } from "palette.slint";
-import { MessageItem } from "types.slint";
+import { MessageItem, PendingRequestItem } from "types.slint";
 import { MessageCard } from "message_card.slint";
+import { PermissionCard } from "permission_card.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
 // chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
@@ -15,10 +16,20 @@ export component ChatArea inherits Rectangle {
     in property <string> active-thread-description: "";
     in property <[MessageItem]> messages: [];
     in property <string> agent-badge: "agent . ask";
+    in property <bool> sending: false;
+    in property <PendingRequestItem> pending-request;
     in-out property <string> compose-text: "";
     callback send-requested();
+    callback stop-requested();
+    callback settings-requested();
     callback toggle-expanded(int);
+    callback approve-request();
+    callback reject-request();
 
+    // The native v1 dock launches at 20% width. Keep the chat surface in
+    // its compact side-panel treatment even after a user widens it; this
+    // avoids a width-to-implicit-size binding loop in Slint layouts.
+    in property <bool> compact: true;
     background: Palette.sys-chat;
 
     VerticalLayout {
@@ -27,14 +38,14 @@ export component ChatArea inherits Rectangle {
         // switcher is out of scope, per the plan; this always reads
         // "CHAT").
         Rectangle {
-            height: 52px;
+            height: compact ? 44px : 52px;
             background: Palette.sys-chat;
             HorizontalLayout {
-                padding: 12px;
-                spacing: 10px;
+                padding: compact ? 6px : 12px;
+                spacing: compact ? 5px : 10px;
                 Rectangle {
-                    width: 28px;
-                    height: 28px;
+                    width: compact ? 22px : 28px;
+                    height: compact ? 22px : 28px;
                     background: Palette.sys-primary-container;
                     border-color: Palette.sys-border;
                     border-width: 1px;
@@ -42,7 +53,7 @@ export component ChatArea inherits Rectangle {
                     Text {
                         text: "\u{276F}"; // heavy right-pointing angle, stand-in for the HTML's chevron/tool svg icon
                         color: Palette.sys-primary;
-                        font-size: 13px;
+                        font-size: compact ? 11px : 13px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
@@ -53,27 +64,31 @@ export component ChatArea inherits Rectangle {
                     Text {
                         text: active-thread-name;
                         color: Palette.sys-text-primary;
-                        font-size: 13px;
+                        font-size: compact ? 11px : 13px;
                         font-weight: 600;
                         font-family: Palette.font-sans;
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        overflow: elide;
                     }
                     Text {
                         text: active-thread-description;
                         color: Palette.sys-text-muted;
                         font-size: 10px;
                         font-family: Palette.font-sans;
-                        visible: active-thread-description != "";
+                        visible: !compact && active-thread-description != "";
                     }
                 }
                 Rectangle { }
-                Text {
+                if !compact : Text {
                     text: "Agent:";
                     color: Palette.sys-text-secondary;
                     font-size: 10px;
                     font-family: Palette.font-sans;
                     vertical-alignment: center;
                 }
-                Rectangle {
+                if !compact : Rectangle {
                     background: Palette.sys-outer;
                     border-color: Palette.sys-border;
                     border-width: 1px;
@@ -92,17 +107,31 @@ export component ChatArea inherits Rectangle {
                         }
                     }
                 }
-                Rectangle {
+                if !compact : Rectangle {
                     width: 1px;
                     background: Palette.sys-border;
                 }
-                Text {
+                if !compact : Text {
                     text: "CHAT";
                     color: Palette.sys-primary;
                     font-size: 9px;
                     font-weight: 700;
                     font-family: Palette.font-mono;
                     vertical-alignment: center;
+                }
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: Palette.radius-sm;
+                    background: Palette.sys-outer;
+                    TouchArea { clicked => { settings-requested(); } }
+                    Text {
+                        text: "\u{2699}";
+                        color: Palette.sys-text-secondary;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
@@ -115,17 +144,45 @@ export component ChatArea inherits Rectangle {
         }
         Flickable {
             VerticalLayout {
-                padding: 12px;
-                spacing: 10px;
+                padding: compact ? 6px : 12px;
+                spacing: compact ? 8px : 10px;
                 for msg[i] in messages : HorizontalLayout {
-                    Rectangle { horizontal-stretch: msg.kind == "user" ? 1 : 0; }
+                    // In the compact dock, full-width cards are more
+                    // legible than the desktop right-anchored bubble
+                    // treatment, which would leave user cards only a few
+                    // pixels wide beside the thread list.
+                    Rectangle { width: msg.kind == "user" ? 8px : 0px; }
                     card := MessageCard {
-                        horizontal-stretch: 0;
-                        width: 260px;
+                        // Stretch within the available chat column instead
+                        // of binding width back to the Flickable viewport.
+                        // A fixed width clips at the 20%-dock target, while
+                        // a parent.width binding creates a Slint layout loop.
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
                         item: msg;
                         toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
-                    Rectangle { horizontal-stretch: msg.kind == "user" ? 0 : 1; }
+                    Rectangle { width: 0px; }
+                }
+            }
+        }
+        // Interactive agent-request relay addition: docked above the
+        // compose bar whenever the active thread has a live pending
+        // decision -- deliberately outside the scrollable message
+        // Flickable above, so it stays visible without the user needing
+        // to scroll to the bottom to see/answer it.
+        if pending-request.active : Rectangle {
+            background: Palette.sys-chat;
+            HorizontalLayout {
+                padding: compact ? 6px : 10px;
+                PermissionCard {
+                    item: pending-request;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    approve() => { approve-request(); }
+                    reject() => { reject-request(); }
                 }
             }
         }
@@ -145,7 +202,7 @@ export component ChatArea inherits Rectangle {
             background: Palette.sys-border;
         }
         Rectangle {
-            height: 64px;
+            height: compact ? 58px : 64px;
             background: Palette.sys-chat;
             VerticalLayout {
                 padding: 8px;
@@ -158,7 +215,7 @@ export component ChatArea inherits Rectangle {
                         border-width: 1px;
                         border-radius: Palette.radius-lg;
                         Text {
-                            text: "Ask the agent to execute tools or run tasks...";
+                            text: sending ? "Agent is working..." : "Ask the agent to execute tools or run tasks...";
                             color: Palette.sys-text-muted;
                             font-size: 10px;
                             font-family: Palette.font-sans;
@@ -168,6 +225,7 @@ export component ChatArea inherits Rectangle {
                         }
                         compose := TextInput {
                             text <=> compose-text;
+                            enabled: !sending;
                             color: Palette.sys-text-primary;
                             font-family: Palette.font-sans;
                             font-size: 11px;
@@ -191,7 +249,7 @@ export component ChatArea inherits Rectangle {
                 }
                 HorizontalLayout {
                     Text {
-                        text: "Press Enter to send";
+                        text: sending ? "Waiting for response..." : "Press Enter to send";
                         color: Palette.sys-text-muted;
                         font-size: 8px;
                         font-family: Palette.font-mono;
@@ -199,15 +257,20 @@ export component ChatArea inherits Rectangle {
                     }
                     Rectangle { }
                     Rectangle {
-                        width: 100px;
-                        background: Palette.sys-primary;
+                        width: compact ? 64px : 100px;
+                        background: sending ? Palette.sys-border : Palette.sys-primary;
                         border-radius: Palette.radius-sm;
+                        opacity: sending ? 0.7 : 1.0;
                         TouchArea {
-                            clicked => { send-requested(); }
+                            enabled: sending || compose.text != "";
+                            clicked => {
+                                if sending { stop-requested(); }
+                                else { send-requested(); }
+                            }
                         }
                         Text {
-                            text: "Send Command";
-                            color: Palette.sys-on-primary;
+                            text: sending ? "Stop" : compact ? "Send" : "Send Command";
+                            color: sending ? Palette.sys-text-secondary : Palette.sys-on-primary;
                             font-family: Palette.font-sans;
                             font-size: 10px;
                             font-weight: 700;

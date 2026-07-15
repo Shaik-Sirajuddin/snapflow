@@ -15,6 +15,7 @@ use slint::{ModelRc, VecModel};
 pub enum ThreadState {
     Idle,
     Loading,
+    Cancelling,
     Error,
 }
 
@@ -23,6 +24,7 @@ impl ThreadState {
         match self {
             ThreadState::Idle => "idle",
             ThreadState::Loading => "loading",
+            ThreadState::Cancelling => "cancelling",
             ThreadState::Error => "error",
         }
     }
@@ -55,7 +57,11 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
             // renders `item.status.toUpperCase()`, so this crate does the
             // same once here rather than duplicating casing logic in
             // `.slint` markup.
-            status: m.status.map(|s| s.to_uppercase()).unwrap_or_default().into(),
+            status: m
+                .status
+                .map(|s| s.to_uppercase())
+                .unwrap_or_default()
+                .into(),
             expanded: expanded.get(i).copied().unwrap_or(false),
             index: i as i32,
         })
@@ -78,7 +84,10 @@ pub fn describe_thread(msgs: &[ChatMessage], max_chars: usize) -> String {
     if flattened.chars().count() <= max_chars {
         flattened
     } else {
-        let truncated: String = flattened.chars().take(max_chars.saturating_sub(1)).collect();
+        let truncated: String = flattened
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
         format!("{truncated}\u{2026}") // "…"
     }
 }
@@ -103,8 +112,8 @@ pub struct VisibleThreadItem {
 /// carries its real index (see `VisibleThreadItem`) since filtering
 /// changes the *displayed* position of a thread without changing its
 /// identity.
-pub fn build_thread_items(
-    names: &[&str],
+pub fn build_thread_items<N: AsRef<str>>(
+    names: &[N],
     state: &[ThreadState],
     descriptions: &[String],
     query: &str,
@@ -115,14 +124,20 @@ pub fn build_thread_items(
         .enumerate()
         .zip(state.iter())
         .filter(|((_, name), _)| {
-            query_lower.is_empty() || name.to_lowercase().contains(&query_lower)
+            query_lower.is_empty() || name.as_ref().to_lowercase().contains(&query_lower)
         })
         .map(|((real_index, name), st)| VisibleThreadItem {
             real_index,
             item: ThreadItem {
-                name: (*name).into(),
+                name: name.as_ref().into(),
                 status: st.as_str().into(),
-                description: descriptions.get(real_index).cloned().unwrap_or_default().into(),
+                busy: matches!(st, ThreadState::Loading),
+                open: true,
+                description: descriptions
+                    .get(real_index)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into(),
             },
         })
         .collect()
@@ -179,7 +194,10 @@ mod tests {
         // must skip the non-matching ones in between.
         let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "x");
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
-        assert_eq!(matched_names, vec!["Fix timeline crash", "Export pipeline bug"]);
+        assert_eq!(
+            matched_names,
+            vec!["Fix timeline crash", "Export pipeline bug"]
+        );
         let real_indices: Vec<usize> = items.iter().map(|i| i.real_index).collect();
         assert_eq!(real_indices, vec![0, 3]);
     }
@@ -253,7 +271,11 @@ mod tests {
     fn to_message_model_uppercases_status_and_defaults_expanded_false() {
         let msgs = vec![
             chat_msg(MessageKind::User, "hi", None),
-            chat_msg(MessageKind::ToolCall, "ffmpeg.export(...)", Some("in_progress")),
+            chat_msg(
+                MessageKind::ToolCall,
+                "ffmpeg.export(...)",
+                Some("in_progress"),
+            ),
         ];
         let model = to_message_model(msgs, &[]);
         assert_eq!(model.row_count(), 2);

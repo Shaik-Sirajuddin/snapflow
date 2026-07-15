@@ -4,6 +4,8 @@
 export struct ThreadItem {
     name: string,
     status: string, // "idle" | "loading" | "error"
+    busy: bool,
+    open: bool,
     // Phase 3 (chat-panel-ui-theme-parity.md): one-line preview
     // synthesized from the thread's latest message (Rust-side --
     // `models::describe_thread`), matching index.html's `t.desc` field.
@@ -30,4 +32,20 @@ export struct MessageItem {
     // `toggle-expanded(index)` so Rust knows which entry in its
     // `expanded: Vec<bool>` to flip.
     index: int,
+}
+
+// Interactive-relay addition: one pending agent-initiated request
+// awaiting a user decision (`session/request_permission`, `fs/*`,
+// `terminal/create`) -- see `panel-rust/src/permission.rs`'s
+// `PendingRequestView`, which this mirrors field-for-field. `active`
+// distinguishes "no pending request" (an all-empty/default struct,
+// since Slint has no `Option<T>`) from a real one with an empty
+// `relay-id` -- callers must check `active` first.
+export struct PendingRequestItem {
+    active: bool,
+    relay-id: string,
+    method: string,
+    title: string,
+    summary: string,
+    supported: bool,
 }

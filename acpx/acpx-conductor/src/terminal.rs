@@ -153,6 +153,29 @@ impl TerminalHandle {
         Ok(exit_status)
     }
 
+    /// Non-blocking exit check -- unlike [`Self::wait_for_exit`], never
+    /// waits for the child; returns `Ok(None)` immediately if it hasn't
+    /// exited yet. This is what a live terminal-output *streaming*
+    /// poller needs (`acpx_core::router`'s `spawn_terminal_output_stream`,
+    /// added for the interactive `terminal/create` relay's live-push
+    /// requirement): it must not hold this terminal's backend-process
+    /// lock for anywhere close to the command's real runtime the way
+    /// `wait_for_exit`'s deliberately-blocking `terminal/wait_for_exit`
+    /// RPC semantics do. Same EOF-draining and `exit_status` bookkeeping
+    /// as `wait_for_exit` once the child *has* actually exited, so every
+    /// subsequent `output()` call (from either path) sees the identical
+    /// complete, exit-status-populated result either way.
+    pub async fn try_wait_for_exit(&mut self) -> Result<Option<TerminalExitStatus>, TerminalError> {
+        let Some(status) = self.child.try_wait()? else {
+            return Ok(None);
+        };
+        let _ = (&mut self.stdout_task).await;
+        let _ = (&mut self.stderr_task).await;
+        let exit_status = to_exit_status(status);
+        self.shared.lock().await.exit_status = Some(exit_status.clone());
+        Ok(Some(exit_status))
+    }
+
     /// Kill the command if it hasn't exited yet. Per real ACP semantics,
     /// the terminal itself stays valid afterward (`output`/`wait_for_exit`
     /// still work) -- only `release` invalidates it, which is the

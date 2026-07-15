@@ -59,12 +59,12 @@
 //!   with durable server-side session storage exists to validate
 //!   against.
 
-use rui_acp_client::{AgentEvent, ChatMessage, JsonlStore, ThreadTrailer};
+use rui_acp_client::{AgentEvent, AgentRequestEvent, ChatMessage, JsonlStore, ThreadTrailer};
 use rui_acpx_client::{spawn_acpx_thread, AcpxThreadHandle};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -96,6 +96,18 @@ struct ThreadSlot {
     handle: Arc<AcpxThreadHandle>,
     history: Mutex<Vec<ChatMessage>>,
     acp_session_id: Mutex<Option<String>>,
+    /// Live interactive requests (`session/request_permission`,
+    /// `fs/read_text_file`, `fs/write_text_file`, `terminal/create`)
+    /// awaiting a UI decision -- populated by
+    /// `AgentEvent::PermissionRequest` in the forwarder loops below,
+    /// drained by [`AgentBridge::respond_to_request`] once the user
+    /// (or a future auto-decision path) answers. In practice never
+    /// holds more than one entry at a time -- a well-behaved backend's
+    /// own `session/prompt` call blocks on the relay's reply before
+    /// sending a second such request -- but a `Vec` rather than an
+    /// `Option` costs nothing and doesn't assume that invariant holds
+    /// for every possible backend.
+    pending_requests: Mutex<Vec<AgentRequestEvent>>,
 }
 
 /// Owns the background runtime, the per-thread agent connections, the
@@ -104,6 +116,7 @@ pub struct AgentBridge {
     runtime: tokio::runtime::Runtime,
     slots: Vec<Arc<ThreadSlot>>,
     events: Arc<Mutex<VecDeque<BridgeEvent>>>,
+    gateway_urls: std::collections::HashMap<String, String>,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
 }
@@ -147,11 +160,33 @@ pub fn provider_for_index(idx: usize) -> &'static str {
 /// `CARGO_MANIFEST_DIR`, matching the same convention
 /// `resolve_agent_command`'s successor (`provision_gateway` below)
 /// uses for the backend it spawns *inside* that gateway.
-fn resolve_acpx_server_bin() -> PathBuf {
-    if let Ok(bin) = std::env::var("RUI_ACPX_SERVER_BIN") {
+fn resolve_acpx_server_bin_from(
+    override_bin: Option<&str>,
+    current_exe: Option<&Path>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
         return PathBuf::from(bin);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
+    if let Some(parent) = current_exe.and_then(Path::parent) {
+        for candidate in [
+            parent.join("acpx-server"),
+            parent.join("../libexec/acpx-server"),
+        ] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    manifest_dir.join("../acpx/target/debug/acpx-server")
+}
+
+fn resolve_acpx_server_bin() -> PathBuf {
+    resolve_acpx_server_bin_from(
+        std::env::var("RUI_ACPX_SERVER_BIN").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
 }
 
 /// Resolves the mock backend agent binary the locally-spawned gateway
@@ -332,14 +367,12 @@ fn reserve_ephemeral_port() -> Option<(u16, File)> {
 /// replies for the multi-provider isolation checks.
 ///
 /// **Deliberately not tied to this process's lifetime**: the spawned
-/// `acpx-server` (and, transitively, its own backend subprocess) is a
-/// completely ordinary child of *this* process, inheriting this
-/// process's session/process-group rather than being placed in a new
-/// one -- so it is reparented to init and keeps running if this process
-/// (the panel / the whole host application) is killed by PID rather
-/// than by process-group signal. This is exactly the "window close does
-/// not imply session close" contract: the gateway process, and
-/// therefore every session it holds open, survives the panel
+/// `acpx-server` (and, transitively, its own backend subprocess) is placed
+/// in a separate process group, so it is reparented to init and keeps
+/// running if this process (the panel / the whole host application) is
+/// killed by PID rather than by process-group signal. This is exactly the
+/// "window close does not imply session close" contract: the gateway
+/// process, and therefore every session it holds open, survives the panel
 /// window/process going away. See
 /// `gen/plans/chat-panel/chat-panel-acpx-gateway-integration.md` Phase 3
 /// bullet 8's verification requirement -- `Command::spawn` here with no
@@ -462,13 +495,38 @@ fn spawn_gateway_process(
     ))
 }
 
-/// Resolves the jsonl cache directory: `RUI_ACP_CACHE_DIR` env override,
-/// else a dev-checkout fallback sibling to this crate.
-pub fn resolve_cache_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("RUI_ACP_CACHE_DIR") {
+/// Resolves the jsonl cache directory: explicit override first, then the
+/// platform state directory, with a dev-checkout fallback for local builds.
+fn resolve_cache_dir_from(
+    override_dir: Option<&str>,
+    xdg_state_home: Option<&str>,
+    local_app_data: Option<&str>,
+    home: Option<&str>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    if let Some(dir) = override_dir.filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.rui-thread-cache")
+    if let Some(dir) = xdg_state_home.filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir).join("shotcut/rui-thread-cache");
+    }
+    if let Some(dir) = local_app_data.filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir).join("Shotcut/rui-thread-cache");
+    }
+    if let Some(home) = home.filter(|home| !home.is_empty()) {
+        return PathBuf::from(home).join(".local/state/shotcut/rui-thread-cache");
+    }
+    manifest_dir.join("../.rui-thread-cache")
+}
+
+pub fn resolve_cache_dir() -> PathBuf {
+    resolve_cache_dir_from(
+        std::env::var("RUI_ACP_CACHE_DIR").ok().as_deref(),
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
 }
 
 /// Opaque staleness token -- not a real RFC3339 timestamp (no chrono
@@ -490,6 +548,52 @@ fn now_token() -> String {
 /// that's somehow unavailable.
 fn cwd_for_session() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn persist_thread_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot, updated_at: String) {
+    let Some(store) = store else {
+        return;
+    };
+    let history = slot.history.lock().expect("history mutex poisoned").clone();
+    let session_id = slot
+        .acp_session_id
+        .lock()
+        .expect("acp_session_id mutex poisoned")
+        .clone()
+        .unwrap_or_default();
+    let trailer = ThreadTrailer {
+        acp_session_id: session_id,
+        title: Some(slot.thread_id.clone()),
+        updated_at: Some(updated_at),
+        message_count: history.len(),
+    };
+    if let Err(e) = store.overwrite(&slot.thread_id, &history, &trailer) {
+        eprintln!(
+            "panel-rust: jsonl trailer overwrite failed for {}: {e}",
+            slot.thread_id
+        );
+    }
+}
+
+fn replay_matches_cached_position(
+    history: &[ChatMessage],
+    cached_index: &mut usize,
+    message: &ChatMessage,
+) -> bool {
+    // A gateway replay contains backend-originated updates, while the
+    // local jsonl transcript also contains the user's prompt. Match the
+    // replay as an ordered subsequence rather than requiring both streams
+    // to have identical event boundaries. Advancing only forward preserves
+    // repeated identical messages at distinct transcript positions.
+    if let Some(relative) = history[*cached_index..]
+        .iter()
+        .position(|cached| cached == message)
+    {
+        *cached_index += relative + 1;
+        true
+    } else {
+        false
+    }
 }
 
 impl AgentBridge {
@@ -603,17 +707,25 @@ impl AgentBridge {
             // able to disable the whole chat panel -- it degrades to an
             // empty scrollback for *that thread only*, same as any other
             // cache miss.
-            let seeded = match &store {
+            let (seeded, cached_session_id) = match &store {
                 Some(s) => match s.load(&thread_id) {
-                    Ok(cached) => cached.messages,
+                    Ok(cached) => {
+                        let session_id = cached
+                            .trailer
+                            .as_ref()
+                            .map(|trailer| trailer.acp_session_id.trim())
+                            .filter(|session_id| !session_id.is_empty())
+                            .map(str::to_owned);
+                        (cached.messages, session_id)
+                    }
                     Err(e) => {
                         eprintln!(
                             "panel-rust: jsonl cache load failed for thread {thread_id:?} ({e}); starting this thread with empty history rather than failing the whole bridge"
                         );
-                        Vec::new()
+                        (Vec::new(), None)
                     }
                 },
-                None => Vec::new(),
+                None => (Vec::new(), None),
             };
 
             let provider = provider_for_index(idx);
@@ -629,6 +741,7 @@ impl AgentBridge {
                 handle: handle.clone(),
                 history: Mutex::new(seeded),
                 acp_session_id: Mutex::new(None),
+                pending_requests: Mutex::new(Vec::new()),
             });
             slots.push(slot.clone());
 
@@ -654,12 +767,66 @@ impl AgentBridge {
             // local subprocess handshake per thread), which is an
             // acceptable trade for "a message sent right after startup
             // must actually go through."
-            match runtime.block_on(handle_for_task.open_session(cwd_for_session())) {
+            let cwd = cwd_for_session();
+            let session_result = if let Some(session_id) = cached_session_id.clone() {
+                match runtime
+                    .block_on(handle_for_task.resume_session(session_id.clone(), cwd.clone()))
+                {
+                    Ok(()) => Ok(session_id),
+                    Err(resume_error) => {
+                        eprintln!(
+                            "panel-rust: cached acpx session resume failed for thread {thread_id:?} ({resume_error}); opening a fresh session"
+                        );
+                        runtime.block_on(handle_for_task.open_session(cwd))
+                    }
+                }
+            } else {
+                runtime.block_on(handle_for_task.open_session(cwd))
+            };
+            match session_result {
                 Ok(session_id) => {
                     *slot_for_task
                         .acp_session_id
                         .lock()
                         .expect("acp_session_id mutex poisoned") = Some(session_id);
+                    // Persist the gateway id immediately. A window can close
+                    // before the first turn reaches TurnEnded; the next
+                    // launch must still be able to resume this session.
+                    persist_thread_snapshot(store_for_task.as_ref(), &slot_for_task, now_token());
+
+                    // `session/load` can replay the backend's transcript.
+                    // The jsonl cache already rendered that transcript, so
+                    // consume the buffered replay in sequence order. This
+                    // avoids duplicating the cached prefix while preserving
+                    // legitimate repeated messages.
+                    if cached_session_id.is_some() {
+                        let mut cached_index = 0usize;
+                        while let Ok(ev) = events_rx.try_recv() {
+                            if let AgentEvent::Message(message) = &ev {
+                                let mut history = slot_for_task
+                                    .history
+                                    .lock()
+                                    .expect("history mutex poisoned");
+                                if !replay_matches_cached_position(
+                                    &history,
+                                    &mut cached_index,
+                                    message,
+                                ) {
+                                    history.push(message.clone());
+                                    if let Some(store) = &store_for_task {
+                                        if let Err(e) =
+                                            store.append(&slot_for_task.thread_id, message)
+                                        {
+                                            eprintln!(
+                                                "panel-rust: jsonl append failed for {}: {e}",
+                                                slot_for_task.thread_id
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     events
@@ -691,35 +858,20 @@ impl AgentBridge {
                             }
                         }
                         AgentEvent::TurnEnded(_) => {
-                            if let Some(store) = &store_for_task {
-                                let hist = slot_for_task
-                                    .history
-                                    .lock()
-                                    .expect("history mutex poisoned")
-                                    .clone();
-                                let session_id = slot_for_task
-                                    .acp_session_id
-                                    .lock()
-                                    .expect("acp_session_id mutex poisoned")
-                                    .clone()
-                                    .unwrap_or_default();
-                                let trailer = ThreadTrailer {
-                                    acp_session_id: session_id,
-                                    title: Some(slot_for_task.thread_id.clone()),
-                                    updated_at: Some(now_token()),
-                                    message_count: hist.len(),
-                                };
-                                if let Err(e) =
-                                    store.overwrite(&slot_for_task.thread_id, &hist, &trailer)
-                                {
-                                    eprintln!(
-                                        "panel-rust: jsonl trailer overwrite failed for {}: {e}",
-                                        slot_for_task.thread_id
-                                    );
-                                }
-                            }
+                            persist_thread_snapshot(
+                                store_for_task.as_ref(),
+                                &slot_for_task,
+                                now_token(),
+                            );
                         }
                         AgentEvent::Error(_) => {}
+                        AgentEvent::PermissionRequest(req) => {
+                            slot_for_task
+                                .pending_requests
+                                .lock()
+                                .expect("pending_requests mutex poisoned")
+                                .push(req.clone());
+                        }
                     }
                     events_out
                         .lock()
@@ -737,8 +889,146 @@ impl AgentBridge {
             runtime,
             slots,
             events,
+            gateway_urls: resolved_urls,
             store,
         })
+    }
+
+    /// Adds one open thread using the already-provisioned provider gateway.
+    /// The session is opened synchronously before the new slot is exposed to
+    /// the UI, so selecting the row and sending immediately cannot race
+    /// `session/new`.
+    pub fn add_thread(&mut self, name: &str) -> Result<usize, BridgeError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(BridgeError::Gateway("thread name cannot be empty".into()));
+        }
+        let thread_id = slug(name);
+        if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
+            return Err(BridgeError::Gateway(format!(
+                "thread already exists: {name}"
+            )));
+        }
+
+        let idx = self.slots.len();
+        let provider = provider_for_index(idx);
+        let base_url =
+            self.gateway_urls.get(provider).cloned().ok_or_else(|| {
+                BridgeError::Gateway(format!("gateway URL missing for {provider}"))
+            })?;
+        let (seeded, cached_session_id) = match &self.store {
+            Some(store) => match store.load(&thread_id) {
+                Ok(cached) => (
+                    cached.messages,
+                    cached
+                        .trailer
+                        .as_ref()
+                        .map(|trailer| trailer.acp_session_id.trim())
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                ),
+                Err(error) => {
+                    eprintln!("panel-rust: new thread cache load failed for {thread_id}: {error}");
+                    (Vec::new(), None)
+                }
+            },
+            None => (Vec::new(), None),
+        };
+
+        let mut handle = {
+            let _guard = self.runtime.enter();
+            spawn_acpx_thread(base_url)
+        };
+        let mut events_rx = handle.take_events();
+        let handle = Arc::new(handle);
+        let slot = Arc::new(ThreadSlot {
+            thread_id: thread_id.clone(),
+            handle: handle.clone(),
+            history: Mutex::new(seeded),
+            acp_session_id: Mutex::new(None),
+            pending_requests: Mutex::new(Vec::new()),
+        });
+        let cwd = cwd_for_session();
+        let session_id = if let Some(session_id) = cached_session_id.clone() {
+            match self
+                .runtime
+                .block_on(handle.resume_session(session_id.clone(), cwd.clone()))
+            {
+                Ok(()) => session_id,
+                Err(_) => self
+                    .runtime
+                    .block_on(handle.open_session(cwd))
+                    .map_err(|error| BridgeError::Gateway(error.to_string()))?,
+            }
+        } else {
+            self.runtime
+                .block_on(handle.open_session(cwd))
+                .map_err(|error| BridgeError::Gateway(error.to_string()))?
+        };
+        *slot
+            .acp_session_id
+            .lock()
+            .expect("acp_session_id mutex poisoned") = Some(session_id);
+        persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
+
+        if cached_session_id.is_some() {
+            let mut cached_index = 0usize;
+            while let Ok(event) = events_rx.try_recv() {
+                if let AgentEvent::Message(message) = event {
+                    let mut history = slot.history.lock().expect("history mutex poisoned");
+                    if !replay_matches_cached_position(&history, &mut cached_index, &message) {
+                        history.push(message.clone());
+                        if let Some(store) = &self.store {
+                            let _ = store.append(&slot.thread_id, &message);
+                        }
+                    }
+                }
+            }
+        }
+
+        let events_out = self.events.clone();
+        let store_for_task = self.store.clone();
+        let slot_for_task = slot.clone();
+        self.runtime.spawn(async move {
+            while let Some(event) = events_rx.recv().await {
+                match &event {
+                    AgentEvent::Message(message) => {
+                        slot_for_task
+                            .history
+                            .lock()
+                            .expect("history mutex poisoned")
+                            .push(message.clone());
+                        if let Some(store) = &store_for_task {
+                            let _ = store.append(&slot_for_task.thread_id, message);
+                        }
+                    }
+                    AgentEvent::TurnEnded(_) => {
+                        persist_thread_snapshot(
+                            store_for_task.as_ref(),
+                            &slot_for_task,
+                            now_token(),
+                        );
+                    }
+                    AgentEvent::Error(_) => {}
+                    AgentEvent::PermissionRequest(req) => {
+                        slot_for_task
+                            .pending_requests
+                            .lock()
+                            .expect("pending_requests mutex poisoned")
+                            .push(req.clone());
+                    }
+                }
+                events_out
+                    .lock()
+                    .expect("event queue mutex poisoned")
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event,
+                    });
+            }
+        });
+        self.slots.push(slot);
+        Ok(idx)
     }
 
     /// Drains every event queued since the last call. Non-blocking, safe
@@ -762,6 +1052,63 @@ impl AgentBridge {
             .get(idx)
             .map(|s| s.history.lock().expect("history mutex poisoned").clone())
             .unwrap_or_default()
+    }
+
+    /// Snapshot of a thread's currently-pending interactive requests
+    /// (`session/request_permission`, `fs/*`, `terminal/create`) --
+    /// what a permission/approval request-card component should render.
+    /// In practice at most one entry (see [`ThreadSlot::pending_requests`]'s
+    /// doc comment), but returned as a `Vec` for the same reason that
+    /// field is one.
+    pub fn pending_requests(&self, idx: usize) -> Vec<AgentRequestEvent> {
+        self.slots
+            .get(idx)
+            .map(|s| {
+                s.pending_requests
+                    .lock()
+                    .expect("pending_requests mutex poisoned")
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Answers a pending interactive request (identified by `relay_id`)
+    /// with `response` and removes it from the thread's pending queue --
+    /// called from the Slint approve/reject button callbacks via
+    /// `lib.rs`. Fire-and-forget on the background runtime, same as
+    /// [`Self::send_prompt`]: the caller is the synchronous UI thread,
+    /// and any failure (gateway gone, relay already timed out) surfaces
+    /// as a queued `AgentEvent::Error` rather than a return value this
+    /// call site couldn't usefully act on. Removing the entry from
+    /// `pending_requests` happens synchronously, before the async
+    /// response is even sent -- the UI should stop showing this
+    /// request's card immediately on click, regardless of whether the
+    /// gateway round trip that follows succeeds.
+    pub fn respond_to_request(&self, idx: usize, relay_id: &str, response: serde_json::Value) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        {
+            let mut pending = slot
+                .pending_requests
+                .lock()
+                .expect("pending_requests mutex poisoned");
+            pending.retain(|req| req.relay_id != relay_id);
+        }
+        let handle = slot.handle.clone();
+        let events_out = self.events.clone();
+        let relay_id = relay_id.to_string();
+        self.runtime.spawn(async move {
+            if let Err(e) = handle.respond_agent_request(relay_id, response).await {
+                events_out
+                    .lock()
+                    .expect("event queue mutex poisoned")
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("respond_agent_request failed: {e}")),
+                    });
+            }
+        });
     }
 
     /// Immediately (synchronously) records a locally-originated message
@@ -807,6 +1154,27 @@ impl AgentBridge {
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("send_prompt failed: {e}")),
+                    });
+            }
+        });
+    }
+
+    /// Dispatches the control operation on the handle's independent cancel
+    /// connection. It deliberately does not wait for the prompt task.
+    pub fn cancel_prompt(&self, idx: usize) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = handle.cancel_session().await {
+                events
+                    .lock()
+                    .expect("event queue mutex poisoned")
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("session/cancel failed: {e}")),
                     });
             }
         });
@@ -866,19 +1234,44 @@ mod tests {
         /// multi-provider isolation test below to prove which gateway a
         /// reply actually came through.
         fn spawn_with_persona(persona: &str) -> Self {
+            Self::spawn_with_persona_and_db(persona, None)
+        }
+
+        fn spawn_with_persona_and_db(persona: &str, db_path: Option<&std::path::Path>) -> Self {
+            Self::spawn_with_backend_cmd(
+                &mock_agent_bin().to_string_lossy(),
+                persona,
+                db_path,
+            )
+        }
+
+        /// Same as [`Self::spawn_with_persona_and_db`], but with an
+        /// arbitrary `ACPX_BACKEND_CMD` instead of the real
+        /// `rui-mock-agent` binary -- used by the interactive-relay test
+        /// below, which needs a stand-in backend that sends a real
+        /// mid-turn `session/request_permission` request (`rui-mock-agent`
+        /// only speaks the plain three-notification-then-EndTurn shape
+        /// its own module doc describes, no agent-initiated requests).
+        fn spawn_with_backend_cmd(
+            backend_cmd: &str,
+            persona: &str,
+            db_path: Option<&std::path::Path>,
+        ) -> Self {
             let port = free_port();
-            let child = std::process::Command::new(acpx_server_bin())
+            let mut command = std::process::Command::new(acpx_server_bin());
+            command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env(
-                    "ACPX_BACKEND_CMD",
-                    mock_agent_bin().to_string_lossy().to_string(),
-                )
+                .env("ACPX_BACKEND_CMD", backend_cmd)
                 .env("ACPX_DEFAULT_AGENT_ID", persona)
                 .env("RUI_MOCK_AGENT_PERSONA", persona)
                 .env("RUST_LOG", "error")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(db_path) = db_path {
+                command.env("ACPX_DB_PATH", db_path);
+            }
+            let child = command
                 .spawn()
                 .expect("spawn real acpx-server binary for test");
             let base_url = format!("http://127.0.0.1:{port}");
@@ -918,10 +1311,51 @@ mod tests {
         )
     }
 
+    #[test]
+    fn add_thread_opens_a_persistent_session_and_routes_prompts() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
+        let names = ["Thread One", "Thread Two"];
+        let mut bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge");
+
+        let index = bridge.add_thread("New thread 1").expect("add thread");
+        assert_eq!(index, 2);
+        assert!(bridge.history(index).is_empty());
+
+        bridge.push_local(
+            index,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: "hello from a new thread".into(),
+                status: None,
+            },
+        );
+        bridge.send_prompt(index, "hello from a new thread".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline && !ended {
+            ended = bridge
+                .poll()
+                .into_iter()
+                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(ended, "new thread prompt did not finish");
+        assert!(bridge
+            .history(index)
+            .iter()
+            .any(|message| { message.text.contains("HELLO FROM A NEW THREAD") }));
+        assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
+    }
+
     /// Cold-start persistence: a message written by one bridge instance
-    /// is visible (without any live agent involvement) to a second bridge
-    /// instance pointed at the same cache dir -- the "later async live
-    /// reload" contract from a prior run's perspective.
+    /// remains the first message visible to a second bridge instance pointed
+    /// at the same cache dir. Since this test does not send a prompt, the
+    /// transcript-faithful gateway load has no backend turns to replay.
     #[test]
     fn history_persists_across_bridge_restarts_via_jsonl_cache() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
@@ -950,6 +1384,214 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].text, "hello from run one");
         assert_eq!(history[0].kind, MessageKind::User);
+    }
+
+    #[test]
+    fn bridge_relaunch_resumes_cached_gateway_session_without_duplicate_replay() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let gateway = TestGateway::spawn_with_persona_and_db(
+            "codex",
+            Some(&db_dir.path().join("acpx.sqlite3")),
+        );
+        let names = ["Thread One"];
+
+        let first_session_id;
+        {
+            let bridge =
+                bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                    .expect("first bridge");
+            first_session_id = bridge.slots[0]
+                .acp_session_id
+                .lock()
+                .expect("session mutex")
+                .clone()
+                .expect("first session id");
+            bridge.push_local(
+                0,
+                ChatMessage {
+                    kind: MessageKind::User,
+                    text: "first turn".into(),
+                    status: None,
+                },
+            );
+            bridge.send_prompt(0, "first turn".into());
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut ended = false;
+            while std::time::Instant::now() < deadline && !ended {
+                ended = bridge
+                    .poll()
+                    .into_iter()
+                    .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+                if !ended {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            assert!(ended, "first bridge turn did not finish");
+        }
+
+        let bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("relaunched bridge");
+        let resumed_session_id = bridge.slots[0]
+            .acp_session_id
+            .lock()
+            .expect("session mutex")
+            .clone()
+            .expect("resumed session id");
+        assert_eq!(resumed_session_id, first_session_id);
+
+        let history = bridge.history(0);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| message.text.contains("FIRST TURN"))
+                .count(),
+            1,
+            "session/load replay must not duplicate jsonl-cached history: {history:?}"
+        );
+
+        bridge.push_local(
+            0,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: "second turn".into(),
+                status: None,
+            },
+        );
+        bridge.send_prompt(0, "second turn".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline && !ended {
+            ended = bridge
+                .poll()
+                .into_iter()
+                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(ended, "resumed bridge turn did not finish");
+        assert!(
+            bridge
+                .history(0)
+                .iter()
+                .any(|message| message.text.contains("SECOND TURN")),
+            "new prompt did not continue the resumed gateway session"
+        );
+    }
+
+    #[test]
+    fn replay_matching_preserves_identical_messages_at_distinct_positions() {
+        let message = ChatMessage {
+            kind: MessageKind::Agent,
+            text: "same answer".into(),
+            status: None,
+        };
+        let mut history = vec![message.clone(), message.clone()];
+        let mut cached_index = 0;
+
+        assert!(replay_matches_cached_position(
+            &history,
+            &mut cached_index,
+            &message
+        ));
+        assert!(replay_matches_cached_position(
+            &history,
+            &mut cached_index,
+            &message
+        ));
+        assert_eq!(cached_index, 2);
+
+        assert!(!replay_matches_cached_position(
+            &history,
+            &mut cached_index,
+            &message
+        ));
+        history.push(message.clone());
+        history.push(message);
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    fn replay_matching_skips_cached_user_messages_without_duplicate_agent_updates() {
+        let user = ChatMessage {
+            kind: MessageKind::User,
+            text: "same answer".into(),
+            status: None,
+        };
+        let agent = ChatMessage {
+            kind: MessageKind::Agent,
+            text: "same answer".into(),
+            status: None,
+        };
+        let history = vec![user, agent.clone()];
+        let mut cached_index = 0;
+
+        assert!(replay_matches_cached_position(
+            &history,
+            &mut cached_index,
+            &agent
+        ));
+        assert_eq!(cached_index, 2);
+    }
+
+    #[test]
+    fn session_id_is_persisted_before_first_turn_completes() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
+        let names = ["Thread One"];
+        let bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge");
+
+        let cached = JsonlStore::open(cache_dir.path())
+            .expect("cache store")
+            .load("thread-one")
+            .expect("cached thread");
+        assert_eq!(
+            cached
+                .trailer
+                .expect("session trailer should be written at open")
+                .acp_session_id,
+            bridge.slots[0]
+                .acp_session_id
+                .lock()
+                .expect("session mutex")
+                .clone()
+                .expect("active session")
+        );
+    }
+
+    #[test]
+    fn dropping_bridge_does_not_close_gateway_session() {
+        let gateway = TestGateway::spawn();
+        let names = ["Thread One"];
+        let session_id;
+        {
+            let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+            session_id = bridge.slots[0]
+                .acp_session_id
+                .lock()
+                .expect("session mutex")
+                .clone()
+                .expect("active session");
+        }
+
+        let runtime = tokio::runtime::Runtime::new().expect("checker runtime");
+        let sessions = runtime.block_on(async {
+            let checker = spawn_acpx_thread(gateway.base_url.clone());
+            let sessions = checker.list_sessions().await.expect("list sessions");
+            checker.shutdown();
+            sessions
+        });
+        assert!(
+            sessions
+                .iter()
+                .any(|session| session.acp_session_id == session_id),
+            "AgentBridge drop must not send session/close; got {sessions:?}"
+        );
     }
 
     /// No cross-thread bleed in the jsonl cache -- each thread's file is
@@ -1022,6 +1664,84 @@ mod tests {
         assert_eq!(provider_for_index(1), "claude");
         assert_eq!(provider_for_index(2), "codex");
         assert_eq!(provider_for_index(3), "claude");
+    }
+
+    #[test]
+    fn packaged_gateway_binary_resolution_prefers_override_then_relative_install() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let packaged = bin_dir.join("acpx-server");
+        std::fs::write(&packaged, b"binary").expect("packaged binary");
+        let exe = bin_dir.join("panel");
+
+        assert_eq!(
+            resolve_acpx_server_bin_from(
+                Some("/explicit/acpx-server"),
+                Some(&exe),
+                Path::new("/manifest"),
+            ),
+            PathBuf::from("/explicit/acpx-server")
+        );
+        assert_eq!(
+            resolve_acpx_server_bin_from(None, Some(&exe), Path::new("/manifest")),
+            packaged
+        );
+
+        let libexec_dir = temp.path().join("libexec");
+        std::fs::create_dir_all(&libexec_dir).expect("libexec dir");
+        let libexec_bin = libexec_dir.join("acpx-server");
+        std::fs::write(&libexec_bin, b"binary").expect("libexec binary");
+        std::fs::remove_file(&packaged).expect("remove sibling binary");
+        assert_eq!(
+            resolve_acpx_server_bin_from(None, Some(&exe), Path::new("/manifest")),
+            bin_dir.join("../libexec/acpx-server")
+        );
+    }
+
+    #[test]
+    fn packaged_gateway_binary_resolution_falls_back_to_dev_checkout() {
+        assert_eq!(
+            resolve_acpx_server_bin_from(None, None, Path::new("/manifest")),
+            PathBuf::from("/manifest/../acpx/target/debug/acpx-server")
+        );
+    }
+
+    #[test]
+    fn cache_directory_resolution_follows_packaged_state_precedence() {
+        let manifest = Path::new("/manifest");
+        assert_eq!(
+            resolve_cache_dir_from(
+                Some("/explicit/cache"),
+                Some("/xdg"),
+                None,
+                Some("/home/user"),
+                manifest,
+            ),
+            PathBuf::from("/explicit/cache")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(None, Some("/xdg"), None, Some("/home/user"), manifest),
+            PathBuf::from("/xdg/shotcut/rui-thread-cache")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(None, None, None, Some("/home/user"), manifest),
+            PathBuf::from("/home/user/.local/state/shotcut/rui-thread-cache")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(None, None, None, None, manifest),
+            PathBuf::from("/manifest/../.rui-thread-cache")
+        );
+        assert_eq!(
+            resolve_cache_dir_from(
+                None,
+                None,
+                Some("C:/Users/test/AppData/Local"),
+                None,
+                manifest
+            ),
+            PathBuf::from("C:/Users/test/AppData/Local/Shotcut/rui-thread-cache")
+        );
     }
 
     /// Regression guard for a real bug found by this session's own
@@ -1303,6 +2023,126 @@ mod tests {
             claude_reply.text.starts_with("[CLAUDE]"),
             "got: {:?}",
             claude_reply.text
+        );
+    }
+
+    /// Same real stand-in-backend shell-script technique
+    /// `acpx-server/tests/agent_request_relay_test.rs` uses, one layer up
+    /// the stack: proves the interactive `session/request_permission`
+    /// relay is wired all the way through `AgentBridge` -- not just
+    /// `acpx-client`/`rui-acpx-client` in isolation. A real acpx-server
+    /// relays a mid-turn permission request to this bridge as
+    /// `AgentEvent::PermissionRequest`; `respond_to_request` answers it
+    /// with `allow-once` (deliberately not the profile's default
+    /// `AutoReject` policy, which would pick `reject-once` -- see the
+    /// acpx-server test's own doc comment for why that's the right
+    /// "only the live relay path could produce this" signal); the
+    /// backend's own final `agent_message_chunk` echoes back which
+    /// option it actually received, so `bridge.history` is the
+    /// observable proof the live answer -- not the auto-policy fallback
+    /// -- reached the backend.
+    #[test]
+    fn permission_request_relay_round_trips_through_the_bridge() {
+        // Written to a real temp file (rather than passed as `sh -c
+        // '...'`) because `ACPX_BACKEND_CMD` is parsed by naive
+        // whitespace-splitting (see `acpx-server/src/config.rs`), which
+        // would mangle an inline multi-word script.
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("stand_in_backend.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    printf '{"jsonrpc":"2.0","id":999,"method":"session/request_permission","params":{"sessionId":"backend-abc","toolCall":{"toolCallId":"call-1","title":"Run a risky command"},"options":[{"optionId":"allow-once","name":"Allow","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+    reply=""
+    while IFS= read -r reply_line; do
+      echo "$reply_line" | grep -q '"id":999' && { reply="$reply_line"; break; }
+    done
+    chosen=$(echo "$reply" | grep -o '"optionId":"[^"]*"' | head -1 | cut -d: -f2 | tr -d '"')
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"backend-abc","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"CHOSE: %s"}}}}\n' "$chosen"
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#,
+        )
+        .expect("write stand-in backend script");
+
+        let gateway = {
+            let port = free_port();
+            let mut command = std::process::Command::new(acpx_server_bin());
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                .env("ACPX_DEFAULT_AGENT_ID", "relay-test")
+                .env("RUST_LOG", "error")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let child = command
+                .spawn()
+                .expect("spawn real acpx-server binary for test");
+            let base_url = format!("http://127.0.0.1:{port}");
+            for _ in 0..100 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            TestGateway { child, base_url }
+        };
+
+        let names = ["Relay Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        bridge.send_prompt(0, "trigger the permission request".into());
+
+        // Wait for the PermissionRequest event to surface, then answer
+        // it -- exercising the exact path a real Slint approve-button
+        // click drives via `PanelSingleton::answer_pending_request`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut answered = false;
+        while std::time::Instant::now() < deadline && !answered {
+            let pending = bridge.pending_requests(0);
+            if let Some(event) = pending.first() {
+                assert_eq!(event.method, "session/request_permission");
+                let response = crate::permission::build_response(event, true);
+                bridge.respond_to_request(0, &event.relay_id, response);
+                answered = true;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(answered, "permission request never surfaced on the bridge");
+        assert!(
+            bridge.pending_requests(0).is_empty(),
+            "pending_requests should be cleared synchronously by respond_to_request"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline && !ended {
+            ended = bridge
+                .poll()
+                .into_iter()
+                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(ended, "prompt turn did not finish after answering the relay");
+
+        let history = bridge.history(0);
+        assert!(
+            history.iter().any(|m| m.text.contains("CHOSE: allow-once")),
+            "expected the backend's own echo to reflect the live-relayed \
+             allow-once answer, not the profile's AutoReject default \
+             (which would have picked reject-once): got {history:?}"
         );
     }
 }

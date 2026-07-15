@@ -7,10 +7,11 @@
 //! this deliberate shape match.
 
 use crate::{classify_raw_update, AgentEvent};
-use acpx_client::ext::sessions as acpx_sessions;
-use acpx_client::raw::{ClientError, GatewayClient};
+use acpx_client::raw::ClientError;
+use acpx_client::{AgentRequest, Gateway};
+use rui_acp_client::AgentRequestEvent;
 use std::path::PathBuf;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(thiserror::Error, Debug)]
 pub enum AcpxThreadError {
@@ -77,7 +78,25 @@ enum Command {
 /// here.
 pub struct AcpxThreadHandle {
     cmd_tx: mpsc::UnboundedSender<Command>,
+    cancel_tx: mpsc::UnboundedSender<oneshot::Sender<Result<(), AcpxThreadError>>>,
+    /// Independent channel for answering a live [`AgentEvent::
+    /// PermissionRequest`] -- same "own worker, own gateway connection,
+    /// never queued behind `cmd_tx`'s in-flight `SendPrompt`" reasoning
+    /// as `cancel_tx`/`run_cancel_worker` above: a mid-turn permission
+    /// decision must reach the gateway *while* `SendPrompt`'s own
+    /// command is still occupying the main actor loop awaiting that
+    /// exact turn's completion, so routing it through `cmd_tx` would
+    /// deadlock (the answer the prompt call is waiting on would never
+    /// be sent because the actor loop can't get back to `cmd_rx.recv()`
+    /// until the prompt call itself returns).
+    respond_tx: mpsc::UnboundedSender<RespondCommand>,
     pub events: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+struct RespondCommand {
+    relay_id: String,
+    response: serde_json::Value,
+    resp: oneshot::Sender<Result<bool, AcpxThreadError>>,
 }
 
 impl AcpxThreadHandle {
@@ -139,6 +158,43 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::CloseSession { resp }).await
     }
 
+    /// Sends `session/cancel` through an independent gateway connection, so
+    /// it is never queued behind this handle's in-flight prompt command.
+    pub async fn cancel_session(&self) -> Result<(), AcpxThreadError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cancel_tx
+            .send(response_tx)
+            .map_err(|_| AcpxThreadError::ActorGone)?;
+        response_rx.await.map_err(|_| AcpxThreadError::ActorGone)?
+    }
+
+    /// Answer a live [`AgentEvent::PermissionRequest`] -- `relay_id` must
+    /// be the exact one that event carried; `response` is the decision
+    /// payload the relay expects for that request's own method (a full
+    /// native `RequestPermissionResponse`-shaped value for `session/
+    /// request_permission`, or a `{"approved": bool}` decision envelope
+    /// for `fs/*`/`terminal/create` -- see `acpx_core::router`'s
+    /// `try_relay_agent_request`/`try_relay_approval` doc comments for
+    /// which shape each method expects). Returns whether the gateway
+    /// still had a pending relay waiting for this exact `relay_id`
+    /// (`false` covers both an unknown id and one whose server-side
+    /// wait already timed out).
+    pub async fn respond_agent_request(
+        &self,
+        relay_id: impl Into<String>,
+        response: serde_json::Value,
+    ) -> Result<bool, AcpxThreadError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.respond_tx
+            .send(RespondCommand {
+                relay_id: relay_id.into(),
+                response,
+                resp: resp_tx,
+            })
+            .map_err(|_| AcpxThreadError::ActorGone)?;
+        resp_rx.await.map_err(|_| AcpxThreadError::ActorGone)?
+    }
+
     /// Deliberately does **not** send `session/close` -- only stops this
     /// handle's own local actor task/command loop. The gateway-side
     /// session and its backend process are entirely unaffected, exactly
@@ -165,12 +221,61 @@ impl AcpxThreadHandle {
 /// transport.
 pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
+    let (respond_tx, respond_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let base_url = base_url.into();
-    tokio::spawn(run_thread_actor(base_url, cmd_rx, event_tx));
+    let (session_tx, session_rx) = watch::channel(None::<String>);
+    tokio::spawn(run_thread_actor(
+        base_url.clone(),
+        cmd_rx,
+        event_tx,
+        session_tx,
+    ));
+    tokio::spawn(run_cancel_worker(base_url.clone(), cancel_rx, session_rx));
+    tokio::spawn(run_respond_worker(base_url, respond_rx));
     AcpxThreadHandle {
         cmd_tx,
+        cancel_tx,
+        respond_tx,
         events: event_rx,
+    }
+}
+
+/// Independent worker with its own gateway connection, answering live
+/// [`AgentEvent::PermissionRequest`]s -- see [`AcpxThreadHandle::
+/// respond_agent_request`]'s doc comment for why this cannot share the
+/// main actor's `cmd_tx`/`cmd_rx` loop. `base_url` alone is enough here
+/// (unlike [`run_cancel_worker`], this never needs the bound session id
+/// -- `acpx/agent_response` is addressed purely by `relay_id`, which the
+/// server resolves against its own process-wide relay hub regardless of
+ /// which connection sends it).
+///
+/// Connects **lazily**, on the first actual `RespondCommand`, unlike
+/// [`run_thread_actor`]/[`run_cancel_worker`]'s eager `Gateway::connect`
+/// at spawn time -- an interactive permission/fs/terminal decision is
+/// comparatively rare next to the always-used session/prompt path, and a
+/// third unconditional connection attempt per spawned thread has a real
+/// cost (an extra live WS handshake per chat thread even for threads
+/// that never see a single agent-initiated request in their lifetime).
+/// Once connected, the same `Gateway` is reused for every subsequent
+/// command on this worker, matching the other two workers' one-
+/// connection-per-actor-lifetime shape.
+async fn run_respond_worker(
+    base_url: String,
+    mut respond_rx: mpsc::UnboundedReceiver<RespondCommand>,
+) {
+    let mut client: Option<Gateway> = None;
+    while let Some(cmd) = respond_rx.recv().await {
+        let client = match &client {
+            Some(client) => client,
+            None => client.insert(Gateway::connect(base_url.clone()).await),
+        };
+        let result = client
+            .respond_agent_request(&cmd.relay_id, cmd.response)
+            .await
+            .map_err(Into::into);
+        let _ = cmd.resp.send(result);
     }
 }
 
@@ -180,7 +285,20 @@ pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
 /// `SessionUpdate` variants it doesn't render.
 fn forward_updates(updates: &[serde_json::Value], event_tx: &mpsc::UnboundedSender<AgentEvent>) {
     for update in updates {
-        if let Some(msg) = classify_raw_update(update) {
+        // A live relayed agent-initiated request (`acpx/agent_request`)
+        // is checked first -- it is a bare notification shaped nothing
+        // like a `session/update`, so `classify_raw_update` would (correctly)
+        // ignore it; this is the one other live-notification shape this
+        // actor's subscription stream can see (see
+        // `acpx_client::Gateway::subscribe`'s doc comment).
+        if let Some(request) = AgentRequest::from_notification(update) {
+            let method = request.method().unwrap_or_default().to_string();
+            let _ = event_tx.send(AgentEvent::PermissionRequest(AgentRequestEvent {
+                relay_id: request.relay_id,
+                method,
+                raw_request: request.request,
+            }));
+        } else if let Some(msg) = classify_raw_update(update) {
             let _ = event_tx.send(AgentEvent::Message(msg));
         }
     }
@@ -190,11 +308,23 @@ async fn run_thread_actor(
     base_url: String,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
+    session_tx: watch::Sender<Option<String>>,
 ) {
-    let client = GatewayClient::new(base_url);
+    let client = Gateway::connect(base_url).await;
+    let (live_tx, mut live_rx) = mpsc::unbounded_channel();
+    if let Some(mut live_notifications) = client.subscribe() {
+        tokio::spawn(async move {
+            while let Ok(update) = live_notifications.recv().await {
+                let _ = live_tx.send(update);
+            }
+        });
+    }
     let mut session_id: Option<String> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
+        while let Ok(update) = live_rx.try_recv() {
+            forward_updates(&[update], &event_tx);
+        }
         match cmd {
             Command::OpenSession { cwd, resp } => {
                 let params = serde_json::json!({
@@ -207,6 +337,7 @@ async fn run_thread_actor(
                         Ok(value) => match value.get("sessionId").and_then(|s| s.as_str()) {
                             Some(sid) => {
                                 session_id = Some(sid.to_string());
+                                let _ = session_tx.send(Some(sid.to_string()));
                                 Ok(sid.to_string())
                             }
                             None => Err(AcpxThreadError::MissingSessionId),
@@ -237,16 +368,43 @@ async fn run_thread_actor(
                     "cwd": cwd.to_string_lossy(),
                     "mcpServers": [],
                 });
-                let result = client.call_with_updates("session/load", params, None).await;
-                let outcome = match result {
-                    Ok((_, updates)) => {
-                        forward_updates(&updates, &event_tx);
-                        session_id = Some(sid);
-                        Ok(())
+                // Match session/new's bounded retry. A relaunched panel can
+                // race an acpx-server that is still accepting its socket but
+                // has not finished restoring its sqlite-backed registry.
+                // Falling back to session/new after one failed load would
+                // silently break continuity, so only report failure after
+                // the same five-attempt startup window used for opening.
+                let mut result = Err(AcpxThreadError::ActorGone);
+                for attempt in 0..5 {
+                    result = match client
+                        .call_with_updates("session/load", params.clone(), None)
+                        .await
+                    {
+                        Ok((_, updates)) => {
+                            forward_updates(&updates, &event_tx);
+                            if let Ok(Some(update)) = tokio::time::timeout(
+                                std::time::Duration::from_millis(50),
+                                live_rx.recv(),
+                            )
+                            .await
+                            {
+                                forward_updates(&[update], &event_tx);
+                            }
+                            while let Ok(update) = live_rx.try_recv() {
+                                forward_updates(&[update], &event_tx);
+                            }
+                            session_id = Some(sid.clone());
+                            let _ = session_tx.send(Some(sid.clone()));
+                            Ok(())
+                        }
+                        Err(e) => Err(e.into()),
+                    };
+                    if result.is_ok() || attempt == 4 {
+                        break;
                     }
-                    Err(e) => Err(e.into()),
-                };
-                let _ = resp.send(outcome);
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                }
+                let _ = resp.send(result);
             }
             Command::SendPrompt { text, resp } => {
                 let Some(sid) = session_id.clone() else {
@@ -257,12 +415,32 @@ async fn run_thread_actor(
                     "sessionId": sid,
                     "prompt": [{"type": "text", "text": text}],
                 });
-                match client
-                    .call_with_updates("session/prompt", params, None)
-                    .await
-                {
+                let prompt = client.call_with_updates("session/prompt", params, None);
+                tokio::pin!(prompt);
+                let outcome = loop {
+                    tokio::select! {
+                        update = live_rx.recv() => {
+                            if let Some(update) = update {
+                                forward_updates(&[update], &event_tx);
+                            }
+                        }
+                        result = &mut prompt => break result,
+                    }
+                };
+                match outcome {
                     Ok((result, updates)) => {
                         forward_updates(&updates, &event_tx);
+                        if let Ok(Some(update)) = tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            live_rx.recv(),
+                        )
+                        .await
+                        {
+                            forward_updates(&[update], &event_tx);
+                        }
+                        while let Ok(update) = live_rx.try_recv() {
+                            forward_updates(&[update], &event_tx);
+                        }
                         let stop_reason = result
                             .get("stopReason")
                             .and_then(|s| s.as_str())
@@ -278,15 +456,23 @@ async fn run_thread_actor(
                 }
             }
             Command::ListSessions { resp } => {
-                let result = acpx_sessions::list(&client).await.map(|sessions| {
-                    sessions
-                        .into_iter()
-                        .map(|s| RemoteThreadInfo {
-                            acp_session_id: s.session_id,
-                            agent_id: s.agent_id,
-                        })
-                        .collect()
-                });
+                let result = client
+                    .call("session/list", serde_json::json!({}), None)
+                    .await
+                    .map(|value| {
+                        value["sessions"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|session| {
+                                Some(RemoteThreadInfo {
+                                    acp_session_id: session.get("sessionId")?.as_str()?.to_owned(),
+                                    agent_id: session.get("agentId")?.as_str()?.to_owned(),
+                                })
+                            })
+                            .collect()
+                    });
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CloseSession { resp } => {
@@ -303,5 +489,29 @@ async fn run_thread_actor(
             }
             Command::Shutdown => break,
         }
+    }
+}
+
+async fn run_cancel_worker(
+    base_url: String,
+    mut cancel_rx: mpsc::UnboundedReceiver<oneshot::Sender<Result<(), AcpxThreadError>>>,
+    session_rx: watch::Receiver<Option<String>>,
+) {
+    let client = Gateway::connect(base_url).await;
+    while let Some(response) = cancel_rx.recv().await {
+        let session_id = { session_rx.borrow().clone() };
+        let result = match session_id {
+            Some(session_id) => client
+                .call(
+                    "session/cancel",
+                    serde_json::json!({ "sessionId": session_id }),
+                    None,
+                )
+                .await
+                .map(|_| ())
+                .map_err(Into::into),
+            None => Err(AcpxThreadError::NoActiveSession),
+        };
+        let _ = response.send(result);
     }
 }
