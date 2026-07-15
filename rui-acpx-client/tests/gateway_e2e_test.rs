@@ -35,6 +35,60 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local_addr").port()
 }
 
+/// Spawns a real `acpx-server` child, retrying the whole pick-port/
+/// spawn/wait-for-connect cycle (bounded at 5 attempts) if the process
+/// never becomes reachable within one attempt's own shorter window.
+///
+/// **Why this exists.** `free_port()`'s "bind a listener, read its
+/// port, then drop it" trick has an unavoidable TOCTOU gap: a different
+/// concurrently-running test's own `free_port()` call can claim the
+/// exact same port before this function's spawned process binds it.
+/// When that race is lost, `acpx-server` fails its bind and exits
+/// immediately -- ported verbatim from `panel-rust::agent_bridge`'s
+/// `spawn_acpx_server_with_retry` (see its doc comment for the full
+/// root-cause writeup), whose fix this file's tests never picked up,
+/// which is the confirmed cause of this file's own `resume_session_
+/// replays_history_via_session_load` flake under parallel test load.
+fn spawn_acpx_server_with_retry(
+    configure: impl Fn(&mut Command, u16),
+) -> (Child, String) {
+    for attempt in 0..5 {
+        let port = free_port();
+        let mut command = Command::new(acpx_server_bin());
+        configure(&mut command, port);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let mut reachable = false;
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                reachable = true;
+                break;
+            }
+            if let Ok(Some(_status)) = child.try_wait() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        if reachable {
+            return (child, format!("http://127.0.0.1:{port}"));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+        }
+    }
+    panic!(
+        "acpx-server never became reachable after 5 fresh-port attempts -- \
+         this looks like more than ordinary port contention"
+    );
+}
+
 struct GatewayProcess {
     child: Child,
     pub base_url: String,
@@ -47,38 +101,20 @@ impl GatewayProcess {
     /// `panel-rust::agent_bridge::ensure_gateway_running` uses in
     /// production, just parameterized for a test's own tempdir.
     async fn spawn(persona: &str, db_path: &std::path::Path) -> Self {
-        let port = free_port();
-        Self::spawn_on_port(persona, db_path, port).await
-    }
-
-    async fn spawn_on_port(persona: &str, db_path: &std::path::Path, port: u16) -> Self {
-        let child = Command::new(acpx_server_bin())
-            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env(
-                "ACPX_BACKEND_CMD",
-                mock_agent_bin().to_string_lossy().to_string(),
-            )
-            .env("ACPX_DEFAULT_AGENT_ID", persona)
-            .env("ACPX_DB_PATH", db_path)
-            .env("RUI_MOCK_AGENT_PERSONA", persona)
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn real acpx-server binary");
-        let base_url = format!("http://127.0.0.1:{port}");
-        // Poll until the HTTP transport is actually accepting connections
-        // -- same bounded-retry pattern acpx's own test suite uses.
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
+        let persona = persona.to_string();
+        let db_path = db_path.to_path_buf();
+        let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env(
+                    "ACPX_BACKEND_CMD",
+                    mock_agent_bin().to_string_lossy().to_string(),
+                )
+                .env("ACPX_DEFAULT_AGENT_ID", &persona)
+                .env("ACPX_DB_PATH", &db_path)
+                .env("RUI_MOCK_AGENT_PERSONA", &persona)
+                .env("RUST_LOG", "error");
+        });
         GatewayProcess { child, base_url }
     }
 }

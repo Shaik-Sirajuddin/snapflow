@@ -113,3 +113,30 @@ export struct ConfigOptionRow {
     value: string,
     is-current: bool,
 }
+
+// Settings-sheet addition: one centrally-registered MCP server row, as
+// returned by `AgentBridge::list_mcp_servers` (`mcp_servers/list`, see
+// `models::to_mcp_server_options`). `command` is shown as a small
+// secondary label so the settings list is legible without opening an
+// edit dialog -- full entry payloads (env, args, etc.) are opaque JSON
+// on the Rust side (`acpx-core::McpServerStore` never interprets more
+// than `"name"`), this struct only surfaces what the list view needs.
+export struct McpServerOption {
+    name: string,
+    command: string,
+}
+
+// Settings-sheet addition: one agent-catalog entry, as returned by
+// `AgentBridge::list_agents` (`agents/list`, see `models::
+// to_agent_catalog_entries`). `status` is the registry's own live
+// detection string (`acpx_proto::AgentStatus`'s serde tag, e.g.
+// "installed" / "not_installed" / "installed_no_session" /
+// "runtime_missing") -- rendered as plain monochrome text, not a
+// colored badge, matching this project's established no-status-color
+// design language (see `component-style-system.md`).
+export struct AgentCatalogEntry {
+    id: string,
+    name: string,
+    version: string,
+    status: string,
+}

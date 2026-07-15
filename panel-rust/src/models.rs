@@ -8,7 +8,10 @@
 //! `ChatPanel` component.
 
 use crate::agent_bridge::TerminalBuffer;
-use crate::{ConfigOptionRow, MessageItem, ModeOption, ProfileOption, TerminalItem, ThreadItem};
+use crate::{
+    AgentCatalogEntry, ConfigOptionRow, McpServerOption, MessageItem, ModeOption, ProfileOption,
+    TerminalItem, ThreadItem,
+};
 use rui_acp_client::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::{ModelRc, VecModel};
 
@@ -249,6 +252,64 @@ pub fn to_profile_options(profiles: Vec<rui_acpx_client::ProfileSummary>) -> Mod
     ModelRc::new(VecModel::from(items))
 }
 
+/// Builds the settings sheet's MCP-server list row model from a real
+/// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`). Each
+/// entry is an opaque JSON object on the Rust side (`acpx-core::
+/// McpServerStore` never interprets more than `"name"`) -- this only
+/// extracts the two fields the list view shows, `"command"` falling
+/// back to an empty string for an entry that omits it (still a valid
+/// MCP server entry per ACP's own schema, e.g. a URL-based server with
+/// no `command` field at all).
+pub fn to_mcp_server_options(servers: Vec<serde_json::Value>) -> ModelRc<McpServerOption> {
+    let items: Vec<McpServerOption> = servers
+        .into_iter()
+        .map(|entry| McpServerOption {
+            name: entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .into(),
+            command: entry
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .into(),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Builds the settings sheet's agent-catalog row model from a real
+/// `agents/list` result (`AgentBridge::list_agents`). `status` is
+/// forwarded verbatim as the registry's own snake_case detection tag
+/// (see `AgentCatalogEntry`'s doc comment) rather than re-mapped to a
+/// UI-specific string -- the panel has no independent opinion about
+/// what a real gateway's detection means.
+pub fn to_agent_catalog_entries(agents: Vec<serde_json::Value>) -> ModelRc<AgentCatalogEntry> {
+    let items: Vec<AgentCatalogEntry> = agents
+        .into_iter()
+        .map(|entry| AgentCatalogEntry {
+            id: entry.get("id").and_then(|v| v.as_str()).unwrap_or_default().into(),
+            name: entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .into(),
+            version: entry
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .into(),
+            status: entry
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .into(),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +460,40 @@ mod tests {
         let msgs = vec![chat_msg(MessageKind::ToolCall, "x", Some("completed"))];
         let model = to_message_model(msgs, &[true]);
         assert!(model.row_data(0).unwrap().expanded);
+    }
+
+    #[test]
+    fn to_mcp_server_options_extracts_name_and_command_falling_back_to_empty() {
+        let servers = vec![
+            serde_json::json!({ "name": "central-fs", "command": "mcp-central-fs" }),
+            // No "command" field at all -- still a valid MCP server
+            // entry (e.g. URL-based), must not panic or drop the row.
+            serde_json::json!({ "name": "url-only" }),
+        ];
+        let model = to_mcp_server_options(servers);
+        assert_eq!(model.row_count(), 2);
+        let first = model.row_data(0).unwrap();
+        assert_eq!(first.name, "central-fs");
+        assert_eq!(first.command, "mcp-central-fs");
+        let second = model.row_data(1).unwrap();
+        assert_eq!(second.name, "url-only");
+        assert_eq!(second.command, "");
+    }
+
+    #[test]
+    fn to_agent_catalog_entries_forwards_registry_fields_verbatim() {
+        let agents = vec![serde_json::json!({
+            "id": "codex-acp",
+            "name": "Codex Agent",
+            "version": "1.0.0",
+            "status": "installed"
+        })];
+        let model = to_agent_catalog_entries(agents);
+        assert_eq!(model.row_count(), 1);
+        let entry = model.row_data(0).unwrap();
+        assert_eq!(entry.id, "codex-acp");
+        assert_eq!(entry.name, "Codex Agent");
+        assert_eq!(entry.version, "1.0.0");
+        assert_eq!(entry.status, "installed");
     }
 }

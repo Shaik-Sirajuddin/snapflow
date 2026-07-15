@@ -630,6 +630,12 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         component.set_available_profiles(models::to_profile_options(
                             bridge.list_profiles(0),
                         ));
+                        component.set_available_mcp_servers(models::to_mcp_server_options(
+                            bridge.list_mcp_servers(0),
+                        ));
+                        component.set_agent_catalog(models::to_agent_catalog_entries(
+                            bridge.list_agents(0),
+                        ));
                     }
                     component.set_settings_open(true);
                 }
@@ -664,6 +670,79 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             if let Some(component) = component_weak.upgrade() {
                 component.set_settings_open(false);
             }
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_create(move |name, command| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else {
+                        return;
+                    };
+                    let entry = if command.is_empty() {
+                        serde_json::json!({ "name": name.to_string() })
+                    } else {
+                        serde_json::json!({ "name": name.to_string(), "command": command.to_string() })
+                    };
+                    // Don't optimistically append -- re-list from the
+                    // gateway's own state either way, same posture as
+                    // the mode/config selector's `refresh_capabilities_
+                    // for`. A failed create still triggers a re-list so
+                    // the sheet reflects reality (e.g. a duplicate name
+                    // the gateway rejected).
+                    bridge.create_mcp_server(0, entry);
+                    component.set_available_mcp_servers(models::to_mcp_server_options(
+                        bridge.list_mcp_servers(0),
+                    ));
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_delete(move |name| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else {
+                        return;
+                    };
+                    bridge.delete_mcp_server(0, &name);
+                    component.set_available_mcp_servers(models::to_mcp_server_options(
+                        bridge.list_mcp_servers(0),
+                    ));
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_agent_install_requested(move |agent_id| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else {
+                        return;
+                    };
+                    // Blocking, same posture as `add_thread_with_
+                    // profile`'s own gateway calls -- `agents/install`
+                    // is a low-frequency settings-sheet action, and
+                    // this call can be genuinely slow (a real first-time
+                    // npx/binary install). A future progress/job model
+                    // is an explicitly open, undecided item (see acpx-
+                    // client::ext::registry::install's own doc comment)
+                    // -- not addressed by this call site.
+                    bridge.install_agent(0, &agent_id);
+                    component.set_agent_catalog(models::to_agent_catalog_entries(
+                        bridge.list_agents(0),
+                    ));
+                }
+            });
         });
 
         let component_weak = panel.component.as_weak();

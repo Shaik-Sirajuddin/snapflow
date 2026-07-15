@@ -1275,6 +1275,82 @@ impl AgentBridge {
             .unwrap_or_default()
     }
 
+    /// `mcp_servers/list` against thread `idx`'s bound gateway -- what
+    /// the settings sheet's MCP-server list populates from. Same
+    /// blocking/degrade-gracefully-on-error convention as
+    /// [`Self::list_profiles`].
+    pub fn list_mcp_servers(&self, idx: usize) -> Vec<serde_json::Value> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.list_mcp_servers())
+            .unwrap_or_default()
+    }
+
+    /// `mcp_servers/create`. Returns `true` on success -- the caller
+    /// (`lib.rs`'s settings-sheet save handler) is expected to re-call
+    /// [`Self::list_mcp_servers`] afterward to refresh the UI list from
+    /// the gateway's own state, same "don't optimistically mutate
+    /// client-side state" posture the mode/config selector uses.
+    pub fn create_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        let handle = slot.handle.clone();
+        self.runtime.block_on(handle.create_mcp_server(entry)).is_ok()
+    }
+
+    /// `mcp_servers/update` -- same payload shape as [`Self::
+    /// create_mcp_server`].
+    pub fn update_mcp_server(&self, idx: usize, entry: serde_json::Value) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        let handle = slot.handle.clone();
+        self.runtime.block_on(handle.update_mcp_server(entry)).is_ok()
+    }
+
+    /// `mcp_servers/delete`.
+    pub fn delete_mcp_server(&self, idx: usize, name: &str) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.delete_mcp_server(name.to_string()))
+            .is_ok()
+    }
+
+    /// `agents/list` against thread `idx`'s bound gateway -- the
+    /// registry catalogue (installed/not-installed/runtime-missing
+    /// status per entry) an agent-catalog UI section populates from.
+    /// Same blocking/degrade-gracefully-on-error convention as
+    /// [`Self::list_profiles`].
+    pub fn list_agents(&self, idx: usize) -> Vec<serde_json::Value> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        let handle = slot.handle.clone();
+        self.runtime.block_on(handle.list_agents()).unwrap_or_default()
+    }
+
+    /// `agents/install` -- client-initiated installer trigger. Returns
+    /// `true` on success; the caller is expected to re-call
+    /// [`Self::list_agents`] afterward to refresh the catalogue's
+    /// status from the gateway's own real detection, not a client-side
+    /// optimistic flip to "installed".
+    pub fn install_agent(&self, idx: usize, agent_id: &str) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.install_agent(agent_id.to_string()))
+            .is_ok()
+    }
+
     /// Answers a pending interactive request (identified by `relay_id`)
     /// with `response` and removes it from the thread's pending queue --
     /// called from the Slint approve/reject button callbacks via
@@ -2855,6 +2931,58 @@ done
             Some("gpt-5-mini"),
             "config_options(0) should reflect the backend's own updated currentValue \
              after session/set_config_option resolves"
+        );
+    }
+
+    /// Coverage-matrix `mcp_servers/*`/`agents/*` rows, proven through
+    /// `AgentBridge`'s own blocking accessors (not just `rui-acpx-
+    /// client`'s actor, which `rui-acpx-client/tests/mcp_agents_e2e_
+    /// test.rs` already covers directly) -- these are exactly what
+    /// `lib.rs`'s settings-sheet callbacks call from a Slint
+    /// button-click handler, so this is the layer a UI bug would
+    /// actually manifest at.
+    #[test]
+    fn mcp_server_crud_and_agent_catalog_reach_a_real_backend_through_the_bridge() {
+        let gateway = TestGateway::spawn();
+        let names = ["Settings Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        assert!(
+            bridge.list_mcp_servers(0).is_empty(),
+            "expected no MCP servers on a fresh gateway"
+        );
+        assert!(bridge.create_mcp_server(
+            0,
+            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs" })
+        ));
+        let after_create = bridge.list_mcp_servers(0);
+        assert_eq!(after_create.len(), 1);
+        assert_eq!(after_create[0]["name"], "bridge-fs");
+
+        assert!(bridge.update_mcp_server(
+            0,
+            serde_json::json!({ "name": "bridge-fs", "command": "mcp-bridge-fs-v2" })
+        ));
+        let after_update = bridge.list_mcp_servers(0);
+        assert_eq!(after_update.len(), 1);
+        assert_eq!(after_update[0]["command"], "mcp-bridge-fs-v2");
+
+        assert!(bridge.delete_mcp_server(0, "bridge-fs"));
+        assert!(
+            bridge.list_mcp_servers(0).is_empty(),
+            "expected the server to be gone after delete"
+        );
+
+        // Agent catalog: real fallback/live registry entries, each with
+        // a real detection status -- not a client-side stub.
+        let agents = bridge.list_agents(0);
+        assert!(
+            agents.iter().any(|a| a["id"] == "codex-acp"),
+            "expected a codex-acp entry from the registry, got {agents:?}"
+        );
+        assert!(
+            !bridge.install_agent(0, "definitely-not-a-real-agent-id"),
+            "install_agent against an unknown id should fail against the real registry, not succeed"
         );
     }
 }

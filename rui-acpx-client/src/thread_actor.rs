@@ -100,6 +100,48 @@ enum Command {
         value: serde_json::Value,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    /// `mcp_servers/list` -- every centrally-registered MCP server this
+    /// gateway currently has, for a settings-gear MCP list UI. Read-only,
+    /// no session binding involved, same "safe before `OpenSession`"
+    /// shape as `ListProfiles`.
+    ListMcpServers {
+        resp: oneshot::Sender<Result<Vec<serde_json::Value>, AcpxThreadError>>,
+    },
+    /// `mcp_servers/create`. `entry` must include a `"name"` field (the
+    /// merge key `acpx-core::mcp_servers::McpServerStore` uses).
+    CreateMcpServer {
+        entry: serde_json::Value,
+        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+    },
+    /// `mcp_servers/update` -- same payload shape as create.
+    UpdateMcpServer {
+        entry: serde_json::Value,
+        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+    },
+    /// `mcp_servers/delete`.
+    DeleteMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `agents/list` -- the registry's agent catalogue with this
+    /// gateway's live detection status per entry, for an agent-catalog
+    /// UI (installed/not-installed/runtime-missing chips). Read-only.
+    ListAgents {
+        resp: oneshot::Sender<Result<Vec<serde_json::Value>, AcpxThreadError>>,
+    },
+    /// `agents/status` for one agent id.
+    AgentStatus {
+        agent_id: String,
+        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+    },
+    /// `agents/install` -- client-initiated installer trigger, see
+    /// `acpx_client::ext::registry::install`'s doc comment: this blocks
+    /// until the gateway's own synchronous install completes, no
+    /// progress/job model yet.
+    InstallAgent {
+        agent_id: String,
+        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+    },
     Shutdown,
 }
 
@@ -258,6 +300,63 @@ impl AcpxThreadHandle {
             resp,
         })
         .await
+    }
+
+    /// `mcp_servers/list` against this thread's bound gateway -- what a
+    /// settings-gear MCP server list populates from. Safe before
+    /// `open_session`/`open_session_with_profile` (no session-dependent
+    /// state), same shape as `list_profiles`.
+    pub async fn list_mcp_servers(&self) -> Result<Vec<serde_json::Value>, AcpxThreadError> {
+        self.call(|resp| Command::ListMcpServers { resp }).await
+    }
+
+    /// `mcp_servers/create`. `entry` must include a `"name"` field.
+    pub async fn create_mcp_server(
+        &self,
+        entry: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpxThreadError> {
+        self.call(|resp| Command::CreateMcpServer { entry, resp }).await
+    }
+
+    /// `mcp_servers/update` -- same payload shape as `create_mcp_server`.
+    pub async fn update_mcp_server(
+        &self,
+        entry: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpxThreadError> {
+        self.call(|resp| Command::UpdateMcpServer { entry, resp }).await
+    }
+
+    /// `mcp_servers/delete`.
+    pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::DeleteMcpServer { name, resp }).await
+    }
+
+    /// `agents/list` -- the registry's agent catalogue with this
+    /// gateway's live detection status per entry. Safe before a session
+    /// is open, same shape as `list_profiles`/`list_mcp_servers`.
+    pub async fn list_agents(&self) -> Result<Vec<serde_json::Value>, AcpxThreadError> {
+        self.call(|resp| Command::ListAgents { resp }).await
+    }
+
+    /// `agents/status` for one agent id.
+    pub async fn agent_status(
+        &self,
+        agent_id: impl Into<String>,
+    ) -> Result<serde_json::Value, AcpxThreadError> {
+        let agent_id = agent_id.into();
+        self.call(|resp| Command::AgentStatus { agent_id, resp }).await
+    }
+
+    /// `agents/install` -- client-initiated installer trigger. Blocks
+    /// until the gateway's own synchronous install completes; see
+    /// [`Command::InstallAgent`]'s doc comment.
+    pub async fn install_agent(
+        &self,
+        agent_id: impl Into<String>,
+    ) -> Result<serde_json::Value, AcpxThreadError> {
+        let agent_id = agent_id.into();
+        self.call(|resp| Command::InstallAgent { agent_id, resp }).await
     }
 
     /// Sends `session/cancel` through an independent gateway connection, so
@@ -911,6 +1010,66 @@ async fn run_thread_actor(
                 }
             }
             Command::Shutdown => break,
+            Command::ListMcpServers { resp } => {
+                // Deliberately `client.call(...)` (the transport-neutral
+                // `Gateway` facade this actor already holds), not
+                // `acpx_client::ext::mcp_servers::list` -- that helper is
+                // typed against the raw HTTP-only `GatewayClient`, which
+                // would silently drop this actor onto HTTP even in a live
+                // WS session. Same reasoning `ListProfiles`/`ListSessions`
+                // above already follow.
+                let result = client
+                    .call("mcp_servers/list", serde_json::json!({}), None)
+                    .await
+                    .map(|value| {
+                        value
+                            .get("servers")
+                            .and_then(|s| s.as_array())
+                            .cloned()
+                            .unwrap_or_default()
+                    });
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::CreateMcpServer { entry, resp } => {
+                let result = client.call("mcp_servers/create", entry, None).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::UpdateMcpServer { entry, resp } => {
+                let result = client.call("mcp_servers/update", entry, None).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::DeleteMcpServer { name, resp } => {
+                let result = client
+                    .call("mcp_servers/delete", serde_json::json!({ "name": name }), None)
+                    .await
+                    .map(|_| ());
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::ListAgents { resp } => {
+                let result = client
+                    .call("agents/list", serde_json::json!({}), None)
+                    .await
+                    .map(|value| {
+                        value
+                            .get("agents")
+                            .and_then(|a| a.as_array())
+                            .cloned()
+                            .unwrap_or_default()
+                    });
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::AgentStatus { agent_id, resp } => {
+                let result = client
+                    .call("agents/status", serde_json::json!({ "id": agent_id }), None)
+                    .await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::InstallAgent { agent_id, resp } => {
+                let result = client
+                    .call("agents/install", serde_json::json!({ "id": agent_id }), None)
+                    .await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
         }
     }
 }

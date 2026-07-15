@@ -7,6 +7,7 @@
 //! still gets an unmodified ACP client. Phase 5 step 21.
 
 pub mod profiles;
+pub mod mcp_servers;
 pub mod prompt;
 pub mod registry;
 pub mod sessions;

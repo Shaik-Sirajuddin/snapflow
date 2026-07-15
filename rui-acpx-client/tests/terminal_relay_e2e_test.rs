@@ -32,6 +32,47 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local_addr").port()
 }
 
+/// Same TOCTOU-safe retry wrapper as `gateway_e2e_test.rs`'s copy (see
+/// its doc comment) -- duplicated rather than shared, these are
+/// independent test binaries.
+fn spawn_acpx_server_with_retry(configure: impl Fn(&mut Command, u16)) -> (Child, String) {
+    for attempt in 0..5 {
+        let port = free_port();
+        let mut command = Command::new(acpx_server_bin());
+        configure(&mut command, port);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let mut reachable = false;
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                reachable = true;
+                break;
+            }
+            if let Ok(Some(_status)) = child.try_wait() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        if reachable {
+            return (child, format!("http://127.0.0.1:{port}"));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+        }
+    }
+    panic!(
+        "acpx-server never became reachable after 5 fresh-port attempts -- \
+         this looks like more than ordinary port contention"
+    );
+}
+
 struct GatewayProcess {
     child: Child,
     base_url: String,
@@ -46,27 +87,13 @@ impl GatewayProcess {
     async fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
         let script_path = script_dir.join("stand_in_backend.sh");
         std::fs::write(&script_path, backend_script).expect("write stand-in backend script");
-        let port = free_port();
-        let child = Command::new(acpx_server_bin())
-            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-            .env("ACPX_DEFAULT_AGENT_ID", "terminal-relay-agent")
-            .env("RUST_LOG", "error")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn real acpx-server binary");
-        let base_url = format!("http://127.0.0.1:{port}");
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                .env("ACPX_DEFAULT_AGENT_ID", "terminal-relay-agent")
+                .env("RUST_LOG", "error");
+        });
         GatewayProcess { child, base_url }
     }
 }
