@@ -157,6 +157,34 @@ pub struct AgentBridge {
     gateway_urls: std::collections::HashMap<String, String>,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
+    // Client-local PTY terminals -- v1 keeps this to at most one per
+    // thread (keyed by thread `idx`), matching the settings-sheet's own
+    // "one bound choice per scope" simplicity; a future increment could
+    // key by a client-generated terminal id instead to support more
+    // than one per thread. Distinct from `ThreadSlot::terminal_buffers`
+    // (agent-created, read-only, gateway-relayed) -- these are real
+    // client-spawned shell processes (`local_terminal::LocalTerminal`),
+    // never touch the gateway at all.
+    // `RefCell`, not a plain field, so every accessor below can stay
+    // `&self` -- matches every other per-thread read accessor in this
+    // impl block (`history`/`active_terminals`/`terminal_buffer`/etc.),
+    // which `PanelSingleton`'s own `&self` refresh methods
+    // (`refresh_terminals_for` and friends) rely on being able to call
+    // without needing `&mut self.bridge` threaded through.
+    local_terminals: std::cell::RefCell<std::collections::HashMap<usize, crate::local_terminal::LocalTerminal>>,
+}
+
+/// A point-in-time read of a client-local terminal's VT100 screen state
+/// (`AgentBridge::local_terminal_snapshot`) -- what `models::to_local_
+/// terminal_item` turns into the Slint-facing `LocalTerminalItem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTerminalSnapshot {
+    pub screen_text: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub has_exited: bool,
 }
 
 /// Turns a UI thread display name into a filesystem-safe, stable jsonl
@@ -1015,6 +1043,7 @@ impl AgentBridge {
             events,
             gateway_urls: resolved_urls,
             store,
+            local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1349,6 +1378,90 @@ impl AgentBridge {
         self.runtime
             .block_on(handle.install_agent(agent_id.to_string()))
             .is_ok()
+    }
+
+    /// Opens (or returns the already-open) client-local PTY terminal
+    /// for thread `idx` -- see [`crate::local_terminal::LocalTerminal`]'s
+    /// doc comment for what "client-local" means (a real shell process
+    /// this panel spawns itself, never touching the gateway). Returns
+    /// `false` if `idx` is out of range or the real PTY spawn failed
+    /// (e.g. no shell resolvable); the caller degrades to "no terminal
+    /// card shown" in that case, same posture as this crate's other
+    /// gateway-call accessors.
+    pub fn open_local_terminal(&self, idx: usize, cols: u16, rows: u16) -> bool {
+        if idx >= self.slots.len() {
+            return false;
+        }
+        let mut local_terminals = self.local_terminals.borrow_mut();
+        if local_terminals.contains_key(&idx) {
+            return true;
+        }
+        match crate::local_terminal::LocalTerminal::spawn(cols, rows) {
+            Ok(term) => {
+                local_terminals.insert(idx, term);
+                true
+            }
+            Err(error) => {
+                eprintln!("panel-rust: failed to spawn local terminal for thread {idx}: {error}");
+                false
+            }
+        }
+    }
+
+    /// `true` if thread `idx` currently has an open client-local
+    /// terminal (drives whether the Slint card renders at all).
+    pub fn has_local_terminal(&self, idx: usize) -> bool {
+        self.local_terminals.borrow().contains_key(&idx)
+    }
+
+    /// A snapshot of thread `idx`'s local terminal's current VT100
+    /// screen state, or `None` if no terminal is open. `&mut self`
+    /// Interior-mutable (`RefCell`, `&self`) rather than `&mut self` --
+    /// checking whether the shell process has exited (`LocalTerminal::
+    /// has_exited`) requires a non-blocking `waitpid`-family call, which
+    /// the underlying `Child` trait only exposes as `&mut self`, but
+    /// every other per-thread read accessor on this type is `&self`
+    /// (see the field's own doc comment), so this borrows mutably
+    /// through the `RefCell` instead of taking `&mut self`.
+    pub fn local_terminal_snapshot(&self, idx: usize) -> Option<LocalTerminalSnapshot> {
+        let mut local_terminals = self.local_terminals.borrow_mut();
+        let term = local_terminals.get_mut(&idx)?;
+        let (cursor_row, cursor_col) = term.cursor_position();
+        Some(LocalTerminalSnapshot {
+            screen_text: term.screen_text(),
+            cols: term.cols(),
+            rows: term.rows(),
+            cursor_row,
+            cursor_col,
+            has_exited: term.has_exited(),
+        })
+    }
+
+    /// Writes raw input bytes to thread `idx`'s local terminal, if one
+    /// is open. A no-op (not an error) if none is open -- the caller
+    /// (a Slint `FocusScope::key-pressed` handler) has no meaningful
+    /// recovery action either way.
+    pub fn write_local_terminal_input(&self, idx: usize, bytes: &[u8]) {
+        if let Some(term) = self.local_terminals.borrow_mut().get_mut(&idx) {
+            if let Err(error) = term.write_input(bytes) {
+                eprintln!("panel-rust: local terminal write_input failed for thread {idx}: {error}");
+            }
+        }
+    }
+
+    /// Live-resizes thread `idx`'s local terminal, if one is open.
+    pub fn resize_local_terminal(&self, idx: usize, cols: u16, rows: u16) {
+        if let Some(term) = self.local_terminals.borrow_mut().get_mut(&idx) {
+            if let Err(error) = term.resize(cols, rows) {
+                eprintln!("panel-rust: local terminal resize failed for thread {idx}: {error}");
+            }
+        }
+    }
+
+    /// Closes (kills, see `LocalTerminal`'s `Drop` impl) thread `idx`'s
+    /// local terminal, if one is open.
+    pub fn close_local_terminal(&self, idx: usize) {
+        self.local_terminals.borrow_mut().remove(&idx);
     }
 
     /// Answers a pending interactive request (identified by `relay_id`)
@@ -2984,5 +3097,60 @@ done
             !bridge.install_agent(0, "definitely-not-a-real-agent-id"),
             "install_agent against an unknown id should fail against the real registry, not succeed"
         );
+    }
+
+    /// Client-local PTY terminal, proven through `AgentBridge`'s own
+    /// accessors (`local_terminal.rs`'s own tests already prove the
+    /// lower `LocalTerminal` layer against a real shell directly --
+    /// this proves the bridge's per-thread open/write/resize/close
+    /// wrapper reaches the exact same real behavior, the layer `lib.rs`
+    /// actually calls from Slint callbacks). No gateway involved at all
+    /// -- `TestGateway` here only supplies a thread to index into,
+    /// proving thread-index scoping (two threads get two independent
+    /// real shell processes) rather than anything ACP-related.
+    #[test]
+    fn local_terminal_open_write_resize_and_close_reach_a_real_shell_through_the_bridge() {
+        let gateway = TestGateway::spawn();
+        let names = ["Terminal Thread One", "Terminal Thread Two"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        assert!(!bridge.has_local_terminal(0));
+        assert!(bridge.local_terminal_snapshot(0).is_none());
+
+        assert!(bridge.open_local_terminal(0, 80, 24));
+        assert!(bridge.has_local_terminal(0));
+        // Idempotent -- opening again on the same thread must not spawn
+        // a second shell process, just report the existing one is open.
+        assert!(bridge.open_local_terminal(0, 80, 24));
+
+        bridge.write_local_terminal_input(0, b"echo BRIDGE_PTY_MARKER_998877\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline && !seen {
+            if let Some(snapshot) = bridge.local_terminal_snapshot(0) {
+                if snapshot.screen_text.contains("BRIDGE_PTY_MARKER_998877") {
+                    seen = true;
+                }
+            }
+            if !seen {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(seen, "expected the real shell's own echoed output through the bridge");
+
+        bridge.resize_local_terminal(0, 100, 40);
+        let resized = bridge
+            .local_terminal_snapshot(0)
+            .expect("terminal still open after resize");
+        assert_eq!(resized.cols, 100);
+        assert_eq!(resized.rows, 40);
+
+        // Thread 1's own local terminal is untouched -- proves the map
+        // is genuinely keyed per thread index, not a single shared slot.
+        assert!(!bridge.has_local_terminal(1));
+
+        bridge.close_local_terminal(0);
+        assert!(!bridge.has_local_terminal(0));
+        assert!(bridge.local_terminal_snapshot(0).is_none());
     }
 }

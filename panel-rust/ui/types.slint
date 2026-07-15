@@ -140,3 +140,22 @@ export struct AgentCatalogEntry {
     version: string,
     status: string,
 }
+
+// Client-local PTY terminal addition: a snapshot of the currently
+// selected thread's own client-spawned shell process (`AgentBridge::
+// local_terminal_snapshot`, see `local_terminal::LocalTerminal`'s doc
+// comment). Distinct from `TerminalItem` (agent-created, read-only,
+// relayed from the gateway) -- this one is interactive: the card that
+// renders it also captures keyboard input and forwards it back via
+// `local-terminal-input(string)`. `open` mirrors `PendingRequestItem`'s
+// "all-empty/default struct means nothing is open" convention (Slint
+// has no `Option<T>`).
+export struct LocalTerminalItem {
+    open: bool,
+    screen-text: string,
+    cols: int,
+    rows: int,
+    cursor-row: int,
+    cursor-col: int,
+    has-exited: bool,
+}

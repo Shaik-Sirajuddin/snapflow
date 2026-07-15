@@ -1,8 +1,9 @@
 import { Palette } from "palette.slint";
-import { MessageItem, PendingRequestItem, TerminalItem, ModeOption, ConfigOptionRow } from "types.slint";
+import { MessageItem, PendingRequestItem, TerminalItem, ModeOption, ConfigOptionRow, LocalTerminalItem } from "types.slint";
 import { MessageCard } from "message_card.slint";
 import { PermissionCard } from "permission_card.slint";
 import { TerminalCard } from "terminal_card.slint";
+import { LocalTerminalCard } from "local_terminal_card.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
 // chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
@@ -20,6 +21,12 @@ export component ChatArea inherits Rectangle {
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
+    // Client-local PTY terminal addition -- see `local_terminal_card.
+    // slint`'s doc comment. `local-terminal.open == false` (the
+    // all-empty default) hides both the header toggle's active state
+    // and the card entirely, same "no Option<T>, use an all-default
+    // struct" convention `PendingRequestItem` already established.
+    in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
     // Mode/config selector addition: the *currently displayed* thread's
     // live capability advertisement (`AgentBridge::session_modes`/
@@ -39,6 +46,10 @@ export component ChatArea inherits Rectangle {
     callback approve-request();
     callback reject-request();
     callback expand-terminal(string);
+    callback local-terminal-toggle-requested();
+    callback local-terminal-key-input(string);
+    callback local-terminal-expand-requested();
+    callback local-terminal-close-requested();
 
     // The native v1 dock launches at 20% width. Keep the chat surface in
     // its compact side-panel treatment even after a user widens it; this
@@ -132,6 +143,20 @@ export component ChatArea inherits Rectangle {
                     font-weight: 700;
                     font-family: Palette.font-mono;
                     vertical-alignment: center;
+                }
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: Palette.radius-sm;
+                    background: local-terminal.open ? Palette.sys-primary-container : Palette.sys-outer;
+                    TouchArea { clicked => { local-terminal-toggle-requested(); } }
+                    Text {
+                        text: "\u{2318}"; // same terminal glyph stand-in as TerminalCard
+                        color: local-terminal.open ? Palette.sys-primary : Palette.sys-text-secondary;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
                 Rectangle {
                     width: 24px;
@@ -273,6 +298,26 @@ export component ChatArea inherits Rectangle {
                     preferred-width: 0px;
                     min-width: 0px;
                     expand => { expand-terminal(term.terminal-id); }
+                }
+            }
+        }
+        // Client-local PTY terminal card -- same docking spot as the
+        // agent-created terminal cards above (outside the scrollable
+        // message Flickable), shown whenever the user has toggled it
+        // open via the header button.
+        if local-terminal.open : Rectangle {
+            background: Palette.sys-chat;
+            HorizontalLayout {
+                padding: compact ? 6px : 10px;
+                LocalTerminalCard {
+                    item: local-terminal;
+                    compact: compact;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    expand => { local-terminal-expand-requested(); }
+                    key-input(text) => { local-terminal-key-input(text); }
+                    close-requested => { local-terminal-close-requested(); }
                 }
             }
         }

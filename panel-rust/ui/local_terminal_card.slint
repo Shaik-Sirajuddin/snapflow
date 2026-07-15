@@ -1,0 +1,195 @@
+import { Palette } from "palette.slint";
+import { LocalTerminalItem } from "types.slint";
+
+// Client-local PTY terminal view -- companion to `terminal_card.slint`'s
+// agent-created (read-only) `TerminalCard`/`TerminalOverlay`. This one
+// is a real interactive terminal the *client itself* spawned
+// (`AgentBridge::open_local_terminal`, see `local_terminal.rs`'s doc
+// comment): the card/overlay both capture keyboard input via a
+// `FocusScope` and forward every keystroke to Rust through
+// `local-terminal-key(text)`, which writes it straight to the real
+// PTY's input side. `screen-text` is the VT100 parser's real rendered
+// screen (cursor-tracked, control sequences interpreted), monochrome
+// per this project's design language (see `local_terminal.rs`'s doc
+// comment on why colors are intentionally not reproduced).
+export component LocalTerminalCard inherits Rectangle {
+    in property <LocalTerminalItem> item;
+    in property <bool> compact: true;
+    callback expand();
+    callback key-input(string);
+    callback close-requested();
+
+    background: Palette.sys-terminal-bg;
+    border-color: Palette.sys-terminal-border;
+    border-width: 1px;
+    border-radius: Palette.radius-md;
+    height: compact ? 120px : 180px;
+
+    focus-scope := FocusScope {
+        key-pressed(event) => {
+            key-input(event.text);
+            accept
+        }
+        VerticalLayout {
+            padding: 8px;
+            spacing: 4px;
+            Rectangle {
+                height: 18px;
+                TouchArea {
+                    clicked => {
+                        focus-scope.focus();
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "\u{2318}"; // terminal glyph stand-in, same as TerminalCard
+                        color: Palette.sys-primary;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: "local terminal";
+                        color: Palette.sys-text-primary;
+                        font-family: Palette.font-mono;
+                        font-size: 10px;
+                        font-weight: 700;
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        overflow: elide;
+                        vertical-alignment: center;
+                    }
+                    if item.has-exited : Text {
+                        text: "exited";
+                        color: Palette.sys-text-muted;
+                        font-family: Palette.font-mono;
+                        font-size: 9px;
+                        vertical-alignment: center;
+                    }
+                    if !item.has-exited : Text {
+                        text: focus-scope.has-focus ? "focused" : "click to focus";
+                        color: Palette.sys-text-secondary;
+                        font-family: Palette.font-mono;
+                        font-size: 9px;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        width: 44px; height: 16px;
+                        background: Palette.sys-card;
+                        border-color: Palette.sys-border;
+                        border-width: 1px;
+                        border-radius: Palette.radius-sm;
+                        TouchArea { clicked => { close-requested(); } }
+                        Text { text: "Kill"; color: Palette.sys-text-secondary; font-size: 8px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    TouchArea {
+                        width: 16px;
+                        clicked => { expand(); }
+                        Text {
+                            text: "\u{2922}"; // expand glyph, same as TerminalCard
+                            color: Palette.sys-text-muted;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+            Flickable {
+                viewport-height: log.preferred-height;
+                log := Text {
+                    text: item.screen-text;
+                    color: Palette.sys-terminal-text;
+                    font-family: Palette.font-mono;
+                    font-size: 10px;
+                    wrap: no-wrap;
+                    overflow: clip;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                }
+            }
+        }
+    }
+}
+
+// Full-window floating overlay -- same docking convention as
+// `TerminalOverlay`/the settings sheet.
+export component LocalTerminalOverlay inherits Rectangle {
+    in property <LocalTerminalItem> item;
+    in property <length> container-width;
+    in property <length> container-height;
+    callback close();
+    callback key-input(string);
+    callback close-requested();
+
+    x: 8px;
+    y: 8px;
+    width: container-width - 16px;
+    height: container-height - 16px;
+    background: Palette.sys-terminal-bg;
+    border-color: Palette.sys-border-strong;
+    border-width: 1px;
+    border-radius: Palette.radius-md;
+
+    focus-scope := FocusScope {
+        key-pressed(event) => {
+            key-input(event.text);
+            accept
+        }
+        VerticalLayout {
+            padding: 10px;
+            spacing: 8px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: "local terminal" + (item.has-exited ? " (exited)" : "");
+                    color: Palette.sys-text-primary;
+                    font-family: Palette.font-mono;
+                    font-size: 12px;
+                    font-weight: 700;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    width: 60px; height: 24px;
+                    background: Palette.sys-sidebar;
+                    border-color: Palette.sys-border;
+                    border-width: 1px;
+                    border-radius: Palette.radius-sm;
+                    TouchArea { clicked => { close-requested(); } }
+                    Text { text: "Kill"; color: Palette.sys-text-primary; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle {
+                    width: 60px; height: 24px;
+                    background: Palette.sys-sidebar;
+                    border-color: Palette.sys-border;
+                    border-width: 1px;
+                    border-radius: Palette.radius-sm;
+                    TouchArea { clicked => { close(); } }
+                    Text { text: "Close"; color: Palette.sys-text-primary; font-size: 10px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+            Rectangle { height: 1px; background: Palette.sys-border; }
+            Flickable {
+                viewport-height: full-log.preferred-height;
+                full-log := Text {
+                    text: item.screen-text;
+                    color: Palette.sys-terminal-text;
+                    font-family: Palette.font-mono;
+                    font-size: 11px;
+                    wrap: no-wrap;
+                    overflow: clip;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                }
+            }
+        }
+    }
+
+    init => { focus-scope.focus(); }
+}

@@ -17,6 +17,7 @@
 mod agent_bridge;
 mod appearance;
 mod conversation;
+mod local_terminal;
 mod models;
 mod permission;
 mod state_store;
@@ -154,6 +155,10 @@ struct PanelSingleton {
     /// is just a snapshot" convention `refresh_pending_request_for`
     /// already follows).
     expanded_terminal_id: RefCell<Option<String>>,
+    /// Last-rendered client-local terminal screen text, for `refresh_
+    /// local_terminal_for`'s change-detection -- see that method's doc
+    /// comment.
+    local_terminal_last_text: RefCell<String>,
 }
 
 impl PanelSingleton {
@@ -243,6 +248,7 @@ impl PanelSingleton {
         self.refresh_pending_request_for(real_idx);
         self.refresh_terminals_for(real_idx);
         self.refresh_capabilities_for(real_idx);
+        self.refresh_local_terminal_for(real_idx);
     }
 
     /// Rebuilds the `available-modes`/`current-mode-id`/`config-option-
@@ -341,6 +347,32 @@ impl PanelSingleton {
         }
         self.component
             .set_terminals(models::to_terminal_items(entries));
+    }
+
+    /// Rebuilds the `local-terminal` property for `real_idx` from
+    /// `AgentBridge::local_terminal_snapshot` -- same "this thread
+    /// became the displayed one" hook convention `refresh_terminals_for`
+    /// documents, plus called on every periodic poll tick (see
+    /// `panel_rust_poll`) regardless of whether any gateway event
+    /// arrived, since a client-local PTY's output changes purely from
+    /// its own background reader thread, never through `AgentBridge::
+    /// poll()`'s event queue at all. Returns whether the rendered
+    /// screen text actually changed, so the poll-tick caller only
+    /// requests a redraw when there was something new to show (typing
+    /// into an idle shell's prompt should not force a redraw every
+    /// tick).
+    fn refresh_local_terminal_for(&self, real_idx: usize) -> bool {
+        let Some(bridge) = &self.bridge else { return false };
+        let snapshot = bridge.local_terminal_snapshot(real_idx);
+        let new_text = snapshot
+            .as_ref()
+            .map(|s| s.screen_text.clone())
+            .unwrap_or_default();
+        let changed = *self.local_terminal_last_text.borrow() != new_text;
+        *self.local_terminal_last_text.borrow_mut() = new_text;
+        self.component
+            .set_local_terminal(models::to_local_terminal_item(snapshot));
+        changed
     }
 
     /// Answers the currently-displayed thread's first pending request
@@ -566,6 +598,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             expanded: RefCell::new(Vec::new()),
             displayed_thread: Cell::new(None),
             expanded_terminal_id: RefCell::new(None),
+            local_terminal_last_text: RefCell::new(String::new()),
         };
         panel.refresh_threads_model();
         if let Some(store) = panel.panel_state.as_ref() {
@@ -931,6 +964,77 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        // Client-local PTY terminal addition -- toggle open/closed,
+        // forward keyboard input, and an explicit kill action. Real
+        // `LocalTerminal::spawn`/`close_local_terminal`, no simulation
+        // -- see `local_terminal.rs`'s doc comment.
+        let component_weak = panel.component.as_weak();
+        panel.component.on_local_terminal_toggle_requested(move || {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else { return };
+                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
+                    else {
+                        return;
+                    };
+                    if bridge.has_local_terminal(real_idx) {
+                        bridge.close_local_terminal(real_idx);
+                    } else {
+                        // 80x24 is the conventional default terminal
+                        // size (same default `xterm`/most emulators
+                        // start at) -- the card's own pixel size isn't
+                        // translated into a live cols/rows resize yet
+                        // (a future increment; `resize_local_terminal`
+                        // already exists for it), so this is a fixed
+                        // starting size, not a measured one.
+                        bridge.open_local_terminal(real_idx, 80, 24);
+                    }
+                    panel.refresh_local_terminal_for(real_idx);
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_local_terminal_key_input(move |text| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else { return };
+                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
+                    else {
+                        return;
+                    };
+                    let bytes = models::translate_local_terminal_key(text.as_str());
+                    if !bytes.is_empty() {
+                        bridge.write_local_terminal_input(real_idx, &bytes);
+                    }
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_local_terminal_close_requested(move || {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else { return };
+                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
+                    else {
+                        return;
+                    };
+                    bridge.close_local_terminal(real_idx);
+                    panel.refresh_local_terminal_for(real_idx);
+                }
+            });
+        });
+
         // Mode/config selector addition: dispatch `session/set_mode`/
         // `session/set_config_option` on the *currently displayed*
         // thread. Neither callback optimistically updates `current-
@@ -1177,7 +1281,18 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let Some(panel) = slot.as_ref() else {
             return false;
         };
-        panel.apply_bridge_events()
+        let bridge_changed = panel.apply_bridge_events();
+        // Client-local PTY terminal output arrives on its own
+        // background reader thread, never through `AgentBridge::
+        // poll()`'s event queue -- refresh it unconditionally on every
+        // tick (not gated behind `apply_bridge_events`'s own "any
+        // gateway events at all" early return), independent of whether
+        // any gateway activity happened this tick.
+        let selected = panel.real_index(panel.component.get_selected_thread() as usize);
+        let local_terminal_changed = selected
+            .map(|idx| panel.refresh_local_terminal_for(idx))
+            .unwrap_or(false);
+        bridge_changed || local_terminal_changed
     })
 }
 

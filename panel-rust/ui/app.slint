@@ -1,11 +1,12 @@
 import { Palette } from "palette.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem } from "types.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "terminal_card.slint";
+import { LocalTerminalOverlay } from "local_terminal_card.slint";
 import { SettingsSheet } from "settings_sheet.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, Palette }
+export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem, Palette }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -35,6 +36,12 @@ export component ChatPanel inherits Window {
     in property <bool> compact: true;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
+    // Client-local PTY terminal addition -- see `chat_area.slint`'s own
+    // doc comment on `LocalTerminalItem`. Populated per the *currently
+    // selected* thread, same convention `terminals`/`pending-request`
+    // already follow.
+    in property <LocalTerminalItem> local-terminal;
+    in-out property <bool> local-terminal-overlay-open: false;
     // Profile-picker addition: populated by Rust (`AgentBridge::
     // list_profiles`, see `models::to_profile_options`) whenever the
     // settings sheet opens. Chip-clicking sets `default-profile`/
@@ -79,6 +86,9 @@ export component ChatPanel inherits Window {
     callback reject-request();
     callback expand-terminal(string);
     callback close-terminal-overlay();
+    callback local-terminal-toggle-requested();
+    callback local-terminal-key-input(string);
+    callback local-terminal-close-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
 
@@ -121,6 +131,11 @@ export component ChatPanel inherits Window {
             reject-request => { reject-request(); }
             terminals: terminals;
             expand-terminal(id) => { expand-terminal(id); }
+            local-terminal: local-terminal;
+            local-terminal-toggle-requested => { local-terminal-toggle-requested(); }
+            local-terminal-key-input(text) => { local-terminal-key-input(text); }
+            local-terminal-expand-requested => { local-terminal-overlay-open = true; }
+            local-terminal-close-requested => { local-terminal-close-requested(); }
             available-modes: available-modes;
             current-mode-id: current-mode-id;
             config-option-rows: config-option-rows;
@@ -136,6 +151,17 @@ export component ChatPanel inherits Window {
             expanded-terminal = { terminal-id: "" };
             close-terminal-overlay();
         }
+    }
+    if local-terminal-overlay-open : LocalTerminalOverlay {
+        item: local-terminal;
+        container-width: root.width;
+        container-height: root.height;
+        close => { local-terminal-overlay-open = false; }
+        close-requested => {
+            local-terminal-overlay-open = false;
+            local-terminal-close-requested();
+        }
+        key-input(text) => { local-terminal-key-input(text); }
     }
     if settings-open : Rectangle {
         SettingsSheet {

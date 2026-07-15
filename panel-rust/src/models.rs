@@ -9,8 +9,8 @@
 
 use crate::agent_bridge::TerminalBuffer;
 use crate::{
-    AgentCatalogEntry, ConfigOptionRow, McpServerOption, MessageItem, ModeOption, ProfileOption,
-    TerminalItem, ThreadItem,
+    AgentCatalogEntry, ConfigOptionRow, LocalTerminalItem, McpServerOption, MessageItem,
+    ModeOption, ProfileOption, TerminalItem, ThreadItem,
 };
 use rui_acp_client::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::{ModelRc, VecModel};
@@ -310,6 +310,53 @@ pub fn to_agent_catalog_entries(agents: Vec<serde_json::Value>) -> ModelRc<Agent
     ModelRc::new(VecModel::from(items))
 }
 
+/// Builds the `LocalTerminalItem` Slint property from a real
+/// `AgentBridge::local_terminal_snapshot` result -- `None` (no terminal
+/// open for this thread) becomes the all-default/`open: false` struct,
+/// same convention `PendingRequestItem`'s "no `Option<T>` in Slint"
+/// doc comment establishes.
+pub fn to_local_terminal_item(
+    snapshot: Option<crate::agent_bridge::LocalTerminalSnapshot>,
+) -> LocalTerminalItem {
+    match snapshot {
+        Some(s) => LocalTerminalItem {
+            open: true,
+            screen_text: s.screen_text.into(),
+            cols: s.cols as i32,
+            rows: s.rows as i32,
+            cursor_row: s.cursor_row as i32,
+            cursor_col: s.cursor_col as i32,
+            has_exited: s.has_exited,
+        },
+        None => LocalTerminalItem {
+            open: false,
+            screen_text: String::new().into(),
+            cols: 0,
+            rows: 0,
+            cursor_row: 0,
+            cursor_col: 0,
+            has_exited: false,
+        },
+    }
+}
+
+/// Translates one Slint `KeyEvent.text` into the raw bytes to write to
+/// a client-local PTY's input side -- a real terminal emulator forwards
+/// keystrokes as bytes, not as a Rust-level "insert this string"
+/// operation. Only one real remapping needed: Slint's `Key::Return`
+/// produces `"\n"` as its `text`, but a PTY in the OS's usual line
+/// discipline expects Enter as carriage return (`\r`) -- every other
+/// character (printable UTF-8, `\x7f` Backspace, `\x1b` Escape, `\t`
+/// Tab, Ctrl-key combinations, arrow-key escape sequences Slint already
+/// encodes as private-use-area text) is forwarded verbatim.
+pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
+    if text == "\n" {
+        vec![b'\r']
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +542,43 @@ mod tests {
         assert_eq!(entry.name, "Codex Agent");
         assert_eq!(entry.version, "1.0.0");
         assert_eq!(entry.status, "installed");
+    }
+
+    #[test]
+    fn to_local_terminal_item_none_becomes_closed_default() {
+        let item = to_local_terminal_item(None);
+        assert!(!item.open);
+        assert_eq!(item.screen_text, "");
+        assert!(!item.has_exited);
+    }
+
+    #[test]
+    fn to_local_terminal_item_some_is_marked_open_with_fields_forwarded() {
+        let snapshot = crate::agent_bridge::LocalTerminalSnapshot {
+            screen_text: "$ echo hi\nhi".to_string(),
+            cols: 80,
+            rows: 24,
+            cursor_row: 1,
+            cursor_col: 2,
+            has_exited: false,
+        };
+        let item = to_local_terminal_item(Some(snapshot));
+        assert!(item.open);
+        assert_eq!(item.screen_text, "$ echo hi\nhi");
+        assert_eq!(item.cols, 80);
+        assert_eq!(item.rows, 24);
+        assert_eq!(item.cursor_row, 1);
+        assert_eq!(item.cursor_col, 2);
+    }
+
+    #[test]
+    fn translate_local_terminal_key_maps_return_to_carriage_return() {
+        assert_eq!(translate_local_terminal_key("\n"), vec![b'\r']);
+    }
+
+    #[test]
+    fn translate_local_terminal_key_forwards_other_text_verbatim() {
+        assert_eq!(translate_local_terminal_key("a"), b"a".to_vec());
+        assert_eq!(translate_local_terminal_key("\u{7f}"), vec![0x7f]);
     }
 }
