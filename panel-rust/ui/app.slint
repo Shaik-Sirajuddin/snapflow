@@ -1,10 +1,10 @@
 import { Palette } from "palette.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption } from "types.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "terminal_card.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, Palette }
+export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, Palette }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -34,6 +34,14 @@ export component ChatPanel inherits Window {
     in property <bool> compact: true;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
+    // Profile-picker addition: populated by Rust (`AgentBridge::
+    // list_profiles`, see `models::to_profile_options`) whenever the
+    // settings sheet opens. Chip-clicking sets `default-profile`/
+    // `permission-profile` directly rather than needing a distinct
+    // "selected profile" property -- picking a chip is exactly
+    // equivalent to typing that exact name into the existing free-text
+    // field, just without the user needing to know exact profile names.
+    in property <[ProfileOption]> available-profiles: [];
     // Set by Rust whenever `expand-terminal` fires (looked up from
     // `terminals` at that moment, since Slint has no `for`-as-expression
     // find/filter construct) -- an empty `terminal-id` means no overlay
@@ -120,6 +128,38 @@ export component ChatPanel inherits Window {
             Text { text: "Chat Defaults"; color: Palette.sys-text-primary; font-size: 16px; font-weight: 700; }
             Text { text: "Profile"; color: Palette.sys-text-secondary; font-size: 11px; }
             TextInput { text <=> default-profile; color: Palette.sys-text-primary; font-size: 12px; }
+            // Profile-picker chips -- real `profiles/list` choices,
+            // quick-select alternative to typing an exact name into the
+            // TextInput above (both write the same `default-profile`
+            // property, so either path works). `T`/`F` suffix badges
+            // are `allow_terminal_access`/`allow_fs_access` -- see
+            // `ProfileOption`'s doc comment.
+            Flickable {
+                height: available-profiles.length > 0 ? 30px : 0px;
+                viewport-width: chip-row.preferred-width;
+                chip-row := HorizontalLayout {
+                    spacing: 6px;
+                    for profile in available-profiles : Rectangle {
+                        width: chip-label.preferred-width + 16px;
+                        height: 24px;
+                        background: profile.name == default-profile ? Palette.sys-primary : Palette.sys-sidebar;
+                        border-color: Palette.sys-border;
+                        border-width: 1px;
+                        border-radius: Palette.radius-sm;
+                        TouchArea { clicked => { default-profile = profile.name; } }
+                        chip-label := Text {
+                            text: profile.name
+                                + (profile.terminal-enabled ? " T" : "")
+                                + (profile.fs-enabled ? " F" : "");
+                            color: profile.name == default-profile ? Palette.sys-on-primary : Palette.sys-text-primary;
+                            font-family: Palette.font-mono;
+                            font-size: 10px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
             Text { text: "Permission profile"; color: Palette.sys-text-secondary; font-size: 11px; }
             TextInput { text <=> permission-profile; color: Palette.sys-text-primary; font-size: 12px; }
             Rectangle {

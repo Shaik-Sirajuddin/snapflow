@@ -8,7 +8,7 @@
 //! `ChatPanel` component.
 
 use crate::agent_bridge::TerminalBuffer;
-use crate::{MessageItem, TerminalItem, ThreadItem};
+use crate::{MessageItem, ProfileOption, TerminalItem, ThreadItem};
 use rui_acp_client::{ChatMessage, MessageKind};
 use slint::{ModelRc, VecModel};
 
@@ -174,6 +174,21 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
                 has_exited: false,
                 exit_code: 0,
             },
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Builds the settings sheet's profile-picker row model from a real
+/// `profiles/list` result (`AgentBridge::list_profiles`).
+pub fn to_profile_options(profiles: Vec<rui_acpx_client::ProfileSummary>) -> ModelRc<ProfileOption> {
+    let items: Vec<ProfileOption> = profiles
+        .into_iter()
+        .map(|p| ProfileOption {
+            name: p.name.into(),
+            agent_id: p.agent_id.into(),
+            terminal_enabled: p.allow_terminal_access,
+            fs_enabled: p.allow_fs_access,
         })
         .collect();
     ModelRc::new(VecModel::from(items))

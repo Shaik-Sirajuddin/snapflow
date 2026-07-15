@@ -65,8 +65,15 @@ enum Command {
         text: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
-    ListSessions {
-        resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
+   ListSessions {
+       resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
+   },
+    /// `profiles/list` -- every profile the bound gateway currently has
+    /// registered, for a profile-picker UI. Read-only, no session
+    /// binding involved -- safe to call before `OpenSession` has ever
+    /// run on this handle.
+    ListProfiles {
+        resp: oneshot::Sender<Result<Vec<ProfileSummary>, AcpxThreadError>>,
     },
     /// Explicit, opt-in-only `session/close`. Deliberately **never**
     /// sent by `shutdown()`/`Drop` -- see this crate's module doc and
@@ -179,8 +186,16 @@ impl AcpxThreadHandle {
     /// Gateway-aggregated `session/list` -- every session across every
     /// backend *this gateway* currently supervises, not just this
     /// thread's own.
-    pub async fn list_sessions(&self) -> Result<Vec<RemoteThreadInfo>, AcpxThreadError> {
-        self.call(|resp| Command::ListSessions { resp }).await
+   pub async fn list_sessions(&self) -> Result<Vec<RemoteThreadInfo>, AcpxThreadError> {
+       self.call(|resp| Command::ListSessions { resp }).await
+   }
+
+    /// `profiles/list` against this thread's bound gateway -- what a
+    /// profile-picker UI populates its choices from. Safe to call before
+    /// `open_session`/`open_session_with_profile` (no session-dependent
+    /// state involved).
+    pub async fn list_profiles(&self) -> Result<Vec<ProfileSummary>, AcpxThreadError> {
+        self.call(|resp| Command::ListProfiles { resp }).await
     }
 
     /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
@@ -590,6 +605,38 @@ async fn run_thread_actor(
                             })
                             .collect()
                     });
+               let _ = resp.send(result.map_err(Into::into));
+           }
+            Command::ListProfiles { resp } => {
+                let result = client
+                    .call("profiles/list", serde_json::json!({}), None)
+                    .await
+                    .map(|value| {
+                        value["profiles"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|profile| {
+                                Some(ProfileSummary {
+                                    name: profile.get("name")?.as_str()?.to_owned(),
+                                    agent_id: profile
+                                        .get("agent_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                    allow_terminal_access: profile
+                                        .get("allow_terminal_access")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                    allow_fs_access: profile
+                                        .get("allow_fs_access")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                })
+                            })
+                            .collect()
+                    });
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::CloseSession { resp } => {
@@ -631,4 +678,18 @@ async fn run_cancel_worker(
         };
         let _ = response.send(result);
     }
+}
+
+/// A profile the bound gateway currently has registered, as returned by
+/// `profiles/list` -- narrowed to the fields a profile-picker UI needs
+/// (name to display/select, and the two capability gates that determine
+/// whether picking this profile actually unlocks terminal/fs approval
+/// cards, so the picker can show that inline rather than the user
+/// discovering it only after a request silently auto-rejects).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSummary {
+    pub name: String,
+    pub agent_id: String,
+    pub allow_terminal_access: bool,
+    pub allow_fs_access: bool,
 }

@@ -3641,6 +3641,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 name = "panel-rust"
 version = "0.1.0"
 dependencies = [
+ "acpx-client",
  "rui-acp-client",
  "rui-acpx-client",
  "rusqlite",

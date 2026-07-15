@@ -155,6 +155,21 @@ pub struct AgentBridge {
 /// `slot`'s live terminal-buffer map -- shared by both forwarder loops
 /// (initial-construction and `add_thread`) so the "replace this
 /// terminal's snapshot" semantics stay in exactly one place.
+/// `handle.open_session(cwd)` if `profile` is `None`, else
+/// `handle.open_session_with_profile(cwd, profile)` -- one helper so
+/// [`AgentBridge::add_thread_with_profile`]'s two call sites (fresh-open
+/// and resume-failed-fallback) don't duplicate the branch.
+async fn open_session_maybe_profiled(
+    handle: &AcpxThreadHandle,
+    cwd: PathBuf,
+    profile: Option<&str>,
+) -> Result<String, rui_acpx_client::AcpxThreadError> {
+    match profile {
+        Some(profile) => handle.open_session_with_profile(cwd, profile).await,
+        None => handle.open_session(cwd).await,
+    }
+}
+
 fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
     let is_new = !slot
         .terminal_buffers
@@ -954,11 +969,29 @@ impl AgentBridge {
         })
     }
 
-    /// Adds one open thread using the already-provisioned provider gateway.
-    /// The session is opened synchronously before the new slot is exposed to
-    /// the UI, so selecting the row and sending immediately cannot race
-    /// `session/new`.
-    pub fn add_thread(&mut self, name: &str) -> Result<usize, BridgeError> {
+   /// Adds one open thread using the already-provisioned provider gateway.
+   /// The session is opened synchronously before the new slot is exposed to
+   /// the UI, so selecting the row and sending immediately cannot race
+   /// `session/new`.
+   pub fn add_thread(&mut self, name: &str) -> Result<usize, BridgeError> {
+        self.add_thread_with_profile(name, None)
+    }
+
+    /// Same as [`Self::add_thread`], but selects a named ACPX profile for
+    /// the new thread's `session/new` call (`_acpx.profile`, via
+    /// [`AcpxThreadHandle::open_session_with_profile`]) -- the live hook
+    /// for the settings sheet's profile picker: a profile with
+    /// `allow_terminal_access`/`allow_fs_access` enabled only actually
+    /// unlocks those interactive request cards for threads opened with
+    /// it selected, not retroactively for already-open threads (ACPX has
+    /// no `session/set_profile`; changing a live session's profile means
+    /// opening a new one). `None` behaves identically to `add_thread`
+    /// (native/unmanaged mode, no `_acpx.profile` sent at all).
+    pub fn add_thread_with_profile(
+        &mut self,
+        name: &str,
+        profile: Option<&str>,
+    ) -> Result<usize, BridgeError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(BridgeError::Gateway("thread name cannot be empty".into()));
@@ -1010,21 +1043,21 @@ impl AgentBridge {
             terminal_buffers: Mutex::new(HashMap::new()),
             terminal_order: Mutex::new(Vec::new()),
         });
-        let cwd = cwd_for_session();
-        let session_id = if let Some(session_id) = cached_session_id.clone() {
-            match self
-                .runtime
-                .block_on(handle.resume_session(session_id.clone(), cwd.clone()))
-            {
-                Ok(()) => session_id,
+       let cwd = cwd_for_session();
+       let session_id = if let Some(session_id) = cached_session_id.clone() {
+           match self
+               .runtime
+               .block_on(handle.resume_session(session_id.clone(), cwd.clone()))
+           {
+               Ok(()) => session_id,
                 Err(_) => self
                     .runtime
-                    .block_on(handle.open_session(cwd))
+                    .block_on(open_session_maybe_profiled(&handle, cwd, profile))
                     .map_err(|error| BridgeError::Gateway(error.to_string()))?,
             }
         } else {
             self.runtime
-                .block_on(handle.open_session(cwd))
+                .block_on(open_session_maybe_profiled(&handle, cwd, profile))
                 .map_err(|error| BridgeError::Gateway(error.to_string()))?
         };
         *slot
@@ -1149,19 +1182,40 @@ impl AgentBridge {
         })
     }
 
-    /// Every terminal id known on thread `idx` so far, first-seen order
-    /// -- what a terminal-view component iterates to render one card per
-    /// live/finished terminal. Paired with [`Self::terminal_buffer`] for
-    /// each id's current output/exit state.
-    pub fn active_terminals(&self, idx: usize) -> Vec<String> {
-        self.slots
-            .get(idx)
-            .map(|s| {
-                s.terminal_order
-                    .lock()
-                    .expect("terminal_order mutex poisoned")
-                    .clone()
-            })
+   /// Every terminal id known on thread `idx` so far, first-seen order
+   /// -- what a terminal-view component iterates to render one card per
+   /// live/finished terminal. Paired with [`Self::terminal_buffer`] for
+   /// each id's current output/exit state.
+   pub fn active_terminals(&self, idx: usize) -> Vec<String> {
+       self.slots
+           .get(idx)
+           .map(|s| {
+               s.terminal_order
+                   .lock()
+                   .expect("terminal_order mutex poisoned")
+                   .clone()
+           })
+           .unwrap_or_default()
+   }
+
+    /// `profiles/list` against thread `idx`'s bound gateway -- what the
+    /// settings sheet's profile picker populates its choices from.
+    /// Blocking (`block_on` on the background runtime, same "settings
+    /// UI is a low-frequency, blocking-acceptable action" convention
+    /// `open_session`'s own `block_on` use documents) since this is
+    /// called synchronously from a Slint button-click handler with no
+    /// other useful place to await a future. Returns an empty list
+    /// (rather than propagating the error to a UI with no error-toast
+    /// mechanism yet) if the call fails -- the picker then just shows
+    /// no choices, same degrade-gracefully posture already used for the
+    /// existing free-text profile fields.
+    pub fn list_profiles(&self, idx: usize) -> Vec<rui_acpx_client::ProfileSummary> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.list_profiles())
             .unwrap_or_default()
     }
 
@@ -2234,8 +2288,143 @@ done
         assert!(
             history.iter().any(|m| m.text.contains("CHOSE: allow-once")),
             "expected the backend's own echo to reflect the live-relayed \
-             allow-once answer, not the profile's AutoReject default \
-             (which would have picked reject-once): got {history:?}"
+            allow-once answer, not the profile's AutoReject default \
+            (which would have picked reject-once): got {history:?}"
+       );
+    }
+
+    /// Real end-to-end proof of the profile-picker path this crate
+    /// exposes to `lib.rs`'s settings sheet: `AgentBridge::list_profiles`
+    /// sees a real profile registered on the gateway (including its
+    /// capability flags), and `AgentBridge::add_thread_with_profile`
+    /// actually threads `_acpx.profile` through to a real `session/new`
+    /// call -- proven by the new thread's own terminal/create relay
+    /// succeeding, which only happens when `allow_terminal_access` is
+    /// true for the session's resolved profile (the default/no-profile
+    /// path has it false, see `acpx_core::Profile::allow_terminal_access`'s
+    /// default).
+    #[test]
+    fn add_thread_with_profile_unlocks_terminal_access_end_to_end() {
+        // This test needs a stand-in backend that sends a real mid-turn
+        // `terminal/create` request, which `rui-mock-agent`/
+        // `spawn_with_backend_cmd`'s default backend cannot do -- reuse
+        // the same stand-in shell script technique
+        // `permission_request_relay_round_trips_through_the_bridge`
+        // uses, driving a raw `acpx-server` process directly (built
+        // below) instead of going through `spawn_with_backend_cmd`.
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("stand_in_backend.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-profile"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    printf '{"jsonrpc":"2.0","id":971,"method":"terminal/create","params":{"sessionId":"backend-profile","command":"sh","args":["-c","printf profile-ok"]}}\n'
+    while IFS= read -r reply_line; do
+      echo "$reply_line" | grep -q '"id":971' && break
+    done
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#,
+        )
+        .expect("write stand-in backend script");
+
+        let port = free_port();
+        let mut command = std::process::Command::new(acpx_server_bin());
+        command
+            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+            .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
+            .env("RUST_LOG", "error")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = command.spawn().expect("spawn real acpx-server binary");
+        let base_url = format!("http://127.0.0.1:{port}");
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let gateway = TestGateway { child, base_url };
+
+        // Register a profile with allow_terminal_access before either
+        // list_profiles or add_thread_with_profile touches it.
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let client = acpx_client::raw::GatewayClient::new(gateway.base_url.clone());
+            client
+                .call(
+                    "profiles/create",
+                    serde_json::json!({
+                        "name": "picker-enabled",
+                        "agent_id": "profile-picker-agent",
+                        "allow_terminal_access": true
+                    }),
+                    None,
+                )
+                .await
+                .expect("profiles/create");
+        });
+
+        // Two seed threads (not one): `resolved_urls`/`gateway_urls` is
+        // populated once, at construction, only for the providers the
+        // *initial* thread list actually alternates across
+        // (`provider_for_index`, codex at even indices, claude at odd
+        // -- see that fn's own doc comment on why: production always
+        // starts from the fixed four-thread list, so both providers are
+        // always pre-resolved by the time any `add_thread*` call runs).
+        // A single-seed-thread bridge would leave "claude" unresolved,
+        // so `add_thread_with_profile`'s new thread at index 1 would
+        // fail with "gateway URL missing for claude" before ever
+        // reaching the profile/terminal-relay behavior this test
+        // actually exercises. Both seed names still resolve to the same
+        // single real `TestGateway` (`bridge_with_single_gateway`'s
+        // resolver ignores the provider argument), so this doesn't
+        // change what's under test.
+        let mut bridge =
+            bridge_with_single_gateway(&["Seed Thread", "Seed Thread Two"], &gateway, None)
+                .expect("bridge with two seed threads");
+
+        let profiles = bridge.list_profiles(0);
+        assert!(
+            profiles
+                .iter()
+                .any(|p| p.name == "picker-enabled" && p.allow_terminal_access),
+            "expected list_profiles to see the just-created profile with \
+             allow_terminal_access=true, got {profiles:?}"
+        );
+
+        let idx = bridge
+            .add_thread_with_profile("Profile Thread", Some("picker-enabled"))
+            .expect("add_thread_with_profile");
+        bridge.send_prompt(idx, "start a terminal".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut relay_seen = false;
+        while std::time::Instant::now() < deadline && !relay_seen {
+            let pending = bridge.pending_requests(idx);
+            if let Some(event) = pending.first() {
+                assert_eq!(event.method, "terminal/create");
+                let response = crate::permission::build_response(event, true);
+                bridge.respond_to_request(idx, &event.relay_id, response);
+                relay_seen = true;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            relay_seen,
+            "expected a terminal/create relay on the profile-selected thread -- \
+             a thread opened without this profile would never see one, since \
+             the default profile has allow_terminal_access=false"
         );
     }
 }

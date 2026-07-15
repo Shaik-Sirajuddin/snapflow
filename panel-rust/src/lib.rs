@@ -579,8 +579,20 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                             component.set_permission_profile(
                                 defaults.permission_profile.unwrap_or_default().into(),
                             );
-                            component.set_background_default(defaults.background_session);
-                        }
+                           component.set_background_default(defaults.background_session);
+                       }
+                   }
+                    // Profile-picker addition: populate the chip row
+                    // from a real `profiles/list` call against thread
+                    // 0's bound gateway -- profiles are gateway-wide
+                    // (registered once per acpx-server process, not
+                    // per-thread), so any bound thread's connection can
+                    // answer this; thread 0 always exists once the
+                    // fixed v1 thread list has been created.
+                    if let Some(bridge) = &panel.bridge {
+                        component.set_available_profiles(models::to_profile_options(
+                            bridge.list_profiles(0),
+                        ));
                     }
                     component.set_settings_open(true);
                 }
@@ -629,10 +641,17 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 let next_number = panel.thread_names.borrow().len() + 1;
                 let name = format!("New thread {next_number}");
-                let Some(bridge) = panel.bridge.as_mut() else {
-                    return;
-                };
-                let Ok(real_idx) = bridge.add_thread(&name) else {
+               let Some(bridge) = panel.bridge.as_mut() else {
+                   return;
+               };
+                // Profile-picker addition: a new thread opens with
+                // whichever profile is currently set as the settings
+                // sheet's default (empty means native/unmanaged mode,
+                // matching `add_thread`'s prior always-`None` behavior).
+                let default_profile = component.get_default_profile().to_string();
+                let profile = non_empty(default_profile);
+                let Ok(real_idx) = bridge.add_thread_with_profile(&name, profile.as_deref())
+                else {
                     return;
                 };
                 panel.thread_names.borrow_mut().push(name);

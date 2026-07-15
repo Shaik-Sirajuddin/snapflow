@@ -63,3 +63,17 @@ export struct TerminalItem {
     has-exited: bool,
     exit-code: int,
 }
+
+// Profile-picker addition: one profile row as returned by
+// `AgentBridge::list_profiles` (`rui_acpx_client::ProfileSummary`, see
+// `models::to_profile_options`). `terminal-enabled`/`fs-enabled` are
+// shown as small inline badges so picking a profile makes clear whether
+// it will actually unlock terminal/fs approval cards for a new thread,
+// rather than the user discovering that only after a request silently
+// auto-rejects.
+export struct ProfileOption {
+    name: string,
+    agent-id: string,
+    terminal-enabled: bool,
+    fs-enabled: bool,
+}

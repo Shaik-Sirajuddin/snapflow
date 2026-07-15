@@ -40,7 +40,9 @@
 mod thread_actor;
 
 pub use rui_acp_client::{AgentEvent, ChatMessage, MessageKind};
-pub use thread_actor::{spawn_acpx_thread, AcpxThreadError, AcpxThreadHandle, RemoteThreadInfo};
+pub use thread_actor::{
+    spawn_acpx_thread, AcpxThreadError, AcpxThreadHandle, ProfileSummary, RemoteThreadInfo,
+};
 
 /// Maps one raw `session/update` JSON-RPC notification (as returned in
 /// `acpx-client`'s `_acpx.updates` array) into this crate's shared

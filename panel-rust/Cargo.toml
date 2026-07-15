@@ -19,6 +19,12 @@ rusqlite = "0.31"
 
 [dev-dependencies]
 tempfile = "3"
+# Real profiles/create call in the profile-picker e2e test below (setting
+# up a profile with allow_terminal_access before AgentBridge::add_thread_
+# with_profile selects it) -- not a runtime dependency of this crate's
+# own public API, which reaches the gateway only through rui-acpx-client
+# (see that crate's own doc comment on this same acpx-client boundary).
+acpx-client = { path = "../acpx/acpx-client" }
 
 [build-dependencies]
 slint-build = "1.17.1"
