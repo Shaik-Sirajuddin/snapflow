@@ -31,7 +31,7 @@ async fn start_server(tag: &str, token: &str) -> PathBuf {
     };
     let backend = MockBackend::new();
     tokio::spawn(async move {
-        let _ = server::serve(config, backend).await;
+        let _ = server::serve(config, backend, None).await;
     });
     for _ in 0..100 {
         if socket_path.exists() {

@@ -15,6 +15,7 @@ pub mod openapi;
 pub mod openrpc;
 pub mod schema;
 pub mod session;
+pub mod validate;
 
 /// Re-export of the official ACP SDK crate, so downstream crates can depend
 /// on `acpx_proto::acp` instead of taking a second direct dependency that

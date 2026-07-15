@@ -3,25 +3,28 @@ package mcpadapter_test
 // TestMCPAdapter_PhaseB_SameProjectConcurrency is the real, MCP-level proof
 // requested by 11-e2e-scenario-tests.md's Phase B: two independent MCP/SSE
 // client sessions, both project.select-ed into the SAME running real
-// sap-rust process (MltBackend, not a mock), exercising:
+// sap-rust process (FfiBackend, driving the real Qt/C++ Shotcut engine --
+// not a mock), exercising:
 //
 //  1. Notification fan-out: a mutation Agent 1 requests is delivered to
 //     Agent 2's live SSE stream as a real "sap.notification" even though
 //     Agent 2 never asked for it, through the full MCP round trip -- not
 //     just proven at the sap-rust socket level like the earlier
 //     *_realsaprust_test.go files.
-//  2. Last-write-wins on a shared mutable resource: Agent 2 sets one
+//  2. The shared, session-independent undo_depth counter: Agent 1's
+//     project.undo() (a real Qt QUndoStack operation on the video-track add
+//     immediately preceding it) is observed by Agent 2 via
+//     project.getState() even though Agent 2 didn't call undo -- proving
+//     project state (not just the connection) is shared. Deliberately
+//     exercised on a track add rather than the filter work in row 3 below:
+//     FfiBackend's filter.add/filter.setProperty push no QUndoCommand of
+//     their own (see sap_ffi.cpp), so undoing/redoing here first keeps this
+//     proof from colliding with (and collaterally discarding) the filter
+//     state that row 3 depends on.
+//  3. Last-write-wins on a shared mutable resource: Agent 2 sets one
 //     brightness filter property, Agent 1 immediately replaces it, and the
 //     project's serialized MLT XML must contain Agent 1's later value.
-//  3. The shared, session-independent undo_depth counter: Agent 1's
-//     project.undo() is observed by Agent 2 via project.getState() even
-//     though Agent 2 didn't call undo -- proving project state (not just
-//     the connection) is shared. Honesty note: MltBackend's project_undo is
-//     documented (mlt_backend.rs) as a plain depth counter, not real
-//     timeline rewind, so this test proves the *sharedness* of that
-//     counter, not full undo/redo semantics -- which is exactly what the
-//     task asked to prove given the current stub.
-//  4. Project-scoped (not session-scoped) job visibility: a file.export job
+//  5. Project-scoped (not session-scoped) job visibility: a file.export job
 //     started by Agent 1 appears in Agent 2's jobs.list result, then remains
 //     queryable through jobs.get until it completes.
 
@@ -119,40 +122,19 @@ func TestMCPAdapter_PhaseB_SameProjectConcurrency(t *testing.T) {
 	}
 	t.Logf("Phase B step 1 OK: agent2 received fan-out notification for agent1's mutation it never requested: %+v", fields)
 
-	// Set up a real clip both agents can race on: a video track + one
-	// appended real source clip (2s @ 30fps = 60 frames, so inFrame values
-	// below 60 are all valid per edit.trimClipIn's own validation).
+	// Add the video track that clip work below will land on. This (like
+	// the audio addTrack above) is a real Timeline::AddTrackCommand on
+	// mw->undoStack() -- it is the operation step 4's undo/redo proof
+	// below exercises. Note: unlike edit.addTrack/edit.appendClip,
+	// FfiBackend's filter.add/filter.setProperty (used further down for
+	// the last-write-wins race) push no QUndoCommand of their own -- see
+	// sap_ffi.cpp's sap_filter_add/sap_filter_set_property doc comments.
+	// Doing the undo/redo proof here, on the track add, rather than after
+	// the filter race, means it neither depends on nor disturbs filter
+	// state that isn't on the undo stack in the first place.
 	agent1.sapCall("edit.addTrack", map[string]any{"kind": "video"})
-	appended := agent1.sapCall("playlist.append", map[string]any{"source": map[string]any{"path": source}})
-	clip := agent1.sapCall("edit.appendClip", map[string]any{
-		"trackIndex": float64(0),
-		"source":     map[string]any{"playlistIndex": appended["index"]},
-	})
-	clipID, _ := clip["clipId"].(string)
-	if clipID == "" {
-		t.Fatalf("expected a real clipId from edit.appendClip, got %+v", clip)
-	}
-	filter := agent1.sapCall("filter.add", map[string]any{
-		"clipId":     clipID,
-		"mltService": "brightness",
-		"properties": map[string]any{},
-	})
-	filterIndex, _ := filter["filterIndex"].(float64)
 
-	// --- Step 2/3: last-write-wins race on the same clip (doc 11 Phase B
-	// rows 2-3). Agent 2 writes first (A=0.25), Agent 1 immediately writes
-	// B=0.75 to the same filter property. Exporting below serializes the
-	// real MLT project state, which is the read-back proving B won.
-	const valueA = 0.25
-	const valueB = 0.75
-	agent2.sapCall("filter.setProperty", map[string]any{
-		"clipId": clipID, "filterIndex": filterIndex, "property": "level", "value": valueA,
-	})
-	agent1.sapCall("filter.setProperty", map[string]any{
-		"clipId": clipID, "filterIndex": filterIndex, "property": "level", "value": valueB,
-	})
-
-	// --- Step 4: shared undo_depth counter (doc 11 Phase B row 4) ---
+	// --- Step 2: shared undo_depth counter (doc 11 Phase B row 4) ---
 	before := agent1.sapCall("project.getState", map[string]any{})
 	beforeUndo, _ := before["undoDepth"].(float64)
 	if beforeUndo == 0 {
@@ -170,7 +152,48 @@ func TestMCPAdapter_PhaseB_SameProjectConcurrency(t *testing.T) {
 	if afterRedo < 1 {
 		t.Fatalf("expected agent2 to observe redoDepth incremented by agent1's undo, got %v", afterRedo)
 	}
-	t.Logf("Phase B step 4 OK: agent2 observed shared undoDepth %v->%v via project.getState after agent1's project.undo (agent2 never called undo itself)", beforeUndo, afterUndo)
+	t.Logf("Phase B step 2 OK: agent2 observed shared undoDepth %v->%v via project.getState after agent1's project.undo (agent2 never called undo itself)", beforeUndo, afterUndo)
+	// Unlike the removed MltBackend's fake depth counter, FfiBackend's
+	// project.undo is real (Qt's QUndoStack) -- it genuinely reverted
+	// agent1's video-track add. project.redo restores it so the clip
+	// work below (which appends to trackIndex 0, the just-restored video
+	// track) sees the same timeline shape either way.
+	agent1.sapCall("project.redo", map[string]any{})
+
+	// Set up a real clip both agents can race on: one appended real
+	// source clip on the video track (2s @ 30fps = 60 frames, so inFrame
+	// values below 60 are all valid per edit.trimClipIn's own
+	// validation).
+	appended := agent1.sapCall("playlist.append", map[string]any{"source": map[string]any{"path": source}})
+	clip := agent1.sapCall("edit.appendClip", map[string]any{
+		"trackIndex": float64(0),
+		"source":     map[string]any{"playlistIndex": appended["index"]},
+	})
+	clipID, _ := clip["clipId"].(string)
+	if clipID == "" {
+		t.Fatalf("expected a real clipId from edit.appendClip, got %+v", clip)
+	}
+	filter := agent1.sapCall("filter.add", map[string]any{
+		"clipId":     clipID,
+		"mltService": "brightness",
+		"properties": map[string]any{},
+	})
+	filterIndex, _ := filter["filterIndex"].(float64)
+
+	// --- Step 3: last-write-wins race on the same clip (doc 11 Phase B
+	// rows 2-3). Agent 2 writes first (A=0.25), Agent 1 immediately writes
+	// B=0.75 to the same filter property, with no undo/redo in between
+	// (filter.setProperty isn't itself undoable in the current FfiBackend
+	// -- see the comment above step 2). Exporting below serializes the
+	// real MLT project state, which is the read-back proving B won.
+	const valueA = 0.25
+	const valueB = 0.75
+	agent2.sapCall("filter.setProperty", map[string]any{
+		"clipId": clipID, "filterIndex": filterIndex, "property": "level", "value": valueA,
+	})
+	agent1.sapCall("filter.setProperty", map[string]any{
+		"clipId": clipID, "filterIndex": filterIndex, "property": "level", "value": valueB,
+	})
 
 	// --- Step 5: project-scoped (not session-scoped) job visibility (doc
 	// 11 Phase B row 5) ---
@@ -213,6 +236,11 @@ func TestMCPAdapter_PhaseB_SameProjectConcurrency(t *testing.T) {
 	if status != "done" {
 		t.Fatalf("expected agent2's jobs.get polling on agent1's job to reach status=done, last: %+v", lastJob)
 	}
+	// file.export writes to an explicit scratch outputPath, not
+	// <projectRoot>/project.mlt -- project.save is the real, explicit
+	// primitive (Controller::saveXML()) that persists the live session
+	// there, matching real Shotcut's "must save to persist" semantics.
+	agent1.sapCall("project.save", map[string]any{})
 	projectXML, err := os.ReadFile(filepath.Join(proj.RootDir, "project.mlt"))
 	if err != nil {
 		t.Fatalf("read exported project XML: %v", err)
@@ -221,6 +249,6 @@ func TestMCPAdapter_PhaseB_SameProjectConcurrency(t *testing.T) {
 		strings.Contains(string(projectXML), `<property name="level">0.25</property>`) {
 		t.Fatalf("last-write-wins should serialize only agent1's later brightness value, XML=%s", projectXML)
 	}
-	t.Logf("Phase B step 2-3 OK: last-write-wins confirmed, filter level=%.2f (agent1's write, not agent2's %.2f)", valueB, valueA)
+	t.Logf("Phase B step 3 OK: last-write-wins confirmed, filter level=%.2f (agent1's write, not agent2's %.2f)", valueB, valueA)
 	t.Logf("Phase B step 5 OK: agent2 discovered agent1's export job (%s) via jobs.list and observed it reach status=done via jobs.get on a different session", jobID)
 }

@@ -165,7 +165,19 @@ async fn dispatch(tx: &DispatchSender, op: BackendOp) -> BackendCallResult {
 /// requirement) and are applied one at a time.
 async fn run_dispatcher<B: Backend>(mut backend: B, mut rx: mpsc::UnboundedReceiver<DispatchMsg>) {
     while let Some(msg) = rx.recv().await {
+        // See `ffi_backend::SUPPRESS_QT_BRIDGE_NOTIFICATION`'s doc comment:
+        // marks this op's call into `backend` as "already RPC-attributed"
+        // so `FfiBackend`'s Qt-signal bridge doesn't also publish a
+        // generic duplicate for the very same mutation. A no-op under
+        // `MockBackend` (nothing reads the flag without a live Qt
+        // process), so this is unconditional rather than backend-typed.
+        #[cfg(feature = "real_ffi")]
+        crate::ffi_backend::SUPPRESS_QT_BRIDGE_NOTIFICATION
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let outcome = (msg.op)(&mut backend);
+        #[cfg(feature = "real_ffi")]
+        crate::ffi_backend::SUPPRESS_QT_BRIDGE_NOTIFICATION
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = msg.respond_to.send(outcome);
     }
 }
@@ -383,6 +395,52 @@ fn build_op(method: &str, params: Value, project_id: String) -> Result<BackendOp
                     notify: Some(RpcNotification::new(
                         "edit.changed",
                         json!({"reason": "appendClip", "trackIndex": track_index, "clipIndex": clip.index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "edit.insertClip" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                clip_index: usize,
+                source: Value,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            let track_index = p.track_index;
+            let clip_index = p.clip_index;
+            Ok(Box::new(move |b| match b.edit_insert_clip(&project_id, track_index, clip_index, p.source) {
+                Ok(clip) => BackendCallResult {
+                    result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                    notify: Some(RpcNotification::new(
+                        "edit.changed",
+                        json!({"reason": "insertClip", "trackIndex": track_index, "clipIndex": clip.index}),
+                    )),
+                },
+                Err(e) => err_result(e),
+            }))
+        }
+
+        "edit.overwriteClip" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+                clip_index: usize,
+                source: Value,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            let track_index = p.track_index;
+            let clip_index = p.clip_index;
+            Ok(Box::new(move |b| match b.edit_overwrite_clip(&project_id, track_index, clip_index, p.source) {
+                Ok(clip) => BackendCallResult {
+                    result: Ok(serde_json::to_value(&clip).expect("Clip serializes")),
+                    notify: Some(RpcNotification::new(
+                        "edit.changed",
+                        json!({"reason": "overwriteClip", "trackIndex": track_index, "clipIndex": clip.index}),
                     )),
                 },
                 Err(e) => err_result(e),
@@ -1038,51 +1096,55 @@ fn build_op_ext(
             }))
         }
 
-        "edit.trimClipIn" => {
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct P {
-                track_index: usize,
-                clip_index: usize,
-                new_frame: i64,
-            }
-            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| {
-                match b.edit_trim_clip_in(&project_id, p.track_index, p.clip_index, p.new_frame) {
-                    Ok(()) => BackendCallResult {
-                        result: Ok(json!({})),
-                        notify: Some(RpcNotification::new(
-                            "edit.changed",
-                            json!({"reason": "trimClipIn", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
-                        )),
-                    },
-                    Err(e) => err_result(e),
-                }
-            }))
-        }
+       "edit.trimClipIn" => {
+           #[derive(Deserialize)]
+           #[serde(rename_all = "camelCase")]
+           struct P {
+               track_index: usize,
+               clip_index: usize,
+               new_frame: i64,
+                #[serde(default)]
+                ripple: bool,
+           }
+           let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+           Ok(Box::new(move |b| {
+                match b.edit_trim_clip_in(&project_id, p.track_index, p.clip_index, p.new_frame, p.ripple) {
+                   Ok(()) => BackendCallResult {
+                       result: Ok(json!({})),
+                       notify: Some(RpcNotification::new(
+                           "edit.changed",
+                           json!({"reason": "trimClipIn", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
+                       )),
+                   },
+                   Err(e) => err_result(e),
+               }
+           }))
+       }
 
-        "edit.trimClipOut" => {
-            #[derive(Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct P {
-                track_index: usize,
-                clip_index: usize,
-                new_frame: i64,
-            }
-            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
-            Ok(Box::new(move |b| {
-                match b.edit_trim_clip_out(&project_id, p.track_index, p.clip_index, p.new_frame) {
-                    Ok(()) => BackendCallResult {
-                        result: Ok(json!({})),
-                        notify: Some(RpcNotification::new(
-                            "edit.changed",
-                            json!({"reason": "trimClipOut", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
-                        )),
-                    },
-                    Err(e) => err_result(e),
-                }
-            }))
-        }
+       "edit.trimClipOut" => {
+           #[derive(Deserialize)]
+           #[serde(rename_all = "camelCase")]
+           struct P {
+               track_index: usize,
+               clip_index: usize,
+               new_frame: i64,
+                #[serde(default)]
+                ripple: bool,
+           }
+           let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+           Ok(Box::new(move |b| {
+                match b.edit_trim_clip_out(&project_id, p.track_index, p.clip_index, p.new_frame, p.ripple) {
+                   Ok(()) => BackendCallResult {
+                       result: Ok(json!({})),
+                       notify: Some(RpcNotification::new(
+                           "edit.changed",
+                           json!({"reason": "trimClipOut", "trackIndex": p.track_index, "clipIndex": p.clip_index}),
+                       )),
+                   },
+                   Err(e) => err_result(e),
+               }
+           }))
+       }
 
         "edit.splitClip" => {
             #[derive(Deserialize)]
@@ -1346,7 +1408,12 @@ fn build_op_ext(
             }))
         }
 
-        "generator.createTitle" => Ok(Box::new(move |b| match b.generator_create_title(&project_id, params) {
+       "generator.createTitle" => Ok(Box::new(move |b| match b.generator_create_title(&project_id, params) {
+           Ok(entry) => ok_result(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
+           Err(e) => err_result(e),
+       })),
+
+        "generator.createColor" => Ok(Box::new(move |b| match b.generator_create_color(&project_id, params) {
             Ok(entry) => ok_result(serde_json::to_value(&entry).expect("PlaylistEntry serializes")),
             Err(e) => err_result(e),
         })),
@@ -1449,6 +1516,25 @@ fn build_op_ext(
                     Ok(path) => ok_result(json!({"path": path})),
                     Err(e) => err_result(e),
                 }
+            }))
+        }
+
+        "subtitles.burnIn" => {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct P {
+                track_index: usize,
+            }
+            let p: P = serde_json::from_value(params).map_err(|e| invalid_params(&e))?;
+            Ok(Box::new(move |b| match b.subtitles_burn_in(&project_id, p.track_index) {
+                Ok(()) => BackendCallResult {
+                    result: Ok(json!({"trackIndex": p.track_index})),
+                    notify: Some(RpcNotification::new(
+                        "subtitles.changed",
+                        json!({"reason": "burnIn", "trackIndex": p.track_index}),
+                    )),
+                },
+                Err(e) => err_result(e),
             }))
         }
 
@@ -2016,7 +2102,26 @@ async fn handle_connection(
 /// Binds `config.socket_path`, starts the shared dispatcher task that owns
 /// `backend`, then accepts connections forever, spawning one task pair per
 /// connection. Never returns except on a fatal listener error.
-pub async fn serve<B: Backend + 'static>(config: ServerConfig, backend: B) -> std::io::Result<()> {
+/// Runs the server. `external_notify_rx`, when `Some`, is a channel of
+/// notifications that did not originate from this process's own RPC
+/// dispatch -- currently only used by the FFI backend to bridge real
+/// Qt-side edits (`sap_ffi.cpp`'s `sap_emit_event`, which fires on
+/// `MultitrackModel::modified` regardless of whether the edit came from an
+/// RPC-driven `Backend` call or a direct human GUI edit in the same
+/// process) into every connected client's fan-out stream. Unlike normal
+/// dispatch-generated notifications (which are scoped to one project via
+/// `channel_for_project`), an external notification is broadcast to
+/// *every* currently-known project's channel: the FFI backend manages
+/// exactly one real open document, so any session bound to any project_id
+/// in this process is, in reality, looking at that same document. `None`
+/// (every non-FFI caller: `main.rs`, tests) means this fan-out is simply
+/// never spawned -- MockBackend/MltBackend generate their own
+/// per-mutation notifications through the normal dispatch path already.
+pub async fn serve<B: Backend + 'static>(
+    config: ServerConfig,
+    backend: B,
+    external_notify_rx: Option<mpsc::UnboundedReceiver<RpcNotification>>,
+) -> std::io::Result<()> {
     // A stale socket file from a previous run would otherwise make bind()
     // fail with AddrInUse.
     let _ = std::fs::remove_file(&config.socket_path);
@@ -2031,6 +2136,21 @@ pub async fn serve<B: Backend + 'static>(config: ServerConfig, backend: B) -> st
     let channels: ProjectChannels = Arc::new(Mutex::new(HashMap::new()));
     let token = config.token;
     let audio_enabled = config.audio_enabled;
+
+    if let Some(mut external_rx) = external_notify_rx {
+        let channels = channels.clone();
+        tokio::spawn(async move {
+            while let Some(notification) = external_rx.recv().await {
+                let senders: Vec<_> = channels.lock().expect("project channel map poisoned").values().cloned().collect();
+                for sender in senders {
+                    // Fan-out only; no subscribers on a project yet is a
+                    // normal, silent no-op (matches every other notify
+                    // send site in this file).
+                    let _ = sender.send(notification.clone());
+                }
+            }
+        });
+    }
 
     loop {
         let (stream, _addr) = listener.accept().await?;

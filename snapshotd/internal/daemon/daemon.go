@@ -56,7 +56,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 	if err != nil {
 		return nil, fmt.Errorf("daemon: open registry: %w", err)
 	}
-	pm := procmgr.New(reg, cfg.SnapshotBinPath, cfg.RunDir)
+	pm := procmgr.New(reg, cfg.SnapshotBinPath, cfg.RunDir, cfg.LogDir)
 	d := &Daemon{
 		Cfg:      cfg,
 		Reg:      reg,
@@ -217,6 +217,7 @@ func (d *Daemon) Launch(ctx context.Context, p LaunchParams) (registry.ProcessIn
 	return d.Proc.Launch(ctx, projectID, procmgr.LaunchOptions{
 		Headless:     headless,
 		ProjectRoot:  proj.RootDir,
+		MltFileName:  proj.MltFileName,
 		AudioEnabled: d.Cfg.AudioEnabled,
 	})
 }
@@ -324,24 +325,49 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 		_ = d.Sessions.Touch(sessionID, proxySessionTTL)
 	}
 
+	// mcp-server-side edit log: one line per forwarded sap.* call, so a
+	// daemon log file (captured via `snapshotd serve > logfile 2>&1`, or
+	// any slog handler this Daemon was constructed with) is an independent,
+	// server-side record of "an MCP client asked for this edit" -- separate
+	// from and correlatable with the per-instance child-process log
+	// (config.LogDir/procmgr.LogDir) that captures the real C++/sap_ffi.cpp
+	// side of the same mutation. Kept to a single Info line per call (no
+	// full params dump, which can be large/binary) to stay cheap on the hot
+	// path; failures get their own Warn line with the error.
+	logMethod := func(err error, extra ...any) {
+		args := append([]any{"sessionId", sessionID, "method", method}, extra...)
+		if err != nil {
+			d.Log.Warn("mcp sap edit call failed", append(args, "error", err)...)
+			return
+		}
+		d.Log.Info("mcp sap edit call", args...)
+	}
+
 	if method == "project.select" {
 		var p struct {
 			ProjectID string `json:"projectId"`
 		}
 		if err := unmarshalParams(params, &p); err != nil {
+			logMethod(err)
 			return nil, err
 		}
 		if p.ProjectID == "" {
-			return nil, fmt.Errorf("daemon: project.select: projectId is required")
+			err := fmt.Errorf("daemon: project.select: projectId is required")
+			logMethod(err)
+			return nil, err
 		}
 		if _, err := d.Reg.GetProject(p.ProjectID); err != nil {
-			return nil, fmt.Errorf("daemon: project.select: %w", err)
+			err = fmt.Errorf("daemon: project.select: %w", err)
+			logMethod(err, "projectId", p.ProjectID)
+			return nil, err
 		}
 		result, err := d.SAP.Bind(ctx, sessionID, p.ProjectID, sink)
 		if err != nil {
+			logMethod(err, "projectId", p.ProjectID)
 			return nil, err
 		}
 		_ = d.Sessions.BindProject(sessionID, p.ProjectID)
+		logMethod(nil, "projectId", p.ProjectID)
 		return result, nil
 	}
 
@@ -360,10 +386,13 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 		// project.exit being harmless/idempotent when called while unbound.
 		d.SAP.Unbind(sessionID)
 		_ = d.Sessions.BindProject(sessionID, "")
+		logMethod(nil)
 		return json.RawMessage(`{}`), nil
 	}
 
-	return d.SAP.Call(ctx, sessionID, method, params)
+	result, err := d.SAP.Call(ctx, sessionID, method, params)
+	logMethod(err)
+	return result, err
 }
 
 // UnbindSession releases sessionID's SAP project binding/notification sink

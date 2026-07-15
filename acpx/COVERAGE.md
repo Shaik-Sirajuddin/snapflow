@@ -2793,3 +2793,105 @@ environment, same standing limitation as every prior phase.
 **Recheck against the full ACP spec surface after this phase:** no
 change to wire behavior, router logic, or generated schema content --
 documentation only.
+
+## 2026-07-14 -- real JSON Schema *validation* against real `claude-acp`/`codex-acp` traffic (closes "did you verify this e2e?")
+
+Directly answers a question asked after `acpx-openrpc-schema` phases
+A-E landed: "did you make all acpx use raw ACP methods, did you verify
+this with codex exec or claude e2e, does the daemon actually use/detect
+the strict schema?" Answer, honestly: no, not until this phase --
+phases A-E only proved the generated schema documents were internally
+self-consistent (drift guards, type-name cross-checks); nothing had
+ever run a real JSON Schema validator against real JSON that actually
+went over the wire to/from a real backend process. This phase closes
+that gap for real, using this machine's already-installed `claude`/
+`codex` CLIs (confirmed present, ambient-authenticated) rather than a
+synthetic stand-in.
+
+**New: `acpx-proto/src/validate.rs`.** Adds the `jsonschema` crate
+(`0.47.0`, `default-features = false` -- offline draft2020-12
+validation only, no remote `$ref` resolution/network deps needed).
+`validate_against(type_name, instance)` builds a `{$ref, $defs}`
+document from `schema.rs`'s `register_all_defs` (the exact same
+registrations `openrpc.rs`/`openapi.rs` already use, so there is only
+ever one generator's worth of `$defs` in this workspace) and returns
+every `jsonschema` validation failure (not just the first).
+`validate_params(method, instance)`/`validate_result(method, instance)`
+look the method up in `methods.rs`'s `METHODS` table and delegate --
+the same registry phase B built, now serving a second purpose beyond
+documentation generation.
+
+**Real bug found and fixed by this exercise:** `acpx-proto::session::
+NewSessionParams` was missing `#[serde(rename_all = "camelCase")]`.
+Upstream's real `NewSessionRequest` (`agent-client-protocol-schema`
+1.4.0) carries that container attribute, so `mcp_servers` is
+`mcpServers` on the actual wire -- every real ACP client, including
+this workspace's own `real_ambient_multi_agent_test.rs`'s literal
+`"mcpServers": []`, sends the camelCase form. Before this fix, a real
+`mcpServers` array silently fell through to `NewSessionParams`'s
+`#[serde(flatten)] rest` catch-all instead of the typed `mcp_servers`
+field -- functionally harmless today (`router.rs` never actually
+deserializes into this type; it's schema/test tooling, not the live
+producer -- see that module's doc comment), but the *generated schema
+document was simply wrong* about the real wire field name until now.
+Found by running `validate_params("session/new", ...)` against this
+exact test's own real request literal and getting a real, unexpected
+failure -- not by manual inspection. Fixed with the rename, a new
+regression test (`real_camel_case_mcp_servers_field_is_recognized`),
+and regenerated all three schema documents (`acpx-wire.schema.json`,
+`acpx.openrpc.json`, `acpx-http.openapi.json`) to reflect the corrected
+shape.
+
+**Real e2e proof, run live against this machine's ambient-authenticated
+`claude` CLI session (real billed haiku call, real `PONG` reply):**
+added `acpx-server/tests/real_ambient_multi_agent_test.rs::
+ambient_claude_only_conversation_conforms_to_generated_schema`
+(`#[ignore]`d, `ACPX_LIVE_TEST_AMBIENT=1` opt-in, same convention as
+every other real-binary test in this file) and instrumented both
+`run_claude_conversation`/`run_codex_conversation` with
+`assert_schema_valid` at every real call site: `agents/list` result,
+`session/new` params+result, `session/set_config_option` params,
+`session/prompt` params+result, `session/close` params. **Actually run
+live this session** (not just written) -- `agents/list` detected both
+registry entries, `session/new` spawned the real `npx -y
+@agentclientprotocol/claude-agent-acp` child under ambient
+`~/.claude/.credentials.json` auth, `session/prompt` got a real
+haiku-generated `PONG` back, and every one of those real params/result
+payloads validated cleanly against the generated schema -- the actual
+end-to-end proof this question asked for.
+
+**Known adapter-side gap found, not fixed (out of scope -- an
+acpx-external adapter behavior, not a schema/dispatch bug):**
+`codex-acp`'s ambient auth no longer "just works" the way it did in an
+earlier session's manual `curl` check -- a fresh `npx -y` fetch on this
+machine now requires an explicit `authenticate` call
+(`RouterError::BackendRequiresAuthentication`, already-existing acpx
+machinery, unaffected by this phase). `auth_method_id: "api-key"` fails
+fast with a clear missing-env-var error (expected, this test
+deliberately supplies no credentials). `auth_method_id: "chat-gpt"`
+(this machine's actual ambient codex CLI login method) instead hangs
+past several minutes of real patience with no error -- consistent with
+`codex-acp` needing an interactive device-code/browser step it can't
+complete headlessly under a `Supervisor`-spawned child with no TTY,
+unlike `claude-agent-acp`'s non-interactive ambient reuse. Documented
+in detail on the new (`#[ignore]`d)
+`ambient_codex_only_conversation_conforms_to_generated_schema` test
+rather than silently worked around or deleted.
+
+Workspace test count after this phase: **275 passed, 0 failed, 8
+ignored** (up from 268/0/6 -- 6 new `validate::tests` unit tests, 1 new
+`session::tests` regression test, and 2 new `#[ignore]`d real-binary
+tests in `acpx-server`). `cargo fmt --all --check` and `cargo build
+--workspace --tests` both clean. `cargo clippy` still not installed in
+this environment, same standing limitation as every prior phase. The
+two new `#[ignore]`d tests were additionally run live this session with
+`ACPX_LIVE_TEST_AMBIENT=1` (not just compiled) -- the claude one passed
+for real; the codex one's failure is the documented adapter-side gap
+above, not a regression in this phase's own code.
+
+**Recheck against the full ACP spec surface after this phase:** no
+change to wire dispatch behavior except the `NewSessionParams` schema
+type's field naming fix above (schema-accuracy only -- `router.rs`
+never consumed this type at runtime, so no behavior change to actual
+`session/new` handling).
+++ /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/acpx/COVERAGE.md

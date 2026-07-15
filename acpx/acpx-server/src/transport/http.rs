@@ -6,14 +6,12 @@
 //! only. Do not bind this to a public interface in production without
 //! adding auth/TLS first.
 //!
-//! Exposes three endpoints on one axum router (WS lives in `ws.rs`, wired in
+//! Exposes two endpoints on one axum router (WS lives in `ws.rs`, wired in
 //! here so both share the same listener and `SharedRouter` state):
 //! - `POST /rpc`: JSON-RPC-over-HTTP. Body is a raw JSON-RPC request;
 //!   response body is the JSON-RPC response (success or error, both
 //!   `200 OK` -- JSON-RPC errors are reported via the body's `error`
 //!   field per convention, not via HTTP status).
-//! - `GET /health`: local identity/liveness response used by clients that
-//!   must distinguish one provider's gateway from another on a reused port.
 //! - `GET /ws`: WebSocket upgrade, see `ws.rs`.
 //!
 //! `X-Acpx-Profile` header handling (`POST /rpc` only -- WS has no
@@ -146,7 +144,6 @@ fn tokens_match(presented: &str, expected: &str) -> bool {
 pub struct AppState {
     pub router: SharedRouter,
     pub auth: AuthConfig,
-    pub agent_id: Arc<str>,
 }
 
 /// Header carrying an explicit profile selection, highest precedence per
@@ -191,14 +188,10 @@ pub async fn serve(
     let state = AppState {
         router,
         auth: AuthConfig::new(auth_token),
-        agent_id: std::env::var("ACPX_DEFAULT_AGENT_ID")
-            .unwrap_or_else(|_| "default".to_string())
-            .into(),
     };
     let auth_enabled = state.auth.token.is_some();
     let app = axum::Router::new()
         .route("/rpc", post(rpc_handler))
-        .route("/health", get(health_handler))
         .route("/ws", get(super::ws::ws_handler))
         .with_state(state);
 
@@ -211,23 +204,6 @@ pub async fn serve(
     );
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn health_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !state.auth.authorize(&headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "status": "unauthorized",
-            })),
-        )
-            .into_response();
-    }
-    Json(serde_json::json!({
-        "status": "ok",
-        "agentId": state.agent_id,
-    }))
-    .into_response()
 }
 
 async fn rpc_handler(

@@ -22,6 +22,7 @@ import (
 
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
+	"snapshotd/internal/daemonlock"
 	"snapshotd/internal/mcpadapter"
 	"snapshotd/internal/sdp"
 )
@@ -77,6 +78,12 @@ func cmdServe(cfg config.Config, args []string) error {
 	_ = fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	lock, err := daemonlock.Acquire(cfg.HomeDir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 
 	d, err := daemon.New(cfg, logger)
 	if err != nil {

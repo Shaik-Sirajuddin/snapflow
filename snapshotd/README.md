@@ -69,7 +69,7 @@ these two layers use different framing; it is what the real
 `sap-rust/src/framing.rs` file actually specifies, and this package's own
 `framing.go` mirrors it byte-for-byte.
 
-### The generic SAP proxy (`internal/sapproxy`, `sap.call`)
+### The SAP proxy (`internal/sapproxy`) and typed MCP tools
 
 Neither `internal/sapproxy` nor the rest of snapshotd has any compiled-in
 knowledge of sap-rust's method surface (`project.*`, `edit.*`, `playlist.*`,
@@ -94,9 +94,19 @@ knowledge of sap-rust's method surface (`project.*`, `edit.*`, `playlist.*`,
    `"sap.notification"` notification pushed over SSE
    (`server.SendNotificationToSpecificClient`).
 
-On the MCP side this is exposed as exactly one additional tool, **`sap.call`**
-(`{method: string, params: object}`), rather than ~70 individually typed
-tools -- see gap #9 below for why.
+On the raw SDP side this is still one opaque `method`/`params` passthrough
+(`internal/sapproxy.Router.Call` never inspects either). On the MCP side,
+`internal/mcpadapter` wraps that same passthrough behind one individually
+named, strictly-schema'd tool per sap-rust method (`edit.addTrack`,
+`playlist.append`, `filter.setProperty`, ... -- see `tools_*.go`), plus
+three Go-side session-lifecycle tools that don't exist on the wire at all:
+`project_open` (wraps `project.select`), `project_close` (wraps
+`project.exit`), and `project_current` (reads `internal/daemon.Daemon`'s
+session store directly, no SAP round trip). None of the ~70 sap-rust-derived
+tools take a `projectId` argument -- `Router.Call` already resolves each
+session's bound project internally, so a session calls `project_open` once
+and every subsequent tool call acts on that binding. See gap #9 below for
+how this replaced the earlier single generic `sap.call` tool.
 
 ## Driver choice: `github.com/glebarez/sqlite`
 
@@ -182,31 +192,34 @@ available, swapping the one `gorm.Open(...)` call in
    and `stop` reads that file and sends SIGTERM. It still verifies a daemon
    is actually reachable (dials the control socket first) before doing so,
    matching the "CLI never silently no-ops if nothing is running" rule from
-   09's summary table.
-9. **MCP exposes one generic `sap.call` tool, not ~70 typed tools, and tool
-   listing is not deferred/lazy.** 10-testing-plan.md asks for
-   "deferred/lazily-searchable" tool listing so an agent's context isn't
-   flooded once the daemon-side proxy grows to the full ~70+ method SAP
-   surface. `github.com/mark3labs/mcp-go` v0.56.0 (the version this module
-   pulled via `go get ...@latest`) has no built-in equivalent of that -- it
-   offers `server.WithToolFilter` (session-scoped visibility/access control,
-   applied at both list- and call-time) and
-   `server.WithToolCapabilities(listChanged)` (list-changed-notification
-   support), but nothing like "register as lazily-searchable, full schema
-   fetched on demand." Rather than hand-writing ~70 individually typed MCP
-   tools (one per sap-rust method, each needing its own schema kept in sync
-   as sap-rust's surface grows independently), this build registers 7
-   `daemon.*` tools plus **one** generic `sap.call` tool
-   (`{method: string, params: object}`) that forwards opaquely through
-   `internal/sapproxy`, per the "Generic SAP proxy" section above. That
-   makes every current and future sap-rust method callable over MCP today
-   without per-method Go code, at the cost of per-method schema/validation/
-   description over MCP (an agent has to know sap-rust's method names and
-   param shapes itself, the same way a direct SAP client would). A later
-   pass adding typed per-method tools and/or real deferred tool listing
-   (once mcp-go supports it, or via a custom search-based tool like this
-   sandbox's own `tool_search`) is out of scope here and noted as a real,
-   honest gap.
+   09's summary table. Startup ownership is separate: `serve` also holds an
+   OS-level exclusive lock at `<SNAPSHOTD_HOME>/daemon.lock`, so a second
+   daemon using the same home fails immediately with "already running".
+   Kernel lock ownership is released automatically if the daemon crashes;
+   the file is only metadata and is removed on clean shutdown.
+9. **MCP exposes ~82 individually typed tools, not a generic `sap.call`
+   passthrough, and tool listing is not deferred/lazy.** An earlier build of
+   this package took the opposite tradeoff -- registering 7 `daemon.*` tools
+   plus one generic `sap.call` tool (`{method: string, params: object}`)
+   that forwarded opaquely through `internal/sapproxy`, so every current and
+   future sap-rust method was callable without per-method Go code, at the
+   cost of no per-method schema/validation/description over MCP (an agent
+   had to already know sap-rust's method names and param shapes itself).
+   That tradeoff was reversed: every sap-rust method now gets its own named
+   MCP tool with a real JSON Schema (`tools_*.go`), and
+   `server.NewMCPServer` is constructed with `WithInputSchemaValidation`,
+   `WithStrictInputSchemaDefault`, and `WithOutputSchemaValidation`
+   (`mcp-go` v0.56.0's server-side schema enforcement, both directions), so
+   a malformed call is rejected by `mcp-go` itself -- unknown top-level
+   argument name, missing required field, out-of-enum value -- before
+   `Handler.ForwardSAP` is ever invoked, on top of sap-rust's own
+   `serde`/`INVALID_PARAMS` validation on the wire. `mcp-go` still has no
+   built-in "deferred/lazily-searchable" tool-listing primitive (only
+   `server.WithToolFilter` and `server.WithToolCapabilities(listChanged)`),
+   so all ~82 tools are listed eagerly. A later pass adding real deferred/
+   lazy tool listing (once mcp-go supports it, or via a custom search-based
+   tool like this sandbox's own `tool_search`) is out of scope here and
+   noted as a real, honest gap.
 
 ## Toolchain note
 
@@ -266,13 +279,13 @@ folders). `SNAPSHOT_BIN_PATH` overrides the auto-discovered child binary
 location. `SNAPSHOTD_MCP_SSE_ADDR` overrides the MCP SSE listen address
 (default `127.0.0.1:7777`).
 
-The generic SAP proxy is exercised over MCP via the `sap.call` tool, e.g.
+The SAP proxy is exercised over MCP via the typed per-method tools, e.g.
 (pseudocode for an MCP client):
 
 ```json
-{"name": "sap.call", "arguments": {"method": "project.select", "params": {"projectId": "<id>"}}}
-{"name": "sap.call", "arguments": {"method": "edit.addTrack", "params": {"kind": "video"}}}
-{"name": "sap.call", "arguments": {"method": "edit.listTracks", "params": {}}}
+{"name": "project_open", "arguments": {"projectId": "<id>"}}
+{"name": "edit.addTrack", "arguments": {"kind": "video"}}
+{"name": "edit.listTracks", "arguments": {}}
 ```
 
 and over raw SDP by connecting to the control socket and sending the same
@@ -315,14 +328,21 @@ JSON-RPC 2.0 request.
   `sap-rust/target/{release,debug}/sap-rust` isn't built.
 - `internal/mcpadapter`: spins up a real `httptest` SSE MCP server backed by
   a fake handler, connects a real `mcp-go` SSE client, lists tools (asserts
-  all 7 `daemon.*` tools plus `sap.call` are present), calls tools (success
-  and handler-error cases), and exercises `sap.call`'s opaque forwarding
-  and error surfacing against the fake handler. **
-  `TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd`** repeats this against
-  the real `sap-rust` binary end to end: a real MCP/SSE client calls
-  `sap.call` for `project.select` then `edit.addTrack` then
-  `edit.listTracks`, asserting real mutated backend state, and asserts the
-  resulting `edit.changed` notification is delivered back over the live SSE
+  the exact 76-tool typed surface with the audio.* namespace disabled, per
+  `TestMCPAdapter_ToolsListedAndCallable`), calls tools (success and
+  handler-error cases), exercises the `project_open`/`project_close`/
+  `project_current` session-lifecycle tools and an ordinary typed tool's
+  opaque forwarding/error surfacing against the fake handler
+  (`TestMCPAdapter_ProjectLifecycleAndTypedToolForwarding`), and proves
+  `WithInputSchemaValidation`/`WithStrictInputSchemaDefault` actually reject
+  bad arguments -- unknown top-level field, missing required field,
+  out-of-enum value -- before `ForwardSAP` is ever called
+  (`TestMCPAdapter_StrictSchemaRejectsBadArguments`). **
+  `TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd`** repeats the forwarding
+  proof against the real `sap-rust` binary end to end: a real MCP/SSE
+  client calls `project_open` then `edit.addTrack` then `edit.listTracks`,
+  asserting real mutated backend state, and asserts the resulting
+  `edit.changed` notification is delivered back over the live SSE
   connection as a real `"sap.notification"` MCP notification (via
   `client.OnNotification`). Also skipped, not failed, if sap-rust isn't
   built.

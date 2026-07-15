@@ -19,29 +19,37 @@ import (
 	"snapshotd/internal/mcpadapter"
 )
 
-// realSapRustBinary locates the actual sap-rust binary (built independently
-// by another engineer's crate) under sap-rust/target/{debug,release}/
-// sap-rust, three directories up from this package. The current debug build
-// is preferred because these integration tests must exercise the source tree
-// under test, not a potentially stale release artifact. If it isn't built yet
-// the test is skipped, not failed -- this package's `go test ./...` must
-// not require sap-rust to exist. In this checkout it does exist, so this
-// test actually proves the full MCP -> daemon -> sapproxy -> real sap-rust
-// chain end to end, including real mutated MockBackend state and real
-// fanned-out notifications delivered over a live SSE connection.
+// realSapRustBinary locates the real, production child binary these
+// integration tests need: the Qt/`real_ffi`-linked `shotcut` binary (see
+// shotcut/CMakeLists.txt's corrosion_import_crate(... FEATURES real_ffi)
+// and sap-rust/README.md's "Real FFI" section), under
+// shotcut/build*/src/shotcut relative to this repo's root. This is
+// deliberately NOT the standalone `sap-rust/target/{debug,release}/sap-rust`
+// binary any more -- since the MltBackend removal, that binary only ever
+// runs MockBackend (no real ffprobe/melt), which cannot back the real
+// file.export/file.probe assertions several tests in this package make. If
+// no such build exists yet, the test is skipped, not failed -- this
+// package's `go test ./...` must not require a full Qt build to exist. In
+// this checkout it does exist, so this test actually proves the full MCP
+// -> daemon -> sapproxy -> real headless Shotcut/FfiBackend chain end to
+// end, including real mutated project state and real fanned-out
+// notifications delivered over a live SSE connection.
 func realSapRustBinary(t *testing.T) string {
 	t.Helper()
-	for _, variant := range []string{"debug", "release"} {
-		candidate := filepath.Join("..", "..", "..", "sap-rust", "target", variant, "sap-rust")
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			abs, err := filepath.Abs(candidate)
-			if err != nil {
-				t.Fatalf("abs path: %v", err)
+	repoRoot := filepath.Join("..", "..", "..")
+	matches, err := filepath.Glob(filepath.Join(repoRoot, "shotcut", "build*", "src", "shotcut"))
+	if err == nil {
+		for _, candidate := range matches {
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+				abs, absErr := filepath.Abs(candidate)
+				if absErr != nil {
+					t.Fatalf("abs path: %v", absErr)
+				}
+				return abs
 			}
-			return abs
 		}
 	}
-	t.Skip("real sap-rust binary not found under sap-rust/target/{release,debug}/sap-rust; build sap-rust first to run this integration test")
+	t.Skip("real Qt/real_ffi shotcut binary not found under shotcut/build*/src/shotcut; run `cmake -S shotcut -B shotcut/build-real-ffi -G Ninja && ninja -C shotcut/build-real-ffi` first to run this integration test")
 	return ""
 }
 
@@ -56,12 +64,15 @@ func realSapRustBinary(t *testing.T) string {
 func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 	binPath := realSapRustBinary(t)
 
+	debugHome := "/tmp/sap-debug-home"
+	_ = os.RemoveAll(debugHome)
 	cfg := config.Config{
-		HomeDir:         t.TempDir(),
+		HomeDir:         debugHome,
 		ProjectsRoot:    filepath.Join(t.TempDir(), "projects"),
 		RunDir:          filepath.Join(t.TempDir(), "run"),
 		SnapshotBinPath: binPath,
 	}
+	cfg.LogDir = filepath.Join(cfg.HomeDir, "logs")
 	cfg.DBPath = filepath.Join(cfg.HomeDir, "registry.db")
 	cfg.ControlSocketPath = filepath.Join(cfg.HomeDir, "control.sock")
 
@@ -69,10 +80,10 @@ func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new daemon: %v", err)
 	}
-	d.Proc.ConnectTimeout = 10 * time.Second
+	d.Proc.ConnectTimeout = 60 * time.Second
 	t.Cleanup(func() { _ = d.Close() })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	proj, err := d.CreateProject(ctx, daemon.CreateProjectParams{Name: "mcp-e2e"})

@@ -289,21 +289,23 @@ pub trait Backend: Send {
     /// `file.import` -- import a local file into the project's playlist bin.
     fn file_import(&mut self, project_id: &str, path: &str) -> BackendResult<PlaylistEntry>;
 
-    /// `edit.trimClipIn` / `edit.trimClipOut`.
-    fn edit_trim_clip_in(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()>;
-    fn edit_trim_clip_out(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()>;
+   /// `edit.trimClipIn` / `edit.trimClipOut`.
+   fn edit_trim_clip_in(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        ripple: bool,
+   ) -> BackendResult<()>;
+   fn edit_trim_clip_out(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        ripple: bool,
+   ) -> BackendResult<()>;
 
     /// `edit.splitClip` -- split a clip at a source frame strictly between
     /// `in_frame` and `out_frame`. Left keeps the original `clip_id` with
@@ -367,6 +369,45 @@ pub trait Backend: Send {
         from_clip_index: usize,
         to_track_index: usize,
         to_clip_index: usize,
+    ) -> BackendResult<Clip>;
+
+    /// `edit.insertClip` -- insert `source` on `track_index` BEFORE the
+    /// clip currently at `clip_index` (`clip_index == that track's
+    /// current clip count` means "insert at the end", equivalent to
+    /// `edit_append_clip`), rippling every downstream clip on that track
+    /// forward by the inserted clip's duration. Distinct from
+    /// `edit_append_clip` + `edit_move_clip`: this is one undo step, one
+    /// real `Timeline::InsertCommand` (real backend) rather than an
+    /// append followed by a non-rippling reposition. `clip_index` (not an
+    /// absolute frame) for the same reason `edit_move_clip` uses
+    /// `to_clip_index` rather than the spec's `toPosition` -- this trait
+    /// models a track as an ordered clip list, not raw frame offsets; see
+    /// `edit_move_clip`'s doc comment.
+    fn edit_insert_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip>;
+
+    /// `edit.overwriteClip` -- place `source` on `track_index` starting at
+    /// clip-slot `clip_index`, REPLACING whatever clip currently occupies
+    /// that slot (non-rippling "drop and replace"), rather than shifting
+    /// downstream clips like `edit_insert_clip` does. `clip_index ==
+    /// that track's current clip count` means "no clip to replace",
+    /// which behaves like `edit_append_clip`. One real
+    /// `Timeline::OverwriteCommand` (real backend), one undo step.
+    /// `clip_index` (not an absolute frame) for the same reason
+    /// `edit_insert_clip`/`edit_move_clip` use a clip-slot index -- this
+    /// trait models a track as an ordered clip list, not raw frame
+    /// offsets.
+    fn edit_overwrite_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
     ) -> BackendResult<Clip>;
 
     /// `transitions.addCrossfade`.
@@ -462,13 +503,21 @@ pub trait Backend: Send {
     /// to the clip end.
     fn clip_length_frames(&mut self, project_id: &str, clip_id: &str) -> BackendResult<i64>;
 
-    /// `generator.createTitle` -- constructs a title-card producer (color
-    /// background + `dynamictext`/`qtext` filter, per 01's `generator.*`
-    /// namespace) and adds it to the Playlist bin, ready for
-    /// `edit.appendClip({source:{playlistIndex}})` like any other source.
-    fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
+   /// `generator.createTitle` -- constructs a title-card producer (color
+   /// background + `dynamictext`/`qtext` filter, per 01's `generator.*`
+   /// namespace) and adds it to the Playlist bin, ready for
+   /// `edit.appendClip({source:{playlistIndex}})` like any other source.
+   fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
 
-    fn subtitles_add_track(&mut self, project_id: &str) -> BackendResult<SubtitleTrackInfo>;
+    /// `generator.createColor` -- constructs a plain `color:` producer
+    /// (`{hexColor}`, `#AARRGGBB`) and adds it to the Playlist bin, per
+    /// 01's `generator.*` namespace (`ColorProducerWidget::newProducer`).
+    /// Commonly used with a fully-transparent `#00000000` to build a
+    /// timeline spacer clip: append it, then `edit.trimClipOut` to the
+    /// desired length.
+    fn generator_create_color(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry>;
+
+   fn subtitles_add_track(&mut self, project_id: &str) -> BackendResult<SubtitleTrackInfo>;
     fn subtitles_append_item(
         &mut self,
         project_id: &str,
@@ -504,6 +553,14 @@ pub trait Backend: Send {
         path: &str,
         track_index: usize,
     ) -> BackendResult<String>;
+
+    /// `subtitles.burnIn` -- attach (or, if already attached, leave in
+    /// place) a real burn-in filter on the timeline output rendering
+    /// `track_index`'s cues into every exported/rendered frame. Unlike the
+    /// other `subtitles.*` calls, this mutates the *output* rather than
+    /// the subtitle track data itself; `subtitles.appendItem`/`removeItems`
+    /// alone never make cues visible in rendered frames.
+    fn subtitles_burn_in(&mut self, project_id: &str, track_index: usize) -> BackendResult<()>;
 
     /// `file.export` -- returns a `jobId` immediately per 01's async-job
     /// convention; progress/completion is polled via `jobs_get`.
@@ -897,6 +954,72 @@ impl Backend for MockBackend {
         Ok(clip)
     }
 
+    fn edit_insert_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        data.next_clip_id += 1;
+        let clip_id = format!("clip-{}", data.next_clip_id);
+        let clips = data.clips.entry(track_index).or_default();
+        if clip_index > clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "clipIndex {clip_index} out of range (len {})",
+                clips.len()
+            )));
+        }
+        let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        clips.insert(clip_index, clip.clone());
+        for (i, c) in clips.iter_mut().enumerate() {
+            c.index = i;
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(clip)
+    }
+
+    fn edit_overwrite_clip(
+        &mut self,
+        project_id: &str,
+        track_index: usize,
+        clip_index: usize,
+        source: Value,
+    ) -> BackendResult<Clip> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.tracks.len() {
+            return Err(BackendError::NotFound(format!("track {track_index}")));
+        }
+        data.next_clip_id += 1;
+        let clip_id = format!("clip-{}", data.next_clip_id);
+        let clips = data.clips.entry(track_index).or_default();
+        if clip_index > clips.len() {
+            return Err(BackendError::InvalidParams(format!(
+                "clipIndex {clip_index} out of range (len {})",
+                clips.len()
+            )));
+        }
+        let clip = Clip { clip_id, index: clip_index, source, in_frame: 0, out_frame: 0 };
+        if clip_index == clips.len() {
+            // No clip occupies this slot yet -- behaves like append.
+            clips.push(clip.clone());
+        } else {
+            // Non-rippling: replace the occupant in place, downstream
+            // indices unaffected (unlike edit_insert_clip's splice).
+            clips[clip_index] = clip.clone();
+        }
+        data.dirty = true;
+        data.undo_depth += 1;
+        data.redo_depth = 0;
+        Ok(clip)
+    }
+
     fn edit_append_clip(
         &mut self,
         project_id: &str,
@@ -1045,41 +1168,43 @@ impl Backend for MockBackend {
         self.playlist_append(project_id, Value::from(json!({"path": path})), None)
     }
 
-    fn edit_trim_clip_in(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()> {
-        let data = self.project_mut(project_id);
-        let clip = data
-            .clips
-            .get_mut(&track_index)
-            .and_then(|c| c.get_mut(clip_index))
-            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
-        clip.in_frame = new_frame;
-        data.dirty = true;
-        Ok(())
-    }
+   fn edit_trim_clip_in(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        _ripple: bool,
+   ) -> BackendResult<()> {
+       let data = self.project_mut(project_id);
+       let clip = data
+           .clips
+           .get_mut(&track_index)
+           .and_then(|c| c.get_mut(clip_index))
+           .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+       clip.in_frame = new_frame;
+       data.dirty = true;
+       Ok(())
+   }
 
-    fn edit_trim_clip_out(
-        &mut self,
-        project_id: &str,
-        track_index: usize,
-        clip_index: usize,
-        new_frame: i64,
-    ) -> BackendResult<()> {
-        let data = self.project_mut(project_id);
-        let clip = data
-            .clips
-            .get_mut(&track_index)
-            .and_then(|c| c.get_mut(clip_index))
-            .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
-        clip.out_frame = new_frame;
-        data.dirty = true;
-        Ok(())
-    }
+   fn edit_trim_clip_out(
+       &mut self,
+       project_id: &str,
+       track_index: usize,
+       clip_index: usize,
+       new_frame: i64,
+        _ripple: bool,
+   ) -> BackendResult<()> {
+       let data = self.project_mut(project_id);
+       let clip = data
+           .clips
+           .get_mut(&track_index)
+           .and_then(|c| c.get_mut(clip_index))
+           .ok_or_else(|| BackendError::NotFound(format!("clip {track_index}/{clip_index}")))?;
+       clip.out_frame = new_frame;
+       data.dirty = true;
+       Ok(())
+   }
 
     fn edit_split_clip(
         &mut self,
@@ -1396,11 +1521,24 @@ impl Backend for MockBackend {
         Err(BackendError::NotFound(format!("clip {clip_id}")))
     }
 
-    fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+   fn generator_create_title(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
+       let data = self.project_mut(project_id);
+       let entry = PlaylistEntry {
+           index: data.playlist.len(),
+           name: "title".to_string(),
+           source: params,
+           duration_frames: 0,
+       };
+       data.playlist.push(entry.clone());
+       data.dirty = true;
+       Ok(entry)
+   }
+
+    fn generator_create_color(&mut self, project_id: &str, params: Value) -> BackendResult<PlaylistEntry> {
         let data = self.project_mut(project_id);
         let entry = PlaylistEntry {
             index: data.playlist.len(),
-            name: "title".to_string(),
+            name: "color".to_string(),
             source: params,
             duration_frames: 0,
         };
@@ -1514,6 +1652,15 @@ impl Backend for MockBackend {
         })?;
         data.dirty = true;
         Ok(path.to_string())
+    }
+
+    fn subtitles_burn_in(&mut self, project_id: &str, track_index: usize) -> BackendResult<()> {
+        let data = self.project_mut(project_id);
+        if track_index >= data.subtitle_tracks {
+            return Err(BackendError::NotFound(format!("subtitle track {track_index}")));
+        }
+        data.dirty = true;
+        Ok(())
     }
 
     fn file_export(
@@ -1966,6 +2113,66 @@ mod tests {
     }
 
     #[test]
+    fn edit_insert_clip_splices_mid_track_and_ripples_downstream_indices() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        let c = b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+
+        // Splice `b` between `a` and `c` in one call, distinct from
+        // append+move: the caller never places `b` at the end first.
+        let inserted = b.edit_insert_clip("p", 0, 1, json!({"path": "/tmp/b.mp4"})).unwrap();
+        assert_eq!(inserted.index, 1);
+
+        let clips = b.edit_list_clips("p", 0).unwrap();
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0].clip_id, a.clip_id);
+        assert_eq!(clips[1].clip_id, inserted.clip_id);
+        assert_eq!(clips[2].clip_id, c.clip_id);
+        assert_eq!(clips[2].index, 2); // c rippled from index 1 to 2.
+
+        // clipIndex == current clip count is append-equivalent.
+        let appended_via_insert = b.edit_insert_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"})).unwrap();
+        assert_eq!(appended_via_insert.index, 3);
+
+        assert!(b.edit_insert_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"})).is_err());
+        assert!(b.edit_insert_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"})).is_err());
+    }
+
+    #[test]
+    fn edit_overwrite_clip_replaces_in_place_without_rippling_downstream() {
+        let mut b = MockBackend::new();
+        b.project_select("p").unwrap();
+        b.edit_add_track("p", "video").unwrap();
+        let a = b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
+        let bee = b.edit_append_clip("p", 0, json!({"path": "/tmp/b.mp4"})).unwrap();
+        let c = b.edit_append_clip("p", 0, json!({"path": "/tmp/c.mp4"})).unwrap();
+
+        // Overwrite slot 1 (b) with a new clip -- unlike insertClip, this
+        // must NOT shift c's index.
+        let overwritten = b.edit_overwrite_clip("p", 0, 1, json!({"path": "/tmp/x.mp4"})).unwrap();
+        assert_eq!(overwritten.index, 1);
+        assert_ne!(overwritten.clip_id, bee.clip_id);
+
+        let clips = b.edit_list_clips("p", 0).unwrap();
+        assert_eq!(clips.len(), 3); // count unchanged -- replace, not splice.
+        assert_eq!(clips[0].clip_id, a.clip_id);
+        assert_eq!(clips[1].clip_id, overwritten.clip_id);
+        assert_eq!(clips[2].clip_id, c.clip_id);
+        assert_eq!(clips[2].index, 2); // c did NOT ripple, unlike insertClip.
+
+        // clipIndex == current clip count is append-equivalent.
+        let appended_via_overwrite =
+            b.edit_overwrite_clip("p", 0, 3, json!({"path": "/tmp/d.mp4"})).unwrap();
+        assert_eq!(appended_via_overwrite.index, 3);
+        assert_eq!(b.edit_list_clips("p", 0).unwrap().len(), 4);
+
+        assert!(b.edit_overwrite_clip("p", 0, 99, json!({"path": "/tmp/e.mp4"})).is_err());
+        assert!(b.edit_overwrite_clip("p", 9, 0, json!({"path": "/tmp/e.mp4"})).is_err());
+    }
+
+    #[test]
     fn edit_split_clip_splits_and_reindexes() {
         let mut b = MockBackend::new();
         b.project_select("p").unwrap();
@@ -1973,8 +2180,8 @@ mod tests {
         let clip = b
             .edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"}))
             .unwrap();
-        b.edit_trim_clip_in("p", 0, 0, 10).unwrap();
-        b.edit_trim_clip_out("p", 0, 0, 100).unwrap();
+        b.edit_trim_clip_in("p", 0, 0, 10, false).unwrap();
+        b.edit_trim_clip_out("p", 0, 0, 100, false).unwrap();
 
         let result = b.edit_split_clip("p", 0, 0, 50).unwrap();
         assert_eq!(result.left_clip_id, clip.clip_id);
@@ -2001,8 +2208,8 @@ mod tests {
         b.project_select("p").unwrap();
         b.edit_add_track("p", "video").unwrap();
         b.edit_append_clip("p", 0, json!({"path": "/tmp/a.mp4"})).unwrap();
-        b.edit_trim_clip_in("p", 0, 0, 10).unwrap();
-        b.edit_trim_clip_out("p", 0, 0, 100).unwrap();
+        b.edit_trim_clip_in("p", 0, 0, 10, false).unwrap();
+        b.edit_trim_clip_out("p", 0, 0, 100, false).unwrap();
         assert!(b.edit_split_clip("p", 0, 0, 10).is_err());
         assert!(b.edit_split_clip("p", 0, 0, 101).is_err());
     }
