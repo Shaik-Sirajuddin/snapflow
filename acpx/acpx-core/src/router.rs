@@ -1513,7 +1513,21 @@ impl Router {
                         "close": {},
                         "delete": {},
                         "resume": {},
-                        "list": {}
+                        "list": {},
+                        // **ACP compatibility gap closed post-review.**
+                        // `session/fork` is now genuinely forwarded to
+                        // whatever backend a caller selects (see
+                        // `MethodClass::SessionFork`'s doc comment) --
+                        // same honesty rule as `close`/`delete`/
+                        // `resume`/`list` above -- so it belongs here
+                        // too, not left implicitly unsupported the way
+                        // it silently was before that fix. A
+                        // spec-compliant client checks this capability
+                        // before ever calling `session/fork`, so leaving
+                        // it unset would have meant no compliant client
+                        // could discover acpx supports it even though
+                        // the dispatch path itself works correctly.
+                        "fork": {}
                     }
                 },
                 "authMethods": [],
