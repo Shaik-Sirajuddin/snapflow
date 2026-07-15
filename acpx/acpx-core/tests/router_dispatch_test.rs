@@ -341,7 +341,16 @@ async fn launch_overrides_values_are_redacted_in_every_profile_response() {
         .dispatch(json!({"jsonrpc": "2.0", "id": 2, "method": "profiles/list", "params": {}}))
         .await
         .expect("profiles/list");
-    let listed = &list["result"]["profiles"][0];
+    // `.find()` rather than index `[0]`: `profiles/list` now also
+    // includes auto-seeded profiles (`ensure_default_profiles_seeded`,
+    // see `default_profile_seeding_test.rs`) alongside this explicit
+    // one, in unspecified `HashMap` iteration order.
+    let listed = list["result"]["profiles"]
+        .as_array()
+        .expect("profiles array")
+        .iter()
+        .find(|p| p["name"] == json!("secret-holder"))
+        .expect("secret-holder listed");
     assert_eq!(
         listed["launch_overrides"]["ANTHROPIC_API_KEY"],
         json!("***redacted***"),

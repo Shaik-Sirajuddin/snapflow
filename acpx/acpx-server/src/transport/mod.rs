@@ -9,4 +9,10 @@ pub mod ws;
 // Re-exported so `main.rs` can call `transport::serve(...)` / build a
 // `transport::SharedRouter` without reaching into `transport::http`
 // directly.
-pub use http::{serve, SharedRouter};
+pub use http::{serve_on, SharedRouter};
+// `http::serve` (bind-then-serve convenience wrapper) is intentionally not
+// re-exported here: `main.rs` binds the listener itself via `serve_on` (see
+// `config.rs`'s `ACPX_HTTP_BIND=off` doc comment for why), and every
+// integration test that calls `serve` does so against its own `#[path]`-
+// included copy of `transport/http.rs` (see `tests/auth_test.rs`'s doc
+// comment), not through this re-export.

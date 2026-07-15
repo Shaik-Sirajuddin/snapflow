@@ -11,6 +11,7 @@ use crate::persistence::{Direction, PersistenceStore};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
+use acpx_proto::agent::AgentStatus;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -25,6 +26,41 @@ pub enum MethodClass {
     /// One-time gateway logic (profile/agent resolution + spawn), then
     /// delegates to the backend.
     Hybrid,
+    /// **ACP compatibility gap closed post-review.** `session/fork` is a
+    /// real v1 ACP method (`ForkSessionRequest`/`ForkSessionResponse`,
+    /// `x-side: agent`) that was entirely unclassified before this fix --
+    /// found by cross-checking every method the real
+    /// `agent-client-protocol` 1.2.0 crate's own `impl_jsonrpc_request!`
+    /// macro invocations define
+    /// (`src/schema/client_to_agent/requests.rs`) against `classify`'s
+    /// match arms; every other one was covered, this one fell straight
+    /// through to `MethodClass::Unknown`.
+    ///
+    /// **Not yet stabilized upstream** -- gated behind
+    /// `agent-client-protocol-schema`'s own `unstable_session_fork`
+    /// Cargo feature (see this workspace's root `Cargo.toml`, which now
+    /// enables it), i.e. the ACP project itself still considers this an
+    /// opt-in draft extension, not a baseline-spec method every agent
+    /// must implement. acpx supports it anyway because a real backend
+    /// can and does advertise fork support (`claude-agent-acp` 0.58.1's
+    /// own `session/new` response includes `sessionCapabilities.fork:
+    /// {}}`, verified against the real npx-installed adapter), so any
+    /// client that checked that capability before calling `session/fork`
+    /// would get a spurious "unknown method" from acpx even though the
+    /// backend it's actually talking to genuinely supports it.
+    ///
+    /// Neither `Proxied` (its response mints a *new* session id, unlike
+    /// every other proxied method) nor `Hybrid` (it forwards against an
+    /// *existing* session's already-running backend process, not a
+    /// freshly resolved profile/spawn like `session/new`) fits, so this
+    /// is its own bucket: resolve the *source* session's agent/backend
+    /// (like `Proxied`), forward with the gateway `sessionId` rewritten
+    /// to the backend-native one (like `Proxied`), then register the
+    /// backend's newly-minted forked session id under a *new* gateway
+    /// session id and rewrite the response the same way `session/new`
+    /// does. See `Router::dispatch_session_fork`/
+    /// `dispatch_session_fork_shared`.
+    SessionFork,
     /// Not a recognized ACP or acpx method.
     Unknown,
 }
@@ -98,6 +134,9 @@ pub fn classify(method: &str) -> MethodClass {
         // *previous* acpx process lifetime is exactly as legitimate a use
         // case as loading/resuming one.
         | "session/delete" => MethodClass::Proxied,
+        // See `MethodClass::SessionFork`'s doc comment for why this is
+        // neither `Proxied` nor `Hybrid`.
+        "session/fork" => MethodClass::SessionFork,
         "agents/list" | "agents/install" | "agents/status" | "session/list" => {
             MethodClass::GatewayNative
         }
@@ -486,6 +525,67 @@ impl Router {
         self.registry_cache.as_ref().expect("just populated")
     }
 
+    /// Auto-seed one native (no `provider`/`key_ref`) [`Profile`] per
+    /// ACP-registry agent this host can actually launch
+    /// (`AgentStatus::Installed` per [`crate::detect::detect`]), named
+    /// after the agent's registry id (`claude-acp`, `codex-acp`,
+    /// `gemini`, ...) -- so `_acpx.profile` (and `profiles/list`) surface
+    /// every backend the host already supports with zero
+    /// `ACPX_CONFIG_FILE`/`profiles/create` setup required, instead of an
+    /// empty `ProfileStore` until an operator explicitly provisions one.
+    /// This closes the gap where `agents/list` could report `Installed`
+    /// for claude/codex/gemini while `profiles/list` -- the thing
+    /// `session/new`'s `_acpx.profile` actually resolves against --
+    /// stayed empty regardless.
+    ///
+    /// An explicitly created/provisioned profile of the same name always
+    /// wins (this only fills in names nobody has claimed yet -- see the
+    /// `self.profiles.get(&agent.id).is_some()` skip below); a synthetic
+    /// profile carries no provider/key, so it composes with an
+    /// already-completed `codex login`/`claude login` on this host via
+    /// plain ambient-env inheritance, exactly like `default_agent_id`'s
+    /// native/unmanaged mode already does (see `crate::launch`'s doc
+    /// comment).
+    ///
+    /// Idempotent and self-healing rather than a one-shot/cached flag:
+    /// re-run on every `profiles/list` call and every `_acpx.profile`
+    /// resolution. Cheap either way -- `ensure_registry_loaded` caches
+    /// the registry fetch after the first call, and detection is just a
+    /// handful of `<runtime> --version` subprocess spawns (three agents
+    /// in the bundled fallback registry as of this writing) -- so an
+    /// agent that becomes installed only after this process started
+    /// (e.g. `node` added to `PATH` later) still gets picked up without
+    /// a restart, with no separate cache-invalidation path to get wrong.
+    async fn ensure_default_profiles_seeded(&mut self) {
+        self.ensure_registry_loaded().await;
+        let agents = self
+            .registry_cache
+            .as_ref()
+            .expect("just loaded")
+            .agents
+            .clone();
+        for agent in agents {
+            if self.profiles.get(&agent.id).is_some() {
+                continue;
+            }
+            if crate::detect::detect(&agent.id, &agent.distribution) != AgentStatus::Installed {
+                continue;
+            }
+            let profile = Profile {
+                name: agent.id.clone(),
+                agent_id: agent.id.clone(),
+                ..Profile::default()
+            };
+            // Best-effort: `create` only fails on a name collision, which
+            // the `get`/skip check above already rules out for any path
+            // that reaches here (single `&mut self` access, no
+            // concurrent seeding possible) -- ignored rather than
+            // `.expect()`-ed so a future concurrent-seeding change can't
+            // turn a benign race into a panic.
+            let _ = self.profiles.create(profile);
+        }
+    }
+
     /// Dispatch one JSON-RPC request, returning the JSON-RPC response to
     /// send back to the client that issued it.
     pub async fn dispatch(
@@ -517,6 +617,7 @@ impl Router {
         match classify(&method) {
             MethodClass::Hybrid => self.dispatch_session_new(tenant_id, request).await,
             MethodClass::Proxied => self.dispatch_proxied(tenant_id, request).await,
+            MethodClass::SessionFork => self.dispatch_session_fork(tenant_id, request).await,
             MethodClass::GatewayNative => self.dispatch_native(tenant_id, &method, request).await,
             MethodClass::Unknown => Err(RouterError::UnknownMethod(method)),
         }
@@ -838,6 +939,7 @@ impl Router {
         &mut self,
         profile_name: &str,
     ) -> Result<(String, Profile), RouterError> {
+        self.ensure_default_profiles_seeded().await;
         let profile = self
             .profiles
             .get(profile_name)
@@ -938,7 +1040,10 @@ impl Router {
         method: &str,
         gateway_session_id: &str,
     ) -> Result<crate::session_registry::SessionEntry, RouterError> {
-        if !matches!(method, "session/load" | "session/resume" | "session/delete") {
+        if !matches!(
+            method,
+            "session/load" | "session/resume" | "session/delete" | "session/fork"
+        ) {
             return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
         let store = self
@@ -1104,6 +1209,117 @@ impl Router {
                     }
                 });
             }
+        }
+        Ok(response)
+    }
+
+    /// Real ACP `session/fork` -- see [`MethodClass::SessionFork`]'s doc
+    /// comment for the full rationale (this method was entirely
+    /// unclassified/unimplemented before that fix). Resolves the
+    /// *source* session named by `params.sessionId` exactly like
+    /// `dispatch_proxied` does (including `rehydrate_session` fallback
+    /// for a source session that only survives in persistence), forwards
+    /// the fork request to that same backend process with the gateway id
+    /// rewritten to the backend-native one, then -- mirroring
+    /// `dispatch_session_new`'s own "mint a fresh gateway id for
+    /// whatever backend session id came back" handling -- registers the
+    /// backend's newly-forked session id under a *brand new* gateway
+    /// session id (same tenant/agent/profile as the source session,
+    /// `cwd` taken from the fork request's own `params.cwd` since a
+    /// forked session's working directory is independently specified,
+    /// not necessarily inherited) and rewrites the response's
+    /// `result.sessionId` accordingly before it ever reaches the client.
+    async fn dispatch_session_fork(
+        &mut self,
+        tenant_id: &TenantId,
+        mut request: serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
+        let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+        let params = request
+            .get_mut("params")
+            .ok_or(RouterError::MissingParams)?;
+        let gateway_session_id = params
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .ok_or(RouterError::MissingSessionId)?
+            .to_string();
+        // The *new* forked session's cwd, per `ForkSessionRequest`'s own
+        // schema -- distinct from (and not inherited from) the source
+        // session's cwd, so this is read off the fork request itself,
+        // exactly like `dispatch_session_new` reads it off `session/
+        // new`'s own params.
+        let cwd = params
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+
+        let entry = match self.sessions.resolve(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        ) {
+            Some(entry) => entry.clone(),
+            None => {
+                self.rehydrate_session(tenant_id, "session/fork", &gateway_session_id)
+                    .await?
+            }
+        };
+        let agent_id = entry.agent_id.clone();
+        let backend_session_id = entry.backend_session_id.0.clone();
+        let profile_name = entry.profile_name.clone();
+        let call_policy = BackendCallPolicy::from_profile(
+            profile_name
+                .as_deref()
+                .and_then(|name| self.profiles.get(name)),
+        );
+
+        params["sessionId"] = serde_json::Value::String(backend_session_id);
+
+        let backend = self.supervisor.ensure_running(&agent_id).await?;
+        let mut response = {
+            let mut backend = backend.lock().await;
+            ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
+            backend.writer.lock().await.write_value(&request).await?;
+            let (response, notifications, agent_requests) =
+                read_matching_response(&mut backend, &id, call_policy, None).await?;
+            attach_updates(response, notifications, agent_requests)
+        };
+
+        let forked_backend_session_id = extract_backend_session_id(&response)?;
+        let forked_gateway_id = self.sessions.register(
+            tenant_id,
+            agent_id,
+            BackendSessionId(forked_backend_session_id),
+            profile_name.clone(),
+            cwd,
+        );
+        let forked_gateway_session_id_str = forked_gateway_id.0.clone();
+        if let Some(result) = response.get_mut("result") {
+            result["sessionId"] = serde_json::Value::String(forked_gateway_id.0.clone());
+        }
+
+        // Persisted as the *new* forked session's own inaugural
+        // transcript (client request that created it, agent's response
+        // minting it) -- mirrors `dispatch_session_new`'s own persistence
+        // exactly, since a fork is a fresh session from a persistence
+        // point of view, just one whose backend process happens to
+        // already be running (reused, not freshly spawned) and whose
+        // conversation history the backend itself carried over. Nothing
+        // is recorded against the *source* `gateway_session_id` here --
+        // `session/fork` doesn't add a message to the source session's
+        // own conversation.
+        if let Some(entry) = self.sessions.resolve(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(forked_gateway_session_id_str.clone()),
+        ) {
+            self.spawn_session_persistence(
+                tenant_id,
+                forked_gateway_session_id_str,
+                entry.agent_id.clone(),
+                entry.backend_session_id.0.clone(),
+                profile_name,
+                request,
+                response.clone(),
+            );
         }
         Ok(response)
     }
@@ -1473,6 +1689,7 @@ impl Router {
                 )
             }
             "profiles/list" => {
+                self.ensure_default_profiles_seeded().await;
                 let profiles: Vec<serde_json::Value> = self
                     .profiles
                     .list()
@@ -2643,6 +2860,7 @@ pub async fn dispatch_shared_for_tenant(
             dispatch_session_cancel_shared(router, tenant_id, request).await
         }
         MethodClass::Proxied => dispatch_proxied_shared(router, tenant_id, request).await,
+        MethodClass::SessionFork => dispatch_session_fork_shared(router, tenant_id, request).await,
         // **Phase 13.** Mirrors `dispatch_native`'s `"session/list"`
         // branching (see `session_list_selector`'s doc comment) but only
         // when a selector is actually present -- an unqualified
@@ -2951,6 +3169,118 @@ async fn dispatch_proxied_shared(
             });
         }
     }
+    Ok(response)
+}
+
+/// [`dispatch_shared`]'s `session/fork` path. Mirrors
+/// `Router::dispatch_session_fork` exactly (see that method's doc
+/// comment for the full rationale) but restructured -- release
+/// `router`'s own lock before the backend round trip -- the same way
+/// every other `_shared` function in this file is, per this function's
+/// own module-level pattern.
+async fn dispatch_session_fork_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    mut request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+    let gateway_session_id = request
+        .get("params")
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .ok_or(RouterError::MissingSessionId)?
+        .to_string();
+    let cwd = request
+        .get("params")
+        .and_then(|p| p.get("cwd"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+
+    let (backend, persistence, call_policy, agent_id, profile_name) = {
+        let mut r = router.lock().await;
+        let entry = match r.sessions.resolve(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        ) {
+            Some(entry) => entry.clone(),
+            None => {
+                r.rehydrate_session(tenant_id, "session/fork", &gateway_session_id)
+                    .await?
+            }
+        };
+        let agent_id = entry.agent_id.clone();
+        let backend_session_id = entry.backend_session_id.0.clone();
+        let profile_name = entry.profile_name.clone();
+        if let Some(params) = request.get_mut("params") {
+            params["sessionId"] = serde_json::Value::String(backend_session_id);
+        }
+        let backend = r.supervisor.ensure_running(&agent_id).await?;
+        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        let call_policy = BackendCallPolicy::from_profile(
+            profile_name
+                .as_deref()
+                .and_then(|name| r.profiles.get(name)),
+        );
+        (
+            backend,
+            r.persistence.clone(),
+            call_policy,
+            agent_id,
+            profile_name,
+        )
+    };
+
+    let mut response = {
+        let mut proc = backend.lock().await;
+        ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
+        proc.writer.lock().await.write_value(&request).await?;
+        // No `LiveNotifyCtx` here, deliberately -- same reasoning as
+        // `dispatch_session_new_shared`'s own doc comment on this exact
+        // point: this call is what *creates* the new forked gateway
+        // session (`sessions.register` below), so no transport
+        // connection could possibly have subscribed to it yet.
+        let (response, notifications, agent_requests) =
+            read_matching_response(&mut proc, &id, call_policy, None).await?;
+        attach_updates(response, notifications, agent_requests)
+    };
+
+    let forked_backend_session_id = extract_backend_session_id(&response)?;
+    let (forked_gateway_session_id_str, persist_args) = {
+        let mut r = router.lock().await;
+        let forked_gateway_id = r.sessions.register(
+            tenant_id,
+            agent_id,
+            BackendSessionId(forked_backend_session_id),
+            profile_name.clone(),
+            cwd,
+        );
+        let forked_gateway_session_id_str = forked_gateway_id.0.clone();
+        if let Some(result) = response.get_mut("result") {
+            result["sessionId"] = serde_json::Value::String(forked_gateway_id.0);
+        }
+        let persist_args = r
+            .sessions
+            .resolve(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(forked_gateway_session_id_str.clone()),
+            )
+            .map(|entry| (entry.agent_id.clone(), entry.backend_session_id.0.clone()));
+        (forked_gateway_session_id_str, persist_args)
+    };
+
+    if let Some((persisted_agent_id, persisted_backend_session_id)) = persist_args {
+        spawn_session_persistence_fn(
+            persistence,
+            tenant_id.0.clone(),
+            forked_gateway_session_id_str,
+            persisted_agent_id,
+            persisted_backend_session_id,
+            profile_name,
+            request,
+            response.clone(),
+        );
+    }
+
     Ok(response)
 }
 

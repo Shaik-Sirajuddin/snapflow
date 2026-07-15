@@ -25,15 +25,16 @@ use crate::session::{AcpxExt, GatewaySessionId, NewSessionParams};
 use agent_client_protocol::schema::v1::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
     CloseSessionResponse, CreateTerminalRequest, CreateTerminalResponse, DeleteSessionRequest,
-    DeleteSessionResponse, InitializeRequest, InitializeResponse, KillTerminalRequest,
-    KillTerminalResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, LogoutRequest, LogoutResponse, NewSessionResponse, PromptRequest,
-    PromptResponse, ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest,
-    ReleaseTerminalResponse, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, ResumeSessionResponse, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    TerminalOutputRequest, TerminalOutputResponse, WaitForTerminalExitRequest,
-    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
+    DeleteSessionResponse, ForkSessionRequest, ForkSessionResponse, InitializeRequest,
+    InitializeResponse, KillTerminalRequest, KillTerminalResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutRequest, LogoutResponse,
+    NewSessionResponse, PromptRequest, PromptResponse, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, TerminalOutputRequest, TerminalOutputResponse,
+    WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
+    WriteTextFileResponse,
 };
 
 /// Registers every acpx-native wire type *and* every upstream raw-ACP
@@ -98,6 +99,8 @@ pub(crate) fn register_all_defs(generator: &mut SchemaGenerator) {
     generator.subschema_for::<CancelNotification>();
     generator.subschema_for::<DeleteSessionRequest>();
     generator.subschema_for::<DeleteSessionResponse>();
+    generator.subschema_for::<ForkSessionRequest>();
+    generator.subschema_for::<ForkSessionResponse>();
     generator.subschema_for::<ListSessionsRequest>();
     generator.subschema_for::<ListSessionsResponse>();
     generator.subschema_for::<RequestPermissionRequest>();

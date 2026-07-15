@@ -133,13 +133,18 @@ async fn ext_profiles_create_list_delete_round_trip() {
     assert_eq!(created["name"], "work");
 
     let listed = profiles::list(&client).await.expect("profiles/list");
-    assert_eq!(listed.len(), 1);
+    // `profiles/list` also includes one auto-seeded profile per
+    // `Installed` ACP-registry agent (`ensure_default_profiles_seeded`,
+    // see `acpx-core/tests/default_profile_seeding_test.rs`) alongside
+    // this explicitly created one, so this asserts presence rather than
+    // the list's exact length.
+    assert!(listed.iter().any(|p| p["name"] == "work"));
 
     profiles::delete(&client, "work")
         .await
         .expect("profiles/delete");
     let listed_after = profiles::list(&client).await.expect("profiles/list");
-    assert_eq!(listed_after.len(), 0);
+    assert!(!listed_after.iter().any(|p| p["name"] == "work"));
 }
 
 #[tokio::test]

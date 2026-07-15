@@ -129,8 +129,16 @@ async fn real_binary_applies_a_provisioning_file_at_startup() {
     let profiles = list["result"]["profiles"]
         .as_array()
         .expect("profiles array");
-    assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0]["name"], json!("work"));
+    // `profiles/list` now also includes auto-seeded profiles
+    // (`ensure_default_profiles_seeded` -- one per `Installed` registry
+    // agent, e.g. claude-acp/codex-acp/gemini in this environment)
+    // alongside the provisioned one, so this asserts the provisioned
+    // "work" profile is present rather than asserting the list's exact
+    // length/order.
+    assert!(
+        profiles.iter().any(|p| p["name"] == json!("work")),
+        "provisioned \"work\" profile missing from profiles/list: {profiles:?}"
+    );
 
     // The provisioned profile is actually usable: session/new against it
     // resolves through to the real (test-spawned) stand-in backend.

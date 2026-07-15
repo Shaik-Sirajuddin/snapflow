@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         default_agent_id = %config.default_agent_id,
         program = %config.backend.program,
         args = ?config.backend.args,
-        http_bind_addr = %config.http_bind_addr,
+        http_bind_addr = ?config.http_bind_addr,
         "starting acpx-server"
     );
 
@@ -85,10 +85,43 @@ async fn main() -> anyhow::Result<()> {
     let stdio_router = router.clone();
     let stdio_task = tokio::spawn(async move { transport::stdio::run(stdio_router).await });
     let auth_token = config.auth_token.clone();
-    let mut http_task =
-        tokio::spawn(
-            async move { transport::serve(router, config.http_bind_addr, auth_token).await },
-        );
+
+    // HTTP/WS bind is attempted here (rather than inside `transport::serve`)
+    // so a bind failure -- or an explicit `ACPX_HTTP_BIND=off`/`none` -- can
+    // fall back to a stdio-only process instead of killing the whole thing.
+    // This matters for exactly the case documented on `ServerConfig::
+    // http_bind_addr`: an ACP client that spawns `acpx-server` itself as a
+    // per-conversation stdio subprocess (OpenHands's `ACPAgent` is one
+    // concrete example) may launch several concurrent instances on one
+    // host, all contending for the same fixed default port purely by
+    // accident -- none of them need the HTTP/WS surface at all, so losing
+    // that race must not break their (only actually used) stdio transport.
+    let http_listener = match config.http_bind_addr {
+        Some(bind_addr) => match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    %bind_addr,
+                    "failed to bind HTTP/WS transport, continuing stdio-only -- \
+                     see ServerConfig::http_bind_addr's doc comment (set \
+                     ACPX_HTTP_BIND to a free port, or to \"off\"/\"none\" to \
+                     silence this warning, if HTTP/WS is not needed)"
+                );
+                None
+            }
+        },
+        None => {
+            tracing::info!(
+                "ACPX_HTTP_BIND=off/none: HTTP/WS transport disabled, serving stdio only"
+            );
+            None
+        }
+    };
+
+    let http_task = http_listener.map(|listener| {
+        tokio::spawn(async move { transport::serve_on(listener, router, auth_token).await })
+    });
 
     // Bug fix (discovered driving the real-adapter e2e test with a
     // Stdio::null()/closed-stdin child, the same shape any daemonized
@@ -101,13 +134,23 @@ async fn main() -> anyhow::Result<()> {
     // falls through to just waiting on `http_task` alone (selected here
     // by `&mut` -- std's blanket `impl Future for &mut F where F: Future
     // + Unpin` -- so the same handle can still be awaited again below).
-    tokio::select! {
-        result = stdio_task => {
-            result??;
-            (&mut http_task).await??;
+    match http_task {
+        Some(mut http_task) => {
+            tokio::select! {
+                result = stdio_task => {
+                    result??;
+                    (&mut http_task).await??;
+                }
+                result = &mut http_task => {
+                    result??;
+                }
+            }
         }
-        result = &mut http_task => {
-            result??;
+        // HTTP/WS disabled or unbindable: nothing to select against, just
+        // run stdio to completion (its own EOF-vs-error distinction is
+        // handled inside `transport::stdio::run` already).
+        None => {
+            stdio_task.await??;
         }
     }
     Ok(())

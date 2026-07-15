@@ -313,8 +313,16 @@ done
             serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "profiles/list", "params": {}});
         let response = router.dispatch(list).await.unwrap();
         let profiles = response["result"]["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert!(profiles[0].get("key_ref").is_some_and(|v| !v.is_null()));
+        // `profiles/list` also includes auto-seeded profiles
+        // (`ensure_default_profiles_seeded`, see
+        // `acpx-core/tests/default_profile_seeding_test.rs`) alongside
+        // the provisioned "work" one, so find it by name rather than
+        // asserting the list's exact length.
+        let work = profiles
+            .iter()
+            .find(|p| p["name"] == "work")
+            .expect("provisioned \"work\" profile listed");
+        assert!(work.get("key_ref").is_some_and(|v| !v.is_null()));
     }
 
     #[tokio::test]

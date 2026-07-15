@@ -180,9 +180,34 @@ fn resolve_tenant(headers: &HeaderMap) -> TenantId {
 /// behavior every test in this workspace already relies on) disables
 /// auth; `Some(token)` requires `Authorization: Bearer <token>` on every
 /// `POST /rpc` and the `GET /ws` upgrade. See this module's doc comment.
+/// Kept as a small bind-then-serve convenience wrapper around
+/// [`serve_on`] -- not called from this crate's own `main.rs` any more
+/// (see `transport/mod.rs`'s doc comment), but every integration test in
+/// this crate that exercises the HTTP/WS transport calls it against its
+/// own `#[path]`-included physical copy of this same file (`tests/
+/// auth_test.rs` et al.), where it very much is used; `#[allow(dead_code)]`
+/// only silences the *this-crate's-own-`acpx-server`-binary* lint, which
+/// has no visibility into those separately-compiled test copies.
+#[allow(dead_code)]
 pub async fn serve(
     router: SharedRouter,
     bind_addr: SocketAddr,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    serve_on(listener, router, auth_token).await
+}
+
+/// Same as [`serve`], but against an already-bound [`tokio::net::TcpListener`]
+/// -- lets `main.rs` attempt the bind itself first (so a bind failure, e.g.
+/// the default port already taken by another concurrently-running
+/// `acpx-server` instance, can be handled as a non-fatal "run stdio only"
+/// fallback rather than propagating out of this function and killing the
+/// whole process, stdio transport included -- see `config.rs`'s
+/// `ACPX_HTTP_BIND=off` doc comment for the full rationale).
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    router: SharedRouter,
     auth_token: Option<String>,
 ) -> anyhow::Result<()> {
     let state = AppState {
@@ -195,9 +220,8 @@ pub async fn serve(
         .route("/ws", get(super::ws::ws_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(
-        %bind_addr,
+        bind_addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
         auth_enabled,
         "acpx-server HTTP/WS transport listening (no TLS -- see 05-open-risks.md; \
          set ACPX_AUTH_TOKEN for bearer-token auth)"

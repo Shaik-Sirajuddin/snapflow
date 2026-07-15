@@ -10,8 +10,12 @@ use acpx_conductor::SpawnSpec;
 pub struct ServerConfig {
     pub default_agent_id: String,
     pub backend: SpawnSpec,
-    /// Bind address for the HTTP/WS transport (Phase 2 step 11).
-    pub http_bind_addr: std::net::SocketAddr,
+    /// Bind address for the HTTP/WS transport (Phase 2 step 11). `None`
+    /// means the transport is disabled outright (`ACPX_HTTP_BIND=off`/
+    /// `none` -- see `from_env`'s doc comment for why a
+    /// per-conversation-subprocess ACP client, e.g. OpenHands's
+    /// `ACPAgent`, wants this).
+    pub http_bind_addr: Option<std::net::SocketAddr>,
     /// Optional bearer token gating `POST /rpc` and the `GET /ws` upgrade
     /// (Phase 2/post-review "auth" hardening -- see `transport::http`'s
     /// `AuthConfig`). `None` (the default, `ACPX_AUTH_TOKEN` unset) keeps
@@ -27,6 +31,21 @@ impl ServerConfig {
     /// HTTP/WS bind address (default `127.0.0.1:8790` -- loopback only,
     /// per `05-open-risks.md`'s unresolved transport-security note; do not
     /// point this at a public interface without adding auth/TLS first).
+    /// `ACPX_HTTP_BIND=off` (or `none`, case-insensitive) disables the
+    /// HTTP/WS transport entirely -- the shape any ACP client that spawns
+    /// `acpx-server` itself as a per-conversation stdio subprocess (the
+    /// backward-compatible path documented in `main.rs`'s module doc
+    /// comment; OpenHands's `ACPAgent`/`ACPAgentSettings` is exactly this
+    /// shape) wants, since it never talks to the HTTP/WS surface at all
+    /// and a second/third concurrent instance on the same host would
+    /// otherwise contend for one fixed default port for no reason. Even
+    /// without this set, a bind failure at startup (e.g. the default
+    /// port already in use by another instance) is treated as
+    /// *non-fatal* to the stdio transport -- see `main.rs`'s startup
+    /// sequence -- so a client that only cares about stdio ACP semantics
+    /// still gets a fully working subprocess either way; this explicit
+    /// opt-out just skips the doomed bind attempt (and its warning log)
+    /// outright when the caller already knows HTTP/WS is unwanted.
     /// `ACPX_AUTH_TOKEN`, if set, requires every HTTP/WS client to present
     /// it as `Authorization: Bearer <token>` -- still no TLS provided by
     /// this process itself, so pair this with a TLS-terminating reverse
@@ -39,10 +58,13 @@ impl ServerConfig {
         let args: Vec<String> = parts.map(|s| s.to_string()).collect();
         let default_agent_id =
             std::env::var("ACPX_DEFAULT_AGENT_ID").unwrap_or_else(|_| "default".to_string());
-        let http_bind_addr = std::env::var("ACPX_HTTP_BIND")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| ([127, 0, 0, 1], 8790).into());
+        let http_bind_addr = match std::env::var("ACPX_HTTP_BIND") {
+            Ok(raw) if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") => None,
+            Ok(raw) => Some(raw.parse().unwrap_or_else(|err| {
+                panic!("ACPX_HTTP_BIND={raw:?} is not a valid socket address: {err}")
+            })),
+            Err(_) => Some(([127, 0, 0, 1], 8790).into()),
+        };
         // Treat an empty string the same as unset -- an operator who sets
         // `ACPX_AUTH_TOKEN=""` (e.g. via a templated env file with an
         // unfilled placeholder) almost certainly meant "no auth", not "the

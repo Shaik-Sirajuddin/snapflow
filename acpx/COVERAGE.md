@@ -2894,4 +2894,120 @@ change to wire dispatch behavior except the `NewSessionParams` schema
 type's field naming fix above (schema-accuracy only -- `router.rs`
 never consumed this type at runtime, so no behavior change to actual
 `session/new` handling).
+
+## 2026-07-15 -- three real ACP-compatibility gaps closed: default profile seeding, HTTP/WS bind resilience, `session/fork`
+
+Three independent, real gaps found and fixed while integrating a real
+external ACP client (OpenHands's `openhands-sdk`, `ACPAgent(acp_server=
+"custom", acp_command=[...])` spawning `acpx-server` as a per-conversation
+stdio subprocess) and, separately, re-deriving the ACP method surface
+from the real `agent-client-protocol` 1.2.0 crate's own macro
+invocations rather than trusting a prior summary.
+
+**1. `profiles/list`/`_acpx.profile` used to stay empty on a completely
+unconfigured gateway.** `agents/list` (registry catalog + local
+`node`/`npm`/`uv` detection) already reported `claude-acp`/`codex-acp`/
+`gemini` as `Installed` on a host with real CLI logins, but
+`profiles/list` -- the thing `session/new`'s `_acpx.profile` actually
+resolves against -- stayed empty until an operator ran `ACPX_CONFIG_FILE`
+or `profiles/create`. Fixed with `Router::ensure_default_profiles_seeded`
+(`router.rs`): idempotent, re-run on every `profiles/list` call and every
+`_acpx.profile` resolution, auto-creates one native (no provider/key)
+`Profile` per `Installed` registry agent, named after its registry id, if
+and only if nothing has already claimed that name. New coverage:
+`acpx-core/tests/default_profile_seeding_test.rs` (4 tests: seeding
+itself, idempotency, explicit-profile-wins, and a real `session/new`
+against an auto-seeded profile with zero prior provisioning). Several
+pre-existing tests asserting exact `profiles/list` lengths/indices had to
+be loosened to name-based lookups (`profile_resolution_test.rs`,
+`router_dispatch_test.rs`, `gateway_client_test.rs`,
+`provisioning_binary_test.rs`, `provisioning.rs`'s own unit test) since
+the list now legitimately contains more than just what a test explicitly
+created.
+
+**2. `acpx-server`'s HTTP/WS bind failure used to kill the whole
+process, stdio transport included.** Found integrating with OpenHands,
+which spawns one `acpx-server` instance per conversation as a stdio
+subprocess -- several concurrent conversations on one host all default
+to the same fixed `ACPX_HTTP_BIND=127.0.0.1:8790`, and none of them
+actually use the HTTP/WS surface at all. `main.rs` used to build the
+listener inside `transport::serve` and propagate a bind error straight
+out of the `tokio::select!`, tearing down the stdio task too. Fixed:
+`ServerConfig::http_bind_addr` is now `Option<SocketAddr>`
+(`ACPX_HTTP_BIND=off`/`none`, case-insensitive, disables the transport
+outright); `main.rs` now attempts the bind itself first and, on failure,
+logs a `tracing::warn!` and falls back to serving stdio only instead of
+exiting. `transport::http::serve_on` (new) takes an already-bound
+`TcpListener`; `serve` (kept, used by every pre-existing integration test
+via its own `#[path]`-included copy of this file) is a thin bind-then-
+call-`serve_on` wrapper. New coverage:
+`acpx-server/tests/binary_self_test.rs`'s
+`real_binary_with_http_bind_off_still_serves_stdio` and
+`real_binary_survives_a_concurrent_bind_conflict_and_still_serves_stdio`
+(two real `acpx-server` processes told to bind the same address; the
+second's stdio transport must still fully round-trip a real request).
+Also added `acpx/scripts/openhands-acpx-{claude,codex}.sh` (wrapper
+scripts OpenHands's `ACPAgentSettings.acp_command` points at, each
+setting `ACPX_HTTP_BIND=off` and a real backend's `ACPX_BACKEND_CMD`)
+and `acpx/tests/openhands_integration/` (a real, dependency-light Python
+pytest suite driving OpenHands's own `openhands-sdk` client against a
+real, already-running agent-server -- see its own `README.md` for
+prerequisites and what it proves; skips cleanly, doesn't fail, when no
+such stack is running).
+
+**3. `session/fork` was entirely unclassified -- a real, previously
+undiscovered ACP compatibility gap.** Found by cross-checking every
+`impl_jsonrpc_request!` macro invocation in the real
+`agent-client-protocol` 1.2.0 crate's own
+`src/schema/client_to_agent/requests.rs` against `router.rs`'s
+`classify()` match arms -- every method was covered except this one,
+which fell straight through to `MethodClass::Unknown`. Not yet
+stabilized upstream (gated behind `agent-client-protocol-schema`'s own
+`unstable_session_fork` Cargo feature, now enabled in the workspace root
+`Cargo.toml`), but a real, published adapter already advertises and
+implements it -- `claude-agent-acp` 0.58.1's own `session/new` response
+includes `sessionCapabilities.fork: {}}`, verified against the real
+npx-installed package during this same session's manual stdio probe.
+Neither `Proxied` (its response mints a *new* session id) nor `Hybrid`
+(it forwards against an *existing* session, not a fresh profile
+resolution) fit, so this got its own `MethodClass::SessionFork` bucket:
+resolve the source session (with the same `rehydrate_session` fallback
+`session/load`/`session/resume`/`session/delete` get), forward with the
+gateway id rewritten to the backend-native one, then register the
+backend's newly-forked session id under a brand-new gateway session id
+(persisted via `spawn_session_persistence` exactly like `session/new`,
+keyed to the new session, not the source one) and rewrite the response
+accordingly. Implemented on both dispatch paths
+(`Router::dispatch_session_fork` and `dispatch_session_fork_shared`, the
+production path every real transport uses). Schema surface updated to
+match: `acpx-proto/src/methods.rs`'s `METHODS` table (25 client-to-agent
+methods now, was 24), `acpx-proto/src/schema.rs`'s `register_all_defs`,
+and all three regenerated schema documents. New coverage:
+`acpx-core/tests/session_fork_test.rs` (4 tests: new-gateway-id-minted-
+and-distinct-from-source on both `Router::dispatch` and `dispatch_shared`,
+unknown-source-session errors cleanly, and interleaved `session/update`
+notifications still land in `_acpx.updates`).
+
+**A real, unrelated incident worth recording:** partway through this
+phase, `acpx-core/src/router.rs` was found reset to its last-committed
+state on disk -- both this phase's `session/fork` work *and* the
+already-tested/passing default-profile-seeding work from earlier the
+same session had vanished from the file, even though `git status` showed
+every other touched file (including this same phase's `Cargo.toml`/
+`acpx-proto` changes) still modified. Not caused by anything in this
+session's own tool calls (no `git checkout`/`reset` was ever run) --
+re-diagnosed by comparing `git status`/`git diff --stat` against what
+had just built and passed moments before, then both sets of changes were
+carefully reapplied from scratch and reverified with a full, uninterrupted
+`cargo test --workspace` run immediately afterward. Flagged here in case
+it recurs -- if `router.rs` (or any file) ever again shows as
+unexpectedly clean against `HEAD` mid-session, treat it as a real
+external event to re-diagnose, not a tooling illusion.
+
+Workspace test count after this phase: **285 passed, 0 failed, 8
+ignored** (up from 275/0/8 -- 4 new `default_profile_seeding_test`
+tests, 4 new `session_fork_test` tests, 2 new `binary_self_test`
+HTTP-bind-resilience tests). `cargo fmt --all --check` and `cargo build
+--workspace --tests` both clean. `cargo clippy` still not installed in
+this environment, same standing limitation as every prior phase.
 ++ /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/acpx/COVERAGE.md

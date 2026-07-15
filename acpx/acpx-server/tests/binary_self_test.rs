@@ -381,3 +381,131 @@ async fn real_binary_answers_the_client_facing_initialize_and_authenticate_hands
         .expect("POST /rpc session/list after the handshake exchange");
     assert!(list_response.status().is_success());
 }
+
+/// **ACP compatibility, `ACPX_HTTP_BIND=off`**: any ACP client that spawns
+/// `acpx-server` itself as a per-conversation stdio subprocess (OpenHands's
+/// `ACPAgent`/`ACPAgentSettings.acp_command`, or any editor's "spawn an ACP
+/// agent as a child process" integration point) never talks to the HTTP/WS
+/// surface at all -- this proves the real binary still boots and serves a
+/// full stdio round trip with the HTTP/WS transport explicitly turned off,
+/// not just skipped-by-bind-failure (see the sibling
+/// `real_binary_survives_a_concurrent_bind_conflict_and_still_serves_stdio`
+/// test for that case).
+#[tokio::test]
+async fn real_binary_with_http_bind_off_still_serves_stdio() {
+    let script_path = write_stand_in_script();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env("ACPX_HTTP_BIND", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().expect("spawn real acpx-server binary");
+    let mut stdin = child.stdin.take().expect("child stdin piped");
+    let stdout = child.stdout.take().expect("child stdout piped");
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let _guard = ServerGuard { child, script_path };
+
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": "session/list", "params": {}});
+    stdin
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write request to real binary's stdin");
+    stdin.flush().await.expect("flush stdin");
+
+    let line = tokio::time::timeout(Duration::from_secs(5), stdout_lines.next_line())
+        .await
+        .expect("timed out waiting for stdio response with ACPX_HTTP_BIND=off")
+        .expect("read stdout line")
+        .expect("child stdout closed before responding");
+    let body: Value = serde_json::from_str(&line).expect("parse stdio json response");
+    assert_eq!(body["jsonrpc"], json!("2.0"));
+    assert_eq!(body["id"], json!(1));
+}
+
+/// **ACP compatibility, concurrent-instance bind conflict**: two real
+/// `acpx-server` processes told to bind the *same* `ACPX_HTTP_BIND`
+/// address (exactly what happens today if an ACP client spawns more than
+/// one instance concurrently on one host with no per-instance port
+/// coordination -- e.g. OpenHands opening two conversations against a
+/// `custom` `acp_command` pointed at `acpx-server`) -- the second
+/// process's HTTP/WS bind must fail, but its stdio transport (the only
+/// thing such a client actually talks to) must still come up and serve a
+/// full request/response round trip rather than the whole process dying
+/// at startup. This is the actual regression this phase's fix targets;
+/// the sibling `ACPX_HTTP_BIND=off` test above covers the explicit-opt-out
+/// path instead of the accidental-conflict path.
+#[tokio::test]
+async fn real_binary_survives_a_concurrent_bind_conflict_and_still_serves_stdio() {
+    let addr = ephemeral_addr().await;
+    // First instance: binds `addr` successfully and holds it for this
+    // test's whole lifetime (kept alive via `_first`, dropped -- and thus
+    // killed -- only at the end of the test).
+    let _first = spawn_real_server(addr).await;
+
+    // Second instance: told the exact same address. Its own HTTP bind
+    // must lose the race and fail -- proving this test actually exercises
+    // the conflict, not two independent successful binds -- while its
+    // stdio transport still answers normally.
+    let script_path = write_stand_in_script();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env("ACPX_HTTP_BIND", addr.to_string())
+        // Default `EnvFilter` (no `RUST_LOG`) only surfaces `ERROR`-level
+        // events -- this test asserts on a `tracing::warn!`, so make sure
+        // it's not filtered out regardless of this environment's ambient
+        // `RUST_LOG`.
+        .env("RUST_LOG", "acpx_server=warn")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().expect("spawn second real acpx-server binary");
+    let mut stdin = child.stdin.take().expect("child stdin piped");
+    let stdout = child.stdout.take().expect("child stdout piped");
+    let stderr = child.stderr.take().expect("child stderr piped");
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let _second = ServerGuard { child, script_path };
+
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": "session/list", "params": {}});
+    stdin
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("write request to the second instance's stdin");
+    stdin.flush().await.expect("flush stdin");
+
+    let line = tokio::time::timeout(Duration::from_secs(5), stdout_lines.next_line())
+        .await
+        .expect(
+            "timed out waiting for the second instance's stdio response -- \
+             a bind conflict must not kill its stdio transport",
+        )
+        .expect("read stdout line")
+        .expect("second instance's stdout closed before responding");
+    let body: Value = serde_json::from_str(&line).expect("parse stdio json response");
+    assert_eq!(body["jsonrpc"], json!("2.0"));
+    assert_eq!(body["id"], json!(1));
+
+    // Sanity-check the conflict was real (not e.g. a silently-succeeded
+    // second bind on some platforms' `SO_REUSEADDR` default): the second
+    // instance's own stderr must mention the bind failure it logged
+    // before falling back to stdio-only.
+    let mut saw_bind_warning = false;
+    for _ in 0..20 {
+        match tokio::time::timeout(Duration::from_millis(200), stderr_lines.next_line()).await {
+            Ok(Ok(Some(stderr_line))) => {
+                if stderr_line.contains("failed to bind HTTP/WS transport") {
+                    saw_bind_warning = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        saw_bind_warning,
+        "expected the second instance to log a bind-failure warning on stderr"
+    );
+}
