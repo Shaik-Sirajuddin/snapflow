@@ -65,6 +65,11 @@ use tokio::sync::Mutex;
 use acpx_core::router::{dispatch_shared_for_tenant, Router, RouterError};
 use acpx_core::TenantId;
 
+#[path = "acp_bridge.rs"]
+pub(crate) mod acp_bridge;
+
+use self::acp_bridge::BridgeRuntime;
+
 /// Shared, lockable handle to the one `Router` instance serving every
 /// concurrent HTTP/WS client. The `Mutex` here is intentionally *not* held
 /// for the duration of a whole request anymore -- see
@@ -147,6 +152,9 @@ pub struct AppState {
     /// `None` means `/acp/*` is intentionally not mounted. This is a
     /// feature gate, not an authorization check.
     pub bridge: Option<Arc<acpx_bridge::BridgeConfig>>,
+    /// Virtual-session state exists only alongside an enabled bridge
+    /// policy. It is shared by `/acp/rpc` and `/acp/ws`.
+    pub bridge_runtime: Option<Arc<BridgeRuntime>>,
 }
 
 /// Header carrying an explicit profile selection, highest precedence per
@@ -229,6 +237,14 @@ pub async fn serve_on_with_bridge(
         router,
         auth: AuthConfig::new(auth_token),
         bridge: bridge.map(Arc::new),
+        bridge_runtime: None,
+    };
+    let state = AppState {
+        bridge_runtime: state
+            .bridge
+            .as_ref()
+            .map(|config| Arc::new(BridgeRuntime::new(Arc::clone(config)))),
+        ..state
     };
     let auth_enabled = state.auth.token.is_some();
     let bridge_enabled = state.bridge.is_some();
@@ -238,7 +254,9 @@ pub async fn serve_on_with_bridge(
     if bridge_enabled {
         app = app
             .route("/acp/agents", get(acp_agents_handler))
-            .route("/acp/models", get(acp_models_handler));
+            .route("/acp/models", get(acp_models_handler))
+            .route("/acp/rpc", post(acp_rpc_handler))
+            .route("/acp/ws", get(super::ws::acp_ws_handler));
     }
     let app = app.with_state(state);
 
@@ -269,6 +287,26 @@ async fn rpc_handler(
             Err(err) => json_rpc_error(&request, err),
         };
     Json(response).into_response()
+}
+
+/// Standard-ACP HTTP bridge. Unlike native `/rpc`, this route has no
+/// profile header injection and rejects `_acpx` request fields outright.
+async fn acp_rpc_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    if !state.auth.authorize(&headers) {
+        return unauthorized_response(&request);
+    }
+    let Some(runtime) = &state.bridge_runtime else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let tenant_id = resolve_tenant(&headers);
+    match acp_bridge::dispatch(&state.router, runtime, &tenant_id, request.clone()).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => Json(bridge_json_rpc_error(&request, error)).into_response(),
+    }
 }
 
 /// Secret-safe view of the bridge-enabled adapters, derived from ACPX's own
@@ -358,6 +396,25 @@ fn unauthorized_response(request: &serde_json::Value) -> Response {
         }
     });
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+}
+
+pub(crate) fn bridge_json_rpc_error(
+    request: &serde_json::Value,
+    error: acp_bridge::BridgeDispatchError,
+) -> serde_json::Value {
+    let code = match error {
+        acp_bridge::BridgeDispatchError::AcpxExtensionNotAllowed
+        | acp_bridge::BridgeDispatchError::InvalidModelSelection
+        | acp_bridge::BridgeDispatchError::UnknownModel(_)
+        | acp_bridge::BridgeDispatchError::CrossAdapterModelSwitch
+        | acp_bridge::BridgeDispatchError::MissingSessionId => -32602,
+        _ => -32020,
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "error": { "code": code, "message": error.to_string() }
+    })
 }
 
 /// Per the precedence rule, an `X-Acpx-Profile` header on a `session/new`

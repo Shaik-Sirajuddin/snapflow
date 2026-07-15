@@ -51,6 +51,7 @@ async fn global_capacity_rejects_before_starting_the_selected_backend() {
     let mut router = Router::new("primary").with_lifecycle_config(LifecycleConfig {
         max_sessions_total: 1,
         max_sessions_per_tenant: 2,
+        ..Default::default()
     });
     router.register_agent("primary", stand_in_backend_spec(&primary_marker));
     router.register_agent("rejected", stand_in_backend_spec(&rejected_marker));
@@ -94,6 +95,7 @@ async fn tenant_capacity_is_independent_for_dispatch_for_tenant() {
     let mut router = Router::new("stand-in").with_lifecycle_config(LifecycleConfig {
         max_sessions_total: 3,
         max_sessions_per_tenant: 1,
+        ..Default::default()
     });
     router.register_agent(
         "stand-in",

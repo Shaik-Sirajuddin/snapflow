@@ -79,6 +79,218 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state.router, tenant_id))
 }
 
+/// Strict ACP bridge counterpart to [`ws_handler`]. It shares the same
+/// auth and tenant boundary, but routes every frame through the bridge
+/// virtual-session dispatcher so clients never need ACPX profile fields.
+pub async fn acp_ws_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(runtime) = state.bridge_runtime.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let tenant_id = headers
+        .get("x-acpx-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(TenantId::from)
+        .unwrap_or_default();
+    ws.on_upgrade(move |socket| handle_acp_socket(socket, state.router, runtime, tenant_id))
+}
+
+async fn handle_acp_socket(
+    socket: WebSocket,
+    router: SharedRouter,
+    runtime: Arc<super::http::acp_bridge::BridgeRuntime>,
+    tenant_id: TenantId,
+) {
+    let (sink, mut stream) = socket.split();
+    let sink = Arc::new(AsyncMutex::new(sink));
+    let hub = { router.lock().await.notification_hub() };
+    let mut watched: HashSet<String> = HashSet::new();
+    while let Some(message) = stream.next().await {
+        let text = match message {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Binary(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => continue,
+            },
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+        };
+        let request: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let mut response =
+            match super::http::acp_bridge::dispatch(&router, &runtime, &tenant_id, request.clone())
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => super::http::bridge_json_rpc_error(&request, error),
+            };
+        // The first lazy-bound prompt cannot be subscribed before it binds,
+        // so Router buffers any early backend updates in its native
+        // `_acpx.updates` extension. Flush those as normal ACP frames before
+        // the final response; bridge clients must never need to understand
+        // ACPX-only response extensions.
+        if let Some(updates) = response
+            .get_mut("_acpx")
+            .and_then(|value| value.get_mut("updates"))
+            .and_then(|value| value.as_array_mut())
+        {
+            for mut update in std::mem::take(updates) {
+                let Some(native_session_id) = update
+                    .pointer("/params/sessionId")
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                if runtime
+                    .bound_gateway_session_id(&tenant_id, native_session_id)
+                    .is_none()
+                {
+                    let Some(virtual_id) =
+                        runtime.virtual_session_id(&tenant_id, native_session_id)
+                    else {
+                        continue;
+                    };
+                    update["params"]["sessionId"] = serde_json::Value::String(virtual_id);
+                }
+                let Ok(frame) = serde_json::to_string(&update) else {
+                    continue;
+                };
+                if sink.lock().await.send(Message::Text(frame)).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if response
+            .get("_acpx")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|extension| {
+                extension
+                    .get("updates")
+                    .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty))
+            })
+        {
+            response
+                .get_mut("_acpx")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("checked extension object")
+                .remove("updates");
+            if response
+                .get("_acpx")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                response
+                    .as_object_mut()
+                    .expect("JSON-RPC object")
+                    .remove("_acpx");
+            }
+        }
+        let method = request
+            .get("method")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if let Some(public_id) = bridge_session_id_to_forget(&request, &response, method) {
+            if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
+                if watched.remove(&native_id) {
+                    hub.unsubscribe(&native_id).await;
+                }
+            }
+        } else if let Some(public_id) = bridge_session_id_to_watch(&request, &response, method) {
+            if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
+                if watched.insert(native_id.clone()) {
+                    let mut rx = hub.subscribe(native_id).await;
+                    let forwarder_sink = Arc::clone(&sink);
+                    let forwarder_runtime = Arc::clone(&runtime);
+                    let forwarder_tenant = tenant_id.clone();
+                    tokio::spawn(async move {
+                        while let Some(mut update) = rx.recv().await {
+                            let Some(native_session_id) = update
+                                .pointer("/params/sessionId")
+                                .and_then(|value| value.as_str())
+                            else {
+                                continue;
+                            };
+                            let Some(virtual_id) = forwarder_runtime
+                                .virtual_session_id(&forwarder_tenant, native_session_id)
+                            else {
+                                continue;
+                            };
+                            update["params"]["sessionId"] = serde_json::Value::String(virtual_id);
+                            let Ok(frame) = serde_json::to_string(&update) else {
+                                continue;
+                            };
+                            if forwarder_sink
+                                .lock()
+                                .await
+                                .send(Message::Text(frame))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        let Ok(frame) = serde_json::to_string(&response) else {
+            continue;
+        };
+        // A backend update published during this dispatch is already queued
+        // for the per-session forwarder. Yield before writing the terminal
+        // response so an ACP client observes streamed updates first.
+        tokio::task::yield_now().await;
+        if sink.lock().await.send(Message::Text(frame)).await.is_err() {
+            break;
+        }
+    }
+    for native_id in watched {
+        hub.unsubscribe(&native_id).await;
+    }
+}
+
+fn bridge_session_id_to_watch(
+    request: &serde_json::Value,
+    response: &serde_json::Value,
+    method: &str,
+) -> Option<String> {
+    if response.get("error").is_some() {
+        return None;
+    }
+    if method == "session/new" || method == "session/fork" {
+        return response
+            .pointer("/result/sessionId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+    }
+    request
+        .pointer("/params/sessionId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn bridge_session_id_to_forget(
+    request: &serde_json::Value,
+    response: &serde_json::Value,
+    method: &str,
+) -> Option<String> {
+    if response.get("error").is_some() || !matches!(method, "session/close" | "session/delete") {
+        return None;
+    }
+    request
+        .pointer("/params/sessionId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 /// One WS connection's request/response loop: each inbound text/binary
 /// frame is parsed as a single JSON-RPC request, dispatched against the
 /// shared `Router`, and the JSON-RPC response written back as one outbound

@@ -6,9 +6,13 @@ version = 4
 name = "acpx-bridge"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "futures-util",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

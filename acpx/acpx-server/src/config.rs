@@ -30,6 +30,13 @@ pub struct ServerConfig {
     /// transport starts. Defaults to enabled only when `ACPX_DB_PATH` is
     /// set; `ACPX_STARTUP_SESSION_RECOVERY_ENABLED=0` disables it.
     pub startup_session_recovery_enabled: bool,
+    /// Runs native session retention cleanup independently of transport
+    /// connection lifetime. Set `ACPX_LIFECYCLE_REAPER_ENABLED=0` to
+    /// disable, primarily for controlled diagnostics.
+    pub lifecycle_reaper_enabled: bool,
+    /// Poll interval for the lifecycle reaper. The actual session TTLs live
+    /// in `acpx-core::LifecycleConfig`; this only controls observation lag.
+    pub lifecycle_reaper_interval: std::time::Duration,
 }
 
 impl ServerConfig {
@@ -87,6 +94,24 @@ impl ServerConfig {
                 Ok(value) => value != "0",
                 Err(_) => std::env::var_os("ACPX_DB_PATH").is_some(),
             };
+        let lifecycle_reaper_enabled = std::env::var("ACPX_LIFECYCLE_REAPER_ENABLED")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        let lifecycle_reaper_interval = std::env::var("ACPX_LIFECYCLE_REAPER_INTERVAL_SECONDS")
+            .ok()
+            .map(|value| {
+                let seconds = value.parse::<u64>().unwrap_or_else(|err| {
+                    panic!(
+                        "ACPX_LIFECYCLE_REAPER_INTERVAL_SECONDS={value:?} is not a positive integer: {err}"
+                    )
+                });
+                assert!(
+                    seconds > 0,
+                    "ACPX_LIFECYCLE_REAPER_INTERVAL_SECONDS must be greater than zero"
+                );
+                std::time::Duration::from_secs(seconds)
+            })
+            .unwrap_or_else(|| std::time::Duration::from_secs(60));
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -96,6 +121,8 @@ impl ServerConfig {
             http_bind_addr,
             auth_token,
             startup_session_recovery_enabled,
+            lifecycle_reaper_enabled,
+            lifecycle_reaper_interval,
         }
     }
 }

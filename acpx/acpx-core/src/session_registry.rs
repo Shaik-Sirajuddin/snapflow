@@ -5,6 +5,9 @@
 
 use acpx_proto::session::GatewaySessionId;
 use std::collections::HashMap;
+use std::time::Instant;
+
+use crate::LifecycleConfig;
 
 /// **Phase A (`acpx-tenant-isolation`, see
 /// `memory/acpx/gen/plans/acpx-tenant-isolation/01-architecture.md`).**
@@ -90,6 +93,14 @@ pub struct SessionEntry {
     /// itself doesn't carry `cwd` yet -- a known, tracked follow-up, not
     /// silently dropped) or from any other path that never learned it.
     pub cwd: Option<String>,
+    /// Monotonic timestamps keep retention independent of wall-clock jumps.
+    pub created_at: Instant,
+    pub last_activity_at: Instant,
+    /// A reaper must never evict a session while a backend operation is
+    /// executing against it.
+    pub in_flight: usize,
+    /// Explicit retention override controlled by ACPX administration.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Default)]
@@ -124,6 +135,10 @@ impl SessionRegistry {
                 backend_session_id,
                 profile_name,
                 cwd,
+                created_at: Instant::now(),
+                last_activity_at: Instant::now(),
+                in_flight: 0,
+                pinned: false,
             },
         );
         gateway_id
@@ -160,6 +175,85 @@ impl SessionRegistry {
             .entry(tenant_id.clone())
             .or_default()
             .insert(gateway_id.0, entry);
+    }
+
+    /// Refreshes an existing session's activity deadline.
+    pub fn touch(&mut self, tenant_id: &TenantId, gateway_id: &GatewaySessionId) -> bool {
+        let Some(entry) = self
+            .sessions
+            .get_mut(tenant_id)
+            .and_then(|sessions| sessions.get_mut(&gateway_id.0))
+        else {
+            return false;
+        };
+        entry.last_activity_at = Instant::now();
+        true
+    }
+
+    /// Marks a session as executing or finished executing backend work.
+    pub fn set_in_flight(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_id: &GatewaySessionId,
+        in_flight: usize,
+    ) -> bool {
+        let Some(entry) = self
+            .sessions
+            .get_mut(tenant_id)
+            .and_then(|sessions| sessions.get_mut(&gateway_id.0))
+        else {
+            return false;
+        };
+        entry.in_flight = in_flight;
+        if in_flight == 0 {
+            entry.last_activity_at = Instant::now();
+        }
+        true
+    }
+
+    /// Sets the explicit retention override for one tenant-scoped session.
+    pub fn set_pinned(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_id: &GatewaySessionId,
+        pinned: bool,
+    ) -> bool {
+        let Some(entry) = self
+            .sessions
+            .get_mut(tenant_id)
+            .and_then(|sessions| sessions.get_mut(&gateway_id.0))
+        else {
+            return false;
+        };
+        entry.pinned = pinned;
+        entry.last_activity_at = Instant::now();
+        true
+    }
+
+    /// Lists sessions eligible for lifecycle cleanup without mutating them.
+    /// Callers are responsible for marking/closing each candidate before
+    /// removal so a concurrent operation cannot race a backend close.
+    pub fn reap_candidates(
+        &self,
+        now: Instant,
+        lifecycle: &LifecycleConfig,
+    ) -> Vec<(TenantId, GatewaySessionId)> {
+        self.sessions
+            .iter()
+            .flat_map(|(tenant, sessions)| {
+                sessions.iter().filter_map(move |(id, entry)| {
+                    if entry.pinned || entry.in_flight != 0 {
+                        return None;
+                    }
+                    let idle = now.saturating_duration_since(entry.last_activity_at);
+                    let absolute = lifecycle
+                        .absolute_session_ttl
+                        .is_some_and(|ttl| now.saturating_duration_since(entry.created_at) >= ttl);
+                    (idle >= lifecycle.idle_session_ttl || absolute)
+                        .then(|| (tenant.clone(), GatewaySessionId(id.clone())))
+                })
+            })
+            .collect()
     }
 
     pub fn remove(
@@ -417,5 +511,38 @@ mod tests {
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.len_for_tenant(&tenant_a), 1);
         assert_eq!(reg.len_for_tenant(&TenantId::from("tenant-c")), 0);
+    }
+
+    #[test]
+    fn reap_candidates_exclude_pinned_and_in_flight_sessions() {
+        let mut reg = SessionRegistry::new();
+        let tenant = TenantId::default_tenant();
+        let idle = reg.register(
+            &tenant,
+            "agent",
+            BackendSessionId("idle".to_string()),
+            None,
+            None,
+        );
+        let pinned = reg.register(
+            &tenant,
+            "agent",
+            BackendSessionId("pinned".to_string()),
+            None,
+            None,
+        );
+        let active = reg.register(
+            &tenant,
+            "agent",
+            BackendSessionId("active".to_string()),
+            None,
+            None,
+        );
+        reg.set_pinned(&tenant, &pinned, true);
+        reg.set_in_flight(&tenant, &active, 1);
+
+        let then = Instant::now() + std::time::Duration::from_secs(31 * 60);
+        let candidates = reg.reap_candidates(then, &LifecycleConfig::default());
+        assert_eq!(candidates, vec![(tenant, idle)]);
     }
 }

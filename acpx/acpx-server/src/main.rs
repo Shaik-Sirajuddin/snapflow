@@ -38,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
         http_bind_addr = ?config.http_bind_addr,
         acp_bridge_enabled = config.bridge.is_some(),
         startup_session_recovery_enabled = config.startup_session_recovery_enabled,
+        lifecycle_reaper_enabled = config.lifecycle_reaper_enabled,
+        lifecycle_reaper_interval_secs = config.lifecycle_reaper_interval.as_secs(),
         "starting acpx-server"
     );
 
@@ -92,6 +94,30 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let router: transport::SharedRouter = Arc::new(Mutex::new(router));
+    if config.lifecycle_reaper_enabled {
+        let lifecycle_router = Arc::clone(&router);
+        let interval = config.lifecycle_reaper_interval;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // Establish interval without delaying the first full tick.
+            loop {
+                ticker.tick().await;
+                let report = lifecycle_router
+                    .lock()
+                    .await
+                    .reap_expired_sessions(std::time::Instant::now())
+                    .await;
+                if report.closed != 0 || report.failed != 0 {
+                    tracing::info!(
+                        closed = report.closed,
+                        failed = report.failed,
+                        skipped = report.skipped,
+                        "completed ACPX lifecycle reaper pass"
+                    );
+                }
+            }
+        });
+    }
 
     // stdio serves this process's own stdin/stdout (a single local
     // client); HTTP/WS serves remote clients. Both run against the same

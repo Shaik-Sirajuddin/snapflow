@@ -19,6 +19,9 @@ while IFS= read -r line; do
     session/load)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"loaded":true}}\n' "$id"
       ;;
+    session/resume)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"resumed":true}}\n' "$id"
+      ;;
     session/prompt)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"prompted":true}}\n' "$id"
       ;;
@@ -131,5 +134,84 @@ async fn startup_recovery_loads_before_prompt_and_restores_gateway_session() {
         .expect("read recovery status")
         .expect("recovery row remains");
     assert_eq!(persisted.status, RecoveryStatus::Restored);
+    let _ = tokio::fs::remove_file(log_path).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_recovery_uses_persisted_resume_method_before_prompt() {
+    let store = PersistenceStore::open_in_memory().expect("open persistence store");
+    store
+        .record_session_with_recovery(
+            "gateway-resumed",
+            "stand-in-agent",
+            "backend-resumed",
+            None,
+            "2026-01-01T00:00:00Z",
+            "default",
+            RecoveryMetadata {
+                cwd: Some("/workspace".to_string()),
+                recovery_params: Some(json!({"cwd": "/workspace"})),
+                status: RecoveryStatus::Active,
+                recovery_method: RecoveryMethod::Resume,
+                last_recovery_error: None,
+            },
+        )
+        .await
+        .expect("persist resume recovery candidate");
+
+    let log_path = std::env::temp_dir().join(format!(
+        "acpx-startup-resume-recovery-{}.log",
+        uuid::Uuid::new_v4()
+    ));
+    let mut router = Router::new("stand-in-agent").with_persistence(store.clone());
+    router.register_agent("stand-in-agent", recording_backend_spec(&log_path));
+
+    let report = router
+        .recover_open_sessions()
+        .await
+        .expect("startup resume recovery");
+    assert_eq!(report.restored, 1);
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.skipped, 0);
+
+    let prompt = router
+        .dispatch(json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "session/prompt",
+            "params": {"sessionId": "gateway-resumed", "prompt": []}
+        }))
+        .await
+        .expect("prompt resumed session");
+    assert_eq!(prompt["result"]["prompted"], true);
+
+    let methods = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(&log_path).await {
+                let lines: Vec<_> = contents.lines().collect();
+                if lines
+                    .iter()
+                    .any(|line| line.starts_with("session/prompt\t"))
+                {
+                    return lines.into_iter().map(str::to_string).collect::<Vec<_>>();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("backend log includes prompt");
+    assert!(
+        methods
+            .iter()
+            .any(|line| line.starts_with("session/resume\t")),
+        "startup recovery must use session/resume: {methods:?}"
+    );
+    assert!(
+        !methods
+            .iter()
+            .any(|line| line.starts_with("session/load\t")),
+        "resume candidate must not be rewritten to session/load: {methods:?}"
+    );
     let _ = tokio::fs::remove_file(log_path).await;
 }

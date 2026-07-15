@@ -3,6 +3,7 @@
 //! transcript persistence. See
 //! `memory/acpx/gen/plans/acp-gateway-daemon/02-architecture.md`.
 
+pub mod bridge_sessions;
 pub mod detect;
 pub mod keystore;
 pub mod launch;
@@ -15,10 +16,14 @@ pub mod provider;
 pub mod router;
 pub mod session_registry;
 
+pub use bridge_sessions::{
+    BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
+    BridgeSessionStore,
+};
 pub use lifecycle::LifecycleConfig;
 pub use notify::NotificationHub;
 pub use persistence::{
     Direction, PersistenceError, PersistenceStore, SessionRecord, TranscriptRecord,
 };
-pub use router::{MethodClass, Router};
+pub use router::{LifecycleReapReport, MethodClass, Router};
 pub use session_registry::{BackendSessionId, SessionRegistry, TenantId};

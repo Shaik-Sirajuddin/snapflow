@@ -347,7 +347,18 @@ async fn ambient_codex_only_conversation_conforms_to_generated_schema() {
     .await
     .expect("profiles/create(ambient-codex-solo)");
 
-    let text = run_codex_conversation(&client, "ambient-codex-solo").await;
+    let text = tokio::time::timeout(
+        Duration::from_secs(120),
+        run_codex_conversation(&client, "ambient-codex-solo"),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "codex-acp did not complete its ambient chat-gpt authentication/session \
+             flow within 120 seconds; this adapter currently requires a headless-safe \
+             auth path (for example API-key provisioning) rather than silently hanging"
+        )
+    });
     assert!(
         text.to_uppercase().contains("PANG"),
         "codex-acp: expected a real model reply containing PANG, got {text:?}"

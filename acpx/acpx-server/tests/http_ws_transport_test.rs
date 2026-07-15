@@ -64,8 +64,10 @@ while IFS= read -r line; do
   id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
   if echo "$line" | grep -q 'session/new'; then
     printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"backend-abc","agentTag":"{tag}"}}}}\n' "$id"
+  elif echo "$line" | grep -q 'session/fork'; then
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"backend-fork-{tag}","agentTag":"{tag}"}}}}\n' "$id"
   else
-    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"ok":true}}}}\n' "$id"
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"ok":true,"agentTag":"{tag}"}}}}\n' "$id"
   fi
 done
 "#
@@ -84,6 +86,23 @@ fn tagged_backend_spec(tag: &str) -> SpawnSpec {
         "sh",
         vec!["-c".to_string(), stand_in_backend_script_with_tag(tag)],
     )
+}
+
+fn streaming_backend_spec() -> SpawnSpec {
+    let script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-stream"}}\n' "$id"
+  elif echo "$line" | grep -q 'session/prompt'; then
+    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"backend-stream","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"stream"}}}}\n'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+  fi
+done
+"#;
+    SpawnSpec::new("sh", vec!["-c".to_string(), script.to_string()])
 }
 
 /// Starts `transport::serve` on `127.0.0.1:0` (OS-assigned port) in a
@@ -225,6 +244,172 @@ async fn bridge_catalog_routes_expose_only_configured_public_entries() {
         .expect("agents is an array")
         .iter()
         .all(|agent| configured_agent_ids.contains(&agent["id"].as_str().expect("agent id"))));
+}
+
+#[tokio::test]
+async fn strict_acp_http_bridge_lazily_binds_selected_models_without_profiles() {
+    let mut router = Router::new("codex-acp");
+    router.register_agent("claude-acp", tagged_backend_spec("claude"));
+    router.register_agent("codex-acp", tagged_backend_spec("codex"));
+    let addr = spawn_server_with_bridge(
+        Arc::new(Mutex::new(router)),
+        BridgeConfig {
+            default_model: "codex/gpt-5.5".to_string(),
+            models: vec![
+                BridgeModel {
+                    id: "claude/sonnet".to_string(),
+                    name: Some("Claude Sonnet".to_string()),
+                    agent_id: "claude-acp".to_string(),
+                    model_id: "sonnet".to_string(),
+                },
+                BridgeModel {
+                    id: "codex/gpt-5.5".to_string(),
+                    name: Some("Codex GPT-5.5".to_string()),
+                    agent_id: "codex-acp".to_string(),
+                    model_id: "gpt-5.5".to_string(),
+                },
+            ],
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let new = |id| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        })
+    };
+    let claude_new: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&new(1))
+        .send()
+        .await
+        .expect("bridge session/new")
+        .json()
+        .await
+        .expect("bridge session/new JSON");
+    let claude_session = claude_new["result"]["sessionId"]
+        .as_str()
+        .expect("virtual session id")
+        .to_string();
+    assert_eq!(
+        claude_new["result"]["configOptions"][0]["id"],
+        json!("model")
+    );
+    assert_eq!(
+        claude_new["result"]["configOptions"][0]["currentValue"],
+        json!("codex/gpt-5.5")
+    );
+    assert!(claude_new.to_string().contains("claude/sonnet"));
+    assert!(!claude_new.to_string().contains("claude-acp"));
+
+    let selected: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/set_config_option",
+            "params": {"sessionId": claude_session, "configId": "model", "value": "claude/sonnet"}
+        }))
+        .send()
+        .await
+        .expect("bridge model select")
+        .json()
+        .await
+        .expect("bridge model select JSON");
+    assert!(selected.get("error").is_none(), "{selected:?}");
+    assert_eq!(selected["result"]["configOptions"][0]["id"], json!("model"));
+
+    let claude_prompt: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": claude_session, "prompt": []}
+        }))
+        .send()
+        .await
+        .expect("bridge claude prompt")
+        .json()
+        .await
+        .expect("bridge claude prompt JSON");
+    assert_eq!(
+        claude_prompt["result"]["agentTag"],
+        json!("claude"),
+        "unexpected bridged Claude response: {claude_prompt:?}"
+    );
+
+    let forked: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 31, "method": "session/fork",
+            "params": {"sessionId": claude_session, "cwd": "/tmp"}
+        }))
+        .send()
+        .await
+        .expect("bridge Claude fork")
+        .json()
+        .await
+        .expect("bridge Claude fork JSON");
+    let forked_session = forked["result"]["sessionId"]
+        .as_str()
+        .expect("forked virtual session id")
+        .to_string();
+    assert_ne!(forked_session, "backend-fork-claude");
+    let fork_prompt: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 32, "method": "session/prompt",
+            "params": {"sessionId": forked_session, "prompt": []}
+        }))
+        .send()
+        .await
+        .expect("bridge fork prompt")
+        .json()
+        .await
+        .expect("bridge fork prompt JSON");
+    assert_eq!(fork_prompt["result"]["agentTag"], json!("claude"));
+
+    let codex_new: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&new(4))
+        .send()
+        .await
+        .expect("bridge default session/new")
+        .json()
+        .await
+        .expect("bridge default session/new JSON");
+    let codex_session = codex_new["result"]["sessionId"]
+        .as_str()
+        .expect("virtual session id")
+        .to_string();
+    let codex_prompt: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 5, "method": "session/prompt",
+            "params": {"sessionId": codex_session, "prompt": []}
+        }))
+        .send()
+        .await
+        .expect("bridge codex prompt")
+        .json()
+        .await
+        .expect("bridge codex prompt JSON");
+    assert_eq!(codex_prompt["result"]["agentTag"], json!("codex"));
+
+    let rejected: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 6, "method": "session/new",
+            "params": {"cwd": "/tmp", "_acpx": {"profile": "forbidden"}}
+        }))
+        .send()
+        .await
+        .expect("bridge forbidden extension request")
+        .json()
+        .await
+        .expect("bridge forbidden extension JSON");
+    assert_eq!(rejected["error"]["code"], json!(-32602));
 }
 
 #[tokio::test]
@@ -379,4 +564,136 @@ async fn ws_round_trips_a_request() {
     // own "backend-abc" -- same invariant `router_dispatch_test.rs` checks
     // directly against `Router`.
     assert_ne!(body["result"]["sessionId"], json!("backend-abc"));
+}
+
+#[tokio::test]
+async fn strict_acp_ws_exposes_virtual_session_model_selection() {
+    let mut router = Router::new("codex-acp");
+    router.register_agent("codex-acp", tagged_backend_spec("codex"));
+    let addr = spawn_server_with_bridge(
+        Arc::new(Mutex::new(router)),
+        BridgeConfig {
+            default_model: "codex/gpt-5.5".to_string(),
+            models: vec![BridgeModel {
+                id: "codex/gpt-5.5".to_string(),
+                name: None,
+                agent_id: "codex-acp".to_string(),
+                model_id: "gpt-5.5".to_string(),
+            }],
+        },
+    )
+    .await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/acp/ws"))
+        .await
+        .expect("strict ACP websocket connect");
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "session/new",
+                "params": {"cwd": "/tmp"}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send strict ACP websocket frame");
+    let reply = socket
+        .next()
+        .await
+        .expect("strict ACP websocket stream ended")
+        .expect("strict ACP websocket frame");
+    let text = match reply {
+        WsMessage::Text(text) => text,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let body: serde_json::Value = serde_json::from_str(&text).expect("strict ACP JSON");
+    assert!(body["result"]["sessionId"].is_string());
+    assert_eq!(
+        body["result"]["configOptions"][0]["options"][0]["value"],
+        json!("codex/gpt-5.5")
+    );
+}
+
+#[tokio::test]
+async fn strict_acp_ws_forwards_bound_session_updates_with_virtual_ids() {
+    let mut router = Router::new("streaming");
+    router.register_agent("streaming", streaming_backend_spec());
+    let addr = spawn_server_with_bridge(
+        Arc::new(Mutex::new(router)),
+        BridgeConfig {
+            default_model: "stream/model".to_string(),
+            models: vec![BridgeModel {
+                id: "stream/model".to_string(),
+                name: None,
+                agent_id: "streaming".to_string(),
+                model_id: "stream-model".to_string(),
+            }],
+        },
+    )
+    .await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/acp/ws"))
+        .await
+        .expect("strict ACP websocket connect");
+
+    async fn send(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        value: serde_json::Value,
+    ) {
+        socket
+            .send(WsMessage::Text(value.to_string()))
+            .await
+            .expect("send frame");
+    }
+    async fn receive(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> serde_json::Value {
+        let frame = socket
+            .next()
+            .await
+            .expect("socket ended")
+            .expect("socket frame");
+        let WsMessage::Text(text) = frame else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).expect("JSON frame")
+    }
+
+    send(
+        &mut socket,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let created = receive(&mut socket).await;
+    let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+    send(
+        &mut socket,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[]}}),
+    )
+    .await;
+    let first_update = receive(&mut socket).await;
+    assert_eq!(first_update["method"], json!("session/update"));
+    assert_eq!(first_update["params"]["sessionId"], json!(session_id));
+    let first = receive(&mut socket).await;
+    assert_eq!(first["id"], json!(2));
+    // The transport installs its hub forwarder after the bind-completing
+    // response; let that spawned task begin receiving before turn two.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    send(
+        &mut socket,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[]}}),
+    )
+    .await;
+    let update = receive(&mut socket).await;
+    assert_eq!(
+        update["method"],
+        json!("session/update"),
+        "expected live update before response, got {update:?}"
+    );
+    assert_eq!(update["params"]["sessionId"], json!(session_id));
+    let final_response = receive(&mut socket).await;
+    assert_eq!(final_response["id"], json!(3));
 }

@@ -299,6 +299,14 @@ pub struct StartupRecoveryReport {
     pub skipped: usize,
 }
 
+/// Result of one lifecycle reaper pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleReapReport {
+    pub closed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
 #[derive(Debug, Default)]
 struct AdmissionState {
     live_total: usize,
@@ -468,6 +476,8 @@ pub enum RouterError {
     Keystore(#[from] crate::keystore::KeystoreError),
     #[error("session/new: no profile named {0}")]
     UnknownProfile(String),
+    #[error("session/new cannot select both _acpx.profile and _acpx.agentId")]
+    ConflictingSessionSelection,
     #[error("profile {profile} references unknown provider {provider}")]
     UnknownProviderRef { profile: String, provider: String },
     #[error("profile {profile}'s agent id {agent_id} has no npx/uvx distribution in the registry")]
@@ -576,6 +586,22 @@ impl Router {
         self
     }
 
+    /// Lifecycle-management seam used by the server's future authenticated
+    /// retention controls. Pinning never bypasses explicit `session/close`.
+    pub fn set_session_pinned(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        pinned: bool,
+    ) -> Result<(), RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        if self.sessions.set_pinned(tenant_id, &gateway_id, pinned) {
+            Ok(())
+        } else {
+            Err(RouterError::UnknownSession(gateway_session_id.to_string()))
+        }
+    }
+
     fn admit_session(&self, tenant_id: &TenantId) -> Result<SessionAdmissionPermit, RouterError> {
         let mut state = self
             .admission
@@ -602,6 +628,35 @@ impl Router {
     /// just owns the `Supervisor` instance.
     pub fn register_agent(&mut self, agent_id: impl Into<String>, spec: acpx_conductor::SpawnSpec) {
         self.supervisor.register(agent_id, spec);
+    }
+
+    /// Ensure an official registry adapter has a launch specification
+    /// registered without starting its process. The strict ACP bridge uses
+    /// this before its first lazy-bound turn; native callers remain free to
+    /// provision explicit specs through [`Self::register_agent`].
+    pub async fn ensure_registry_agent_registered(
+        &mut self,
+        agent_id: &str,
+    ) -> Result<(), RouterError> {
+        if self.supervisor.spec(agent_id).is_some() {
+            return Ok(());
+        }
+        self.ensure_registry_loaded().await;
+        let agent = self
+            .registry_cache
+            .as_ref()
+            .expect("registry cache populated by ensure_registry_loaded")
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .cloned()
+            .ok_or_else(|| RouterError::UnknownAgentId(agent_id.to_string()))?;
+        let spec = npx_spawn_spec(&agent).ok_or_else(|| RouterError::NoLaunchableDistribution {
+            profile: "bridge".to_string(),
+            agent_id: agent_id.to_string(),
+        })?;
+        self.supervisor.register(agent_id.to_string(), spec);
+        Ok(())
     }
 
     /// Seed a provider config, overwriting any existing entry of the same
@@ -723,11 +778,7 @@ impl Router {
         let mut report = StartupRecoveryReport::default();
 
         for record in store.list_recoverable_sessions().await? {
-            if record.recovery_method != RecoveryMethod::Load {
-                // Proactive recovery currently has one deliberate backend
-                // contract: replay persisted context through session/load.
-                // Keep future resume rows durable but do not guess at their
-                // different backend semantics.
+            if record.recovery_method == RecoveryMethod::None {
                 report.skipped += 1;
                 continue;
             }
@@ -782,6 +833,80 @@ impl Router {
         Ok(report)
     }
 
+    /// Safely closes and removes sessions whose native lifecycle retention
+    /// deadline has elapsed. Candidates are selected only when unpinned and
+    /// not already executing; each is marked in-flight before any backend
+    /// I/O so another reaper pass cannot race it.
+    pub async fn reap_expired_sessions(&mut self, now: std::time::Instant) -> LifecycleReapReport {
+        let candidates = self.sessions.reap_candidates(now, &self.lifecycle);
+        let mut report = LifecycleReapReport::default();
+
+        for (tenant_id, gateway_id) in candidates {
+            let Some(entry) = self.sessions.resolve(&tenant_id, &gateway_id).cloned() else {
+                report.skipped += 1;
+                continue;
+            };
+            if entry.pinned || entry.in_flight != 0 {
+                report.skipped += 1;
+                continue;
+            }
+            self.sessions.set_in_flight(&tenant_id, &gateway_id, 1);
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 999_998,
+                "method": "session/close",
+                "params": {"sessionId": entry.backend_session_id.0}
+            });
+            let result = async {
+                let backend = self.supervisor.ensure_running(&entry.agent_id).await?;
+                let call_policy = BackendCallPolicy::from_profile(
+                    entry
+                        .profile_name
+                        .as_deref()
+                        .and_then(|name| self.profiles.get(name)),
+                );
+                let mut backend = backend.lock().await;
+                ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
+                backend.writer.lock().await.write_value(&request).await?;
+                let (response, _, _) = read_matching_response(
+                    &mut backend,
+                    &serde_json::json!(999_998),
+                    call_policy,
+                    None,
+                )
+                .await?;
+                if let Some(error) = response.get("error") {
+                    return Err(RouterError::BackendSessionNewError(error.clone()));
+                }
+                Ok::<_, RouterError>(())
+            }
+            .await;
+            if result.is_err() {
+                self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
+                report.failed += 1;
+                continue;
+            }
+            if let Some(store) = self.persistence.clone() {
+                if store
+                    .close_session(gateway_id.0.clone(), now_rfc3339())
+                    .await
+                    .is_err()
+                {
+                    self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
+                    report.failed += 1;
+                    continue;
+                }
+            }
+            if self.sessions.remove(&tenant_id, &gateway_id).is_some() {
+                self.release_live_session(&tenant_id);
+                report.closed += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+        report
+    }
+
     async fn restore_open_session(
         &mut self,
         record: &crate::persistence::SessionRecord,
@@ -825,10 +950,15 @@ impl Router {
         );
         let request_id = format!("acpx-startup-recovery:{}", record.gateway_session_id);
         let request_id_value = serde_json::Value::String(request_id.clone());
+        let recovery_method = match record.recovery_method {
+            RecoveryMethod::Load => "session/load",
+            RecoveryMethod::Resume => "session/resume",
+            RecoveryMethod::None => unreachable!("filtered before recovery"),
+        };
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_id_value,
-            "method": "session/load",
+            "method": recovery_method,
             "params": params,
         });
         let response = {
@@ -850,6 +980,10 @@ impl Router {
                 backend_session_id: BackendSessionId(record.backend_session_id.clone()),
                 profile_name: record.profile_name.clone(),
                 cwd: record.cwd.clone(),
+                created_at: std::time::Instant::now(),
+                last_activity_at: std::time::Instant::now(),
+                in_flight: 0,
+                pinned: false,
             },
             admission,
         ))
@@ -997,16 +1131,26 @@ impl Router {
             .and_then(|ext| ext.get("profile"))
             .and_then(|p| p.as_str())
             .map(str::to_string);
+        let explicit_agent_id = params
+            .get("_acpx")
+            .and_then(|ext| ext.get("agentId"))
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        if profile_name.is_some() && explicit_agent_id.is_some() {
+            return Err(RouterError::ConflictingSessionSelection);
+        }
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_acpx");
         }
 
-        let (agent_id, profile) = match &profile_name {
-            Some(name) => {
+        let (agent_id, profile) = match (&profile_name, explicit_agent_id) {
+            (Some(name), None) => {
                 let (supervisor_key, profile) = self.resolve_profile(name).await?;
                 (supervisor_key, Some(profile))
             }
-            None => (self.default_agent_id.clone(), None),
+            (None, Some(agent_id)) => (agent_id, None),
+            (None, None) => (self.default_agent_id.clone(), None),
+            (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
         };
 
         // Merge the resolved profile's centrally-registered MCP servers
@@ -1440,6 +1584,10 @@ impl Router {
             backend_session_id: BackendSessionId(record.backend_session_id),
             profile_name: record.profile_name,
             cwd: record.cwd,
+            created_at: std::time::Instant::now(),
+            last_activity_at: std::time::Instant::now(),
+            in_flight: 0,
+            pinned: false,
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -3496,6 +3644,11 @@ async fn dispatch_proxied_shared(
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        r.sessions.set_in_flight(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            1,
+        );
         let call_policy = BackendCallPolicy::from_profile(
             profile_name
                 .as_deref()
@@ -3511,7 +3664,7 @@ async fn dispatch_proxied_shared(
         request.clone(),
     );
 
-    let response = {
+    let response_result = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&request).await?;
@@ -3522,8 +3675,18 @@ async fn dispatch_proxied_shared(
         };
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, Some(&live)).await?;
-        attach_updates(response, notifications, agent_requests)
-    };
+        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+    }
+    .await;
+    {
+        let mut r = router.lock().await;
+        r.sessions.set_in_flight(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            0,
+        );
+    }
+    let response = response_result?;
 
     spawn_transcript_fn(
         persistence.clone(),
@@ -3701,16 +3864,26 @@ async fn dispatch_session_new_shared(
             .and_then(|ext| ext.get("profile"))
             .and_then(|p| p.as_str())
             .map(str::to_string);
+        let explicit_agent_id = params
+            .get("_acpx")
+            .and_then(|ext| ext.get("agentId"))
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        if profile_name.is_some() && explicit_agent_id.is_some() {
+            return Err(RouterError::ConflictingSessionSelection);
+        }
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_acpx");
         }
 
-        let (agent_id, profile) = match &profile_name {
-            Some(name) => {
+        let (agent_id, profile) = match (&profile_name, explicit_agent_id) {
+            (Some(name), None) => {
                 let (supervisor_key, profile) = r.resolve_profile(name).await?;
                 (supervisor_key, Some(profile))
             }
-            None => (r.default_agent_id.clone(), None),
+            (None, Some(agent_id)) => (agent_id, None),
+            (None, None) => (r.default_agent_id.clone(), None),
+            (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
         };
 
         if let Some(profile) = &profile {

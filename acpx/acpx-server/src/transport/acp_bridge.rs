@@ -1,0 +1,457 @@
+//! Strict ACP request dispatcher for the optional `/acp` surface.
+//!
+//! The public protocol has no ACPX profile or adapter selector. A bridge
+//! session starts as an in-memory virtual session, selects one policy-owned
+//! model alias, and binds to a regular ACPX gateway session only when a turn
+//! needs a backend. This module deliberately delegates all backend work to
+//! `acpx_core::Router`; it does not own a second process manager.
+
+use std::sync::Arc;
+
+use acpx_bridge::BridgeConfig;
+use acpx_core::router::{dispatch_shared_for_tenant, RouterError};
+use acpx_core::{
+    BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
+    BridgeSessionStore, TenantId,
+};
+use serde_json::{json, Value};
+
+use super::SharedRouter;
+
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeDispatchError {
+    #[error("strict ACP bridge requests cannot include _acpx extensions")]
+    AcpxExtensionNotAllowed,
+    #[error("bridge request requires params.sessionId")]
+    MissingSessionId,
+    #[error("bridge session binding is in progress; retry the request")]
+    BindingInProgress,
+    #[error("bridge session binding previously failed; create a new session")]
+    BindingFailed,
+    #[error("bridge model selector must use configId \"model\" and a string value")]
+    InvalidModelSelection,
+    #[error("model alias {0:?} is not configured")]
+    UnknownModel(String),
+    #[error("cannot switch a bound bridge session between adapters")]
+    CrossAdapterModelSwitch,
+    #[error(transparent)]
+    Session(#[from] BridgeSessionError),
+    #[error(transparent)]
+    Router(#[from] RouterError),
+}
+
+/// Shared state mounted only when the strict bridge feature is enabled.
+#[derive(Clone)]
+pub struct BridgeRuntime {
+    pub config: Arc<BridgeConfig>,
+    pub sessions: BridgeSessionStore,
+}
+
+impl BridgeRuntime {
+    pub fn new(config: Arc<BridgeConfig>) -> Self {
+        Self {
+            config,
+            sessions: BridgeSessionStore::new(),
+        }
+    }
+
+    pub fn bound_gateway_session_id(
+        &self,
+        tenant_id: &TenantId,
+        virtual_session_id: &str,
+    ) -> Option<String> {
+        self.sessions
+            .bound_gateway_session_id(tenant_id, &BridgeSessionId(virtual_session_id.to_string()))
+    }
+
+    pub fn virtual_session_id(
+        &self,
+        tenant_id: &TenantId,
+        bound_gateway_session_id: &str,
+    ) -> Option<String> {
+        self.sessions
+            .find_by_bound_gateway_session_id(tenant_id, bound_gateway_session_id)
+            .map(|id| id.0)
+    }
+}
+
+pub async fn dispatch(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    request: Value,
+) -> Result<Value, BridgeDispatchError> {
+    match request.get("method").and_then(Value::as_str) {
+        Some("session/new") => new_session(runtime, tenant_id, request),
+        Some("session/set_config_option") => {
+            set_config_option(router, runtime, tenant_id, request).await
+        }
+        Some("session/close") | Some("session/delete") => {
+            close_or_delete(router, runtime, tenant_id, request).await
+        }
+        Some("session/fork") => fork_session(router, runtime, tenant_id, request).await,
+        Some(
+            "session/prompt" | "session/cancel" | "session/load" | "session/resume"
+            | "session/set_mode",
+        ) => forward_bound(router, runtime, tenant_id, request).await,
+        Some(_) => {
+            reject_acpx_extension(&request)?;
+            Ok(dispatch_shared_for_tenant(router, tenant_id, request).await?)
+        }
+        None => Err(BridgeDispatchError::Router(RouterError::MissingMethod)),
+    }
+}
+
+fn new_session(
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    request: Value,
+) -> Result<Value, BridgeDispatchError> {
+    reject_acpx_extension(&request)?;
+    let params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    let parsed = serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
+    let session_id = runtime.sessions.register(tenant_id, parsed);
+    Ok(json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(Value::Null),
+        "result": {
+            "sessionId": session_id.0,
+            "configOptions": runtime.config.model_config_options(),
+        }
+    }))
+}
+
+async fn set_config_option(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    request: Value,
+) -> Result<Value, BridgeDispatchError> {
+    reject_acpx_extension(&request)?;
+    let session_id = request_session_id(&request)?;
+    let config_id = request
+        .pointer("/params/configId")
+        .and_then(Value::as_str)
+        .ok_or(BridgeDispatchError::InvalidModelSelection)?;
+    let model_alias = request
+        .pointer("/params/value")
+        .and_then(Value::as_str)
+        .ok_or(BridgeDispatchError::InvalidModelSelection)?;
+    if config_id != "model" {
+        return Err(BridgeDispatchError::InvalidModelSelection);
+    }
+    let selected = runtime
+        .config
+        .resolve_model(model_alias)
+        .map_err(|_| BridgeDispatchError::UnknownModel(model_alias.to_string()))?;
+    let session = runtime
+        .sessions
+        .get(tenant_id, &session_id)
+        .ok_or_else(|| BridgeSessionError::NotFound {
+            tenant_id: tenant_id.0.clone(),
+            session_id: session_id.0.clone(),
+        })?;
+
+    match session.state {
+        BridgeSessionState::Unbound => {
+            runtime
+                .sessions
+                .select_model(tenant_id, &session_id, selected.id.clone())?;
+            Ok(success(
+                &request,
+                json!({"configOptions": runtime.config.model_config_options()}),
+            ))
+        }
+        BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
+        BridgeSessionState::Failed => Err(BridgeDispatchError::BindingFailed),
+        BridgeSessionState::Bound => {
+            let current_alias = session
+                .selected_public_model_alias
+                .as_deref()
+                .unwrap_or(&runtime.config.default_model);
+            let current = runtime
+                .config
+                .resolve_model(current_alias)
+                .map_err(|_| BridgeDispatchError::UnknownModel(current_alias.to_string()))?;
+            if current.agent_id != selected.agent_id {
+                return Err(BridgeDispatchError::CrossAdapterModelSwitch);
+            }
+            let mut native = request.clone();
+            native["params"]["sessionId"] =
+                Value::String(session.bound_gateway_session_id.expect("bound id"));
+            native["params"]["value"] = Value::String(selected.model_id.clone());
+            let mut response = dispatch_shared_for_tenant(router, tenant_id, native).await?;
+            if response.get("error").is_none() {
+                runtime
+                    .sessions
+                    .update_bound_model(tenant_id, &session_id, selected.id.clone())?;
+                if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
+                    result
+                        .entry("configOptions".to_string())
+                        .or_insert_with(|| runtime.config.model_config_options());
+                }
+            }
+            Ok(response)
+        }
+    }
+}
+
+async fn close_or_delete(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    request: Value,
+) -> Result<Value, BridgeDispatchError> {
+    reject_acpx_extension(&request)?;
+    let session_id = request_session_id(&request)?;
+    let Some(session) = runtime.sessions.get(tenant_id, &session_id) else {
+        return Err(BridgeSessionError::NotFound {
+            tenant_id: tenant_id.0.clone(),
+            session_id: session_id.0.clone(),
+        }
+        .into());
+    };
+    if session.state == BridgeSessionState::Unbound {
+        runtime.sessions.remove(tenant_id, &session_id);
+        return Ok(success(&request, json!({})));
+    }
+    let response = forward_session_request(router, tenant_id, &session, request).await?;
+    if response.get("error").is_none() {
+        runtime.sessions.remove(tenant_id, &session_id);
+    }
+    Ok(response)
+}
+
+async fn forward_bound(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    request: Value,
+) -> Result<Value, BridgeDispatchError> {
+    reject_acpx_extension(&request)?;
+    let session_id = request_session_id(&request)?;
+    let session = runtime
+        .sessions
+        .get(tenant_id, &session_id)
+        .ok_or_else(|| BridgeSessionError::NotFound {
+            tenant_id: tenant_id.0.clone(),
+            session_id: session_id.0.clone(),
+        })?;
+    let session = match session.state {
+        BridgeSessionState::Unbound => {
+            bind(router, runtime, tenant_id, &session_id, session).await?
+        }
+        BridgeSessionState::Binding => return Err(BridgeDispatchError::BindingInProgress),
+        BridgeSessionState::Failed => return Err(BridgeDispatchError::BindingFailed),
+        BridgeSessionState::Bound => session,
+    };
+    forward_session_request(router, tenant_id, &session, request).await
+}
+
+async fn fork_session(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    request: Value,
+) -> Result<Value, BridgeDispatchError> {
+    reject_acpx_extension(&request)?;
+    let source_id = request_session_id(&request)?;
+    let source = runtime.sessions.get(tenant_id, &source_id).ok_or_else(|| {
+        BridgeSessionError::NotFound {
+            tenant_id: tenant_id.0.clone(),
+            session_id: source_id.0.clone(),
+        }
+    })?;
+    let source = match source.state {
+        BridgeSessionState::Unbound => bind(router, runtime, tenant_id, &source_id, source).await?,
+        BridgeSessionState::Binding => return Err(BridgeDispatchError::BindingInProgress),
+        BridgeSessionState::Failed => return Err(BridgeDispatchError::BindingFailed),
+        BridgeSessionState::Bound => source,
+    };
+    let mut native_request = request.clone();
+    native_request["params"]["sessionId"] = Value::String(
+        source
+            .bound_gateway_session_id
+            .clone()
+            .expect("bound bridge session has native gateway id"),
+    );
+    let mut response = dispatch_shared_for_tenant(router, tenant_id, native_request).await?;
+    let Some(native_fork_id) = response
+        .pointer("/result/sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return Ok(response);
+    };
+    let public_fork_id = runtime.sessions.register_bound(
+        tenant_id,
+        source.original_new_session_params,
+        source.selected_public_model_alias,
+        native_fork_id,
+    );
+    response["result"]["sessionId"] = Value::String(public_fork_id.0);
+    Ok(response)
+}
+
+async fn bind(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    virtual_id: &BridgeSessionId,
+    session: BridgeSession,
+) -> Result<BridgeSession, BridgeDispatchError> {
+    match runtime.sessions.begin_binding(tenant_id, virtual_id)? {
+        BindingClaim::Owner => {}
+        BindingClaim::Binding => return Err(BridgeDispatchError::BindingInProgress),
+        BindingClaim::Failed => return Err(BridgeDispatchError::BindingFailed),
+        BindingClaim::Bound => {
+            return Ok(runtime
+                .sessions
+                .get(tenant_id, virtual_id)
+                .expect("bound bridge session exists"))
+        }
+    }
+
+    let model_alias = session
+        .selected_public_model_alias
+        .as_deref()
+        .unwrap_or(&runtime.config.default_model);
+    let model = match runtime.config.resolve_model(model_alias) {
+        Ok(model) => model.clone(),
+        Err(_) => {
+            let _ = runtime.sessions.fail_binding(tenant_id, virtual_id);
+            return Err(BridgeDispatchError::UnknownModel(model_alias.to_string()));
+        }
+    };
+
+    let result = async {
+        router
+            .lock()
+            .await
+            .ensure_registry_agent_registered(&model.agent_id)
+            .await?;
+
+        let mut params = serde_json::to_value(&session.original_new_session_params)
+            .expect("bridge session params serialize");
+        // Some published ACP adapters (notably the current Claude ACP
+        // adapter) validate `mcpServers` as required even when an ACP client
+        // omitted it. The bridge owns this backend-facing normalization; the
+        // public `/acp` request remains standard and profile-free.
+        if params.get("mcpServers").is_none() {
+            params["mcpServers"] = json!([]);
+        }
+        params["_acpx"] = json!({"agentId": model.agent_id});
+        let native_new = json!({
+            "jsonrpc": "2.0",
+            "id": bridge_internal_id(virtual_id, "new"),
+            "method": "session/new",
+            "params": params,
+        });
+        let response = dispatch_shared_for_tenant(router, tenant_id, native_new).await?;
+        if let Some(error) = response.get("error") {
+            return Err(RouterError::BackendSessionNewError(error.clone()));
+        }
+        let native_id = response
+            .pointer("/result/sessionId")
+            .and_then(Value::as_str)
+            .ok_or(RouterError::MissingBackendSessionId)?
+            .to_string();
+        let native_select = json!({
+            "jsonrpc": "2.0",
+            "id": bridge_internal_id(virtual_id, "model"),
+            "method": "session/set_config_option",
+            "params": {
+                "sessionId": native_id,
+                "configId": "model",
+                "value": model.model_id,
+            }
+        });
+        let selection = dispatch_shared_for_tenant(router, tenant_id, native_select).await?;
+        if let Some(error) = selection.get("error") {
+            return Err(RouterError::BackendSessionNewError(error.clone()));
+        }
+        Ok::<_, RouterError>(native_id)
+    }
+    .await;
+
+    match result {
+        Ok(native_id) => Ok(runtime
+            .sessions
+            .finish_binding(tenant_id, virtual_id, native_id)?),
+        Err(error) => {
+            let _ = runtime.sessions.fail_binding(tenant_id, virtual_id);
+            Err(error.into())
+        }
+    }
+}
+
+async fn forward_session_request(
+    router: &SharedRouter,
+    tenant_id: &TenantId,
+    session: &BridgeSession,
+    mut request: Value,
+) -> Result<Value, BridgeDispatchError> {
+    request["params"]["sessionId"] = Value::String(
+        session
+            .bound_gateway_session_id
+            .clone()
+            .expect("bound bridge session has native gateway id"),
+    );
+    let mut response = dispatch_shared_for_tenant(router, tenant_id, request).await?;
+    if let Some(result) = response.get_mut("result") {
+        if result.get("sessionId").is_some() {
+            result["sessionId"] = Value::String(session.id.0.clone());
+        }
+    }
+    // Buffered updates are read directly from the backend stream, so their
+    // params still contain the backend-native session id. Normal live hub
+    // delivery translates them earlier; this path covers the first lazy-bind
+    // turn before a WebSocket subscription exists.
+    if let Some(updates) = response
+        .pointer_mut("/_acpx/updates")
+        .and_then(Value::as_array_mut)
+    {
+        for update in updates {
+            if update.pointer("/params/sessionId").is_some() {
+                update["params"]["sessionId"] = Value::String(session.id.0.clone());
+            }
+        }
+    }
+    Ok(response)
+}
+
+fn reject_acpx_extension(request: &Value) -> Result<(), BridgeDispatchError> {
+    if request.pointer("/params/_acpx").is_some() {
+        Err(BridgeDispatchError::AcpxExtensionNotAllowed)
+    } else {
+        Ok(())
+    }
+}
+
+fn request_session_id(request: &Value) -> Result<BridgeSessionId, BridgeDispatchError> {
+    request
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str)
+        .map(|id| BridgeSessionId(id.to_string()))
+        .ok_or(BridgeDispatchError::MissingSessionId)
+}
+
+fn success(request: &Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(Value::Null),
+        "result": result,
+    })
+}
+
+fn bridge_internal_id(session_id: &BridgeSessionId, operation: &str) -> Value {
+    // ACP permits numeric ids, and fixed values are safe here because a
+    // connector serializes requests on its stdio stream. Numeric ids also
+    // keep older ACP adapter test doubles that only parse numeric ids
+    // interoperable with the bridge's internal setup calls.
+    let _ = (session_id, operation);
+    json!(1_000_000)
+}

@@ -40,6 +40,7 @@ ACPX_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = ACPX_ROOT / "scripts"
 CLAUDE_WRAPPER = SCRIPTS_DIR / "openhands-acpx-claude.sh"
 CODEX_WRAPPER = SCRIPTS_DIR / "openhands-acpx-codex.sh"
+SHARED_BRIDGE_WRAPPER = SCRIPTS_DIR / "openhands-acpx-bridge.sh"
 
 DEFAULT_AGENT_SERVER_HOST = "http://127.0.0.1:18000"
 
@@ -141,6 +142,40 @@ def build_acp_agent(backend: AcpxBackend):
         acp_server="custom",
         acp_model=backend.acp_model,
     )
+
+
+def build_shared_bridge_agent(model_alias: str):
+    """Build one OpenHands ACP agent backed by the shared ACPX bridge.
+
+    URL/token/tenant are intentionally supplied as `Conversation.secrets`,
+    not written into an OpenHands profile or process-wide environment. The
+    SDK forwards request secrets only to that ACP subprocess.
+    """
+    from openhands.sdk.agent import ACPAgent
+
+    if not SHARED_BRIDGE_WRAPPER.exists():
+        raise FileNotFoundError(f"missing shared bridge wrapper: {SHARED_BRIDGE_WRAPPER}")
+    return ACPAgent(
+        acp_command=[str(SHARED_BRIDGE_WRAPPER)],
+        acp_server="custom",
+        acp_model=model_alias,
+    )
+
+
+def shared_bridge_secrets(
+    url: str, *, token: str | None = None, tenant: str | None = None
+) -> dict[str, str]:
+    """Environment variables consumed by `openhands-acpx-bridge.sh`.
+
+    `token` is optional because a loopback development daemon may omit
+    bearer auth; caller-owned values are never persisted in agent profiles.
+    """
+    secrets = {"ACPX_ACP_BRIDGE_URL": url}
+    if token:
+        secrets["ACPX_ACP_BRIDGE_TOKEN"] = token
+    if tenant:
+        secrets["ACPX_ACP_BRIDGE_TENANT"] = tenant
+    return secrets
 
 
 def build_remote_workspace(host: str, api_key: str, working_dir: Path):
