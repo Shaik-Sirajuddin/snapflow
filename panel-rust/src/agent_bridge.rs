@@ -2285,19 +2285,124 @@ done
         assert!(ended, "prompt turn did not finish after answering the relay");
 
         let history = bridge.history(0);
+       assert!(
+           history.iter().any(|m| m.text.contains("CHOSE: allow-once")),
+           "expected the backend's own echo to reflect the live-relayed \
+           allow-once answer, not the profile's AutoReject default \
+           (which would have picked reject-once): got {history:?}"
+      );
+   }
+
+    /// Coverage-matrix `session/cancel` row: proves a real slow turn gets
+    /// exactly one cancel and ends with `stopReason: "cancelled"`, driven
+    /// through the same `AgentBridge::cancel_prompt` call
+    /// `PanelSingleton::on_stop_requested` invokes from the Stop button.
+    ///
+    /// The stand-in backend never replies to `session/prompt` on its own
+    /// (matching the real ACP spec: `session/cancel` is a client-sent
+    /// *notification*, and the in-flight prompt call is what eventually
+    /// resolves) -- it only replies once it sees `session/cancel` arrive on
+    /// the same stdio stream, using the prompt's own captured `id`. If
+    /// `cancel_prompt` failed to reach the backend at all, this test would
+    /// hang until its own deadline and fail with `ended == false`, so a
+    /// pass is proof the cancel notification, not a coincidental timeout,
+    /// is what unblocked the turn.
+    #[test]
+    fn cancel_prompt_ends_a_slow_turn_with_cancelled_stop_reason() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("stand_in_backend.sh");
+        let prompt_id_path = script_dir.path().join("prompt_id");
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"backend-abc"}}}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    echo "$id" > {prompt_id_path}
+  elif echo "$line" | grep -q '"method":"session/cancel"'; then
+    prompt_id=$(cat {prompt_id_path})
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"cancelled"}}}}\n' "$prompt_id"
+  else
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"ok":true}}}}\n' "$id"
+  fi
+done
+"#,
+                prompt_id_path = prompt_id_path.display(),
+            ),
+        )
+        .expect("write stand-in backend script");
+
+        let gateway = {
+            let port = free_port();
+            let mut command = std::process::Command::new(acpx_server_bin());
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                .env("ACPX_DEFAULT_AGENT_ID", "cancel-test")
+                .env("RUST_LOG", "error")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let child = command
+                .spawn()
+                .expect("spawn real acpx-server binary for test");
+            let base_url = format!("http://127.0.0.1:{port}");
+            for _ in 0..100 {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            TestGateway { child, base_url }
+        };
+
+        let names = ["Cancel Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        bridge.send_prompt(0, "start a slow task".into());
+
+        // Wait for the backend to actually be mid-prompt (its script has
+        // captured the prompt's own `id`) before cancelling -- a cancel
+        // that raced ahead of the prompt reaching the backend would prove
+        // nothing about the cancel path itself.
+        let capture_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < capture_deadline && !prompt_id_path.is_file() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
-            history.iter().any(|m| m.text.contains("CHOSE: allow-once")),
-            "expected the backend's own echo to reflect the live-relayed \
-            allow-once answer, not the profile's AutoReject default \
-            (which would have picked reject-once): got {history:?}"
-       );
+            prompt_id_path.is_file(),
+            "backend never observed the in-flight session/prompt"
+        );
+
+        bridge.cancel_prompt(0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stop_reason = None;
+        while std::time::Instant::now() < deadline && stop_reason.is_none() {
+            for event in bridge.poll() {
+                if let AgentEvent::TurnEnded(reason) = event.event {
+                    stop_reason = Some(reason);
+                }
+            }
+            if stop_reason.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            stop_reason.as_deref(),
+            Some("cancelled"),
+            "cancel_prompt should have produced exactly one TurnEnded(\"cancelled\"), got {stop_reason:?}"
+        );
     }
 
-    /// Real end-to-end proof of the profile-picker path this crate
-    /// exposes to `lib.rs`'s settings sheet: `AgentBridge::list_profiles`
-    /// sees a real profile registered on the gateway (including its
-    /// capability flags), and `AgentBridge::add_thread_with_profile`
-    /// actually threads `_acpx.profile` through to a real `session/new`
+   /// Real end-to-end proof of the profile-picker path this crate
+   /// exposes to `lib.rs`'s settings sheet: `AgentBridge::list_profiles`
+   /// sees a real profile registered on the gateway (including its
+   /// capability flags), and `AgentBridge::add_thread_with_profile`
+   /// actually threads `_acpx.profile` through to a real `session/new`
     /// call -- proven by the new thread's own terminal/create relay
     /// succeeding, which only happens when `allow_terminal_access` is
     /// true for the session's resolved profile (the default/no-profile
