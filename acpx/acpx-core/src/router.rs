@@ -7,6 +7,7 @@
 use crate::keystore::Keystore;
 use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
+use crate::agent_relay::AgentRequestHub;
 use crate::persistence::{Direction, PersistenceStore};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
@@ -221,6 +222,15 @@ pub struct Router {
     /// without that transport ever needing to come back through this
     /// `Router`'s own lock to subscribe/publish.
     notification_hub: NotificationHub,
+    /// **Interactive relay addition.** Live agent-initiated request
+    /// relay (`session/request_permission` today; see
+    /// `crate::agent_relay`'s module doc comment) to whichever transport
+    /// connection currently owns a given gateway session. Same
+    /// cheaply-cloneable-handle convention as `notification_hub` right
+    /// above; kept as a fully separate hub rather than folded into
+    /// `NotificationHub` because it's bidirectional (request-out,
+    /// reply-in) where `NotificationHub` is publish-only.
+    agent_request_hub: AgentRequestHub,
     /// **Phase 15 addition.** Identity (`Arc::as_ptr` cast to `usize`) of
     /// every physical backend process instance that already has an idle
     /// scavenger task (see [`spawn_idle_scavenger`]/[`backend_idle_
@@ -309,6 +319,10 @@ pub enum RouterError {
 }
 
 impl Router {
+    pub fn default_agent_id(&self) -> &str {
+        &self.default_agent_id
+    }
+
     pub fn new(default_agent_id: impl Into<String>) -> Self {
         Self {
             supervisor: acpx_conductor::Supervisor::new(),
@@ -322,6 +336,7 @@ impl Router {
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
             notification_hub: NotificationHub::new(),
+            agent_request_hub: AgentRequestHub::new(),
             scavenged_backends: HashSet::new(),
         }
     }
@@ -332,6 +347,14 @@ impl Router {
     /// connection touches. See `crate::notify`'s module doc comment.
     pub fn notification_hub(&self) -> NotificationHub {
         self.notification_hub.clone()
+    }
+
+    /// A clone of this router's live agent-request relay hub -- see
+    /// [`Self::notification_hub`]'s doc comment for the sharing
+    /// convention and `crate::agent_relay`'s module doc comment for what
+    /// this hub is for.
+    pub fn agent_request_hub(&self) -> AgentRequestHub {
+        self.agent_request_hub.clone()
     }
 
     /// **Phase 15.** Ensure exactly one idle scavenger task
@@ -358,6 +381,8 @@ impl Router {
             router: std::sync::Arc::clone(router_handle),
             agent_id: agent_id.to_string(),
             tenant_id: None,
+            agent_relay: self.agent_request_hub.clone(),
+            gateway_session_id: None,
         };
         let backend = std::sync::Arc::clone(backend);
         tokio::spawn(backend_idle_scavenger(backend, ctx));
@@ -2104,6 +2129,28 @@ struct LiveNotifyCtx {
     /// per-call tenant context -- `None` means "search every tenant" via
     /// `SessionRegistry::find_by_backend_any_tenant`.
     tenant_id: Option<TenantId>,
+    /// **Interactive relay addition.** A clone of the same
+    /// `AgentRequestHub` `Router::agent_request_hub()` hands to
+    /// transports, so `read_matching_response` can attempt a live relay
+    /// for an agent-initiated request without needing to re-acquire the
+    /// router lock mid-backend-I/O.
+    agent_relay: AgentRequestHub,
+    /// **Interactive relay addition.** The *gateway* session id already
+    /// known at this ctx's construction site, when there is one --
+    /// `try_deliver_live`'s backend-id -> gateway-id translation exists
+    /// because a bare `session/update` notification only ever carries
+    /// the backend's own session id, but every agent-initiated *request*
+    /// this relay targets arrives strictly mid an already-dispatched
+    /// call whose caller already resolved the gateway id for its own
+    /// bookkeeping (see `dispatch_proxied_shared`) -- reusing that
+    /// instead of re-deriving it avoids a second registry lookup per
+    /// request. `None` at the two sites that can't cheaply know it yet
+    /// (`spawn_idle_scavenger_if_new`'s ctx, and `session/new`, which
+    /// mints its gateway id only *after* this ctx would have been built
+    /// -- see the "No `LiveNotifyCtx` here" comment at that call site):
+    /// a relay attempt against `None` is skipped and falls straight
+    /// through to the policy auto-answer, same as `live: None` entirely.
+    gateway_session_id: Option<String>,
 }
 
 /// Attempt to deliver a real `session/update` notification (`value`,
@@ -2281,6 +2328,33 @@ async fn backend_idle_scavenger(
     }
 }
 
+/// How long a relayed `session/request_permission` is allowed to wait
+/// for a live client's decision before falling back to the profile's
+/// static `permission_policy`. Generous on purpose -- this is a real
+/// human decision point, not a network round trip -- but bounded so a
+/// client that disconnects mid-decision (tab closed, panel crashed)
+/// doesn't leave the backend's own `session/prompt` call hanging
+/// forever; the backend always gets *an* answer.
+const PERMISSION_RELAY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Attempt to relay an agent-initiated request to whichever transport
+/// connection currently owns its gateway session, via `live`'s
+/// `AgentRequestHub`. `None` (no `live` ctx at all, no known gateway
+/// session id yet, no live subscriber, or a timeout) is the caller's cue
+/// to fall back to the existing policy-based auto-answer -- see
+/// `crate::agent_relay`'s module doc comment for the full contract.
+async fn try_relay_agent_request(
+    live: Option<&LiveNotifyCtx>,
+    value: &serde_json::Value,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let ctx = live?;
+    let gateway_session_id = ctx.gateway_session_id.as_deref()?;
+    ctx.agent_relay
+        .relay(gateway_session_id, value.clone(), timeout)
+        .await
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
@@ -2320,7 +2394,19 @@ async fn read_matching_response(
             value.get("method").and_then(|m| m.as_str()),
         ) {
             let reply = if method == "session/request_permission" {
-                build_permission_reply(&value, policy.permission_policy)
+                // **Interactive relay addition.** A live client (WS,
+                // currently) that owns this gateway session gets first
+                // say: it may take real user interaction to answer, so
+                // this waits up to `PERMISSION_RELAY_TIMEOUT` before
+                // falling back to the exact same static-policy answer
+                // this arm always gave before the relay existed. An
+                // HTTP-only client (`live: None`) or a WS client that
+                // never subscribed to this session always falls straight
+                // through to that same fallback, unchanged.
+                match try_relay_agent_request(live, &value, PERMISSION_RELAY_TIMEOUT).await {
+                    Some(relayed) => relayed,
+                    None => build_permission_reply(&value, policy.permission_policy),
+                }
             } else if (method == "fs/read_text_file" || method == "fs/write_text_file")
                 && policy.allow_fs_access
             {
@@ -2877,7 +2963,7 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence, call_policy, agent_id) = {
+    let (backend, persistence, call_policy, agent_id, agent_relay) = {
         let mut r = router.lock().await;
         let entry = match r.sessions.resolve(
             tenant_id,
@@ -2902,7 +2988,13 @@ async fn dispatch_proxied_shared(
                 .as_deref()
                 .and_then(|name| r.profiles.get(name)),
         );
-        (backend, r.persistence.clone(), call_policy, agent_id)
+        (
+            backend,
+            r.persistence.clone(),
+            call_policy,
+            agent_id,
+            r.agent_request_hub.clone(),
+        )
     };
 
     spawn_transcript_fn(
@@ -2920,6 +3012,8 @@ async fn dispatch_proxied_shared(
             router: std::sync::Arc::clone(router),
             agent_id,
             tenant_id: Some(tenant_id.clone()),
+            agent_relay,
+            gateway_session_id: Some(gateway_session_id.clone()),
         };
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, Some(&live)).await?;

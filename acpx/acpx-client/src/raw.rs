@@ -37,6 +37,8 @@ pub enum ClientError {
     Rpc { code: i64, message: String },
     #[error("gateway response had neither \"result\" nor \"error\"")]
     MalformedResponse,
+    #[error("WebSocket request to acpx gateway failed: {0}")]
+    WebSocket(String),
 }
 
 /// Raw JSON-RPC-over-HTTP transport to one acpx gateway instance. Every

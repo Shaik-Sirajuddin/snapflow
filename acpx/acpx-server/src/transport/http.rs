@@ -146,6 +146,14 @@ pub struct AppState {
     pub auth: AuthConfig,
 }
 
+async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let agent_id = state.router.lock().await.default_agent_id().to_owned();
+    Json(serde_json::json!({ "status": "ok", "agentId": agent_id })).into_response()
+}
+
 /// Header carrying an explicit profile selection, highest precedence per
 /// `02-architecture.md`. `axum`'s `HeaderMap` lookups are already
 /// case-insensitive, so this lowercase constant matches `X-Acpx-Profile`
@@ -191,6 +199,7 @@ pub async fn serve(
     };
     let auth_enabled = state.auth.token.is_some();
     let app = axum::Router::new()
+        .route("/health", get(health))
         .route("/rpc", post(rpc_handler))
         .route("/ws", get(super::ws::ws_handler))
         .with_state(state);

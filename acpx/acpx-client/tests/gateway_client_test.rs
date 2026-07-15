@@ -15,6 +15,7 @@ mod ws;
 
 use acpx_client::ext::{profiles, registry, sessions};
 use acpx_client::raw::GatewayClient;
+use acpx_client::{AgentRequest, Gateway, TransportMode};
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::Router;
 use http::SharedRouter;
@@ -80,6 +81,25 @@ async fn raw_call_round_trips_a_gateway_native_method() {
         .call("session/list", serde_json::json!({}), None)
         .await
         .expect("session/list");
+    assert_eq!(result["sessions"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn gateway_facade_prefers_websocket_and_round_trips_rpc() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let router: SharedRouter = Arc::new(Mutex::new(router));
+    let addr = spawn_server(router).await;
+
+    let client = Gateway::connect(format!("http://{addr}")).await;
+    assert_eq!(client.mode(), TransportMode::WebSocketInteractive);
+    assert!(client.supports_interactive_requests());
+    assert!(client.subscribe().is_some());
+
+    let result = client
+        .call("session/list", serde_json::json!({}), None)
+        .await
+        .expect("session/list over WebSocket");
     assert_eq!(result["sessions"], serde_json::json!([]));
 }
 
@@ -210,6 +230,101 @@ async fn ext_registry_agents_list_and_status_and_install_round_trip() {
         .as_str()
         .unwrap()
         .contains("RuntimeConfirmed"));
+}
+
+/// **acpx-client SDK level, end to end**: proves the whole interactive
+/// relay contract works through the public [`Gateway`] facade, not just
+/// the raw transport `acpx-server`'s own `agent_request_relay_test.rs`
+/// already proves -- `Gateway::connect` picks up the live
+/// `acpx/agent_request` notification via `subscribe()`,
+/// `AgentRequest::from_notification` parses it, and
+/// `Gateway::respond_agent_request` answers it, all through the same
+/// APIs a real panel/consumer uses. Same stand-in backend script and
+/// deliberately-distinguishable-outcome trick as `acpx-server`'s own
+/// `agent_request_relay_test.rs` (see that file's doc comment): relaying
+/// `allow-once` here can only be distinguished from the profile's
+/// `AutoReject` policy default (`reject-once`, since a `reject_once`
+/// option is offered) by the live relay path actually having run.
+#[tokio::test]
+async fn gateway_relays_a_live_permission_request_end_to_end() {
+    let permission_script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    printf '{"jsonrpc":"2.0","id":999,"method":"session/request_permission","params":{"sessionId":"backend-abc","toolCall":{"toolCallId":"call-1"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+    reply=""
+    while IFS= read -r reply_line; do
+      echo "$reply_line" | grep -q '"id":999' && { reply="$reply_line"; break; }
+    done
+    chosen=$(echo "$reply" | grep -o '"optionId":"[^"]*"' | head -1 | cut -d: -f2 | tr -d '"')
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","chosenOptionId":"%s"}}\n' "$id" "$chosen"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+    let mut router = Router::new("permission-agent");
+    router.register_agent(
+        "permission-agent",
+        SpawnSpec::new("sh", vec!["-c".to_string(), permission_script.to_string()]),
+    );
+    let router: SharedRouter = Arc::new(Mutex::new(router));
+    let addr = spawn_server(router).await;
+
+    let gateway = Gateway::connect(format!("http://{addr}")).await;
+    assert_eq!(gateway.mode(), TransportMode::WebSocketInteractive);
+    let mut notifications = gateway.subscribe().expect("WS mode has notifications");
+
+    let new_result = gateway
+        .call("session/new", serde_json::json!({"cwd": "/tmp"}), None)
+        .await
+        .expect("session/new");
+    let gateway_session_id = new_result["sessionId"].as_str().expect("sessionId").to_string();
+
+    let prompt_params = serde_json::json!({"sessionId": gateway_session_id, "prompt": []});
+    let gateway_for_prompt = &gateway;
+    let prompt_task = async {
+        gateway_for_prompt
+            .call("session/prompt", prompt_params, None)
+            .await
+    };
+
+    let answer_task = async {
+        loop {
+            let notification = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                notifications.recv(),
+            )
+            .await
+            .expect("agent request notification arrives promptly")
+            .expect("notification channel stays open");
+            let Some(agent_request) = AgentRequest::from_notification(&notification) else {
+                continue;
+            };
+            assert_eq!(agent_request.session_id, gateway_session_id);
+            assert_eq!(agent_request.method(), Some("session/request_permission"));
+            let backend_request_id = agent_request.request["id"].clone();
+            let delivered = gateway
+                .respond_agent_request(
+                    &agent_request.relay_id,
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": backend_request_id,
+                        "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}
+                    }),
+                )
+                .await
+                .expect("respond_agent_request");
+            assert!(delivered);
+            return;
+        }
+    };
+
+    let (prompt_result, _) = tokio::join!(prompt_task, answer_task);
+    let prompt_result = prompt_result.expect("session/prompt");
+    assert_eq!(prompt_result["chosenOptionId"], serde_json::json!("allow-once"));
 }
 
 /// **acpx client + acpx daemon auth, end to end**: proves

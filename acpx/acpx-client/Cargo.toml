@@ -13,6 +13,8 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
 
 [dev-dependencies]
 # Compile acpx-server's transport modules directly into test binaries via
@@ -27,4 +29,3 @@ tracing = { workspace = true }
 # `#[path]`, see this block's doc comment) now needs `futures_util::
 # {SinkExt, StreamExt}` to split the `WebSocket` for live-notification
 # forwarding.
-futures-util = "0.3"

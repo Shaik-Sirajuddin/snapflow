@@ -3,6 +3,7 @@
 //! transcript persistence. See
 //! `memory/acpx/gen/plans/acp-gateway-daemon/02-architecture.md`.
 
+pub mod agent_relay;
 pub mod detect;
 pub mod keystore;
 pub mod launch;
@@ -14,6 +15,7 @@ pub mod provider;
 pub mod router;
 pub mod session_registry;
 
+pub use agent_relay::AgentRequestHub;
 pub use notify::NotificationHub;
 pub use persistence::{
     Direction, PersistenceError, PersistenceStore, SessionRecord, TranscriptRecord,

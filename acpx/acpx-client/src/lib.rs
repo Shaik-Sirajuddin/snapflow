@@ -11,4 +11,8 @@
 //! official SDK's subprocess-stdio-oriented `Client` trait).
 
 pub mod ext;
+pub mod gateway;
 pub mod raw;
+pub mod ws;
+
+pub use gateway::{AgentRequest, Gateway, TransportMode};
