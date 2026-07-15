@@ -36,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
         program = %config.backend.program,
         args = ?config.backend.args,
         http_bind_addr = ?config.http_bind_addr,
+        acp_bridge_enabled = config.bridge.is_some(),
+        startup_session_recovery_enabled = config.startup_session_recovery_enabled,
         "starting acpx-server"
     );
 
@@ -75,6 +77,18 @@ async fn main() -> anyhow::Result<()> {
             profiles = summary.profiles,
             "applied startup provisioning file"
         );
+    }
+
+    if config.startup_session_recovery_enabled {
+        let report = router.recover_open_sessions().await?;
+        tracing::info!(
+            restored = report.restored,
+            failed = report.failed,
+            skipped = report.skipped,
+            "completed startup session recovery"
+        );
+    } else {
+        tracing::info!("startup session recovery disabled");
     }
 
     let router: transport::SharedRouter = Arc::new(Mutex::new(router));
@@ -119,8 +133,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let http_task = http_listener.map(|listener| {
-        tokio::spawn(async move { transport::serve_on(listener, router, auth_token).await })
+    let bridge_config = config.bridge.clone();
+    let http_task = http_listener.map(move |listener| {
+        let bridge = bridge_config.clone();
+        tokio::spawn(async move {
+            transport::serve_on_with_bridge(listener, router, auth_token, bridge).await
+        })
     });
 
     // Bug fix (discovered driving the real-adapter e2e test with a

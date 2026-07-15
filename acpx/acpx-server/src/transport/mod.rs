@@ -9,7 +9,7 @@ pub mod ws;
 // Re-exported so `main.rs` can call `transport::serve(...)` / build a
 // `transport::SharedRouter` without reaching into `transport::http`
 // directly.
-pub use http::{serve_on, SharedRouter};
+pub use http::{serve_on_with_bridge, SharedRouter};
 // `http::serve` (bind-then-serve convenience wrapper) is intentionally not
 // re-exported here: `main.rs` binds the listener itself via `serve_on` (see
 // `config.rs`'s `ACPX_HTTP_BIND=off` doc comment for why), and every

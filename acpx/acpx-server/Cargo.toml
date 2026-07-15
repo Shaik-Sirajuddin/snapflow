@@ -21,6 +21,7 @@ acpx-proto = { workspace = true }
 acpx-core = { workspace = true }
 acpx-conductor = { workspace = true }
 acpx-registry = { workspace = true }
+acpx-bridge = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -10,6 +10,10 @@ use acpx_conductor::SpawnSpec;
 pub struct ServerConfig {
     pub default_agent_id: String,
     pub backend: SpawnSpec,
+    /// Optional strict-ACP `/acp` bridge policy. `None` keeps every bridge
+    /// route disabled so legacy ACPX deployments retain their exact public
+    /// surface until an operator opts in.
+    pub bridge: Option<acpx_bridge::BridgeConfig>,
     /// Bind address for the HTTP/WS transport (Phase 2 step 11). `None`
     /// means the transport is disabled outright (`ACPX_HTTP_BIND=off`/
     /// `none` -- see `from_env`'s doc comment for why a
@@ -22,6 +26,10 @@ pub struct ServerConfig {
     /// this transport fully unauthenticated, matching every pre-existing
     /// deployment/test that never set this var.
     pub auth_token: Option<String>,
+    /// Whether durable open sessions are proactively restored before any
+    /// transport starts. Defaults to enabled only when `ACPX_DB_PATH` is
+    /// set; `ACPX_STARTUP_SESSION_RECOVERY_ENABLED=0` disables it.
+    pub startup_session_recovery_enabled: bool,
 }
 
 impl ServerConfig {
@@ -74,11 +82,20 @@ impl ServerConfig {
         let auth_token = std::env::var("ACPX_AUTH_TOKEN")
             .ok()
             .filter(|t| !t.is_empty());
+        let startup_session_recovery_enabled =
+            match std::env::var("ACPX_STARTUP_SESSION_RECOVERY_ENABLED") {
+                Ok(value) => value != "0",
+                Err(_) => std::env::var_os("ACPX_DB_PATH").is_some(),
+            };
+        let bridge = acpx_bridge::BridgeConfig::from_env()
+            .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
             default_agent_id,
             backend: SpawnSpec::new(program, args),
+            bridge,
             http_bind_addr,
             auth_token,
+            startup_session_recovery_enabled,
         }
     }
 }

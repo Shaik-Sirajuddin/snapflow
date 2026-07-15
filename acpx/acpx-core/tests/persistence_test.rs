@@ -1,7 +1,10 @@
 //! Phase 2 step 10 -- persistence round-trip tests, against an in-memory
 //! sqlite database (no filesystem dependency, isolated per test).
 
-use acpx_core::persistence::{Direction, PersistenceStore};
+use acpx_core::persistence::{
+    sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
+    Direction, PersistenceStore,
+};
 use serde_json::json;
 
 #[tokio::test]
@@ -33,6 +36,11 @@ async fn session_round_trips_and_starts_unclosed() {
     assert_eq!(fetched.tenant_id, "default");
     // closed_at starts null.
     assert_eq!(fetched.closed_at, None);
+    assert_eq!(fetched.status, RecoveryStatus::Active);
+    assert_eq!(fetched.recovery_method, RecoveryMethod::None);
+    assert_eq!(fetched.cwd, None);
+    assert_eq!(fetched.recovery_params, None);
+    assert_eq!(fetched.last_recovery_error, None);
 
     store
         .close_session("gw-1", "2026-07-12T01:00:00Z")
@@ -45,6 +53,94 @@ async fn session_round_trips_and_starts_unclosed() {
         .expect("get_session")
         .expect("session still exists");
     assert_eq!(closed.closed_at.as_deref(), Some("2026-07-12T01:00:00Z"));
+    assert_eq!(closed.status, RecoveryStatus::Closed);
+}
+
+#[tokio::test]
+async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    store
+        .record_session_with_recovery(
+            "gw-load",
+            "codex-acp",
+            "backend-load",
+            None,
+            "2026-07-12T00:00:00Z",
+            "default",
+            RecoveryMetadata {
+                cwd: Some("/workspace/project".to_string()),
+                recovery_params: Some(json!({"checkpoint": "abc"})),
+                status: RecoveryStatus::Active,
+                recovery_method: RecoveryMethod::Load,
+                last_recovery_error: None,
+            },
+        )
+        .await
+        .expect("record recoverable session");
+    store
+        .record_session_with_recovery(
+            "gw-none",
+            "codex-acp",
+            "backend-none",
+            None,
+            "2026-07-12T00:01:00Z",
+            "default",
+            RecoveryMetadata::default(),
+        )
+        .await
+        .expect("record non-recoverable session");
+
+    let recoverable = store
+        .list_recoverable_sessions()
+        .await
+        .expect("list recoverable sessions");
+    assert_eq!(recoverable.len(), 1);
+    let session = &recoverable[0];
+    assert_eq!(session.gateway_session_id, "gw-load");
+    assert_eq!(session.cwd.as_deref(), Some("/workspace/project"));
+    assert_eq!(session.recovery_params, Some(json!({"checkpoint": "abc"})));
+    assert_eq!(session.recovery_method, RecoveryMethod::Load);
+
+    store
+        .update_recovery_status(
+            "gw-load",
+            RecoveryStatus::RecoveryFailed,
+            Some("backend unavailable".to_string()),
+        )
+        .await
+        .expect("record recovery failure");
+    let failed = store
+        .get_session("gw-load")
+        .await
+        .expect("get session")
+        .expect("session exists");
+    assert_eq!(failed.status, RecoveryStatus::RecoveryFailed);
+    assert_eq!(
+        failed.last_recovery_error.as_deref(),
+        Some("backend unavailable")
+    );
+
+    store
+        .update_recovery_status("gw-load", RecoveryStatus::Restored, None)
+        .await
+        .expect("clear recovery failure");
+    let restored = store
+        .get_session("gw-load")
+        .await
+        .expect("get session")
+        .expect("session exists");
+    assert_eq!(restored.status, RecoveryStatus::Restored);
+    assert_eq!(restored.last_recovery_error, None);
+
+    store
+        .close_session("gw-load", "2026-07-12T01:00:00Z")
+        .await
+        .expect("close session");
+    assert!(store
+        .list_recoverable_sessions()
+        .await
+        .expect("list recoverable sessions")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -288,4 +384,43 @@ async fn pre_tenant_id_database_migrates_existing_rows_to_default() {
         .expect("get_session")
         .expect("row still present");
     assert_eq!(migrated_again.tenant_id, "default");
+}
+
+#[tokio::test]
+async fn pre_recovery_database_migrates_all_recovery_columns_idempotently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("pre-recovery.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw connection");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                gateway_session_id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                backend_session_id TEXT NOT NULL,
+                profile_name TEXT,
+                created_at TEXT NOT NULL,
+                closed_at TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default'
+            );
+            INSERT INTO sessions
+                (gateway_session_id, agent_id, backend_session_id, created_at, tenant_id)
+            VALUES
+                ('gw-old', 'codex-acp', 'backend-old', '2026-07-01T00:00:00Z', 'default');",
+        )
+        .expect("create pre-recovery schema");
+    }
+
+    let store = PersistenceStore::open(&db_path).expect("migrate recovery columns");
+    let migrated = store
+        .get_session("gw-old")
+        .await
+        .expect("get session")
+        .expect("pre-existing row survives migration");
+    assert_eq!(migrated.status, RecoveryStatus::Active);
+    assert_eq!(migrated.recovery_method, RecoveryMethod::None);
+    assert_eq!(migrated.cwd, None);
+    assert_eq!(migrated.recovery_params, None);
+    assert_eq!(migrated.last_recovery_error, None);
+
+    PersistenceStore::open(&db_path).expect("rerun idempotent recovery migration");
 }

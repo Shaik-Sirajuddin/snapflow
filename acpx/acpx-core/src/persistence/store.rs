@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::error::PersistenceError;
-use super::sessions::SessionRecord;
+use super::sessions::{RecoveryMetadata, RecoveryStatus, SessionRecord};
 use super::transcripts::{Direction, TranscriptRecord};
 
 #[derive(Clone)]
@@ -50,7 +50,7 @@ impl PersistenceStore {
 
     fn from_connection(conn: Connection) -> Result<Self, PersistenceError> {
         conn.execute_batch(super::SCHEMA_SQL)?;
-        migrate_tenant_id_column(&conn)?;
+        migrate_sessions_columns(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -69,25 +69,63 @@ impl PersistenceStore {
         created_at: impl Into<String>,
         tenant_id: impl Into<String>,
     ) -> Result<(), PersistenceError> {
+        self.record_session_with_recovery(
+            gateway_session_id,
+            agent_id,
+            backend_session_id,
+            profile_name,
+            created_at,
+            tenant_id,
+            RecoveryMetadata::default(),
+        )
+        .await
+    }
+
+    /// Record a newly-created session with durable recovery metadata.
+    ///
+    /// [`Self::record_session`] remains the compatibility API for callers
+    /// that do not yet provide recovery data.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_session_with_recovery(
+        &self,
+        gateway_session_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        backend_session_id: impl Into<String>,
+        profile_name: Option<String>,
+        created_at: impl Into<String>,
+        tenant_id: impl Into<String>,
+        recovery: RecoveryMetadata,
+    ) -> Result<(), PersistenceError> {
         let gateway_session_id = gateway_session_id.into();
         let agent_id = agent_id.into();
         let backend_session_id = backend_session_id.into();
         let created_at = created_at.into();
         let tenant_id = tenant_id.into();
+        let recovery_params_json = recovery
+            .recovery_params
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
             conn.execute(
                 "INSERT INTO sessions \
-                 (gateway_session_id, agent_id, backend_session_id, profile_name, created_at, tenant_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (gateway_session_id, agent_id, backend_session_id, profile_name, created_at, tenant_id, \
+                  cwd, recovery_params_json, status, recovery_method, last_recovery_error) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     gateway_session_id,
                     agent_id,
                     backend_session_id,
                     profile_name,
                     created_at,
-                    tenant_id
+                    tenant_id,
+                    recovery.cwd,
+                    recovery_params_json,
+                    recovery.status,
+                    recovery.recovery_method,
+                    recovery.last_recovery_error
                 ],
             )?;
             Ok(())
@@ -108,7 +146,7 @@ impl PersistenceStore {
         run_blocking(move || {
             let conn = lock(&conn)?;
             let rows = conn.execute(
-                "UPDATE sessions SET closed_at = ?1 WHERE gateway_session_id = ?2",
+                "UPDATE sessions SET closed_at = ?1, status = 'closed' WHERE gateway_session_id = ?2",
                 params![closed_at, gateway_session_id],
             )?;
             if rows == 0 {
@@ -130,7 +168,8 @@ impl PersistenceStore {
             let conn = lock(&conn)?;
             let mut stmt = conn.prepare(
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
-                        created_at, closed_at, tenant_id \
+                        created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
+                        recovery_method, last_recovery_error \
                  FROM sessions WHERE gateway_session_id = ?1",
             )?;
             let mut rows = stmt.query_map(params![gateway_session_id], row_to_session_record)?;
@@ -152,11 +191,61 @@ impl PersistenceStore {
             let conn = lock(&conn)?;
             let mut stmt = conn.prepare(
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
-                        created_at, closed_at, tenant_id \
+                        created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
+                        recovery_method, last_recovery_error \
                  FROM sessions ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// List sessions that are still open and have an explicit recovery
+    /// mechanism. These rows are candidates for startup recovery.
+    pub async fn list_recoverable_sessions(&self) -> Result<Vec<SessionRecord>, PersistenceError> {
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn.prepare(
+                "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
+                        created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
+                        recovery_method, last_recovery_error \
+                 FROM sessions \
+                 WHERE closed_at IS NULL \
+                   AND status != 'closed' \
+                   AND recovery_method IN ('load', 'resume') \
+                 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map([], row_to_session_record)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Persist the current startup-recovery result for a session.
+    ///
+    /// Passing `None` clears any previously stored recovery error.
+    pub async fn update_recovery_status(
+        &self,
+        gateway_session_id: impl Into<String>,
+        status: RecoveryStatus,
+        last_recovery_error: Option<String>,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let rows = conn.execute(
+                "UPDATE sessions \
+                 SET status = ?1, last_recovery_error = ?2 \
+                 WHERE gateway_session_id = ?3",
+                params![status, last_recovery_error, gateway_session_id],
+            )?;
+            if rows == 0 {
+                return Err(PersistenceError::SessionNotFound(gateway_session_id));
+            }
+            Ok(())
         })
         .await
     }
@@ -235,6 +324,18 @@ impl PersistenceStore {
 }
 
 fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    let recovery_params_json = row.get::<_, Option<String>>(8)?;
+    let recovery_params = recovery_params_json
+        .map(|text| {
+            serde_json::from_str(&text).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })
+        })
+        .transpose()?;
     Ok(SessionRecord {
         gateway_session_id: row.get(0)?,
         agent_id: row.get(1)?,
@@ -243,35 +344,40 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         created_at: row.get(4)?,
         closed_at: row.get(5)?,
         tenant_id: row.get(6)?,
+        cwd: row.get(7)?,
+        recovery_params,
+        status: row.get(9)?,
+        recovery_method: row.get(10)?,
+        last_recovery_error: row.get(11)?,
     })
 }
 
-/// **Phase C (`acpx-tenant-isolation`).** Idempotent upgrade path for
-/// databases created before `tenant_id` existed: `CREATE TABLE IF NOT
-/// EXISTS` (in `SCHEMA_SQL`, applied unconditionally above) never touches
-/// an already-existing `sessions` table, so a pre-existing on-disk
-/// database would otherwise be missing the column entirely and every
-/// query above would fail with "no such column: tenant_id". Sqlite has no
-/// `ADD COLUMN IF NOT EXISTS`, so this checks `PRAGMA table_info` first
-/// (same pattern used everywhere else idempotent schema evolution is
-/// needed in this codebase) and only runs `ALTER TABLE` when the column
-/// is genuinely absent. Existing rows backfill to `'default'` via the
-/// column's own `DEFAULT` clause -- exactly the tenant every pre-tenant-
-/// isolation session implicitly belonged to, since `TenantId::default_tenant`
-/// is what every caller used before `X-Acpx-Tenant` existed.
-fn migrate_tenant_id_column(conn: &Connection) -> Result<(), PersistenceError> {
+/// Idempotently add columns introduced after the first `sessions` schema.
+///
+/// `CREATE TABLE IF NOT EXISTS` never changes an existing table, and SQLite
+/// has no `ADD COLUMN IF NOT EXISTS`, so upgrades inspect `PRAGMA table_info`
+/// before applying each additive migration.
+fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
     let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-    let has_tenant_id = stmt
+    let column_names = stmt
         .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == "tenant_id");
+        .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
-    if !has_tenant_id {
-        conn.execute(
-            "ALTER TABLE sessions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
-            [],
-        )?;
+
+    for (name, definition) in [
+        ("tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
+        ("cwd", "TEXT"),
+        ("recovery_params_json", "TEXT"),
+        ("status", "TEXT NOT NULL DEFAULT 'active'"),
+        ("recovery_method", "TEXT NOT NULL DEFAULT 'none'"),
+        ("last_recovery_error", "TEXT"),
+    ] {
+        if !column_names.iter().any(|column| column == name) {
+            conn.execute(
+                &format!("ALTER TABLE sessions ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
     }
     Ok(())
 }

@@ -178,6 +178,19 @@ impl SessionRegistry {
             .flat_map(|inner| inner.iter())
     }
 
+    /// Number of live gateway sessions across every tenant.
+    pub fn len(&self) -> usize {
+        self.sessions.values().map(HashMap::len).sum()
+    }
+
+    /// Number of live gateway sessions owned by one tenant.
+    pub fn len_for_tenant(&self, tenant_id: &TenantId) -> usize {
+        self.sessions
+            .get(tenant_id)
+            .map(HashMap::len)
+            .unwrap_or_default()
+    }
+
     /// Reverse lookup: does a gateway session id already exist for this
     /// exact `(agent_id, backend_session_id)` pair? **Phase 13 addition.**
     /// Backs the real, per-backend `session/list` path's backend-id ->
@@ -380,5 +393,29 @@ mod tests {
         );
         assert_eq!(reg.find_owner("codex-acp", "backend-1"), Some(&tenant_a));
         assert_eq!(reg.find_owner("codex-acp", "backend-2"), None);
+    }
+
+    #[test]
+    fn lengths_track_total_and_tenant_scoped_sessions() {
+        let mut reg = SessionRegistry::new();
+        let tenant_a = TenantId::from("tenant-a");
+        let tenant_b = TenantId::from("tenant-b");
+        reg.register(
+            &tenant_a,
+            "claude-agent-acp",
+            BackendSessionId("a-1".to_string()),
+            None,
+            None,
+        );
+        reg.register(
+            &tenant_b,
+            "codex-acp",
+            BackendSessionId("b-1".to_string()),
+            None,
+            None,
+        );
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.len_for_tenant(&tenant_a), 1);
+        assert_eq!(reg.len_for_tenant(&TenantId::from("tenant-c")), 0);
     }
 }

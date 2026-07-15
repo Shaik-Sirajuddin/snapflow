@@ -3,9 +3,19 @@
 version = 4
 
 [[package]]
+name = "acpx-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "acpx-client"
 version = "0.1.0"
 dependencies = [
+ "acpx-bridge",
  "acpx-conductor",
  "acpx-core",
  "acpx-proto",
@@ -84,6 +94,7 @@ dependencies = [
 name = "acpx-server"
 version = "0.1.0"
 dependencies = [
+ "acpx-bridge",
  "acpx-client",
  "acpx-conductor",
  "acpx-core",

@@ -144,6 +144,9 @@ fn tokens_match(presented: &str, expected: &str) -> bool {
 pub struct AppState {
     pub router: SharedRouter,
     pub auth: AuthConfig,
+    /// `None` means `/acp/*` is intentionally not mounted. This is a
+    /// feature gate, not an authorization check.
+    pub bridge: Option<Arc<acpx_bridge::BridgeConfig>>,
 }
 
 /// Header carrying an explicit profile selection, highest precedence per
@@ -210,19 +213,39 @@ pub async fn serve_on(
     router: SharedRouter,
     auth_token: Option<String>,
 ) -> anyhow::Result<()> {
+    serve_on_with_bridge(listener, router, auth_token, None).await
+}
+
+/// Same as [`serve_on`], with an explicitly enabled strict-ACP bridge.
+/// Kept separate so all pre-existing callers/tests retain their legacy
+/// `/rpc` + `/ws` surface without constructing bridge configuration.
+pub async fn serve_on_with_bridge(
+    listener: tokio::net::TcpListener,
+    router: SharedRouter,
+    auth_token: Option<String>,
+    bridge: Option<acpx_bridge::BridgeConfig>,
+) -> anyhow::Result<()> {
     let state = AppState {
         router,
         auth: AuthConfig::new(auth_token),
+        bridge: bridge.map(Arc::new),
     };
     let auth_enabled = state.auth.token.is_some();
-    let app = axum::Router::new()
+    let bridge_enabled = state.bridge.is_some();
+    let mut app = axum::Router::new()
         .route("/rpc", post(rpc_handler))
-        .route("/ws", get(super::ws::ws_handler))
-        .with_state(state);
+        .route("/ws", get(super::ws::ws_handler));
+    if bridge_enabled {
+        app = app
+            .route("/acp/agents", get(acp_agents_handler))
+            .route("/acp/models", get(acp_models_handler));
+    }
+    let app = app.with_state(state);
 
     tracing::info!(
         bind_addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
         auth_enabled,
+        bridge_enabled,
         "acpx-server HTTP/WS transport listening (no TLS -- see 05-open-risks.md; \
          set ACPX_AUTH_TOKEN for bearer-token auth)"
     );
@@ -246,6 +269,79 @@ async fn rpc_handler(
             Err(err) => json_rpc_error(&request, err),
         };
     Json(response).into_response()
+}
+
+/// Secret-safe view of the bridge-enabled adapters, derived from ACPX's own
+/// native `agents/list` implementation rather than duplicating registry or
+/// install detection in the HTTP transport.
+async fn acp_agents_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(bridge) = &state.bridge else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let tenant_id = resolve_tenant(&headers);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "acp-bridge-agents",
+        "method": "agents/list",
+        "params": {}
+    });
+    let response =
+        match dispatch_shared_for_tenant(&state.router, &tenant_id, request.clone()).await {
+            Ok(response) => response,
+            Err(err) => return Json(json_rpc_error(&request, err)).into_response(),
+        };
+    let allowed = bridge.agent_ids();
+    let agents = response
+        .get("result")
+        .and_then(|result| result.get("agents"))
+        .and_then(serde_json::Value::as_array)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter(|agent| {
+                    agent
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| allowed.contains(id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Json(serde_json::json!({ "agents": agents })).into_response()
+}
+
+/// Public model aliases are bridge policy filtered through ACPX's native
+/// adapter detection result. No command, credential, profile, or provider
+/// information is emitted here.
+async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(bridge) = &state.bridge else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let tenant_id = resolve_tenant(&headers);
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "acp-bridge-models",
+        "method": "agents/list",
+        "params": {}
+    });
+    let response =
+        match dispatch_shared_for_tenant(&state.router, &tenant_id, request.clone()).await {
+            Ok(response) => response,
+            Err(err) => return Json(json_rpc_error(&request, err)).into_response(),
+        };
+    let agents_result = response.get("result").cloned().unwrap_or_default();
+    Json(serde_json::json!({
+        "defaultModel": bridge.default_model,
+        "models": bridge.public_models(&agents_result),
+    }))
+    .into_response()
 }
 
 /// `401 Unauthorized` with a JSON-RPC-shaped error body (same envelope as

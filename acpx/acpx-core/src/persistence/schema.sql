@@ -15,7 +15,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- `migrate_tenant_id_column` for the idempotent `ALTER TABLE` that
     -- covers upgrades. `NOT NULL DEFAULT 'default'` here only governs
     -- brand-new databases created after this change.
-    tenant_id TEXT NOT NULL DEFAULT 'default'
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    cwd TEXT,
+    recovery_params_json TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    recovery_method TEXT NOT NULL DEFAULT 'none',
+    last_recovery_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transcripts (

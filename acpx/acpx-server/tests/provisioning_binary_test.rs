@@ -5,6 +5,10 @@
 //! wiring, never that `main.rs` actually reads `ACPX_CONFIG_FILE` and
 //! calls it before either transport starts.
 
+use acpx_core::persistence::{
+    sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
+    PersistenceStore,
+};
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::process::Stdio;
@@ -25,6 +29,26 @@ while IFS= read -r line; do
     printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
   else
     printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+
+/// Records every backend call. The log path is the script's first argument
+/// because `ACPX_BACKEND_CMD` only supports whitespace-separated arguments.
+const RECOVERY_RECORDING_BACKEND_SCRIPT: &str = r#"
+log_path=$1
+while IFS= read -r line; do
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  printf '%s\t%s\n' "$method" "$line" >> "$log_path"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
+  if echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  elif echo "$line" | grep -q 'session/load'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"loaded":true}}\n' "$id"
+  elif echo "$line" | grep -q 'session/prompt'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"prompted":true}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
   fi
 done
 "#;
@@ -55,6 +79,54 @@ async fn ephemeral_addr() -> SocketAddr {
     let addr = probe.local_addr().expect("local_addr");
     drop(probe);
     addr
+}
+
+async fn wait_for_listener(addr: SocketAddr) {
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("real binary never opened its HTTP listener");
+}
+
+async fn wait_for_log_line(log_path: &std::path::Path, prefix: &str) -> Vec<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(log_path).await {
+                let lines: Vec<String> = contents.lines().map(str::to_owned).collect();
+                if lines.iter().any(|line| line.starts_with(prefix)) {
+                    return lines;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("backend log never contained {prefix:?}"))
+}
+
+async fn seed_recoverable_session(db_path: &std::path::Path, profile_name: Option<&str>) {
+    let store = PersistenceStore::open(db_path).expect("open sqlite persistence store");
+    store
+        .record_session_with_recovery(
+            "gateway-recovered",
+            "default",
+            "backend-recovered",
+            profile_name.map(str::to_owned),
+            "2026-01-01T00:00:00Z",
+            "default",
+            RecoveryMetadata {
+                cwd: Some("/workspace".to_string()),
+                recovery_params: Some(json!({"cwd": "/workspace"})),
+                status: RecoveryStatus::Active,
+                recovery_method: RecoveryMethod::Load,
+                last_recovery_error: None,
+            },
+        )
+        .await
+        .expect("seed recoverable session");
 }
 
 struct ServerGuard {
@@ -103,15 +175,7 @@ async fn real_binary_applies_a_provisioning_file_at_startup() {
         _config_path: config_path,
     };
 
-    let mut connected = false;
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            connected = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(connected, "real binary never opened its HTTP listener");
+    wait_for_listener(addr).await;
 
     let client = reqwest::Client::new();
 
@@ -213,4 +277,210 @@ async fn real_binary_refuses_to_start_with_an_invalid_provisioning_file() {
 
     let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&config_path);
+}
+
+/// Proactive recovery must finish before startup binds a client transport:
+/// this starts a fresh compiled binary from a SQLite row and verifies the
+/// stand-in backend sees `session/load` before this test sends its first
+/// JSON-RPC request.
+#[tokio::test]
+async fn real_binary_recovers_open_sqlite_sessions_before_client_requests() {
+    let addr = ephemeral_addr().await;
+    let db_path = write_temp_file("acpx-startup-recovery-db", "");
+    let log_path = write_temp_file("acpx-startup-recovery-log", "");
+    let script_path = write_temp_file(
+        "acpx-startup-recovery-backend",
+        RECOVERY_RECORDING_BACKEND_SCRIPT,
+    );
+    let config_path = write_temp_file(
+        "acpx-startup-recovery-config",
+        &json!({
+            "profiles": [{"name": "recovery", "agent_id": "default"}]
+        })
+        .to_string(),
+    );
+
+    let mut first_cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    first_cmd
+        .env(
+            "ACPX_BACKEND_CMD",
+            format!("sh {} {}", script_path.display(), log_path.display()),
+        )
+        .env("ACPX_HTTP_BIND", addr.to_string())
+        .env("ACPX_DB_PATH", db_path.display().to_string())
+        .env("ACPX_CONFIG_FILE", config_path.display().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let first_child = first_cmd
+        .spawn()
+        .expect("spawn first real acpx-server binary");
+    let mut first_guard = ServerGuard {
+        child: first_child,
+        _script_path: script_path.clone(),
+        _config_path: config_path.clone(),
+    };
+
+    wait_for_listener(addr).await;
+    let session_new = reqwest::Client::new()
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {"cwd": "/workspace", "_acpx": {"profile": "recovery"}}
+        }))
+        .send()
+        .await
+        .expect("POST /rpc session/new")
+        .json::<Value>()
+        .await
+        .expect("json body");
+    let gateway_session_id = session_new["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new did not return a gateway session id: {session_new}"))
+        .to_string();
+
+    // The second process must recover solely from the SQLite row written by
+    // this first real process, not from any inherited in-memory state.
+    let _ = first_guard.child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), first_guard.child.wait())
+        .await
+        .expect("first server exited after kill");
+    drop(first_guard);
+    let _ = std::fs::remove_file(&log_path);
+
+    let restart_addr = ephemeral_addr().await;
+    let mut restart_cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    restart_cmd
+        .env(
+            "ACPX_BACKEND_CMD",
+            format!("sh {} {}", script_path.display(), log_path.display()),
+        )
+        .env("ACPX_HTTP_BIND", restart_addr.to_string())
+        .env("ACPX_DB_PATH", db_path.display().to_string())
+        .env("ACPX_CONFIG_FILE", config_path.display().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = restart_cmd
+        .spawn()
+        .expect("spawn restarted real acpx-server binary");
+    let mut guard = ServerGuard {
+        child,
+        _script_path: script_path,
+        _config_path: config_path,
+    };
+
+    // `wait_for_listener` cannot complete until recovery has completed,
+    // because main calls recovery before binding the listener.
+    wait_for_listener(restart_addr).await;
+    let methods = wait_for_log_line(&log_path, "session/load\t").await;
+    assert!(
+        methods
+            .iter()
+            .any(|line| line.contains("\"sessionId\":\"backend-abc\"")),
+        "startup recovery did not load the persisted backend session: {methods:?}"
+    );
+
+    let prompt = reqwest::Client::new()
+        .post(format!("http://{restart_addr}/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": gateway_session_id,
+                "prompt": [{"type": "text", "text": "after recovery"}]
+            }
+        }))
+        .send()
+        .await
+        .expect("POST /rpc session/prompt")
+        .json::<Value>()
+        .await
+        .expect("json body");
+    assert_eq!(prompt["result"]["prompted"], true, "{prompt:?}");
+
+    let methods = wait_for_log_line(&log_path, "session/prompt\t").await;
+    let load_index = methods
+        .iter()
+        .position(|line| line.starts_with("session/load\t"))
+        .expect("startup session/load");
+    let prompt_index = methods
+        .iter()
+        .position(|line| line.starts_with("session/prompt\t"))
+        .expect("client session/prompt");
+    assert!(
+        load_index < prompt_index,
+        "startup recovery must load before any client prompt: {methods:?}"
+    );
+
+    let _ = guard.child.start_kill();
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_file(log_path);
+}
+
+#[tokio::test]
+async fn real_binary_skips_startup_recovery_when_disabled() {
+    let addr = ephemeral_addr().await;
+    let db_path = write_temp_file("acpx-startup-recovery-disabled-db", "");
+    let log_path = write_temp_file("acpx-startup-recovery-disabled-log", "");
+    let script_path = write_temp_file(
+        "acpx-startup-recovery-disabled-backend",
+        RECOVERY_RECORDING_BACKEND_SCRIPT,
+    );
+    seed_recoverable_session(&db_path, None).await;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    cmd.env(
+        "ACPX_BACKEND_CMD",
+        format!("sh {} {}", script_path.display(), log_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_DB_PATH", db_path.display().to_string())
+    .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn real acpx-server binary");
+    let mut guard = ServerGuard {
+        child,
+        _script_path: script_path,
+        _config_path: std::path::PathBuf::new(),
+    };
+
+    wait_for_listener(addr).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log_contents.contains("session/load\t"),
+        "disabled recovery still called the backend: {log_contents:?}"
+    );
+
+    let prompt = reqwest::Client::new()
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {"sessionId": "gateway-recovered", "prompt": []}
+        }))
+        .send()
+        .await
+        .expect("POST /rpc session/prompt")
+        .json::<Value>()
+        .await
+        .expect("json body");
+    assert!(
+        prompt.get("error").is_some(),
+        "disabled recovery should leave the persisted session unloaded: {prompt:?}"
+    );
+
+    let _ = guard.child.start_kill();
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_file(log_path);
 }

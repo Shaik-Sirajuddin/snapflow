@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use acpx_bridge::{BridgeConfig, BridgeModel};
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::Router;
 use futures_util::{SinkExt, StreamExt};
@@ -36,7 +37,7 @@ mod live;
 #[path = "../src/transport/ws.rs"]
 mod ws;
 
-use http::{serve, SharedRouter};
+use http::{serve, serve_on_with_bridge, SharedRouter};
 
 /// Echoes back a canned `session/new` result carrying `sessionId`
 /// `"backend-abc"`, or `{"ok": true}` for anything else -- same shape as
@@ -116,6 +117,114 @@ async fn spawn_server(router: SharedRouter) -> SocketAddr {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     addr
+}
+
+/// Starts the bridge-enabled transport on an already-bound loopback
+/// listener, matching the production `serve_on_with_bridge` startup path.
+async fn spawn_server_with_bridge(router: SharedRouter, bridge: BridgeConfig) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+
+    tokio::spawn(async move {
+        serve_on_with_bridge(listener, router, None, Some(bridge))
+            .await
+            .expect("transport::serve_on_with_bridge");
+    });
+
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    addr
+}
+
+#[tokio::test]
+async fn legacy_server_does_not_mount_acp_model_catalog() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let addr = spawn_server(Arc::new(Mutex::new(router))).await;
+
+    let response = reqwest::get(format!("http://{addr}/acp/models"))
+        .await
+        .expect("GET /acp/models");
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn bridge_catalog_routes_expose_only_configured_public_entries() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let addr = spawn_server_with_bridge(
+        Arc::new(Mutex::new(router)),
+        BridgeConfig {
+            default_model: "public/sonnet".to_string(),
+            models: vec![
+                BridgeModel {
+                    id: "public/sonnet".to_string(),
+                    name: Some("Public Sonnet".to_string()),
+                    agent_id: "codex-acp".to_string(),
+                    model_id: "internal-model-secret-one".to_string(),
+                },
+                BridgeModel {
+                    id: "public/private".to_string(),
+                    name: None,
+                    agent_id: "not-a-registry-adapter".to_string(),
+                    model_id: "internal-model-secret-two".to_string(),
+                },
+            ],
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let models_response = client
+        .get(format!("http://{addr}/acp/models"))
+        .send()
+        .await
+        .expect("GET /acp/models");
+    assert!(models_response.status().is_success());
+    let models: serde_json::Value = models_response.json().await.expect("models json body");
+    assert_eq!(models["defaultModel"], json!("public/sonnet"));
+    assert_eq!(
+        models["models"]
+            .as_array()
+            .expect("models is an array")
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id"))
+            .collect::<Vec<_>>(),
+        vec!["public/sonnet", "public/private"]
+    );
+    assert!(models["models"]
+        .as_array()
+        .expect("models is an array")
+        .iter()
+        .all(|model| model
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .is_some()));
+    let models_text = models.to_string();
+    assert!(!models_text.contains("internal-model-secret-one"));
+    assert!(!models_text.contains("internal-model-secret-two"));
+    assert!(!models_text.contains("modelId"));
+
+    let agents_response = client
+        .get(format!("http://{addr}/acp/agents"))
+        .send()
+        .await
+        .expect("GET /acp/agents");
+    assert!(agents_response.status().is_success());
+    let agents: serde_json::Value = agents_response.json().await.expect("agents json body");
+    let configured_agent_ids = ["codex-acp", "not-a-registry-adapter"];
+    assert!(agents["agents"]
+        .as_array()
+        .expect("agents is an array")
+        .iter()
+        .all(|agent| configured_agent_ids.contains(&agent["id"].as_str().expect("agent id"))));
 }
 
 #[tokio::test]

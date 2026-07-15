@@ -5,14 +5,19 @@
 //! Phase 2/3.
 
 use crate::keystore::Keystore;
+use crate::lifecycle::LifecycleConfig;
 use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
-use crate::persistence::{Direction, PersistenceStore};
+use crate::persistence::{
+    sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
+    Direction, PersistenceStore,
+};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
 use acpx_proto::agent::AgentStatus;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Which bucket a given JSON-RPC method falls into. See the classification
@@ -214,6 +219,13 @@ fn session_list_selector(params: &serde_json::Value) -> Option<SessionListSelect
 pub struct Router {
     supervisor: acpx_conductor::Supervisor,
     sessions: SessionRegistry,
+    /// Native gateway-wide limits, checked before `session/new` consumes
+    /// a connector/backend session.
+    lifecycle: LifecycleConfig,
+    /// Live and in-flight session admissions. This is independent of the
+    /// router lock so permits can safely span backend I/O without leaking
+    /// capacity when their owning task is cancelled.
+    admission: Arc<Mutex<AdmissionState>>,
     /// Fallback agent id used when `session/new` carries no `_acpx.profile`
     /// (native/unmanaged mode, see `02-architecture.md`) -- Phase 3 adds
     /// real profile -> agent resolution; until then every session goes to
@@ -276,6 +288,136 @@ pub struct Router {
     scavenged_backends: HashSet<usize>,
 }
 
+/// Outcome of proactively restoring durable sessions during startup.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StartupRecoveryReport {
+    /// Rows restored into the live [`SessionRegistry`].
+    pub restored: usize,
+    /// Rows whose backend recovery RPC failed.
+    pub failed: usize,
+    /// Rows already registered in this router, so no recovery was needed.
+    pub skipped: usize,
+}
+
+#[derive(Debug, Default)]
+struct AdmissionState {
+    live_total: usize,
+    live_by_tenant: HashMap<TenantId, usize>,
+    reserved_total: usize,
+    reserved_by_tenant: HashMap<TenantId, usize>,
+}
+
+impl AdmissionState {
+    fn reserve(
+        &mut self,
+        tenant_id: &TenantId,
+        lifecycle: &LifecycleConfig,
+    ) -> Result<(), RouterError> {
+        let total = self.live_total + self.reserved_total;
+        if total >= lifecycle.max_sessions_total {
+            return Err(RouterError::GlobalSessionCapacity {
+                current: total,
+                limit: lifecycle.max_sessions_total,
+            });
+        }
+        let tenant_count = self
+            .live_by_tenant
+            .get(tenant_id)
+            .copied()
+            .unwrap_or_default()
+            + self
+                .reserved_by_tenant
+                .get(tenant_id)
+                .copied()
+                .unwrap_or_default();
+        if tenant_count >= lifecycle.max_sessions_per_tenant {
+            return Err(RouterError::TenantSessionCapacity {
+                tenant: tenant_id.0.clone(),
+                current: tenant_count,
+                limit: lifecycle.max_sessions_per_tenant,
+            });
+        }
+        self.reserved_total += 1;
+        *self
+            .reserved_by_tenant
+            .entry(tenant_id.clone())
+            .or_default() += 1;
+        Ok(())
+    }
+
+    fn release_reservation(&mut self, tenant_id: &TenantId) {
+        debug_assert!(self.reserved_total > 0);
+        self.reserved_total -= 1;
+        let remove_tenant = {
+            let reserved = self
+                .reserved_by_tenant
+                .get_mut(tenant_id)
+                .expect("session admission tenant must exist");
+            debug_assert!(*reserved > 0);
+            *reserved -= 1;
+            *reserved == 0
+        };
+        if remove_tenant {
+            self.reserved_by_tenant.remove(tenant_id);
+        }
+    }
+
+    fn commit(&mut self, tenant_id: &TenantId) {
+        self.release_reservation(tenant_id);
+        self.live_total += 1;
+        *self.live_by_tenant.entry(tenant_id.clone()).or_default() += 1;
+    }
+
+    fn release_live(&mut self, tenant_id: &TenantId) {
+        debug_assert!(self.live_total > 0);
+        self.live_total -= 1;
+        let remove_tenant = {
+            let live = self
+                .live_by_tenant
+                .get_mut(tenant_id)
+                .expect("registered session tenant must exist");
+            debug_assert!(*live > 0);
+            *live -= 1;
+            *live == 0
+        };
+        if remove_tenant {
+            self.live_by_tenant.remove(tenant_id);
+        }
+    }
+}
+
+/// Reserves one future registry insertion. Dropping an uncommitted permit
+/// returns the reservation, including when Tokio cancels the request task.
+struct SessionAdmissionPermit {
+    state: Arc<Mutex<AdmissionState>>,
+    tenant_id: TenantId,
+    committed: bool,
+}
+
+impl SessionAdmissionPermit {
+    fn commit(mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.commit(&self.tenant_id);
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionAdmissionPermit {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.release_reservation(&self.tenant_id);
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
     #[error("request has no \"method\" field")]
@@ -290,6 +432,16 @@ pub enum RouterError {
     MissingSessionId,
     #[error("no session registered for gateway session id {0}")]
     UnknownSession(String),
+    #[error(
+        "session capacity reached for tenant {tenant}: {current}/{limit} live gateway sessions"
+    )]
+    TenantSessionCapacity {
+        tenant: String,
+        current: usize,
+        limit: usize,
+    },
+    #[error("global session capacity reached: {current}/{limit} live gateway sessions")]
+    GlobalSessionCapacity { current: usize, limit: usize },
     #[error("backend response to session/new has no result.sessionId")]
     MissingBackendSessionId,
     #[error("backend rejected session/new: {0}")]
@@ -345,6 +497,10 @@ pub enum RouterError {
     LogoutNotSupported,
     #[error("backend rejected session/list: {0}")]
     BackendSessionListError(serde_json::Value),
+    #[error("startup recovery for gateway session {0} has non-object recovery params")]
+    InvalidRecoveryParams(String),
+    #[error("persistence: {0}")]
+    Persistence(#[from] crate::persistence::PersistenceError),
 }
 
 impl Router {
@@ -352,6 +508,8 @@ impl Router {
         Self {
             supervisor: acpx_conductor::Supervisor::new(),
             sessions: SessionRegistry::new(),
+            lifecycle: LifecycleConfig::default(),
+            admission: Arc::new(Mutex::new(AdmissionState::default())),
             default_agent_id: default_agent_id.into(),
             http: reqwest::Client::new(),
             registry_cache: None,
@@ -408,6 +566,35 @@ impl Router {
     pub fn with_persistence(mut self, store: PersistenceStore) -> Self {
         self.persistence = Some(store);
         self
+    }
+
+    /// Override native session limits. Server configuration should validate
+    /// the values before constructing a router; this builder preserves the
+    /// low-friction in-process test API.
+    pub fn with_lifecycle_config(mut self, config: LifecycleConfig) -> Self {
+        self.lifecycle = config;
+        self
+    }
+
+    fn admit_session(&self, tenant_id: &TenantId) -> Result<SessionAdmissionPermit, RouterError> {
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.reserve(tenant_id, &self.lifecycle)?;
+        Ok(SessionAdmissionPermit {
+            state: Arc::clone(&self.admission),
+            tenant_id: tenant_id.clone(),
+            committed: false,
+        })
+    }
+
+    fn release_live_session(&self, tenant_id: &TenantId) {
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.release_live(tenant_id);
     }
 
     /// Register how to spawn a given agent id. Mirrors
@@ -473,25 +660,37 @@ impl Router {
         );
     }
 
-    /// Fire-and-forget persistence for a freshly-registered session:
-    /// `record_session` followed by the two `session/new` transcript rows
-    /// (client request, agent response), all inside a *single* spawned
-    /// task so the writes are strictly ordered.
-    ///
-    /// This matters beyond bookkeeping: `transcripts.gateway_session_id`
-    /// has a `FOREIGN KEY` on `sessions.gateway_session_id` (see
-    /// `persistence/mod.rs`'s `SCHEMA_SQL`). Spawning `record_session` and
-    /// the transcript appends as three *independent* `tokio::spawn` tasks
-    /// (as this used to do) races them against each other -- if either
-    /// transcript insert's blocking-pool task got scheduled before
-    /// `record_session`'s, sqlite rejected it with `FOREIGN KEY constraint
-    /// failed`, and because these are fire-and-forget the error was only
-    /// ever logged via `tracing::warn!`, never surfacing to a caller. That
-    /// produced the exact flake seen in `router_persistence_test.rs`:
-    /// `list_transcripts` intermittently stuck at 0 or 1 instead of 2.
-    /// Doing all three writes sequentially inside one task preserves the
-    /// "never block the client-visible request path" property while
-    /// guaranteeing the parent `sessions` row always lands first.
+    async fn persist_session_recovery(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        entry: &crate::session_registry::SessionEntry,
+        effective_params: serde_json::Value,
+    ) -> Result<(), RouterError> {
+        let Some(store) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        store
+            .record_session_with_recovery(
+                gateway_session_id,
+                entry.agent_id.clone(),
+                entry.backend_session_id.0.clone(),
+                entry.profile_name.clone(),
+                now_rfc3339(),
+                tenant_id.0.clone(),
+                RecoveryMetadata {
+                    cwd: entry.cwd.clone(),
+                    recovery_params: Some(effective_params),
+                    status: RecoveryStatus::Active,
+                    recovery_method: RecoveryMethod::Load,
+                    last_recovery_error: None,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn spawn_session_persistence(
         &self,
         tenant_id: &TenantId,
@@ -512,6 +711,148 @@ impl Router {
             client_request,
             agent_response,
         );
+    }
+
+    /// Restore all durable, open sessions before the router begins serving
+    /// prompts. Failed rows remain durable for later inspection/retry but
+    /// are intentionally never added to the live registry.
+    pub async fn recover_open_sessions(&mut self) -> Result<StartupRecoveryReport, RouterError> {
+        let Some(store) = self.persistence.clone() else {
+            return Ok(StartupRecoveryReport::default());
+        };
+        let mut report = StartupRecoveryReport::default();
+
+        for record in store.list_recoverable_sessions().await? {
+            if record.recovery_method != RecoveryMethod::Load {
+                // Proactive recovery currently has one deliberate backend
+                // contract: replay persisted context through session/load.
+                // Keep future resume rows durable but do not guess at their
+                // different backend semantics.
+                report.skipped += 1;
+                continue;
+            }
+            let tenant_id = TenantId(record.tenant_id.clone());
+            let gateway_id =
+                acpx_proto::session::GatewaySessionId(record.gateway_session_id.clone());
+            if self.sessions.resolve(&tenant_id, &gateway_id).is_some() {
+                report.skipped += 1;
+                continue;
+            }
+
+            store
+                .update_recovery_status(
+                    record.gateway_session_id.clone(),
+                    RecoveryStatus::Restoring,
+                    None,
+                )
+                .await?;
+
+            let result = self.restore_open_session(&record).await;
+            match result {
+                Ok((tenant_id, entry, admission)) => {
+                    store
+                        .update_recovery_status(
+                            record.gateway_session_id.clone(),
+                            RecoveryStatus::Restored,
+                            None,
+                        )
+                        .await?;
+                    self.sessions.insert(
+                        &tenant_id,
+                        acpx_proto::session::GatewaySessionId(record.gateway_session_id.clone()),
+                        entry,
+                    );
+                    admission.commit();
+                    report.restored += 1;
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    store
+                        .update_recovery_status(
+                            record.gateway_session_id.clone(),
+                            RecoveryStatus::RecoveryFailed,
+                            Some(error),
+                        )
+                        .await?;
+                    report.failed += 1;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    async fn restore_open_session(
+        &mut self,
+        record: &crate::persistence::SessionRecord,
+    ) -> Result<
+        (
+            TenantId,
+            crate::session_registry::SessionEntry,
+            SessionAdmissionPermit,
+        ),
+        RouterError,
+    > {
+        let tenant_id = TenantId(record.tenant_id.clone());
+        if let Some(profile_name) = record.profile_name.as_deref() {
+            // A fresh router has not yet registered the profile-specific
+            // supervisor key persisted with the session.
+            self.resolve_profile(profile_name).await?;
+        }
+
+        let mut params = record
+            .recovery_params
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let params_object = params
+            .as_object_mut()
+            .ok_or_else(|| RouterError::InvalidRecoveryParams(record.gateway_session_id.clone()))?;
+        params_object.insert(
+            "sessionId".to_string(),
+            serde_json::Value::String(record.backend_session_id.clone()),
+        );
+        if let Some(cwd) = &record.cwd {
+            params_object.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
+        }
+
+        let admission = self.admit_session(&tenant_id)?;
+        let backend = self.supervisor.ensure_running(&record.agent_id).await?;
+        let call_policy = BackendCallPolicy::from_profile(
+            record
+                .profile_name
+                .as_deref()
+                .and_then(|name| self.profiles.get(name)),
+        );
+        let request_id = format!("acpx-startup-recovery:{}", record.gateway_session_id);
+        let request_id_value = serde_json::Value::String(request_id.clone());
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id_value,
+            "method": "session/load",
+            "params": params,
+        });
+        let response = {
+            let mut backend = backend.lock().await;
+            ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
+            backend.writer.lock().await.write_value(&request).await?;
+            let (response, _, _) =
+                read_matching_response(&mut backend, &request_id_value, call_policy, None).await?;
+            response
+        };
+        if let Some(error) = response.get("error") {
+            return Err(RouterError::BackendSessionNewError(error.clone()));
+        }
+
+        Ok((
+            tenant_id,
+            crate::session_registry::SessionEntry {
+                agent_id: record.agent_id.clone(),
+                backend_session_id: BackendSessionId(record.backend_session_id.clone()),
+                profile_name: record.profile_name.clone(),
+                cwd: record.cwd.clone(),
+            },
+            admission,
+        ))
     }
 
     /// Ensure the registry cache is populated, fetching (live, falling
@@ -692,6 +1033,7 @@ impl Router {
             }
         }
 
+        let admission = self.admit_session(tenant_id)?;
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         let mut response = {
@@ -724,20 +1066,39 @@ impl Router {
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
         }
-        if let Some(entry) = self.sessions.resolve(
-            tenant_id,
-            &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
-        ) {
-            self.spawn_session_persistence(
+        let entry = self
+            .sessions
+            .resolve(
                 tenant_id,
-                gateway_session_id_str,
-                entry.agent_id.clone(),
-                entry.backend_session_id.0.clone(),
-                profile.map(|p| p.name),
-                request,
-                response.clone(),
+                &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
+            )
+            .cloned()
+            .expect("session was just registered");
+        let effective_params = request
+            .get("params")
+            .cloned()
+            .ok_or(RouterError::MissingParams)?;
+        if let Err(error) = self
+            .persist_session_recovery(tenant_id, &gateway_session_id_str, &entry, effective_params)
+            .await
+        {
+            self.sessions.remove(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
             );
+            return Err(error);
         }
+        admission.commit();
+        self.spawn_transcript(
+            gateway_session_id_str.clone(),
+            Direction::ClientToAgent,
+            request,
+        );
+        self.spawn_transcript(
+            gateway_session_id_str,
+            Direction::AgentToClient,
+            response.clone(),
+        );
         Ok(response)
     }
 
@@ -904,17 +1265,16 @@ impl Router {
                 return None;
             }
         }
-        Some(
-            self.sessions
-                .register(
-                    tenant_id,
-                    agent_id.to_string(),
-                    BackendSessionId(backend_session_id.to_string()),
-                    profile_name,
-                    cwd,
-                )
-                .0,
-        )
+        let admission = self.admit_session(tenant_id).ok()?;
+        let gateway_id = self.sessions.register(
+            tenant_id,
+            agent_id.to_string(),
+            BackendSessionId(backend_session_id.to_string()),
+            profile_name,
+            cwd,
+        );
+        admission.commit();
+        Some(gateway_id.0)
     }
 
     /// Resolve `_acpx.profile` for `session/new`'s managed mode: look up
@@ -1079,11 +1439,7 @@ impl Router {
             agent_id: record.agent_id,
             backend_session_id: BackendSessionId(record.backend_session_id),
             profile_name: record.profile_name,
-            // The `sessions` sqlite table doesn't carry `cwd` yet (see
-            // `SessionEntry::cwd`'s doc comment) -- honestly `None` here
-            // rather than guessing, not a regression this phase
-            // introduced.
-            cwd: None,
+            cwd: record.cwd,
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -1106,11 +1462,13 @@ impl Router {
         if let Some(name) = entry.profile_name.as_deref() {
             self.resolve_profile(name).await?;
         }
+        let admission = self.admit_session(tenant_id)?;
         self.sessions.insert(
             tenant_id,
             acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
             entry.clone(),
         );
+        admission.commit();
         Ok(entry)
     }
 
@@ -1190,6 +1548,11 @@ impl Router {
             response.clone(),
         );
         if method == "session/close" {
+            if let Some(store) = self.persistence.clone() {
+                store
+                    .close_session(gateway_session_id.clone(), now_rfc3339())
+                    .await?;
+            }
             // Evict the closed session from the in-memory registry --
             // **real bug fix**: this used to never happen, so every
             // session ever opened over a long-running daemon's lifetime
@@ -1198,16 +1561,15 @@ impl Router {
             // closed sessions as still live indefinitely. `remove` already
             // existed on `SessionRegistry` but was never called from
             // anywhere in this file until now.
-            self.sessions.remove(
-                tenant_id,
-                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
-            );
-            if let Some(store) = self.persistence.clone() {
-                tokio::spawn(async move {
-                    if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
-                        tracing::warn!(%err, "failed to persist session close");
-                    }
-                });
+            if self
+                .sessions
+                .remove(
+                    tenant_id,
+                    &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+                )
+                .is_some()
+            {
+                self.release_live_session(tenant_id);
             }
         }
         Ok(response)
@@ -1253,6 +1615,10 @@ impl Router {
             .and_then(|c| c.as_str())
             .map(str::to_string);
 
+        // Reserve the fork before potentially rehydrating its persisted
+        // source. If either source or fork cannot fit, rehydration remains
+        // non-mutating rather than leaving a source-only live entry behind.
+        let admission = self.admit_session(tenant_id)?;
         let entry = match self.sessions.resolve(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
@@ -1292,6 +1658,7 @@ impl Router {
             profile_name.clone(),
             cwd,
         );
+        admission.commit();
         let forked_gateway_session_id_str = forked_gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(forked_gateway_id.0.clone());
@@ -3166,21 +3533,25 @@ async fn dispatch_proxied_shared(
     );
 
     if method == "session/close" {
+        if let Some(store) = persistence.clone() {
+            store
+                .close_session(gateway_session_id.clone(), now_rfc3339())
+                .await?;
+        }
         // Same leak/correctness fix as `Router::dispatch_proxied` above --
         // see that call site's comment. Re-acquire the router lock
         // briefly (bookkeeping only, no backend I/O held) to evict the
         // closed session from the shared `SessionRegistry` too, so the
         // two dispatch paths never drift apart on this behavior.
-        router.lock().await.sessions.remove(
-            tenant_id,
-            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
-        );
-        if let Some(store) = persistence {
-            tokio::spawn(async move {
-                if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
-                    tracing::warn!(%err, "failed to persist session close");
-                }
-            });
+        let mut r = router.lock().await;
+        if r.sessions
+            .remove(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            )
+            .is_some()
+        {
+            r.release_live_session(tenant_id);
         }
     }
     Ok(response)
@@ -3210,8 +3581,11 @@ async fn dispatch_session_fork_shared(
         .and_then(|c| c.as_str())
         .map(str::to_string);
 
-    let (backend, persistence, call_policy, agent_id, profile_name) = {
+    let (backend, persistence, call_policy, agent_id, profile_name, admission) = {
         let mut r = router.lock().await;
+        // Reserve the fork before potentially rehydrating its persisted
+        // source so a rejected fork cannot leave the source registered.
+        let admission = r.admit_session(tenant_id)?;
         let entry = match r.sessions.resolve(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
@@ -3241,10 +3615,11 @@ async fn dispatch_session_fork_shared(
             call_policy,
             agent_id,
             profile_name,
+            admission,
         )
     };
 
-    let mut response = {
+    let mut response = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&request).await?;
@@ -3255,8 +3630,9 @@ async fn dispatch_session_fork_shared(
         // connection could possibly have subscribed to it yet.
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, None).await?;
-        attach_updates(response, notifications, agent_requests)
-    };
+        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+    }
+    .await?;
 
     let forked_backend_session_id = extract_backend_session_id(&response)?;
     let (forked_gateway_session_id_str, persist_args) = {
@@ -3268,6 +3644,7 @@ async fn dispatch_session_fork_shared(
             profile_name.clone(),
             cwd,
         );
+        admission.commit();
         let forked_gateway_session_id_str = forked_gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(forked_gateway_id.0);
@@ -3310,7 +3687,7 @@ async fn dispatch_session_new_shared(
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
 
-    let (agent_id, profile, backend, persistence, cwd) = {
+    let (agent_id, profile, backend, persistence, cwd, admission) = {
         let mut r = router.lock().await;
         let params = request
             .get_mut("params")
@@ -3354,12 +3731,20 @@ async fn dispatch_session_new_shared(
             }
         }
 
+        let admission = r.admit_session(tenant_id)?;
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        (agent_id, profile, backend, r.persistence.clone(), cwd)
+        (
+            agent_id,
+            profile,
+            backend,
+            r.persistence.clone(),
+            cwd,
+            admission,
+        )
     };
 
-    let mut response = {
+    let mut response = async {
         let mut proc = backend.lock().await;
         let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
@@ -3379,17 +3764,18 @@ async fn dispatch_session_new_shared(
         // session.
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, None).await?;
-        attach_session_new_extras(
+        Ok::<_, RouterError>(attach_session_new_extras(
             response,
             notifications,
             agent_requests,
             proc.agent_capabilities.clone(),
-        )
-    };
+        ))
+    }
+    .await?;
 
     let backend_session_id = extract_backend_session_id(&response)?;
 
-    let (gateway_session_id_str, persist_args) = {
+    let (gateway_session_id_str, entry) = {
         let mut r = router.lock().await;
         let gateway_id = r.sessions.register(
             tenant_id,
@@ -3402,32 +3788,61 @@ async fn dispatch_session_new_shared(
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
         }
-        // Re-resolve (mirrors `Router::dispatch_session_new`'s own
-        // approach) rather than threading `agent_id`/`backend_session_id`
-        // back out through the closure -- `agent_id` was just moved into
-        // `register` above, and this is the same lock acquisition anyway.
-        let persist_args = r
+        let entry = r
             .sessions
             .resolve(
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
             )
-            .map(|entry| (entry.agent_id.clone(), entry.backend_session_id.0.clone()));
-        (gateway_session_id_str, persist_args)
+            .cloned()
+            .expect("session was just registered");
+        (gateway_session_id_str, entry)
     };
 
-    if let Some((persisted_agent_id, persisted_backend_session_id)) = persist_args {
-        spawn_session_persistence_fn(
-            persistence,
-            tenant_id.0.clone(),
-            gateway_session_id_str,
-            persisted_agent_id,
-            persisted_backend_session_id,
-            profile.map(|p| p.name),
-            request,
-            response.clone(),
-        );
+    let effective_params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    if let Some(store) = persistence.clone() {
+        if let Err(error) = store
+            .record_session_with_recovery(
+                gateway_session_id_str.clone(),
+                entry.agent_id.clone(),
+                entry.backend_session_id.0.clone(),
+                entry.profile_name.clone(),
+                now_rfc3339(),
+                tenant_id.0.clone(),
+                RecoveryMetadata {
+                    cwd: entry.cwd.clone(),
+                    recovery_params: Some(effective_params),
+                    status: RecoveryStatus::Active,
+                    recovery_method: RecoveryMethod::Load,
+                    last_recovery_error: None,
+                },
+            )
+            .await
+        {
+            let mut r = router.lock().await;
+            r.sessions.remove(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
+            );
+            return Err(error.into());
+        }
     }
+    admission.commit();
+    spawn_transcript_fn(
+        persistence.clone(),
+        gateway_session_id_str.clone(),
+        Direction::ClientToAgent,
+        request,
+    );
+    spawn_transcript_fn(
+        persistence,
+        gateway_session_id_str,
+        Direction::AgentToClient,
+        response.clone(),
+    );
 
     Ok(response)
 }
