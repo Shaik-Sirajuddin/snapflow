@@ -9,7 +9,7 @@
 use crate::{classify_raw_update, AgentEvent};
 use acpx_client::raw::ClientError;
 use acpx_client::{AgentRequest, Gateway};
-use rui_acp_client::AgentRequestEvent;
+use rui_acp_client::{AgentRequestEvent, TerminalOutputEvent};
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -39,6 +39,14 @@ pub struct RemoteThreadInfo {
 enum Command {
     OpenSession {
         cwd: PathBuf,
+        /// `_acpx.profile` to send with `session/new`, if any -- see
+        /// [`AcpxThreadHandle::open_session_with_profile`]'s doc
+        /// comment. `None` (the shape every pre-existing caller via
+        /// [`AcpxThreadHandle::open_session`] still gets) omits
+        /// `_acpx.profile` entirely, i.e. native/unmanaged mode, byte-
+        /// for-byte the same request this crate always sent before
+        /// profile selection existed.
+        profile: Option<String>,
         resp: oneshot::Sender<Result<String, AcpxThreadError>>,
     },
     /// `session/load` against an already-known gateway session id --
@@ -117,7 +125,29 @@ impl AcpxThreadHandle {
     /// a client).
     pub async fn open_session(&self, cwd: impl Into<PathBuf>) -> Result<String, AcpxThreadError> {
         let cwd = cwd.into();
-        self.call(|resp| Command::OpenSession { cwd, resp }).await
+        self.call(|resp| Command::OpenSession {
+            cwd,
+            profile: None,
+            resp,
+        })
+        .await
+    }
+
+    /// Same as [`Self::open_session`], but selects a named ACPX profile
+    /// (`_acpx.profile` in `session/new`'s params) -- e.g. to pick a
+    /// profile with `allow_terminal_access`/`allow_fs_access` enabled,
+    /// or a specific Codex/Claude configuration. `panel-rust`'s profile
+    /// picker (Coverage Matrix row) is the intended production caller;
+    /// exercised directly today by this crate's own tests.
+    pub async fn open_session_with_profile(
+        &self,
+        cwd: impl Into<PathBuf>,
+        profile: impl Into<String>,
+    ) -> Result<String, AcpxThreadError> {
+        let cwd = cwd.into();
+        let profile = Some(profile.into());
+        self.call(|resp| Command::OpenSession { cwd, profile, resp })
+            .await
     }
 
     /// `session/load` against an already-known gateway session id --
@@ -279,29 +309,112 @@ async fn run_respond_worker(
     }
 }
 
-/// Forwards every classified update in `updates` (in order) to `event_tx`,
-/// dropping (not erroring on) anything `classify_raw_update` doesn't
-/// recognize -- same tolerant behavior the direct-ACP actor has for
-/// `SessionUpdate` variants it doesn't render.
+/// Forwards every classified `session/update` chunk in `updates` (in
+/// order) to `event_tx` as an `AgentEvent::Message`, dropping (not
+/// erroring on) anything `classify_raw_update` doesn't recognize --
+/// same tolerant behavior the direct-ACP actor has for `SessionUpdate`
+/// variants it doesn't render. **Does not** handle `acpx/agent_request`
+/// or `acpx/terminal_output` notifications -- those are exclusively
+/// [`spawn_out_of_band_notification_forwarder`]'s job now (see that
+/// function's doc comment for why they were split out of this
+/// function).
 fn forward_updates(updates: &[serde_json::Value], event_tx: &mpsc::UnboundedSender<AgentEvent>) {
     for update in updates {
-        // A live relayed agent-initiated request (`acpx/agent_request`)
-        // is checked first -- it is a bare notification shaped nothing
-        // like a `session/update`, so `classify_raw_update` would (correctly)
-        // ignore it; this is the one other live-notification shape this
-        // actor's subscription stream can see (see
-        // `acpx_client::Gateway::subscribe`'s doc comment).
-        if let Some(request) = AgentRequest::from_notification(update) {
-            let method = request.method().unwrap_or_default().to_string();
-            let _ = event_tx.send(AgentEvent::PermissionRequest(AgentRequestEvent {
-                relay_id: request.relay_id,
-                method,
-                raw_request: request.request,
-            }));
-        } else if let Some(msg) = classify_raw_update(update) {
+        if let Some(msg) = classify_raw_update(update) {
             let _ = event_tx.send(AgentEvent::Message(msg));
         }
     }
+}
+
+/// Spawns a task that forwards `acpx/agent_request` and
+/// `acpx/terminal_output` notifications to `event_tx` for the entire
+/// lifetime of `client`'s connection -- **independent** of
+/// [`run_thread_actor`]'s own command loop and its `live_rx`-fed
+/// `forward_updates` calls.
+///
+/// **Why this needs its own standalone subscription, not just another
+/// branch in `forward_updates`.** `forward_updates`/`live_rx` are only
+/// ever drained from inside `run_thread_actor`'s command-handling
+/// arms (a `try_recv` sweep at the top of the loop, plus a bounded
+/// racing/trailing-drain window scoped to one in-flight `SendPrompt`/
+/// `ResumeSession` call) -- deliberately, since `session/update` message
+/// chunk *ordering relative to that call's own completion* matters for
+/// the streamed-typing UX. Once that call returns, the loop goes back to
+/// blocking on `cmd_rx.recv().await`, and nothing drains `live_rx` again
+/// until another command arrives. A live `acpx/terminal_output` push
+/// (`acpx_core::router::spawn_terminal_output_stream` keeps polling for
+/// as long as the terminal process runs, independent of whether the
+/// `session/prompt` call that created it is still outstanding) would
+/// then sit unread in `live_rx`'s buffer indefinitely if no further
+/// command happened to be sent -- a real, previously-undiscovered gap
+/// found by this crate's own `terminal_relay_e2e_test.rs`: a short-lived
+/// backend command exits and its final push arrives well after
+/// `session/prompt` has already completed, and no further command was
+/// ever queued, so the push was silently lost.
+///
+/// **Why this doesn't double-deliver.** `client.subscribe()` (an
+/// `acpx_client::ws::GatewayWsClient` broadcast channel) hands back a
+/// fresh, independent `broadcast::Receiver` on every call -- this task's
+/// subscription and `run_thread_actor`'s own are two separate receivers
+/// of the same underlying broadcast, each seeing every notification
+/// frame, so as long as each side only *acts* on the notification kinds
+/// the other ignores, nothing is delivered twice: `forward_updates`
+/// (fed by `run_thread_actor`'s own subscription) only recognizes
+/// `session/update`-shaped frames now; this task only recognizes
+/// `acpx/agent_request`/`acpx/terminal_output`-shaped frames. A `None`
+/// from `client.subscribe()` (HTTP degraded mode -- no live push channel
+/// at all) makes this a no-op, matching every other live-only code path
+/// in this crate.
+fn spawn_out_of_band_notification_forwarder(
+    client: &Gateway,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
+    let Some(mut notifications) = client.subscribe() else {
+        return;
+    };
+    tokio::spawn(async move {
+        while let Ok(update) = notifications.recv().await {
+            if let Some(request) = AgentRequest::from_notification(&update) {
+                let method = request.method().unwrap_or_default().to_string();
+                let _ = event_tx.send(AgentEvent::PermissionRequest(AgentRequestEvent {
+                    relay_id: request.relay_id,
+                    method,
+                    raw_request: request.request,
+                }));
+            } else if let Some(term_ev) = parse_terminal_output(&update) {
+                let _ = event_tx.send(AgentEvent::TerminalOutput(term_ev));
+            }
+        }
+    });
+}
+
+/// Parses a bare `acpx/terminal_output` notification (see
+/// `acpx_core::router::spawn_terminal_output_stream`'s doc comment for
+/// the exact wire shape it publishes) into this crate's shared
+/// `TerminalOutputEvent`. `None` for anything else, same "operate on
+/// the raw JSON shape, tolerate unrecognized input" convention
+/// `classify_raw_update` and `AgentRequest::from_notification` both
+/// already follow.
+fn parse_terminal_output(value: &serde_json::Value) -> Option<TerminalOutputEvent> {
+    if value.get("method").and_then(|m| m.as_str()) != Some("acpx/terminal_output") {
+        return None;
+    }
+    let params = value.get("params")?;
+    let terminal_id = params.get("terminalId")?.as_str()?.to_string();
+    let output = params.get("output")?.as_str()?.to_string();
+    let truncated = params.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false);
+    let exit_status = params.get("exitStatus").filter(|v| !v.is_null()).map(|status| {
+        (
+            status.get("exitCode").and_then(|c| c.as_i64()).map(|c| c as i32),
+            status.get("signal").and_then(|s| s.as_i64()).map(|s| s as i32),
+        )
+    });
+    Some(TerminalOutputEvent {
+        terminal_id,
+        output,
+        truncated,
+        exit_status,
+    })
 }
 
 async fn run_thread_actor(
@@ -311,6 +424,7 @@ async fn run_thread_actor(
     session_tx: watch::Sender<Option<String>>,
 ) {
     let client = Gateway::connect(base_url).await;
+    spawn_out_of_band_notification_forwarder(&client, event_tx.clone());
     let (live_tx, mut live_rx) = mpsc::unbounded_channel();
     if let Some(mut live_notifications) = client.subscribe() {
         tokio::spawn(async move {
@@ -326,14 +440,17 @@ async fn run_thread_actor(
             forward_updates(&[update], &event_tx);
         }
         match cmd {
-            Command::OpenSession { cwd, resp } => {
+            Command::OpenSession { cwd, profile, resp } => {
                 let params = serde_json::json!({
                     "cwd": cwd.to_string_lossy(),
                     "mcpServers": [],
                 });
                 let mut result = Err(AcpxThreadError::ActorGone);
                 for attempt in 0..5 {
-                    result = match client.call("session/new", params.clone(), None).await {
+                    result = match client
+                        .call("session/new", params.clone(), profile.as_deref())
+                        .await
+                    {
                         Ok(value) => match value.get("sessionId").and_then(|s| s.as_str()) {
                             Some(sid) => {
                                 session_id = Some(sid.to_string());

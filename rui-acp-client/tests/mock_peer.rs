@@ -109,6 +109,10 @@ async fn open_session_and_prompt_roundtrip() {
                 "unexpected PermissionRequest event on the direct-ACP path \
                  (only rui-acpx-client's actor ever emits this): {req:?}"
             ),
+            AgentEvent::TerminalOutput(ev) => panic!(
+                "unexpected TerminalOutput event on the direct-ACP path \
+                 (only rui-acpx-client's actor ever emits this): {ev:?}"
+            ),
         }
     }
 

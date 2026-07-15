@@ -126,6 +126,28 @@ pub enum AgentEvent {
     /// type's existing "shared vocabulary across both client crates"
     /// role for `Message`/`TurnEnded`/`Error`.
     PermissionRequest(AgentRequestEvent),
+    /// A live output-buffer push from a `terminal/create`d command --
+    /// only ever produced by `rui-acpx-client`'s actor, via the
+    /// gateway's `acpx/terminal_output` notification (see
+    /// `acpx_core::router::spawn_terminal_output_stream`'s doc comment
+    /// on the server side). Carries the *whole current buffer*, not a
+    /// byte delta -- the gateway's own poller already collapses
+    /// no-change ticks, and a client displaying this is expected to
+    /// simply replace its shown contents each time, not append.
+    TerminalOutput(TerminalOutputEvent),
+}
+
+/// See [`AgentEvent::TerminalOutput`]'s doc comment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalOutputEvent {
+    pub terminal_id: String,
+    pub output: String,
+    pub truncated: bool,
+    /// `Some((exit_code, signal))` once the command has exited -- both
+    /// inner fields individually optional per real ACP `ExitStatus`
+    /// semantics (a signal-killed process has no exit code and vice
+    /// versa).
+    pub exit_status: Option<(Option<i32>, Option<i32>)>,
 }
 
 /// A pending interactive decision the UI must render and answer. Carries

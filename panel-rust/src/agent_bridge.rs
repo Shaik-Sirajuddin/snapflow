@@ -59,8 +59,11 @@
 //!   with durable server-side session storage exists to validate
 //!   against.
 
-use rui_acp_client::{AgentEvent, AgentRequestEvent, ChatMessage, JsonlStore, ThreadTrailer};
+use rui_acp_client::{
+    AgentEvent, AgentRequestEvent, ChatMessage, JsonlStore, TerminalOutputEvent, ThreadTrailer,
+};
 use rui_acpx_client::{spawn_acpx_thread, AcpxThreadHandle};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -108,6 +111,22 @@ struct ThreadSlot {
     /// `Option` costs nothing and doesn't assume that invariant holds
     /// for every possible backend.
     pending_requests: Mutex<Vec<AgentRequestEvent>>,
+    /// Latest live output snapshot per terminal id, keyed by
+    /// `terminal_id` -- populated from `AgentEvent::TerminalOutput`
+    /// (the gateway's `acpx/terminal_output` push, see
+    /// `acpx_core::router::spawn_terminal_output_stream`'s doc comment).
+    /// Always the current whole-buffer snapshot, never appended-to --
+    /// matches that event's own "replace, don't append" contract.
+    terminal_buffers: Mutex<HashMap<String, TerminalBuffer>>,
+}
+
+/// One terminal's current known state, as last observed via
+/// `AgentEvent::TerminalOutput`. See [`ThreadSlot::terminal_buffers`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalBuffer {
+    pub output: String,
+    pub truncated: bool,
+    pub exit_status: Option<(Option<i32>, Option<i32>)>,
 }
 
 /// Owns the background runtime, the per-thread agent connections, the
@@ -125,6 +144,24 @@ pub struct AgentBridge {
 /// cache key -- lowercased, non-alphanumerics collapsed to `-`. Stable
 /// across runs as long as `THREAD_NAMES` (in `lib.rs`) doesn't change,
 /// which is the v1 fixed-thread-list assumption documented there.
+/// One `AgentEvent::TerminalOutput`'s worth of update, applied to
+/// `slot`'s live terminal-buffer map -- shared by both forwarder loops
+/// (initial-construction and `add_thread`) so the "replace this
+/// terminal's snapshot" semantics stay in exactly one place.
+fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
+    slot.terminal_buffers
+        .lock()
+        .expect("terminal_buffers mutex poisoned")
+        .insert(
+            ev.terminal_id.clone(),
+            TerminalBuffer {
+                output: ev.output.clone(),
+                truncated: ev.truncated,
+                exit_status: ev.exit_status,
+            },
+        );
+}
+
 fn slug(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut last_was_dash = false;
@@ -742,6 +779,7 @@ impl AgentBridge {
                 history: Mutex::new(seeded),
                 acp_session_id: Mutex::new(None),
                 pending_requests: Mutex::new(Vec::new()),
+                terminal_buffers: Mutex::new(HashMap::new()),
             });
             slots.push(slot.clone());
 
@@ -872,6 +910,9 @@ impl AgentBridge {
                                 .expect("pending_requests mutex poisoned")
                                 .push(req.clone());
                         }
+                        AgentEvent::TerminalOutput(term_ev) => {
+                            store_terminal_output(&slot_for_task, term_ev);
+                        }
                     }
                     events_out
                         .lock()
@@ -947,6 +988,7 @@ impl AgentBridge {
             history: Mutex::new(seeded),
             acp_session_id: Mutex::new(None),
             pending_requests: Mutex::new(Vec::new()),
+            terminal_buffers: Mutex::new(HashMap::new()),
         });
         let cwd = cwd_for_session();
         let session_id = if let Some(session_id) = cached_session_id.clone() {
@@ -1017,6 +1059,9 @@ impl AgentBridge {
                             .expect("pending_requests mutex poisoned")
                             .push(req.clone());
                     }
+                    AgentEvent::TerminalOutput(term_ev) => {
+                        store_terminal_output(&slot_for_task, term_ev);
+                    }
                 }
                 events_out
                     .lock()
@@ -1070,6 +1115,18 @@ impl AgentBridge {
                     .clone()
             })
             .unwrap_or_default()
+    }
+
+    /// Current live snapshot of `terminal_id` on thread `idx`, if any
+    /// `AgentEvent::TerminalOutput` has been observed for it yet.
+    pub fn terminal_buffer(&self, idx: usize, terminal_id: &str) -> Option<TerminalBuffer> {
+        self.slots.get(idx).and_then(|s| {
+            s.terminal_buffers
+                .lock()
+                .expect("terminal_buffers mutex poisoned")
+                .get(terminal_id)
+                .cloned()
+        })
     }
 
     /// Answers a pending interactive request (identified by `relay_id`)

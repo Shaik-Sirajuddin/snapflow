@@ -338,6 +338,14 @@ impl PanelSingleton {
                         // arriving on the currently-selected thread,
                         // which the loop above already does via `idx`.
                         AgentEvent::PermissionRequest(_) => {}
+                        // Same "re-read the bridge's own source of
+                        // truth" convention -- `AgentBridge::
+                        // terminal_buffer` is what a future terminal
+                        // view component would poll; this arm exists
+                        // only so the match stays exhaustive and
+                        // `selected_touched` covers a terminal thread's
+                        // events like every other variant.
+                        AgentEvent::TerminalOutput(_) => {}
                     }
                 }
             }

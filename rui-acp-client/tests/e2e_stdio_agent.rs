@@ -35,6 +35,10 @@ async fn drain_turn(thread: &mut rui_acp_client::ThreadHandle) -> (Vec<String>, 
                 "unexpected PermissionRequest event on the direct-ACP path \
                  (only rui-acpx-client's actor ever emits this): {req:?}"
             ),
+            AgentEvent::TerminalOutput(ev) => panic!(
+                "unexpected TerminalOutput event on the direct-ACP path \
+                 (only rui-acpx-client's actor ever emits this): {ev:?}"
+            ),
         }
     }
 }

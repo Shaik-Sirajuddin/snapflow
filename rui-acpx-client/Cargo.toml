@@ -20,3 +20,9 @@ thiserror = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Raw profiles/create call in terminal_relay_e2e_test.rs (setting up a
+# profile with allow_terminal_access before this crate's own SDK-level
+# session/new call selects it) -- not a runtime dependency of this
+# crate's own public API, which never speaks raw HTTP itself (see
+# acpx-client::Gateway, which this crate depends on for that).
+reqwest = { version = "0.12", features = ["json"] }
