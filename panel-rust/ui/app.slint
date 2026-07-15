@@ -1,9 +1,10 @@
 import { Palette } from "palette.slint";
-import { ThreadItem, MessageItem, PendingRequestItem } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem } from "types.slint";
 import { Sidebar } from "sidebar.slint";
 import { ChatArea } from "chat_area.slint";
+import { TerminalOverlay } from "terminal_card.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, Palette }
+export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, Palette }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -32,6 +33,13 @@ export component ChatPanel inherits Window {
     in-out property <string> agent-badge: "agent . ask";
     in property <bool> compact: true;
     in property <PendingRequestItem> pending-request;
+    in property <[TerminalItem]> terminals: [];
+    // Set by Rust whenever `expand-terminal` fires (looked up from
+    // `terminals` at that moment, since Slint has no `for`-as-expression
+    // find/filter construct) -- an empty `terminal-id` means no overlay
+    // is shown. Cleared (terminal-id: "") by the overlay's own close
+    // callback.
+    in-out property <TerminalItem> expanded-terminal: { terminal-id: "" };
 
     callback thread-selected(int);
     callback new-thread-requested();
@@ -44,6 +52,8 @@ export component ChatPanel inherits Window {
     callback toggle-expanded(int);
     callback approve-request();
     callback reject-request();
+    callback expand-terminal(string);
+    callback close-terminal-overlay();
 
     HorizontalLayout {
         Sidebar {
@@ -82,6 +92,17 @@ export component ChatPanel inherits Window {
             pending-request: pending-request;
             approve-request => { approve-request(); }
             reject-request => { reject-request(); }
+            terminals: terminals;
+            expand-terminal(id) => { expand-terminal(id); }
+        }
+    }
+    if expanded-terminal.terminal-id != "" : TerminalOverlay {
+        item: expanded-terminal;
+        container-width: root.width;
+        container-height: root.height;
+        close => {
+            expanded-terminal = { terminal-id: "" };
+            close-terminal-overlay();
         }
     }
     if settings-open : Rectangle {

@@ -115,9 +115,16 @@ struct ThreadSlot {
     /// `terminal_id` -- populated from `AgentEvent::TerminalOutput`
     /// (the gateway's `acpx/terminal_output` push, see
     /// `acpx_core::router::spawn_terminal_output_stream`'s doc comment).
-    /// Always the current whole-buffer snapshot, never appended-to --
-    /// matches that event's own "replace, don't append" contract.
-    terminal_buffers: Mutex<HashMap<String, TerminalBuffer>>,
+   /// Always the current whole-buffer snapshot, never appended-to --
+   /// matches that event's own "replace, don't append" contract.
+   terminal_buffers: Mutex<HashMap<String, TerminalBuffer>>,
+    /// Insertion-ordered list of every terminal id ever seen on this
+    /// thread (first-seen order) -- `HashMap` iteration order is
+    /// unspecified, but the UI needs a stable order to render terminal
+    /// cards in (and to pick "the active/most-recent one" without
+    /// depending on hash iteration). Appended to exactly once per new
+    /// terminal id, in [`store_terminal_output`].
+    terminal_order: Mutex<Vec<String>>,
 }
 
 /// One terminal's current known state, as last observed via
@@ -149,6 +156,17 @@ pub struct AgentBridge {
 /// (initial-construction and `add_thread`) so the "replace this
 /// terminal's snapshot" semantics stay in exactly one place.
 fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
+    let is_new = !slot
+        .terminal_buffers
+        .lock()
+        .expect("terminal_buffers mutex poisoned")
+        .contains_key(&ev.terminal_id);
+    if is_new {
+        slot.terminal_order
+            .lock()
+            .expect("terminal_order mutex poisoned")
+            .push(ev.terminal_id.clone());
+    }
     slot.terminal_buffers
         .lock()
         .expect("terminal_buffers mutex poisoned")
@@ -780,6 +798,7 @@ impl AgentBridge {
                 acp_session_id: Mutex::new(None),
                 pending_requests: Mutex::new(Vec::new()),
                 terminal_buffers: Mutex::new(HashMap::new()),
+                terminal_order: Mutex::new(Vec::new()),
             });
             slots.push(slot.clone());
 
@@ -989,6 +1008,7 @@ impl AgentBridge {
             acp_session_id: Mutex::new(None),
             pending_requests: Mutex::new(Vec::new()),
             terminal_buffers: Mutex::new(HashMap::new()),
+            terminal_order: Mutex::new(Vec::new()),
         });
         let cwd = cwd_for_session();
         let session_id = if let Some(session_id) = cached_session_id.clone() {
@@ -1127,6 +1147,22 @@ impl AgentBridge {
                 .get(terminal_id)
                 .cloned()
         })
+    }
+
+    /// Every terminal id known on thread `idx` so far, first-seen order
+    /// -- what a terminal-view component iterates to render one card per
+    /// live/finished terminal. Paired with [`Self::terminal_buffer`] for
+    /// each id's current output/exit state.
+    pub fn active_terminals(&self, idx: usize) -> Vec<String> {
+        self.slots
+            .get(idx)
+            .map(|s| {
+                s.terminal_order
+                    .lock()
+                    .expect("terminal_order mutex poisoned")
+                    .clone()
+            })
+            .unwrap_or_default()
     }
 
     /// Answers a pending interactive request (identified by `relay_id`)

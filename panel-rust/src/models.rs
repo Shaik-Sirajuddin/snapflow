@@ -7,7 +7,8 @@
 //! themselves, so it's straightforward to unit test without a live
 //! `ChatPanel` component.
 
-use crate::{MessageItem, ThreadItem};
+use crate::agent_bridge::TerminalBuffer;
+use crate::{MessageItem, TerminalItem, ThreadItem};
 use rui_acp_client::{ChatMessage, MessageKind};
 use slint::{ModelRc, VecModel};
 
@@ -141,6 +142,41 @@ pub fn build_thread_items<N: AsRef<str>>(
             },
         })
         .collect()
+}
+
+/// Builds the terminal-card row model for the active thread --
+/// `entries` is `(terminal_id, buffer)` pairs in the same first-seen
+/// order `AgentBridge::active_terminals` returns, paired with whatever
+/// `AgentBridge::terminal_buffer` currently knows for each id (`None`
+/// only in the narrow window between the id first appearing in
+/// `active_terminals` and its first `TerminalOutput` snapshot landing --
+/// rendered as an empty/still-running placeholder rather than skipped,
+/// so the card appears the moment the terminal is created, not only
+/// once output exists).
+pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> ModelRc<TerminalItem> {
+    let items: Vec<TerminalItem> = entries
+        .into_iter()
+        .map(|(terminal_id, buffer)| match buffer {
+            Some(buffer) => TerminalItem {
+                terminal_id: terminal_id.into(),
+                output: buffer.output.into(),
+                truncated: buffer.truncated,
+                has_exited: buffer.exit_status.is_some(),
+                exit_code: buffer
+                    .exit_status
+                    .and_then(|(code, _signal)| code)
+                    .unwrap_or_default(),
+            },
+            None => TerminalItem {
+                terminal_id: terminal_id.into(),
+                output: String::new().into(),
+                truncated: false,
+                has_exited: false,
+                exit_code: 0,
+            },
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
 }
 
 #[cfg(test)]

@@ -146,6 +146,14 @@ struct PanelSingleton {
     /// (different thread) or just grow it in place (same thread, new
     /// streamed messages).
     displayed_thread: Cell<Option<usize>>,
+    /// Terminal-view addition: which terminal id (if any) the floating
+    /// overlay is currently showing -- `None` means closed. Set by the
+    /// `expand-terminal` callback, cleared by `close-terminal-overlay`;
+    /// re-read every refresh so the overlay keeps showing live output
+    /// while open (same "Rust owns the source of truth, Slint property
+    /// is just a snapshot" convention `refresh_pending_request_for`
+    /// already follows).
+    expanded_terminal_id: RefCell<Option<String>>,
 }
 
 impl PanelSingleton {
@@ -233,6 +241,7 @@ impl PanelSingleton {
         self.displayed_thread.set(Some(real_idx));
         self.render_messages(real_idx);
         self.refresh_pending_request_for(real_idx);
+        self.refresh_terminals_for(real_idx);
     }
 
     /// Rebuilds the `pending-request` property for `real_idx` from the
@@ -268,6 +277,45 @@ impl PanelSingleton {
             },
         };
         self.component.set_pending_request(item);
+    }
+
+    /// Rebuilds the `terminals` row model for `real_idx` from the agent
+    /// bridge's current terminal registry (`active_terminals` +
+    /// `terminal_buffer`, see `agent_bridge.rs`) and, if the floating
+    /// overlay is currently showing one of this thread's terminals,
+    /// refreshes `expanded-terminal` too so live output keeps streaming
+    /// into an already-open overlay. Called from
+    /// [`Self::refresh_messages_for`] (the shared "this thread became
+    /// the displayed one" hook) so terminal cards stay in sync with
+    /// every event that touches the selected thread, same convention
+    /// [`Self::refresh_pending_request_for`] follows.
+    fn refresh_terminals_for(&self, real_idx: usize) {
+        let Some(bridge) = &self.bridge else { return };
+        let ids = bridge.active_terminals(real_idx);
+        let entries: Vec<(String, Option<agent_bridge::TerminalBuffer>)> = ids
+            .into_iter()
+            .map(|id| {
+                let buffer = bridge.terminal_buffer(real_idx, &id);
+                (id, buffer)
+            })
+            .collect();
+        let expanded_id = self.expanded_terminal_id.borrow().clone();
+        if let Some(expanded_id) = &expanded_id {
+            if let Some(buffer) = bridge.terminal_buffer(real_idx, expanded_id) {
+                self.component.set_expanded_terminal(TerminalItem {
+                    terminal_id: expanded_id.clone().into(),
+                    output: buffer.output.into(),
+                    truncated: buffer.truncated,
+                    has_exited: buffer.exit_status.is_some(),
+                    exit_code: buffer
+                        .exit_status
+                        .and_then(|(code, _signal)| code)
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        self.component
+            .set_terminals(models::to_terminal_items(entries));
     }
 
     /// Answers the currently-displayed thread's first pending request
@@ -480,6 +528,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             visible_indices: RefCell::new(Vec::new()),
             expanded: RefCell::new(Vec::new()),
             displayed_thread: Cell::new(None),
+            expanded_terminal_id: RefCell::new(None),
         };
         panel.refresh_threads_model();
         if let Some(store) = panel.panel_state.as_ref() {
@@ -709,6 +758,40 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     panel.answer_pending_request(&component, false);
+                }
+            });
+        });
+
+        // Terminal-view addition: expand a card into the floating
+        // overlay, and close it. `refresh_terminals_for` (called from
+        // every `refresh_messages_for`) keeps whichever terminal is
+        // currently expanded live-updating; these two callbacks only
+        // own which id (if any) is expanded.
+        let component_weak = panel.component.as_weak();
+        panel.component.on_expand_terminal(move |terminal_id| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    *panel.expanded_terminal_id.borrow_mut() = Some(terminal_id.to_string());
+                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
+                    else {
+                        return;
+                    };
+                    panel.refresh_terminals_for(real_idx);
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_close_terminal_overlay(move || {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    *panel.expanded_terminal_id.borrow_mut() = None;
                 }
             });
         });

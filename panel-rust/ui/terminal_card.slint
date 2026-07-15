@@ -1,0 +1,185 @@
+import { Palette } from "palette.slint";
+import { TerminalItem } from "types.slint";
+
+// Real embedded terminal view -- Phase 4 terminal-view addition. Two
+// components:
+//
+// - `TerminalCard`: the bounded max-height read-only card docked above
+//   the compose bar (mirrors `PermissionCard`'s docking spot in
+//   `chat_area.slint`), one per live/finished agent-created terminal on
+//   the active thread (`AgentBridge::active_terminals` +
+//   `terminal_buffer`, see `agent_bridge.rs`). Click the header (or the
+//   expand glyph) to request the floating overlay via `expand()`.
+// - `TerminalOverlay`: the click-to-expand floating box (full-window,
+//   same overlay convention `app.slint`'s settings sheet already uses),
+//   showing the same buffer full-height/scrollable with a close action.
+//
+// This is the agent-created terminal path (`terminal/create` relayed
+// from the backend, output streamed live via `acpx/terminal_output` --
+// see `permission_card.slint`'s doc comment for the request/approval
+// half of this flow). A distinct client-PTY terminal component (real
+// interactive input/resize) is separate, tracked work -- this is
+// read-only, matching the plan's "close to a real terminal ui" framing
+// for the *client*-created case while the *agent*-created case stays a
+// bounded streaming log.
+export component TerminalCard inherits Rectangle {
+    in property <TerminalItem> item;
+    in property <bool> compact: true;
+    callback expand();
+
+    background: Palette.sys-terminal-bg;
+    border-color: Palette.sys-terminal-border;
+    border-width: 1px;
+    border-radius: Palette.radius-md;
+    height: compact ? 96px : 140px;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+        Rectangle {
+            height: 18px;
+            TouchArea { clicked => { expand(); } }
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: "\u{2318}"; // terminal glyph stand-in
+                    color: Palette.sys-primary;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "terminal " + item.terminal-id;
+                    color: Palette.sys-text-primary;
+                    font-family: Palette.font-mono;
+                    font-size: 10px;
+                    font-weight: 700;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+                if item.has-exited : Text {
+                    text: "exit " + item.exit-code;
+                    color: Palette.sys-text-muted;
+                    font-family: Palette.font-mono;
+                    font-size: 9px;
+                    vertical-alignment: center;
+                }
+                if !item.has-exited : Text {
+                    text: "running";
+                    color: Palette.sys-text-secondary;
+                    font-family: Palette.font-mono;
+                    font-size: 9px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "\u{2922}"; // expand glyph
+                    color: Palette.sys-text-muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Flickable {
+            viewport-height: log.preferred-height;
+            log := Text {
+                text: item.output + (item.truncated ? "\n... (truncated)" : "");
+                color: Palette.sys-terminal-text;
+                font-family: Palette.font-mono;
+                font-size: 10px;
+                wrap: word-wrap;
+                overflow: clip;
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+            }
+        }
+    }
+}
+
+// Full-window floating overlay for one expanded terminal -- same
+// docking convention as `app.slint`'s settings sheet (8px inset
+// Rectangle over the whole window), reused rather than duplicated
+// visually since both are "modal card over the panel" treatments.
+export component TerminalOverlay inherits Rectangle {
+    in property <TerminalItem> item;
+    // A standalone exported component has no compile-time-resolvable
+    // `parent` (unlike `app.slint`'s inline settings sheet, which is
+    // lexically nested directly inside the `Window` component and so
+    // can reference `parent.width`/`parent.height` directly) -- the
+    // caller passes the window's own size in explicitly instead.
+    in property <length> container-width;
+    in property <length> container-height;
+    callback close();
+
+    x: 8px;
+    y: 8px;
+    width: container-width - 16px;
+    height: container-height - 16px;
+    background: Palette.sys-terminal-bg;
+    border-color: Palette.sys-border-strong;
+    border-width: 1px;
+    border-radius: Palette.radius-md;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: "terminal " + item.terminal-id;
+                color: Palette.sys-text-primary;
+                font-family: Palette.font-mono;
+                font-size: 12px;
+                font-weight: 700;
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+            if item.has-exited : Text {
+                text: "exit " + item.exit-code;
+                color: Palette.sys-text-muted;
+                font-family: Palette.font-mono;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                width: 60px;
+                height: 24px;
+                background: Palette.sys-sidebar;
+                border-color: Palette.sys-border;
+                border-width: 1px;
+                border-radius: Palette.radius-sm;
+                TouchArea { clicked => { close(); } }
+                Text {
+                    text: "Close";
+                    color: Palette.sys-text-primary;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Palette.sys-border;
+        }
+        Flickable {
+            viewport-height: full-log.preferred-height;
+            full-log := Text {
+                text: item.output + (item.truncated ? "\n... (truncated)" : "");
+                color: Palette.sys-terminal-text;
+                font-family: Palette.font-mono;
+                font-size: 11px;
+                wrap: word-wrap;
+                overflow: clip;
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+            }
+        }
+    }
+}

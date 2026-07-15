@@ -49,3 +49,17 @@ export struct PendingRequestItem {
     summary: string,
     supported: bool,
 }
+
+// Terminal-view addition: one live agent-created terminal known to the
+// currently-displayed thread (`AgentBridge::active_terminal_ids` +
+// `terminal_buffer`, see `agent_bridge.rs`). Rendered as a bounded
+// max-height card docked above the compose bar (mirrors
+// `PendingRequestItem`'s docking convention) with click-to-expand into
+// a full-window floating overlay -- see `terminal_card.slint`.
+export struct TerminalItem {
+    terminal-id: string,
+    output: string,
+    truncated: bool,
+    has-exited: bool,
+    exit-code: int,
+}
