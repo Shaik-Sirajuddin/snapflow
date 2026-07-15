@@ -119,6 +119,75 @@ already manages an OpenHands stack lifecycle) is expected to have one up
 first. `conftest.py`'s skip-not-fail fixtures are what make that an
 ergonomic tradeoff rather than a footgun.
 
+## Full coverage: terminal, profiles, approval flow, multi-session
+
+`test_openhands_acpx_e2e.py` (above) proves the base chat round trip.
+Four more files round out full HTTP-surface coverage against the same
+real, already-running agent-server, each independently runnable:
+
+- `test_openhands_terminal.py` -- the host-level `/api/bash/*` terminal
+  surface (synchronous `execute_bash_command`, async `start_bash_command`
+  + poll, a non-zero exit code, and a real acpx-backed conversation
+  running *concurrently* with terminal traffic to prove the two surfaces
+  don't contend for a shared lock).
+- `test_openhands_profiles.py` -- the `/api/agent-profiles/*` launch-spec
+  profile store (not just `/api/profiles`, the LLM-config store): full
+  save/get/activate/materialize CRUD round trip for an `ACPAgentProfile`
+  pointed at each acpx wrapper script (both backends), plus a
+  from-a-stored-profile conversation that launches the real backend
+  process tree exactly like `test_openhands_acpx_e2e.py`'s direct
+  `ACPAgent(...)` construction does.
+- `test_openhands_approval_flow.py` -- `/api/conversations/{id}/
+  confirmation_policy` and `/api/conversations/{id}/events/
+  respond_to_confirmation`. Documents and asserts on a real,
+  live-verified architectural finding: `ACPAgentClient.request_permission`
+  auto-approves every ACP `session/request_permission` call, so the
+  OpenHands-side confirmation-policy pause is a no-op for ACP-backed
+  conversations -- see that file's module docstring for the full
+  explanation and why the tests are written to assert on *actual*
+  observed behavior rather than the behavior the endpoint names might
+  suggest. Also covers `/api/conversations/{id}/ask_agent` (which
+  internally forks the ACP session -- see the "real bugs found and fixed"
+  section below).
+- `test_openhands_multi_session.py` -- two real, concurrently-running
+  acpx-backed conversations against the same agent-server: no
+  cross-talk between their marker-token responses, distinct process
+  trees (best-effort, see the `ps`-snapshot-stability note below), and
+  `GET /api/conversations/search` correctly listing both independently.
+
+Run the whole suite (still needs the prerequisites above -- a running
+agent-server, a release `acpx-server` binary, real credentials):
+
+```sh
+uv run --with openhands-sdk==1.29.0 --with pytest \
+    pytest tests/openhands_integration -v
+```
+
+### Real ACP/acpx bugs this suite found and fixed
+
+Writing `test_ask_agent_side_channel_works_on_acp_conversation` surfaced
+a genuine acpx transport bug, not a test artifact: `OpenHands.ask_agent`
+implements its side-channel question by issuing a real ACP `session/
+fork` against the live session, then a `session/prompt` against the
+*newly forked* session id. acpx's `session/fork` dispatch logic (added
+in ACP-compatibility phase 28/29) was correct, but the stdio/WS
+transports' live-notification watch-subscription wiring
+(`acpx-server/src/transport/live.rs::session_id_to_watch`) special-cased
+only `session/new`'s freshly-minted `result.sessionId` -- not `session/
+fork`'s equally freshly-minted one -- so after a fork the transport kept
+watching the *source* session instead of the new forked one. The forked
+session's first `session/prompt` call then had no live subscriber in
+place for the router's `try_deliver_live` to find, so its `session/
+update` notifications silently fell back to the `_acpx.updates` buffer
+embedded in the JSON-RPC response -- a proprietary acpx extension no
+standard ACP client (including OpenHands's `ACPAgentClient`) reads,
+manifesting as `ask_agent` returning an empty string despite the backend
+replying normally. Fixed by special-casing `session/fork` in
+`session_id_to_watch` exactly like `session/new`; see `acpx/COVERAGE.md`
+for the phase entry and `acpx-server/src/transport/live.rs`'s own tests
+(`session_fork_watches_the_newly_minted_forked_gateway_id_not_the_
+source_one`) for the regression coverage.
+
 ## A note on `ps` snapshot stability
 
 `proc_tree.py` shells out to `ps -eo pid,ppid,args` rather than using

@@ -218,3 +218,257 @@ def assert_real_backend_process_ran(
         f"the real ACP adapter"
     )
     return acpx_procs
+
+
+# ---------------------------------------------------------------------------
+# Direct HTTP helpers for agent-server surfaces that `openhands-sdk`'s
+# `RemoteConversation` has no typed client for (terminal/bash, LLM + agent
+# profiles, confirmation policy/approval flow, conversation search). Kept as
+# thin `httpx` wrappers, same rationale as `fetch_agent_final_response`/
+# `fetch_conversation_info` above: these are simple enough calls that a
+# second parallel client abstraction would cost more clarity than it saves.
+# ---------------------------------------------------------------------------
+
+
+def _headers(api_key: str) -> dict[str, str]:
+    return {"X-Session-API-Key": api_key}
+
+
+# -- Terminal (bash) --------------------------------------------------------
+
+
+def execute_bash_command(
+    host: str, api_key: str, command: str, *, cwd: str | None = None, timeout: int = 60
+) -> dict[str, Any]:
+    """`POST /api/bash/execute_bash_command` -- runs synchronously (the
+    agent-server itself awaits the background task before responding) and
+    returns the final `BashOutput` (stdout/stderr/exit_code)."""
+    body: dict[str, Any] = {"command": command, "timeout": timeout}
+    if cwd is not None:
+        body["cwd"] = cwd
+    response = httpx.post(
+        f"{host.rstrip('/')}/api/bash/execute_bash_command",
+        headers=_headers(api_key),
+        json=body,
+        timeout=timeout + 30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def start_bash_command(
+    host: str, api_key: str, command: str, *, cwd: str | None = None, timeout: int = 60
+) -> dict[str, Any]:
+    """`POST /api/bash/start_bash_command` -- fires the command in the
+    background and returns the `BashCommand` record immediately (caller
+    polls `search_bash_events` for its output)."""
+    body: dict[str, Any] = {"command": command, "timeout": timeout}
+    if cwd is not None:
+        body["cwd"] = cwd
+    response = httpx.post(
+        f"{host.rstrip('/')}/api/bash/start_bash_command",
+        headers=_headers(api_key),
+        json=body,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def search_bash_events(
+    host: str, api_key: str, *, command_id: str | None = None
+) -> dict[str, Any]:
+    """`GET /api/bash/bash_events/search` -- optionally filtered to one
+    command's `BashCommand`/`BashOutput` events."""
+    params: dict[str, str] = {}
+    if command_id is not None:
+        params["command_id__eq"] = command_id
+    response = httpx.get(
+        f"{host.rstrip('/')}/api/bash/bash_events/search",
+        headers=_headers(api_key),
+        params=params,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+# -- LLM profiles (`/api/profiles`) ------------------------------------------
+
+
+def list_llm_profiles(host: str, api_key: str) -> dict[str, Any]:
+    response = httpx.get(
+        f"{host.rstrip('/')}/api/profiles", headers=_headers(api_key), timeout=30
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+# -- Agent profiles (`/api/agent-profiles`) -- the ACP-relevant surface -----
+
+
+def list_agent_profiles(host: str, api_key: str) -> dict[str, Any]:
+    """`GET /api/agent-profiles` -- launch-spec profiles, including
+    `agent_kind: "acp"` entries carrying `acp_server`/`acp_command`. Lazily
+    seeds one `default` profile from current settings on first call against
+    an empty store (see `agent_profiles_router.list_agent_profiles`)."""
+    response = httpx.get(
+        f"{host.rstrip('/')}/api/agent-profiles", headers=_headers(api_key), timeout=30
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def get_agent_profile(host: str, api_key: str, name: str) -> dict[str, Any]:
+    response = httpx.get(
+        f"{host.rstrip('/')}/api/agent-profiles/{name}",
+        headers=_headers(api_key),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def save_agent_profile(
+    host: str, api_key: str, name: str, profile_body: dict[str, Any]
+) -> dict[str, Any]:
+    """`POST /api/agent-profiles/{name}` -- creates or overwrites (by
+    name) a stored `AgentProfile`. `profile_body` should omit `name` (the
+    path segment is authoritative) and match either the
+    `OpenHandsAgentProfile` or `ACPAgentProfile` discriminated-union shape
+    (`agent_kind: "openhands" | "acp"`)."""
+    response = httpx.post(
+        f"{host.rstrip('/')}/api/agent-profiles/{name}",
+        headers=_headers(api_key),
+        json=profile_body,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def delete_agent_profile(host: str, api_key: str, name: str) -> dict[str, Any]:
+    response = httpx.delete(
+        f"{host.rstrip('/')}/api/agent-profiles/{name}",
+        headers=_headers(api_key),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def activate_agent_profile(host: str, api_key: str, profile_id: str) -> dict[str, Any]:
+    """`POST /api/agent-profiles/{profile_id}/activate` -- pointer-only
+    (does not itself write `agent_settings`; a conversation must pass
+    `agent_profile_id` at creation time, or the caller must separately
+    `materialize` it, to actually apply it)."""
+    response = httpx.post(
+        f"{host.rstrip('/')}/api/agent-profiles/{profile_id}/activate",
+        headers=_headers(api_key),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def materialize_agent_profile(host: str, api_key: str, name: str) -> dict[str, Any]:
+    response = httpx.post(
+        f"{host.rstrip('/')}/api/agent-profiles/{name}/materialize",
+        headers=_headers(api_key),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def acp_agent_profile_body(backend: AcpxBackend) -> dict[str, Any]:
+    """Build an `ACPAgentProfile`-shaped body pointed at one of this
+    package's acpx wrapper scripts -- the profile-store equivalent of
+    `build_acp_agent`'s direct `ACPAgent(...)` construction. `acp_command`
+    is a single shlex-joined string (the store's on-disk representation;
+    see `agent_profiles_router._build_seed_profile`'s own `shlex.join`)."""
+    import shlex
+
+    return {
+        "agent_kind": "acp",
+        "acp_server": "custom",
+        "acp_command": shlex.join([str(backend.wrapper_script)]),
+        "acp_model": backend.acp_model,
+    }
+
+
+# -- Approval / confirmation-policy flow -------------------------------------
+
+
+def set_confirmation_policy(
+    host: str, api_key: str, conversation_id: str, policy: dict[str, Any]
+) -> dict[str, Any]:
+    """`POST /api/conversations/{id}/confirmation_policy`. `policy` is a
+    `ConfirmationPolicyBase`-shaped dict, e.g. `{"kind": "AlwaysConfirm"}`,
+    `{"kind": "NeverConfirm"}`, or `{"kind": "ConfirmRisky", "threshold":
+    "HIGH"}`."""
+    response = httpx.post(
+        f"{host.rstrip('/')}/api/conversations/{conversation_id}/confirmation_policy",
+        headers=_headers(api_key),
+        json={"policy": policy},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def respond_to_confirmation(
+    host: str,
+    api_key: str,
+    conversation_id: str,
+    *,
+    accept: bool,
+    reason: str = "test response",
+) -> httpx.Response:
+    """`POST /api/conversations/{id}/events/respond_to_confirmation`.
+    Returns the raw `httpx.Response` (not `.json()`-decoded/raised) since
+    callers of this helper specifically want to assert on status codes,
+    including the no-pending-action 4xx case."""
+    return httpx.post(
+        f"{host.rstrip('/')}/api/conversations/{conversation_id}/events/respond_to_confirmation",
+        headers=_headers(api_key),
+        json={"accept": accept, "reason": reason},
+        timeout=30,
+    )
+
+
+def ask_agent(host: str, api_key: str, conversation_id: str, question: str) -> str:
+    """`POST /api/conversations/{id}/ask_agent` -- a side-channel question
+    to the agent that does not affect conversation state (used here as a
+    lightweight liveness probe against an ACP-backed conversation without
+    spending a full billed turn)."""
+    response = httpx.post(
+        f"{host.rstrip('/')}/api/conversations/{conversation_id}/ask_agent",
+        headers=_headers(api_key),
+        json={"question": question},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()["response"]
+
+
+# -- Conversation search (multi-session verification) ------------------------
+
+
+def search_conversations(
+    host: str, api_key: str, *, limit: int = 20, page_id: str | None = None
+) -> dict[str, Any]:
+    """`GET /api/conversations/search` -- lists conversations known to this
+    agent-server (unlike `GET /api/conversations`, which requires an
+    explicit `ids` query param and 400s without one)."""
+    params: dict[str, Any] = {"limit": limit}
+    if page_id is not None:
+        params["page_id"] = page_id
+    response = httpx.get(
+        f"{host.rstrip('/')}/api/conversations/search",
+        headers=_headers(api_key),
+        params=params,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()

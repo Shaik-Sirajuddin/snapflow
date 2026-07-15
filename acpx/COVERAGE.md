@@ -3010,4 +3010,102 @@ tests, 4 new `session_fork_test` tests, 2 new `binary_self_test`
 HTTP-bind-resilience tests). `cargo fmt --all --check` and `cargo build
 --workspace --tests` both clean. `cargo clippy` still not installed in
 this environment, same standing limitation as every prior phase.
-++ /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/acpx/COVERAGE.md
+
+## Phase 30: full OpenHands HTTP-surface coverage (terminal, profiles,
+## approval flow, multi-session) + a real acpx `session/fork` transport
+## bug found and fixed
+
+Extended the OpenHands integration test package
+(`tests/openhands_integration/`, phase 28's Python test suite) from one
+base chat-round-trip file to full HTTP-surface coverage, all against the
+same real, already-running agent-server + real Claude/Codex backends --
+no new mocks, no synthetic transport:
+
+- `test_openhands_terminal.py` (4 tests) -- `/api/bash/*`: synchronous
+  `execute_bash_command`, a non-zero exit code, async `start_bash_command`
+  + poll via `search_bash_events`, and the shared host-level terminal
+  answering normally *while* a real acpx-backed conversation is running
+  concurrently (proves the terminal surface and the ACP subprocess
+  bridge don't contend for a lock).
+- `test_openhands_profiles.py` (6 tests, one parametrized x2 backends)
+  -- `/api/agent-profiles/*` (the launch-spec profile store, distinct
+  from `/api/profiles`'s LLM-config store): save/get/activate/
+  materialize CRUD round trip for an `ACPAgentProfile` naming each acpx
+  wrapper script, plus a from-a-stored-profile conversation that
+  launches the real backend process tree.
+- `test_openhands_approval_flow.py` (5 tests) -- confirmation-policy +
+  respond-to-confirmation + ask_agent against a real ACP-backed
+  conversation. Documents a real architectural finding (not an acpx
+  issue): `ACPAgentClient.request_permission` auto-approves every ACP
+  `session/request_permission` call, so OpenHands's confirmation-policy
+  pause is a verified no-op for ACP-backed conversations; the tests
+  assert on this actual behavior rather than an assumed one.
+- `test_openhands_multi_session.py` (2 tests) -- two real, concurrently
+  running acpx-backed conversations against the same agent-server: no
+  response cross-talk, distinct conversation ids, distinct process
+  trees (best-effort), and `GET /api/conversations/search` correctly
+  listing both independently.
+
+**A real, previously undiscovered acpx transport bug, found live while
+writing `test_ask_agent_side_channel_works_on_acp_conversation`:**
+`OpenHands.ask_agent` implements its side-channel question via a real
+ACP `session/fork` followed by a `session/prompt` against the newly
+forked session id -- exercising phase 28/29's `session/fork` dispatch
+support for the first time against a real client that actually calls it
+mid-conversation (rather than as an isolated protocol probe). Confirmed
+live (both via the raw stdio ACP client and the real OpenHands SDK) that
+the fork's `session/prompt` response always carried the correct final
+result, but its `session/update` notifications (the assistant's actual
+reply text) never reached the client -- `ask_agent` returned `""` every
+time despite the real backend replying normally.
+
+Root cause: `acpx-server/src/transport/live.rs::session_id_to_watch`
+(shared by both the stdio and WS transports, phase 14's live-notification
+wiring) special-cased only `session/new`'s freshly-minted
+`result.sessionId` for "start watching this new gateway session id
+for live push" -- not `session/fork`'s equally freshly-minted one. A
+`session/fork` request's own `params.sessionId` names the *source*
+session, so the generic "read the id the client supplied" fallback path
+picked that up instead, meaning a connection kept watching the source
+session and never subscribed to the forked one at all. The forked
+session's first `session/prompt` call then ran with zero live
+subscribers, so the router's `try_deliver_live` had nowhere to push its
+`session/update` notifications and they silently fell back to the
+`_acpx.updates` buffer embedded in the JSON-RPC response -- a proprietary
+acpx extension no standard ACP client (including OpenHands's
+`ACPAgentClient`) ever reads.
+
+Fixed by special-casing `session/fork` in `session_id_to_watch` exactly
+like `session/new` (read the *response's* minted `result.sessionId`, not
+the request's source one). New unit tests:
+`session_fork_watches_the_newly_minted_forked_gateway_id_not_the_
+source_one`, `a_failed_session_fork_yields_nothing_to_watch`. Verified
+end to end twice post-fix: a raw stdio ACP probe (fork + prompt on the
+forked session now returns the real `"pong"` reply instead of `""`) and
+the real OpenHands SDK `ask_agent` call against a live agent-server.
+
+Workspace test count after this phase: **293 passed, 0 failed, 8
+ignored** (up from 285/0/8 -- 8 new `transport::live` unit tests, 2 of
+them the fork-specific regression coverage above; the other 6 are the
+pre-existing `session/new`/`session/prompt`/`session/close` cases,
+recompiled and rerun as part of the same file). `cargo fmt --all --check`
+and `cargo build --workspace --tests` both clean. `cargo clippy` still
+not installed in this environment, same standing limitation as every
+prior phase.
+
+All four new Python test files pass live against a real running
+OpenHands agent-server stack + real Claude backend (Codex backend
+covered by the profile-CRUD parametrization; not separately re-run for
+the process-heavier tests in this phase to limit real spend): terminal
+4/4, profiles 5/5 non-billed + 1 billed (`test_conversation_from_stored_
+acp_profile_launches_real_backend`, requires the agent-server pid to be
+visible to `ps` -- see the multi-session note below), approval-flow 5/5,
+multi-session 1/1 (`test_conversation_search_lists_both_sessions_
+independently`, no model spend) plus the concurrent-two-conversations
+test's response-isolation assertions (the process-tree corroboration
+specifically needs `ps` to see the agent-server's pid, which this
+sandboxed tool-execution environment's own pytest-invoked processes
+cannot -- see `tests/openhands_integration/README.md`'s pre-existing
+"a note on `ps` snapshot stability" section; not a new issue, not an
+acpx/OpenHands bug, and the test degrades gracefully to a partial-skip
+rather than a false failure).

@@ -24,6 +24,22 @@ use serde_json::Value;
 /// - `session/new`: the client doesn't know the gateway session id until
 ///   *this* response -- `dispatch_session_new_shared` mints it and writes
 ///   it into `result.sessionId` before this function ever sees it.
+/// - `session/fork`: the same "client doesn't know it yet" situation as
+///   `session/new` -- `dispatch_session_fork_shared` mints a *brand new*
+///   gateway session id for the forked session (distinct from the
+///   source session named in `request.params.sessionId`) and writes it
+///   into `result.sessionId`, exactly like `session/new` does. Falling
+///   through to the generic `request.params.sessionId` branch below for
+///   this method would incorrectly re-subscribe to the *source*
+///   session's id instead -- and since a client's very next call after a
+///   fork is typically `session/prompt` against the *forked* id (e.g.
+///   `ACPAgent.ask_agent`'s fork-then-prompt sequence), that forked
+///   session's live `session/update` notifications would have no
+///   subscriber in place for the whole duration of that first prompt
+///   call, silently falling back to the buffered `_acpx.updates`
+///   fallback a standard ACP client never reads. Found via a real
+///   OpenHands `ask_agent` (fork + prompt) call returning an empty
+///   response despite the backend replying normally.
 /// - Every other `Proxied` method that carries a `params.sessionId`
 ///   (`session/prompt`, `session/resume`, `session/load`, `session/set_
 ///   mode`, `session/set_config_option`, `session/close`, `session/
@@ -40,7 +56,7 @@ pub fn session_id_to_watch(request: &Value, response: &Value, method: &str) -> O
     if response.get("error").is_some() {
         return None;
     }
-    if method == "session/new" {
+    if method == "session/new" || method == "session/fork" {
         return response
             .get("result")
             .and_then(|r| r.get("sessionId"))
@@ -89,6 +105,38 @@ mod tests {
         assert_eq!(
             session_id_to_watch(&request, &response, "session/new"),
             Some("gw-1".to_string())
+        );
+    }
+
+    #[test]
+    fn session_fork_watches_the_newly_minted_forked_gateway_id_not_the_source_one() {
+        // The request names the *source* session; the response mints a
+        // brand new gateway id for the forked session -- the transport
+        // must watch the latter, exactly like `session/new`, not fall
+        // through to the generic `request.params.sessionId` branch (which
+        // would incorrectly watch the source session again).
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/fork",
+            "params": {"sessionId": "gw-source", "cwd": "/tmp"}
+        });
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "gw-forked"}});
+        assert_eq!(
+            session_id_to_watch(&request, &response, "session/fork"),
+            Some("gw-forked".to_string())
+        );
+    }
+
+    #[test]
+    fn a_failed_session_fork_yields_nothing_to_watch() {
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/fork",
+            "params": {"sessionId": "gw-source", "cwd": "/tmp"}
+        });
+        let response =
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32001, "message": "boom"}});
+        assert_eq!(
+            session_id_to_watch(&request, &response, "session/fork"),
+            None
         );
     }
 
