@@ -18,7 +18,8 @@
 //! (duplicated helpers rather than shared -- these are independent
 //! test binaries).
 
-use rui_acpx_client::{spawn_acpx_thread, AgentEvent};
+use panel_rust::gateway_actor::spawn_acpx_thread;
+use panel_rust::protocol_types::AgentEvent;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;

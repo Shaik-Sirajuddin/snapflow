@@ -6,14 +6,16 @@
 //! an import/type swap for the acpx cutover, not a rewrite, because of
 //! this deliberate shape match.
 
-use crate::{classify_raw_update, AgentEvent};
+use crate::gateway_actor::classify_raw_update;
+use crate::protocol_types::AgentEvent;
 use acpx_client::raw::ClientError;
 use acpx_client::{AgentRequest, Gateway};
-use rui_acp_client::{
+use crate::protocol_types::{
     AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
     TerminalOutputEvent,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(thiserror::Error, Debug)]
@@ -415,31 +417,104 @@ impl AcpxThreadHandle {
     }
 }
 
-/// Spawn a standalone thread actor bound to one acpx-server instance at
-/// `base_url` (e.g. `http://127.0.0.1:8790`). One actor per logical UI
-/// thread, mirroring `rui_acp_client::spawn_thread`'s per-thread-static-
-/// binding shape -- just against a gateway URL instead of a subprocess
-/// transport.
+/// Spawn a standalone thread actor, connecting its own dedicated
+/// `Gateway` to `base_url` (e.g. `http://127.0.0.1:8790`) first. Kept
+/// for standalone/test callers that just want one thread against one
+/// URL with no connection sharing -- internally this is now just
+/// "connect once, then delegate to [`spawn_acpx_thread_with_gateway`]",
+/// so a caller that *does* want to share one connection across several
+/// threads (see that function's doc comment -- this crate's own
+/// `AgentBridge` is exactly that caller) should call it directly
+/// instead of this one.
 pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
+    let base_url = base_url.into();
+    let (handle, ready_tx) = spawn_acpx_thread_pending();
+    tokio::spawn(async move {
+        let gateway = Arc::new(Gateway::connect(base_url).await);
+        let _ = ready_tx.send(Some(gateway));
+    });
+    handle
+}
+
+/// Spawn a thread actor that talks over an **already-connected**, shared
+/// `Gateway` -- the plan's "one shared `acpx_client::Gateway` held by
+/// `AgentBridge`" design (Phase 2 of `chat-panel-production-ui/
+/// execution-plan.md`): every thread bound to the same provider/gateway
+/// URL passes in the *same* `Arc<Gateway>` (one real WS/HTTP connection
+/// per provider, not per thread), while each thread still gets its own
+/// independent actor/command-loop/cancel-worker/respond-worker set, so
+/// per-thread command serialization (the actual reason those three
+/// workers exist -- see [`AcpxThreadHandle::respond_agent_request`]'s
+/// doc comment) is unaffected by connection sharing. Safe because
+/// `Gateway`'s own transport already multiplexes concurrent in-flight
+/// requests by JSON-RPC id (`GatewayWsClient`'s `pending: Mutex<HashMap
+/// <i64, oneshot::Sender<..>>>`, confirmed by reading `acpx-client::
+/// ws.rs` directly before relying on it) -- a slow prompt on one thread
+/// never blocks another thread's cancel/respond/prompt call from
+/// completing on the same shared connection.
+pub fn spawn_acpx_thread_with_gateway(gateway: Arc<Gateway>) -> AcpxThreadHandle {
+    let (handle, ready_tx) = spawn_acpx_thread_pending();
+    let _ = ready_tx.send(Some(gateway));
+    handle
+}
+
+/// Shared plumbing for both public constructors above: sets up every
+/// channel and spawns all three worker tasks immediately, but each
+/// worker's very first action is to await a `Gateway` handed to it
+/// through a `oneshot` -- `spawn_acpx_thread` fills that oneshot only
+/// once its own `Gateway::connect` resolves; `spawn_acpx_thread_with_
+/// gateway` fills it immediately with the caller's already-connected
+/// `Arc<Gateway>`. A `broadcast`-backed oneshot substitute (a `watch`
+/// channel seeded once) since four independent tasks (main loop, cancel
+/// worker, respond worker, plus this function's own caller) all need to
+/// read the same connected `Gateway` exactly once.
+fn spawn_acpx_thread_pending() -> (AcpxThreadHandle, watch::Sender<Option<Arc<Gateway>>>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
     let (respond_tx, respond_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let base_url = base_url.into();
     let (session_tx, session_rx) = watch::channel(None::<String>);
+    let (gateway_tx, gateway_rx) = watch::channel(None::<Arc<Gateway>>);
     tokio::spawn(run_thread_actor(
-        base_url.clone(),
+        gateway_rx.clone(),
         cmd_rx,
         event_tx,
         session_tx,
     ));
-    tokio::spawn(run_cancel_worker(base_url.clone(), cancel_rx, session_rx));
-    tokio::spawn(run_respond_worker(base_url, respond_rx));
-    AcpxThreadHandle {
-        cmd_tx,
-        cancel_tx,
-        respond_tx,
-        events: event_rx,
+    tokio::spawn(run_cancel_worker(gateway_rx.clone(), cancel_rx, session_rx));
+    tokio::spawn(run_respond_worker(gateway_rx, respond_rx));
+    (
+        AcpxThreadHandle {
+            cmd_tx,
+            cancel_tx,
+            respond_tx,
+            events: event_rx,
+        },
+        gateway_tx,
+    )
+}
+
+/// Awaits `gateway_rx`'s first non-`None` value -- see
+/// `spawn_acpx_thread_pending`'s doc comment on why every worker starts
+/// this way instead of connecting itself.
+async fn await_gateway(gateway_rx: &mut watch::Receiver<Option<Arc<Gateway>>>) -> Arc<Gateway> {
+    loop {
+        if let Some(gateway) = gateway_rx.borrow().clone() {
+            return gateway;
+        }
+        if gateway_rx.changed().await.is_err() {
+            // Sender dropped without ever sending -- only possible if
+            // `spawn_acpx_thread`'s own `Gateway::connect` task panicked
+            // before sending. Retry the borrow one last time in case of
+            // a benign race, else this worker simply never proceeds
+            // (matches every other unrecoverable-setup-failure path in
+            // this actor, which likewise just stalls rather than
+            // panicking the whole process).
+            if let Some(gateway) = gateway_rx.borrow().clone() {
+                return gateway;
+            }
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -463,14 +538,14 @@ pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
 /// command on this worker, matching the other two workers' one-
 /// connection-per-actor-lifetime shape.
 async fn run_respond_worker(
-    base_url: String,
+    mut gateway_rx: watch::Receiver<Option<Arc<Gateway>>>,
     mut respond_rx: mpsc::UnboundedReceiver<RespondCommand>,
 ) {
-    let mut client: Option<Gateway> = None;
+    let mut client: Option<Arc<Gateway>> = None;
     while let Some(cmd) = respond_rx.recv().await {
         let client = match &client {
             Some(client) => client,
-            None => client.insert(Gateway::connect(base_url.clone()).await),
+            None => client.insert(await_gateway(&mut gateway_rx).await),
         };
         let result = client
             .respond_agent_request(&cmd.relay_id, cmd.response)
@@ -750,12 +825,12 @@ fn parse_terminal_output(value: &serde_json::Value) -> Option<TerminalOutputEven
 }
 
 async fn run_thread_actor(
-    base_url: String,
+    mut gateway_rx: watch::Receiver<Option<Arc<Gateway>>>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     session_tx: watch::Sender<Option<String>>,
 ) {
-    let client = Gateway::connect(base_url).await;
+    let client = await_gateway(&mut gateway_rx).await;
     spawn_out_of_band_notification_forwarder(&client, event_tx.clone());
     let (live_tx, mut live_rx) = mpsc::unbounded_channel();
     if let Some(mut live_notifications) = client.subscribe() {
@@ -1075,11 +1150,11 @@ async fn run_thread_actor(
 }
 
 async fn run_cancel_worker(
-    base_url: String,
+    mut gateway_rx: watch::Receiver<Option<Arc<Gateway>>>,
     mut cancel_rx: mpsc::UnboundedReceiver<oneshot::Sender<Result<(), AcpxThreadError>>>,
     session_rx: watch::Receiver<Option<String>>,
 ) {
-    let client = Gateway::connect(base_url).await;
+    let client = await_gateway(&mut gateway_rx).await;
     while let Some(response) = cancel_rx.recv().await {
         let session_id = { session_rx.borrow().clone() };
         let result = match session_id {

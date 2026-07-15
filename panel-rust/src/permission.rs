@@ -19,7 +19,7 @@
 //! doc comment) -- the real disk/process I/O always happens gateway-side
 //! either way.
 
-use rui_acp_client::AgentRequestEvent;
+use crate::protocol_types::AgentRequestEvent;
 use serde_json::Value;
 
 /// What a request card actually shows: a short title (method-derived),

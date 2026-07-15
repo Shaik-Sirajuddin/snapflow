@@ -7,7 +7,8 @@
 //! real binary, don't fake the boundary" testing discipline (see
 //! `panel-rust`'s own headless smoke-test methodology).
 
-use rui_acpx_client::{spawn_acpx_thread, AgentEvent};
+use panel_rust::gateway_actor::spawn_acpx_thread;
+use panel_rust::protocol_types::AgentEvent;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -22,7 +23,7 @@ fn acpx_server_bin() -> PathBuf {
 
 fn mock_agent_bin() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../rui-acp-client/target/debug/rui-mock-agent")
+        .join("target/debug/rui-mock-agent")
 }
 
 /// Binds an ephemeral TCP port synchronously (std, not tokio -- this

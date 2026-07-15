@@ -37,14 +37,22 @@
 //! message-kind vocabulary and status-string convention, verified against
 //! `acpx-core`'s own `session_update_forwarding_test.rs` fixture shapes.
 
+//! Ported directly into `panel-rust` from the former standalone
+//! `rui-acpx-client` crate (Phase 2 of `chat-panel-production-ui/
+//! execution-plan.md`'s "delete rui-acp-client/rui-acpx-client as
+//! separate crates" goal) -- logic and structure otherwise unchanged
+//! from that crate's own `lib.rs`, only the shared-type import source
+//! moved from `rui_acp_client::*` to `crate::protocol_types::*`.
+
 mod thread_actor;
 
-pub use rui_acp_client::{
+pub use crate::protocol_types::{
     AgentEvent, ChatMessage, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
     SessionModesEvent,
 };
 pub use thread_actor::{
-    spawn_acpx_thread, AcpxThreadError, AcpxThreadHandle, ProfileSummary, RemoteThreadInfo,
+    spawn_acpx_thread, spawn_acpx_thread_with_gateway, AcpxThreadError, AcpxThreadHandle,
+    ProfileSummary, RemoteThreadInfo,
 };
 
 /// Maps one raw `session/update` JSON-RPC notification (as returned in

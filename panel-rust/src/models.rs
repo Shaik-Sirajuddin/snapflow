@@ -12,7 +12,7 @@ use crate::{
     AgentCatalogEntry, ConfigOptionRow, LocalTerminalItem, McpServerOption, MessageItem,
     ModeOption, ProfileOption, TerminalItem, ThreadItem,
 };
-use rui_acp_client::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
+use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::{ModelRc, VecModel};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -239,7 +239,7 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
 
 /// Builds the settings sheet's profile-picker row model from a real
 /// `profiles/list` result (`AgentBridge::list_profiles`).
-pub fn to_profile_options(profiles: Vec<rui_acpx_client::ProfileSummary>) -> ModelRc<ProfileOption> {
+pub fn to_profile_options(profiles: Vec<crate::gateway_actor::ProfileSummary>) -> ModelRc<ProfileOption> {
     let items: Vec<ProfileOption> = profiles
         .into_iter()
         .map(|p| ProfileOption {

@@ -10,7 +10,7 @@
 //!
 //! ## JSON persistence (jsonl cache) and live reload
 //!
-//! Backed by [`rui_acp_client::JsonlStore`] -- one `<thread_id>.jsonl`
+//! Backed by [`crate::jsonl_store::JsonlStore`] -- one `<thread_id>.jsonl`
 //! file per thread under the cache dir resolved by
 //! [`resolve_cache_dir`].
 //!
@@ -59,11 +59,12 @@
 //!   with durable server-side session storage exists to validate
 //!   against.
 
-use rui_acp_client::{
-    AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, JsonlStore, SessionModesEvent,
-    TerminalOutputEvent, ThreadTrailer,
+use crate::jsonl_store::{JsonlStore, ThreadTrailer};
+use crate::protocol_types::{
+    AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
+    TerminalOutputEvent,
 };
-use rui_acpx_client::{spawn_acpx_thread, AcpxThreadHandle};
+use crate::gateway_actor::{spawn_acpx_thread_with_gateway, AcpxThreadHandle};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -77,7 +78,7 @@ pub enum BridgeError {
     #[error("failed to start background async runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("jsonl cache error: {0}")]
-    Cache(#[source] rui_acp_client::CacheError),
+    Cache(#[source] crate::jsonl_store::CacheError),
     #[error("acpx gateway provisioning failed: {0}")]
     Gateway(String),
 }
@@ -155,6 +156,14 @@ pub struct AgentBridge {
     slots: Vec<Arc<ThreadSlot>>,
     events: Arc<Mutex<VecDeque<BridgeEvent>>>,
     gateway_urls: std::collections::HashMap<String, String>,
+    // Phase 2 (chat-panel-production-ui/execution-plan.md): "one shared
+    // acpx_client::Gateway held by AgentBridge" -- one real connection
+    // per distinct gateway URL (== per provider, today), reused by
+    // every thread bound to that provider instead of each thread
+    // opening its own. Keyed by base_url (not provider) so a future
+    // multi-URL-per-provider scenario stays representable without a
+    // schema change, even though provider and URL are 1:1 today.
+    gateways: std::collections::HashMap<String, Arc<acpx_client::Gateway>>,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
     // Client-local PTY terminals -- v1 keeps this to at most one per
@@ -203,7 +212,7 @@ async fn open_session_maybe_profiled(
     handle: &AcpxThreadHandle,
     cwd: PathBuf,
     profile: Option<&str>,
-) -> Result<String, rui_acpx_client::AcpxThreadError> {
+) -> Result<String, crate::gateway_actor::AcpxThreadError> {
     match profile {
         Some(profile) => handle.open_session_with_profile(cwd, profile).await,
         None => handle.open_session(cwd).await,
@@ -332,15 +341,17 @@ fn resolve_acpx_server_bin() -> PathBuf {
 /// Resolves the mock backend agent binary the locally-spawned gateway
 /// should proxy to: `RUI_ACP_AGENT_CMD` env override (a real
 /// ACP-compliant agent binary/command), else the dev-checkout
-/// `rui-mock-agent` built alongside `rui-acp-client` -- the same fallback
-/// `resolve_agent_command` used for the (now-retired) direct-subprocess
-/// path, kept as the acpx-gateway's own default backend for dev/test.
+/// `rui-mock-agent` binary this crate itself builds (`src/bin/
+/// mock_agent.rs`, ported directly from the former `rui-acp-client`
+/// crate's own `[[bin]]` of the same name -- Phase 2, chat-panel-
+/// production-ui/execution-plan.md) -- the acpx-gateway's own default
+/// backend for dev/test.
 fn resolve_backend_agent_command() -> String {
     if let Ok(cmd) = std::env::var("RUI_ACP_AGENT_CMD") {
         return cmd;
     }
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../rui-acp-client/target/debug/rui-mock-agent")
+        .join("target/debug/rui-mock-agent")
         .to_string_lossy()
         .into_owned()
 }
@@ -822,7 +833,24 @@ impl AgentBridge {
             }
         }
 
-        // `spawn_acpx_thread` calls the free-function `tokio::spawn` internally,
+        // One real `Gateway` connection per distinct URL, connected once
+        // here (not inside the per-thread loop below) -- see `gateways`
+        // field's own doc comment. `runtime.block_on` is safe here: the
+        // runtime has no other work queued yet (no threads have been
+        // spawned), so this cannot deadlock against anything this
+        // constructor itself is waiting on.
+        let mut gateways: std::collections::HashMap<String, Arc<acpx_client::Gateway>> =
+            std::collections::HashMap::new();
+        for url in resolved_urls.values() {
+            if !gateways.contains_key(url) {
+                gateways.insert(
+                    url.clone(),
+                    Arc::new(runtime.block_on(acpx_client::Gateway::connect(url.clone()))),
+                );
+            }
+        }
+
+        // `spawn_acpx_thread_with_gateway` calls the free-function `tokio::spawn` internally,
         // which needs an active runtime context on this (calling) thread --
         // `enter()` provides that for the duration of this loop. The tasks
         // it schedules then run on the runtime's own worker threads for the
@@ -872,7 +900,10 @@ impl AgentBridge {
             let base_url = resolved_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
-            let mut handle = spawn_acpx_thread(base_url);
+            let gateway = gateways.get(&base_url).cloned().ok_or_else(|| {
+                BridgeError::Gateway(format!("gateway connection missing for {base_url}"))
+            })?;
+            let mut handle = spawn_acpx_thread_with_gateway(gateway);
             let mut events_rx = handle.take_events();
             let handle = Arc::new(handle);
 
@@ -1042,6 +1073,7 @@ impl AgentBridge {
             slots,
             events,
             gateway_urls: resolved_urls,
+            gateways,
             store,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
@@ -1087,6 +1119,9 @@ impl AgentBridge {
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
+        let gateway = self.gateways.get(&base_url).cloned().ok_or_else(|| {
+            BridgeError::Gateway(format!("gateway connection missing for {base_url}"))
+        })?;
         let (seeded, cached_session_id) = match &self.store {
             Some(store) => match store.load(&thread_id) {
                 Ok(cached) => (
@@ -1108,7 +1143,7 @@ impl AgentBridge {
 
         let mut handle = {
             let _guard = self.runtime.enter();
-            spawn_acpx_thread(base_url)
+            spawn_acpx_thread_with_gateway(gateway)
         };
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
@@ -1294,7 +1329,7 @@ impl AgentBridge {
     /// mechanism yet) if the call fails -- the picker then just shows
     /// no choices, same degrade-gracefully posture already used for the
     /// existing free-text profile fields.
-    pub fn list_profiles(&self, idx: usize) -> Vec<rui_acpx_client::ProfileSummary> {
+    pub fn list_profiles(&self, idx: usize) -> Vec<crate::gateway_actor::ProfileSummary> {
         let Some(slot) = self.slots.get(idx) else {
             return Vec::new();
         };
@@ -1633,7 +1668,7 @@ impl AgentBridge {
     /// Dispatches `session/set_config_option` on the background
     /// runtime. Unlike [`Self::set_mode`], a successful call's own
     /// response carries the full updated `configOptions[]` -- the actor
-    /// (`rui_acpx_client::thread_actor`) already re-emits that as a
+    /// (`crate::gateway_actor::thread_actor`) already re-emits that as a
     /// fresh `AgentEvent::ConfigOptions`, which `poll()`/`store_
     /// capability_event` apply the same as any other occurrence, so
     /// `config_options(idx)` reflects the change shortly after this
@@ -1674,7 +1709,12 @@ impl Drop for AgentBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rui_acp_client::MessageKind;
+    // Standalone-thread constructor (its own dedicated connection, not
+    // the bridge's shared-gateway pool) -- used directly by tests below
+    // that want to talk to a `TestGateway` without going through a full
+    // `AgentBridge`.
+    use crate::gateway_actor::spawn_acpx_thread;
+    use crate::protocol_types::MessageKind;
 
     /// Real, already-built `acpx-server` binary next to this crate's own
     /// checkout -- same dev-checkout-relative-path convention
@@ -1685,7 +1725,7 @@ mod tests {
 
     fn mock_agent_bin() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../rui-acp-client/target/debug/rui-mock-agent")
+            .join("target/debug/rui-mock-agent")
     }
 
     fn free_port() -> u16 {

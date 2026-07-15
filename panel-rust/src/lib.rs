@@ -17,16 +17,19 @@
 mod agent_bridge;
 mod appearance;
 mod conversation;
+pub mod gateway_actor;
+pub mod jsonl_store;
 mod local_terminal;
 mod models;
 mod permission;
+pub mod protocol_types;
 mod state_store;
 mod theme;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge};
 use appearance::{AppearanceState, ColorScheme, HostAppearance};
 use models::{build_thread_items, describe_thread, to_message_model, ThreadState};
-use rui_acp_client::{AgentEvent, ChatMessage, MessageKind};
+use protocol_types::{AgentEvent, ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };

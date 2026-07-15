@@ -13,7 +13,7 @@
 //! crate diffs against `session/list`'s response, per Decision 2's
 //! local-first / lazy-verify sequencing.
 
-use crate::session_client::ChatMessage;
+use crate::protocol_types::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};

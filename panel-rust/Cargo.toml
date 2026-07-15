@@ -2,18 +2,19 @@
 name = "panel-rust"
 version = "0.1.0"
 edition = "2021"
-description = "Phase 4+: real chat-panel crate. Renders a Slint UI (software renderer, CPU pixel buffer) driven by rui-acp-client's live ACP session data, exposed via a C ABI for a Qt QQuickItem to composite. See src/agent_bridge.rs for how the async agent connections are bridged onto panel-rust's single required OS thread, and its module docs for the jsonl cache / live-reload contract."
+description = "Real chat-panel crate. Renders a Slint UI (software renderer, CPU pixel buffer) driven by live ACPX gateway session data (via acpx-client directly, see src/gateway_actor.rs), exposed via a C ABI for a Qt QQuickItem to composite. See src/agent_bridge.rs for how the async agent connections are bridged onto panel-rust's single required OS thread, and its module docs for the jsonl cache / live-reload contract."
 
 [dependencies]
 slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
-rui-acp-client = { path = "../rui-acp-client" }
-# Full acpx-gateway cutover (chat-panel-acpx-gateway-integration.md): every
-# thread's live agent connection is one of these, never a direct
-# rui-acp-client subprocess connection. rui-acp-client stays a dependency
-# for its jsonl cache + shared ChatMessage/AgentEvent types only.
-rui-acpx-client = { path = "../rui-acpx-client" }
+# Phase 2 (chat-panel-production-ui/execution-plan.md): the former
+# rui-acp-client/rui-acpx-client wrapper crates were folded directly
+# into this crate (src/protocol_types.rs, src/jsonl_store.rs, src/
+# gateway_actor.rs) -- acpx-client is now this crate's only ACP/ACPX SDK
+# dependency, used directly rather than through a second crate boundary.
+acpx-client = { path = "../acpx/acpx-client" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "io-util", "time", "io-std"] }
 thiserror = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = "0.31"
 portable-pty = "0.9"
@@ -21,12 +22,14 @@ vt100 = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
-# Real profiles/create call in the profile-picker e2e test below (setting
-# up a profile with allow_terminal_access before AgentBridge::add_thread_
-# with_profile selects it) -- not a runtime dependency of this crate's
-# own public API, which reaches the gateway only through rui-acpx-client
-# (see that crate's own doc comment on this same acpx-client boundary).
-acpx-client = { path = "../acpx/acpx-client" }
+# Raw profiles/create + mcp_servers/create HTTP calls in this crate's
+# ported real-process e2e tests (tests/gateway_actor_*_e2e_test.rs,
+# ported directly from the former rui-acpx-client crate's own test
+# suite) -- test-fixture setup only, not a runtime dependency of the
+# library itself (see gateway_actor::thread_actor's own doc comment on
+# why production code goes through the transport-neutral `Gateway`
+# facade, not raw HTTP).
+reqwest = { version = "0.12", features = ["json"] }
 
 [build-dependencies]
 slint-build = "1.17.1"
@@ -35,3 +38,17 @@ slint-build = "1.17.1"
 name = "panel_rust"
 path = "src/lib.rs"
 crate-type = ["staticlib", "rlib"]
+
+# Standalone stdio ACP agent, spawned as a real subprocess by this
+# crate's own real-process e2e tests (and, at runtime, as the acpx
+# gateway's default dev/test backend -- see `agent_bridge::resolve_
+# backend_agent_command`) -- ported directly from the former
+# `rui-acp-client` crate's own `[[bin]]` of the same name (Phase 2,
+# chat-panel-production-ui/execution-plan.md). Not part of this crate's
+# public library API.
+[[bin]]
+name = "rui-mock-agent"
+path = "src/bin/mock_agent.rs"
+
+[dependencies.agent-client-protocol]
+version = "1.2"

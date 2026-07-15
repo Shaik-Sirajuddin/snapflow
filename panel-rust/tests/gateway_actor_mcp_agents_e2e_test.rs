@@ -25,7 +25,7 @@
 //!    `codex-acp`/`gemini` entries, each carrying a real
 //!    `acpx-core::detect::detect` status, not a client-side default).
 
-use rui_acpx_client::spawn_acpx_thread;
+use panel_rust::gateway_actor::spawn_acpx_thread;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -132,14 +132,14 @@ done
 "#;
 
 async fn wait_for_message_containing(
-    rx: &mut UnboundedReceiver<rui_acpx_client::AgentEvent>,
+    rx: &mut UnboundedReceiver<panel_rust::protocol_types::AgentEvent>,
     needle: &str,
     timeout: Duration,
 ) -> Option<String> {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if let Ok(Some(rui_acpx_client::AgentEvent::Message(msg))) =
+        if let Ok(Some(panel_rust::protocol_types::AgentEvent::Message(msg))) =
             tokio::time::timeout(remaining.min(Duration::from_millis(200)), rx.recv()).await
         {
             if msg.text.contains(needle) {
