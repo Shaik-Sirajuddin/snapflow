@@ -3263,3 +3263,18 @@ persisted pinning, pinned recovery surviving an expired idle TTL, and stale
 recovered activity becoming eligible for safe backend close. Verified with
 `cargo test --workspace --no-fail-fast`; credentialed ambient tests remain
 intentionally ignored.
+
+## Phase 38: strict ACP bridge recovery continuity
+
+Strict `/acp` sessions now retain their virtual bridge id, selected public
+model alias, and accepted adapter configuration in the SQLite `sessions`
+row. Once native startup recovery has restored the gateway session, the
+HTTP bridge rebuilds the tenant-scoped virtual mapping before exposing
+`/acp/rpc` or `/acp/ws`. Model changes, bound adapter option changes, and
+forks update the same durable record; a failed initial durable write closes
+the just-created native session so it cannot become an untracked orphan.
+
+Focused tests cover SQLite migration defaults, bridge binding overwrite
+semantics, virtual mapping restoration, and strict HTTP bridge binding.
+Verified with `cargo test --workspace --no-fail-fast`; credentialed ambient
+tests remain intentionally ignored.

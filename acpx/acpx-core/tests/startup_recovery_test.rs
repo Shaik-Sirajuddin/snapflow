@@ -296,6 +296,7 @@ async fn startup_recovery_preserves_pinned_retention_state() {
                 created_at_unix_nanos: Some(stale),
                 last_activity_at_unix_nanos: Some(stale),
                 pinned: true,
+                ..RecoveryMetadata::default()
             },
         )
         .await
@@ -344,6 +345,7 @@ async fn startup_recovery_retains_stale_activity_for_lifecycle_reaping() {
                 created_at_unix_nanos: Some(stale),
                 last_activity_at_unix_nanos: Some(stale),
                 pinned: false,
+                ..RecoveryMetadata::default()
             },
         )
         .await

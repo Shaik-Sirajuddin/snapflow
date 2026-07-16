@@ -246,6 +246,17 @@ pub async fn serve_on_with_bridge(
             .map(|config| Arc::new(BridgeRuntime::new(Arc::clone(config)))),
         ..state
     };
+    if let Some(runtime) = &state.bridge_runtime {
+        if let Some(store) = state.router.lock().await.persistence_store() {
+            let restored = runtime
+                .restore_recovered_sessions(&store)
+                .await
+                .map_err(anyhow::Error::from)?;
+            if restored != 0 {
+                tracing::info!(restored, "restored strict ACP bridge session mappings");
+            }
+        }
+    }
     let auth_enabled = state.auth.token.is_some();
     let bridge_enabled = state.bridge.is_some();
     let mut app = axum::Router::new()

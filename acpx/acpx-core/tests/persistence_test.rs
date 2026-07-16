@@ -44,6 +44,9 @@ async fn session_round_trips_and_starts_unclosed() {
     assert!(!fetched.pinned);
     assert!(fetched.created_at_unix_nanos.is_some());
     assert!(fetched.last_activity_at_unix_nanos.is_some());
+    assert_eq!(fetched.bridge_session_id, None);
+    assert_eq!(fetched.bridge_model_alias, None);
+    assert_eq!(fetched.bridge_config_options, None);
 
     store
         .close_session("gw-1", "2026-07-12T01:00:00Z")
@@ -104,6 +107,7 @@ async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
     assert_eq!(session.cwd.as_deref(), Some("/workspace/project"));
     assert_eq!(session.recovery_params, Some(json!({"checkpoint": "abc"})));
     assert_eq!(session.recovery_method, RecoveryMethod::Load);
+    assert_eq!(session.bridge_session_id, None);
 
     store
         .update_recovery_status(
@@ -145,6 +149,58 @@ async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
         .await
         .expect("list recoverable sessions")
         .is_empty());
+}
+
+#[tokio::test]
+async fn bridge_binding_metadata_round_trips_and_overwrites_prior_selection() {
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    store
+        .record_session_with_recovery(
+            "gw-bridge",
+            "codex-acp",
+            "backend-bridge",
+            None,
+            "2026-07-12T00:00:00Z",
+            "tenant-a",
+            RecoveryMetadata {
+                recovery_params: Some(json!({"cwd": "/workspace", "mcpServers": []})),
+                recovery_method: RecoveryMethod::Load,
+                ..RecoveryMetadata::default()
+            },
+        )
+        .await
+        .expect("record native session");
+
+    store
+        .update_bridge_binding(
+            "gw-bridge",
+            "virtual-bridge".to_string(),
+            "codex/gpt-5".to_string(),
+            json!({"permissionMode": "acceptEdits"}),
+        )
+        .await
+        .expect("persist initial bridge binding");
+    store
+        .update_bridge_binding(
+            "gw-bridge",
+            "virtual-bridge".to_string(),
+            "codex/gpt-5.5".to_string(),
+            json!({"permissionMode": "plan"}),
+        )
+        .await
+        .expect("persist updated bridge binding");
+
+    let fetched = store
+        .get_session("gw-bridge")
+        .await
+        .expect("get session")
+        .expect("session exists");
+    assert_eq!(fetched.bridge_session_id.as_deref(), Some("virtual-bridge"));
+    assert_eq!(fetched.bridge_model_alias.as_deref(), Some("codex/gpt-5.5"));
+    assert_eq!(
+        fetched.bridge_config_options,
+        Some(json!({"permissionMode": "plan"}))
+    );
 }
 
 #[tokio::test]
@@ -428,6 +484,9 @@ async fn pre_recovery_database_migrates_all_recovery_columns_idempotently() {
     assert!(!migrated.pinned);
     assert_eq!(migrated.created_at_unix_nanos, None);
     assert_eq!(migrated.last_activity_at_unix_nanos, None);
+    assert_eq!(migrated.bridge_session_id, None);
+    assert_eq!(migrated.bridge_model_alias, None);
+    assert_eq!(migrated.bridge_config_options, None);
 
     PersistenceStore::open(&db_path).expect("rerun idempotent recovery migration");
 }

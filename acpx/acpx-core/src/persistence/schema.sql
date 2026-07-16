@@ -23,7 +23,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_recovery_error TEXT,
     pinned INTEGER NOT NULL DEFAULT 0,
     created_at_unix_nanos INTEGER,
-    last_activity_at_unix_nanos INTEGER
+    last_activity_at_unix_nanos INTEGER,
+    bridge_session_id TEXT,
+    bridge_model_alias TEXT,
+    bridge_config_options_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transcripts (

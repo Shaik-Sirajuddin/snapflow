@@ -650,6 +650,12 @@ impl Router {
         self
     }
 
+    /// Clone the optional durable store for server-owned features that need
+    /// to persist metadata adjacent to a native gateway session.
+    pub fn persistence_store(&self) -> Option<PersistenceStore> {
+        self.persistence.clone()
+    }
+
     /// Override native session limits. Server configuration should validate
     /// the values before constructing a router; this builder preserves the
     /// low-friction in-process test API.
@@ -917,6 +923,9 @@ impl Router {
                     created_at_unix_nanos: Some(now_unix_nanos()),
                     last_activity_at_unix_nanos: Some(now_unix_nanos()),
                     pinned: entry.pinned,
+                    bridge_session_id: None,
+                    bridge_model_alias: None,
+                    bridge_config_options: None,
                 },
             )
             .await?;
@@ -4519,6 +4528,9 @@ async fn dispatch_session_new_shared(
                     created_at_unix_nanos: Some(now_unix_nanos()),
                     last_activity_at_unix_nanos: Some(now_unix_nanos()),
                     pinned: entry.pinned,
+                    bridge_session_id: None,
+                    bridge_model_alias: None,
+                    bridge_config_options: None,
                 },
             )
             .await

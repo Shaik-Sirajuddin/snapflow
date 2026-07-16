@@ -117,6 +117,10 @@ pub struct RecoveryMetadata {
     pub created_at_unix_nanos: Option<i64>,
     pub last_activity_at_unix_nanos: Option<i64>,
     pub pinned: bool,
+    /// Strict-ACP bridge state. Native transports leave these fields empty.
+    pub bridge_session_id: Option<String>,
+    pub bridge_model_alias: Option<String>,
+    pub bridge_config_options: Option<Value>,
 }
 
 impl Default for RecoveryMetadata {
@@ -130,6 +134,9 @@ impl Default for RecoveryMetadata {
             created_at_unix_nanos: None,
             last_activity_at_unix_nanos: None,
             pinned: false,
+            bridge_session_id: None,
+            bridge_model_alias: None,
+            bridge_config_options: None,
         }
     }
 }
@@ -169,4 +176,9 @@ pub struct SessionRecord {
     /// Wall-clock last activity used to reconstruct the idle deadline after
     /// a daemon restart. `None` denotes a pre-lifecycle row.
     pub last_activity_at_unix_nanos: Option<i64>,
+    /// Virtual `/acp` session identity, retained separately from the native
+    /// gateway id so a bridge client can resume after a daemon restart.
+    pub bridge_session_id: Option<String>,
+    pub bridge_model_alias: Option<String>,
+    pub bridge_config_options: Option<Value>,
 }

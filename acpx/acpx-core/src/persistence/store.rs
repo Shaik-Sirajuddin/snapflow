@@ -21,6 +21,7 @@
 //! just move the contention from our `Mutex` to sqlite's own file lock.
 
 use rusqlite::{params, Connection};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -118,6 +119,11 @@ impl PersistenceStore {
         let last_activity_at_unix_nanos = recovery
             .last_activity_at_unix_nanos
             .unwrap_or(created_at_unix_nanos);
+        let bridge_config_options_json = recovery
+            .bridge_config_options
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
@@ -125,8 +131,9 @@ impl PersistenceStore {
                 "INSERT INTO sessions \
                  (gateway_session_id, agent_id, backend_session_id, profile_name, created_at, tenant_id, \
                   cwd, recovery_params_json, status, recovery_method, last_recovery_error, pinned, \
-                  created_at_unix_nanos, last_activity_at_unix_nanos) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  created_at_unix_nanos, last_activity_at_unix_nanos, bridge_session_id, \
+                  bridge_model_alias, bridge_config_options_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     gateway_session_id,
                     agent_id,
@@ -141,7 +148,10 @@ impl PersistenceStore {
                     recovery.last_recovery_error,
                     recovery.pinned as i64,
                     created_at_unix_nanos,
-                    last_activity_at_unix_nanos
+                    last_activity_at_unix_nanos,
+                    recovery.bridge_session_id,
+                    recovery.bridge_model_alias,
+                    bridge_config_options_json
                 ],
             )?;
             Ok(())
@@ -186,7 +196,8 @@ impl PersistenceStore {
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
-                        last_activity_at_unix_nanos \
+                        last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
+                        bridge_config_options_json \
                  FROM sessions WHERE gateway_session_id = ?1",
             )?;
             let mut rows = stmt.query_map(params![gateway_session_id], row_to_session_record)?;
@@ -210,7 +221,8 @@ impl PersistenceStore {
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
-                        last_activity_at_unix_nanos \
+                        last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
+                        bridge_config_options_json \
                  FROM sessions ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
@@ -229,7 +241,8 @@ impl PersistenceStore {
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
-                        last_activity_at_unix_nanos \
+                        last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
+                        bridge_config_options_json \
                  FROM sessions \
                  WHERE closed_at IS NULL \
                    AND status != 'closed' \
@@ -311,6 +324,36 @@ impl PersistenceStore {
                 params![
                     pinned as i64,
                     last_activity_at_unix_nanos,
+                    gateway_session_id
+                ],
+            )?;
+            if rows == 0 {
+                return Err(PersistenceError::SessionNotFound(gateway_session_id));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn update_bridge_binding(
+        &self,
+        gateway_session_id: impl Into<String>,
+        bridge_session_id: String,
+        bridge_model_alias: String,
+        bridge_config_options: Value,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let bridge_config_options = serde_json::to_string(&bridge_config_options)?;
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let rows = conn.execute(
+                "UPDATE sessions SET bridge_session_id = ?1, bridge_model_alias = ?2, \
+                 bridge_config_options_json = ?3 WHERE gateway_session_id = ?4",
+                params![
+                    bridge_session_id,
+                    bridge_model_alias,
+                    bridge_config_options,
                     gateway_session_id
                 ],
             )?;
@@ -457,6 +500,18 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
             })
         })
         .transpose()?;
+    let bridge_config_options = row
+        .get::<_, Option<String>>(17)?
+        .map(|text| {
+            serde_json::from_str(&text).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })
+        })
+        .transpose()?;
     Ok(SessionRecord {
         gateway_session_id: row.get(0)?,
         agent_id: row.get(1)?,
@@ -473,6 +528,9 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         pinned: row.get::<_, i64>(12)? != 0,
         created_at_unix_nanos: row.get(13)?,
         last_activity_at_unix_nanos: row.get(14)?,
+        bridge_session_id: row.get(15)?,
+        bridge_model_alias: row.get(16)?,
+        bridge_config_options,
     })
 }
 
@@ -498,6 +556,9 @@ fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("created_at_unix_nanos", "INTEGER"),
         ("last_activity_at_unix_nanos", "INTEGER"),
+        ("bridge_session_id", "TEXT"),
+        ("bridge_model_alias", "TEXT"),
+        ("bridge_config_options_json", "TEXT"),
     ] {
         if !column_names.iter().any(|column| column == name) {
             conn.execute(

@@ -162,6 +162,30 @@ impl BridgeSessionStore {
         Ok(session.clone())
     }
 
+    /// Retain an accepted backend option so a recovered bridge session can
+    /// recreate the same adapter configuration after a daemon restart.
+    pub fn update_bound_adapter_config_option(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &BridgeSessionId,
+        config_id: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<BridgeSession, BridgeSessionError> {
+        let mut sessions = self.lock_sessions();
+        let session = session_mut(&mut sessions, tenant_id, session_id)?;
+        if session.state != BridgeSessionState::Bound {
+            return Err(invalid_state(
+                "update adapter config option",
+                session_id,
+                session.state,
+            ));
+        }
+        session
+            .selected_adapter_config_options
+            .insert(config_id.into(), value.into());
+        Ok(session.clone())
+    }
+
     /// Stores one adapter configuration choice before binding. The bridge
     /// validates the public option before it reaches this transport-agnostic
     /// store; this type only enforces the lazy-binding lifecycle.
@@ -196,6 +220,7 @@ impl BridgeSessionStore {
         tenant_id: &TenantId,
         original_new_session_params: NewSessionParams,
         selected_public_model_alias: Option<String>,
+        selected_adapter_config_options: HashMap<String, String>,
         bound_gateway_session_id: impl Into<String>,
     ) -> BridgeSessionId {
         let session_id = BridgeSessionId(uuid::Uuid::new_v4().to_string());
@@ -205,7 +230,7 @@ impl BridgeSessionStore {
             original_new_session_params,
             cwd,
             selected_public_model_alias,
-            selected_adapter_config_options: HashMap::new(),
+            selected_adapter_config_options,
             bound_gateway_session_id: Some(bound_gateway_session_id.into()),
             state: BridgeSessionState::Bound,
         };
@@ -214,6 +239,42 @@ impl BridgeSessionStore {
             .or_default()
             .insert(session_id.clone(), session);
         session_id
+    }
+
+    /// Restore a bridge-visible session id after the native gateway session
+    /// has recovered from persistence. Existing entries are never replaced.
+    pub fn restore_bound(
+        &self,
+        tenant_id: &TenantId,
+        session_id: BridgeSessionId,
+        original_new_session_params: NewSessionParams,
+        selected_public_model_alias: Option<String>,
+        selected_adapter_config_options: HashMap<String, String>,
+        bound_gateway_session_id: impl Into<String>,
+    ) -> Result<(), BridgeSessionError> {
+        let mut sessions = self.lock_sessions();
+        let entries = sessions.entry(tenant_id.clone()).or_default();
+        if let Some(existing) = entries.get(&session_id) {
+            return Err(invalid_state(
+                "restore binding",
+                &session_id,
+                existing.state,
+            ));
+        }
+        let cwd = original_new_session_params.cwd.clone();
+        entries.insert(
+            session_id.clone(),
+            BridgeSession {
+                id: session_id,
+                original_new_session_params,
+                cwd,
+                selected_public_model_alias,
+                selected_adapter_config_options,
+                bound_gateway_session_id: Some(bound_gateway_session_id.into()),
+                state: BridgeSessionState::Bound,
+            },
+        );
+        Ok(())
     }
 
     /// Atomically elects one caller to perform lazy binding.
@@ -561,6 +622,7 @@ mod tests {
             &tenant,
             params("/workspace"),
             Some("codex/gpt-5.5".to_string()),
+            HashMap::new(),
             "native-gateway-fork",
         );
         let fork = store

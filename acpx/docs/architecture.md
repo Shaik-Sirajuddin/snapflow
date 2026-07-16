@@ -212,6 +212,14 @@ after a restart is therefore narrower than a live reconnect:
   `acpx-server` process, real `claude-agent-acp`) by
   `ambient_claude_session_load_survives_a_real_gateway_restart` in
   [`real_ambient_multi_agent_test.rs`](../acpx-server/tests/real_ambient_multi_agent_test.rs).
+- When the strict `/acp` bridge is enabled, its virtual session id,
+  selected public model, and accepted adapter configuration are persisted
+  alongside the native gateway session. After native startup recovery has
+  restored that gateway session, the HTTP bridge rebuilds the tenant-scoped
+  virtual mapping before serving `/acp` requests. Bridge model changes,
+  adapter option changes, and forks update the same durable binding. If
+  the initial binding cannot be persisted, ACPX closes the newly-created
+  native session rather than leaving an untracked orphan.
 
 ## Transports
 

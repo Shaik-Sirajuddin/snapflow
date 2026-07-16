@@ -6,15 +6,18 @@
 //! needs a backend. This module deliberately delegates all backend work to
 //! `acpx_core::Router`; it does not own a second process manager.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use acpx_bridge::{BridgeConfig, BridgeModel};
+use acpx_core::persistence::PersistenceError;
+use acpx_core::persistence::{sessions::RecoveryStatus, PersistenceStore};
 use acpx_core::router::{dispatch_shared_for_tenant, RouterError};
 use acpx_core::{
     BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
     BridgeSessionStore, TenantId,
 };
+use acpx_proto::session::NewSessionParams;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -40,6 +43,8 @@ pub enum BridgeDispatchError {
     Session(#[from] BridgeSessionError),
     #[error(transparent)]
     Router(#[from] RouterError),
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
 }
 
 /// Shared state mounted only when the strict bridge feature is enabled.
@@ -196,6 +201,54 @@ impl BridgeRuntime {
             .find_by_bound_gateway_session_id(tenant_id, bound_gateway_session_id)
             .map(|id| id.0)
     }
+
+    /// Recreate bridge-visible mappings only after native startup recovery
+    /// has restored their gateway sessions. Malformed or stale bridge data is
+    /// skipped so it cannot make the whole daemon unavailable.
+    pub async fn restore_recovered_sessions(
+        &self,
+        store: &PersistenceStore,
+    ) -> Result<usize, BridgeDispatchError> {
+        let mut restored = 0;
+        for record in store.list_recoverable_sessions().await? {
+            if record.status != RecoveryStatus::Restored {
+                continue;
+            }
+            let (Some(virtual_id), Some(model_alias), Some(params)) = (
+                record.bridge_session_id,
+                record.bridge_model_alias,
+                record.recovery_params,
+            ) else {
+                continue;
+            };
+            let Ok(params) = serde_json::from_value::<NewSessionParams>(params) else {
+                tracing::warn!(
+                    gateway_session_id = %record.gateway_session_id,
+                    "skipping malformed persisted bridge session parameters"
+                );
+                continue;
+            };
+            let options = record
+                .bridge_config_options
+                .and_then(|value| serde_json::from_value::<HashMap<String, String>>(value).ok())
+                .unwrap_or_default();
+            let tenant = TenantId(record.tenant_id);
+            let id = BridgeSessionId(virtual_id);
+            if self.sessions.get(&tenant, &id).is_some() {
+                continue;
+            }
+            self.sessions.restore_bound(
+                &tenant,
+                id,
+                params,
+                Some(model_alias),
+                options,
+                record.gateway_session_id,
+            )?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
 }
 
 pub async fn dispatch(
@@ -296,7 +349,19 @@ async fn set_config_option(
                 let mut native = request.clone();
                 native["params"]["sessionId"] =
                     Value::String(session.bound_gateway_session_id.clone().expect("bound id"));
-                forward_session_request(router, tenant_id, &session, native).await
+                native["params"]["configId"] = Value::String(native_id.to_string());
+                native["params"]["value"] = Value::String(native_value.to_string());
+                let response = forward_session_request(router, tenant_id, &session, native).await?;
+                if response.get("error").is_none() {
+                    let updated = runtime.sessions.update_bound_adapter_config_option(
+                        tenant_id,
+                        &session_id,
+                        native_id,
+                        native_value,
+                    )?;
+                    persist_bridge_binding(router, runtime, &updated).await?;
+                }
+                Ok(response)
             }
         };
     }
@@ -335,9 +400,12 @@ async fn set_config_option(
             native["params"]["value"] = Value::String(selected.model_id.clone());
             let mut response = dispatch_shared_for_tenant(router, tenant_id, native).await?;
             if response.get("error").is_none() {
-                runtime
-                    .sessions
-                    .update_bound_model(tenant_id, &session_id, selected.id.clone())?;
+                let updated = runtime.sessions.update_bound_model(
+                    tenant_id,
+                    &session_id,
+                    selected.id.clone(),
+                )?;
+                persist_bridge_binding(router, runtime, &updated).await?;
                 if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
                     result
                         .entry("configOptions".to_string())
@@ -440,8 +508,18 @@ async fn fork_session(
         tenant_id,
         source.original_new_session_params,
         source.selected_public_model_alias,
-        native_fork_id,
+        source.selected_adapter_config_options,
+        native_fork_id.clone(),
     );
+    let fork = runtime
+        .sessions
+        .get(tenant_id, &public_fork_id)
+        .expect("fresh bridge fork exists");
+    if let Err(error) = persist_bridge_binding(router, runtime, &fork).await {
+        let _ = close_native_session(router, tenant_id, &native_fork_id).await;
+        let _ = runtime.sessions.remove(tenant_id, &public_fork_id);
+        return Err(error);
+    }
     response["result"]["sessionId"] = Value::String(public_fork_id.0);
     Ok(response)
 }
@@ -548,14 +626,71 @@ async fn bind(
     .await;
 
     match result {
-        Ok(native_id) => Ok(runtime
-            .sessions
-            .finish_binding(tenant_id, virtual_id, native_id)?),
+        Ok(native_id) => {
+            let bound = runtime
+                .sessions
+                .finish_binding(tenant_id, virtual_id, native_id)?;
+            if let Err(error) = persist_bridge_binding(router, runtime, &bound).await {
+                let native_id = bound
+                    .bound_gateway_session_id
+                    .as_deref()
+                    .expect("bound bridge session has native id");
+                let _ = close_native_session(router, tenant_id, native_id).await;
+                let _ = runtime.sessions.remove(tenant_id, virtual_id);
+                return Err(error);
+            }
+            Ok(bound)
+        }
         Err(error) => {
             let _ = runtime.sessions.fail_binding(tenant_id, virtual_id);
             Err(error.into())
         }
     }
+}
+
+async fn persist_bridge_binding(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    session: &BridgeSession,
+) -> Result<(), BridgeDispatchError> {
+    let Some(store) = router.lock().await.persistence_store() else {
+        return Ok(());
+    };
+    store
+        .update_bridge_binding(
+            session
+                .bound_gateway_session_id
+                .clone()
+                .expect("bound bridge session has native id"),
+            session.id.0.clone(),
+            session
+                .selected_public_model_alias
+                .clone()
+                .unwrap_or_else(|| runtime.config.default_model.clone()),
+            serde_json::to_value(&session.selected_adapter_config_options)
+                .expect("bridge adapter options serialize"),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn close_native_session(
+    router: &SharedRouter,
+    tenant_id: &TenantId,
+    gateway_session_id: &str,
+) -> Result<(), BridgeDispatchError> {
+    dispatch_shared_for_tenant(
+        router,
+        tenant_id,
+        json!({
+            "jsonrpc": "2.0",
+            "id": bridge_internal_id(&BridgeSessionId(gateway_session_id.to_string()), "close"),
+            "method": "session/close",
+            "params": {"sessionId": gateway_session_id},
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn forward_session_request(
@@ -624,4 +759,72 @@ fn bridge_internal_id(session_id: &BridgeSessionId, operation: &str) -> Value {
     // interoperable with the bridge's internal setup calls.
     let _ = (session_id, operation);
     json!(1_000_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acpx_core::persistence::{
+        sessions::{RecoveryMetadata, RecoveryMethod},
+        PersistenceStore,
+    };
+
+    #[tokio::test]
+    async fn restored_native_session_rebuilds_its_virtual_bridge_mapping() {
+        let store = PersistenceStore::open_in_memory().expect("persistence store");
+        store
+            .record_session_with_recovery(
+                "gateway-restored",
+                "codex-acp",
+                "backend-restored",
+                None,
+                "2026-07-16T00:00:00Z",
+                "tenant-a",
+                RecoveryMetadata {
+                    cwd: Some("/workspace".to_string()),
+                    recovery_params: Some(json!({"cwd": "/workspace", "mcpServers": []})),
+                    status: RecoveryStatus::Restored,
+                    recovery_method: RecoveryMethod::Load,
+                    last_recovery_error: None,
+                    bridge_session_id: Some("virtual-restored".to_string()),
+                    bridge_model_alias: Some("codex/gpt-5".to_string()),
+                    bridge_config_options: Some(json!({"permissionMode": "acceptEdits"})),
+                    ..RecoveryMetadata::default()
+                },
+            )
+            .await
+            .expect("seed restored native session");
+
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: "codex/gpt-5".to_string(),
+            models: vec![BridgeModel {
+                id: "codex/gpt-5".to_string(),
+                name: None,
+                agent_id: "codex-acp".to_string(),
+                model_id: "gpt-5".to_string(),
+            }],
+        }));
+        assert_eq!(
+            runtime
+                .restore_recovered_sessions(&store)
+                .await
+                .expect("restore bridge mapping"),
+            1
+        );
+        let tenant = TenantId::from("tenant-a");
+        assert_eq!(
+            runtime.bound_gateway_session_id(&tenant, "virtual-restored"),
+            Some("gateway-restored".to_string())
+        );
+        let session = runtime
+            .sessions
+            .get(&tenant, &BridgeSessionId("virtual-restored".to_string()))
+            .expect("restored virtual session");
+        assert_eq!(
+            session
+                .selected_adapter_config_options
+                .get("permissionMode"),
+            Some(&"acceptEdits".to_string())
+        );
+    }
 }
