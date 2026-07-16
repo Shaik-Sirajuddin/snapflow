@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         program = %config.backend.program,
         args = ?config.backend.args,
         http_bind_addr = ?config.http_bind_addr,
+        admin_bind_addr = ?config.admin_bind_addr,
         acp_bridge_enabled = config.bridge.is_some(),
         startup_session_recovery_enabled = config.startup_session_recovery_enabled,
         startup_session_recovery_timeout_secs = config.startup_session_recovery_timeout.as_secs(),
@@ -81,6 +82,29 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // The admin plane changes gateway-wide launch policy, so it is never
+    // allowed to run with ephemeral state. Load one registry snapshot now
+    // too: AdminOps owns the registry/custom-id namespace boundary.
+    let admin_transport = if let Some(token) = config.admin_token.clone() {
+        let store = router.persistence_store().ok_or_else(|| {
+            anyhow::anyhow!("ACPX_ADMIN_TOKEN requires ACPX_DB_PATH for durable admin state")
+        })?;
+        let registry_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let registry = acpx_registry::fetch_registry_or_fallback(&registry_client).await;
+        Some((
+            config
+                .admin_bind_addr
+                .expect("admin token always sets an admin bind address"),
+            token,
+            store,
+            registry,
+        ))
+    } else {
+        None
+    };
 
     // Provisioning: providers/central-MCP-servers/profiles declared in a
     // JSON file, applied before either transport starts accepting
@@ -208,6 +232,15 @@ async fn main() -> anyhow::Result<()> {
             transport::serve_on_with_bridge(listener, router, auth_token, bridge).await
         })
     });
+    let admin_task = match admin_transport {
+        Some((bind_addr, token, store, registry)) => {
+            let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+            Some(tokio::spawn(async move {
+                transport::admin::serve_on(listener, token, store, registry).await
+            }))
+        }
+        None => None,
+    };
 
     // Bug fix (discovered driving the real-adapter e2e test with a
     // Stdio::null()/closed-stdin child, the same shape any daemonized
@@ -220,8 +253,23 @@ async fn main() -> anyhow::Result<()> {
     // falls through to just waiting on `http_task` alone (selected here
     // by `&mut` -- std's blanket `impl Future for &mut F where F: Future
     // + Unpin` -- so the same handle can still be awaited again below).
-    match http_task {
-        Some(mut http_task) => {
+    match (http_task, admin_task) {
+        (Some(mut http_task), Some(mut admin_task)) => {
+            tokio::select! {
+                result = stdio_task => {
+                    result??;
+                    (&mut http_task).await??;
+                    (&mut admin_task).await??;
+                }
+                result = &mut http_task => {
+                    result??;
+                }
+                result = &mut admin_task => {
+                    result??;
+                }
+            }
+        }
+        (Some(mut http_task), None) => {
             tokio::select! {
                 result = stdio_task => {
                     result??;
@@ -232,10 +280,21 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        (None, Some(mut admin_task)) => {
+            tokio::select! {
+                result = stdio_task => {
+                    result??;
+                    (&mut admin_task).await??;
+                }
+                result = &mut admin_task => {
+                    result??;
+                }
+            }
+        }
         // HTTP/WS disabled or unbindable: nothing to select against, just
         // run stdio to completion (its own EOF-vs-error distinction is
         // handled inside `transport::stdio::run` already).
-        None => {
+        (None, None) => {
             stdio_task.await??;
         }
     }

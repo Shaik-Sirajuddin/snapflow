@@ -30,6 +30,13 @@ pub struct ServerConfig {
     /// this transport fully unauthenticated, matching every pre-existing
     /// deployment/test that never set this var.
     pub auth_token: Option<String>,
+    /// Optional bearer token for the loopback-only admin HTTP surface.
+    /// Unlike `auth_token`, enabling this requires `ACPX_DB_PATH` so
+    /// gateway-wide agent administration is always durable.
+    pub admin_token: Option<String>,
+    /// Loopback bind address for `/admin/*`. Present only when
+    /// `ACPX_ADMIN_TOKEN` is configured.
+    pub admin_bind_addr: Option<std::net::SocketAddr>,
     /// Whether durable open sessions are proactively restored before any
     /// transport starts. Defaults to enabled only when `ACPX_DB_PATH` is
     /// set; `ACPX_STARTUP_SESSION_RECOVERY_ENABLED=0` disables it.
@@ -121,6 +128,21 @@ impl ServerConfig {
         let auth_token = std::env::var("ACPX_AUTH_TOKEN")
             .ok()
             .filter(|t| !t.is_empty());
+        let admin_token = std::env::var("ACPX_ADMIN_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+        let admin_bind_addr = admin_token.as_ref().map(|_| {
+            let raw =
+                std::env::var("ACPX_ADMIN_BIND").unwrap_or_else(|_| "127.0.0.1:8791".to_owned());
+            let address = raw.parse::<std::net::SocketAddr>().unwrap_or_else(|err| {
+                panic!("ACPX_ADMIN_BIND={raw:?} is not a valid socket address: {err}")
+            });
+            assert!(
+                address.ip().is_loopback(),
+                "ACPX_ADMIN_BIND must use a loopback address"
+            );
+            address
+        });
         let startup_session_recovery_enabled =
             match std::env::var("ACPX_STARTUP_SESSION_RECOVERY_ENABLED") {
                 Ok(value) => value != "0",
@@ -200,6 +222,8 @@ impl ServerConfig {
             bridge,
             http_bind_addr,
             auth_token,
+            admin_token,
+            admin_bind_addr,
             startup_session_recovery_enabled,
             startup_session_recovery_timeout,
             startup_session_recovery_concurrency,

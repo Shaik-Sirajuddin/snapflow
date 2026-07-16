@@ -763,6 +763,14 @@
           },
           "status": {
             "$ref": "#/components/schemas/AgentStatus"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "source": {
+            "$ref": "#/components/schemas/AgentSource",
+            "default": "registry"
           }
         },
         "required": [
@@ -770,6 +778,13 @@
           "name",
           "version",
           "status"
+        ]
+      },
+      "AgentSource": {
+        "type": "string",
+        "enum": [
+          "registry",
+          "custom"
         ]
       },
       "AgentIdParams": {

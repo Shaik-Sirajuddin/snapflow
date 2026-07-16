@@ -181,6 +181,14 @@
         },
         "status": {
           "$ref": "#/$defs/AgentStatus"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "source": {
+          "$ref": "#/$defs/AgentSource",
+          "default": "registry"
         }
       },
       "required": [
@@ -188,6 +196,13 @@
         "name",
         "version",
         "status"
+      ]
+    },
+    "AgentSource": {
+      "type": "string",
+      "enum": [
+        "registry",
+        "custom"
       ]
     },
     "AgentIdParams": {

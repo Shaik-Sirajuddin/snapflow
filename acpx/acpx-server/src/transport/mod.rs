@@ -1,6 +1,7 @@
 //! Transport implementations. Phase 1: `stdio` only. Phase 2 step 11 adds
 //! `http`/`ws` alongside it -- see `04-phased-plan.md`.
 
+pub mod admin;
 pub mod http;
 pub mod live;
 pub mod stdio;

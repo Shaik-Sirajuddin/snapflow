@@ -68,6 +68,10 @@ impl AdminOps {
         self.custom_agents.delete(id).await?;
         Ok(())
     }
+
+    pub async fn list_custom_agents(&self) -> Result<Vec<CustomAgent>, AdminError> {
+        Ok(self.custom_agents.list().await?)
+    }
 }
 
 fn validate_custom_agent(agent: &CustomAgent) -> Result<(), AdminError> {
