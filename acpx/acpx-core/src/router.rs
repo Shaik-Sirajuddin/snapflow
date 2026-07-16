@@ -18,7 +18,7 @@ use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
 use acpx_proto::agent::AgentStatus;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Which bucket a given JSON-RPC method falls into. See the classification
 /// table in `02-architecture.md`.
@@ -240,6 +240,10 @@ pub struct Router {
     /// every call. No TTL/invalidation yet; a later phase can add one if
     /// the registry needs to be re-polled for changes mid-run.
     registry_cache: Option<acpx_registry::Registry>,
+    /// Cached results from disposable backend capability probes. Unlike the
+    /// registry cache this stores adapter-runtime data (`configOptions`,
+    /// permission modes, and auth methods), not launch metadata.
+    capability_cache: acpx_registry::CapabilityCache,
     /// Optional sqlite-backed persistence (Phase 2 step 10, see
     /// `crate::persistence`). `None` by default -- a `Router` used purely
     /// in-memory (e.g. most of this crate's own tests) never touches
@@ -523,6 +527,7 @@ impl Router {
             default_agent_id: default_agent_id.into(),
             http: reqwest::Client::new(),
             registry_cache: None,
+            capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
             providers: ProviderStore::new(),
             keystore: Keystore::new(),
@@ -657,6 +662,85 @@ impl Router {
         })?;
         self.supervisor.register(agent_id.to_string(), spec);
         Ok(())
+    }
+
+    /// Discover one adapter's runtime model and permission selectors without
+    /// creating an ACPX gateway session. The temporary backend session is
+    /// always closed before the result is cached.
+    pub async fn probe_adapter_capabilities(
+        &mut self,
+        agent_id: &str,
+        cwd: &str,
+    ) -> Result<acpx_registry::AdapterCapabilities, RouterError> {
+        if self.supervisor.spec(agent_id).is_none() {
+            self.ensure_registry_agent_registered(agent_id).await?;
+        }
+
+        let adapter_version = {
+            self.ensure_registry_loaded().await;
+            self.registry_cache
+                .as_ref()
+                .and_then(|registry| registry.agents.iter().find(|agent| agent.id == agent_id))
+                .map(|agent| agent.version.clone())
+        };
+        let cache_key = acpx_registry::CapabilityCacheKey::new(agent_id, adapter_version.clone());
+        if let Some(capabilities) = self.capability_cache.get(&cache_key, Instant::now()) {
+            return Ok(capabilities);
+        }
+
+        let backend = self.supervisor.ensure_running(agent_id).await?;
+        let capabilities = {
+            let mut backend = backend.lock().await;
+            ensure_backend_initialized(&mut backend, BackendCallPolicy::default()).await?;
+            let initialize_result = backend.agent_capabilities.clone().unwrap_or_default();
+
+            let new_id = serde_json::json!("acpx-capability-probe-new");
+            backend
+                .writer
+                .lock()
+                .await
+                .write_value(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": new_id,
+                    "method": "session/new",
+                    "params": {"cwd": cwd, "mcpServers": []}
+                }))
+                .await?;
+            let (response, _, _) =
+                read_matching_response(&mut backend, &new_id, BackendCallPolicy::default(), None)
+                    .await?;
+            let backend_session_id = extract_backend_session_id(&response)?;
+            let capabilities = acpx_registry::AdapterCapabilities::from_acp(
+                agent_id,
+                &initialize_result,
+                &response["result"],
+            );
+
+            let close_id = serde_json::json!("acpx-capability-probe-close");
+            backend
+                .writer
+                .lock()
+                .await
+                .write_value(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": close_id,
+                    "method": "session/close",
+                    "params": {"sessionId": backend_session_id}
+                }))
+                .await?;
+            if let Err(error) =
+                read_matching_response(&mut backend, &close_id, BackendCallPolicy::default(), None)
+                    .await
+            {
+                tracing::warn!(%error, %agent_id, "capability probe could not close disposable backend session");
+            }
+            capabilities
+        };
+
+        self.capability_cache.invalidate_adapter(agent_id);
+        self.capability_cache
+            .put(cache_key, capabilities.clone(), Instant::now());
+        Ok(capabilities)
     }
 
     /// Seed a provider config, overwriting any existing entry of the same
