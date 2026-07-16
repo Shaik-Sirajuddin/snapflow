@@ -1914,6 +1914,8 @@ impl Router {
                 .update_session_activity(gateway_session_id.clone(), now_unix_nanos())
                 .await?;
         }
+        mark_successful_recovery_retry(self.persistence.clone(), &gateway_session_id, &method)
+            .await?;
         self.spawn_transcript(
             gateway_session_id.clone(),
             Direction::AgentToClient,
@@ -3622,6 +3624,36 @@ fn spawn_session_persistence_fn(
     });
 }
 
+/// A failed proactive restore remains durable so a client can retry it with
+/// ACP's native `session/load` or `session/resume`. Once any retry reaches
+/// the backend successfully, clear the stale failure diagnostics without
+/// changing unrelated active or closed session rows.
+async fn mark_successful_recovery_retry(
+    store: Option<PersistenceStore>,
+    gateway_session_id: &str,
+    method: &str,
+) -> Result<(), RouterError> {
+    if !matches!(method, "session/load" | "session/resume") {
+        return Ok(());
+    }
+    let Some(store) = store else {
+        return Ok(());
+    };
+    let Some(record) = store.get_session(gateway_session_id.to_string()).await? else {
+        return Ok(());
+    };
+    if record.closed_at.is_none() && record.status == RecoveryStatus::RecoveryFailed {
+        store
+            .update_recovery_status(
+                gateway_session_id.to_string(),
+                RecoveryStatus::Restored,
+                None,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// `Arc<tokio::sync::Mutex<Router>>` -- the handle type
 /// `acpx-server`'s transports hold and pass to [`dispatch_shared`].
 /// Re-exported here (rather than only living in `acpx-server`) so this
@@ -4230,6 +4262,7 @@ async fn dispatch_proxied_shared(
             .await?;
     }
     let response = response_result?;
+    mark_successful_recovery_retry(persistence.clone(), &gateway_session_id, &method).await?;
 
     spawn_transcript_fn(
         persistence.clone(),

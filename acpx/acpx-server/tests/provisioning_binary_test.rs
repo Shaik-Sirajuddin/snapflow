@@ -39,6 +39,7 @@ done
 /// because `ACPX_BACKEND_CMD` only supports whitespace-separated arguments.
 const RECOVERY_RECORDING_BACKEND_SCRIPT: &str = r#"
 log_path=$1
+fail_load_path=$2
 while IFS= read -r line; do
   method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
   printf '%s\t%s\n' "$method" "$line" >> "$log_path"
@@ -46,6 +47,9 @@ while IFS= read -r line; do
   if echo "$line" | grep -q 'session/new'; then
     printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
   elif echo "$line" | grep -q 'session/load'; then
+    if [ -n "$fail_load_path" ] && [ -e "$fail_load_path" ]; then
+      exit 17
+    fi
     printf '{"jsonrpc":"2.0","id":%s,"result":{"loaded":true}}\n' "$id"
   elif echo "$line" | grep -q 'session/prompt'; then
     printf '{"jsonrpc":"2.0","id":%s,"result":{"prompted":true}}\n' "$id"
@@ -554,6 +558,156 @@ async fn real_binary_recovered_session_accepts_websocket_prompt() {
         .position(|line| line.starts_with("session/prompt\t"))
         .expect("websocket session/prompt");
     assert!(load_index < prompt_index, "{methods:?}");
+
+    let _ = guard.child.start_kill();
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_file(log_path);
+}
+
+#[tokio::test]
+async fn real_binary_survives_a_recovery_connector_outage() {
+    let addr = ephemeral_addr().await;
+    let db_path = write_temp_file("acpx-recovery-outage-db", "");
+    let log_path = write_temp_file("acpx-recovery-outage-log", "");
+    let fail_load_path = write_temp_file("acpx-recovery-outage-flag", "");
+    let script_path = write_temp_file(
+        "acpx-recovery-outage-backend",
+        RECOVERY_RECORDING_BACKEND_SCRIPT,
+    );
+    seed_recoverable_session(&db_path, None).await;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    cmd.env(
+        "ACPX_BACKEND_CMD",
+        format!(
+            "sh {} {} {}",
+            script_path.display(),
+            log_path.display(),
+            fail_load_path.display()
+        ),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_DB_PATH", db_path.display().to_string())
+    // The backend exits only while this sentinel exists. Removing it lets
+    // the client retry native session/load against a replacement connector.
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn recovering real binary");
+    let mut guard = ServerGuard {
+        child,
+        _script_path: script_path,
+        _config_path: std::path::PathBuf::new(),
+    };
+    wait_for_listener(addr).await;
+
+    let client = reqwest::Client::new();
+    let health = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("GET /health")
+        .json::<Value>()
+        .await
+        .expect("health JSON");
+    assert_eq!(health["status"], json!("ready"), "{health:?}");
+    assert_eq!(health["recovery"]["failed"], json!(1), "{health:?}");
+    assert_eq!(health["recovery"]["restored"], json!(0), "{health:?}");
+
+    let unavailable = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {"sessionId": "gateway-recovered", "prompt": []}
+        }))
+        .send()
+        .await
+        .expect("POST /rpc session/prompt")
+        .json::<Value>()
+        .await
+        .expect("JSON-RPC response");
+    assert!(
+        unavailable["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no session registered")),
+        "failed recovery must not expose a live session: {unavailable:?}"
+    );
+
+    std::fs::remove_file(&fail_load_path).expect("remove outage sentinel");
+    let recovered = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let response = client
+                .post(format!("http://{addr}/rpc"))
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/load",
+                    "params": {"sessionId": "gateway-recovered", "cwd": "/workspace"}
+                }))
+                .send()
+                .await
+                .expect("POST /rpc session/load")
+                .json::<Value>()
+                .await
+                .expect("JSON-RPC response");
+            if response["result"]["loaded"] == json!(true) {
+                return response;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("connector never recovered from crash backoff");
+    assert!(
+        recovered["result"]["loaded"] == json!(true),
+        "daemon must allow native recovery retry after connector backoff: {recovered:?}"
+    );
+
+    let prompt = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {"sessionId": "gateway-recovered", "prompt": []}
+        }))
+        .send()
+        .await
+        .expect("POST /rpc session/prompt after recovery retry")
+        .json::<Value>()
+        .await
+        .expect("JSON-RPC response");
+    assert_eq!(prompt["result"]["prompted"], json!(true), "{prompt:?}");
+
+    let healed_health = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("GET /health after retry")
+        .json::<Value>()
+        .await
+        .expect("health JSON");
+    assert_eq!(
+        healed_health["recovery"]["failed"],
+        json!(0),
+        "{healed_health:?}"
+    );
+    assert_eq!(
+        healed_health["recovery"]["restored"],
+        json!(1),
+        "{healed_health:?}"
+    );
+
+    let methods = wait_for_log_line(&log_path, "session/prompt\t").await;
+    assert!(
+        methods
+            .iter()
+            .any(|line| line.starts_with("session/load\t")),
+        "recovery did not attempt the persisted session: {methods:?}"
+    );
 
     let _ = guard.child.start_kill();
     let _ = std::fs::remove_file(db_path);

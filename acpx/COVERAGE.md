@@ -3325,3 +3325,21 @@ Verified with `cargo test -p acpx-server --test provisioning_binary_test
 real_binary_recovered_session_accepts_websocket_prompt -- --nocapture`.
 Connector-outage coverage and credentialed Codex/OpenHands recovery remain
 open.
+
+## Phase 42: connector-outage recovery retry
+
+`real_binary_survives_a_recovery_connector_outage` starts a real daemon from
+a recoverable SQLite row whose recording adapter exits during startup
+`session/load`. With non-fail-fast recovery, `/health` remains ready while
+reporting one failed recovery, and the unavailable gateway id cannot receive a
+prompt. After the adapter outage sentinel is removed, a native client
+`session/load` retries through the connector's bounded crash backoff, restores
+the session, permits `session/prompt`, and changes durable health from
+`failed: 1` to `restored: 1`.
+
+This test also fixed stale recovery diagnostics: successful client-initiated
+`session/load` or `session/resume` now clears `recovery_failed` for an open
+durable row in both direct and shared router dispatch paths. Verified with
+`cargo test -p acpx-core --test session_load_rehydration_test` and `cargo test
+-p acpx-server --test provisioning_binary_test
+real_binary_survives_a_recovery_connector_outage -- --nocapture`.
