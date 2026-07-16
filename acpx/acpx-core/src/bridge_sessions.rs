@@ -45,6 +45,9 @@ pub struct BridgeSession {
     pub original_new_session_params: NewSessionParams,
     pub cwd: String,
     pub selected_public_model_alias: Option<String>,
+    /// Adapter-native configuration choices selected before lazy binding,
+    /// keyed by the native ACP `configId` (for example `permissionMode`).
+    pub selected_adapter_config_options: HashMap<String, String>,
     /// ACPX-native gateway id created after lazy binding. This remains
     /// internal: bridge clients keep using [`Self::id`] for the lifetime of
     /// the virtual session.
@@ -109,6 +112,7 @@ impl BridgeSessionStore {
             original_new_session_params,
             cwd,
             selected_public_model_alias: None,
+            selected_adapter_config_options: HashMap::new(),
             bound_gateway_session_id: None,
             state: BridgeSessionState::Unbound,
         };
@@ -158,6 +162,31 @@ impl BridgeSessionStore {
         Ok(session.clone())
     }
 
+    /// Stores one adapter configuration choice before binding. The bridge
+    /// validates the public option before it reaches this transport-agnostic
+    /// store; this type only enforces the lazy-binding lifecycle.
+    pub fn select_adapter_config_option(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &BridgeSessionId,
+        config_id: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<BridgeSession, BridgeSessionError> {
+        let mut sessions = self.lock_sessions();
+        let session = session_mut(&mut sessions, tenant_id, session_id)?;
+        if session.state != BridgeSessionState::Unbound {
+            return Err(invalid_state(
+                "select adapter config option",
+                session_id,
+                session.state,
+            ));
+        }
+        session
+            .selected_adapter_config_options
+            .insert(config_id.into(), value.into());
+        Ok(session.clone())
+    }
+
     /// Registers an already-created native ACPX gateway session behind a
     /// fresh virtual bridge id. This is used for `session/fork`: the
     /// backend has made the real fork, while the bridge must keep the
@@ -176,6 +205,7 @@ impl BridgeSessionStore {
             original_new_session_params,
             cwd,
             selected_public_model_alias,
+            selected_adapter_config_options: HashMap::new(),
             bound_gateway_session_id: Some(bound_gateway_session_id.into()),
             state: BridgeSessionState::Bound,
         };
@@ -402,6 +432,23 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn adapter_config_selection_is_retained_until_binding() {
+        let store = BridgeSessionStore::new();
+        let tenant = TenantId::from("tenant-a");
+        let session_id = store.register(&tenant, params("/workspace"));
+        let session = store
+            .select_adapter_config_option(&tenant, &session_id, "permissionMode", "acceptEdits")
+            .unwrap();
+        assert_eq!(
+            session
+                .selected_adapter_config_options
+                .get("permissionMode")
+                .map(String::as_str),
+            Some("acceptEdits")
+        );
     }
 
     #[test]

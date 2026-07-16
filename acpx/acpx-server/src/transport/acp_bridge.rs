@@ -48,12 +48,14 @@ pub struct BridgeRuntime {
     pub config: Arc<BridgeConfig>,
     pub sessions: BridgeSessionStore,
     models: Arc<RwLock<Vec<BridgeModel>>>,
+    config_options: Arc<RwLock<Vec<Value>>>,
 }
 
 impl BridgeRuntime {
     pub fn new(config: Arc<BridgeConfig>) -> Self {
         Self {
             models: Arc::new(RwLock::new(config.models.clone())),
+            config_options: Arc::new(RwLock::new(Vec::new())),
             config,
             sessions: BridgeSessionStore::new(),
         }
@@ -70,6 +72,7 @@ impl BridgeRuntime {
             .map(ToOwned::to_owned)
             .collect();
         let mut discovered = Vec::new();
+        let mut discovered_options = Vec::new();
         for agent_id in agent_ids {
             let capabilities = {
                 let mut router = router.lock().await;
@@ -85,6 +88,25 @@ impl BridgeRuntime {
                 agent_id: agent_id.clone(),
                 model_id: model.value,
             }));
+            discovered_options.extend(
+                capabilities
+                    .config_options
+                    .into_iter()
+                    .filter(|option| option.id != "model")
+                    .map(|option| {
+                        json!({
+                            "id": option.id,
+                            "name": option.name,
+                            "category": option.category,
+                            "type": "select",
+                            "currentValue": option.current_value,
+                            "options": option.options.into_iter().map(|choice| json!({
+                                "value": choice.value,
+                                "name": choice.name,
+                            })).collect::<Vec<_>>(),
+                        })
+                    }),
+            );
         }
         if discovered.is_empty() {
             return;
@@ -96,6 +118,15 @@ impl BridgeRuntime {
                 .into_iter()
                 .filter(|model| seen.insert(model.id.clone())),
         );
+        drop(models);
+        let mut options = self.config_options.write().await;
+        for option in discovered_options {
+            let id = option.get("id").and_then(Value::as_str);
+            if id.is_some_and(|id| options.iter().any(|existing| existing["id"] == id)) {
+                continue;
+            }
+            options.push(option);
+        }
     }
 
     pub async fn resolve_model(&self, alias: &str) -> Option<BridgeModel> {
@@ -109,7 +140,7 @@ impl BridgeRuntime {
 
     pub async fn model_config_options(&self) -> Value {
         let models = self.models.read().await;
-        json!([{
+        let mut options = vec![json!({
             "id": "model",
             "name": "Model",
             "category": "model",
@@ -119,7 +150,27 @@ impl BridgeRuntime {
                 "value": model.id,
                 "name": model.name.as_deref().unwrap_or(&model.id),
             })).collect::<Vec<_>>(),
-        }])
+        })];
+        options.extend(self.config_options.read().await.iter().cloned());
+        Value::Array(options)
+    }
+
+    pub async fn adapter_config_option(
+        &self,
+        config_id: &str,
+        value: &str,
+    ) -> Option<(String, String)> {
+        self.config_options
+            .read()
+            .await
+            .iter()
+            .find(|option| {
+                option["id"] == config_id
+                    && option["options"].as_array().is_some_and(|choices| {
+                        choices.iter().any(|choice| choice["value"] == value)
+                    })
+            })
+            .map(|_| (config_id.to_string(), value.to_string()))
     }
 
     pub async fn public_models(&self, agents_result: &Value) -> Vec<acpx_bridge::PublicModel> {
@@ -209,17 +260,10 @@ async fn set_config_option(
         .pointer("/params/configId")
         .and_then(Value::as_str)
         .ok_or(BridgeDispatchError::InvalidModelSelection)?;
-    let model_alias = request
+    let selected_value = request
         .pointer("/params/value")
         .and_then(Value::as_str)
         .ok_or(BridgeDispatchError::InvalidModelSelection)?;
-    if config_id != "model" {
-        return Err(BridgeDispatchError::InvalidModelSelection);
-    }
-    let selected = runtime
-        .resolve_model(model_alias)
-        .await
-        .ok_or_else(|| BridgeDispatchError::UnknownModel(model_alias.to_string()))?;
     let session = runtime
         .sessions
         .get(tenant_id, &session_id)
@@ -227,6 +271,39 @@ async fn set_config_option(
             tenant_id: tenant_id.0.clone(),
             session_id: session_id.0.clone(),
         })?;
+
+    if config_id != "model" {
+        let (native_id, native_value) = runtime
+            .adapter_config_option(config_id, selected_value)
+            .await
+            .ok_or(BridgeDispatchError::InvalidModelSelection)?;
+        return match session.state {
+            BridgeSessionState::Unbound => {
+                runtime.sessions.select_adapter_config_option(
+                    tenant_id,
+                    &session_id,
+                    native_id,
+                    native_value,
+                )?;
+                Ok(success(
+                    &request,
+                    json!({"configOptions": runtime.model_config_options().await}),
+                ))
+            }
+            BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
+            BridgeSessionState::Failed => Err(BridgeDispatchError::BindingFailed),
+            BridgeSessionState::Bound => {
+                let mut native = request.clone();
+                native["params"]["sessionId"] =
+                    Value::String(session.bound_gateway_session_id.clone().expect("bound id"));
+                forward_session_request(router, tenant_id, &session, native).await
+            }
+        };
+    }
+    let selected = runtime
+        .resolve_model(selected_value)
+        .await
+        .ok_or_else(|| BridgeDispatchError::UnknownModel(selected_value.to_string()))?;
 
     match session.state {
         BridgeSessionState::Unbound => {
@@ -445,6 +522,26 @@ async fn bind(
         let selection = dispatch_shared_for_tenant(router, tenant_id, native_select).await?;
         if let Some(error) = selection.get("error") {
             return Err(RouterError::BackendSessionNewError(error.clone()));
+        }
+        for (config_id, value) in &session.selected_adapter_config_options {
+            let configured = dispatch_shared_for_tenant(
+                router,
+                tenant_id,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": bridge_internal_id(virtual_id, config_id),
+                    "method": "session/set_config_option",
+                    "params": {
+                        "sessionId": native_id,
+                        "configId": config_id,
+                        "value": value,
+                    }
+                }),
+            )
+            .await?;
+            if let Some(error) = configured.get("error") {
+                return Err(RouterError::BackendSessionNewError(error.clone()));
+            }
         }
         Ok::<_, RouterError>(native_id)
     }
