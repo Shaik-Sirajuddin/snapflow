@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let config = ServerConfig::from_env();
     tracing::info!(
         default_agent_id = %config.default_agent_id,
+        native_auth_method_id = ?config.native_auth_method_id,
         program = %config.backend.program,
         args = ?config.backend.args,
         http_bind_addr = ?config.http_bind_addr,
@@ -58,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut router = Router::new(config.default_agent_id.clone())
+        .with_native_auth_method_id(config.native_auth_method_id.clone())
         .with_lifecycle_config(config.lifecycle.clone())
         .with_tenant_process_isolation(config.tenant_process_isolation)
         .with_notification_hub(NotificationHub::with_stream_retention(

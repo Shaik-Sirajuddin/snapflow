@@ -232,6 +232,10 @@ pub struct Router {
     /// real profile -> agent resolution; until then every session goes to
     /// this one configured agent.
     default_agent_id: String,
+    /// Explicit backend authentication method for native/unmanaged sessions.
+    /// Unset preserves the safe default: ACPX never guesses a backend auth
+    /// method when a caller did not select a managed profile.
+    native_auth_method_id: Option<String>,
     /// HTTP client for `acpx-registry`'s live registry fetch. Reused across
     /// calls rather than constructed per-request.
     http: reqwest::Client,
@@ -588,6 +592,7 @@ impl Router {
             lifecycle: LifecycleConfig::default(),
             admission: Arc::new(Mutex::new(AdmissionState::default())),
             default_agent_id: default_agent_id.into(),
+            native_auth_method_id: None,
             http: reqwest::Client::new(),
             registry_cache: None,
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
@@ -680,6 +685,22 @@ impl Router {
     pub fn with_tenant_process_isolation(mut self, enabled: bool) -> Self {
         self.tenant_process_isolation = enabled;
         self
+    }
+
+    /// Configure the backend auth method ACPX uses for a native/unmanaged
+    /// session. Managed profiles retain their own `auth_method_id`, and an
+    /// unset native value still refuses to guess.
+    pub fn with_native_auth_method_id(mut self, method_id: Option<String>) -> Self {
+        self.native_auth_method_id = method_id.filter(|value| !value.is_empty());
+        self
+    }
+
+    fn call_policy(&self, profile: Option<&Profile>) -> BackendCallPolicy {
+        let mut policy = BackendCallPolicy::from_profile(profile);
+        if profile.is_none() {
+            policy.auth_method_id = self.native_auth_method_id.clone();
+        }
+        policy
     }
 
     /// Lifecycle-management seam used by the server's future authenticated
@@ -1050,7 +1071,7 @@ impl Router {
             });
             let result = async {
                 let backend = self.supervisor.ensure_running(&entry.agent_id).await?;
-                let call_policy = BackendCallPolicy::from_profile(
+                let call_policy = self.call_policy(
                     entry
                         .profile_name
                         .as_deref()
@@ -1142,7 +1163,7 @@ impl Router {
         };
         let admission = self.admit_session(&tenant_id)?;
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let call_policy = BackendCallPolicy::from_profile(
+        let call_policy = self.call_policy(
             record
                 .profile_name
                 .as_deref()
@@ -1380,7 +1401,7 @@ impl Router {
 
         let admission = self.admit_session(tenant_id)?;
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        let call_policy = self.call_policy(profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
@@ -1480,7 +1501,7 @@ impl Router {
             SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        let call_policy = self.call_policy(profile.as_ref());
         let backend = self.supervisor.ensure_running(&agent_id).await?;
 
         let outbound = serde_json::json!({
@@ -1879,7 +1900,7 @@ impl Router {
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
-        let call_policy = BackendCallPolicy::from_profile(
+        let call_policy = self.call_policy(
             profile_name
                 .as_deref()
                 .and_then(|name| self.profiles.get(name)),
@@ -2006,7 +2027,7 @@ impl Router {
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
-        let call_policy = BackendCallPolicy::from_profile(
+        let call_policy = self.call_policy(
             profile_name
                 .as_deref()
                 .and_then(|name| self.profiles.get(name)),
@@ -4094,7 +4115,7 @@ async fn dispatch_session_list_real_shared(
         let profile_name = profile.as_ref().map(|p| p.name.clone());
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        let call_policy = r.call_policy(profile.as_ref());
         (agent_id, profile_name, backend, call_policy)
     };
 
@@ -4219,7 +4240,7 @@ async fn dispatch_proxied_shared(
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             1,
         );
-        let call_policy = BackendCallPolicy::from_profile(
+        let call_policy = r.call_policy(
             profile_name
                 .as_deref()
                 .and_then(|name| r.profiles.get(name)),
@@ -4343,7 +4364,7 @@ async fn dispatch_session_fork_shared(
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        let call_policy = BackendCallPolicy::from_profile(
+        let call_policy = r.call_policy(
             profile_name
                 .as_deref()
                 .and_then(|name| r.profiles.get(name)),
@@ -4426,7 +4447,7 @@ async fn dispatch_session_new_shared(
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
 
-    let (agent_id, profile, backend, persistence, cwd, admission) = {
+    let (agent_id, profile, backend, persistence, cwd, admission, call_policy) = {
         let mut r = router.lock().await;
         let params = request
             .get_mut("params")
@@ -4483,6 +4504,7 @@ async fn dispatch_session_new_shared(
         let admission = r.admit_session(tenant_id)?;
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        let call_policy = r.call_policy(profile.as_ref());
         (
             agent_id,
             profile,
@@ -4490,12 +4512,12 @@ async fn dispatch_session_new_shared(
             r.persistence.clone(),
             cwd,
             admission,
+            call_policy,
         )
     };
 
     let mut response = async {
         let mut proc = backend.lock().await;
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&request).await?;
         // No `LiveNotifyCtx` here, deliberately: this exact call is what

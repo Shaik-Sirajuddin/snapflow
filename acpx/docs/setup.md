@@ -59,6 +59,7 @@ connection with live `session/update` streaming.
 | --- | --- | --- |
 | `ACPX_BACKEND_CMD` | `npx -y @agentclientprotocol/codex-acp@1.1.2` | Space-separated program + args for the default/native-mode backend. |
 | `ACPX_DEFAULT_AGENT_ID` | `default` | Agent id that command is registered under. |
+| `ACPX_NATIVE_AUTH_METHOD_ID` | unset | Explicit backend `authenticate` method for native/unmanaged sessions. Leave unset to preserve ACPX's no-guessing default; set only when the configured backend requires a known method (for example `api-key` for the OpenHands Codex wrapper). |
 | `ACPX_HTTP_BIND` | `127.0.0.1:8790` | HTTP/WS bind address. Loopback only by default -- do not point at a public interface without auth + a TLS-terminating reverse proxy (acpx never terminates TLS itself). |
 | `ACPX_AUTH_TOKEN` | unset (no auth) | If set, requires `Authorization: Bearer <token>` on `POST /rpc` and the `GET /ws` upgrade. Empty string is treated as unset. |
 | `ACPX_DB_PATH` | unset (no persistence) | sqlite file path for session metadata + transcripts. See [`architecture.md`](./architecture.md)'s "Persistence and restart recovery". |

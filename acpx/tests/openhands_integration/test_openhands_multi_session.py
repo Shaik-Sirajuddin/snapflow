@@ -123,7 +123,7 @@ def test_two_concurrent_claude_sessions_stay_isolated(
     # here (not via the `agent_server_pid` fixture) so a resolution
     # failure only disables assertion 2, not the whole test -- see the
     # docstring above.
-    agent_server_pid = proc_tree.find_pid_by_cmd_substring("agent-server --host")
+    agent_server_pid = proc_tree.find_agent_server_pid()
     seen_pids: set[int] = set()
     stop_polling = threading.Event()
 

@@ -16,6 +16,7 @@ OpenHands SDK's own dependency set.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -130,3 +131,28 @@ def find_pid_by_cmd_substring(substring: str) -> int | None:
     stack" section for why)."""
     matches = sorted(p.pid for p in snapshot_stable() if substring in p.cmd)
     return matches[0] if matches else None
+
+
+def find_agent_server_pid(
+    *, attempts: int = 10, delay: float = 0.2
+) -> int | None:
+    """Locate an OpenHands ``agent-server`` console script.
+
+    The normal ``uvx`` launch has ``agent-server --host`` in its command
+    line, but an installed Python console script appears as
+    ``.../bin/python .../bin/agent-server --host``. Match the executable's
+    basename instead of requiring the bare command spelling so lifecycle
+    checks work in both supported launch forms.
+    """
+    for _ in range(max(1, attempts)):
+        matches: list[int] = []
+        for proc in snapshot_stable():
+            words = proc.cmd.split()
+            if "--host" not in words:
+                continue
+            if any(os.path.basename(word) == "agent-server" for word in words):
+                matches.append(proc.pid)
+        if matches:
+            return min(matches)
+        time.sleep(delay)
+    return None

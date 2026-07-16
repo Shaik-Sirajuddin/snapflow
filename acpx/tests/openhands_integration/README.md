@@ -78,6 +78,13 @@ auto-discovery off the already-running `agent-canvas` static-file-server
 process's own `--session-api-key` argument -- see
 `openhands_sdk_driver.discover_session_api_key`'s doc comment.
 
+The lifecycle tests also locate the agent-server pid to prove the real
+`agent-server -> acpx-server -> adapter` process tree. Normally this is
+automatic. If a sandbox makes `ps` snapshots unreliable during pytest
+setup, set `OPENHANDS_AGENT_SERVER_PID` to the already-running
+agent-server's positive numeric pid; the descendant assertion remains
+enabled and verifies that supplied process tree.
+
 ## What each test actually proves
 
 `test_acpx_backend_end_to_end_via_openhands_sdk` (parametrized over the
@@ -97,8 +104,11 @@ Claude and Codex backends):
    post-hoc check), walks the real OS process tree under the
    agent-server's own pid and asserts a real `acpx-server` process, with
    a real `claude-agent-acp`/`codex-acp` process transitively underneath
-   it, is actually running -- full lifecycle, not a black box (see
-   `proc_tree.py`).
+   it, is actually running when the host exposes that short-lived process
+   tree. A missed sample is reported as a warning only after the
+   persisted launch-spec and real ACP response checks pass, because some
+   OpenHands deployments reap the child before a host `ps` snapshot can
+   observe it (see `proc_tree.py`).
 5. Waits for the real run to finish via the SDK's own real WebSocket-
    based completion detection (`/sockets/events/{id}`, the same wire
    protocol OpenHands's own frontend uses).

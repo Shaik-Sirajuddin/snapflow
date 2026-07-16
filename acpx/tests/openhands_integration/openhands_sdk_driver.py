@@ -82,13 +82,26 @@ def discover_session_api_key(explicit: str | None = None) -> str:
 
 def discover_agent_server_pid() -> int:
     """Locate the already-running agent-server process's pid -- see
-    `proc_tree.find_pid_by_cmd_substring`'s doc comment for why this
+    `proc_tree.find_agent_server_pid`'s doc comment for why this
     suite attaches to one rather than spawning its own."""
-    pid = proc_tree.find_pid_by_cmd_substring("agent-server --host")
+    explicit_pid = os.environ.get("OPENHANDS_AGENT_SERVER_PID")
+    if explicit_pid:
+        try:
+            pid = int(explicit_pid)
+        except ValueError as err:
+            raise RuntimeError(
+                "OPENHANDS_AGENT_SERVER_PID must be a positive integer"
+            ) from err
+        if pid <= 0:
+            raise RuntimeError("OPENHANDS_AGENT_SERVER_PID must be a positive integer")
+        return pid
+
+    pid = proc_tree.find_agent_server_pid()
     if pid is None:
         raise RuntimeError(
             "no running OpenHands agent-server process found "
-            "(looked for a command line containing 'agent-server --host')"
+            "(looked for an agent-server executable launched with --host; "
+            "set OPENHANDS_AGENT_SERVER_PID if process listing is unreliable)"
         )
     return pid
 

@@ -10,6 +10,9 @@ use acpx_core::LifecycleConfig;
 /// `Router` knows how to spawn.
 pub struct ServerConfig {
     pub default_agent_id: String,
+    /// Backend auth method for native/unmanaged sessions. This is opt-in so
+    /// native ACPX retains its no-guessing authentication default.
+    pub native_auth_method_id: Option<String>,
     pub backend: SpawnSpec,
     /// Optional strict-ACP `/acp` bridge policy. `None` keeps every bridge
     /// route disabled so legacy ACPX deployments retain their exact public
@@ -99,6 +102,9 @@ impl ServerConfig {
         let args: Vec<String> = parts.map(|s| s.to_string()).collect();
         let default_agent_id =
             std::env::var("ACPX_DEFAULT_AGENT_ID").unwrap_or_else(|_| "default".to_string());
+        let native_auth_method_id = std::env::var("ACPX_NATIVE_AUTH_METHOD_ID")
+            .ok()
+            .filter(|value| !value.is_empty());
         let http_bind_addr = match std::env::var("ACPX_HTTP_BIND") {
             Ok(raw) if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") => None,
             Ok(raw) => Some(raw.parse().unwrap_or_else(|err| {
@@ -189,6 +195,7 @@ impl ServerConfig {
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
             default_agent_id,
+            native_auth_method_id,
             backend: SpawnSpec::new(program, args),
             bridge,
             http_bind_addr,

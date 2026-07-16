@@ -134,6 +134,26 @@ async fn session_new_is_refused_with_a_clear_error_when_backend_requires_auth_an
 }
 
 #[tokio::test]
+async fn session_new_uses_explicit_native_auth_method_when_configured() {
+    let mut router =
+        Router::new("auth-agent").with_native_auth_method_id(Some("api-key".to_string()));
+    router.register_agent("auth-agent", stand_in_auth_required_backend_spec());
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        router.dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        })),
+    )
+    .await
+    .expect("must not hang once native auth is explicitly configured")
+    .expect("session/new");
+
+    assert!(response["result"]["sessionId"].as_str().is_some());
+}
+
+#[tokio::test]
 async fn session_new_succeeds_after_a_real_authenticate_round_trip_when_configured() {
     let mut router = Router::new("auth-agent");
     router.register_agent("auth-agent", stand_in_auth_required_backend_spec());
