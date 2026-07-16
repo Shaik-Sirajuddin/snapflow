@@ -49,11 +49,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
-use acpx_core::router::dispatch_shared_for_tenant;
-use acpx_core::{InteractionBinding, TenantId};
+use acpx_core::router::{dispatch_shared_for_tenant, stream_resume_state_shared};
+use acpx_core::{InteractionBinding, StreamResumeState, TenantId};
 
 use super::http::{json_rpc_error, json_rpc_subscribe_error, AppState, SharedRouter};
-use super::live::{session_id_to_forget, session_id_to_watch, take_resume_last_seq};
+use super::live::{session_id_to_forget, session_id_to_watch, take_resume_cursor};
 
 /// Axum handler for `GET /ws`: upgrades the connection, then hands off to
 /// `handle_socket` for the request/response loop.
@@ -125,7 +125,7 @@ async fn handle_acp_socket(
             Ok(request) => request,
             Err(_) => continue,
         };
-        let _resume_last_seq = take_resume_last_seq(&mut request);
+        let _resume_cursor = take_resume_cursor(&mut request);
         let mut response =
             match super::http::acp_bridge::dispatch(&router, &runtime, &tenant_id, request.clone())
                 .await
@@ -215,7 +215,15 @@ async fn handle_acp_socket(
         } else if let Some(public_id) = bridge_session_id_to_watch(&request, &response, method) {
             if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
                 if watched.insert(native_id.clone()) {
-                    match hub.subscribe(&tenant_id, native_id.clone(), None).await {
+                    match hub
+                        .subscribe_resuming(
+                            &tenant_id,
+                            native_id.clone(),
+                            None,
+                            StreamResumeState::default(),
+                        )
+                        .await
+                    {
                         Ok(mut rx) => {
                             let forwarder_sink = Arc::clone(&sink);
                             let forwarder_runtime = Arc::clone(&runtime);
@@ -405,7 +413,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                 continue;
             }
         };
-        let resume_last_seq = take_resume_last_seq(&mut request);
+        let resume_cursor = take_resume_cursor(&mut request);
 
         // A response with no method can only be the client's answer to an
         // agent-initiated request sent by InteractionHub. It must not enter
@@ -430,11 +438,20 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             // preserves live records that arrive while `session/resume` or
             // `session/load` is in flight even if they later roll out of
             // the bounded replay ring.
-            let resumed_before_dispatch = if resume_last_seq.is_some()
+            let resumed_before_dispatch = if resume_cursor.is_some()
                 && deferred_watches.lock().await.insert(session_id.clone())
             {
+                let state = stream_resume_state_shared(&router, &tenant_id, &session_id).await;
                 match hub
-                    .subscribe(&tenant_id, session_id.clone(), resume_last_seq)
+                    .subscribe_resuming(
+                        &tenant_id,
+                        session_id.clone(),
+                        resume_cursor.clone(),
+                        StreamResumeState {
+                            backend_session_id: state.backend_session_id,
+                            durable_state_changed: state.durable_state_changed,
+                        },
+                    )
                     .await
                 {
                     Ok(mut rx) => {
@@ -505,8 +522,17 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                         Err(error) => json_rpc_error(&request, error),
                     };
                 if subscribe_after_response && response.get("error").is_none() {
+                    let state = stream_resume_state_shared(&router, &tenant_id, &session_id).await;
                     match hub
-                        .subscribe(&tenant_id, session_id.clone(), resume_last_seq)
+                        .subscribe_resuming(
+                            &tenant_id,
+                            session_id.clone(),
+                            resume_cursor.clone(),
+                            StreamResumeState {
+                                backend_session_id: state.backend_session_id,
+                                durable_state_changed: state.durable_state_changed,
+                            },
+                        )
                         .await
                     {
                         Ok(mut rx) => {
@@ -574,8 +600,17 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             deferred_watches.lock().await.remove(&forget);
         } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
             if watched.insert(watch.clone()) {
+                let state = stream_resume_state_shared(&router, &tenant_id, &watch).await;
                 match hub
-                    .subscribe(&tenant_id, watch.clone(), resume_last_seq)
+                    .subscribe_resuming(
+                        &tenant_id,
+                        watch.clone(),
+                        resume_cursor.clone(),
+                        StreamResumeState {
+                            backend_session_id: state.backend_session_id,
+                            durable_state_changed: state.durable_state_changed,
+                        },
+                    )
                     .await
                 {
                     Ok(mut rx) => {

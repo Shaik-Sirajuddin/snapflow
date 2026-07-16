@@ -25,7 +25,7 @@ pub use interaction::{
     InteractionBinding, InteractionError, InteractionHub, DEFAULT_INTERACTION_TIMEOUT,
 };
 pub use lifecycle::LifecycleConfig;
-pub use notify::{NotificationHub, SubscribeError};
+pub use notify::{NotificationHub, ResumeCursor, StreamResumeState, SubscribeError};
 pub use persistence::{
     Direction, PersistenceError, PersistenceStore, SessionRecord, TranscriptRecord,
 };

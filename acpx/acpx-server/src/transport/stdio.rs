@@ -33,9 +33,9 @@
 //! mid-stream switch.
 
 use crate::transport::http::SharedRouter;
-use crate::transport::live::{session_id_to_forget, session_id_to_watch, take_resume_last_seq};
-use acpx_core::router::dispatch_shared_for_tenant;
-use acpx_core::{InteractionBinding, TenantId};
+use crate::transport::live::{session_id_to_forget, session_id_to_watch, take_resume_cursor};
+use acpx_core::router::{dispatch_shared_for_tenant, stream_resume_state_shared};
+use acpx_core::{InteractionBinding, StreamResumeState, TenantId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -81,7 +81,7 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let resume_last_seq = take_resume_last_seq(&mut request);
+        let resume_cursor = take_resume_cursor(&mut request);
 
         // Response-only JSON-RPC frames are replies to agent-initiated
         // requests. They are correlated directly and must not be routed as
@@ -102,11 +102,20 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             // Resume subscriptions attach before dispatch for the same
             // reason as WS: a backend can emit updates while a slow
             // `session/load`/`session/resume` request is still executing.
-            let resumed_before_dispatch = if resume_last_seq.is_some()
+            let resumed_before_dispatch = if resume_cursor.is_some()
                 && watched.lock().await.insert(session_id.clone())
             {
+                let state = stream_resume_state_shared(&router, &tenant_id, &session_id).await;
                 match hub
-                    .subscribe(&tenant_id, session_id.clone(), resume_last_seq)
+                    .subscribe_resuming(
+                        &tenant_id,
+                        session_id.clone(),
+                        resume_cursor.clone(),
+                        StreamResumeState {
+                            backend_session_id: state.backend_session_id,
+                            durable_state_changed: state.durable_state_changed,
+                        },
+                    )
                     .await
                 {
                     Ok(mut rx) => {
@@ -181,8 +190,17 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
                         Err(error) => crate::transport::http::json_rpc_error(&request, error),
                     };
                 if subscribe_after_response && response.get("error").is_none() {
+                    let state = stream_resume_state_shared(&router, &tenant_id, &session_id).await;
                     match hub
-                        .subscribe(&tenant_id, session_id.clone(), resume_last_seq)
+                        .subscribe_resuming(
+                            &tenant_id,
+                            session_id.clone(),
+                            resume_cursor.clone(),
+                            StreamResumeState {
+                                backend_session_id: state.backend_session_id,
+                                durable_state_changed: state.durable_state_changed,
+                            },
+                        )
                         .await
                     {
                         Ok(mut rx) => {
@@ -254,8 +272,17 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             }
         } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
             if watched.lock().await.insert(watch.clone()) {
+                let state = stream_resume_state_shared(&router, &tenant_id, &watch).await;
                 match hub
-                    .subscribe(&tenant_id, watch.clone(), resume_last_seq)
+                    .subscribe_resuming(
+                        &tenant_id,
+                        watch.clone(),
+                        resume_cursor.clone(),
+                        StreamResumeState {
+                            backend_session_id: state.backend_session_id,
+                            durable_state_changed: state.durable_state_changed,
+                        },
+                    )
                     .await
                 {
                     Ok(mut rx) => {

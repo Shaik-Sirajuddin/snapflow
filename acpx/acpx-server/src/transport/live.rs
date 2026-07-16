@@ -14,6 +14,7 @@
 //! should now be watching for live updates, and which one it should stop
 //! watching.
 
+use acpx_core::ResumeCursor;
 use serde_json::Value;
 
 /// Extract ACPX's additive reconnect cursor before a request is proxied to
@@ -25,18 +26,20 @@ use serde_json::Value;
 /// cursor. Invalid cursors are removed and treated as fresh subscriptions;
 /// this preserves backend compatibility while never inventing replay state
 /// from malformed client input.
-pub fn take_resume_last_seq(request: &mut Value) -> Option<u64> {
+pub fn take_resume_cursor(request: &mut Value) -> Option<ResumeCursor> {
     let params = request.get_mut("params")?.as_object_mut()?;
     let extension = params.get_mut("_acpx")?.as_object_mut()?;
-    let last_seq = extension
-        .get("resume")
-        .and_then(|resume| resume.get("lastSeq"))
-        .and_then(Value::as_u64);
+    let cursor = extension.get("resume").and_then(|resume| {
+        Some(ResumeCursor {
+            last_seq: resume.get("lastSeq")?.as_u64()?,
+            epoch: resume.get("epoch")?.as_str()?.to_string(),
+        })
+    });
     extension.remove("resume");
     if extension.is_empty() {
         params.remove("_acpx");
     }
-    last_seq
+    cursor
 }
 
 /// Which gateway session id (if any) `request`/`response` -- a JSON-RPC
@@ -240,11 +243,17 @@ mod tests {
                 "sessionId": "gw-1",
                 "_acpx": {
                     "profile": "retained",
-                    "resume": {"lastSeq": 42}
+                    "resume": {"lastSeq": 42, "epoch": "epoch-1"}
                 }
             }
         });
-        assert_eq!(take_resume_last_seq(&mut request), Some(42));
+        assert_eq!(
+            take_resume_cursor(&mut request),
+            Some(ResumeCursor {
+                last_seq: 42,
+                epoch: "epoch-1".to_string()
+            })
+        );
         assert_eq!(request["params"]["_acpx"]["profile"], json!("retained"));
         assert!(request["params"]["_acpx"].get("resume").is_none());
     }
@@ -254,7 +263,7 @@ mod tests {
         let mut request = json!({
             "params": {"_acpx": {"resume": {"lastSeq": "not-a-number"}}}
         });
-        assert_eq!(take_resume_last_seq(&mut request), None);
+        assert_eq!(take_resume_cursor(&mut request), None);
         assert!(request["params"].get("_acpx").is_none());
     }
 }

@@ -21,6 +21,7 @@
 //! just move the contention from our `Mutex` to sqlite's own file lock.
 
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -31,6 +32,10 @@ use super::transcripts::{Direction, TranscriptRecord};
 #[derive(Clone)]
 pub struct PersistenceStore {
     conn: Arc<Mutex<Connection>>,
+    /// Counts written through this store. Comparing this against SQLite's
+    /// actual count lets a reconnect distinguish normal ACPX persistence
+    /// from an out-of-band transcript mutation.
+    known_transcript_counts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl PersistenceStore {
@@ -53,6 +58,7 @@ impl PersistenceStore {
         migrate_sessions_columns(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            known_transcript_counts: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -264,14 +270,15 @@ impl PersistenceStore {
         let recorded_at = recorded_at.into();
         let payload_text = serde_json::to_string(&payload)?;
         let conn = self.conn.clone();
-        run_blocking(move || {
+        let insert_session_id = gateway_session_id.clone();
+        let result = run_blocking(move || {
             let conn = lock(&conn)?;
             conn.execute(
                 "INSERT INTO transcripts \
                  (gateway_session_id, direction, payload, recorded_at) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
-                    gateway_session_id,
+                    insert_session_id,
                     direction.as_str(),
                     payload_text,
                     recorded_at
@@ -279,7 +286,55 @@ impl PersistenceStore {
             )?;
             Ok(conn.last_insert_rowid())
         })
-        .await
+        .await;
+        if result.is_ok() {
+            if let Some(count) = self
+                .known_transcript_counts
+                .lock()
+                .map_err(|_| PersistenceError::Poisoned)?
+                .get_mut(&gateway_session_id)
+            {
+                *count += 1;
+            }
+        }
+        result
+    }
+
+    /// Return whether durable transcript state changed outside this store
+    /// since it was last observed. The first observation establishes a
+    /// baseline; successful [`Self::append_transcript`] calls advance it.
+    pub async fn transcript_state_changed(
+        &self,
+        gateway_session_id: impl Into<String>,
+    ) -> Result<bool, PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let query_id = gateway_session_id.clone();
+        let conn = self.conn.clone();
+        let actual = run_blocking(move || {
+            let conn = lock(&conn)?;
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM transcripts WHERE gateway_session_id = ?1",
+                params![query_id],
+                |row| row.get(0),
+            )?;
+            Ok(usize::try_from(count).expect("SQLite transcript count is non-negative"))
+        })
+        .await?;
+        let mut known = self
+            .known_transcript_counts
+            .lock()
+            .map_err(|_| PersistenceError::Poisoned)?;
+        match known.get_mut(&gateway_session_id) {
+            Some(expected) if *expected == actual => Ok(false),
+            Some(expected) => {
+                *expected = actual;
+                Ok(true)
+            }
+            None => {
+                known.insert(gateway_session_id, actual);
+                Ok(false)
+            }
+        }
     }
 
     /// Fetch all transcript records for a session, oldest first -- future
@@ -399,4 +454,69 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| PersistenceError::TaskJoin(e.to_string()))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn transcript_state_detects_an_out_of_band_database_write() {
+        let store = PersistenceStore::open_in_memory().expect("in-memory store");
+        store
+            .record_session(
+                "session-1",
+                "agent-1",
+                "backend-1",
+                None,
+                "2026-07-16T00:00:00Z",
+                "default",
+            )
+            .await
+            .expect("parent session");
+        assert!(!store
+            .transcript_state_changed("session-1")
+            .await
+            .expect("baseline"));
+        store
+            .append_transcript(
+                "session-1",
+                Direction::ClientToAgent,
+                json!({"method": "session/prompt"}),
+                "2026-07-16T00:00:00Z",
+            )
+            .await
+            .expect("normal ACPX write");
+        assert!(!store
+            .transcript_state_changed("session-1")
+            .await
+            .expect("normal write stays current"));
+
+        // This models an external session-file/import/database mutation:
+        // it reaches SQLite but never advances PersistenceStore's known
+        // count, so a later resume must invalidate its old epoch.
+        lock(&store.conn)
+            .expect("sqlite lock")
+            .execute(
+                "INSERT INTO transcripts \
+                 (gateway_session_id, direction, payload, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "session-1",
+                    "agent_to_client",
+                    r#"{"method":"session/update"}"#,
+                    "2026-07-16T00:00:01Z"
+                ],
+            )
+            .expect("out-of-band insert");
+        assert!(store
+            .transcript_state_changed("session-1")
+            .await
+            .expect("external write is detected"));
+        assert!(!store
+            .transcript_state_changed("session-1")
+            .await
+            .expect("new baseline is acknowledged once"));
+    }
 }

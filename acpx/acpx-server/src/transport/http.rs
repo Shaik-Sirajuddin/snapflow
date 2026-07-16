@@ -464,16 +464,28 @@ pub(crate) fn json_rpc_subscribe_error(
     request: &serde_json::Value,
     error: acpx_core::SubscribeError,
 ) -> serde_json::Value {
-    let max_subscribers = match error {
-        acpx_core::SubscribeError::TooManySubscribers { max_subscribers } => max_subscribers,
+    let message = error.to_string();
+    let (code, data) = match error {
+        acpx_core::SubscribeError::TooManySubscribers { max_subscribers } => (
+            -32050,
+            serde_json::json!({ "maxSubscribers": max_subscribers }),
+        ),
+        acpx_core::SubscribeError::ResyncRequired { epoch, seq } => (
+            -32051,
+            serde_json::json!({
+                "reason": "resync_required",
+                "epoch": epoch,
+                "seq": seq
+            }),
+        ),
     };
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
         "error": {
-            "code": -32050,
-            "message": error.to_string(),
-            "data": { "maxSubscribers": max_subscribers }
+            "code": code,
+            "message": message,
+            "data": data
         }
     })
 }

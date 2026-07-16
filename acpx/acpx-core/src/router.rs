@@ -3502,6 +3502,50 @@ fn spawn_session_persistence_fn(
 /// module can define `dispatch_shared` against it directly.
 pub type SharedRouterHandle = std::sync::Arc<tokio::sync::Mutex<Router>>;
 
+/// Durable identity and drift state needed by a persistent transport before
+/// it attaches a resumable session-update subscription.
+#[derive(Debug, Clone, Default)]
+pub struct StreamResumeState {
+    pub backend_session_id: Option<String>,
+    pub durable_state_changed: bool,
+}
+
+/// Inspect the session registry and optional persistence store without
+/// holding the router mutex across SQLite I/O. A transcript count mismatch
+/// means a non-ACPX writer changed durable history since the last observed
+/// state and must invalidate any resume cursor.
+pub async fn stream_resume_state_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    gateway_session_id: &str,
+) -> StreamResumeState {
+    let (backend_session_id, persistence) = {
+        let router = router.lock().await;
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        (
+            router
+                .sessions
+                .resolve(tenant_id, &gateway_id)
+                .map(|entry| entry.backend_session_id.0.clone()),
+            router.persistence.clone(),
+        )
+    };
+    let durable_state_changed = match persistence {
+        Some(store) => match store.transcript_state_changed(gateway_session_id).await {
+            Ok(changed) => changed,
+            Err(err) => {
+                tracing::warn!(%err, %gateway_session_id, "failed to inspect durable transcript state for stream resume");
+                false
+            }
+        },
+        None => false,
+    };
+    StreamResumeState {
+        backend_session_id,
+        durable_state_changed,
+    }
+}
+
 /// Real multi-agent concurrency entry point (added post-Phase-6, replacing
 /// the naive "hold the whole-`Router` mutex for an entire `dispatch` call,
 /// including the backend's real-LLM-latency I/O" pattern every transport

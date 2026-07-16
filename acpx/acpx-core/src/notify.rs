@@ -16,10 +16,12 @@ const DEFAULT_STREAM_CAPACITY: usize = 256;
 const DEFAULT_MAX_SUBSCRIBERS: usize = 16;
 const DEFAULT_REPLAY_BUFFER_SIZE: usize = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SubscribeError {
     #[error("session already has the configured maximum of {max_subscribers} live subscribers")]
     TooManySubscribers { max_subscribers: usize },
+    #[error("stream resume state is stale; a full session refresh is required")]
+    ResyncRequired { epoch: String, seq: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,6 +34,7 @@ struct StreamKey {
 #[derive(Debug, Clone)]
 pub struct Envelope {
     seq: u64,
+    epoch: String,
     value: serde_json::Value,
 }
 
@@ -49,6 +52,10 @@ impl Envelope {
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
             if let Some(extension) = extension.as_object_mut() {
                 extension.insert("seq".to_string(), serde_json::Value::from(self.seq));
+                extension.insert(
+                    "epoch".to_string(),
+                    serde_json::Value::String(self.epoch.clone()),
+                );
             }
         }
         self.value
@@ -64,11 +71,36 @@ struct SessionStream {
     tx: broadcast::Sender<Envelope>,
     replay: Mutex<VecDeque<Envelope>>,
     next_seq: AtomicU64,
+    epoch: Mutex<EpochState>,
+}
+
+#[derive(Debug, Clone)]
+struct EpochState {
+    generation: u64,
+    backend_session_id: Option<String>,
+    value: String,
+}
+
+/// Additive client cursor supplied inside `_acpx.resume`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeCursor {
+    pub last_seq: u64,
+    pub epoch: String,
+}
+
+/// Current backend identity and durable-state observation for the session
+/// being subscribed to. Transports obtain this from the router before
+/// attaching a resumable receiver.
+#[derive(Debug, Clone, Default)]
+pub struct StreamResumeState {
+    pub backend_session_id: Option<String>,
+    pub durable_state_changed: bool,
 }
 
 /// A subscriber owns independent replay and live-read state. Replay is
 /// drained before live traffic, while `live_floor` removes the overlapping
 /// broadcast records captured by subscribe-before-snapshot.
+#[derive(Debug)]
 pub struct Subscription {
     replay: VecDeque<Envelope>,
     receiver: broadcast::Receiver<Envelope>,
@@ -89,12 +121,38 @@ impl Subscription {
     }
 }
 
+fn epoch_value(
+    key: &StreamKey,
+    process_nonce: &str,
+    generation: u64,
+    backend_session_id: Option<&str>,
+) -> String {
+    // FNV-1a is sufficient here because epoch is an opaque correctness
+    // token, not an authentication secret. Its output is deterministic
+    // across calls and daemon runs, unlike randomized hash builders.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in key
+        .tenant_id
+        .0
+        .bytes()
+        .chain(key.gateway_session_id.bytes())
+        .chain(process_nonce.bytes())
+        .chain(generation.to_le_bytes())
+        .chain(backend_session_id.unwrap_or_default().bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[derive(Clone)]
 pub struct NotificationHub {
     streams: Arc<Mutex<HashMap<StreamKey, Arc<SessionStream>>>>,
     capacity: usize,
     max_subscribers: usize,
     replay_buffer_size: usize,
+    process_nonce: Arc<str>,
 }
 
 impl Default for NotificationHub {
@@ -131,6 +189,7 @@ impl NotificationHub {
             capacity: capacity.max(1),
             max_subscribers: max_subscribers.max(1),
             replay_buffer_size: replay_buffer_size.max(1),
+            process_nonce: uuid::Uuid::new_v4().to_string().into(),
         }
     }
 
@@ -150,7 +209,31 @@ impl NotificationHub {
         gateway_session_id: impl Into<String>,
         last_seq: Option<u64>,
     ) -> Result<Subscription, SubscribeError> {
+        self.subscribe_resuming(
+            tenant_id,
+            gateway_session_id,
+            last_seq.map(|last_seq| ResumeCursor {
+                last_seq,
+                // Legacy sequence-only callers must explicitly refresh once
+                // epoch validation is enabled rather than silently resuming.
+                epoch: String::new(),
+            }),
+            StreamResumeState::default(),
+        )
+        .await
+    }
+
+    /// Subscribe with a complete reconnect cursor and durable session state.
+    pub async fn subscribe_resuming(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: impl Into<String>,
+        cursor: Option<ResumeCursor>,
+        resume_state: StreamResumeState,
+    ) -> Result<Subscription, SubscribeError> {
         let key = Self::key(tenant_id, gateway_session_id);
+        let stream_key = key.clone();
+        let process_nonce = Arc::clone(&self.process_nonce);
         let stream = {
             let mut streams = self.streams.lock().await;
             streams
@@ -160,6 +243,11 @@ impl NotificationHub {
                         tx: broadcast::channel(self.capacity).0,
                         replay: Mutex::new(VecDeque::new()),
                         next_seq: AtomicU64::new(1),
+                        epoch: Mutex::new(EpochState {
+                            generation: 0,
+                            backend_session_id: None,
+                            value: epoch_value(&stream_key, &process_nonce, 0, None),
+                        }),
                     })
                 })
                 .clone()
@@ -170,18 +258,60 @@ impl NotificationHub {
             });
         }
 
+        let (current_epoch, clear_replay) = {
+            let mut epoch = stream.epoch.lock().await;
+            let backend_changed = epoch.backend_session_id != resume_state.backend_session_id
+                && resume_state.backend_session_id.is_some();
+            if backend_changed || resume_state.durable_state_changed {
+                epoch.generation += 1;
+                epoch.backend_session_id = resume_state.backend_session_id.clone();
+                epoch.value = epoch_value(
+                    &stream_key,
+                    &self.process_nonce,
+                    epoch.generation,
+                    epoch.backend_session_id.as_deref(),
+                );
+            } else if epoch.backend_session_id.is_none()
+                && resume_state.backend_session_id.is_some()
+            {
+                epoch.backend_session_id = resume_state.backend_session_id.clone();
+                epoch.value = epoch_value(
+                    &stream_key,
+                    &self.process_nonce,
+                    epoch.generation,
+                    epoch.backend_session_id.as_deref(),
+                );
+            }
+            (
+                epoch.value.clone(),
+                backend_changed || resume_state.durable_state_changed,
+            )
+        };
+        if clear_replay {
+            stream.replay.lock().await.clear();
+        }
+
+        if let Some(cursor) = &cursor {
+            if cursor.epoch != current_epoch {
+                return Err(SubscribeError::ResyncRequired {
+                    epoch: current_epoch,
+                    seq: stream.next_seq.load(Ordering::Relaxed).saturating_sub(1),
+                });
+            }
+        }
+
         // Subscribe before taking the replay snapshot. A publication that
         // wins the replay lock is replayed and filtered from live delivery;
         // one that loses it lands only in the receiver. Either ordering is
         // exactly-once and ordered.
         let receiver = stream.tx.subscribe();
-        let replay = if let Some(last_seq) = last_seq {
+        let replay = if let Some(cursor) = cursor {
             stream
                 .replay
                 .lock()
                 .await
                 .iter()
-                .filter(|envelope| envelope.seq > last_seq)
+                .filter(|envelope| envelope.seq > cursor.last_seq)
                 .cloned()
                 .collect()
         } else {
@@ -222,6 +352,7 @@ impl NotificationHub {
         };
         let envelope = Envelope {
             seq: stream.next_seq.fetch_add(1, Ordering::Relaxed),
+            epoch: stream.epoch.lock().await.value.clone(),
             value,
         };
         {
@@ -318,8 +449,17 @@ mod tests {
     async fn resume_replays_only_records_after_the_client_cursor() {
         let hub = NotificationHub::with_replay_limits(8, 2, 3);
         let tenant = TenantId::from("tenant-a");
-        let live = hub.subscribe(&tenant, "session-1", None).await.unwrap();
-        for n in 1..=3 {
+        let mut live = hub.subscribe(&tenant, "session-1", None).await.unwrap();
+        assert!(
+            hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
+                .await
+        );
+        let first = live.recv().await.unwrap();
+        let cursor = ResumeCursor {
+            last_seq: first.seq,
+            epoch: first.epoch,
+        };
+        for n in 2..=3 {
             assert!(
                 hub.publish(&tenant, "session-1", serde_json::json!({"n": n}))
                     .await
@@ -327,7 +467,15 @@ mod tests {
         }
         drop(live);
 
-        let mut resumed = hub.subscribe(&tenant, "session-1", Some(1)).await.unwrap();
+        let mut resumed = hub
+            .subscribe_resuming(
+                &tenant,
+                "session-1",
+                Some(cursor),
+                StreamResumeState::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resumed.recv().await.unwrap().seq(), 2);
         assert_eq!(resumed.recv().await.unwrap().seq(), 3);
         assert!(
@@ -335,5 +483,43 @@ mod tests {
                 .await
         );
         assert_eq!(resumed.recv().await.unwrap().seq(), 4);
+    }
+
+    #[tokio::test]
+    async fn durable_drift_invalidates_the_epoch_and_requires_a_resync() {
+        let hub = NotificationHub::new();
+        let tenant = TenantId::from("tenant-a");
+        let mut live = hub.subscribe(&tenant, "session-1", None).await.unwrap();
+        assert!(
+            hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
+                .await
+        );
+        let delivered = live.recv().await.unwrap();
+        let old_epoch = delivered.epoch.clone();
+        let cursor = ResumeCursor {
+            last_seq: delivered.seq,
+            epoch: old_epoch.clone(),
+        };
+        drop(live);
+
+        let error = hub
+            .subscribe_resuming(
+                &tenant,
+                "session-1",
+                Some(cursor),
+                StreamResumeState {
+                    backend_session_id: None,
+                    durable_state_changed: true,
+                },
+            )
+            .await
+            .expect_err("out-of-band durable change must not replay");
+        match error {
+            SubscribeError::ResyncRequired { epoch, seq } => {
+                assert_ne!(epoch, old_epoch);
+                assert_eq!(seq, 1);
+            }
+            other => panic!("expected resync error, got {other:?}"),
+        }
     }
 }

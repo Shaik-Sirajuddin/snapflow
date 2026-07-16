@@ -711,19 +711,41 @@ async fn ws_resume_replays_and_tails_updates_once_while_resume_is_in_flight() {
         .expect("gateway session id")
         .to_string();
     let hub = { router.lock().await.notification_hub() };
-    let bootstrap = hub
-        .subscribe(&acpx_core::TenantId::default(), session_id.clone(), None)
+    let state = acpx_core::router::stream_resume_state_shared(
+        &router,
+        &acpx_core::TenantId::default(),
+        &session_id,
+    )
+    .await;
+    let mut bootstrap = hub
+        .subscribe_resuming(
+            &acpx_core::TenantId::default(),
+            session_id.clone(),
+            None,
+            acpx_core::StreamResumeState {
+                backend_session_id: state.backend_session_id,
+                durable_state_changed: state.durable_state_changed,
+            },
+        )
         .await
         .expect("bootstrap stream");
-    drop(bootstrap);
     assert!(
-        !hub.publish(
+        hub.publish(
             &acpx_core::TenantId::default(),
             &session_id,
             json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"update":{"n":1}}})
         )
         .await
     );
+    let epoch = bootstrap
+        .recv()
+        .await
+        .expect("initial sequence")
+        .into_value()["params"]["_acpx"]["epoch"]
+        .as_str()
+        .expect("epoch metadata")
+        .to_string();
+    drop(bootstrap);
 
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -734,7 +756,7 @@ async fn ws_resume_replays_and_tails_updates_once_while_resume_is_in_flight() {
                 "jsonrpc": "2.0", "id": 2, "method": "session/resume",
                 "params": {
                     "sessionId": session_id,
-                    "_acpx": {"resume": {"lastSeq": 0}}
+                    "_acpx": {"resume": {"lastSeq": 0, "epoch": epoch}}
                 }
             })
             .to_string(),

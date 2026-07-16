@@ -3145,7 +3145,7 @@ session-bearing request such as `session/resume` or `session/load`:
 {
   "params": {
     "_acpx": {
-      "resume": { "lastSeq": 42 }
+      "resume": { "lastSeq": 42, "epoch": "opaque-epoch-token" }
     }
   }
 }
@@ -3163,4 +3163,27 @@ uses a real WebSocket server with a deliberately delayed
 client receives one buffered record and three records published while
 the backend call is in flight, in sequence order `1, 2, 3, 4`, with no
 gap or duplicate. Verified with `cargo test --workspace --no-fail-fast`;
+credentialed ambient tests remain intentionally ignored.
+
+## Phase 33: stale resume epochs
+
+Resume cursors now require both `lastSeq` and the opaque epoch emitted in
+each update's `params._acpx` metadata. Epochs combine the tenant/session
+stream identity, backend session identity, a generation counter, and a
+per-daemon nonce, so tokens from a prior daemon lifetime cannot resume a
+new stream accidentally.
+
+Before stdio or WebSocket attaches a resume subscriber, ACPX compares the
+SQLite transcript count against the count written through its own
+`PersistenceStore`. A direct durable-state change bumps the epoch,
+clears replay history, and returns JSON-RPC error `-32051` with
+`error.data.reason = "resync_required"` plus the current `epoch` and
+`seq` baseline. Clients must perform a full `session/load` refresh
+before retaining a new cursor.
+
+`transcript_state_detects_an_out_of_band_database_write` performs a raw
+SQLite transcript insert after an ACPX-managed write and verifies the
+drift detector trips. `durable_drift_invalidates_the_epoch_and_requires_
+a_resync` verifies the hub returns the new epoch instead of replaying a
+stale stream. Verified with `cargo test --workspace --no-fail-fast`;
 credentialed ambient tests remain intentionally ignored.
