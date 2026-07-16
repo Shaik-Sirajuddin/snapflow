@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acpx_conductor::SpawnSpec;
-use acpx_core::{router::Router, PersistenceStore};
+use acpx_core::{
+    router::{dispatch_shared_for_tenant, Router},
+    PersistenceStore, TenantId,
+};
 use acpx_registry::{Agent, Distribution, Registry};
 use serde_json::json;
 use tokio::process::{Child, Command};
@@ -248,6 +251,88 @@ async fn custom_agent_crud_round_trips_over_admin_http() {
         .await
         .expect("delete custom agent");
     assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn deleting_a_custom_agent_stops_its_live_backend() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind admin listener");
+    let address = listener.local_addr().expect("admin address");
+    let store = PersistenceStore::open_in_memory().expect("in-memory admin database");
+    let router: SharedRouter = Arc::new(Mutex::new(
+        Router::new("stand-in-agent").with_persistence(store.clone()),
+    ));
+    let admin_router = Arc::clone(&router);
+    tokio::spawn(async move {
+        admin::serve_on_with_router(
+            listener,
+            "admin-secret".to_owned(),
+            store,
+            test_registry(),
+            Some(admin_router),
+        )
+        .await
+        .expect("serve admin transport");
+    });
+    wait_for(address).await;
+
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("http://{address}/admin/agents/custom"))
+        .bearer_auth("admin-secret")
+        .json(&json!({
+            "id": "live-custom",
+            "name": "Live Custom",
+            "command": "sh",
+            "args": [
+                "-c",
+                "while IFS= read -r line; do id=$(echo \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p'); printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"sessionId\":\"live\"}}\\n' \"$id\"; done"
+            ],
+            "env": {},
+            "cwd": null
+        }))
+        .send()
+        .await
+        .expect("create custom agent");
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    dispatch_shared_for_tenant(
+        &router,
+        &TenantId::default_tenant(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "cwd": "/tmp",
+                "mcpServers": [],
+                "_acpx": {"agentId": "live-custom"}
+            }
+        }),
+    )
+    .await
+    .expect("start custom backend");
+    assert!(router
+        .lock()
+        .await
+        .process_id("live-custom")
+        .await
+        .is_some());
+
+    let deleted = client
+        .delete(format!("http://{address}/admin/agents/custom/live-custom"))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .expect("delete custom agent");
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(router
+        .lock()
+        .await
+        .process_id("live-custom")
+        .await
+        .is_none());
 }
 
 #[tokio::test]

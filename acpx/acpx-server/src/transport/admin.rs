@@ -15,6 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Json;
 
+use super::http::SharedRouter;
+
 const CUSTOM_AGENT_VERSION: &str = "custom";
 
 #[derive(Clone)]
@@ -63,6 +65,7 @@ struct AdminState {
     ops: AdminOps,
     registry: Registry,
     enablement: AgentEnablement,
+    router: Option<SharedRouter>,
 }
 
 pub fn build_ops(store: PersistenceStore, registry: &Registry) -> AdminOps {
@@ -73,11 +76,24 @@ pub fn build_ops(store: PersistenceStore, registry: &Registry) -> AdminOps {
     )
 }
 
+#[allow(dead_code)] // Used by isolated transport tests; the binary uses serve_on_with_router.
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
     admin_token: String,
     store: PersistenceStore,
     registry: Registry,
+) -> anyhow::Result<()> {
+    serve_on_with_router(listener, admin_token, store, registry, None).await
+}
+
+/// Same as [`serve_on`], but coordinates custom-agent deletion with the
+/// live router so a removed definition cannot retain a running child.
+pub async fn serve_on_with_router(
+    listener: tokio::net::TcpListener,
+    admin_token: String,
+    store: PersistenceStore,
+    registry: Registry,
+    router: Option<SharedRouter>,
 ) -> anyhow::Result<()> {
     let bind_addr = listener.local_addr()?;
     if !bind_addr.ip().is_loopback() {
@@ -89,6 +105,7 @@ pub async fn serve_on(
         ops: build_ops(store, &registry),
         registry,
         enablement,
+        router,
     };
     let app = axum::Router::new()
         .route("/admin/agents", get(list_agents))
@@ -222,7 +239,15 @@ async fn delete_custom_agent(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state.ops.delete_custom_agent(&id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if let Some(router) = &state.router {
+                if let Err(error) = router.lock().await.revoke_custom_agent(&id).await {
+                    tracing::error!(%error, custom_agent = %id, "failed to terminate deleted custom agent");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => admin_error(error),
     }
 }

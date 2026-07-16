@@ -226,8 +226,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let bridge_config = config.bridge.clone();
+    let http_router = Arc::clone(&router);
     let http_task = http_listener.map(move |listener| {
         let bridge = bridge_config.clone();
+        let router = Arc::clone(&http_router);
         tokio::spawn(async move {
             transport::serve_on_with_bridge(listener, router, auth_token, bridge).await
         })
@@ -235,8 +237,16 @@ async fn main() -> anyhow::Result<()> {
     let admin_task = match admin_transport {
         Some((bind_addr, token, store, registry)) => {
             let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+            let router = Arc::clone(&router);
             Some(tokio::spawn(async move {
-                transport::admin::serve_on(listener, token, store, registry).await
+                transport::admin::serve_on_with_router(
+                    listener,
+                    token,
+                    store,
+                    registry,
+                    Some(router),
+                )
+                .await
             }))
         }
         None => None,

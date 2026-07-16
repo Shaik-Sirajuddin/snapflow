@@ -818,6 +818,30 @@ impl Router {
         self.supervisor.register(agent_id, spec);
     }
 
+    /// Revoke a custom definition from the live process manager after the
+    /// admin plane deletes it. Existing sessions using that definition are
+    /// intentionally terminated rather than left attached to a command an
+    /// operator has explicitly removed.
+    pub async fn revoke_custom_agent(&mut self, agent_id: &str) -> Result<(), RouterError> {
+        self.supervisor.stop(agent_id).await?;
+        for profile in self
+            .profiles
+            .list()
+            .filter(|profile| profile.agent_id == agent_id)
+        {
+            let key = format!("profile:{}", profile.name);
+            self.supervisor.stop(&key).await?;
+            self.supervisor
+                .stop_prefix(&format!("{key}:tenant:"))
+                .await?;
+        }
+        // Keep the id marked as materialized: without the durable custom
+        // record, a stale direct supervisor spec must never become
+        // launchable again in this daemon lifetime.
+        self.materialized_custom_agents.insert(agent_id.to_owned());
+        Ok(())
+    }
+
     /// Ensure an official registry adapter has a launch specification
     /// registered without starting its process. The strict ACP bridge uses
     /// this before its first lazy-bound turn; native callers remain free to
