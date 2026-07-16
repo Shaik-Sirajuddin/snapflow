@@ -2971,19 +2971,24 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     else {
         return false;
     };
-    let (gateway_id, hub) = {
+    let (tenant_id, gateway_id, hub) = {
         let r = ctx.router.lock().await;
-        let gateway_id = match &ctx.tenant_id {
-            Some(tenant_id) => {
-                r.sessions
-                    .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
-            }
+        let resolved = match &ctx.tenant_id {
+            Some(tenant_id) => r
+                .sessions
+                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
+                .map(|gateway_id| (tenant_id.clone(), gateway_id)),
             None => r
                 .sessions
                 .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id)
-                .map(|(_tenant, gid)| gid),
+                .map(|(tenant_id, gateway_id)| (tenant_id, gateway_id)),
         };
-        (gateway_id, r.notification_hub.clone())
+        match resolved {
+            Some((tenant_id, gateway_id)) => {
+                (tenant_id, Some(gateway_id), r.notification_hub.clone())
+            }
+            None => (TenantId::default(), None, r.notification_hub.clone()),
+        }
     };
     let Some(gateway_id) = gateway_id else {
         return false;
@@ -2995,7 +3000,7 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     {
         *session_id_field = serde_json::Value::String(gateway_id.0.clone());
     }
-    hub.publish(&gateway_id.0, translated).await
+    hub.publish(&tenant_id, &gateway_id.0, translated).await
 }
 
 /// Forward a backend-initiated request to the persistent client that owns

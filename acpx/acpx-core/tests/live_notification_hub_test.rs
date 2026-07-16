@@ -9,6 +9,7 @@
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::{dispatch_shared, Router, SharedRouterHandle};
+use acpx_core::TenantId;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +66,9 @@ async fn a_subscribed_session_receives_updates_live_and_the_response_carries_no_
     // the crux of the whole phase: live delivery has to arrive *during*
     // the call, not just be recoverable afterward.
     let hub = { router.lock().await.notification_hub() };
-    let mut rx = hub.subscribe(gateway_id.clone()).await;
+    let mut rx = hub
+        .subscribe(&TenantId::default(), gateway_id.clone())
+        .await;
 
     let prompt_response = dispatch_shared(
         &router,
@@ -163,8 +166,10 @@ async fn unsubscribing_mid_stream_falls_back_to_buffering_for_the_rest_of_that_c
     // Subscribe, then immediately unsubscribe -- simulates the
     // subscriber having already gone away by the time any update
     // actually arrives.
-    let _rx = hub.subscribe(gateway_id.clone()).await;
-    hub.unsubscribe(&gateway_id).await;
+    let _rx = hub
+        .subscribe(&TenantId::default(), gateway_id.clone())
+        .await;
+    hub.remove_stream(&TenantId::default(), &gateway_id).await;
 
     let prompt_response = dispatch_shared(
         &router,
@@ -254,7 +259,9 @@ done
         .unwrap()
         .to_string();
     let hub = { router.lock().await.notification_hub() };
-    let mut rx = hub.subscribe(gateway_id.clone()).await;
+    let mut rx = hub
+        .subscribe(&TenantId::default(), gateway_id.clone())
+        .await;
 
     let slow_router = Arc::clone(&router);
     let slow_gateway_id = gateway_id.clone();

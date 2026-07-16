@@ -16,6 +16,7 @@
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::{dispatch_shared, Router, SharedRouterHandle};
+use acpx_core::TenantId;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,7 +77,9 @@ async fn an_idle_notification_between_calls_still_reaches_a_live_subscriber_with
     // this is the subscription the idle scavenger's later `try_deliver_
     // live` call needs already in place.
     let hub = { router.lock().await.notification_hub() };
-    let mut rx = hub.subscribe(gateway_id.clone()).await;
+    let mut rx = hub
+        .subscribe(&TenantId::default(), gateway_id.clone())
+        .await;
 
     let prompt_response = dispatch_shared(
         &router,

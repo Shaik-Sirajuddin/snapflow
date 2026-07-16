@@ -149,14 +149,22 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             .unwrap_or_default();
         if let Some(forget) = session_id_to_forget(&request, &response, method) {
             if watched.remove(&forget) {
-                hub.unsubscribe(&forget).await;
+                hub.remove_stream(&tenant_id, &forget).await;
             }
         } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
             if watched.insert(watch.clone()) {
-                let mut rx = hub.subscribe(watch).await;
+                let mut rx = hub.subscribe(&tenant_id, watch).await;
                 let forwarder_stdout = Arc::clone(&stdout);
                 tokio::spawn(async move {
-                    while let Some(update) = rx.recv().await {
+                    loop {
+                        let update = match rx.recv().await {
+                            Ok(update) => update,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        };
                         let Ok(mut bytes) = serde_json::to_vec(&update) else {
                             continue;
                         };
@@ -178,9 +186,7 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             out.flush().await?;
         }
     }
-    for session_id in watched {
-        hub.unsubscribe(&session_id).await;
-    }
+    drop(watched);
     for (_, binding) in interaction_bindings.lock().await.drain() {
         interaction_hub.unbind(&binding).await;
     }

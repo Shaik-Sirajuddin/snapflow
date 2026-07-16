@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::Router;
+use acpx_core::TenantId;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -498,11 +499,10 @@ async fn two_ws_clients_of_the_same_tenant_share_sessions_while_a_third_tenant_s
 ///    kept `Arc` clone of the router, exactly how a real backend's next
 ///    streamed chunk would route) rather than needing a second real
 ///    backend round trip.
-/// This is acpx's documented, deliberate design (see `notify.rs`):
-/// there is no session-multiplex fan-out yet (that is the separate,
-/// still-unimplemented `acp-session-multiplex` plan).
+/// Once both clients have touched the session, later updates must fan out
+/// to both of them. This is the regression proof for session multiplexing.
 #[tokio::test]
-async fn the_newest_same_tenant_connection_to_touch_a_session_becomes_its_live_subscriber() {
+async fn same_tenant_connections_receive_the_same_later_session_updates() {
     let streaming_script = r#"
 while IFS= read -r line; do
   id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
@@ -590,16 +590,13 @@ done
          {b_has_nothing:?}"
     );
 
-    // Now that B's own call has fully completed, B has taken over as the
-    // subscriber for `gateway_id` (per `session_id_to_watch`'s `Proxied`
-    // branch, run *after* the call above returned) -- proven directly:
-    // publish a synthetic next notification through the hub and confirm
-    // it now routes to B, not A, giving the whole "newest connection to
-    // touch a session wins" rule concrete, end-to-end proof rather than
-    // relying on internal knowledge of when `subscribe` gets called.
+    // B has now subscribed after its successful call. Publish a synthetic
+    // next notification exactly as a backend would and confirm fan-out to
+    // both same-tenant clients.
     let hub = { router_handle.lock().await.notification_hub() };
     let delivered = hub
         .publish(
+            &TenantId::from("tenant-shared"),
             &gateway_id,
             json!({
                 "jsonrpc": "2.0", "method": "session/update",
@@ -607,10 +604,7 @@ done
             }),
         )
         .await;
-    assert!(
-        delivered,
-        "a subscriber (B, post-handoff) should still be registered"
-    );
+    assert!(delivered, "same-tenant subscribers should be registered");
 
     let handoff_frame = tokio::time::timeout(Duration::from_secs(2), ws_b.next())
         .await
@@ -627,10 +621,18 @@ done
         json!("post-handoff")
     );
 
-    let a_has_nothing_more = tokio::time::timeout(Duration::from_millis(300), ws_a.next()).await;
-    assert!(
-        a_has_nothing_more.is_err(),
-        "connection A should have nothing further queued once B took over as the subscriber, \
-         got: {a_has_nothing_more:?}"
+    let fanout_frame = tokio::time::timeout(Duration::from_secs(2), ws_a.next())
+        .await
+        .expect("fan-out frame should arrive on A promptly")
+        .expect("ws stream ended early")
+        .expect("ws frame error");
+    let fanout_text = match fanout_frame {
+        WsMessage::Text(text) => text,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let fanout_value: serde_json::Value = serde_json::from_str(&fanout_text).expect("json body");
+    assert_eq!(
+        fanout_value["params"]["update"]["content"]["text"],
+        json!("post-handoff")
     );
 }
