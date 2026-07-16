@@ -220,6 +220,14 @@ after a restart is therefore narrower than a live reconnect:
   adapter option changes, and forks update the same durable binding. If
   the initial binding cannot be persisted, ACPX closes the newly-created
   native session rather than leaving an untracked orphan.
+- `GET /health` is an authenticated (when `ACPX_AUTH_TOKEN` is set),
+  secret-free readiness endpoint. It reports only aggregate durable
+  recovery counts and returns `recovering` while any persisted session is
+  in the `restoring` state. Individual session ids and recovery errors are
+  deliberately excluded. Recovery errors are flattened and capped before
+  persistence; a client attempting explicit `session/load` or
+  `session/resume` for a still-restoring row receives a retryable error
+  rather than starting duplicate backend recovery.
 
 ## Transports
 

@@ -3278,3 +3278,20 @@ Focused tests cover SQLite migration defaults, bridge binding overwrite
 semantics, virtual mapping restoration, and strict HTTP bridge binding.
 Verified with `cargo test --workspace --no-fail-fast`; credentialed ambient
 tests remain intentionally ignored.
+
+## Phase 39: recovery readiness diagnostics
+
+`GET /health` now reports aggregate durable recovery state without exposing
+session ids, tenant ids, prompts, or stored recovery error text. The endpoint
+is protected by the same bearer-token policy as `/rpc` and `/ws`, reports
+`recovering` while any row is restoring, and returns service unavailable if
+the durable status query itself fails. Recovery error text is flattened and
+capped at 512 bytes before it reaches SQLite. Explicit `session/load` and
+`session/resume` against a restoring row return a retryable error instead of
+starting a duplicate restore.
+
+Focused persistence, transport-auth, and restoring-state tests pass, as do
+`cargo test --workspace --no-fail-fast` and
+`python3 -m unittest tests.bridge_integration.test_stdio_bridge`. Real
+credentialed Claude/Codex and OpenHands suites remain intentionally
+skip-gated.
