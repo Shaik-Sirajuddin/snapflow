@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         session_idle_ttl_secs = config.lifecycle.idle_session_ttl.as_secs(),
         unbound_bridge_session_ttl_secs = config.lifecycle.unbound_bridge_session_ttl.as_secs(),
         session_absolute_ttl_secs = ?config.lifecycle.absolute_session_ttl.map(|ttl| ttl.as_secs()),
+        max_pinned_sessions_per_tenant = ?config.lifecycle.max_pinned_sessions_per_tenant,
         max_subscribers_per_session = config.max_subscribers_per_session,
         stream_replay_buffer_size = config.stream_replay_buffer_size,
         stream_idle_retention_secs = config.stream_idle_retention.as_secs(),

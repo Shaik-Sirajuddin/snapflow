@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use acpx_proto::session::NewSessionParams;
 
@@ -53,6 +54,14 @@ pub struct BridgeSession {
     /// the virtual session.
     pub bound_gateway_session_id: Option<String>,
     pub state: BridgeSessionState,
+    /// **`virtual_and_pinned_resource_limits`.** When this virtual
+    /// session was registered -- backs [`BridgeSessionStore::
+    /// reap_stale_unbound`]'s TTL check. Not persisted (bridge sessions
+    /// that survive a restart are re-registered via
+    /// [`BridgeSessionStore::restore_bound`], always already `Bound`,
+    /// so they are never reap candidates regardless of this field's
+    /// value after a restart).
+    created_at: Instant,
 }
 
 /// The result of atomically attempting to begin lazy binding.
@@ -82,6 +91,12 @@ pub enum BridgeSessionError {
         session_id: String,
         state: BridgeSessionState,
     },
+    #[error("tenant {tenant_id} already has {current} of at most {limit} virtual bridge sessions")]
+    VirtualSessionQuotaExceeded {
+        tenant_id: String,
+        current: usize,
+        limit: usize,
+    },
 }
 
 /// Concurrent store of virtual bridge sessions.
@@ -105,6 +120,25 @@ impl BridgeSessionStore {
         tenant_id: &TenantId,
         original_new_session_params: NewSessionParams,
     ) -> BridgeSessionId {
+        self.try_register(tenant_id, original_new_session_params, None)
+            .expect("register: no limit passed, so a quota error is impossible")
+    }
+
+    /// Same as [`Self::register`], but enforces
+    /// `max_virtual_sessions_per_tenant` (`None` means unlimited, matching
+    /// [`Self::register`]'s unchanged behavior). **`virtual_and_pinned_
+    /// resource_limits`.** The quota counts every session currently in
+    /// this tenant's map regardless of state (`Unbound`/`Binding`/`Bound`/
+    /// `Failed`) -- a `Bound` session still holds a real backend session
+    /// alive, and a `Failed` one is only removed by an explicit client
+    /// retry/cleanup, so both remain real resource consumers until
+    /// removed.
+    pub fn try_register(
+        &self,
+        tenant_id: &TenantId,
+        original_new_session_params: NewSessionParams,
+        max_per_tenant: Option<usize>,
+    ) -> Result<BridgeSessionId, BridgeSessionError> {
         let session_id = BridgeSessionId(uuid::Uuid::new_v4().to_string());
         let cwd = original_new_session_params.cwd.clone();
         let session = BridgeSession {
@@ -115,13 +149,58 @@ impl BridgeSessionStore {
             selected_adapter_config_options: HashMap::new(),
             bound_gateway_session_id: None,
             state: BridgeSessionState::Unbound,
+            created_at: Instant::now(),
         };
 
+        let mut sessions = self.lock_sessions();
+        let tenant_sessions = sessions.entry(tenant_id.clone()).or_default();
+        if let Some(limit) = max_per_tenant {
+            let current = tenant_sessions.len();
+            if current >= limit {
+                return Err(BridgeSessionError::VirtualSessionQuotaExceeded {
+                    tenant_id: tenant_id.0.clone(),
+                    current,
+                    limit,
+                });
+            }
+        }
+        tenant_sessions.insert(session_id.clone(), session);
+        Ok(session_id)
+    }
+
+    /// Count of virtual sessions currently registered for one tenant --
+    /// the same count [`Self::try_register`]'s quota check uses.
+    pub fn count_for_tenant(&self, tenant_id: &TenantId) -> usize {
         self.lock_sessions()
-            .entry(tenant_id.clone())
-            .or_default()
-            .insert(session_id.clone(), session);
-        session_id
+            .get(tenant_id)
+            .map(HashMap::len)
+            .unwrap_or(0)
+    }
+
+    /// **`virtual_and_pinned_resource_limits`.** Removes every `Unbound`
+    /// virtual session across every tenant whose age exceeds `ttl`.
+    /// Deliberately scoped to `Unbound` only: a session in `Binding`
+    /// might have a real backend-creation round trip in flight (removing
+    /// it here could orphan that in-flight work with no way to ever
+    /// observe its outcome), and `Bound`/`Failed` sessions are addressed
+    /// by (respectively) the native session's own idle-TTL reaper and an
+    /// explicit client retry -- an `Unbound` session that a client never
+    /// followed up on (never sent a first prompt) is the one case with
+    /// no other lifecycle owner at all. Returns the number removed.
+    pub fn reap_stale_unbound(&self, now: Instant, ttl: std::time::Duration) -> usize {
+        let mut sessions = self.lock_sessions();
+        let mut removed = 0;
+        for tenant_sessions in sessions.values_mut() {
+            tenant_sessions.retain(|_, session| {
+                let stale = session.state == BridgeSessionState::Unbound
+                    && now.saturating_duration_since(session.created_at) >= ttl;
+                if stale {
+                    removed += 1;
+                }
+                !stale
+            });
+        }
+        removed
     }
 
     /// Selects the public model alias before lazy binding begins.
@@ -233,6 +312,7 @@ impl BridgeSessionStore {
             selected_adapter_config_options,
             bound_gateway_session_id: Some(bound_gateway_session_id.into()),
             state: BridgeSessionState::Bound,
+            created_at: Instant::now(),
         };
         self.lock_sessions()
             .entry(tenant_id.clone())
@@ -272,6 +352,7 @@ impl BridgeSessionStore {
                 selected_adapter_config_options,
                 bound_gateway_session_id: Some(bound_gateway_session_id.into()),
                 state: BridgeSessionState::Bound,
+                created_at: Instant::now(),
             },
         );
         Ok(())
@@ -634,5 +715,70 @@ mod tests {
             Some("native-gateway-fork")
         );
         assert_ne!(fork.id.0, "native-gateway-fork");
+    }
+
+    #[test]
+    fn try_register_enforces_the_per_tenant_quota_and_is_not_shared_across_tenants() {
+        let store = BridgeSessionStore::new();
+        let tenant_a = TenantId::from("tenant-a");
+        let tenant_b = TenantId::from("tenant-b");
+
+        store
+            .try_register(&tenant_a, params("/workspace"), Some(1))
+            .expect("first session under quota");
+        let rejected = store.try_register(&tenant_a, params("/workspace"), Some(1));
+        assert!(matches!(
+            rejected,
+            Err(BridgeSessionError::VirtualSessionQuotaExceeded {
+                current: 1,
+                limit: 1,
+                ..
+            })
+        ));
+
+        // tenant-b's own quota is independent of tenant-a's usage.
+        store
+            .try_register(&tenant_b, params("/workspace"), Some(1))
+            .expect("a different tenant has its own separate quota");
+    }
+
+    #[test]
+    fn register_never_enforces_a_quota() {
+        let store = BridgeSessionStore::new();
+        let tenant = TenantId::from("tenant-a");
+        // The legacy unlimited `register` entry point must keep working
+        // unchanged for every pre-existing caller that never opts into a
+        // quota.
+        for _ in 0..5 {
+            store.register(&tenant, params("/workspace"));
+        }
+        assert_eq!(store.count_for_tenant(&tenant), 5);
+    }
+
+    #[test]
+    fn reap_stale_unbound_removes_only_expired_unbound_sessions() {
+        let store = BridgeSessionStore::new();
+        let tenant = TenantId::from("tenant-a");
+        let stale_unbound = store.register(&tenant, params("/workspace"));
+        let bound = store.register(&tenant, params("/workspace"));
+        store.begin_binding(&tenant, &bound).unwrap();
+        store
+            .finish_binding(&tenant, &bound, "native-session")
+            .unwrap();
+
+        // `stale_unbound`/`bound` are registered, then a real delay
+        // elapses, then `fresh_unbound` is registered -- a TTL between
+        // the two ages must reap only the session actually older than
+        // it, proving this reads each session's own age rather than a
+        // single global cutoff.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let fresh_unbound = store.register(&tenant, params("/workspace"));
+
+        let removed =
+            store.reap_stale_unbound(Instant::now(), std::time::Duration::from_millis(15));
+        assert_eq!(removed, 1);
+        assert!(store.get(&tenant, &stale_unbound).is_none());
+        assert!(store.get(&tenant, &fresh_unbound).is_some());
+        assert!(store.get(&tenant, &bound).is_some());
     }
 }

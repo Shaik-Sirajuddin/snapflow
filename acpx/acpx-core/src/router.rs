@@ -152,6 +152,21 @@ pub fn classify(method: &str) -> MethodClass {
         "mcp_servers/create" | "mcp_servers/list" | "mcp_servers/update" | "mcp_servers/delete" => {
             MethodClass::GatewayNative
         }
+        // `retention_administration` (`acpx-session-lifecycle`). Not a
+        // real ACP method -- an acpx-only extension namespace, same
+        // category as `profiles/*`/`mcp_servers/*` above. Tenant-scoped
+        // (see `dispatch_native`'s arms): each resolves/mutates only a
+        // session already owned by the authenticated tenant issuing the
+        // request, via `SessionRegistry`'s existing tenant-nested map --
+        // exactly the same ownership check `Router::set_session_pinned`
+        // already enforced as an in-process-only seam before this;
+        // these give it a real, authenticated, gateway-native JSON-RPC
+        // surface.
+        "session/retention/get"
+        | "session/retention/list"
+        | "session/retention/pin"
+        | "session/retention/unpin"
+        | "session/retention/set_ttl" => MethodClass::GatewayNative,
         _ => MethodClass::Unknown,
     }
 }
@@ -627,6 +642,15 @@ pub enum RouterError {
     RotationRequiresDurableConfig,
     #[error("master keyring I/O error: {0}")]
     KeyringIo(String),
+    #[error(
+        "session/retention/pin: tenant {tenant_id} already has {current} of at most {limit} \
+         pinned sessions"
+    )]
+    PinQuotaExceeded {
+        tenant_id: String,
+        current: usize,
+        limit: usize,
+    },
 }
 
 impl Router {
@@ -962,6 +986,16 @@ impl Router {
         self
     }
 
+    /// **`virtual_and_pinned_resource_limits`.** Read-only accessor so a
+    /// caller outside this module (`acpx-server`'s strict `/acp` bridge
+    /// reaper task, which owns its own separate `BridgeSessionStore` not
+    /// tracked by this `Router`) can reuse the same deployment-configured
+    /// `unbound_bridge_session_ttl` rather than needing a second,
+    /// independently-configured copy of it.
+    pub fn lifecycle_config(&self) -> &LifecycleConfig {
+        &self.lifecycle
+    }
+
     /// Replace the live notification hub before transports are attached.
     /// The server uses this to apply deployment-level subscriber limits.
     pub fn with_notification_hub(mut self, notification_hub: NotificationHub) -> Self {
@@ -1066,6 +1100,84 @@ impl Router {
         }
         self.sessions.set_pinned(tenant_id, &gateway_id, pinned);
         Ok(())
+    }
+
+    /// **`retention_administration`.** `session/retention/pin`'s actual
+    /// handler: [`Self::set_session_pinned`] plus the per-tenant pin
+    /// quota (`LifecycleConfig::max_pinned_sessions_per_tenant`). A
+    /// no-op re-pin of an already-pinned session never itself trips the
+    /// quota it is already counted toward -- only a session transitioning
+    /// from unpinned to pinned can exceed it.
+    async fn set_session_pinned_administered(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        pinned: bool,
+    ) -> Result<(), RouterError> {
+        if pinned {
+            if let Some(limit) = self.lifecycle.max_pinned_sessions_per_tenant {
+                let gateway_id =
+                    acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+                let already_pinned = self
+                    .sessions
+                    .resolve(tenant_id, &gateway_id)
+                    .is_some_and(|entry| entry.pinned);
+                let current = self.sessions.pinned_count(tenant_id);
+                if !already_pinned && current >= limit {
+                    return Err(RouterError::PinQuotaExceeded {
+                        tenant_id: tenant_id.0.clone(),
+                        current,
+                        limit,
+                    });
+                }
+            }
+        }
+        self.set_session_pinned(tenant_id, gateway_session_id, pinned)
+            .await
+    }
+
+    /// **`retention_administration`.** `session/retention/set_ttl`'s
+    /// handler. Mirrors [`Self::set_session_pinned`]'s ownership check
+    /// and persistence write-through shape.
+    async fn set_session_custom_ttl(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        if self.sessions.resolve(tenant_id, &gateway_id).is_none() {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+        }
+        if let Some(store) = self.persistence.clone() {
+            store
+                .update_session_custom_ttl(
+                    gateway_session_id.to_string(),
+                    ttl.map(|duration| duration.as_secs() as i64),
+                )
+                .await?;
+        }
+        self.sessions.set_custom_ttl(tenant_id, &gateway_id, ttl);
+        Ok(())
+    }
+
+    /// **`retention_administration`.** `session/retention/get`'s handler
+    /// (and every other retention arm's response shape) -- resolves and
+    /// formats one tenant-owned session's retention state. Errors
+    /// `UnknownSession` for a session that either never existed or
+    /// belongs to a different tenant (never distinguishable, matching
+    /// every other tenant-ownership check in this file).
+    fn retention_info_json(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Result<serde_json::Value, RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        let entry = self
+            .sessions
+            .resolve(tenant_id, &gateway_id)
+            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.to_string()))?;
+        Ok(retention_entry_json(gateway_session_id, entry))
     }
 
     fn admit_session(&self, tenant_id: &TenantId) -> Result<SessionAdmissionPermit, RouterError> {
@@ -1665,6 +1777,9 @@ impl Router {
                 last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
                 in_flight: 0,
                 pinned: record.pinned,
+                custom_idle_ttl: record
+                    .custom_idle_ttl_seconds
+                    .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
             },
             admission,
             backend,
@@ -2403,6 +2518,9 @@ impl Router {
             last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
             in_flight: 0,
             pinned: record.pinned,
+            custom_idle_ttl: record
+                .custom_idle_ttl_seconds
+                .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -3142,6 +3260,83 @@ impl Router {
                 self.mcp_servers.delete(&name)?;
                 self.delete_persisted_mcp_server_if_durable(&name).await?;
                 serde_json::json!({ "name": name, "deleted": true })
+            }
+            "session/retention/get" => {
+                let gateway_session_id = request
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                self.retention_info_json(tenant_id, &gateway_session_id)?
+            }
+            "session/retention/list" => {
+                let sessions: Vec<serde_json::Value> = self
+                    .sessions
+                    .list_for_tenant(tenant_id)
+                    .into_iter()
+                    .map(|(gateway_id, entry)| retention_entry_json(&gateway_id.0, &entry))
+                    .collect();
+                serde_json::json!({ "sessions": sessions })
+            }
+            "session/retention/pin" => {
+                let gateway_session_id = request
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                self.set_session_pinned_administered(tenant_id, &gateway_session_id, true)
+                    .await?;
+                tracing::info!(
+                    tenant_id = %tenant_id.0,
+                    gateway_session_id = %gateway_session_id,
+                    "session pinned via session/retention/pin"
+                );
+                self.retention_info_json(tenant_id, &gateway_session_id)?
+            }
+            "session/retention/unpin" => {
+                let gateway_session_id = request
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                self.set_session_pinned_administered(tenant_id, &gateway_session_id, false)
+                    .await?;
+                tracing::info!(
+                    tenant_id = %tenant_id.0,
+                    gateway_session_id = %gateway_session_id,
+                    "session unpinned via session/retention/unpin"
+                );
+                self.retention_info_json(tenant_id, &gateway_session_id)?
+            }
+            "session/retention/set_ttl" => {
+                let params = request
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let gateway_session_id = params
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                // `null`/absent clears the override; a present number
+                // sets it -- distinguished via `Option<Option<u64>>`-
+                // shaped parsing so "field omitted" and "field explicitly
+                // null" both mean "clear", matching every other optional
+                // JSON-RPC param in this dispatcher.
+                let idle_ttl_seconds = params.get("idleTtlSeconds").and_then(|v| v.as_u64());
+                let ttl = idle_ttl_seconds.map(std::time::Duration::from_secs);
+                self.set_session_custom_ttl(tenant_id, &gateway_session_id, ttl)
+                    .await?;
+                tracing::info!(
+                    tenant_id = %tenant_id.0,
+                    gateway_session_id = %gateway_session_id,
+                    idle_ttl_seconds = ?idle_ttl_seconds,
+                    "session idle TTL override changed via session/retention/set_ttl"
+                );
+                self.retention_info_json(tenant_id, &gateway_session_id)?
             }
             other => return Err(RouterError::UnknownMethod(other.to_string())),
         };
@@ -5386,6 +5581,26 @@ fn now_unix_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(now.as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// **`retention_administration`.** Response shape shared by every
+/// `session/retention/*` method -- `session/retention/list` builds an
+/// array of these, the single-session arms return one directly. Ages are
+/// whole seconds (this is a coarse operator-facing view, not a precision
+/// timer).
+fn retention_entry_json(
+    gateway_session_id: &str,
+    entry: &crate::session_registry::SessionEntry,
+) -> serde_json::Value {
+    let now = std::time::Instant::now();
+    serde_json::json!({
+        "sessionId": gateway_session_id,
+        "pinned": entry.pinned,
+        "customIdleTtlSeconds": entry.custom_idle_ttl.map(|ttl| ttl.as_secs()),
+        "idleForSeconds": now.saturating_duration_since(entry.last_activity_at).as_secs(),
+        "ageSeconds": now.saturating_duration_since(entry.created_at).as_secs(),
+        "inFlight": entry.in_flight,
+    })
 }
 
 /// Rebuild a monotonic lifecycle deadline from durable wall time. A missing

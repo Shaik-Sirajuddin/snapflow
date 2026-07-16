@@ -441,6 +441,41 @@ pub async fn serve_on_with_bridge_and_tenant_tokens(
                 tracing::info!(restored, "restored strict ACP bridge session mappings");
             }
         }
+
+        // **`virtual_and_pinned_resource_limits`.** A virtual bridge
+        // session that never received a first prompt (`Unbound` forever
+        // -- a client that called the bridge's `session/new` and then
+        // simply vanished) has no other lifecycle owner: it never became
+        // a real native gateway session, so `Router::reap_expired_
+        // sessions`'s TTL reaper never sees it either. Reuses the same
+        // deployment-configured `unbound_bridge_session_ttl` the native
+        // reaper's doc comment already names for this purpose (see
+        // `crate::config::ServerConfig`'s field of the same name) --
+        // one operator-facing knob, not two independently-tuned TTLs.
+        // Ticks at a quarter of the TTL (floored at 10s) so an
+        // `Unbound` session is reaped reasonably close to its TTL
+        // without a separate configuration knob for this cadence.
+        let ttl = state
+            .router
+            .lock()
+            .await
+            .lifecycle_config()
+            .unbound_bridge_session_ttl;
+        let tick_interval = (ttl / 4).max(std::time::Duration::from_secs(10));
+        let bridge_runtime = Arc::clone(runtime);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tick_interval);
+            ticker.tick().await; // Establish interval without delaying the first full tick.
+            loop {
+                ticker.tick().await;
+                let removed = bridge_runtime
+                    .sessions
+                    .reap_stale_unbound(std::time::Instant::now(), ttl);
+                if removed != 0 {
+                    tracing::info!(removed, "reaped stale unbound virtual bridge sessions");
+                }
+            }
+        });
     }
     let auth_enabled = state.auth.token.is_some();
     let bridge_enabled = state.bridge.is_some();

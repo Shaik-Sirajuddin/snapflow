@@ -101,6 +101,18 @@ pub struct SessionEntry {
     pub in_flight: usize,
     /// Explicit retention override controlled by ACPX administration.
     pub pinned: bool,
+    /// **`retention_administration`.** Per-session idle-TTL override, set
+    /// via `session/retention/set_ttl` -- `None` (the default) means
+    /// "use `LifecycleConfig::idle_session_ttl` like every other
+    /// session", `Some(duration)` overrides it for this session alone
+    /// (shorter *or* longer than the deployment default; an operator
+    /// might want a long-lived session to survive an unusually long idle
+    /// gap without pinning it outright, or a short-lived one reaped
+    /// sooner than the default). Deliberately independent of `pinned`:
+    /// a session can have a custom TTL and still eventually be reaped by
+    /// it, whereas `pinned` exempts a session from idle reaping
+    /// entirely regardless of any TTL.
+    pub custom_idle_ttl: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Default)]
@@ -166,6 +178,7 @@ impl SessionRegistry {
                 last_activity_at: Instant::now(),
                 in_flight: 0,
                 pinned: false,
+                custom_idle_ttl: None,
             },
         );
         gateway_id
@@ -257,6 +270,53 @@ impl SessionRegistry {
         true
     }
 
+    /// Sets (or clears, with `ttl: None`) the per-session idle-TTL
+    /// override for one tenant-scoped session. See
+    /// [`SessionEntry::custom_idle_ttl`]'s doc comment.
+    pub fn set_custom_ttl(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_id: &GatewaySessionId,
+        ttl: Option<std::time::Duration>,
+    ) -> bool {
+        let Some(entry) = self
+            .sessions
+            .get_mut(tenant_id)
+            .and_then(|sessions| sessions.get_mut(&gateway_id.0))
+        else {
+            return false;
+        };
+        entry.custom_idle_ttl = ttl;
+        true
+    }
+
+    /// Count of currently-pinned sessions for one tenant -- backs the
+    /// `session/retention/pin` pin-quota check
+    /// (`LifecycleConfig::max_pinned_sessions_per_tenant`).
+    pub fn pinned_count(&self, tenant_id: &TenantId) -> usize {
+        self.sessions
+            .get(tenant_id)
+            .map(|sessions| sessions.values().filter(|entry| entry.pinned).count())
+            .unwrap_or(0)
+    }
+
+    /// Every `(gateway_session_id, entry)` pair for one tenant, for the
+    /// `session/retention/list` tenant-scoped inspection method.
+    /// Snapshotted as owned `GatewaySessionId`s (not borrowed) so a
+    /// caller can format a response without holding this registry's
+    /// borrow across it.
+    pub fn list_for_tenant(&self, tenant_id: &TenantId) -> Vec<(GatewaySessionId, SessionEntry)> {
+        self.sessions
+            .get(tenant_id)
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .map(|(id, entry)| (GatewaySessionId(id.clone()), entry.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Lists sessions eligible for lifecycle cleanup without mutating them.
     /// Callers are responsible for marking/closing each candidate before
     /// removal so a concurrent operation cannot race a backend close.
@@ -273,10 +333,12 @@ impl SessionRegistry {
                         return None;
                     }
                     let idle = now.saturating_duration_since(entry.last_activity_at);
+                    let effective_idle_ttl =
+                        entry.custom_idle_ttl.unwrap_or(lifecycle.idle_session_ttl);
                     let absolute = lifecycle
                         .absolute_session_ttl
                         .is_some_and(|ttl| now.saturating_duration_since(entry.created_at) >= ttl);
-                    (idle >= lifecycle.idle_session_ttl || absolute)
+                    (idle >= effective_idle_ttl || absolute)
                         .then(|| (tenant.clone(), GatewaySessionId(id.clone())))
                 })
             })

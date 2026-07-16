@@ -28,6 +28,13 @@ pub struct BridgeModel {
 pub struct BridgeConfig {
     pub default_model: String,
     pub models: Vec<BridgeModel>,
+    /// **`virtual_and_pinned_resource_limits`.** Caps how many virtual
+    /// bridge sessions (`BridgeSessionStore` entries, any state) one
+    /// tenant may hold at once. `#[serde(default)]` (`None`, unlimited)
+    /// so every pre-existing bridge config file parses unchanged despite
+    /// `#[serde(deny_unknown_fields)]` on this struct.
+    #[serde(default)]
+    pub max_virtual_sessions_per_tenant: Option<usize>,
 }
 
 /// Public, secret-safe model entry returned by `/acp/models`.
@@ -218,6 +225,7 @@ mod tests {
                     model_id: "gpt-5.5".to_string(),
                 },
             ],
+            max_virtual_sessions_per_tenant: None,
         }
     }
 

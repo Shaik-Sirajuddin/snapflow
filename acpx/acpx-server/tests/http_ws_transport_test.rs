@@ -213,6 +213,7 @@ async fn bridge_catalog_routes_expose_only_configured_public_entries() {
                     model_id: "internal-model-secret-two".to_string(),
                 },
             ],
+            max_virtual_sessions_per_tenant: None,
         },
     )
     .await;
@@ -286,6 +287,7 @@ async fn strict_acp_http_bridge_lazily_binds_selected_models_without_profiles() 
                     model_id: "gpt-5.5".to_string(),
                 },
             ],
+            max_virtual_sessions_per_tenant: None,
         },
     )
     .await;
@@ -427,6 +429,59 @@ async fn strict_acp_http_bridge_lazily_binds_selected_models_without_profiles() 
         .await
         .expect("bridge forbidden extension JSON");
     assert_eq!(rejected["error"]["code"], json!(-32602));
+}
+
+#[tokio::test]
+async fn strict_acp_http_bridge_enforces_max_virtual_sessions_per_tenant() {
+    let mut router = Router::new("codex-acp");
+    router.register_agent("codex-acp", tagged_backend_spec("codex"));
+    let addr = spawn_server_with_bridge(
+        Arc::new(Mutex::new(router)),
+        BridgeConfig {
+            default_model: "codex/gpt-5.5".to_string(),
+            models: vec![BridgeModel {
+                id: "codex/gpt-5.5".to_string(),
+                name: None,
+                agent_id: "codex-acp".to_string(),
+                model_id: "gpt-5.5".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: Some(1),
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let new = |id| {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        })
+    };
+
+    let first: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&new(1))
+        .send()
+        .await
+        .expect("first bridge session/new")
+        .json()
+        .await
+        .expect("first bridge session/new JSON");
+    assert!(first["result"]["sessionId"].as_str().is_some(), "{first:?}");
+
+    let second: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&new(2))
+        .send()
+        .await
+        .expect("second bridge session/new")
+        .json()
+        .await
+        .expect("second bridge session/new JSON");
+    assert!(
+        second.get("error").is_some(),
+        "second session/new should be rejected once the per-tenant virtual \
+         session quota is exhausted: {second:?}"
+    );
 }
 
 #[tokio::test]
@@ -815,6 +870,7 @@ async fn strict_acp_ws_exposes_virtual_session_model_selection() {
                 agent_id: "codex-acp".to_string(),
                 model_id: "gpt-5.5".to_string(),
             }],
+            max_virtual_sessions_per_tenant: None,
         },
     )
     .await;
@@ -862,6 +918,7 @@ async fn strict_acp_ws_forwards_bound_session_updates_with_virtual_ids() {
                 agent_id: "streaming".to_string(),
                 model_id: "stream-model".to_string(),
             }],
+            max_virtual_sessions_per_tenant: None,
         },
     )
     .await;
@@ -981,6 +1038,7 @@ async fn strict_acp_ws_forwards_backend_permission_requests_to_the_bound_client(
                 agent_id: "permission-agent".to_string(),
                 model_id: "perm-model".to_string(),
             }],
+            max_virtual_sessions_per_tenant: None,
         },
     )
     .await;

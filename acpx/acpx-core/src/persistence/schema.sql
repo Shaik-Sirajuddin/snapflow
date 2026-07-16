@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     bridge_session_id TEXT,
     bridge_model_alias TEXT,
     bridge_config_options_json TEXT
+    ,
+    -- `retention_administration` (`acpx-session-lifecycle`). Per-session
+    -- idle-TTL override in whole seconds; NULL means "no override, use
+    -- the deployment default". Added after the table already shipped,
+    -- so `store.rs`'s `migrate_sessions_columns` also idempotently
+    -- `ALTER TABLE`s this in for a pre-existing database.
+    custom_idle_ttl_seconds INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS transcripts (

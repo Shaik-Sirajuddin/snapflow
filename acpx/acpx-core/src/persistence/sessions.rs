@@ -192,4 +192,10 @@ pub struct SessionRecord {
     pub bridge_session_id: Option<String>,
     pub bridge_model_alias: Option<String>,
     pub bridge_config_options: Option<Value>,
+    /// **`retention_administration`.** Per-session idle-TTL override in
+    /// whole seconds, set via `session/retention/set_ttl` and mirrored
+    /// into `crate::session_registry::SessionEntry::custom_idle_ttl` on
+    /// startup recovery. `None` means "no override, use the deployment
+    /// default" -- the migration default for every pre-existing row.
+    pub custom_idle_ttl_seconds: Option<i64>,
 }

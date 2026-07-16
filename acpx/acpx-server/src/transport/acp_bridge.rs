@@ -357,7 +357,11 @@ async fn new_session(
         .cloned()
         .ok_or(RouterError::MissingParams)?;
     let parsed = serde_json::from_value(params).map_err(|_| RouterError::MissingParams)?;
-    let session_id = runtime.sessions.register(tenant_id, parsed);
+    let session_id = runtime.sessions.try_register(
+        tenant_id,
+        parsed,
+        runtime.config.max_virtual_sessions_per_tenant,
+    )?;
     Ok(json!({
         "jsonrpc": "2.0",
         "id": request.get("id").cloned().unwrap_or(Value::Null),
@@ -892,6 +896,7 @@ mod tests {
                 agent_id: "codex-acp".to_string(),
                 model_id: "gpt-5".to_string(),
             }],
+            max_virtual_sessions_per_tenant: None,
         }));
         assert_eq!(
             runtime

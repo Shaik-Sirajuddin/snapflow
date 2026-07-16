@@ -198,7 +198,7 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json \
+                        bridge_config_options_json, custom_idle_ttl_seconds \
                  FROM sessions WHERE gateway_session_id = ?1",
             )?;
             let mut rows = stmt.query_map(params![gateway_session_id], row_to_session_record)?;
@@ -223,7 +223,7 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json \
+                        bridge_config_options_json, custom_idle_ttl_seconds \
                  FROM sessions ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
@@ -243,7 +243,7 @@ impl PersistenceStore {
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
                         recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
                         last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
-                        bridge_config_options_json \
+                        bridge_config_options_json, custom_idle_ttl_seconds \
                  FROM sessions \
                  WHERE closed_at IS NULL \
                    AND status != 'closed' \
@@ -356,6 +356,30 @@ impl PersistenceStore {
                     last_activity_at_unix_nanos,
                     gateway_session_id
                 ],
+            )?;
+            if rows == 0 {
+                return Err(PersistenceError::SessionNotFound(gateway_session_id));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// **`retention_administration`.** Persist (or clear, with `ttl_
+    /// seconds: None`) a session's idle-TTL override -- mirrors
+    /// [`Self::update_session_pinned`]'s shape.
+    pub async fn update_session_custom_ttl(
+        &self,
+        gateway_session_id: impl Into<String>,
+        ttl_seconds: Option<i64>,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let rows = conn.execute(
+                "UPDATE sessions SET custom_idle_ttl_seconds = ?1 WHERE gateway_session_id = ?2",
+                params![ttl_seconds, gateway_session_id],
             )?;
             if rows == 0 {
                 return Err(PersistenceError::SessionNotFound(gateway_session_id));
@@ -933,6 +957,7 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         bridge_session_id: row.get(15)?,
         bridge_model_alias: row.get(16)?,
         bridge_config_options,
+        custom_idle_ttl_seconds: row.get(18)?,
     })
 }
 
@@ -961,6 +986,7 @@ fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
         ("bridge_session_id", "TEXT"),
         ("bridge_model_alias", "TEXT"),
         ("bridge_config_options_json", "TEXT"),
+        ("custom_idle_ttl_seconds", "INTEGER"),
     ] {
         if !column_names.iter().any(|column| column == name) {
             conn.execute(

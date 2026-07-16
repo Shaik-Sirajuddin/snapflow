@@ -273,6 +273,21 @@ impl ServerConfig {
             )),
             Err(_) => lifecycle.absolute_session_ttl,
         };
+        lifecycle.max_pinned_sessions_per_tenant =
+            match std::env::var("ACPX_MAX_PINNED_SESSIONS_PER_TENANT") {
+                Ok(value)
+                    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") =>
+                {
+                    None
+                }
+                Ok(value) => Some(value.parse::<usize>().unwrap_or_else(|err| {
+                    panic!(
+                        "ACPX_MAX_PINNED_SESSIONS_PER_TENANT={value:?} is not a positive \
+                             integer: {err}"
+                    )
+                })),
+                Err(_) => lifecycle.max_pinned_sessions_per_tenant,
+            };
         lifecycle
             .validate()
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));

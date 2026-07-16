@@ -13,6 +13,17 @@ pub struct LifecycleConfig {
     pub idle_session_ttl: std::time::Duration,
     pub unbound_bridge_session_ttl: std::time::Duration,
     pub absolute_session_ttl: Option<std::time::Duration>,
+    /// **`retention_administration`.** Caps how many sessions one tenant
+    /// may hold pinned (exempt from idle reaping) at once, via
+    /// `session/retention/pin`. `None` (the default) means unlimited --
+    /// unchanged behavior from before this field existed, since pinning
+    /// was previously only reachable through `Router::set_session_pinned`
+    /// as an in-process-only seam with no client-facing quota concern.
+    /// `Some(0)` is deliberately rejected by `validate` below (use a
+    /// deployment that simply never enables the retention-administration
+    /// JSON-RPC methods instead of a zero quota, which would be a
+    /// confusing way to spell "no pinning allowed").
+    pub max_pinned_sessions_per_tenant: Option<usize>,
 }
 
 impl Default for LifecycleConfig {
@@ -23,6 +34,7 @@ impl Default for LifecycleConfig {
             idle_session_ttl: std::time::Duration::from_secs(30 * 60),
             unbound_bridge_session_ttl: std::time::Duration::from_secs(5 * 60),
             absolute_session_ttl: None,
+            max_pinned_sessions_per_tenant: None,
         }
     }
 }
@@ -45,6 +57,11 @@ impl LifecycleConfig {
         }
         if self.absolute_session_ttl.is_some_and(|ttl| ttl.is_zero()) {
             return Err(LifecycleConfigError::ZeroDuration("absolute_session_ttl"));
+        }
+        if self.max_pinned_sessions_per_tenant == Some(0) {
+            return Err(LifecycleConfigError::ZeroLimit(
+                "max_pinned_sessions_per_tenant",
+            ));
         }
         Ok(())
     }
