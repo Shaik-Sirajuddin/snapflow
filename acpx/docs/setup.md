@@ -63,6 +63,8 @@ connection with live `session/update` streaming.
 | `ACPX_HTTP_BIND` | `127.0.0.1:8790` | HTTP/WS bind address. Loopback only by default -- do not point at a public interface without auth + a TLS-terminating reverse proxy (acpx never terminates TLS itself). |
 | `ACPX_AUTH_TOKEN` | unset (no auth) | If set, requires `Authorization: Bearer <token>` on `POST /rpc` and the `GET /ws` upgrade. Empty string is treated as unset. |
 | `ACPX_DB_PATH` | unset (no persistence) | sqlite file path for session metadata + transcripts. See [`architecture.md`](./architecture.md)'s "Persistence and restart recovery". |
+| `ACPX_MASTER_KEYRING_PATH` | `<ACPX_DB_PATH>.keyring` | Encryption keyring file for the durable secret store (only relevant when `ACPX_DB_PATH` is set). Created with `0600` permissions on first use. See [`architecture.md`](./architecture.md)'s "Durable secret and configuration store". |
+| `ACPX_MASTER_KEYRING_ROTATE` | unset | Set to `1` on a given startup to rotate the master key and re-encrypt every persisted secret once. Not a schedule. |
 | `ACPX_CONFIG_FILE` | unset | Path to a startup provisioning JSON file (providers/central MCP servers/profiles), applied before either transport accepts requests. Malformed/rejected file fails startup outright. |
 
 ## Provisioning file (`ACPX_CONFIG_FILE`)

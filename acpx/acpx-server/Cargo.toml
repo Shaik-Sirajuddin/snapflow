@@ -63,3 +63,8 @@ acpx-client = { path = "../acpx-client" }
 # enough since tests only ever connect to our own plaintext ws://
 # loopback listener, no TLS involved.
 tokio-tungstenite = "0.24"
+# Direct raw-sqlite assertions in durable_secret_store_binary_test.rs
+# (verifying what `acpx-server` actually wrote to `ACPX_DB_PATH`,
+# independent of any acpx abstraction reading it back).
+rusqlite = { version = "0.31", features = ["bundled"] }
+tempfile = "3"

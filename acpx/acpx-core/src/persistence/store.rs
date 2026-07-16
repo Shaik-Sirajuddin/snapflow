@@ -651,6 +651,217 @@ impl PersistenceStore {
         })
         .await
     }
+
+    // -- Durable secret + config store (`durable_secret_and_configuration_
+    // store`, `acp-gateway-daemon`). Only reached when a caller opts into
+    // `Router::enable_durable_config` on top of `with_persistence` --
+    // never touched by an in-memory-only `Router`. See
+    // `crate::keystore::MasterKeyring` for the encryption side; this
+    // struct only ever stores/returns opaque ciphertext bytes, never a
+    // plaintext secret.
+
+    /// Insert or replace one secret's encrypted row. `INSERT OR REPLACE`
+    /// (not a plain `INSERT`) because both a fresh `profiles/create` and a
+    /// rotation re-encrypt need "this `key_ref` now has this ciphertext"
+    /// semantics, not "fail if it already exists".
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_secret(
+        &self,
+        key_ref: impl Into<String>,
+        ciphertext: Vec<u8>,
+        nonce: Vec<u8>,
+        key_version: u32,
+        created_at: impl Into<String>,
+        rotated_at: Option<String>,
+    ) -> Result<(), PersistenceError> {
+        let key_ref = key_ref.into();
+        let created_at = created_at.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT OR REPLACE INTO secrets \
+                 (key_ref, ciphertext, nonce, key_version, created_at, rotated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    key_ref,
+                    ciphertext,
+                    nonce,
+                    key_version,
+                    created_at,
+                    rotated_at
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// All persisted secrets, for startup load and for rotation (which
+    /// must re-encrypt every row). Ordered by `key_ref` for deterministic
+    /// iteration in tests.
+    pub async fn load_all_secrets(
+        &self,
+    ) -> Result<Vec<(String, Vec<u8>, Vec<u8>, u32)>, PersistenceError> {
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut statement = conn.prepare(
+                "SELECT key_ref, ciphertext, nonce, key_version \
+                 FROM secrets ORDER BY key_ref ASC",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    let key_version: i64 = row.get(3)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        key_version as u32,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PersistenceError::from)?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn delete_secret(&self, key_ref: impl Into<String>) -> Result<(), PersistenceError> {
+        let key_ref = key_ref.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute("DELETE FROM secrets WHERE key_ref = ?1", params![key_ref])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Best-effort mirror of `Router::register_provider`'s in-memory
+    /// create-or-update -- see that method's doc comment for why this is
+    /// fire-and-forget from the caller's perspective (no JSON-RPC
+    /// `providers/create` exists yet, so there is no client-facing
+    /// durability promise being made here beyond "a restart doesn't lose
+    /// what `ACPX_CONFIG_FILE` already declared once").
+    pub async fn upsert_provider(
+        &self,
+        name: impl Into<String>,
+        json: Value,
+    ) -> Result<(), PersistenceError> {
+        let name = name.into();
+        let json = serde_json::to_string(&json)?;
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT INTO provider_configs (name, json) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET json = excluded.json",
+                params![name, json],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn load_providers(&self) -> Result<Vec<Value>, PersistenceError> {
+        self.load_config_table("provider_configs").await
+    }
+
+    pub async fn upsert_profile(
+        &self,
+        name: impl Into<String>,
+        json: Value,
+    ) -> Result<(), PersistenceError> {
+        let name = name.into();
+        let json = serde_json::to_string(&json)?;
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT INTO profile_configs (name, json) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET json = excluded.json",
+                params![name, json],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn load_profiles(&self) -> Result<Vec<Value>, PersistenceError> {
+        self.load_config_table("profile_configs").await
+    }
+
+    pub async fn delete_profile(&self, name: impl Into<String>) -> Result<(), PersistenceError> {
+        let name = name.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute("DELETE FROM profile_configs WHERE name = ?1", params![name])?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn upsert_mcp_server(
+        &self,
+        name: impl Into<String>,
+        json: Value,
+    ) -> Result<(), PersistenceError> {
+        let name = name.into();
+        let json = serde_json::to_string(&json)?;
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT INTO mcp_server_configs (name, json) VALUES (?1, ?2) \
+                 ON CONFLICT(name) DO UPDATE SET json = excluded.json",
+                params![name, json],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn load_mcp_servers(&self) -> Result<Vec<Value>, PersistenceError> {
+        self.load_config_table("mcp_server_configs").await
+    }
+
+    pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), PersistenceError> {
+        let name = name.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "DELETE FROM mcp_server_configs WHERE name = ?1",
+                params![name],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Shared reader for the three identically-shaped `(name TEXT PRIMARY
+    /// KEY, json TEXT)` config-mirror tables. `table` is always a
+    /// hardcoded `&'static str` literal from one of the three callers
+    /// above, never caller/request-controlled input, so building the
+    /// query with `format!` here does not reopen a SQL-injection surface.
+    async fn load_config_table(&self, table: &'static str) -> Result<Vec<Value>, PersistenceError> {
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut statement =
+                conn.prepare(&format!("SELECT json FROM {table} ORDER BY name ASC"))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PersistenceError::from)?;
+            rows.into_iter()
+                .map(|json| serde_json::from_str(&json).map_err(PersistenceError::from))
+                .collect()
+        })
+        .await
+    }
 }
 
 fn row_to_custom_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<CustomAgent> {

@@ -8,7 +8,14 @@
 //! backend processes regardless of which transport a client used. If
 //! `ACPX_DB_PATH` is set, session metadata + transcripts are persisted to
 //! that sqlite file (see `acpx_core::persistence`); otherwise persistence
-//! is skipped entirely (`Router::with_persistence` is optional).
+//! is skipped entirely (`Router::with_persistence` is optional). Setting
+//! `ACPX_DB_PATH` also enables the durable secret/config store
+//! (`Router::enable_durable_config`, see `acpx_core::keystore`'s module
+//! doc comment): profiles, MCP servers, providers, and encrypted secret
+//! material all survive a restart too, not just session metadata.
+//! `ACPX_MASTER_KEYRING_PATH` overrides the encryption keyring's path
+//! (default `<ACPX_DB_PATH>.keyring`); `ACPX_MASTER_KEYRING_ROTATE=1`
+//! triggers a one-shot key rotation on that startup.
 //!
 //! One agent is registered today (`ServerConfig::default_agent_id`,
 //! spawned via `ACPX_BACKEND_CMD`); Phase 3's profile store is what lets
@@ -72,22 +79,73 @@ async fn main() -> anyhow::Result<()> {
             config.stream_idle_retention,
         ));
     router.register_agent(config.default_agent_id.clone(), config.backend.clone());
-    // Once, here, before any listener starts accepting connections -- see
-    // `Router::warm_default_profiles`'s doc comment for why this must
-    // never happen lazily inside a request's own critical section.
-    router.warm_default_profiles().await;
 
     if let Ok(db_path) = std::env::var("ACPX_DB_PATH") {
         match acpx_core::PersistenceStore::open(std::path::Path::new(&db_path)) {
             Ok(store) => {
                 tracing::info!(%db_path, "session persistence enabled");
                 router = router.with_persistence(store);
+
+                // `durable_secret_and_configuration_store`. Piggybacks on
+                // `ACPX_DB_PATH` being set rather than a separate opt-in
+                // flag: an operator who already asked for durable session
+                // persistence should not discover, only on the next
+                // restart, that keys/profiles/mcp servers quietly stayed
+                // in-memory-only the whole time. `ACPX_MASTER_KEYRING_PATH`
+                // overrides where the encryption keyring lives; default is
+                // `<db_path>.keyring`, created on first use (0600
+                // permissions, see `keystore::MasterKeyring::save`).
+                let keyring_path = std::env::var("ACPX_MASTER_KEYRING_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(format!("{db_path}.keyring")));
+                match router.enable_durable_config(keyring_path.clone()).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            keyring_path = %keyring_path.display(),
+                            "durable secret/config store enabled"
+                        );
+                    }
+                    Err(err) => {
+                        panic!(
+                            "ACPX_DB_PATH={db_path}: failed to enable durable secret/config \
+                             store at {}: {err}",
+                            keyring_path.display()
+                        );
+                    }
+                }
+
+                // One-shot operator-triggered key rotation -- re-encrypts
+                // every persisted secret under a freshly-minted keyring
+                // version. Not a schedule; unset (the default) never
+                // rotates. See `Router::rotate_master_key`'s doc comment.
+                if std::env::var("ACPX_MASTER_KEYRING_ROTATE").as_deref() == Ok("1") {
+                    match router.rotate_master_key().await {
+                        Ok(new_version) => {
+                            tracing::info!(new_version, "master keyring rotated");
+                        }
+                        Err(err) => {
+                            panic!("ACPX_MASTER_KEYRING_ROTATE=1: rotation failed: {err}");
+                        }
+                    }
+                }
             }
             Err(err) => {
                 tracing::error!(%err, %db_path, "failed to open ACPX_DB_PATH, continuing without persistence");
             }
         }
     }
+
+    // Once, here, before any listener starts accepting connections -- see
+    // `Router::warm_default_profiles`'s doc comment for why this must
+    // never happen lazily inside a request's own critical section. Run
+    // *after* the `ACPX_DB_PATH`/durable-config block above (not before
+    // it, as this used to run): `ensure_default_profiles_seeded` only
+    // fills in a profile name that is not already present
+    // (`self.profiles.get(&agent.id).is_some()` short-circuits it), so
+    // persisted profiles must be loaded first or a restart would
+    // silently reseed and shadow an operator's own customization of one
+    // of the auto-seeded default names (e.g. `codex-acp`) every time.
+    router.warm_default_profiles().await;
 
     // The admin plane changes gateway-wide launch policy, so it is never
     // allowed to run with ephemeral state. Load one registry snapshot now

@@ -276,6 +276,17 @@ pub struct Router {
     providers: ProviderStore,
     keystore: Keystore,
     profiles: ProfileStore,
+    /// **`durable_secret_and_configuration_store`.** Set only via
+    /// [`Router::enable_durable_config`] (never by [`Router::new`] or
+    /// [`Router::with_persistence`] alone) -- encrypts every secret
+    /// `Keystore::store`s from that point on before it reaches
+    /// `persistence`. `None` keeps `keystore` exactly as in-memory-only
+    /// as it always was, so a `Router` that never opts in behaves
+    /// byte-for-byte like before this field existed.
+    secret_keyring: Option<Arc<Mutex<crate::keystore::MasterKeyring>>>,
+    /// Where [`Self::rotate_master_key`] writes the keyring back to disk
+    /// after minting a new version. Set alongside `secret_keyring`.
+    keyring_path: Option<std::path::PathBuf>,
     /// Centrally-registered MCP servers (Phase 3 step 17a), merged by
     /// name into a resolved profile's `mcpServers` at `session/new` --
     /// client entries always win on collision, see
@@ -610,6 +621,12 @@ pub enum RouterError {
     InvalidRecoveryPolicy(String),
     #[error("persistence: {0}")]
     Persistence(#[from] crate::persistence::PersistenceError),
+    #[error("durable config requires Router::with_persistence to be configured first")]
+    DurableConfigRequiresPersistence,
+    #[error("secret rotation requires Router::enable_durable_config to be configured first")]
+    RotationRequiresDurableConfig,
+    #[error("master keyring I/O error: {0}")]
+    KeyringIo(String),
 }
 
 impl Router {
@@ -632,6 +649,8 @@ impl Router {
             keystore: Keystore::new(),
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
+            secret_keyring: None,
+            keyring_path: None,
             notification_hub: NotificationHub::new(),
             interaction_hub: InteractionHub::new(),
             scavenged_backends: HashSet::new(),
@@ -691,6 +710,195 @@ impl Router {
         self.custom_agents = Some(CustomAgentStore::new(store.clone()));
         self.persistence = Some(store);
         self
+    }
+
+    /// **`durable_secret_and_configuration_store`.** Load an on-disk (or
+    /// freshly-created) [`crate::keystore::MasterKeyring`] at
+    /// `keyring_path`, then repopulate `providers`/`profiles`/
+    /// `mcp_servers`/`keystore` from whatever was persisted by a prior
+    /// process's runtime CRUD -- and, from this call forward, every
+    /// `profiles/create|update|delete`, `mcp_servers/create|update|
+    /// delete`, and secret store also writes through to `persistence`.
+    /// Requires [`Self::with_persistence`] to have been called first
+    /// (there is nowhere durable to load from or write through to
+    /// otherwise). Intended call site: `acpx-server`'s `main.rs`, once,
+    /// right after `with_persistence`, before either transport starts
+    /// accepting requests -- exactly like `warm_default_profiles`.
+    pub async fn enable_durable_config(
+        &mut self,
+        keyring_path: std::path::PathBuf,
+    ) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.clone() else {
+            return Err(RouterError::DurableConfigRequiresPersistence);
+        };
+        let keyring = crate::keystore::MasterKeyring::load_or_create(&keyring_path)
+            .map_err(|error| RouterError::KeyringIo(error.to_string()))?;
+
+        for (key_ref, ciphertext, nonce, key_version) in persistence.load_all_secrets().await? {
+            let plaintext = keyring
+                .decrypt(key_version, &nonce, &ciphertext)
+                .map_err(RouterError::Keystore)?;
+            let secret = String::from_utf8(plaintext).map_err(|error| {
+                RouterError::KeyringIo(format!("decrypted secret was not valid UTF-8: {error}"))
+            })?;
+            self.keystore
+                .insert_known(crate::keystore::KeyRef(key_ref), secret);
+        }
+
+        for raw in persistence.load_providers().await? {
+            if let Ok(provider) = serde_json::from_value::<crate::provider::ProviderConfig>(raw) {
+                self.register_provider(provider);
+            }
+        }
+
+        for raw in persistence.load_mcp_servers().await? {
+            self.mcp_servers.create(raw)?;
+        }
+
+        for raw in persistence.load_profiles().await? {
+            if let Ok(profile) = serde_json::from_value::<Profile>(raw) {
+                self.profiles.create(profile)?;
+            }
+        }
+
+        self.secret_keyring = Some(Arc::new(Mutex::new(keyring)));
+        self.keyring_path = Some(keyring_path);
+        Ok(())
+    }
+
+    /// Mint a new keyring version, re-encrypt every currently-known
+    /// secret under it, persist both the updated ciphertext rows and the
+    /// new keyring file, and return the new version number. Operator-
+    /// triggered (see `acpx-server`'s `ACPX_MASTER_KEYRING_ROTATE`) --
+    /// there is no automatic rotation schedule.
+    pub async fn rotate_master_key(&mut self) -> Result<u32, RouterError> {
+        let Some(keyring_lock) = self.secret_keyring.clone() else {
+            return Err(RouterError::RotationRequiresDurableConfig);
+        };
+        let Some(persistence) = self.persistence.clone() else {
+            return Err(RouterError::RotationRequiresDurableConfig);
+        };
+        let keyring_path = self
+            .keyring_path
+            .clone()
+            .ok_or(RouterError::RotationRequiresDurableConfig)?;
+
+        // Snapshot every (key_ref, secret) pair before touching the
+        // keyring lock -- `Keystore::iter` borrows `self.keystore`
+        // immutably, and re-encrypting doesn't need to hold that borrow
+        // across the persistence `.await`s below.
+        let secrets: Vec<(crate::keystore::KeyRef, String)> = self
+            .keystore
+            .iter()
+            .map(|(key_ref, secret)| (key_ref.clone(), secret.to_string()))
+            .collect();
+
+        let new_version = {
+            let mut keyring = keyring_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let version = keyring.rotate();
+            keyring
+                .save(&keyring_path)
+                .map_err(|error| RouterError::KeyringIo(error.to_string()))?;
+            version
+        };
+
+        let now = now_rfc3339();
+        for (key_ref, secret) in secrets {
+            let (version, nonce, ciphertext) = {
+                let keyring = keyring_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                keyring.encrypt(secret.as_bytes())
+            };
+            persistence
+                .record_secret(
+                    key_ref.0,
+                    ciphertext,
+                    nonce,
+                    version,
+                    now.clone(),
+                    Some(now.clone()),
+                )
+                .await?;
+        }
+
+        Ok(new_version)
+    }
+
+    /// Encrypt-and-persist one secret, no-op if durable config was never
+    /// enabled. Called right after `Keystore::store` at every profile
+    /// secret entry point. Errors propagate (fail-closed): once durable
+    /// config is enabled, a caller that got a successful `profiles/
+    /// create` response should never discover after a restart that the
+    /// secret silently never made it to disk.
+    async fn persist_secret_if_durable(
+        &self,
+        key_ref: &crate::keystore::KeyRef,
+        secret: &str,
+    ) -> Result<(), RouterError> {
+        let (Some(keyring_lock), Some(persistence)) =
+            (self.secret_keyring.as_ref(), self.persistence.as_ref())
+        else {
+            return Ok(());
+        };
+        let (version, nonce, ciphertext) = {
+            let keyring = keyring_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            keyring.encrypt(secret.as_bytes())
+        };
+        persistence
+            .record_secret(
+                key_ref.0.clone(),
+                ciphertext,
+                nonce,
+                version,
+                now_rfc3339(),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_profile_if_durable(&self, profile: &Profile) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let json = serde_json::to_value(profile).expect("Profile always serializes");
+        persistence
+            .upsert_profile(profile.name.clone(), json)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_persisted_profile_if_durable(&self, name: &str) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence.delete_profile(name).await?;
+        Ok(())
+    }
+
+    async fn persist_mcp_server_if_durable(
+        &self,
+        name: &str,
+        entry: &serde_json::Value,
+    ) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence.upsert_mcp_server(name, entry.clone()).await?;
+        Ok(())
+    }
+
+    async fn delete_persisted_mcp_server_if_durable(&self, name: &str) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence.delete_mcp_server(name).await?;
+        Ok(())
     }
 
     async fn ensure_agent_enabled(&self, agent_id: &str) -> Result<(), RouterError> {
@@ -1045,9 +1253,25 @@ impl Router {
     /// tests use it directly too.
     pub fn register_provider(&mut self, provider: crate::provider::ProviderConfig) {
         let name = provider.name.clone();
+        let json = serde_json::to_value(&provider).expect("ProviderConfig always serializes");
         if self.providers.update(provider.clone()).is_err() {
             let _ = self.providers.create(provider);
-            let _ = name; // update() already logged nothing; create() covers the fresh-entry case
+        }
+        // Best-effort durability mirror -- fire-and-forget `tokio::spawn`
+        // since this method is sync (no runtime `providers/*` JSON-RPC
+        // endpoint exists to make a stronger await-and-propagate promise
+        // to, see this method's own doc comment) and providers are
+        // low-frequency, startup/provisioning-time writes. `enable_
+        // durable_config`'s own load path re-applies `ACPX_CONFIG_FILE`
+        // providers every boot regardless, so this only closes the gap
+        // for providers registered outside that file (e.g. directly by
+        // an embedding caller).
+        if let Some(persistence) = self.persistence.clone() {
+            tokio::spawn(async move {
+                if let Err(error) = persistence.upsert_provider(name.clone(), json).await {
+                    tracing::warn!(%error, provider = %name, "failed to persist provider config");
+                }
+            });
         }
     }
 
@@ -2833,12 +3057,16 @@ impl Router {
                 // see `04-phased-plan.md` step 13/14).
                 if let Some(secret) = params.get("secret").and_then(|s| s.as_str()) {
                     profile.key_ref = Some(self.keystore.store(secret));
+                    if let Some(key_ref) = profile.key_ref.clone() {
+                        self.persist_secret_if_durable(&key_ref, secret).await?;
+                    }
                 }
                 if method == "profiles/create" {
                     self.profiles.create(profile.clone())?;
                 } else {
                     self.profiles.update(profile.clone())?;
                 }
+                self.persist_profile_if_durable(&profile).await?;
                 redact_launch_overrides(
                     serde_json::to_value(&profile).expect("Profile always serializes"),
                 )
@@ -2864,6 +3092,7 @@ impl Router {
                     .ok_or(RouterError::MissingParams)?
                     .to_string();
                 self.profiles.delete(&name)?;
+                self.delete_persisted_profile_if_durable(&name).await?;
                 // **Real bug fix**: this used to only remove the
                 // `ProfileStore` entry, leaving whatever backend process
                 // was spawned for it (under supervisor key
@@ -2895,6 +3124,9 @@ impl Router {
                 } else {
                     self.mcp_servers.update(entry.clone())?;
                 }
+                if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
+                    self.persist_mcp_server_if_durable(name, &entry).await?;
+                }
                 entry
             }
             "mcp_servers/list" => {
@@ -2908,6 +3140,7 @@ impl Router {
                     .ok_or(RouterError::MissingParams)?
                     .to_string();
                 self.mcp_servers.delete(&name)?;
+                self.delete_persisted_mcp_server_if_durable(&name).await?;
                 serde_json::json!({ "name": name, "deleted": true })
             }
             other => return Err(RouterError::UnknownMethod(other.to_string())),

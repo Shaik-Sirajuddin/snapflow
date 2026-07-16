@@ -229,6 +229,52 @@ after a restart is therefore narrower than a live reconnect:
   `session/resume` for a still-restoring row receives a retryable error
   rather than starting duplicate backend recovery.
 
+### Durable secret and configuration store
+
+`ACPX_DB_PATH` also enables `Router::enable_durable_config`
+(`acpx-server`'s `main.rs`, right after `with_persistence` and before
+either transport starts): profiles, centrally-registered MCP servers,
+provider config, and every key a profile references now survive a
+restart, closing what used to be an in-memory-only gap. Behavior:
+
+- **Encryption at rest.** Secrets are AES-256-GCM encrypted
+  (`acpx_core::keystore::MasterKeyring`) before ever reaching sqlite --
+  the `secrets` table only ever holds `(key_ref, ciphertext, nonce,
+  key_version)`, never plaintext. The keyring itself is a local file
+  (default `<ACPX_DB_PATH>.keyring`, override with
+  `ACPX_MASTER_KEYRING_PATH`), created with `0600` permissions on first
+  use. This is explicitly a local-file key-management tier, not a real
+  OS-keychain/KMS integration -- structured so a KMS-backed
+  `MasterKeyring` could replace it later without changing any caller
+  (every consumer only ever sees an opaque `KeyRef`).
+- **Rotation.** `ACPX_MASTER_KEYRING_ROTATE=1` on a given startup mints a
+  new keyring version and re-encrypts every persisted secret under it in
+  a one-shot pass (`Router::rotate_master_key`); older versions stay in
+  the keyring so mid-rotation ciphertext (if a row hasn't been
+  re-encrypted yet) still decrypts. Not a schedule -- unset (the
+  default) never rotates.
+- **Load ordering matters.** `warm_default_profiles` (auto-seeds a
+  profile per installed registry agent) runs *after* `enable_durable_
+  config`, not before -- it only fills in a profile name that isn't
+  already present, so persisted profiles must load first or a restart
+  would silently reseed and shadow an operator's customization of one of
+  those default-named profiles (e.g. `codex-acp`) every time.
+- **Providers stay provisioning-file-first.** There is deliberately no
+  `providers/*` JSON-RPC method (see `Router::register_provider`'s doc
+  comment), so `ACPX_CONFIG_FILE` remains the primary way to declare
+  providers; `enable_durable_config` mirrors whatever `register_provider`
+  registers as a best-effort (fire-and-forget) durability backstop on
+  top of that, not a replacement for it. `provisioning.rs`'s `apply` is
+  correspondingly idempotent across restarts: a `profiles/create`/
+  `mcp_servers/create` that collides with something already loaded from
+  a *prior* run retries as an update rather than failing, while a true
+  duplicate name *within the same file* still fails startup outright.
+- Verified end-to-end (real second `acpx-server` process, same
+  `ACPX_DB_PATH`) by
+  [`durable_secret_store_binary_test.rs`](../acpx-server/tests/durable_secret_store_binary_test.rs);
+  the encryption/rotation/load-ordering details are covered in-process by
+  [`durable_secret_store_test.rs`](../acpx-core/tests/durable_secret_store_test.rs).
+
 ## Transports
 
 All three transports dispatch through the same shared `Router` and are
