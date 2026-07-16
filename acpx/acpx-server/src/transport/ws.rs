@@ -52,7 +52,10 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use acpx_core::router::{dispatch_shared_for_tenant, stream_resume_state_shared};
 use acpx_core::{InteractionBinding, StreamResumeState, TenantId};
 
-use super::http::{json_rpc_error, json_rpc_subscribe_error, AppState, SharedRouter};
+use super::http::{
+    json_rpc_error, json_rpc_subscribe_error, resolve_authorized_tenant, AppState, SharedRouter,
+    TenantAuthError,
+};
 use super::live::{session_id_to_forget, session_id_to_watch, take_resume_cursor};
 
 /// Axum handler for `GET /ws`: upgrades the connection, then hands off to
@@ -62,20 +65,17 @@ pub async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !state.auth.authorize(&headers) {
-        // Reject the upgrade outright -- there is no later point in a WS
-        // connection's lifetime where an `Authorization` header is
-        // available again, so this is the only place auth can be
-        // enforced for this transport. `401` here means the handshake
-        // itself never completes (the client sees a plain HTTP 401
-        // response to its upgrade request, not a WS close frame).
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let tenant_id = headers
-        .get("x-acpx-tenant")
-        .and_then(|v| v.to_str().ok())
-        .map(TenantId::from)
-        .unwrap_or_default();
+    // Reject the upgrade outright on auth failure or a tenant-identity
+    // mismatch -- there is no later point in a WS connection's lifetime
+    // where headers are available again, so this is the only place
+    // either can be enforced for this transport (see this module's doc
+    // comment). The client sees a plain HTTP 401/403 response to its
+    // upgrade request, never a WS close frame.
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(TenantAuthError::Mismatch) => return StatusCode::FORBIDDEN.into_response(),
+    };
     ws.on_upgrade(move |socket| handle_socket(socket, state.router, tenant_id))
 }
 
@@ -87,17 +87,14 @@ pub async fn acp_ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !state.auth.authorize(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     let Some(runtime) = state.bridge_runtime.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let tenant_id = headers
-        .get("x-acpx-tenant")
-        .and_then(|v| v.to_str().ok())
-        .map(TenantId::from)
-        .unwrap_or_default();
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(TenantAuthError::Mismatch) => return StatusCode::FORBIDDEN.into_response(),
+    };
     ws.on_upgrade(move |socket| handle_acp_socket(socket, state.router, runtime, tenant_id))
 }
 

@@ -4,7 +4,157 @@
 //! yet" gap (see `transport::http`'s module doc comment). Follows the
 //! same `#[path]`-including-real-source technique as
 //! `http_ws_transport_test.rs` -- see that file's doc comment for why.
+/// Same bring-up as `spawn_server`, but wires identity-bound tenant
+/// tokens (`ACPX_AUTH_TENANT_TOKENS` equivalent) through
+/// `serve_on_with_bridge_and_tenant_tokens`, exercising the
+/// `tenant_identity_boundary` hardening item from
+/// `acpx-tenant-isolation`'s plan: a tenant is derived from the
+/// authenticated token, not a self-declared header, whenever a
+/// tenant-bound token is configured.
+async fn spawn_server_with_tenant_tokens(
+    router: SharedRouter,
+    auth_token: Option<String>,
+    tenant_tokens: Vec<(String, TenantId)>,
+) -> SocketAddr {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = probe.local_addr().expect("local_addr");
+    drop(probe);
 
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+        serve_on_with_bridge_and_tenant_tokens(listener, router, auth_token, tenant_tokens, None)
+            .await
+            .expect("transport::serve_on_with_bridge_and_tenant_tokens");
+    });
+
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    addr
+}
+
+fn tenant_probe_request() -> serde_json::Value {
+    json!({"jsonrpc": "2.0", "id": 1, "method": "agents/list", "params": {}})
+}
+
+/// A request presenting a tenant-bound token gets that token's tenant,
+/// regardless of any (absent, here) `X-Acpx-Tenant` header -- the
+/// baseline "authenticated identity determines the tenant" case.
+#[tokio::test]
+async fn tenant_bound_token_resolves_its_own_tenant_without_header() {
+    let addr = spawn_server_with_tenant_tokens(
+        new_router(),
+        None,
+        vec![("tok-acme".to_string(), TenantId::from("acme"))],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .bearer_auth("tok-acme")
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// A tenant-bound token's identity is authoritative: a request presenting
+/// it while also claiming a *different* tenant via `X-Acpx-Tenant` is
+/// rejected outright (`403`) rather than silently using either value.
+#[tokio::test]
+async fn tenant_bound_token_rejects_conflicting_header_claim() {
+    let addr = spawn_server_with_tenant_tokens(
+        new_router(),
+        None,
+        vec![("tok-acme".to_string(), TenantId::from("acme"))],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .bearer_auth("tok-acme")
+        .header("X-Acpx-Tenant", "someone-else")
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+/// A tenant-bound token's identity still matches an *equal* header value
+/// -- an honest client stating its own already-implied tenant is not
+/// penalized for being explicit.
+#[tokio::test]
+async fn tenant_bound_token_allows_matching_header_claim() {
+    let addr = spawn_server_with_tenant_tokens(
+        new_router(),
+        None,
+        vec![("tok-acme".to_string(), TenantId::from("acme"))],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .bearer_auth("tok-acme")
+        .header("X-Acpx-Tenant", "acme")
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// The plain global token remains additive: it still authorizes
+/// requests, and (carrying no tenant binding of its own) still falls
+/// back to the pre-existing self-declared `X-Acpx-Tenant` header
+/// behavior, unaffected by an unrelated tenant-bound token also being
+/// configured.
+#[tokio::test]
+async fn global_token_still_falls_back_to_self_declared_tenant_header() {
+    let addr = spawn_server_with_tenant_tokens(
+        new_router(),
+        Some("shared-secret".to_string()),
+        vec![("tok-acme".to_string(), TenantId::from("acme"))],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .bearer_auth("shared-secret")
+        .header("X-Acpx-Tenant", "whatever-self-declared")
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// A token matching neither the global token nor any tenant-bound token
+/// is unauthorized, same as the pre-existing single-token contract.
+#[tokio::test]
+async fn unrecognized_token_is_rejected_even_with_tenant_tokens_configured() {
+    let addr = spawn_server_with_tenant_tokens(
+        new_router(),
+        Some("shared-secret".to_string()),
+        vec![("tok-acme".to_string(), TenantId::from("acme"))],
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .bearer_auth("nope")
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -23,7 +173,8 @@ mod live;
 #[path = "../src/transport/ws.rs"]
 mod ws;
 
-use http::{serve, SharedRouter};
+use acpx_core::TenantId;
+use http::{serve, serve_on_with_bridge_and_tenant_tokens, SharedRouter};
 
 const STAND_IN_BACKEND_SCRIPT: &str = r#"
 while IFS= read -r line; do

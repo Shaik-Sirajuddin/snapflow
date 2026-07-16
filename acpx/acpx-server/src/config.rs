@@ -30,6 +30,13 @@ pub struct ServerConfig {
     /// this transport fully unauthenticated, matching every pre-existing
     /// deployment/test that never set this var.
     pub auth_token: Option<String>,
+    /// Optional tenant-bound bearer tokens (`ACPX_AUTH_TENANT_TOKENS`,
+    /// format `tenant_id=token,tenant_id=token,...`) -- see
+    /// `transport::http`'s "Identity-bound tenant auth" doc comment.
+    /// Empty by default, which keeps every pre-existing deployment's
+    /// `X-Acpx-Tenant` header fully self-declared/cooperative, unchanged.
+    /// Additive to `auth_token`: a request may authenticate via either.
+    pub auth_tenant_tokens: Vec<(String, acpx_core::TenantId)>,
     /// Optional bearer token for the loopback-only admin HTTP surface.
     /// Unlike `auth_token`, enabling this requires `ACPX_DB_PATH` so
     /// gateway-wide agent administration is always durable.
@@ -101,6 +108,13 @@ impl ServerConfig {
     /// it as `Authorization: Bearer <token>` -- still no TLS provided by
     /// this process itself, so pair this with a TLS-terminating reverse
     /// proxy for any non-loopback bind address.
+    /// `ACPX_AUTH_TENANT_TOKENS` (`tenant_id=token,tenant_id=token,...`)
+    /// additionally configures identity-bound tenant tokens: a request
+    /// authenticating with one of these derives its tenant from the
+    /// token itself rather than the self-declared `X-Acpx-Tenant`
+    /// header, and is rejected if that header names a different tenant
+    /// -- see `transport::http`'s "Identity-bound tenant auth" doc
+    /// comment for the full contract.
     pub fn from_env() -> Self {
         let raw = std::env::var("ACPX_BACKEND_CMD")
             .unwrap_or_else(|_| "npx -y @agentclientprotocol/codex-acp@1.1.2".to_string());
@@ -128,6 +142,36 @@ impl ServerConfig {
         let auth_token = std::env::var("ACPX_AUTH_TOKEN")
             .ok()
             .filter(|t| !t.is_empty());
+        // `tenant_id=token` pairs, comma-separated. Whitespace around
+        // each pair/field is trimmed for forgiving shell/env-file
+        // authoring; a malformed entry (missing `=`, empty tenant id, or
+        // empty token) panics at startup rather than silently dropping
+        // or misparsing a security-relevant mapping.
+        let auth_tenant_tokens: Vec<(String, acpx_core::TenantId)> =
+            match std::env::var("ACPX_AUTH_TENANT_TOKENS") {
+                Ok(raw) if !raw.trim().is_empty() => raw
+                    .split(',')
+                    .map(|entry| {
+                        let entry = entry.trim();
+                        let (tenant, token) = entry.split_once('=').unwrap_or_else(|| {
+                            panic!(
+                                "ACPX_AUTH_TENANT_TOKENS entry {entry:?} must be `tenant_id=token`"
+                            )
+                        });
+                        let (tenant, token) = (tenant.trim(), token.trim());
+                        assert!(
+                            !tenant.is_empty(),
+                            "ACPX_AUTH_TENANT_TOKENS entry {entry:?} has an empty tenant id"
+                        );
+                        assert!(
+                            !token.is_empty(),
+                            "ACPX_AUTH_TENANT_TOKENS entry {entry:?} has an empty token"
+                        );
+                        (token.to_string(), acpx_core::TenantId::from(tenant))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
         let admin_token = std::env::var("ACPX_ADMIN_TOKEN")
             .ok()
             .filter(|t| !t.is_empty());
@@ -222,6 +266,7 @@ impl ServerConfig {
             bridge,
             http_bind_addr,
             auth_token,
+            auth_tenant_tokens,
             admin_token,
             admin_bind_addr,
             startup_session_recovery_enabled,

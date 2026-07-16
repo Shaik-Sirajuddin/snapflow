@@ -195,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
     let stdio_router = router.clone();
     let stdio_task = tokio::spawn(async move { transport::stdio::run(stdio_router).await });
     let auth_token = config.auth_token.clone();
+    let auth_tenant_tokens = config.auth_tenant_tokens.clone();
 
     // HTTP/WS bind is attempted here (rather than inside `transport::serve`)
     // so a bind failure -- or an explicit `ACPX_HTTP_BIND=off`/`none` -- can
@@ -235,7 +236,14 @@ async fn main() -> anyhow::Result<()> {
         let bridge = bridge_config.clone();
         let router = Arc::clone(&http_router);
         tokio::spawn(async move {
-            transport::serve_on_with_bridge(listener, router, auth_token, bridge).await
+            transport::serve_on_with_bridge_and_tenant_tokens(
+                listener,
+                router,
+                auth_token,
+                auth_tenant_tokens,
+                bridge,
+            )
+            .await
         })
     });
     let admin_task = match admin_transport {
