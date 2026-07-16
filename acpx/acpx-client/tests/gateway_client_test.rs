@@ -6,6 +6,8 @@
 //! hand-rolled fake server. Stand-in backend scripts follow the same
 //! pattern as `acpx-core/tests/router_dispatch_test.rs`.
 
+#[path = "../../acpx-server/src/transport/admin.rs"]
+mod admin;
 #[path = "../../acpx-server/src/transport/http.rs"]
 mod http;
 #[path = "../../acpx-server/src/transport/live.rs"]
@@ -13,11 +15,14 @@ mod live;
 #[path = "../../acpx-server/src/transport/ws.rs"]
 mod ws;
 
-use acpx_client::ext::{profiles, registry, sessions};
+use acpx_client::ext::{admin::AdminClient, profiles, registry, sessions};
 use acpx_client::raw::GatewayClient;
 use acpx_conductor::SpawnSpec;
-use acpx_core::router::Router;
+use acpx_core::{router::Router, PersistenceStore};
+use acpx_proto::admin::CustomAgentSpec;
+use acpx_registry::{Agent, Distribution, Registry};
 use http::SharedRouter;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -66,6 +71,50 @@ async fn spawn_server_with_auth(router: SharedRouter, auth_token: Option<String>
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     addr
+}
+
+fn admin_registry() -> Registry {
+    Registry {
+        version: "test".to_owned(),
+        agents: vec![Agent {
+            id: "registry-agent".to_owned(),
+            name: "Registry Agent".to_owned(),
+            version: "1.0.0".to_owned(),
+            description: None,
+            repository: None,
+            website: None,
+            authors: Vec::new(),
+            license: None,
+            icon: None,
+            distribution: Distribution {
+                npx: None,
+                uvx: None,
+                binary: Some(HashMap::new()),
+            },
+        }],
+        extensions: Vec::new(),
+    }
+}
+
+async fn spawn_admin_server(token: &str) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind admin listener");
+    let address = listener.local_addr().expect("admin address");
+    let store = PersistenceStore::open_in_memory().expect("in-memory admin database");
+    let token = token.to_owned();
+    tokio::spawn(async move {
+        admin::serve_on(listener, token, store, admin_registry())
+            .await
+            .expect("serve admin transport");
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(address).await.is_ok() {
+            return address;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("admin listener {address} did not become ready");
 }
 
 #[tokio::test]
@@ -256,5 +305,70 @@ async fn client_with_auth_token_round_trips_against_an_authenticated_gateway() {
     assert!(matches!(
         err,
         acpx_client::raw::ClientError::Rpc { code: -32001, .. }
+    ));
+}
+
+#[tokio::test]
+async fn admin_client_uses_its_own_http_plane_for_enablement_and_custom_crud() {
+    let address = spawn_admin_server("admin-secret").await;
+    let client = AdminClient::new(format!("http://{address}"), "admin-secret");
+    let custom = CustomAgentSpec {
+        id: "custom-client-agent".to_owned(),
+        name: "Custom Client Agent".to_owned(),
+        command: "custom-acp".to_owned(),
+        args: vec!["--stdio".to_owned()],
+        env: BTreeMap::from([("CUSTOM_MODE".to_owned(), "test".to_owned())]),
+        cwd: Some("/tmp".to_owned()),
+    };
+
+    let disabled = client
+        .disable_agent("registry-agent")
+        .await
+        .expect("disable registry agent");
+    assert_eq!(disabled.id, "registry-agent");
+    assert!(!disabled.enabled);
+
+    let created = client
+        .create_custom_agent(&custom)
+        .await
+        .expect("create custom agent");
+    assert_eq!(created, custom);
+
+    let listed = client
+        .list_custom_agents()
+        .await
+        .expect("list custom agents");
+    assert_eq!(listed, vec![custom.clone()]);
+
+    let enabled = client
+        .enable_agent(&custom.id)
+        .await
+        .expect("enable custom agent");
+    assert_eq!(enabled.id, custom.id);
+    assert!(enabled.enabled);
+
+    client
+        .delete_custom_agent(&custom.id)
+        .await
+        .expect("delete custom agent");
+    assert!(client
+        .list_custom_agents()
+        .await
+        .expect("list after delete")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn admin_client_rejects_a_client_plane_token() {
+    let address = spawn_admin_server("admin-secret").await;
+    let client = AdminClient::new(format!("http://{address}"), "client-secret");
+
+    let error = client
+        .disable_agent("registry-agent")
+        .await
+        .expect_err("client-plane token must not authorize admin routes");
+    assert!(matches!(
+        error,
+        acpx_client::ext::admin::AdminClientError::Response { status: 401, .. }
     ));
 }

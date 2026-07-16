@@ -138,7 +138,7 @@ async fn list_agents(State(state): State<AdminState>, headers: HeaderMap) -> Res
                     id: agent.id,
                     name: agent.name,
                     version: CUSTOM_AGENT_VERSION.to_owned(),
-                    status: AgentStatus::NotInstalled,
+                    status: AgentStatus::Configured,
                     enabled,
                     source: AgentSource::Custom,
                 });

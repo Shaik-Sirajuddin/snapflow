@@ -23,6 +23,7 @@ dependencies = [
  "acpx-conductor",
  "acpx-core",
  "acpx-proto",
+ "acpx-registry",
  "anyhow",
  "axum",
  "futures-util",
