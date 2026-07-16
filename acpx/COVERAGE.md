@@ -3295,3 +3295,18 @@ Focused persistence, transport-auth, and restoring-state tests pass, as do
 `python3 -m unittest tests.bridge_integration.test_stdio_bridge`. Real
 credentialed Claude/Codex and OpenHands suites remain intentionally
 skip-gated.
+
+## Phase 40: black-box daemon recovery protocol
+
+`tests/recovery_integration/test_recovery_protocol.py` is a maintained,
+stdlib-only process harness. It launches daemon A with a recording ACP
+adapter, creates and verifies a durable session row, kills A, launches daemon
+B against the same SQLite database, checks `/health`, verifies the adapter
+observed `session/load`, and sends an ordinary `session/prompt` using the
+original gateway id. The adapter preserves both numeric and string JSON-RPC
+IDs, matching client traffic and startup recovery traffic respectively.
+
+Verified with `python3 -W error::ResourceWarning -m unittest
+tests.recovery_integration.test_recovery_protocol`. WebSocket restart,
+connector outage, and credentialed real-adapter/OpenHands restart cases
+remain tracked separately.
