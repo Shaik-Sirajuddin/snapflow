@@ -29,5 +29,8 @@ pub use notify::{NotificationHub, ResumeCursor, StreamResumeState, SubscribeErro
 pub use persistence::{
     Direction, PersistenceError, PersistenceStore, SessionRecord, TranscriptRecord,
 };
-pub use router::{LifecycleReapReport, MethodClass, Router};
+pub use router::{
+    recover_open_sessions_shared, LifecycleReapReport, MethodClass, Router, StartupRecoveryPolicy,
+    StartupRecoveryReport,
+};
 pub use session_registry::{BackendSessionId, SessionRegistry, TenantId};

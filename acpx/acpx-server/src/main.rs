@@ -18,7 +18,9 @@ mod config;
 mod provisioning;
 mod transport;
 
-use acpx_core::{router::Router, NotificationHub};
+use acpx_core::{
+    recover_open_sessions_shared, router::Router, NotificationHub, StartupRecoveryPolicy,
+};
 use config::ServerConfig;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -38,6 +40,9 @@ async fn main() -> anyhow::Result<()> {
         http_bind_addr = ?config.http_bind_addr,
         acp_bridge_enabled = config.bridge.is_some(),
         startup_session_recovery_enabled = config.startup_session_recovery_enabled,
+        startup_session_recovery_timeout_secs = config.startup_session_recovery_timeout.as_secs(),
+        startup_session_recovery_concurrency = config.startup_session_recovery_concurrency,
+        startup_session_recovery_fail_fast = config.startup_session_recovery_fail_fast,
         lifecycle_reaper_enabled = config.lifecycle_reaper_enabled,
         lifecycle_reaper_interval_secs = config.lifecycle_reaper_interval.as_secs(),
         max_sessions_total = config.lifecycle.max_sessions_total,
@@ -98,10 +103,19 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    let router: transport::SharedRouter = Arc::new(Mutex::new(router));
     if config.startup_session_recovery_enabled {
         #[cfg(feature = "startup-session-recovery")]
         {
-            let report = router.recover_open_sessions().await?;
+            let report = recover_open_sessions_shared(
+                &router,
+                StartupRecoveryPolicy {
+                    timeout: config.startup_session_recovery_timeout,
+                    concurrency: config.startup_session_recovery_concurrency,
+                    fail_fast: config.startup_session_recovery_fail_fast,
+                },
+            )
+            .await?;
             tracing::info!(
                 restored = report.restored,
                 failed = report.failed,
@@ -120,7 +134,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("startup session recovery disabled");
     }
 
-    let router: transport::SharedRouter = Arc::new(Mutex::new(router));
     if config.lifecycle_reaper_enabled {
         let lifecycle_router = Arc::clone(&router);
         let interval = config.lifecycle_reaper_interval;

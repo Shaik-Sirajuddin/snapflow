@@ -31,6 +31,14 @@ pub struct ServerConfig {
     /// transport starts. Defaults to enabled only when `ACPX_DB_PATH` is
     /// set; `ACPX_STARTUP_SESSION_RECOVERY_ENABLED=0` disables it.
     pub startup_session_recovery_enabled: bool,
+    /// Deadline for one adapter-native session restore during startup.
+    pub startup_session_recovery_timeout: std::time::Duration,
+    /// Maximum simultaneous recovery jobs. Different connectors can run in
+    /// parallel; requests to one connector remain stdio-serialized.
+    pub startup_session_recovery_concurrency: usize,
+    /// Stop startup after the first failed recovery rather than serving a
+    /// partially restored daemon.
+    pub startup_session_recovery_fail_fast: bool,
     /// Runs native session retention cleanup independently of transport
     /// connection lifetime. Set `ACPX_LIFECYCLE_REAPER_ENABLED=0` to
     /// disable, primarily for controlled diagnostics.
@@ -112,6 +120,16 @@ impl ServerConfig {
                 Ok(value) => value != "0",
                 Err(_) => std::env::var_os("ACPX_DB_PATH").is_some(),
             };
+        let startup_session_recovery_timeout = positive_duration(
+            "ACPX_STARTUP_SESSION_RECOVERY_TIMEOUT_SECONDS",
+            std::time::Duration::from_secs(30),
+        );
+        let startup_session_recovery_concurrency =
+            positive_usize("ACPX_STARTUP_SESSION_RECOVERY_CONCURRENCY", 2);
+        let startup_session_recovery_fail_fast =
+            std::env::var("ACPX_STARTUP_SESSION_RECOVERY_FAIL_FAST")
+                .map(|value| value == "1")
+                .unwrap_or(false);
         let lifecycle_reaper_enabled = std::env::var("ACPX_LIFECYCLE_REAPER_ENABLED")
             .map(|value| value != "0")
             .unwrap_or(true);
@@ -176,6 +194,9 @@ impl ServerConfig {
             http_bind_addr,
             auth_token,
             startup_session_recovery_enabled,
+            startup_session_recovery_timeout,
+            startup_session_recovery_concurrency,
+            startup_session_recovery_fail_fast,
             lifecycle_reaper_enabled,
             lifecycle_reaper_interval,
             lifecycle,

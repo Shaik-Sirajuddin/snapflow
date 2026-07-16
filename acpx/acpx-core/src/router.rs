@@ -310,6 +310,52 @@ pub struct StartupRecoveryReport {
     pub skipped: usize,
 }
 
+/// Startup scheduling policy for durable session recovery. The scheduler
+/// allows different backend processes to recover concurrently; each
+/// individual backend remains serialized by its own stdio process mutex.
+#[derive(Debug, Clone)]
+pub struct StartupRecoveryPolicy {
+    pub timeout: Duration,
+    pub concurrency: usize,
+    pub fail_fast: bool,
+}
+
+impl Default for StartupRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            concurrency: 2,
+            fail_fast: false,
+        }
+    }
+}
+
+impl StartupRecoveryPolicy {
+    pub fn validate(&self) -> Result<(), RouterError> {
+        if self.timeout.is_zero() {
+            return Err(RouterError::InvalidRecoveryPolicy(
+                "timeout must be greater than zero".to_string(),
+            ));
+        }
+        if self.concurrency == 0 {
+            return Err(RouterError::InvalidRecoveryPolicy(
+                "concurrency must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct PreparedRecoveryJob {
+    tenant_id: TenantId,
+    entry: crate::session_registry::SessionEntry,
+    admission: SessionAdmissionPermit,
+    backend: acpx_conductor::supervisor::SharedBackendProcess,
+    call_policy: BackendCallPolicy,
+    request: serde_json::Value,
+    request_id: serde_json::Value,
+}
+
 /// Result of one lifecycle reaper pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleReapReport {
@@ -520,6 +566,12 @@ pub enum RouterError {
     BackendSessionListError(serde_json::Value),
     #[error("startup recovery for gateway session {0} has non-object recovery params")]
     InvalidRecoveryParams(String),
+    #[error("startup recovery timed out for gateway session {0}")]
+    RecoveryTimeout(String),
+    #[error("startup recovery stopped after a failed session: {0}")]
+    RecoveryFailFast(String),
+    #[error("invalid startup recovery policy: {0}")]
+    InvalidRecoveryPolicy(String),
     #[error("persistence: {0}")]
     Persistence(#[from] crate::persistence::PersistenceError),
 }
@@ -1036,6 +1088,15 @@ impl Router {
         ),
         RouterError,
     > {
+        let job = self.prepare_open_session_recovery(record).await?;
+        let job = execute_open_session_recovery(job).await?;
+        Ok((job.tenant_id, job.entry, job.admission))
+    }
+
+    async fn prepare_open_session_recovery(
+        &mut self,
+        record: &crate::persistence::SessionRecord,
+    ) -> Result<PreparedRecoveryJob, RouterError> {
         let tenant_id = TenantId(record.tenant_id.clone());
 
         let mut params = record
@@ -1079,21 +1140,10 @@ impl Router {
             "method": recovery_method,
             "params": params,
         });
-        let response = {
-            let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.lock().await.write_value(&request).await?;
-            let (response, _, _) =
-                read_matching_response(&mut backend, &request_id_value, call_policy, None).await?;
-            response
-        };
-        if let Some(error) = response.get("error") {
-            return Err(RouterError::BackendSessionNewError(error.clone()));
-        }
 
-        Ok((
+        Ok(PreparedRecoveryJob {
             tenant_id,
-            crate::session_registry::SessionEntry {
+            entry: crate::session_registry::SessionEntry {
                 agent_id,
                 backend_session_id: BackendSessionId(record.backend_session_id.clone()),
                 profile_name: record.profile_name.clone(),
@@ -1104,7 +1154,19 @@ impl Router {
                 pinned: false,
             },
             admission,
-        ))
+            backend,
+            call_policy,
+            request,
+            request_id: request_id_value,
+        })
+    }
+
+    fn recovery_supervisor_key(&self, record: &crate::persistence::SessionRecord) -> String {
+        let tenant_id = TenantId(record.tenant_id.clone());
+        match record.profile_name.as_deref() {
+            Some(profile_name) => self.profile_supervisor_key(profile_name, &tenant_id),
+            None => record.agent_id.clone(),
+        }
     }
 
     /// Ensure the registry cache is populated, fetching (live, falling
@@ -3530,6 +3592,190 @@ fn spawn_session_persistence_fn(
 /// Re-exported here (rather than only living in `acpx-server`) so this
 /// module can define `dispatch_shared` against it directly.
 pub type SharedRouterHandle = std::sync::Arc<tokio::sync::Mutex<Router>>;
+
+async fn execute_open_session_recovery(
+    job: PreparedRecoveryJob,
+) -> Result<PreparedRecoveryJob, RouterError> {
+    let response = {
+        let mut backend = job.backend.lock().await;
+        ensure_backend_initialized(&mut backend, job.call_policy.clone()).await?;
+        backend
+            .writer
+            .lock()
+            .await
+            .write_value(&job.request)
+            .await?;
+        let (response, _, _) =
+            read_matching_response(&mut backend, &job.request_id, job.call_policy.clone(), None)
+                .await?;
+        response
+    };
+    if let Some(error) = response.get("error") {
+        return Err(RouterError::BackendSessionNewError(error.clone()));
+    }
+    Ok(job)
+}
+
+/// Restore durable sessions through the shared router without holding its
+/// mutex during ACP backend I/O. Different connectors can therefore make
+/// progress concurrently while each connector's own stdio remains serialized.
+pub async fn recover_open_sessions_shared(
+    router: &SharedRouterHandle,
+    policy: StartupRecoveryPolicy,
+) -> Result<StartupRecoveryReport, RouterError> {
+    policy.validate()?;
+    let store = {
+        let router = router.lock().await;
+        router.persistence.clone()
+    };
+    let Some(store) = store else {
+        return Ok(StartupRecoveryReport::default());
+    };
+
+    let mut report = StartupRecoveryReport::default();
+    let mut candidates = std::collections::VecDeque::new();
+    for record in store.list_recoverable_sessions().await? {
+        if record.recovery_method == RecoveryMethod::None {
+            report.skipped += 1;
+            continue;
+        }
+        let is_live = {
+            let router = router.lock().await;
+            let tenant_id = TenantId(record.tenant_id.clone());
+            let gateway_id =
+                acpx_proto::session::GatewaySessionId(record.gateway_session_id.clone());
+            router.sessions.resolve(&tenant_id, &gateway_id).is_some()
+        };
+        if is_live {
+            report.skipped += 1;
+            continue;
+        }
+        store
+            .update_recovery_status(
+                record.gateway_session_id.clone(),
+                RecoveryStatus::Restoring,
+                None,
+            )
+            .await?;
+        candidates.push_back(record);
+    }
+
+    if policy.fail_fast {
+        while let Some(record) = candidates.pop_front() {
+            let restored = run_recovery_candidate(
+                router.clone(),
+                store.clone(),
+                record.clone(),
+                policy.timeout,
+            )
+            .await?;
+            if restored {
+                report.restored += 1;
+            } else {
+                return Err(RouterError::RecoveryFailFast(record.gateway_session_id));
+            }
+        }
+        return Ok(report);
+    }
+
+    let mut running = tokio::task::JoinSet::new();
+    while running.len() < policy.concurrency {
+        let Some(record) = candidates.pop_front() else {
+            break;
+        };
+        running.spawn(run_recovery_candidate(
+            router.clone(),
+            store.clone(),
+            record,
+            policy.timeout,
+        ));
+    }
+    while let Some(result) = running.join_next().await {
+        match result.map_err(|error| RouterError::InvalidRecoveryPolicy(error.to_string()))?? {
+            true => report.restored += 1,
+            false => report.failed += 1,
+        }
+        if let Some(record) = candidates.pop_front() {
+            running.spawn(run_recovery_candidate(
+                router.clone(),
+                store.clone(),
+                record,
+                policy.timeout,
+            ));
+        }
+    }
+    Ok(report)
+}
+
+async fn run_recovery_candidate(
+    router: SharedRouterHandle,
+    store: PersistenceStore,
+    record: crate::persistence::SessionRecord,
+    timeout: Duration,
+) -> Result<bool, RouterError> {
+    let outcome = tokio::time::timeout(timeout, async {
+        let job = {
+            let mut router = router.lock().await;
+            router.prepare_open_session_recovery(&record).await?
+        };
+        execute_open_session_recovery(job).await
+    })
+    .await;
+
+    let job = match outcome {
+        Ok(Ok(job)) => job,
+        Ok(Err(error)) => {
+            store
+                .update_recovery_status(
+                    record.gateway_session_id,
+                    RecoveryStatus::RecoveryFailed,
+                    Some(error.to_string()),
+                )
+                .await?;
+            return Ok(false);
+        }
+        Err(_) => {
+            let supervisor_key = {
+                let mut router = router.lock().await;
+                let key = router.recovery_supervisor_key(&record);
+                if let Err(error) = router.supervisor.stop(&key).await {
+                    tracing::warn!(%error, gateway_session_id = %record.gateway_session_id, "failed to stop timed-out recovery backend");
+                }
+                key
+            };
+            tracing::warn!(
+                gateway_session_id = %record.gateway_session_id,
+                supervisor_key,
+                "startup recovery timed out and the backend process was stopped"
+            );
+            let error = RouterError::RecoveryTimeout(record.gateway_session_id.clone());
+            store
+                .update_recovery_status(
+                    record.gateway_session_id,
+                    RecoveryStatus::RecoveryFailed,
+                    Some(error.to_string()),
+                )
+                .await?;
+            return Ok(false);
+        }
+    };
+
+    store
+        .update_recovery_status(
+            record.gateway_session_id.clone(),
+            RecoveryStatus::Restored,
+            None,
+        )
+        .await?;
+    let mut router = router.lock().await;
+    router.sessions.insert(
+        &job.tenant_id,
+        acpx_proto::session::GatewaySessionId(record.gateway_session_id),
+        job.entry,
+    );
+    job.admission.commit();
+    Ok(true)
+}
 
 /// Durable identity and drift state needed by a persistent transport before
 /// it attaches a resumable session-update subscription.

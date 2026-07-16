@@ -3223,3 +3223,26 @@ launches real shell-backed ACP processes and asserts distinct OS PIDs
 when enabled and one stable shared PID when disabled. Verified with
 `cargo test --workspace --no-fail-fast`; credentialed ambient tests
 remain intentionally ignored.
+
+## Phase 36: bounded startup recovery
+
+Startup recovery now uses a bounded shared-router scheduler rather than
+holding the router mutex over every backend `session/load` or
+`session/resume` round trip. Configure it with
+`ACPX_STARTUP_SESSION_RECOVERY_TIMEOUT_SECONDS` (default `30`),
+`ACPX_STARTUP_SESSION_RECOVERY_CONCURRENCY` (default `2`), and
+`ACPX_STARTUP_SESSION_RECOVERY_FAIL_FAST=1`.
+
+Jobs prepare profile and connector state under the router lock, run the
+adapter RPC outside it, then atomically publish the durable status and
+gateway mapping. Different connector processes recover concurrently;
+one connector remains serialized by its stdio mutex. A timed-out restore
+stops that connector before marking the row `recovery_failed`, preventing
+a late stdio response from contaminating a later request. Fail-fast
+records the failed row and prevents daemon readiness.
+
+`startup_recovery_test` proves cross-connector concurrency, timeout
+cleanup and durable failure status, and fail-fast behavior using real
+shell-backed ACP processes. Verified with
+`cargo test --workspace --no-fail-fast`; credentialed ambient tests
+remain intentionally ignored.
