@@ -15,8 +15,8 @@ use crate::persistence::{
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
-use crate::{InteractionHub, DEFAULT_INTERACTION_TIMEOUT};
-use acpx_proto::agent::AgentStatus;
+use crate::{AgentEnablement, CustomAgentStore, InteractionHub, DEFAULT_INTERACTION_TIMEOUT};
+use acpx_proto::agent::{AgentSource, AgentStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -258,6 +258,14 @@ pub struct Router {
     /// "written asynchronously" design goal -- a slow/failed persistence
     /// write never delays or fails the client's actual request.
     persistence: Option<PersistenceStore>,
+    /// Durable admin-plane read stores. They remain absent for
+    /// in-memory-only routers, preserving the legacy default behavior.
+    agent_enablement: Option<AgentEnablement>,
+    custom_agents: Option<CustomAgentStore>,
+    /// Custom definitions that have been materialized into the supervisor.
+    /// Keeping this local lets a long-lived router reject a deleted custom
+    /// id instead of falling back to its stale supervisor specification.
+    materialized_custom_agents: HashSet<String>,
     /// Phase 3 stores: provider config, secret material, and
     /// {agent, provider, key-ref, launch overrides, mcp servers} profiles.
     /// All in-memory only (see `crate::provider`/`crate::profile`'s doc
@@ -523,6 +531,10 @@ pub enum RouterError {
     Framing(#[from] acpx_conductor::framing::FramingError),
     #[error("agents/status: unknown agent id {0}")]
     UnknownAgentId(String),
+    #[error("session/new: agent {0} is disabled")]
+    AgentDisabled(String),
+    #[error("custom agent id {0} conflicts with an existing registered backend")]
+    CustomAgentIdConflict(String),
     #[error(transparent)]
     Install(#[from] acpx_registry::InstallError),
     #[error("agents/install: missing or non-string params.id")]
@@ -533,6 +545,8 @@ pub enum RouterError {
     Provider(#[from] crate::provider::ProviderStoreError),
     #[error("mcp server store: {0}")]
     McpServer(#[from] crate::mcp_servers::McpServerStoreError),
+    #[error("custom agent store: {0}")]
+    CustomAgent(#[from] crate::CustomAgentStoreError),
     #[error("keystore: {0}")]
     Keystore(#[from] crate::keystore::KeystoreError),
     #[error("session/new: no profile named {0}")]
@@ -597,6 +611,9 @@ impl Router {
             registry_cache: None,
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
+            agent_enablement: None,
+            custom_agents: None,
+            materialized_custom_agents: HashSet::new(),
             providers: ProviderStore::new(),
             keystore: Keystore::new(),
             profiles: ProfileStore::new(),
@@ -655,8 +672,57 @@ impl Router {
     /// are recorded from that point on. Builder-style so callers can write
     /// `Router::new(id).with_persistence(store)`.
     pub fn with_persistence(mut self, store: PersistenceStore) -> Self {
+        self.agent_enablement = Some(AgentEnablement::new(store.clone()));
+        self.custom_agents = Some(CustomAgentStore::new(store.clone()));
         self.persistence = Some(store);
         self
+    }
+
+    async fn ensure_agent_enabled(&self, agent_id: &str) -> Result<(), RouterError> {
+        if let Some(enablement) = &self.agent_enablement {
+            if !enablement.is_enabled(agent_id).await? {
+                return Err(RouterError::AgentDisabled(agent_id.to_owned()));
+            }
+        }
+        Ok(())
+    }
+
+    async fn custom_spawn_spec(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<acpx_conductor::SpawnSpec>, RouterError> {
+        let Some(custom_agents) = &self.custom_agents else {
+            return Ok(None);
+        };
+        let Some(agent) = custom_agents.get(agent_id).await? else {
+            return Ok(None);
+        };
+        let mut spec = acpx_conductor::SpawnSpec::new(agent.command, agent.args);
+        spec.env.extend(agent.env);
+        if let Some(cwd) = agent.cwd {
+            spec = spec.with_cwd(cwd);
+        }
+        Ok(Some(spec))
+    }
+
+    async fn ensure_custom_agent_registered(
+        &mut self,
+        agent_id: &str,
+    ) -> Result<bool, RouterError> {
+        let Some(spec) = self.custom_spawn_spec(agent_id).await? else {
+            if self.materialized_custom_agents.contains(agent_id) {
+                return Err(RouterError::UnknownAgentId(agent_id.to_owned()));
+            }
+            return Ok(false);
+        };
+        if self.supervisor.spec(agent_id).is_some()
+            && !self.materialized_custom_agents.contains(agent_id)
+        {
+            return Err(RouterError::CustomAgentIdConflict(agent_id.to_owned()));
+        }
+        self.supervisor.register(agent_id.to_owned(), spec);
+        self.materialized_custom_agents.insert(agent_id.to_owned());
+        Ok(true)
     }
 
     /// Clone the optional durable store for server-owned features that need
@@ -789,6 +855,7 @@ impl Router {
         agent_id: &str,
         cwd: &str,
     ) -> Result<acpx_registry::AdapterCapabilities, RouterError> {
+        self.ensure_agent_enabled(agent_id).await?;
         if self.supervisor.spec(agent_id).is_none() {
             self.ensure_registry_agent_registered(agent_id).await?;
         }
@@ -1361,6 +1428,22 @@ impl Router {
         if profile_name.is_some() && explicit_agent_id.is_some() {
             return Err(RouterError::ConflictingSessionSelection);
         }
+        let selected_agent_id = match (&profile_name, explicit_agent_id.as_deref()) {
+            (Some(name), None) => {
+                self.ensure_default_profiles_seeded().await;
+                self.profiles
+                    .get(name)
+                    .map(|profile| profile.agent_id.clone())
+                    .ok_or_else(|| RouterError::UnknownProfile(name.clone()))?
+            }
+            (None, Some(agent_id)) => agent_id.to_owned(),
+            (None, None) => self.default_agent_id.clone(),
+            (Some(_), Some(_)) => unreachable!("checked above"),
+        };
+        // Policy is checked before profile/connector resolution and before
+        // capacity reservation, so a disabled definition cannot start a
+        // process or consume a session slot.
+        self.ensure_agent_enabled(&selected_agent_id).await?;
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_acpx");
         }
@@ -1370,8 +1453,15 @@ impl Router {
                 let (supervisor_key, profile) = self.resolve_profile(name, tenant_id).await?;
                 (supervisor_key, Some(profile))
             }
-            (None, Some(agent_id)) => (agent_id, None),
-            (None, None) => (self.default_agent_id.clone(), None),
+            (None, Some(agent_id)) => {
+                self.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
+            (None, None) => {
+                let agent_id = self.default_agent_id.clone();
+                self.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
             (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
         };
 
@@ -1498,7 +1588,11 @@ impl Router {
                 let (key, profile) = self.resolve_profile(&name, tenant_id).await?;
                 (key, Some(profile))
             }
-            SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
+            SessionListSelector::AgentId(explicit_id) => {
+                self.ensure_agent_enabled(&explicit_id).await?;
+                self.ensure_custom_agent_registered(&explicit_id).await?;
+                (explicit_id, None)
+            }
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
         let call_policy = self.call_policy(profile.as_ref());
@@ -1698,6 +1792,9 @@ impl Router {
         // against both registry-listed agents (the common case) and
         // manually-configured/non-registry backends, without forcing a
         // registry fetch on every `session/new` for the latter.
+        self.ensure_agent_enabled(&profile.agent_id).await?;
+        self.ensure_custom_agent_registered(&profile.agent_id)
+            .await?;
         let mut spec = match self.supervisor.spec(&profile.agent_id).cloned() {
             Some(spec) => spec,
             None => {
@@ -2384,18 +2481,37 @@ impl Router {
                     .expect("just loaded")
                     .agents
                     .clone();
-                let entries: Vec<serde_json::Value> = agents
-                    .into_iter()
-                    .map(|agent| {
-                        let status = crate::detect::detect(&agent.id, &agent.distribution);
-                        serde_json::json!({
+                let mut entries: Vec<serde_json::Value> = Vec::with_capacity(agents.len());
+                for agent in agents {
+                    let enabled = match &self.agent_enablement {
+                        Some(enablement) => enablement.is_enabled(&agent.id).await?,
+                        None => true,
+                    };
+                    entries.push(serde_json::json!({
+                        "id": agent.id,
+                        "name": agent.name,
+                        "version": agent.version,
+                        "status": crate::detect::detect(&agent.id, &agent.distribution),
+                        "enabled": enabled,
+                        "source": AgentSource::Registry,
+                    }));
+                }
+                if let Some(custom_agents) = &self.custom_agents {
+                    for agent in custom_agents.list().await? {
+                        let enabled = match &self.agent_enablement {
+                            Some(enablement) => enablement.is_enabled(&agent.id).await?,
+                            None => true,
+                        };
+                        entries.push(serde_json::json!({
                             "id": agent.id,
                             "name": agent.name,
-                            "version": agent.version,
-                            "status": status,
-                        })
-                    })
-                    .collect();
+                            "version": "custom",
+                            "status": AgentStatus::Configured,
+                            "enabled": enabled,
+                            "source": AgentSource::Custom,
+                        }));
+                    }
+                }
                 serde_json::json!({ "agents": entries })
             }
             "agents/status" => {
@@ -2405,6 +2521,15 @@ impl Router {
                     .and_then(|i| i.as_str())
                     .ok_or(RouterError::MissingParams)?
                     .to_string();
+                if let Some(custom_agents) = &self.custom_agents {
+                    if custom_agents.get(&agent_id).await?.is_some() {
+                        return Ok(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"id": agent_id, "status": AgentStatus::Configured}
+                        }));
+                    }
+                }
                 self.ensure_registry_loaded().await;
                 let agent = self
                     .registry_cache
@@ -4110,7 +4235,11 @@ async fn dispatch_session_list_real_shared(
                 let (key, profile) = r.resolve_profile(&name, tenant_id).await?;
                 (key, Some(profile))
             }
-            SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
+            SessionListSelector::AgentId(explicit_id) => {
+                r.ensure_agent_enabled(&explicit_id).await?;
+                r.ensure_custom_agent_registered(&explicit_id).await?;
+                (explicit_id, None)
+            }
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
         let backend = r.supervisor.ensure_running(&agent_id).await?;
@@ -4469,6 +4598,19 @@ async fn dispatch_session_new_shared(
         if profile_name.is_some() && explicit_agent_id.is_some() {
             return Err(RouterError::ConflictingSessionSelection);
         }
+        let selected_agent_id = match (&profile_name, explicit_agent_id.as_deref()) {
+            (Some(name), None) => {
+                r.ensure_default_profiles_seeded().await;
+                r.profiles
+                    .get(name)
+                    .map(|profile| profile.agent_id.clone())
+                    .ok_or_else(|| RouterError::UnknownProfile(name.clone()))?
+            }
+            (None, Some(agent_id)) => agent_id.to_owned(),
+            (None, None) => r.default_agent_id.clone(),
+            (Some(_), Some(_)) => unreachable!("checked above"),
+        };
+        r.ensure_agent_enabled(&selected_agent_id).await?;
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_acpx");
         }
@@ -4478,8 +4620,15 @@ async fn dispatch_session_new_shared(
                 let (supervisor_key, profile) = r.resolve_profile(name, tenant_id).await?;
                 (supervisor_key, Some(profile))
             }
-            (None, Some(agent_id)) => (agent_id, None),
-            (None, None) => (r.default_agent_id.clone(), None),
+            (None, Some(agent_id)) => {
+                r.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
+            (None, None) => {
+                let agent_id = r.default_agent_id.clone();
+                r.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
             (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
         };
 

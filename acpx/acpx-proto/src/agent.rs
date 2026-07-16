@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub enum AgentStatus {
     /// Registry entry known, nothing fetched/verified yet.
     NotInstalled,
+    /// An operator-configured custom command. Its executable is resolved
+    /// when ACPX starts it; it is not a registry installation.
+    Configured,
     /// Runtime present, adapter installed/resolvable (e.g. `node`+`npm` on
     /// `PATH` for an npx-distributed entry, or a fetched binary present).
     Installed,
