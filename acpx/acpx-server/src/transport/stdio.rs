@@ -35,11 +35,11 @@
 use crate::transport::http::SharedRouter;
 use crate::transport::live::{session_id_to_forget, session_id_to_watch};
 use acpx_core::router::dispatch_shared_for_tenant;
-use acpx_core::TenantId;
-use std::collections::HashSet;
+use acpx_core::{InteractionBinding, TenantId};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 /// Run the stdio request/response loop against `router` until stdin closes.
 pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
@@ -47,7 +47,23 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut lines = BufReader::new(stdin).lines();
     let hub = { router.lock().await.notification_hub() };
+    let interaction_hub = { router.lock().await.interaction_hub() };
+    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let interaction_stdout = Arc::clone(&stdout);
+    tokio::spawn(async move {
+        while let Some(request) = interaction_rx.recv().await {
+            let Ok(mut bytes) = serde_json::to_vec(&request) else {
+                continue;
+            };
+            bytes.push(b'\n');
+            let mut out = interaction_stdout.lock().await;
+            if out.write_all(&bytes).await.is_err() || out.flush().await.is_err() {
+                break;
+            }
+        }
+    });
     let mut watched: HashSet<String> = HashSet::new();
+    let interaction_bindings = Arc::new(Mutex::new(HashMap::<String, InteractionBinding>::new()));
     let tenant_id = std::env::var("ACPX_STDIO_TENANT")
         .ok()
         .filter(|t| !t.is_empty())
@@ -65,6 +81,58 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
                 continue;
             }
         };
+
+        // Response-only JSON-RPC frames are replies to agent-initiated
+        // requests. They are correlated directly and must not be routed as
+        // ordinary client-to-agent calls.
+        if request.get("method").is_none() && request.get("id").is_some() {
+            interaction_hub.resolve(request).await;
+            continue;
+        }
+
+        // A prompt can block while its backend asks the client for input.
+        // Bind and dispatch it independently so this read loop remains able
+        // to receive that correlated response over the same stdio stream.
+        if let Some(session_id) = request
+            .pointer("/params/sessionId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        {
+            let binding = interaction_hub
+                .bind(
+                    tenant_id.clone(),
+                    session_id.clone(),
+                    interaction_tx.clone(),
+                )
+                .await;
+            let previous = interaction_bindings
+                .lock()
+                .await
+                .insert(session_id, binding);
+            if let Some(previous) = previous {
+                interaction_hub.unbind(&previous).await;
+            }
+
+            let router = Arc::clone(&router);
+            let tenant_id = tenant_id.clone();
+            let stdout = Arc::clone(&stdout);
+            tokio::spawn(async move {
+                let response =
+                    match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
+                        Ok(response) => response,
+                        Err(error) => crate::transport::http::json_rpc_error(&request, error),
+                    };
+                let Ok(mut bytes) = serde_json::to_vec(&response) else {
+                    return;
+                };
+                bytes.push(b'\n');
+                let mut out = stdout.lock().await;
+                let _ = out.write_all(&bytes).await;
+                let _ = out.flush().await;
+            });
+            continue;
+        }
+
         let response = {
             match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                 Ok(response) => response,
@@ -112,6 +180,9 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
     }
     for session_id in watched {
         hub.unsubscribe(&session_id).await;
+    }
+    for (_, binding) in interaction_bindings.lock().await.drain() {
+        interaction_hub.unbind(&binding).await;
     }
     tracing::info!("client stdin closed, stdio transport exiting");
     Ok(())
