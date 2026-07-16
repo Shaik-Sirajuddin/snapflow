@@ -46,14 +46,16 @@ async fn main() -> anyhow::Result<()> {
         unbound_bridge_session_ttl_secs = config.lifecycle.unbound_bridge_session_ttl.as_secs(),
         session_absolute_ttl_secs = ?config.lifecycle.absolute_session_ttl.map(|ttl| ttl.as_secs()),
         max_subscribers_per_session = config.max_subscribers_per_session,
+        stream_replay_buffer_size = config.stream_replay_buffer_size,
         "starting acpx-server"
     );
 
     let mut router = Router::new(config.default_agent_id.clone())
         .with_lifecycle_config(config.lifecycle.clone())
-        .with_notification_hub(NotificationHub::with_limits(
+        .with_notification_hub(NotificationHub::with_replay_limits(
             256,
             config.max_subscribers_per_session,
+            config.stream_replay_buffer_size,
         ));
     router.register_agent(config.default_agent_id.clone(), config.backend.clone());
 

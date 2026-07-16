@@ -78,7 +78,7 @@ async fn an_idle_notification_between_calls_still_reaches_a_live_subscriber_with
     // live` call needs already in place.
     let hub = { router.lock().await.notification_hub() };
     let mut rx = hub
-        .subscribe(&TenantId::default(), gateway_id.clone())
+        .subscribe(&TenantId::default(), gateway_id.clone(), None)
         .await
         .expect("subscription should fit the default limit");
 
@@ -106,7 +106,8 @@ async fn an_idle_notification_between_calls_still_reaches_a_live_subscriber_with
     let update = tokio::time::timeout(Duration::from_secs(3), rx.recv())
         .await
         .expect("idle scavenger should deliver the delayed update without any further call")
-        .expect("live update");
+        .expect("live update")
+        .into_value();
     assert_eq!(
         update["params"]["update"]["content"]["text"],
         json!("idle-update")

@@ -3130,3 +3130,37 @@ duplicate-subscription path where a client that subscribed during
 
 Verified with `cargo test --workspace --no-fail-fast`: all default tests
 passed; credentialed ambient tests remain intentionally ignored.
+
+## Phase 32: resumable persistent session updates
+
+Added per-session monotonic delivery sequences and a bounded replay ring.
+Every WebSocket and stdio `session/update` frame now carries additive
+`params._acpx.seq` metadata. `ACPX_STREAM_REPLAY_BUFFER_SIZE` controls
+the retained update count and defaults to `200`.
+
+Persistent clients resume with the ACPX-only cursor below on a
+session-bearing request such as `session/resume` or `session/load`:
+
+```json
+{
+  "params": {
+    "_acpx": {
+      "resume": { "lastSeq": 42 }
+    }
+  }
+}
+```
+
+The transport strips `_acpx.resume` before proxying the normal ACP
+request. Subscription occurs before the replay snapshot and before a
+resume/load backend round trip. Buffered records newer than `lastSeq`
+are delivered first; overlapping broadcast records are filtered, so the
+subscriber gets an ordered, exactly-once replay-plus-live stream.
+
+`ws_resume_replays_and_tails_updates_once_while_resume_is_in_flight`
+uses a real WebSocket server with a deliberately delayed
+`session/resume` backend and a two-record replay ring. It proves that a
+client receives one buffered record and three records published while
+the backend call is in flight, in sequence order `1, 2, 3, 4`, with no
+gap or duplicate. Verified with `cargo test --workspace --no-fail-fast`;
+credentialed ambient tests remain intentionally ignored.

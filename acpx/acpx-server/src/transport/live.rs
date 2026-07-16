@@ -16,6 +16,29 @@
 
 use serde_json::Value;
 
+/// Extract ACPX's additive reconnect cursor before a request is proxied to
+/// an ACP backend. `_acpx.resume` belongs to ACPX's persistent transport,
+/// not the upstream ACP method's schema, so forwarding it would make strict
+/// backends reject an otherwise valid `session/load`/`session/resume`.
+///
+/// The extension is deliberately accepted only with a non-negative integer
+/// cursor. Invalid cursors are removed and treated as fresh subscriptions;
+/// this preserves backend compatibility while never inventing replay state
+/// from malformed client input.
+pub fn take_resume_last_seq(request: &mut Value) -> Option<u64> {
+    let params = request.get_mut("params")?.as_object_mut()?;
+    let extension = params.get_mut("_acpx")?.as_object_mut()?;
+    let last_seq = extension
+        .get("resume")
+        .and_then(|resume| resume.get("lastSeq"))
+        .and_then(Value::as_u64);
+    extension.remove("resume");
+    if extension.is_empty() {
+        params.remove("_acpx");
+    }
+    last_seq
+}
+
 /// Which gateway session id (if any) `request`/`response` -- a JSON-RPC
 /// pair that already went through `dispatch_shared` -- makes this
 /// connection newly interested in subscribing to, via `acpx_core::notify::
@@ -205,5 +228,33 @@ mod tests {
             session_id_to_forget(&request, &response, "session/close"),
             None
         );
+    }
+
+    #[test]
+    fn resume_cursor_is_stripped_without_removing_other_acpx_extensions() {
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "session/load",
+            "params": {
+                "sessionId": "gw-1",
+                "_acpx": {
+                    "profile": "retained",
+                    "resume": {"lastSeq": 42}
+                }
+            }
+        });
+        assert_eq!(take_resume_last_seq(&mut request), Some(42));
+        assert_eq!(request["params"]["_acpx"]["profile"], json!("retained"));
+        assert!(request["params"]["_acpx"].get("resume").is_none());
+    }
+
+    #[test]
+    fn malformed_resume_cursor_is_removed_and_ignored() {
+        let mut request = json!({
+            "params": {"_acpx": {"resume": {"lastSeq": "not-a-number"}}}
+        });
+        assert_eq!(take_resume_last_seq(&mut request), None);
+        assert!(request["params"].get("_acpx").is_none());
     }
 }

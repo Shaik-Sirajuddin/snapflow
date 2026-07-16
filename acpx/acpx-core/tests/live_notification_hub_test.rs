@@ -67,7 +67,7 @@ async fn a_subscribed_session_receives_updates_live_and_the_response_carries_no_
     // the call, not just be recoverable afterward.
     let hub = { router.lock().await.notification_hub() };
     let mut rx = hub
-        .subscribe(&TenantId::default(), gateway_id.clone())
+        .subscribe(&TenantId::default(), gateway_id.clone(), None)
         .await
         .expect("subscription should fit the default limit");
 
@@ -86,10 +86,10 @@ async fn a_subscribed_session_receives_updates_live_and_the_response_carries_no_
     // gateway id (never the raw `backend-abc`) -- a subscriber has no use
     // for a backend-native id, only a real transport downstream client's
     // notification frame would.
-    let first = rx.recv().await.expect("first live update");
+    let first = rx.recv().await.expect("first live update").into_value();
     assert_eq!(first["params"]["update"]["content"]["text"], json!("Hello"));
     assert_eq!(first["params"]["sessionId"], json!(gateway_id));
-    let second = rx.recv().await.expect("second live update");
+    let second = rx.recv().await.expect("second live update").into_value();
     assert_eq!(
         second["params"]["update"]["content"]["text"],
         json!(", world")
@@ -168,7 +168,7 @@ async fn unsubscribing_mid_stream_falls_back_to_buffering_for_the_rest_of_that_c
     // subscriber having already gone away by the time any update
     // actually arrives.
     let _rx = hub
-        .subscribe(&TenantId::default(), gateway_id.clone())
+        .subscribe(&TenantId::default(), gateway_id.clone(), None)
         .await
         .expect("subscription should fit the default limit");
     hub.remove_stream(&TenantId::default(), &gateway_id).await;
@@ -262,7 +262,7 @@ done
         .to_string();
     let hub = { router.lock().await.notification_hub() };
     let mut rx = hub
-        .subscribe(&TenantId::default(), gateway_id.clone())
+        .subscribe(&TenantId::default(), gateway_id.clone(), None)
         .await
         .expect("subscription should fit the default limit");
 
@@ -286,7 +286,8 @@ done
     let chunk = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("live chunk should arrive promptly")
-        .expect("live chunk");
+        .expect("live chunk")
+        .into_value();
     assert_eq!(
         chunk["params"]["update"]["content"]["text"],
         json!("chunk-1")

@@ -105,6 +105,23 @@ done
     SpawnSpec::new("sh", vec!["-c".to_string(), script.to_string()])
 }
 
+fn delayed_resume_backend_spec() -> SpawnSpec {
+    let script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-resume"}}\n' "$id"
+  elif echo "$line" | grep -q 'session/resume'; then
+    sleep 0.3
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+  fi
+done
+"#;
+    SpawnSpec::new("sh", vec!["-c".to_string(), script.to_string()])
+}
+
 /// Starts `transport::serve` on `127.0.0.1:0` (OS-assigned port) in a
 /// background task and returns the resolved local address to connect to.
 /// We bind the listener ourselves (rather than letting `serve` do it) so
@@ -663,6 +680,103 @@ async fn ws_rejects_an_over_limit_subscriber_without_disrupting_the_existing_str
     }
     assert!(saw_update, "existing subscriber missed its streamed update");
     assert!(saw_response, "existing subscriber's prompt was disrupted");
+}
+
+#[tokio::test]
+async fn ws_resume_replays_and_tails_updates_once_while_resume_is_in_flight() {
+    // The replay buffer intentionally retains only two updates. Three more
+    // updates are published while the backend delays `session/resume`, so a
+    // subscription installed after dispatch would lose one. The transport
+    // must attach first, replay seq=1, then tail seq=2..4 exactly once.
+    let mut router = Router::new("stand-in-agent")
+        .with_notification_hub(NotificationHub::with_replay_limits(16, 8, 2));
+    router.register_agent("stand-in-agent", delayed_resume_backend_spec());
+    let router: SharedRouter = Arc::new(Mutex::new(router));
+    let addr = spawn_server(Arc::clone(&router)).await;
+    let client = reqwest::Client::new();
+    let created: serde_json::Value = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/tmp"}
+        }))
+        .send()
+        .await
+        .expect("session/new request")
+        .json()
+        .await
+        .expect("session/new JSON");
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("gateway session id")
+        .to_string();
+    let hub = { router.lock().await.notification_hub() };
+    let bootstrap = hub
+        .subscribe(&acpx_core::TenantId::default(), session_id.clone(), None)
+        .await
+        .expect("bootstrap stream");
+    drop(bootstrap);
+    assert!(
+        !hub.publish(
+            &acpx_core::TenantId::default(),
+            &session_id,
+            json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"update":{"n":1}}})
+        )
+        .await
+    );
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("websocket connect");
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {
+                    "sessionId": session_id,
+                    "_acpx": {"resume": {"lastSeq": 0}}
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("resume request");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for n in 2..=4 {
+        assert!(
+            hub.publish(
+                &acpx_core::TenantId::default(),
+                &session_id,
+                json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session_id,"update":{"n":n}}})
+            )
+            .await
+        );
+    }
+
+    let mut sequences = Vec::new();
+    let mut saw_resume_response = false;
+    for _ in 0..5 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("resume stream timed out")
+            .expect("websocket closed")
+            .expect("websocket frame");
+        let WsMessage::Text(text) = frame else {
+            panic!("expected text frame");
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).expect("JSON frame");
+        if body["method"] == json!("session/update") {
+            sequences.push(
+                body["params"]["_acpx"]["seq"]
+                    .as_u64()
+                    .expect("sequence metadata"),
+            );
+        } else if body["id"] == json!(2) {
+            saw_resume_response = true;
+        }
+    }
+    assert_eq!(sequences, vec![1, 2, 3, 4]);
+    assert!(saw_resume_response, "missing session/resume response");
 }
 
 #[tokio::test]

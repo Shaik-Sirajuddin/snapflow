@@ -53,7 +53,7 @@ use acpx_core::router::dispatch_shared_for_tenant;
 use acpx_core::{InteractionBinding, TenantId};
 
 use super::http::{json_rpc_error, json_rpc_subscribe_error, AppState, SharedRouter};
-use super::live::{session_id_to_forget, session_id_to_watch};
+use super::live::{session_id_to_forget, session_id_to_watch, take_resume_last_seq};
 
 /// Axum handler for `GET /ws`: upgrades the connection, then hands off to
 /// `handle_socket` for the request/response loop.
@@ -121,10 +121,11 @@ async fn handle_acp_socket(
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
         };
-        let request: serde_json::Value = match serde_json::from_str(&text) {
+        let mut request: serde_json::Value = match serde_json::from_str(&text) {
             Ok(request) => request,
             Err(_) => continue,
         };
+        let _resume_last_seq = take_resume_last_seq(&mut request);
         let mut response =
             match super::http::acp_bridge::dispatch(&router, &runtime, &tenant_id, request.clone())
                 .await
@@ -214,7 +215,7 @@ async fn handle_acp_socket(
         } else if let Some(public_id) = bridge_session_id_to_watch(&request, &response, method) {
             if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
                 if watched.insert(native_id.clone()) {
-                    match hub.subscribe(&tenant_id, native_id.clone()).await {
+                    match hub.subscribe(&tenant_id, native_id.clone(), None).await {
                         Ok(mut rx) => {
                             let forwarder_sink = Arc::clone(&sink);
                             let forwarder_runtime = Arc::clone(&runtime);
@@ -222,7 +223,7 @@ async fn handle_acp_socket(
                             tokio::spawn(async move {
                                 loop {
                                     let mut update = match rx.recv().await {
-                                        Ok(update) => update,
+                                        Ok(update) => update.into_value(),
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(
                                             skipped,
                                         )) => {
@@ -397,13 +398,14 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             Message::Ping(_) | Message::Pong(_) => continue,
         };
 
-        let request: serde_json::Value = match serde_json::from_str(&text) {
+        let mut request: serde_json::Value = match serde_json::from_str(&text) {
             Ok(value) => value,
             Err(err) => {
                 tracing::warn!(?err, "ws frame is not valid JSON, dropping");
                 continue;
             }
         };
+        let resume_last_seq = take_resume_last_seq(&mut request);
 
         // A response with no method can only be the client's answer to an
         // agent-initiated request sent by InteractionHub. It must not enter
@@ -423,6 +425,57 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             .and_then(|value| value.as_str())
             .map(str::to_string)
         {
+            // A reconnect cursor changes the ordering requirement: install
+            // the receiver before the potentially slow backend call. This
+            // preserves live records that arrive while `session/resume` or
+            // `session/load` is in flight even if they later roll out of
+            // the bounded replay ring.
+            let resumed_before_dispatch = if resume_last_seq.is_some()
+                && deferred_watches.lock().await.insert(session_id.clone())
+            {
+                match hub
+                    .subscribe(&tenant_id, session_id.clone(), resume_last_seq)
+                    .await
+                {
+                    Ok(mut rx) => {
+                        let forwarder_sink = Arc::clone(&sink);
+                        tokio::spawn(async move {
+                            loop {
+                                let update = match rx.recv().await {
+                                    Ok(update) => update.into_value(),
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        skipped,
+                                    )) => {
+                                        tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                };
+                                let Ok(payload) = serde_json::to_string(&update) else {
+                                    continue;
+                                };
+                                if forwarder_sink
+                                    .lock()
+                                    .await
+                                    .send(Message::Text(payload))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        true
+                    }
+                    Err(error) => {
+                        deferred_watches.lock().await.remove(&session_id);
+                        send_frame!(json_rpc_subscribe_error(&request, error));
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
             let binding = interaction_hub
                 .bind(
                     tenant_id.clone(),
@@ -437,7 +490,8 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             if let Some(previous) = previous {
                 interaction_hub.unbind(&previous).await;
             }
-            let subscribe_after_response = deferred_watches.lock().await.insert(session_id.clone());
+            let subscribe_after_response = !resumed_before_dispatch
+                && deferred_watches.lock().await.insert(session_id.clone());
 
             let router = Arc::clone(&router);
             let tenant_id = tenant_id.clone();
@@ -451,13 +505,16 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                         Err(error) => json_rpc_error(&request, error),
                     };
                 if subscribe_after_response && response.get("error").is_none() {
-                    match hub.subscribe(&tenant_id, session_id.clone()).await {
+                    match hub
+                        .subscribe(&tenant_id, session_id.clone(), resume_last_seq)
+                        .await
+                    {
                         Ok(mut rx) => {
                             let forwarder_sink = Arc::clone(&sink);
                             tokio::spawn(async move {
                                 loop {
                                     let update = match rx.recv().await {
-                                        Ok(update) => update,
+                                        Ok(update) => update.into_value(),
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(
                                             skipped,
                                         )) => {
@@ -517,14 +574,17 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             deferred_watches.lock().await.remove(&forget);
         } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
             if watched.insert(watch.clone()) {
-                match hub.subscribe(&tenant_id, watch.clone()).await {
+                match hub
+                    .subscribe(&tenant_id, watch.clone(), resume_last_seq)
+                    .await
+                {
                     Ok(mut rx) => {
                         deferred_watches.lock().await.insert(watch.clone());
                         let forwarder_sink = Arc::clone(&sink);
                         tokio::spawn(async move {
                             loop {
                                 let update = match rx.recv().await {
-                                    Ok(update) => update,
+                                    Ok(update) => update.into_value(),
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(
                                         skipped,
                                     )) => {

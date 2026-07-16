@@ -47,6 +47,9 @@ pub struct ServerConfig {
     /// Maximum concurrent persistent stdio/WS subscribers for one
     /// tenant-scoped gateway session.
     pub max_subscribers_per_session: usize,
+    /// Number of session updates retained per session for resumable
+    /// persistent transport subscriptions.
+    pub stream_replay_buffer_size: usize,
 }
 
 impl ServerConfig {
@@ -151,6 +154,7 @@ impl ServerConfig {
             .validate()
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));
         let max_subscribers_per_session = positive_usize("ACPX_MAX_SUBSCRIBERS_PER_SESSION", 16);
+        let stream_replay_buffer_size = positive_usize("ACPX_STREAM_REPLAY_BUFFER_SIZE", 200);
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -164,6 +168,7 @@ impl ServerConfig {
             lifecycle_reaper_interval,
             lifecycle,
             max_subscribers_per_session,
+            stream_replay_buffer_size,
         }
     }
 }
@@ -216,5 +221,11 @@ mod tests {
     #[should_panic(expected = "must be greater than zero")]
     fn rejects_zero_subscriber_limit() {
         positive_usize("ACPX_MAX_SUBSCRIBERS_PER_SESSION", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be greater than zero")]
+    fn rejects_zero_replay_buffer_size() {
+        positive_usize("ACPX_STREAM_REPLAY_BUFFER_SIZE", 0);
     }
 }
