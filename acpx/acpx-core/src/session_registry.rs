@@ -128,6 +128,33 @@ impl SessionRegistry {
         cwd: Option<String>,
     ) -> GatewaySessionId {
         let gateway_id = GatewaySessionId(uuid::Uuid::new_v4().to_string());
+        self.register_with_id(
+            tenant_id,
+            gateway_id,
+            agent_id,
+            backend_session_id,
+            profile_name,
+            cwd,
+        )
+    }
+
+    /// Same as [`Self::register`], but with an already-minted gateway id
+    /// rather than generating a fresh one. Backs per-session backend
+    /// process isolation (`ACPX_SESSION_PROCESS_ISOLATION`, see
+    /// `Router::dispatch_session_new`): that feature must fold the
+    /// session's own gateway id into its supervisor key *before* the
+    /// backend is even spawned, so the id has to be minted up front
+    /// rather than only after a successful `session/new` round trip like
+    /// [`Self::register`] does.
+    pub fn register_with_id(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_id: GatewaySessionId,
+        agent_id: impl Into<String>,
+        backend_session_id: BackendSessionId,
+        profile_name: Option<String>,
+        cwd: Option<String>,
+    ) -> GatewaySessionId {
         self.sessions.entry(tenant_id.clone()).or_default().insert(
             gateway_id.0.clone(),
             SessionEntry {

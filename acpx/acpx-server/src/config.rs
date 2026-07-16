@@ -85,6 +85,13 @@ pub struct ServerConfig {
     /// Give each tenant using one managed profile an isolated backend
     /// process. Defaults to the legacy shared-profile behavior.
     pub tenant_process_isolation: bool,
+    /// Give each managed session its own dedicated backend process
+    /// instead of sharing one process per profile[/tenant] with every
+    /// other session using it (`backend_process_model` hardening item,
+    /// `acp-gateway-daemon` plan). Composable with
+    /// `tenant_process_isolation`. Defaults to the legacy shared-process
+    /// behavior; native/unmanaged sessions are unaffected either way.
+    pub session_process_isolation: bool,
 }
 
 impl ServerConfig {
@@ -278,6 +285,9 @@ impl ServerConfig {
         let tenant_process_isolation = std::env::var("ACPX_TENANT_PROCESS_ISOLATION")
             .map(|value| value == "1")
             .unwrap_or(false);
+        let session_process_isolation = std::env::var("ACPX_SESSION_PROCESS_ISOLATION")
+            .map(|value| value == "1")
+            .unwrap_or(false);
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -302,6 +312,7 @@ impl ServerConfig {
             stream_replay_buffer_size,
             stream_idle_retention,
             tenant_process_isolation,
+            session_process_isolation,
         }
     }
 }

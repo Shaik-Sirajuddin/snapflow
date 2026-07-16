@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         stream_replay_buffer_size = config.stream_replay_buffer_size,
         stream_idle_retention_secs = config.stream_idle_retention.as_secs(),
         tenant_process_isolation = config.tenant_process_isolation,
+        session_process_isolation = config.session_process_isolation,
         "starting acpx-server"
     );
 
@@ -63,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         .with_native_auth_method_id(config.native_auth_method_id.clone())
         .with_lifecycle_config(config.lifecycle.clone())
         .with_tenant_process_isolation(config.tenant_process_isolation)
+        .with_session_process_isolation(config.session_process_isolation)
         .with_notification_hub(NotificationHub::with_stream_retention(
             256,
             config.max_subscribers_per_session,

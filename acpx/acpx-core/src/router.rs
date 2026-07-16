@@ -309,6 +309,20 @@ pub struct Router {
     /// Opt-in isolation for managed profile processes. Disabled by default
     /// so existing deployments continue sharing one process per profile.
     tenant_process_isolation: bool,
+    /// Opt-in *session*-level isolation for managed profile processes,
+    /// orthogonal to (and composable with) `tenant_process_isolation`
+    /// (`backend_process_model` hardening item, `acp-gateway-daemon`
+    /// plan). Disabled by default -- every managed profile still shares
+    /// one process per (profile[, tenant]) key across every session
+    /// using it, unchanged. When enabled, every *new* managed session
+    /// gets its own dedicated backend process (keyed by folding that
+    /// session's own gateway id into the supervisor key -- see
+    /// `dispatch_session_new`'s use of this flag), trading process count
+    /// for full request/response isolation instead of two concurrent
+    /// sessions on one profile serializing behind that profile's single
+    /// process mutex. Native/unmanaged sessions (no `_acpx.profile`) are
+    /// unaffected regardless of this setting -- see `dispatch_session_new`.
+    session_process_isolation: bool,
 }
 
 /// Outcome of proactively restoring durable sessions during startup.
@@ -622,6 +636,7 @@ impl Router {
             interaction_hub: InteractionHub::new(),
             scavenged_backends: HashSet::new(),
             tenant_process_isolation: false,
+            session_process_isolation: false,
         }
     }
 
@@ -750,6 +765,16 @@ impl Router {
     /// across tenants (default) or isolated per tenant.
     pub fn with_tenant_process_isolation(mut self, enabled: bool) -> Self {
         self.tenant_process_isolation = enabled;
+        self
+    }
+
+    /// Configure whether every new managed session gets its own dedicated
+    /// backend process (see `session_process_isolation`'s field doc
+    /// comment). Composable with [`Self::with_tenant_process_isolation`]:
+    /// both may be enabled together, in which case the per-session key is
+    /// layered on top of the per-tenant key.
+    pub fn with_session_process_isolation(mut self, enabled: bool) -> Self {
+        self.session_process_isolation = enabled;
         self
     }
 
@@ -1050,6 +1075,84 @@ impl Router {
         self.supervisor.process_id(supervisor_key).await
     }
 
+    /// Test/observability seam: the supervisor key `gateway_session_id`
+    /// was created under. Lets a test assert on `process_status` (which
+    /// takes `&mut self`) *after* the session itself has already been
+    /// removed from the registry (e.g. post-reap), when
+    /// `process_id_for_session` can no longer resolve it.
+    pub fn supervisor_key_for_session(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Option<String> {
+        Some(
+            self.sessions
+                .resolve(
+                    tenant_id,
+                    &acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
+                )?
+                .agent_id
+                .clone(),
+        )
+    }
+
+    /// Test/observability seam: the live backend process id for whatever
+    /// supervisor key `gateway_session_id` was created under, following
+    /// the exact same lookup real proxied calls use (`entry.agent_id`).
+    /// Primarily exists so `ACPX_SESSION_PROCESS_ISOLATION` tests can
+    /// assert on a specific session's dedicated process without needing
+    /// to reconstruct its randomly-minted supervisor key by hand.
+    pub async fn process_id_for_session(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Option<u32> {
+        let agent_id = self
+            .sessions
+            .resolve(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
+            )?
+            .agent_id
+            .clone();
+        self.process_id(&agent_id).await
+    }
+
+    /// True if `supervisor_key` was minted by this router's
+    /// `session_process_isolation` path (see `dispatch_session_new`'s doc
+    /// comment) -- i.e. it is provably exclusive to exactly one session,
+    /// so stopping its backend process on that session's close can never
+    /// affect any other still-open session. A profile/tenant-only key
+    /// (the pre-existing shared-process default) never matches this and
+    /// is therefore never auto-stopped on ordinary session close/reap,
+    /// preserving that mode's whole point: keeping the process warm
+    /// across session churn.
+    fn is_session_scoped_supervisor_key(supervisor_key: &str) -> bool {
+        supervisor_key.contains(":session:")
+    }
+
+    /// Stops `supervisor_key`'s backend process iff it is session-scoped
+    /// (see [`Self::is_session_scoped_supervisor_key`]) -- a no-op for
+    /// every pre-existing shared-process key, so ordinary session
+    /// close/reap under the default (or tenant-isolated) process model is
+    /// completely unaffected. Errors are logged, not propagated: a
+    /// session is already being torn down by the caller regardless of
+    /// whether its now-orphaned dedicated process manages to stop
+    /// cleanly, and `Supervisor::stop` on an already-dead process is
+    /// itself a no-op, not an error.
+    async fn stop_if_session_scoped(&mut self, supervisor_key: &str) {
+        if !Self::is_session_scoped_supervisor_key(supervisor_key) {
+            return;
+        }
+        if let Err(error) = self.supervisor.stop(supervisor_key).await {
+            tracing::warn!(
+                %error,
+                %supervisor_key,
+                "failed to stop a session-isolated backend process on session close"
+            );
+        }
+    }
+
     /// Fire-and-forget one transcript append, if persistence is attached.
     /// Never awaited by the caller -- spawned onto the runtime so a slow
     /// sqlite write can't add latency to the client-visible request path.
@@ -1252,8 +1355,9 @@ impl Router {
                     continue;
                 }
             }
-            if self.sessions.remove(&tenant_id, &gateway_id).is_some() {
+            if let Some(removed) = self.sessions.remove(&tenant_id, &gateway_id) {
                 self.release_live_session(&tenant_id);
+                self.stop_if_session_scoped(&removed.agent_id).await;
                 report.closed += 1;
             } else {
                 report.skipped += 1;
@@ -1559,6 +1663,37 @@ impl Router {
             (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
         };
 
+        // **`backend_process_model` hardening, `acp-gateway-daemon` plan.**
+        // Opt-in per-session backend process isolation: when enabled and
+        // this is a *managed* session (a profile resolved above, native/
+        // unmanaged mode is unaffected), fold a freshly-minted gateway id
+        // into the already-resolved profile[/tenant] supervisor key so
+        // this exact session gets its own dedicated backend process
+        // instead of sharing the profile's one process with every other
+        // session using it. The id has to be minted *now*, before
+        // spawning, since it becomes part of the supervisor key itself;
+        // `self.sessions.register_with_id` (below) then reuses this same
+        // id rather than minting another one, so the gateway id the
+        // client sees is identical either way. `":session:"` is a safe,
+        // collision-free marker (a UUID's string form has no colons) --
+        // see [`is_session_scoped_supervisor_key`] for where this
+        // encoding is later decoded to know when it's safe to stop a
+        // session's backend process on close, following the same
+        // string-encoded-supervisor-key idiom `tenant_process_isolation`
+        // already established (`profile_supervisor_key`/`stop_prefix`).
+        let mut pre_minted_gateway_id: Option<String> = None;
+        let agent_id = if self.session_process_isolation && profile.is_some() {
+            let gid = uuid::Uuid::new_v4().to_string();
+            let session_scoped_key = format!("{agent_id}:session:{gid}");
+            if let Some(spec) = self.supervisor.spec(&agent_id).cloned() {
+                self.supervisor.register(session_scoped_key.clone(), spec);
+            }
+            pre_minted_gateway_id = Some(gid);
+            session_scoped_key
+        } else {
+            agent_id
+        };
+
         // Merge the resolved profile's centrally-registered MCP servers
         // into whatever the client itself sent, client entries winning on
         // name collision -- see `crate::mcp_servers::merge_mcp_servers`.
@@ -1613,13 +1748,23 @@ impl Router {
         };
 
         let backend_session_id = extract_backend_session_id(&response)?;
-        let gateway_id = self.sessions.register(
-            tenant_id,
-            agent_id,
-            BackendSessionId(backend_session_id),
-            profile.as_ref().map(|p| p.name.clone()),
-            cwd,
-        );
+        let gateway_id = match pre_minted_gateway_id {
+            Some(gid) => self.sessions.register_with_id(
+                tenant_id,
+                acpx_proto::session::GatewaySessionId(gid),
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+            None => self.sessions.register(
+                tenant_id,
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+        };
 
         // Rewrite the backend's own session id into the gateway-issued one
         // before it ever reaches the client -- the client only ever sees
@@ -1644,10 +1789,12 @@ impl Router {
             .persist_session_recovery(tenant_id, &gateway_session_id_str, &entry, effective_params)
             .await
         {
-            self.sessions.remove(
+            if let Some(removed) = self.sessions.remove(
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
-            );
+            ) {
+                self.stop_if_session_scoped(&removed.agent_id).await;
+            }
             return Err(error);
         }
         admission.commit();
@@ -4674,7 +4821,7 @@ async fn dispatch_session_new_shared(
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
 
-    let (agent_id, profile, backend, persistence, cwd, admission, call_policy) = {
+    let (agent_id, profile, backend, persistence, cwd, admission, call_policy, pre_minted_gateway_id) = {
         let mut r = router.lock().await;
         let params = request
             .get_mut("params")
@@ -4730,6 +4877,24 @@ async fn dispatch_session_new_shared(
             (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
         };
 
+        // See `dispatch_session_new`'s identical block for the full
+        // rationale -- this is the shared (`Arc<Mutex<Router>>`-based)
+        // dispatch path's mirror of that same per-session backend
+        // process isolation logic, kept in lockstep since production
+        // transports call this function, not `Router::dispatch` directly.
+        let mut pre_minted_gateway_id: Option<String> = None;
+        let agent_id = if r.session_process_isolation && profile.is_some() {
+            let gid = uuid::Uuid::new_v4().to_string();
+            let session_scoped_key = format!("{agent_id}:session:{gid}");
+            if let Some(spec) = r.supervisor.spec(&agent_id).cloned() {
+                r.supervisor.register(session_scoped_key.clone(), spec);
+            }
+            pre_minted_gateway_id = Some(gid);
+            session_scoped_key
+        } else {
+            agent_id
+        };
+
         if let Some(profile) = &profile {
             if !profile.mcp_servers.is_empty() {
                 let central = r.mcp_servers.list_named(&profile.mcp_servers);
@@ -4766,6 +4931,7 @@ async fn dispatch_session_new_shared(
             cwd,
             admission,
             call_policy,
+            pre_minted_gateway_id,
         )
     };
 
@@ -4801,13 +4967,23 @@ async fn dispatch_session_new_shared(
 
     let (gateway_session_id_str, entry) = {
         let mut r = router.lock().await;
-        let gateway_id = r.sessions.register(
-            tenant_id,
-            agent_id,
-            BackendSessionId(backend_session_id),
-            profile.as_ref().map(|p| p.name.clone()),
-            cwd,
-        );
+        let gateway_id = match pre_minted_gateway_id.clone() {
+            Some(gid) => r.sessions.register_with_id(
+                tenant_id,
+                acpx_proto::session::GatewaySessionId(gid),
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+            None => r.sessions.register(
+                tenant_id,
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+        };
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
@@ -4853,10 +5029,12 @@ async fn dispatch_session_new_shared(
             .await
         {
             let mut r = router.lock().await;
-            r.sessions.remove(
+            if let Some(removed) = r.sessions.remove(
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
-            );
+            ) {
+                r.stop_if_session_scoped(&removed.agent_id).await;
+            }
             return Err(error.into());
         }
     }
