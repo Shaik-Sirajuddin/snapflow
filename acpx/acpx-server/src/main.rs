@@ -40,10 +40,16 @@ async fn main() -> anyhow::Result<()> {
         startup_session_recovery_enabled = config.startup_session_recovery_enabled,
         lifecycle_reaper_enabled = config.lifecycle_reaper_enabled,
         lifecycle_reaper_interval_secs = config.lifecycle_reaper_interval.as_secs(),
+        max_sessions_total = config.lifecycle.max_sessions_total,
+        max_sessions_per_tenant = config.lifecycle.max_sessions_per_tenant,
+        session_idle_ttl_secs = config.lifecycle.idle_session_ttl.as_secs(),
+        unbound_bridge_session_ttl_secs = config.lifecycle.unbound_bridge_session_ttl.as_secs(),
+        session_absolute_ttl_secs = ?config.lifecycle.absolute_session_ttl.map(|ttl| ttl.as_secs()),
         "starting acpx-server"
     );
 
-    let mut router = Router::new(config.default_agent_id.clone());
+    let mut router = Router::new(config.default_agent_id.clone())
+        .with_lifecycle_config(config.lifecycle.clone());
     router.register_agent(config.default_agent_id.clone(), config.backend.clone());
 
     if let Ok(db_path) = std::env::var("ACPX_DB_PATH") {

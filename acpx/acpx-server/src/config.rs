@@ -1,6 +1,7 @@
 //! Daemon startup config: bind addr, default profile, backend spawn spec.
 
 use acpx_conductor::SpawnSpec;
+use acpx_core::LifecycleConfig;
 
 /// Which backend to proxy to by default (native/unmanaged mode, no
 /// `_acpx.profile` given -- see `02-architecture.md`), and how to spawn
@@ -35,8 +36,14 @@ pub struct ServerConfig {
     /// disable, primarily for controlled diagnostics.
     pub lifecycle_reaper_enabled: bool,
     /// Poll interval for the lifecycle reaper. The actual session TTLs live
-    /// in `acpx-core::LifecycleConfig`; this only controls observation lag.
+    /// in `lifecycle`; this only controls observation lag.
     pub lifecycle_reaper_interval: std::time::Duration,
+    /// Native session admission and retention policy. Configure with:
+    /// `ACPX_MAX_SESSIONS_TOTAL`, `ACPX_MAX_SESSIONS_PER_TENANT`,
+    /// `ACPX_SESSION_IDLE_TTL_SECONDS`,
+    /// `ACPX_UNBOUND_BRIDGE_SESSION_TTL_SECONDS`, and optionally
+    /// `ACPX_SESSION_ABSOLUTE_TTL_SECONDS` (`off` disables it).
+    pub lifecycle: LifecycleConfig,
 }
 
 impl ServerConfig {
@@ -112,6 +119,34 @@ impl ServerConfig {
                 std::time::Duration::from_secs(seconds)
             })
             .unwrap_or_else(|| std::time::Duration::from_secs(60));
+        let mut lifecycle = LifecycleConfig::default();
+        lifecycle.max_sessions_total =
+            positive_usize("ACPX_MAX_SESSIONS_TOTAL", lifecycle.max_sessions_total);
+        lifecycle.max_sessions_per_tenant = positive_usize(
+            "ACPX_MAX_SESSIONS_PER_TENANT",
+            lifecycle.max_sessions_per_tenant,
+        );
+        lifecycle.idle_session_ttl =
+            positive_duration("ACPX_SESSION_IDLE_TTL_SECONDS", lifecycle.idle_session_ttl);
+        lifecycle.unbound_bridge_session_ttl = positive_duration(
+            "ACPX_UNBOUND_BRIDGE_SESSION_TTL_SECONDS",
+            lifecycle.unbound_bridge_session_ttl,
+        );
+        lifecycle.absolute_session_ttl = match std::env::var("ACPX_SESSION_ABSOLUTE_TTL_SECONDS") {
+            Ok(value)
+                if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") =>
+            {
+                None
+            }
+            Ok(value) => Some(parse_positive_duration(
+                "ACPX_SESSION_ABSOLUTE_TTL_SECONDS",
+                &value,
+            )),
+            Err(_) => lifecycle.absolute_session_ttl,
+        };
+        lifecycle
+            .validate()
+            .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -123,6 +158,50 @@ impl ServerConfig {
             startup_session_recovery_enabled,
             lifecycle_reaper_enabled,
             lifecycle_reaper_interval,
+            lifecycle,
         }
+    }
+}
+
+fn positive_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .unwrap_or_else(|err| panic!("{name}={value:?} is not a positive integer: {err}")),
+        Err(_) => default,
+    }
+}
+
+fn positive_duration(name: &str, default: std::time::Duration) -> std::time::Duration {
+    match std::env::var(name) {
+        Ok(value) => parse_positive_duration(name, &value),
+        Err(_) => default,
+    }
+}
+
+fn parse_positive_duration(name: &str, value: &str) -> std::time::Duration {
+    let seconds = value
+        .parse::<u64>()
+        .unwrap_or_else(|err| panic!("{name}={value:?} is not a positive integer: {err}"));
+    assert!(seconds > 0, "{name} must be greater than zero");
+    std::time::Duration::from_secs(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_positive_lifecycle_duration() {
+        assert_eq!(
+            parse_positive_duration("ACPX_SESSION_IDLE_TTL_SECONDS", "42"),
+            std::time::Duration::from_secs(42)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be greater than zero")]
+    fn rejects_zero_lifecycle_duration() {
+        parse_positive_duration("ACPX_SESSION_IDLE_TTL_SECONDS", "0");
     }
 }
