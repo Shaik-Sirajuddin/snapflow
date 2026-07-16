@@ -9,6 +9,7 @@ use acpx_core::persistence::{
     sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
     PersistenceStore,
 };
+use futures_util::{SinkExt, StreamExt};
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::process::Stdio;
@@ -16,6 +17,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Same stand-in backend script used across this crate's tests (see
 /// `binary_self_test.rs`'s doc comment) -- echoes a canned `session/new`
@@ -480,6 +482,78 @@ async fn real_binary_skips_startup_recovery_when_disabled() {
         prompt.get("error").is_some(),
         "disabled recovery should leave the persisted session unloaded: {prompt:?}"
     );
+
+    let _ = guard.child.start_kill();
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_file(log_path);
+}
+
+#[tokio::test]
+async fn real_binary_recovered_session_accepts_websocket_prompt() {
+    let addr = ephemeral_addr().await;
+    let db_path = write_temp_file("acpx-recovery-ws-db", "");
+    let log_path = write_temp_file("acpx-recovery-ws-log", "");
+    let script_path = write_temp_file(
+        "acpx-recovery-ws-backend",
+        RECOVERY_RECORDING_BACKEND_SCRIPT,
+    );
+    seed_recoverable_session(&db_path, None).await;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    cmd.env(
+        "ACPX_BACKEND_CMD",
+        format!("sh {} {}", script_path.display(), log_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_DB_PATH", db_path.display().to_string())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    let child = cmd.spawn().expect("spawn recovering real binary");
+    let mut guard = ServerGuard {
+        child,
+        _script_path: script_path,
+        _config_path: std::path::PathBuf::new(),
+    };
+    wait_for_listener(addr).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect recovered websocket");
+    ws.send(WsMessage::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/prompt",
+            "params": {"sessionId": "gateway-recovered", "prompt": []}
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send websocket prompt");
+    let response = ws
+        .next()
+        .await
+        .expect("websocket stayed open")
+        .expect("websocket response");
+    let text = match response {
+        WsMessage::Text(text) => text,
+        other => panic!("expected text response, got {other:?}"),
+    };
+    let body: Value = serde_json::from_str(&text).expect("parse websocket JSON");
+    assert_eq!(body["result"]["prompted"], json!(true), "{body:?}");
+
+    let methods = wait_for_log_line(&log_path, "session/prompt\t").await;
+    let load_index = methods
+        .iter()
+        .position(|line| line.starts_with("session/load\t"))
+        .expect("startup session/load");
+    let prompt_index = methods
+        .iter()
+        .position(|line| line.starts_with("session/prompt\t"))
+        .expect("websocket session/prompt");
+    assert!(load_index < prompt_index, "{methods:?}");
 
     let _ = guard.child.start_kill();
     let _ = std::fs::remove_file(db_path);

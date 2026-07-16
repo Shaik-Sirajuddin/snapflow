@@ -3310,3 +3310,18 @@ Verified with `python3 -W error::ResourceWarning -m unittest
 tests.recovery_integration.test_recovery_protocol`. WebSocket restart,
 connector outage, and credentialed real-adapter/OpenHands restart cases
 remain tracked separately.
+
+## Phase 41: recovered WebSocket session delivery
+
+`real_binary_recovered_session_accepts_websocket_prompt` extends the
+real-binary recovery coverage to the production `/ws` transport. It seeds a
+recoverable SQLite row, starts `acpx-server` against the recording ACP
+adapter, connects through a real WebSocket upgrade, and prompts the restored
+`gateway-recovered` session. The test asserts both the successful prompt
+response and that adapter-side `session/load` completed before the WebSocket
+`session/prompt`.
+
+Verified with `cargo test -p acpx-server --test provisioning_binary_test
+real_binary_recovered_session_accepts_websocket_prompt -- --nocapture`.
+Connector-outage coverage and credentialed Codex/OpenHands recovery remain
+open.
