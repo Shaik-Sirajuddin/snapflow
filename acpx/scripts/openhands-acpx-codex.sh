@@ -15,4 +15,15 @@ export ACPX_BACKEND_CMD="${ACPX_BACKEND_CMD:-npx -y @agentclientprotocol/codex-a
 export ACPX_DEFAULT_AGENT_ID="${ACPX_DEFAULT_AGENT_ID:-codex-acp}"
 export ACPX_HTTP_BIND="off"
 
+# codex-acp's API-key authentication is noninteractive, unlike its
+# device-login flow under a supervisor child. Prefer an explicitly supplied
+# key; otherwise reuse this user's private Codex CLI key when jq is present.
+if [[ -z "${CODEX_API_KEY:-}" ]]; then
+  CODEX_AUTH_FILE="${ACPX_CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
+  if [[ -r "$CODEX_AUTH_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    CODEX_API_KEY="$(jq -er '.OPENAI_API_KEY // empty' "$CODEX_AUTH_FILE" 2>/dev/null || true)"
+    export CODEX_API_KEY
+  fi
+fi
+
 exec "$ACPX_SERVER_BIN" "$@"

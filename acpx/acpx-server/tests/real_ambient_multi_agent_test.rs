@@ -277,36 +277,11 @@ async fn run_claude_conversation(client: &GatewayClient, profile: &str) -> Strin
 
 /// Codex-only counterpart to
 /// `ambient_claude_only_conversation_conforms_to_generated_schema`,
-/// isolating `codex-acp`'s ambient-auth behavior from `claude-acp`'s so
-/// a regression in either adapter's ambient-auth handshake doesn't mask
-/// the other's schema-validation proof. `auth_method_id: "api-key"`
-/// -- superseded by `"chat-gpt"`, see below -- added here (2026-07-14)
-/// because a fresh `npx -y` fetch of
-/// `codex-acp` on this machine started requiring an explicit
-/// `authenticate` call before `session/new` where it previously didn't
-/// -- a real environmental/adapter-version drift found while running
-/// this very test, not a schema-pipeline concern, see
-/// `Profile::auth_method_id`'s doc comment and `RouterError::
-/// BackendRequiresAuthentication`.
-///
-/// **Known current gap, found while writing this test (2026-07-14):**
-/// `"api-key"` fails fast with a clear `CODEX_API_KEY`/`OPENAI_API_KEY`-
-/// not-set error (expected -- this test deliberately supplies no
-/// credentials, ambient-only per this file's whole premise).
-/// `"chat-gpt"` (this machine's actual ambient codex CLI login method)
-/// instead hangs past this test's own real-network patience (multiple
-/// minutes) with no error and no completion -- consistent with the
-/// `authenticate` handshake needing an interactive device-code/browser
-/// step the codex-acp adapter can't complete headlessly under a
-/// `Supervisor`-spawned child process with no TTY, rather than reusing
-/// the already-logged-in CLI session's token non-interactively the way
-/// `claude-agent-acp` does. This is a `codex-acp`-adapter-side ambient-
-/// auth gap, not an acpx schema/dispatch bug -- `ambient_claude_only_
-/// conversation_conforms_to_generated_schema` above already proves the
-/// schema-validation pipeline against a real backend end to end;
-/// `#[ignore]` (inherited from this test's own attribute) plus this
-/// comment is the honest way to leave this documented rather than
-/// deleting the coverage or silently working around it.
+/// isolating `codex-acp` API-key authentication from Claude's ambient
+/// authentication. `codex-acp` requires its explicit `authenticate`
+/// exchange before `session/new`; the interactive `chat-gpt` mechanism
+/// cannot complete reliably under a supervisor child with no TTY, so this
+/// test deliberately uses its opt-in `ACPX_LIVE_TEST_CODEX_API_KEY`.
 #[tokio::test]
 #[ignore]
 async fn ambient_codex_only_conversation_conforms_to_generated_schema() {
@@ -318,6 +293,16 @@ async fn ambient_codex_only_conversation_conforms_to_generated_schema() {
         );
         return;
     }
+    let Some(api_key) = std::env::var("ACPX_LIVE_TEST_CODEX_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        eprintln!(
+            "skipping: set ACPX_LIVE_TEST_CODEX_API_KEY with ACPX_LIVE_TEST_AMBIENT=1 \
+             to run codex-acp through its noninteractive API-key authentication flow"
+        );
+        return;
+    };
 
     let addr = ephemeral_addr().await;
     let _server = spawn_real_server(addr).await;
@@ -339,9 +324,9 @@ async fn ambient_codex_only_conversation_conforms_to_generated_schema() {
             "agent_id": "codex-acp",
             "provider": null,
             "key_ref": null,
-            "launch_overrides": {},
+            "launch_overrides": {"CODEX_API_KEY": api_key},
             "mcp_servers": [],
-            "auth_method_id": "chat-gpt",
+            "auth_method_id": "api-key",
         }),
     )
     .await
@@ -354,9 +339,8 @@ async fn ambient_codex_only_conversation_conforms_to_generated_schema() {
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "codex-acp did not complete its ambient chat-gpt authentication/session \
-             flow within 120 seconds; this adapter currently requires a headless-safe \
-             auth path (for example API-key provisioning) rather than silently hanging"
+            "codex-acp did not complete its API-key authentication/session \
+             flow within 120 seconds"
         )
     });
     assert!(

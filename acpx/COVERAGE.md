@@ -3343,3 +3343,25 @@ durable row in both direct and shared router dispatch paths. Verified with
 `cargo test -p acpx-core --test session_load_rehydration_test` and `cargo test
 -p acpx-server --test provisioning_binary_test
 real_binary_survives_a_recovery_connector_outage -- --nocapture`.
+
+## Phase 43: headless Codex ACP verification
+
+The Codex live gate now uses explicit noninteractive API-key authentication
+instead of the adapter's interactive `chat-gpt` device flow. It accepts only
+the opt-in `ACPX_LIVE_TEST_CODEX_API_KEY`, passes it as a profile-local
+`CODEX_API_KEY` override, selects the adapter's `api-key` auth method, and
+never writes or logs the credential.
+
+`scripts/openhands-acpx-codex.sh` also prefers an already-supplied
+`CODEX_API_KEY` and otherwise reads the same user's private
+`$HOME/.codex/auth.json` through an overrideable `ACPX_CODEX_AUTH_FILE`.
+This gives an OpenHands-supervised, non-TTY child the API key that the Codex
+CLI already stores locally, without changing ACPX router authentication.
+
+Verified on July 16, 2026 with `codex login status` reporting API-key auth,
+the wrapper key-presence gate, and
+`ACPX_LIVE_TEST_AMBIENT=1 ACPX_LIVE_TEST_CODEX_API_KEY=<private-key> cargo
+test -p acpx-server --test real_ambient_multi_agent_test
+ambient_codex_only_conversation_conforms_to_generated_schema -- --ignored
+--nocapture` (passed in 13.93 seconds). OpenHands live restart recovery
+remains externally gated by a running agent-server/session API key.
