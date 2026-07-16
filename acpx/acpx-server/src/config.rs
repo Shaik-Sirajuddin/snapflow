@@ -50,6 +50,8 @@ pub struct ServerConfig {
     /// Number of session updates retained per session for resumable
     /// persistent transport subscriptions.
     pub stream_replay_buffer_size: usize,
+    /// Grace period before an inactive stream's replay state is removed.
+    pub stream_idle_retention: std::time::Duration,
 }
 
 impl ServerConfig {
@@ -155,6 +157,10 @@ impl ServerConfig {
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));
         let max_subscribers_per_session = positive_usize("ACPX_MAX_SUBSCRIBERS_PER_SESSION", 16);
         let stream_replay_buffer_size = positive_usize("ACPX_STREAM_REPLAY_BUFFER_SIZE", 200);
+        let stream_idle_retention = positive_duration(
+            "ACPX_STREAM_IDLE_RETENTION_SECS",
+            std::time::Duration::from_secs(300),
+        );
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -169,6 +175,7 @@ impl ServerConfig {
             lifecycle,
             max_subscribers_per_session,
             stream_replay_buffer_size,
+            stream_idle_retention,
         }
     }
 }
@@ -227,5 +234,11 @@ mod tests {
     #[should_panic(expected = "must be greater than zero")]
     fn rejects_zero_replay_buffer_size() {
         positive_usize("ACPX_STREAM_REPLAY_BUFFER_SIZE", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be greater than zero")]
+    fn rejects_zero_stream_idle_retention() {
+        parse_positive_duration("ACPX_STREAM_IDLE_RETENTION_SECS", "0");
     }
 }

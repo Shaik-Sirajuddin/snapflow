@@ -9,12 +9,14 @@ use crate::TenantId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex};
 
 const DEFAULT_STREAM_CAPACITY: usize = 256;
 const DEFAULT_MAX_SUBSCRIBERS: usize = 16;
 const DEFAULT_REPLAY_BUFFER_SIZE: usize = 200;
+const DEFAULT_STREAM_IDLE_RETENTION: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SubscribeError {
@@ -72,6 +74,8 @@ struct SessionStream {
     replay: Mutex<VecDeque<Envelope>>,
     next_seq: AtomicU64,
     epoch: Mutex<EpochState>,
+    last_activity: Mutex<tokio::time::Instant>,
+    reaper_started: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -149,10 +153,15 @@ fn epoch_value(
 #[derive(Clone)]
 pub struct NotificationHub {
     streams: Arc<Mutex<HashMap<StreamKey, Arc<SessionStream>>>>,
+    /// Generation retained after an idle stream is reaped. It ensures a
+    /// newly-created stream for the same live session never accepts an old
+    /// cursor whose replay state was deliberately discarded.
+    reaped_generations: Arc<Mutex<HashMap<StreamKey, u64>>>,
     capacity: usize,
     max_subscribers: usize,
     replay_buffer_size: usize,
     process_nonce: Arc<str>,
+    idle_retention: Duration,
 }
 
 impl Default for NotificationHub {
@@ -184,12 +193,29 @@ impl NotificationHub {
         max_subscribers: usize,
         replay_buffer_size: usize,
     ) -> Self {
+        Self::with_stream_retention(
+            capacity,
+            max_subscribers,
+            replay_buffer_size,
+            DEFAULT_STREAM_IDLE_RETENTION,
+        )
+    }
+
+    /// Configure how long a zero-subscriber stream retains replay state.
+    pub fn with_stream_retention(
+        capacity: usize,
+        max_subscribers: usize,
+        replay_buffer_size: usize,
+        idle_retention: Duration,
+    ) -> Self {
         Self {
             streams: Arc::new(Mutex::new(HashMap::new())),
+            reaped_generations: Arc::new(Mutex::new(HashMap::new())),
             capacity: capacity.max(1),
             max_subscribers: max_subscribers.max(1),
             replay_buffer_size: replay_buffer_size.max(1),
             process_nonce: uuid::Uuid::new_v4().to_string().into(),
+            idle_retention,
         }
     }
 
@@ -234,24 +260,39 @@ impl NotificationHub {
         let key = Self::key(tenant_id, gateway_session_id);
         let stream_key = key.clone();
         let process_nonce = Arc::clone(&self.process_nonce);
+        let initial_generation = self
+            .reaped_generations
+            .lock()
+            .await
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
         let stream = {
             let mut streams = self.streams.lock().await;
             streams
-                .entry(key)
+                .entry(key.clone())
                 .or_insert_with(|| {
                     Arc::new(SessionStream {
                         tx: broadcast::channel(self.capacity).0,
                         replay: Mutex::new(VecDeque::new()),
                         next_seq: AtomicU64::new(1),
                         epoch: Mutex::new(EpochState {
-                            generation: 0,
+                            generation: initial_generation,
                             backend_session_id: None,
-                            value: epoch_value(&stream_key, &process_nonce, 0, None),
+                            value: epoch_value(
+                                &stream_key,
+                                &process_nonce,
+                                initial_generation,
+                                None,
+                            ),
                         }),
+                        last_activity: Mutex::new(tokio::time::Instant::now()),
+                        reaper_started: std::sync::atomic::AtomicBool::new(false),
                     })
                 })
                 .clone()
         };
+        self.spawn_idle_reaper_if_new(key.clone(), Arc::clone(&stream));
         if stream.tx.receiver_count() >= self.max_subscribers {
             return Err(SubscribeError::TooManySubscribers {
                 max_subscribers: self.max_subscribers,
@@ -290,6 +331,7 @@ impl NotificationHub {
         if clear_replay {
             stream.replay.lock().await.clear();
         }
+        *stream.last_activity.lock().await = tokio::time::Instant::now();
 
         if let Some(cursor) = &cursor {
             if cursor.epoch != current_epoch {
@@ -327,10 +369,9 @@ impl NotificationHub {
 
     /// Remove a session's stream after the gateway session has closed.
     pub async fn remove_stream(&self, tenant_id: &TenantId, gateway_session_id: &str) {
-        self.streams
-            .lock()
-            .await
-            .remove(&Self::key(tenant_id, gateway_session_id));
+        let key = Self::key(tenant_id, gateway_session_id);
+        self.streams.lock().await.remove(&key);
+        self.reaped_generations.lock().await.remove(&key);
     }
 
     /// Publish an update to every live subscriber. `false` means there were
@@ -362,7 +403,56 @@ impl NotificationHub {
                 replay.pop_front();
             }
         }
+        *stream.last_activity.lock().await = tokio::time::Instant::now();
         stream.tx.send(envelope).is_ok()
+    }
+
+    fn spawn_idle_reaper_if_new(&self, key: StreamKey, stream: Arc<SessionStream>) {
+        if stream
+            .reaper_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let streams = Arc::clone(&self.streams);
+        let reaped_generations = Arc::clone(&self.reaped_generations);
+        let retention = self.idle_retention;
+        let stream = Arc::downgrade(&stream);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(retention).await;
+                let Some(stream) = stream.upgrade() else {
+                    return;
+                };
+                let idle = stream.last_activity.lock().await.elapsed() >= retention;
+                if stream.tx.receiver_count() != 0 || !idle {
+                    continue;
+                }
+                let mut streams = streams.lock().await;
+                if streams
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &stream))
+                    && stream.tx.receiver_count() == 0
+                    && stream.last_activity.lock().await.elapsed() >= retention
+                {
+                    streams.remove(&key);
+                    let next_generation = stream.epoch.lock().await.generation + 1;
+                    reaped_generations
+                        .lock()
+                        .await
+                        .insert(key.clone(), next_generation);
+                }
+                return;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    async fn has_stream(&self, tenant_id: &TenantId, gateway_session_id: &str) -> bool {
+        self.streams
+            .lock()
+            .await
+            .contains_key(&Self::key(tenant_id, gateway_session_id))
     }
 }
 
@@ -518,6 +608,53 @@ mod tests {
             SubscribeError::ResyncRequired { epoch, seq } => {
                 assert_ne!(epoch, old_epoch);
                 assert_eq!(seq, 1);
+            }
+            other => panic!("expected resync error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reaped_stream_rejects_an_old_resume_cursor() {
+        let hub =
+            NotificationHub::with_stream_retention(8, 2, 3, std::time::Duration::from_millis(20));
+        let tenant = TenantId::from("tenant-a");
+        let mut live = hub.subscribe(&tenant, "session-1", None).await.unwrap();
+        assert!(
+            hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
+                .await
+        );
+        let delivered = live.recv().await.unwrap();
+        let old_epoch = delivered.epoch.clone();
+        let cursor = ResumeCursor {
+            last_seq: delivered.seq,
+            epoch: old_epoch.clone(),
+        };
+        drop(live);
+
+        for _ in 0..20 {
+            if !hub.has_stream(&tenant, "session-1").await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !hub.has_stream(&tenant, "session-1").await,
+            "stream was not reaped after its retention deadline"
+        );
+
+        let error = hub
+            .subscribe_resuming(
+                &tenant,
+                "session-1",
+                Some(cursor),
+                StreamResumeState::default(),
+            )
+            .await
+            .expect_err("reaped stream must require a full refresh");
+        match error {
+            SubscribeError::ResyncRequired { epoch, seq } => {
+                assert_ne!(epoch, old_epoch);
+                assert_eq!(seq, 0);
             }
             other => panic!("expected resync error, got {other:?}"),
         }

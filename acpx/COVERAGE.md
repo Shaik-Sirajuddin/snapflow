@@ -3187,3 +3187,21 @@ drift detector trips. `durable_drift_invalidates_the_epoch_and_requires_
 a_resync` verifies the hub returns the new epoch instead of replaying a
 stale stream. Verified with `cargo test --workspace --no-fail-fast`;
 credentialed ambient tests remain intentionally ignored.
+
+## Phase 34: idle stream reaping
+
+Added `ACPX_STREAM_IDLE_RETENTION_SECS` with a default of `300`. Every
+session stream starts one weak-reference reaper task. It retains replay
+state while subscribers are absent during the grace period, then removes
+the zero-subscriber stream without keeping its broadcast sender alive.
+An explicit `session/close` or `session/delete` still removes the stream
+immediately.
+
+Reaping records a per-session generation tombstone. A subsequent resume
+with a cursor from the discarded stream receives the existing
+`-32051 resync_required` response rather than silently attaching to an
+empty new stream. `reaped_stream_rejects_an_old_resume_cursor` verifies
+both removal and that rejection; `removed_stream_does_not_deliver_future_
+updates` verifies the weak task does not delay explicit stream closure.
+Verified with `cargo test --workspace --no-fail-fast`; credentialed
+ambient tests remain intentionally ignored.
