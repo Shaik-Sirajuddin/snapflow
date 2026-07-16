@@ -162,6 +162,11 @@ impl BackendProcess {
         self.try_exit_status().is_some()
     }
 
+    /// Operating-system process id while the child is still running.
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub async fn kill(&mut self) -> Result<(), std::io::Error> {
         self.child.start_kill()?;
         let _ = self.child.wait().await;

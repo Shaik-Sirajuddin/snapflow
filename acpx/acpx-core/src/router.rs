@@ -294,6 +294,9 @@ pub struct Router {
     /// notices its process has exited (`BackendProcess::has_exited`) and
     /// returns on its own next tick, see that function's doc comment.
     scavenged_backends: HashSet<usize>,
+    /// Opt-in isolation for managed profile processes. Disabled by default
+    /// so existing deployments continue sharing one process per profile.
+    tenant_process_isolation: bool,
 }
 
 /// Outcome of proactively restoring durable sessions during startup.
@@ -540,6 +543,7 @@ impl Router {
             notification_hub: NotificationHub::new(),
             interaction_hub: InteractionHub::new(),
             scavenged_backends: HashSet::new(),
+            tenant_process_isolation: false,
         }
     }
 
@@ -606,6 +610,13 @@ impl Router {
     /// The server uses this to apply deployment-level subscriber limits.
     pub fn with_notification_hub(mut self, notification_hub: NotificationHub) -> Self {
         self.notification_hub = notification_hub;
+        self
+    }
+
+    /// Configure whether a managed profile's backend process is shared
+    /// across tenants (default) or isolated per tenant.
+    pub fn with_tenant_process_isolation(mut self, enabled: bool) -> Self {
+        self.tenant_process_isolation = enabled;
         self
     }
 
@@ -798,6 +809,11 @@ impl Router {
         supervisor_key: &str,
     ) -> acpx_conductor::supervisor::ProcessStatus {
         self.supervisor.status(supervisor_key)
+    }
+
+    /// Test/observability seam for a live backend process id.
+    pub async fn process_id(&self, supervisor_key: &str) -> Option<u32> {
+        self.supervisor.process_id(supervisor_key).await
     }
 
     /// Fire-and-forget one transcript append, if persistence is attached.
@@ -1021,11 +1037,6 @@ impl Router {
         RouterError,
     > {
         let tenant_id = TenantId(record.tenant_id.clone());
-        if let Some(profile_name) = record.profile_name.as_deref() {
-            // A fresh router has not yet registered the profile-specific
-            // supervisor key persisted with the session.
-            self.resolve_profile(profile_name).await?;
-        }
 
         let mut params = record
             .recovery_params
@@ -1042,8 +1053,13 @@ impl Router {
             params_object.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
         }
 
+        let agent_id = if let Some(profile_name) = record.profile_name.as_deref() {
+            self.resolve_profile(profile_name, &tenant_id).await?.0
+        } else {
+            record.agent_id.clone()
+        };
         let admission = self.admit_session(&tenant_id)?;
-        let backend = self.supervisor.ensure_running(&record.agent_id).await?;
+        let backend = self.supervisor.ensure_running(&agent_id).await?;
         let call_policy = BackendCallPolicy::from_profile(
             record
                 .profile_name
@@ -1078,7 +1094,7 @@ impl Router {
         Ok((
             tenant_id,
             crate::session_registry::SessionEntry {
-                agent_id: record.agent_id.clone(),
+                agent_id,
                 backend_session_id: BackendSessionId(record.backend_session_id.clone()),
                 profile_name: record.profile_name.clone(),
                 cwd: record.cwd.clone(),
@@ -1247,7 +1263,7 @@ impl Router {
 
         let (agent_id, profile) = match (&profile_name, explicit_agent_id) {
             (Some(name), None) => {
-                let (supervisor_key, profile) = self.resolve_profile(name).await?;
+                let (supervisor_key, profile) = self.resolve_profile(name, tenant_id).await?;
                 (supervisor_key, Some(profile))
             }
             (None, Some(agent_id)) => (agent_id, None),
@@ -1375,7 +1391,7 @@ impl Router {
         }
         let (agent_id, profile) = match selector {
             SessionListSelector::Profile(name) => {
-                let (key, profile) = self.resolve_profile(&name).await?;
+                let (key, profile) = self.resolve_profile(&name, tenant_id).await?;
                 (key, Some(profile))
             }
             SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
@@ -1544,6 +1560,7 @@ impl Router {
     async fn resolve_profile(
         &mut self,
         profile_name: &str,
+        tenant_id: &TenantId,
     ) -> Result<(String, Profile), RouterError> {
         self.ensure_default_profiles_seeded().await;
         let profile = self
@@ -1603,9 +1620,17 @@ impl Router {
             spec.env.insert(key, value);
         }
 
-        let supervisor_key = format!("profile:{}", profile.name);
+        let supervisor_key = self.profile_supervisor_key(&profile.name, tenant_id);
         self.supervisor.register(supervisor_key.clone(), spec);
         Ok((supervisor_key, profile))
+    }
+
+    fn profile_supervisor_key(&self, profile_name: &str, tenant_id: &TenantId) -> String {
+        if self.tenant_process_isolation {
+            format!("profile:{profile_name}:tenant:{}", tenant_id.0)
+        } else {
+            format!("profile:{profile_name}")
+        }
     }
 
     /// **Phase 8 addition -- closes a real gap.** `session/load` (and its
@@ -1681,7 +1706,7 @@ impl Router {
                 gateway_session_id.to_string(),
             ));
         }
-        let entry = crate::session_registry::SessionEntry {
+        let mut entry = crate::session_registry::SessionEntry {
             agent_id: record.agent_id,
             backend_session_id: BackendSessionId(record.backend_session_id),
             profile_name: record.profile_name,
@@ -1710,7 +1735,7 @@ impl Router {
         // process -- an in-process-only test would never have exercised
         // a `Supervisor` that legitimately never saw this profile before.
         if let Some(name) = entry.profile_name.as_deref() {
-            self.resolve_profile(name).await?;
+            entry.agent_id = self.resolve_profile(name, tenant_id).await?.0;
         }
         let admission = self.admit_session(tenant_id)?;
         self.sessions.insert(
@@ -2354,6 +2379,10 @@ impl Router {
                 let supervisor_key = format!("profile:{name}");
                 if let Err(err) = self.supervisor.stop(&supervisor_key).await {
                     tracing::warn!(%err, profile = %name, "failed to stop profile's backend process on delete");
+                }
+                let tenant_prefix = format!("{supervisor_key}:tenant:");
+                if let Err(err) = self.supervisor.stop_prefix(&tenant_prefix).await {
+                    tracing::warn!(%err, profile = %name, "failed to stop tenant-isolated profile backend processes on delete");
                 }
                 serde_json::json!({ "name": name, "deleted": true })
             }
@@ -3744,7 +3773,7 @@ async fn dispatch_session_list_real_shared(
         let mut r = router.lock().await;
         let (agent_id, profile) = match selector {
             SessionListSelector::Profile(name) => {
-                let (key, profile) = r.resolve_profile(&name).await?;
+                let (key, profile) = r.resolve_profile(&name, tenant_id).await?;
                 (key, Some(profile))
             }
             SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
@@ -4106,7 +4135,7 @@ async fn dispatch_session_new_shared(
 
         let (agent_id, profile) = match (&profile_name, explicit_agent_id) {
             (Some(name), None) => {
-                let (supervisor_key, profile) = r.resolve_profile(name).await?;
+                let (supervisor_key, profile) = r.resolve_profile(name, tenant_id).await?;
                 (supervisor_key, Some(profile))
             }
             (None, Some(agent_id)) => (agent_id, None),

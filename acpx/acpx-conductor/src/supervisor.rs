@@ -147,6 +147,13 @@ impl Supervisor {
         }
     }
 
+    /// Return the OS PID for a currently supervised backend.
+    pub async fn process_id(&self, agent_id: &str) -> Option<u32> {
+        let handle = self.running.get(agent_id)?.clone();
+        let pid = handle.lock().await.id();
+        pid
+    }
+
     /// Ensure the named agent's backend process is running, spawning it if
     /// necessary (or if the previously-spawned process has exited).
     ///
@@ -269,6 +276,22 @@ impl Supervisor {
         // An intentional stop isn't a crash -- clear backoff bookkeeping so
         // a subsequent `ensure_running` spawns immediately.
         self.attempts.remove(agent_id);
+        Ok(())
+    }
+
+    /// Stop every running process whose supervisor key starts with
+    /// `prefix`. This lets profile deletion clean up both shared and
+    /// tenant-qualified profile process keys.
+    pub async fn stop_prefix(&mut self, prefix: &str) -> Result<(), SupervisorError> {
+        let keys: Vec<String> = self
+            .running
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            self.stop(&key).await?;
+        }
         Ok(())
     }
 

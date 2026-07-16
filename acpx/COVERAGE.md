@@ -3205,3 +3205,21 @@ both removal and that rejection; `removed_stream_does_not_deliver_future_
 updates` verifies the weak task does not delay explicit stream closure.
 Verified with `cargo test --workspace --no-fail-fast`; credentialed
 ambient tests remain intentionally ignored.
+
+## Phase 35: tenant-qualified profile processes
+
+Added opt-in physical backend isolation for managed profiles.
+`ACPX_TENANT_PROCESS_ISOLATION=1` changes profile supervisor keys from
+`profile:{name}` to `profile:{name}:tenant:{tenant_id}`. Each tenant
+therefore receives a distinct backend process for the same profile,
+while the default remains one shared process per profile for backward
+compatibility and lower resource use.
+
+The router derives the qualified key for profile-backed `session/new`,
+real `session/list`, shared dispatch, durable rehydration, and startup
+recovery. `profiles/delete` stops every matching shared or
+tenant-qualified backend process. `tenant_process_isolation_test`
+launches real shell-backed ACP processes and asserts distinct OS PIDs
+when enabled and one stable shared PID when disabled. Verified with
+`cargo test --workspace --no-fail-fast`; credentialed ambient tests
+remain intentionally ignored.

@@ -48,11 +48,13 @@ async fn main() -> anyhow::Result<()> {
         max_subscribers_per_session = config.max_subscribers_per_session,
         stream_replay_buffer_size = config.stream_replay_buffer_size,
         stream_idle_retention_secs = config.stream_idle_retention.as_secs(),
+        tenant_process_isolation = config.tenant_process_isolation,
         "starting acpx-server"
     );
 
     let mut router = Router::new(config.default_agent_id.clone())
         .with_lifecycle_config(config.lifecycle.clone())
+        .with_tenant_process_isolation(config.tenant_process_isolation)
         .with_notification_hub(NotificationHub::with_stream_retention(
             256,
             config.max_subscribers_per_session,

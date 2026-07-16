@@ -52,6 +52,9 @@ pub struct ServerConfig {
     pub stream_replay_buffer_size: usize,
     /// Grace period before an inactive stream's replay state is removed.
     pub stream_idle_retention: std::time::Duration,
+    /// Give each tenant using one managed profile an isolated backend
+    /// process. Defaults to the legacy shared-profile behavior.
+    pub tenant_process_isolation: bool,
 }
 
 impl ServerConfig {
@@ -161,6 +164,9 @@ impl ServerConfig {
             "ACPX_STREAM_IDLE_RETENTION_SECS",
             std::time::Duration::from_secs(300),
         );
+        let tenant_process_isolation = std::env::var("ACPX_TENANT_PROCESS_ISOLATION")
+            .map(|value| value == "1")
+            .unwrap_or(false);
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -176,6 +182,7 @@ impl ServerConfig {
             max_subscribers_per_session,
             stream_replay_buffer_size,
             stream_idle_retention,
+            tenant_process_isolation,
         }
     }
 }
