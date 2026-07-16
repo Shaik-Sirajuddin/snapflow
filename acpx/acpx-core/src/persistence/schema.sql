@@ -39,3 +39,17 @@ CREATE TABLE IF NOT EXISTS transcripts (
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_session
     ON transcripts (gateway_session_id);
+
+CREATE TABLE IF NOT EXISTS agent_enablement (
+    agent_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS custom_agents (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    command TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    env_json TEXT NOT NULL,
+    cwd TEXT
+);

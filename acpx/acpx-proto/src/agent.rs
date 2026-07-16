@@ -23,10 +23,31 @@ pub enum AgentStatus {
     RuntimeMissing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSource {
+    Registry,
+    Custom,
+}
+
+impl Default for AgentSource {
+    fn default() -> Self {
+        Self::Registry
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentListEntry {
     pub id: String,
     pub name: String,
     pub version: String,
     pub status: AgentStatus,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub source: AgentSource,
+}
+
+fn default_enabled() -> bool {
+    true
 }

@@ -3,7 +3,10 @@
 //! transcript persistence. See
 //! `memory/acpx/gen/plans/acp-gateway-daemon/02-architecture.md`.
 
+pub mod admin;
+pub mod agent_state;
 pub mod bridge_sessions;
+pub mod custom_agents;
 pub mod detect;
 pub mod interaction;
 pub mod keystore;
@@ -17,10 +20,13 @@ pub mod provider;
 pub mod router;
 pub mod session_registry;
 
+pub use admin::{AdminError, AdminOps};
+pub use agent_state::AgentEnablement;
 pub use bridge_sessions::{
     BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
     BridgeSessionStore,
 };
+pub use custom_agents::{CustomAgent, CustomAgentStore, CustomAgentStoreError};
 pub use interaction::{
     InteractionBinding, InteractionError, InteractionHub, DEFAULT_INTERACTION_TIMEOUT,
 };

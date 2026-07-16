@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use super::error::PersistenceError;
 use super::sessions::{RecoveryMetadata, RecoveryStatus, RecoveryStatusCounts, SessionRecord};
 use super::transcripts::{Direction, TranscriptRecord};
+use crate::custom_agents::CustomAgent;
 
 #[derive(Clone)]
 pub struct PersistenceStore {
@@ -514,6 +515,167 @@ impl PersistenceStore {
         })
         .await
     }
+
+    pub(crate) async fn set_agent_enabled(
+        &self,
+        agent_id: impl Into<String>,
+        enabled: bool,
+    ) -> Result<(), PersistenceError> {
+        let agent_id = agent_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            conn.execute(
+                "INSERT INTO agent_enablement (agent_id, enabled) VALUES (?1, ?2) \
+                 ON CONFLICT(agent_id) DO UPDATE SET enabled = excluded.enabled",
+                params![agent_id, enabled as i64],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn agent_enabled(
+        &self,
+        agent_id: impl Into<String>,
+    ) -> Result<Option<bool>, PersistenceError> {
+        let agent_id = agent_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut statement =
+                conn.prepare("SELECT enabled FROM agent_enablement WHERE agent_id = ?1")?;
+            let mut rows = statement.query(params![agent_id])?;
+            match rows.next()? {
+                Some(row) => match row.get::<_, i64>(0)? {
+                    0 => Ok(Some(false)),
+                    1 => Ok(Some(true)),
+                    value => Err(PersistenceError::InvalidAgentEnablement(value)),
+                },
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn create_custom_agent(
+        &self,
+        agent: CustomAgent,
+    ) -> Result<(), PersistenceError> {
+        let args_json = serde_json::to_string(&agent.args)?;
+        let env_json = serde_json::to_string(&agent.env)?;
+        let id = agent.id.clone();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            match conn.execute(
+                "INSERT INTO custom_agents (id, name, command, args_json, env_json, cwd) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    agent.id,
+                    agent.name,
+                    agent.command,
+                    args_json,
+                    env_json,
+                    agent.cwd
+                ],
+            ) {
+                Ok(_) => Ok(()),
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    Err(PersistenceError::CustomAgentAlreadyExists(id))
+                }
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await
+    }
+
+    pub async fn get_custom_agent(
+        &self,
+        id: impl Into<String>,
+    ) -> Result<Option<CustomAgent>, PersistenceError> {
+        let id = id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut statement = conn.prepare(
+                "SELECT id, name, command, args_json, env_json, cwd \
+                 FROM custom_agents WHERE id = ?1",
+            )?;
+            let mut rows = statement.query(params![id])?;
+            Ok(rows.next()?.map(row_to_custom_agent).transpose()?)
+        })
+        .await
+    }
+
+    pub async fn list_custom_agents(&self) -> Result<Vec<CustomAgent>, PersistenceError> {
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut statement = conn.prepare(
+                "SELECT id, name, command, args_json, env_json, cwd \
+                 FROM custom_agents ORDER BY id ASC",
+            )?;
+            let agents = statement
+                .query_map([], row_to_custom_agent)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PersistenceError::from)?;
+            Ok(agents)
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_custom_agent(
+        &self,
+        id: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        let id = id.into();
+        let query_id = id.clone();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let mut conn = lock(&conn)?;
+            let transaction = conn.transaction()?;
+            if transaction.execute("DELETE FROM custom_agents WHERE id = ?1", params![query_id])?
+                == 0
+            {
+                return Err(PersistenceError::CustomAgentNotFound(id));
+            }
+            transaction.execute(
+                "DELETE FROM agent_enablement WHERE agent_id = ?1",
+                params![id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn row_to_custom_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<CustomAgent> {
+    let args_json: String = row.get(3)?;
+    let env_json: String = row.get(4)?;
+    Ok(CustomAgent {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        command: row.get(2)?,
+        args: serde_json::from_str(&args_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        env: serde_json::from_str(&env_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        cwd: row.get(5)?,
+    })
 }
 
 fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
