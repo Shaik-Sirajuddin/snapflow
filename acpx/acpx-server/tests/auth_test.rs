@@ -99,6 +99,30 @@ async fn no_token_configured_requests_succeed_unauthenticated() {
 }
 
 #[tokio::test]
+async fn health_reports_ready_without_persistence_and_requires_auth_when_configured() {
+    let addr = spawn_server(new_router(), Some("s3cret".to_string())).await;
+    let client = reqwest::Client::new();
+    let rejected = client
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .expect("GET /health without auth");
+    assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = client
+        .get(format!("http://{addr}/health"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .expect("GET /health");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("health JSON");
+    assert_eq!(body["status"], json!("ready"));
+    assert_eq!(body["persistenceEnabled"], json!(false));
+    assert_eq!(body["recovery"]["restoring"], json!(0));
+}
+
+#[tokio::test]
 async fn correct_bearer_token_succeeds() {
     let addr = spawn_server(new_router(), Some("s3cret".to_string())).await;
     let client = reqwest::Client::new();

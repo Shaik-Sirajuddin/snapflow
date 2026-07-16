@@ -24,7 +24,7 @@ pub mod store;
 pub mod transcripts;
 
 pub use error::PersistenceError;
-pub use sessions::SessionRecord;
+pub use sessions::{RecoveryStatusCounts, SessionRecord};
 pub use store::PersistenceStore;
 pub use transcripts::{Direction, TranscriptRecord};
 

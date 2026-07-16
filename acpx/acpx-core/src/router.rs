@@ -556,6 +556,10 @@ pub enum RouterError {
     )]
     SessionRehydrationFailed(String, crate::persistence::PersistenceError),
     #[error(
+        "session/load: gateway session {0} is still restoring; retry this request after recovery completes"
+    )]
+    SessionRestoring(String),
+    #[error(
         "logout: acpx's own initialize response advertises no agentCapabilities.auth.logout \
          (gateway-level auth is transport-level, not ACP-level -- see acpx-server's own \
          HTTP/WS auth); acpx also has no single unambiguous backend a bare, session-less \
@@ -1782,6 +1786,11 @@ impl Router {
         // cross-tenant miss.
         if record.tenant_id != tenant_id.0 {
             return Err(RouterError::SessionNotPersisted(
+                gateway_session_id.to_string(),
+            ));
+        }
+        if record.status == RecoveryStatus::Restoring {
+            return Err(RouterError::SessionRestoring(
                 gateway_session_id.to_string(),
             ));
         }

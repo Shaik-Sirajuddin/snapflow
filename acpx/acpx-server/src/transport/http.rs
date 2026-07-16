@@ -260,6 +260,7 @@ pub async fn serve_on_with_bridge(
     let auth_enabled = state.auth.token.is_some();
     let bridge_enabled = state.bridge.is_some();
     let mut app = axum::Router::new()
+        .route("/health", get(health_handler))
         .route("/rpc", post(rpc_handler))
         .route("/ws", get(super::ws::ws_handler));
     if bridge_enabled {
@@ -280,6 +281,47 @@ pub async fn serve_on_with_bridge(
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Bounded readiness surface. It intentionally exposes aggregate recovery
+/// counts only; session identifiers and recovery error text stay private.
+async fn health_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let store = state.router.lock().await.persistence_store();
+    let Some(store) = store else {
+        return Json(serde_json::json!({
+            "status": "ready",
+            "persistenceEnabled": false,
+            "recovery": {
+                "active": 0,
+                "restoring": 0,
+                "restored": 0,
+                "failed": 0,
+                "closed": 0,
+            }
+        }))
+        .into_response();
+    };
+    match store.recovery_status_counts().await {
+        Ok(counts) => Json(serde_json::json!({
+            "status": if counts.restoring == 0 { "ready" } else { "recovering" },
+            "persistenceEnabled": true,
+            "recovery": {
+                "active": counts.active,
+                "restoring": counts.restoring,
+                "restored": counts.restored,
+                "failed": counts.recovery_failed,
+                "closed": counts.closed,
+            }
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read recovery health diagnostics");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }
 
 async fn rpc_handler(

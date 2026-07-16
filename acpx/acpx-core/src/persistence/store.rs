@@ -27,7 +27,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::error::PersistenceError;
-use super::sessions::{RecoveryMetadata, RecoveryStatus, SessionRecord};
+use super::sessions::{RecoveryMetadata, RecoveryStatus, RecoveryStatusCounts, SessionRecord};
 use super::transcripts::{Direction, TranscriptRecord};
 
 #[derive(Clone)]
@@ -265,6 +265,7 @@ impl PersistenceStore {
         last_recovery_error: Option<String>,
     ) -> Result<(), PersistenceError> {
         let gateway_session_id = gateway_session_id.into();
+        let last_recovery_error = last_recovery_error.map(bound_recovery_error);
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
@@ -278,6 +279,34 @@ impl PersistenceStore {
                 return Err(PersistenceError::SessionNotFound(gateway_session_id));
             }
             Ok(())
+        })
+        .await
+    }
+
+    /// Return a secret-free aggregate of durable recovery state for daemon
+    /// readiness and health checks. Individual session identities and error
+    /// strings remain in SQLite-only operator records.
+    pub async fn recovery_status_counts(&self) -> Result<RecoveryStatusCounts, PersistenceError> {
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn.prepare("SELECT status, COUNT(*) FROM sessions GROUP BY status")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, RecoveryStatus>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut counts = RecoveryStatusCounts::default();
+            for row in rows {
+                let (status, count) = row?;
+                let count = usize::try_from(count).unwrap_or(usize::MAX);
+                match status {
+                    RecoveryStatus::Active => counts.active = count,
+                    RecoveryStatus::Restoring => counts.restoring = count,
+                    RecoveryStatus::Restored => counts.restored = count,
+                    RecoveryStatus::RecoveryFailed => counts.recovery_failed = count,
+                    RecoveryStatus::Closed => counts.closed = count,
+                }
+            }
+            Ok(counts)
         })
         .await
     }
@@ -575,6 +604,20 @@ fn unix_time_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
+}
+
+const MAX_RECOVERY_ERROR_BYTES: usize = 512;
+
+fn bound_recovery_error(error: String) -> String {
+    let flattened = error.replace(['\n', '\r'], " ");
+    if flattened.len() <= MAX_RECOVERY_ERROR_BYTES {
+        return flattened;
+    }
+    let mut end = MAX_RECOVERY_ERROR_BYTES;
+    while !flattened.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &flattened[..end])
 }
 
 fn lock(

@@ -18,6 +18,17 @@ pub enum RecoveryStatus {
     Closed,
 }
 
+/// Aggregate durable recovery state for operator diagnostics. Counts do not
+/// expose tenant, session, backend, prompt, or credential information.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryStatusCounts {
+    pub active: usize,
+    pub restoring: usize,
+    pub restored: usize,
+    pub recovery_failed: usize,
+    pub closed: usize,
+}
+
 impl RecoveryStatus {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {

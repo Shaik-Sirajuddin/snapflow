@@ -152,6 +152,64 @@ async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
 }
 
 #[tokio::test]
+async fn recovery_diagnostics_are_aggregated_and_errors_are_bounded() {
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    for (id, status) in [
+        ("gw-active", RecoveryStatus::Active),
+        ("gw-restoring", RecoveryStatus::Restoring),
+        ("gw-restored", RecoveryStatus::Restored),
+        ("gw-failed", RecoveryStatus::RecoveryFailed),
+    ] {
+        store
+            .record_session_with_recovery(
+                id,
+                "codex-acp",
+                format!("backend-{id}"),
+                None,
+                "2026-07-16T00:00:00Z",
+                "default",
+                RecoveryMetadata {
+                    status,
+                    recovery_method: RecoveryMethod::Load,
+                    ..RecoveryMetadata::default()
+                },
+            )
+            .await
+            .expect("record recovery row");
+    }
+    store
+        .close_session("gw-active", "2026-07-16T01:00:00Z")
+        .await
+        .expect("close session");
+    store
+        .update_recovery_status(
+            "gw-failed",
+            RecoveryStatus::RecoveryFailed,
+            Some(format!("first line\n{}", "x".repeat(700))),
+        )
+        .await
+        .expect("persist bounded error");
+
+    let counts = store
+        .recovery_status_counts()
+        .await
+        .expect("read recovery diagnostics");
+    assert_eq!(counts.active, 0);
+    assert_eq!(counts.restoring, 1);
+    assert_eq!(counts.restored, 1);
+    assert_eq!(counts.recovery_failed, 1);
+    assert_eq!(counts.closed, 1);
+    let failed = store
+        .get_session("gw-failed")
+        .await
+        .expect("get failed row")
+        .expect("failed row exists");
+    let error = failed.last_recovery_error.expect("bounded error");
+    assert!(error.len() <= 515);
+    assert!(!error.contains('\n'));
+}
+
+#[tokio::test]
 async fn bridge_binding_metadata_round_trips_and_overwrites_prior_selection() {
     let store = PersistenceStore::open_in_memory().expect("open in-memory store");
     store
