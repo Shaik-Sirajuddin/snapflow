@@ -142,6 +142,7 @@ async fn handle_acp_socket(
             .and_then(|value| value.get_mut("updates"))
             .and_then(|value| value.as_array_mut())
         {
+            let mut flushed_updates = false;
             for mut update in std::mem::take(updates) {
                 let Some(native_session_id) = update
                     .pointer("/params/sessionId")
@@ -166,6 +167,13 @@ async fn handle_acp_socket(
                 if sink.lock().await.send(Message::Text(frame)).await.is_err() {
                     return;
                 }
+                flushed_updates = true;
+            }
+            if flushed_updates {
+                // Some ACP clients dispatch notifications on separate tasks.
+                // Give them one scheduling slice before the prompt response
+                // completes the turn and they snapshot accumulated text.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
         if response
