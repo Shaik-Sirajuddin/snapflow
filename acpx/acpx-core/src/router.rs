@@ -4379,6 +4379,26 @@ pub async fn dispatch_shared_for_tenant(
         {
             dispatch_session_list_real_shared(router, tenant_id, request).await
         }
+        // **`client_and_installer_contract` hardening, `acp-gateway-daemon`
+        // plan.** `agents/install` is a genuine (potentially many-second,
+        // real network/filesystem) download+extract, not the cheap/local
+        // registry-cache read every other `GatewayNative` method actually
+        // is -- routing it through the generic
+        // `router.lock().await.dispatch_for_tenant(...)` arm below would
+        // hold the *entire* router mutex for that whole duration,
+        // freezing every other concurrent client (every tenant, every
+        // session, every unrelated backend) until the install finishes.
+        // Found during this hardening pass, not a pre-existing documented
+        // risk -- fixed the same way `session/list`'s real-backend arm
+        // just above already established: resolve what's needed under a
+        // brief lock, release it, then do the slow part unlocked. The
+        // wire contract (`{id, outcome}`) is unchanged -- see
+        // `dispatch_agents_install_shared`'s doc comment for why a
+        // fuller async job/progress model remains a deliberately
+        // deferred, separate enhancement.
+        MethodClass::GatewayNative if method == "agents/install" => {
+            dispatch_agents_install_shared(router, request).await
+        }
         MethodClass::GatewayNative | MethodClass::Unknown => {
             router
                 .lock()
@@ -4387,6 +4407,57 @@ pub async fn dispatch_shared_for_tenant(
                 .await
         }
     }
+}
+
+/// [`dispatch_shared_for_tenant`]'s `agents/install` path -- resolves the
+/// requested [`acpx_registry::Agent`] under a brief router lock (mirrors
+/// `Router::dispatch_native`'s `"agents/install"` arm exactly, including
+/// its `{id, outcome}` response shape and every error case), then
+/// releases that lock *before* the actual `acpx_registry::install` call,
+/// which is the one that can genuinely take seconds (npm/pip resolution,
+/// or a full binary download+extract).
+///
+/// **Not a polling/streamed job**, deliberately: this still blocks the
+/// *calling* HTTP/WS/stdio request until the install finishes, same as
+/// before this fix -- only the *router-wide* blocking (every other
+/// concurrent client on this whole daemon) is what this function
+/// resolves. A durable job id + `agents/install/status` progress-polling
+/// API remains the documented, still-open, separate enhancement (see
+/// `acpx-client::ext::registry::install`'s doc comment) -- deliberately
+/// out of scope here to avoid a breaking wire-contract change across
+/// `acpx-proto`'s `AgentInstallResult` type and every existing caller/
+/// test that depends on today's synchronous shape, for what would be a
+/// pure UX improvement (progress feedback) rather than a correctness fix
+/// like the mutex-holding bug this function *does* resolve.
+async fn dispatch_agents_install_shared(
+    router: &SharedRouterHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+    let agent = {
+        let mut r = router.lock().await;
+        let agent_id = request
+            .get("params")
+            .and_then(|p| p.get("id"))
+            .and_then(|i| i.as_str())
+            .ok_or(RouterError::MissingAgentId)?
+            .to_string();
+        r.ensure_registry_loaded().await;
+        r.registry_cache
+            .as_ref()
+            .expect("just loaded")
+            .agents
+            .iter()
+            .find(|a| a.id == agent_id)
+            .cloned()
+            .ok_or(RouterError::UnknownAgentId(agent_id))?
+    };
+    let outcome = acpx_registry::install(&agent).await?;
+    Ok(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "id": agent.id, "outcome": format!("{outcome:?}") },
+    }))
 }
 
 /// [`dispatch_shared`]'s `session/cancel` path -- mirrors
