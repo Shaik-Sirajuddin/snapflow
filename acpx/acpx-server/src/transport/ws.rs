@@ -45,12 +45,12 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 use acpx_core::router::dispatch_shared_for_tenant;
-use acpx_core::TenantId;
+use acpx_core::{InteractionBinding, TenantId};
 
 use super::http::{json_rpc_error, AppState, SharedRouter};
 use super::live::{session_id_to_forget, session_id_to_watch};
@@ -313,7 +313,28 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(AsyncMutex::new(sink));
     let hub = { router.lock().await.notification_hub() };
+    let interaction_hub = { router.lock().await.interaction_hub() };
+    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let interaction_sink = Arc::clone(&sink);
+    tokio::spawn(async move {
+        while let Some(request) = interaction_rx.recv().await {
+            let Ok(payload) = serde_json::to_string(&request) else {
+                continue;
+            };
+            if interaction_sink
+                .lock()
+                .await
+                .send(Message::Text(payload))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
     let mut watched: HashSet<String> = HashSet::new();
+    let interaction_bindings =
+        Arc::new(AsyncMutex::new(HashMap::<String, InteractionBinding>::new()));
 
     macro_rules! send_frame {
         ($value:expr) => {{
@@ -365,6 +386,56 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             }
         };
 
+        // A response with no method can only be the client's answer to an
+        // agent-initiated request sent by InteractionHub. It must not enter
+        // Router dispatch: it is correlated directly back to the backend
+        // request that is still awaiting it.
+        if request.get("method").is_none() && request.get("id").is_some() {
+            interaction_hub.resolve(request).await;
+            continue;
+        }
+
+        // Prompt-like calls can block on an agent-initiated request. Bind
+        // this connection before dispatch, then run the backend round trip
+        // independently so this read loop remains available for the
+        // correlated response above.
+        if let Some(session_id) = request
+            .pointer("/params/sessionId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        {
+            let binding = interaction_hub
+                .bind(
+                    tenant_id.clone(),
+                    session_id.clone(),
+                    interaction_tx.clone(),
+                )
+                .await;
+            let previous = interaction_bindings
+                .lock()
+                .await
+                .insert(session_id, binding);
+            if let Some(previous) = previous {
+                interaction_hub.unbind(&previous).await;
+            }
+
+            let router = Arc::clone(&router);
+            let tenant_id = tenant_id.clone();
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let response =
+                    match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
+                        Ok(response) => response,
+                        Err(error) => json_rpc_error(&request, error),
+                    };
+                let Ok(payload) = serde_json::to_string(&response) else {
+                    return;
+                };
+                let _ = sink.lock().await.send(Message::Text(payload)).await;
+            });
+            continue;
+        }
+
         let response = {
             match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                 Ok(response) => response,
@@ -408,5 +479,8 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
 
     for session_id in watched {
         hub.unsubscribe(&session_id).await;
+    }
+    for (_, binding) in interaction_bindings.lock().await.drain() {
+        interaction_hub.unbind(&binding).await;
     }
 }

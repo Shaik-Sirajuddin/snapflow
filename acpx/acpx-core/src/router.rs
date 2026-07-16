@@ -15,6 +15,7 @@ use crate::persistence::{
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
+use crate::{InteractionHub, DEFAULT_INTERACTION_TIMEOUT};
 use acpx_proto::agent::AgentStatus;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -276,6 +277,9 @@ pub struct Router {
     /// without that transport ever needing to come back through this
     /// `Router`'s own lock to subscribe/publish.
     notification_hub: NotificationHub,
+    /// Correlates backend-initiated requests with responses from the
+    /// persistent ACP client that currently owns the session.
+    interaction_hub: InteractionHub,
     /// **Phase 15 addition.** Identity (`Arc::as_ptr` cast to `usize`) of
     /// every physical backend process instance that already has an idle
     /// scavenger task (see [`spawn_idle_scavenger`]/[`backend_idle_
@@ -534,6 +538,7 @@ impl Router {
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
             notification_hub: NotificationHub::new(),
+            interaction_hub: InteractionHub::new(),
             scavenged_backends: HashSet::new(),
         }
     }
@@ -544,6 +549,12 @@ impl Router {
     /// connection touches. See `crate::notify`'s module doc comment.
     pub fn notification_hub(&self) -> NotificationHub {
         self.notification_hub.clone()
+    }
+
+    /// A clone of the persistent client interaction bridge. Transports bind
+    /// sessions they own and resolve client responses through this hub.
+    pub fn interaction_hub(&self) -> InteractionHub {
+        self.interaction_hub.clone()
     }
 
     /// **Phase 15.** Ensure exactly one idle scavenger task
@@ -2987,6 +2998,53 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     hub.publish(&gateway_id.0, translated).await
 }
 
+/// Forward a backend-initiated request to the persistent client that owns
+/// this session. `Ok(None)` means this dispatch has no bound client and the
+/// caller must use its existing profile-policy fallback.
+async fn try_forward_interaction(
+    ctx: &LiveNotifyCtx,
+    value: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, crate::InteractionError> {
+    let Some(tenant_id) = &ctx.tenant_id else {
+        return Ok(None);
+    };
+    let Some(backend_session_id) = value
+        .get("params")
+        .and_then(|params| params.get("sessionId"))
+        .and_then(|session_id| session_id.as_str())
+    else {
+        return Ok(None);
+    };
+    let (gateway_id, interaction_hub) = {
+        let router = ctx.router.lock().await;
+        (
+            router
+                .sessions
+                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id),
+            router.interaction_hub.clone(),
+        )
+    };
+    let Some(gateway_id) = gateway_id else {
+        return Ok(None);
+    };
+
+    let mut request = value.clone();
+    if let Some(session_id) = request
+        .get_mut("params")
+        .and_then(|params| params.get_mut("sessionId"))
+    {
+        *session_id = serde_json::Value::String(gateway_id.0.clone());
+    }
+    interaction_hub
+        .request(
+            tenant_id,
+            &gateway_id.0,
+            request,
+            DEFAULT_INTERACTION_TIMEOUT,
+        )
+        .await
+}
+
 /// **Phase 15.** The idle/background-reader gap phase 14 documented and
 /// deliberately left open: `read_matching_response`'s read loop only ever
 /// runs while one client call is in flight against a given backend, so a
@@ -3149,6 +3207,36 @@ async fn read_matching_response(
             value.get("id"),
             value.get("method").and_then(|m| m.as_str()),
         ) {
+            // A persistent transport may have a client bound to this exact
+            // tenant/session. Give that client the first chance to answer
+            // every backend-initiated request; profile policy remains the
+            // deliberate fallback for HTTP and unbound stdio/WS sessions.
+            if let Some(live) = live {
+                match try_forward_interaction(live, &value).await {
+                    Ok(Some(mut reply)) => {
+                        // The outer client sees ACPX's opaque interaction id;
+                        // the backend must receive the id it originally sent.
+                        reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                            "error": {
+                                "code": -32001,
+                                "message": format!("acpx interactive client request failed: {error}"),
+                            }
+                        });
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
+                        continue;
+                    }
+                }
+            }
             let reply = if method == "session/request_permission" {
                 build_permission_reply(&value, policy.permission_policy)
             } else if (method == "fs/read_text_file" || method == "fs/write_text_file")

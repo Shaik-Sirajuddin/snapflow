@@ -5,6 +5,7 @@
 
 pub mod bridge_sessions;
 pub mod detect;
+pub mod interaction;
 pub mod keystore;
 pub mod launch;
 pub mod lifecycle;
@@ -19,6 +20,9 @@ pub mod session_registry;
 pub use bridge_sessions::{
     BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
     BridgeSessionStore,
+};
+pub use interaction::{
+    InteractionBinding, InteractionError, InteractionHub, DEFAULT_INTERACTION_TIMEOUT,
 };
 pub use lifecycle::LifecycleConfig;
 pub use notify::NotificationHub;
