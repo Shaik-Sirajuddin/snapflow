@@ -196,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
     let stdio_task = tokio::spawn(async move { transport::stdio::run(stdio_router).await });
     let auth_token = config.auth_token.clone();
     let auth_tenant_tokens = config.auth_tenant_tokens.clone();
+    let auth_tenant_allowlist = config.auth_tenant_allowlist.clone();
 
     // HTTP/WS bind is attempted here (rather than inside `transport::serve`)
     // so a bind failure -- or an explicit `ACPX_HTTP_BIND=off`/`none` -- can
@@ -241,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
                 router,
                 auth_token,
                 auth_tenant_tokens,
+                auth_tenant_allowlist,
                 bridge,
             )
             .await

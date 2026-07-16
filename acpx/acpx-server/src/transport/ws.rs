@@ -74,7 +74,7 @@ pub async fn ws_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
     };
     ws.on_upgrade(move |socket| handle_socket(socket, state.router, tenant_id))
 }
@@ -93,7 +93,7 @@ pub async fn acp_ws_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
     };
     ws.on_upgrade(move |socket| handle_acp_socket(socket, state.router, runtime, tenant_id))
 }

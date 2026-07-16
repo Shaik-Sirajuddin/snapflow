@@ -37,6 +37,11 @@ pub struct ServerConfig {
     /// `X-Acpx-Tenant` header fully self-declared/cooperative, unchanged.
     /// Additive to `auth_token`: a request may authenticate via either.
     pub auth_tenant_tokens: Vec<(String, acpx_core::TenantId)>,
+    /// Optional tenant namespace allowlist (`ACPX_TENANT_ALLOWLIST`,
+    /// comma-separated tenant ids). `None` (the default) keeps every
+    /// pre-existing deployment's "any caller-declared/authenticated
+    /// tenant string is a valid namespace" behavior unchanged.
+    pub auth_tenant_allowlist: Option<std::collections::HashSet<String>>,
     /// Optional bearer token for the loopback-only admin HTTP surface.
     /// Unlike `auth_token`, enabling this requires `ACPX_DB_PATH` so
     /// gateway-wide agent administration is always durable.
@@ -115,6 +120,12 @@ impl ServerConfig {
     /// header, and is rejected if that header names a different tenant
     /// -- see `transport::http`'s "Identity-bound tenant auth" doc
     /// comment for the full contract.
+    /// `ACPX_TENANT_ALLOWLIST` (comma-separated tenant ids) additionally
+    /// rejects (`403`) any resolved tenant -- self-declared or
+    /// authenticated -- outside this fixed set, closing the
+    /// `tenant_namespace_governance` hardening item's "unbounded
+    /// tenant-map growth" concern for deployments that know their full
+    /// tenant set up front.
     pub fn from_env() -> Self {
         let raw = std::env::var("ACPX_BACKEND_CMD")
             .unwrap_or_else(|_| "npx -y @agentclientprotocol/codex-acp@1.1.2".to_string());
@@ -171,6 +182,16 @@ impl ServerConfig {
                     })
                     .collect(),
                 _ => Vec::new(),
+            };
+        let auth_tenant_allowlist: Option<std::collections::HashSet<String>> =
+            match std::env::var("ACPX_TENANT_ALLOWLIST") {
+                Ok(raw) if !raw.trim().is_empty() => Some(
+                    raw.split(',')
+                        .map(|entry| entry.trim().to_string())
+                        .filter(|entry| !entry.is_empty())
+                        .collect(),
+                ),
+                _ => None,
             };
         let admin_token = std::env::var("ACPX_ADMIN_TOKEN")
             .ok()
@@ -267,6 +288,7 @@ impl ServerConfig {
             http_bind_addr,
             auth_token,
             auth_tenant_tokens,
+            auth_tenant_allowlist,
             admin_token,
             admin_bind_addr,
             startup_session_recovery_enabled,

@@ -4,6 +4,80 @@
 //! yet" gap (see `transport::http`'s module doc comment). Follows the
 //! same `#[path]`-including-real-source technique as
 //! `http_ws_transport_test.rs` -- see that file's doc comment for why.
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use acpx_conductor::SpawnSpec;
+use acpx_core::router::Router;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::http::Request as WsRequest;
+
+#[path = "../src/transport/http.rs"]
+mod http;
+#[path = "../src/transport/live.rs"]
+mod live;
+#[path = "../src/transport/ws.rs"]
+mod ws;
+
+use acpx_core::TenantId;
+use http::{serve, serve_on_with_bridge_and_tenant_tokens, SharedRouter};
+
+const STAND_IN_BACKEND_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+
+fn stand_in_backend_spec() -> SpawnSpec {
+    SpawnSpec::new(
+        "sh",
+        vec!["-c".to_string(), STAND_IN_BACKEND_SCRIPT.to_string()],
+    )
+}
+
+fn new_router() -> SharedRouter {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    Arc::new(Mutex::new(router))
+}
+
+/// Same ephemeral-port bring-up as `http_ws_transport_test.rs`, but takes
+/// an explicit `auth_token` to exercise both the disabled (`None`) and
+/// enabled (`Some(..)`) paths.
+async fn spawn_server(router: SharedRouter, auth_token: Option<String>) -> SocketAddr {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = probe.local_addr().expect("local_addr");
+    drop(probe);
+
+    tokio::spawn(async move {
+        serve(router, addr, auth_token)
+            .await
+            .expect("transport::serve");
+    });
+
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    addr
+}
+
+fn ping_request() -> serde_json::Value {
+    json!({"jsonrpc": "2.0", "id": 1, "method": "agents/list", "params": {}})
+}
+
 /// Same bring-up as `spawn_server`, but wires identity-bound tenant
 /// tokens (`ACPX_AUTH_TENANT_TOKENS` equivalent) through
 /// `serve_on_with_bridge_and_tenant_tokens`, exercising the
@@ -24,7 +98,7 @@ async fn spawn_server_with_tenant_tokens(
 
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
-        serve_on_with_bridge_and_tenant_tokens(listener, router, auth_token, tenant_tokens, None)
+        serve_on_with_bridge_and_tenant_tokens(listener, router, auth_token, tenant_tokens, None, None)
             .await
             .expect("transport::serve_on_with_bridge_and_tenant_tokens");
     });
@@ -36,6 +110,98 @@ async fn spawn_server_with_tenant_tokens(
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     addr
+}
+
+/// Same bring-up as `spawn_server_with_tenant_tokens`, but additionally
+/// configures a tenant allowlist (`ACPX_TENANT_ALLOWLIST` equivalent),
+/// covering the `tenant_namespace_governance` hardening item.
+async fn spawn_server_with_tenant_allowlist(
+    router: SharedRouter,
+    allowlist: std::collections::HashSet<String>,
+) -> SocketAddr {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = probe.local_addr().expect("local_addr");
+    drop(probe);
+
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+        serve_on_with_bridge_and_tenant_tokens(
+            listener,
+            router,
+            None,
+            Vec::new(),
+            Some(allowlist),
+            None,
+        )
+        .await
+        .expect("transport::serve_on_with_bridge_and_tenant_tokens");
+    });
+
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    addr
+}
+
+#[tokio::test]
+async fn allowlisted_tenant_header_is_accepted() {
+    let addr = spawn_server_with_tenant_allowlist(
+        new_router(),
+        std::collections::HashSet::from(["acme".to_string()]),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .header("X-Acpx-Tenant", "acme")
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn non_allowlisted_tenant_header_is_rejected() {
+    let addr = spawn_server_with_tenant_allowlist(
+        new_router(),
+        std::collections::HashSet::from(["acme".to_string()]),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .header("X-Acpx-Tenant", "not-on-the-list")
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+/// Absent header resolves to `default_tenant()` ("default"), which is
+/// not itself in the allowlist here -- confirms the allowlist applies to
+/// the implicit default tenant too, not just explicitly declared ones.
+#[tokio::test]
+async fn default_tenant_is_rejected_when_not_on_an_active_allowlist() {
+    let addr = spawn_server_with_tenant_allowlist(
+        new_router(),
+        std::collections::HashSet::from(["acme".to_string()]),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/rpc"))
+        .json(&tenant_probe_request())
+        .send()
+        .await
+        .expect("POST /rpc");
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
 fn tenant_probe_request() -> serde_json::Value {
@@ -154,79 +320,6 @@ async fn unrecognized_token_is_rejected_even_with_tenant_tokens_configured() {
         .await
         .expect("POST /rpc");
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-}
-use std::net::SocketAddr;
-use std::sync::Arc;
-
-use acpx_conductor::SpawnSpec;
-use acpx_core::router::Router;
-use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
-use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::handshake::client::generate_key;
-use tokio_tungstenite::tungstenite::http::Request as WsRequest;
-
-#[path = "../src/transport/http.rs"]
-mod http;
-#[path = "../src/transport/live.rs"]
-mod live;
-#[path = "../src/transport/ws.rs"]
-mod ws;
-
-use acpx_core::TenantId;
-use http::{serve, serve_on_with_bridge_and_tenant_tokens, SharedRouter};
-
-const STAND_IN_BACKEND_SCRIPT: &str = r#"
-while IFS= read -r line; do
-  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
-  if echo "$line" | grep -q 'session/new'; then
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
-  else
-    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
-  fi
-done
-"#;
-
-fn stand_in_backend_spec() -> SpawnSpec {
-    SpawnSpec::new(
-        "sh",
-        vec!["-c".to_string(), STAND_IN_BACKEND_SCRIPT.to_string()],
-    )
-}
-
-fn new_router() -> SharedRouter {
-    let mut router = Router::new("stand-in-agent");
-    router.register_agent("stand-in-agent", stand_in_backend_spec());
-    Arc::new(Mutex::new(router))
-}
-
-/// Same ephemeral-port bring-up as `http_ws_transport_test.rs`, but takes
-/// an explicit `auth_token` to exercise both the disabled (`None`) and
-/// enabled (`Some(..)`) paths.
-async fn spawn_server(router: SharedRouter, auth_token: Option<String>) -> SocketAddr {
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = probe.local_addr().expect("local_addr");
-    drop(probe);
-
-    tokio::spawn(async move {
-        serve(router, addr, auth_token)
-            .await
-            .expect("transport::serve");
-    });
-
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    addr
-}
-
-fn ping_request() -> serde_json::Value {
-    json!({"jsonrpc": "2.0", "id": 1, "method": "agents/list", "params": {}})
 }
 
 /// Baseline: `ACPX_AUTH_TOKEN` unset (`None` here) means every

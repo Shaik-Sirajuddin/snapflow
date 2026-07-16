@@ -261,7 +261,31 @@ impl SessionRegistry {
         tenant_id: &TenantId,
         gateway_id: &GatewaySessionId,
     ) -> Option<SessionEntry> {
-        self.sessions.get_mut(tenant_id)?.remove(&gateway_id.0)
+        let inner = self.sessions.get_mut(tenant_id)?;
+        let removed = inner.remove(&gateway_id.0);
+        // Prune the now-empty tenant entry outright (`tenant_namespace_
+        // governance` hardening item, `acpx-tenant-isolation` plan): a
+        // caller-controlled `X-Acpx-Tenant` value mints a fresh outer map
+        // key on first use; without this, closing every session under it
+        // still leaves an empty `HashMap` sitting in `self.sessions`
+        // forever, so an attacker (or just a buggy client) rotating
+        // arbitrary tenant strings could grow this map unboundedly even
+        // while never holding more than one live session at a time.
+        // `default_tenant()` is exempt -- it is the implicit tenant every
+        // unscoped caller uses and should always resolve to *a* (empty is
+        // fine) map rather than be re-created from scratch mid-request.
+        if inner.is_empty() && *tenant_id != TenantId::default_tenant() {
+            self.sessions.remove(tenant_id);
+        }
+        removed
+    }
+
+    /// Number of distinct tenant namespaces currently tracked (including
+    /// ones with zero live sessions, which should not normally accumulate
+    /// post-[`Self::remove`]'s pruning -- exposed for governance/ops
+    /// visibility and test assertions, not on any hot path).
+    pub fn tenant_count(&self) -> usize {
+        self.sessions.len()
     }
 
     /// Aggregated `session/list` -- all live sessions across every backend.
@@ -397,6 +421,53 @@ mod tests {
         );
         assert!(reg.remove(&tenant, &gid).is_some());
         assert!(reg.resolve(&tenant, &gid).is_none());
+    }
+
+    /// `tenant_namespace_governance` hardening: closing every session
+    /// under a non-default tenant must not leave an empty map entry
+    /// behind, otherwise a caller rotating arbitrary self-declared
+    /// tenant strings could grow `sessions` unboundedly forever.
+    #[test]
+    fn removing_the_last_session_prunes_a_non_default_tenant_namespace() {
+        let mut reg = SessionRegistry::new();
+        let tenant = TenantId::from("acme");
+        assert_eq!(reg.tenant_count(), 0);
+        let gid = reg.register(
+            &tenant,
+            "codex-acp",
+            BackendSessionId("backend-1".to_string()),
+            None,
+            None,
+        );
+        assert_eq!(reg.tenant_count(), 1);
+        assert!(reg.remove(&tenant, &gid).is_some());
+        assert_eq!(
+            reg.tenant_count(),
+            0,
+            "the now-empty tenant namespace should be pruned, not retained"
+        );
+    }
+
+    /// The implicit default tenant is exempt from pruning -- it should
+    /// always resolve to *a* (possibly empty) namespace rather than be
+    /// torn down and re-created on every session churn.
+    #[test]
+    fn removing_the_last_session_keeps_the_default_tenant_namespace() {
+        let mut reg = SessionRegistry::new();
+        let tenant = TenantId::default_tenant();
+        let gid = reg.register(
+            &tenant,
+            "codex-acp",
+            BackendSessionId("backend-1".to_string()),
+            None,
+            None,
+        );
+        assert!(reg.remove(&tenant, &gid).is_some());
+        assert_eq!(
+            reg.tenant_count(),
+            1,
+            "the default tenant namespace stays tracked even with zero sessions"
+        );
     }
 
     #[test]

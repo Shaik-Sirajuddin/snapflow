@@ -112,6 +112,16 @@ pub struct AuthConfig {
     /// doc comment. Empty by default -- every pre-existing caller of
     /// [`AuthConfig::new`] gets exactly the old behavior.
     tenant_tokens: Arc<Vec<(Arc<str>, TenantId)>>,
+    /// Optional tenant namespace allowlist (`ACPX_TENANT_ALLOWLIST`,
+    /// `tenant_namespace_governance` hardening item, `acpx-tenant-
+    /// isolation` plan). `None` (the default) keeps every pre-existing
+    /// deployment's "any caller-declared tenant string is a valid
+    /// namespace" behavior unchanged. `Some(set)` rejects (`403`) any
+    /// resolved tenant not in the set -- checked *after* auth/binding
+    /// resolution in [`resolve_authorized_tenant`], so it applies
+    /// equally to a self-declared header and an authenticated
+    /// tenant-bound token.
+    tenant_allowlist: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 /// Result of resolving a request's authentication, distinguishing "no
@@ -147,6 +157,7 @@ impl AuthConfig {
         Self {
             token: token.map(|t| t.into()),
             tenant_tokens: Arc::new(Vec::new()),
+            tenant_allowlist: None,
         }
     }
 
@@ -165,6 +176,25 @@ impl AuthConfig {
                     .map(|(t, tenant)| (Arc::<str>::from(t), tenant))
                     .collect(),
             ),
+            tenant_allowlist: None,
+        }
+    }
+
+    /// Attaches a tenant namespace allowlist (`ACPX_TENANT_ALLOWLIST`) to
+    /// an already-constructed config. Kept as a separate builder step
+    /// (rather than another constructor parameter) since it is
+    /// orthogonal to *how* a request authenticates -- both
+    /// [`AuthConfig::new`] and [`AuthConfig::with_tenant_tokens`] deployments
+    /// may or may not want it.
+    pub fn with_tenant_allowlist(mut self, allowlist: Option<std::collections::HashSet<String>>) -> Self {
+        self.tenant_allowlist = allowlist.map(Arc::new);
+        self
+    }
+
+    fn tenant_allowed(&self, tenant: &TenantId) -> bool {
+        match &self.tenant_allowlist {
+            None => true,
+            Some(allowlist) => allowlist.contains(&tenant.0),
         }
     }
 
@@ -279,6 +309,9 @@ fn resolve_tenant(headers: &HeaderMap) -> TenantId {
 pub(crate) enum TenantAuthError {
     Unauthorized,
     Mismatch,
+    /// Resolved tenant is not present in the configured
+    /// `ACPX_TENANT_ALLOWLIST`.
+    NotAllowed,
 }
 
 /// Combines [`AuthConfig::authorize_tenant`] with the pre-existing
@@ -292,7 +325,7 @@ pub(crate) fn resolve_authorized_tenant(
     auth: &AuthConfig,
     headers: &HeaderMap,
 ) -> Result<TenantId, TenantAuthError> {
-    match auth.authorize_tenant(headers) {
+    let tenant = match auth.authorize_tenant(headers) {
         AuthOutcome::Unauthorized => Err(TenantAuthError::Unauthorized),
         AuthOutcome::Open | AuthOutcome::Global => Ok(resolve_tenant(headers)),
         AuthOutcome::Bound(tenant) => {
@@ -303,6 +336,11 @@ pub(crate) fn resolve_authorized_tenant(
             }
             Ok(tenant)
         }
+    }?;
+    if auth.tenant_allowed(&tenant) {
+        Ok(tenant)
+    } else {
+        Err(TenantAuthError::NotAllowed)
     }
 }
 
@@ -357,7 +395,15 @@ pub async fn serve_on_with_bridge(
     auth_token: Option<String>,
     bridge: Option<acpx_bridge::BridgeConfig>,
 ) -> anyhow::Result<()> {
-    serve_on_with_bridge_and_tenant_tokens(listener, router, auth_token, Vec::new(), bridge).await
+    serve_on_with_bridge_and_tenant_tokens(
+        listener,
+        router,
+        auth_token,
+        Vec::new(),
+        None,
+        bridge,
+    )
+    .await
 }
 
 /// Same as [`serve_on_with_bridge`], additionally configuring
@@ -372,11 +418,13 @@ pub async fn serve_on_with_bridge_and_tenant_tokens(
     router: SharedRouter,
     auth_token: Option<String>,
     tenant_tokens: Vec<(String, TenantId)>,
+    tenant_allowlist: Option<std::collections::HashSet<String>>,
     bridge: Option<acpx_bridge::BridgeConfig>,
 ) -> anyhow::Result<()> {
     let state = AppState {
         router,
-        auth: AuthConfig::with_tenant_tokens(auth_token, tenant_tokens),
+        auth: AuthConfig::with_tenant_tokens(auth_token, tenant_tokens)
+            .with_tenant_allowlist(tenant_allowlist),
         bridge: bridge.map(Arc::new),
         bridge_runtime: None,
     };
@@ -473,7 +521,7 @@ async fn rpc_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return unauthorized_response(&request),
-        Err(TenantAuthError::Mismatch) => return tenant_mismatch_response(&request),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return tenant_mismatch_response(&request),
     };
     inject_profile_header(&headers, &mut request);
     let response =
@@ -494,7 +542,7 @@ async fn acp_rpc_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return unauthorized_response(&request),
-        Err(TenantAuthError::Mismatch) => return tenant_mismatch_response(&request),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return tenant_mismatch_response(&request),
     };
     let Some(runtime) = &state.bridge_runtime else {
         return StatusCode::NOT_FOUND.into_response();
@@ -515,7 +563,7 @@ async fn acp_agents_handler(State(state): State<AppState>, headers: HeaderMap) -
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
     };
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -559,7 +607,7 @@ async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
     };
     let request = serde_json::json!({
         "jsonrpc": "2.0",
