@@ -111,6 +111,12 @@ pub struct RecoveryMetadata {
     pub status: RecoveryStatus,
     pub recovery_method: RecoveryMethod,
     pub last_recovery_error: Option<String>,
+    /// Durable wall-clock lifecycle values. They are optional so a database
+    /// created before lifecycle continuity shipped can be migrated without
+    /// making old rows immediately eligible for TTL reaping on restart.
+    pub created_at_unix_nanos: Option<i64>,
+    pub last_activity_at_unix_nanos: Option<i64>,
+    pub pinned: bool,
 }
 
 impl Default for RecoveryMetadata {
@@ -121,6 +127,9 @@ impl Default for RecoveryMetadata {
             status: RecoveryStatus::Active,
             recovery_method: RecoveryMethod::None,
             last_recovery_error: None,
+            created_at_unix_nanos: None,
+            last_activity_at_unix_nanos: None,
+            pinned: false,
         }
     }
 }
@@ -151,4 +160,13 @@ pub struct SessionRecord {
     pub status: RecoveryStatus,
     pub recovery_method: RecoveryMethod,
     pub last_recovery_error: Option<String>,
+    /// Explicit lifecycle retention override. `false` is the safe migration
+    /// default: old rows retain their existing TTL behavior.
+    pub pinned: bool,
+    /// Wall-clock creation time used to reconstruct a conservative monotonic
+    /// lifetime after a daemon restart. `None` denotes a pre-lifecycle row.
+    pub created_at_unix_nanos: Option<i64>,
+    /// Wall-clock last activity used to reconstruct the idle deadline after
+    /// a daemon restart. `None` denotes a pre-lifecycle row.
+    pub last_activity_at_unix_nanos: Option<i64>,
 }

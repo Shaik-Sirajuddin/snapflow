@@ -3246,3 +3246,20 @@ cleanup and durable failure status, and fail-fast behavior using real
 shell-backed ACP processes. Verified with
 `cargo test --workspace --no-fail-fast`; credentialed ambient tests
 remain intentionally ignored.
+
+## Phase 37: durable lifecycle continuity
+
+The SQLite `sessions` record now persists the explicit pin flag plus
+wall-clock creation and last-activity timestamps. On recovery ACPX derives
+fresh monotonic `Instant` values from those timestamps, preserving idle and
+absolute-TTL age without depending on wall-clock continuity. Rows created by
+older releases retain NULL lifecycle timestamps and conservatively restart
+their TTL clock rather than being reaped immediately after migration.
+
+Session creation, completed proxied work, and explicit pin/unpin operations
+write the durable lifecycle state. Recovery restores pin state before the
+session enters the live registry. Focused tests cover migration defaults,
+persisted pinning, pinned recovery surviving an expired idle TTL, and stale
+recovered activity becoming eligible for safe backend close. Verified with
+`cargo test --workspace --no-fail-fast`; credentialed ambient tests remain
+intentionally ignored.

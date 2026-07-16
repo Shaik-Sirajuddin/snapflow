@@ -41,6 +41,9 @@ async fn session_round_trips_and_starts_unclosed() {
     assert_eq!(fetched.cwd, None);
     assert_eq!(fetched.recovery_params, None);
     assert_eq!(fetched.last_recovery_error, None);
+    assert!(!fetched.pinned);
+    assert!(fetched.created_at_unix_nanos.is_some());
+    assert!(fetched.last_activity_at_unix_nanos.is_some());
 
     store
         .close_session("gw-1", "2026-07-12T01:00:00Z")
@@ -73,6 +76,7 @@ async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
                 status: RecoveryStatus::Active,
                 recovery_method: RecoveryMethod::Load,
                 last_recovery_error: None,
+                ..RecoveryMetadata::default()
             },
         )
         .await
@@ -421,6 +425,9 @@ async fn pre_recovery_database_migrates_all_recovery_columns_idempotently() {
     assert_eq!(migrated.cwd, None);
     assert_eq!(migrated.recovery_params, None);
     assert_eq!(migrated.last_recovery_error, None);
+    assert!(!migrated.pinned);
+    assert_eq!(migrated.created_at_unix_nanos, None);
+    assert_eq!(migrated.last_activity_at_unix_nanos, None);
 
     PersistenceStore::open(&db_path).expect("rerun idempotent recovery migration");
 }

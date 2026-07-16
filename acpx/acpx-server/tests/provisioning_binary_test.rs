@@ -123,6 +123,7 @@ async fn seed_recoverable_session(db_path: &std::path::Path, profile_name: Optio
                 status: RecoveryStatus::Active,
                 recovery_method: RecoveryMethod::Load,
                 last_recovery_error: None,
+                ..RecoveryMetadata::default()
             },
         )
         .await

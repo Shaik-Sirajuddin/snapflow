@@ -112,14 +112,21 @@ impl PersistenceStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let created_at_unix_nanos = recovery
+            .created_at_unix_nanos
+            .unwrap_or_else(unix_time_nanos);
+        let last_activity_at_unix_nanos = recovery
+            .last_activity_at_unix_nanos
+            .unwrap_or(created_at_unix_nanos);
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
             conn.execute(
                 "INSERT INTO sessions \
                  (gateway_session_id, agent_id, backend_session_id, profile_name, created_at, tenant_id, \
-                  cwd, recovery_params_json, status, recovery_method, last_recovery_error) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  cwd, recovery_params_json, status, recovery_method, last_recovery_error, pinned, \
+                  created_at_unix_nanos, last_activity_at_unix_nanos) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     gateway_session_id,
                     agent_id,
@@ -131,7 +138,10 @@ impl PersistenceStore {
                     recovery_params_json,
                     recovery.status,
                     recovery.recovery_method,
-                    recovery.last_recovery_error
+                    recovery.last_recovery_error,
+                    recovery.pinned as i64,
+                    created_at_unix_nanos,
+                    last_activity_at_unix_nanos
                 ],
             )?;
             Ok(())
@@ -175,7 +185,8 @@ impl PersistenceStore {
             let mut stmt = conn.prepare(
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
-                        recovery_method, last_recovery_error \
+                        recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
+                        last_activity_at_unix_nanos \
                  FROM sessions WHERE gateway_session_id = ?1",
             )?;
             let mut rows = stmt.query_map(params![gateway_session_id], row_to_session_record)?;
@@ -198,7 +209,8 @@ impl PersistenceStore {
             let mut stmt = conn.prepare(
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
-                        recovery_method, last_recovery_error \
+                        recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
+                        last_activity_at_unix_nanos \
                  FROM sessions ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
@@ -216,7 +228,8 @@ impl PersistenceStore {
             let mut stmt = conn.prepare(
                 "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
                         created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
-                        recovery_method, last_recovery_error \
+                        recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
+                        last_activity_at_unix_nanos \
                  FROM sessions \
                  WHERE closed_at IS NULL \
                    AND status != 'closed' \
@@ -247,6 +260,59 @@ impl PersistenceStore {
                  SET status = ?1, last_recovery_error = ?2 \
                  WHERE gateway_session_id = ?3",
                 params![status, last_recovery_error, gateway_session_id],
+            )?;
+            if rows == 0 {
+                return Err(PersistenceError::SessionNotFound(gateway_session_id));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Record completed backend work without changing the session's explicit
+    /// retention mode.
+    pub async fn update_session_activity(
+        &self,
+        gateway_session_id: impl Into<String>,
+        last_activity_at_unix_nanos: i64,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let rows = conn.execute(
+                "UPDATE sessions SET last_activity_at_unix_nanos = ?1 WHERE gateway_session_id = ?2",
+                params![last_activity_at_unix_nanos, gateway_session_id],
+            )?;
+            if rows == 0 {
+                return Err(PersistenceError::SessionNotFound(gateway_session_id));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Persist an explicit pin/unpin operation together with the activity
+    /// refresh it induces.
+    pub async fn update_session_pinned(
+        &self,
+        gateway_session_id: impl Into<String>,
+        pinned: bool,
+        last_activity_at_unix_nanos: i64,
+    ) -> Result<(), PersistenceError> {
+        let gateway_session_id = gateway_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let rows = conn.execute(
+                "UPDATE sessions \
+                 SET pinned = ?1, last_activity_at_unix_nanos = ?2 \
+                 WHERE gateway_session_id = ?3",
+                params![
+                    pinned as i64,
+                    last_activity_at_unix_nanos,
+                    gateway_session_id
+                ],
             )?;
             if rows == 0 {
                 return Err(PersistenceError::SessionNotFound(gateway_session_id));
@@ -404,6 +470,9 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         status: row.get(9)?,
         recovery_method: row.get(10)?,
         last_recovery_error: row.get(11)?,
+        pinned: row.get::<_, i64>(12)? != 0,
+        created_at_unix_nanos: row.get(13)?,
+        last_activity_at_unix_nanos: row.get(14)?,
     })
 }
 
@@ -426,6 +495,9 @@ fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
         ("status", "TEXT NOT NULL DEFAULT 'active'"),
         ("recovery_method", "TEXT NOT NULL DEFAULT 'none'"),
         ("last_recovery_error", "TEXT"),
+        ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ("created_at_unix_nanos", "INTEGER"),
+        ("last_activity_at_unix_nanos", "INTEGER"),
     ] {
         if !column_names.iter().any(|column| column == name) {
             conn.execute(
@@ -435,6 +507,13 @@ fn migrate_sessions_columns(conn: &Connection) -> Result<(), PersistenceError> {
         }
     }
     Ok(())
+}
+
+fn unix_time_nanos() -> i64 {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
 }
 
 fn lock(

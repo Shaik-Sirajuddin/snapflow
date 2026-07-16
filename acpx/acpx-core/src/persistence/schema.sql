@@ -20,7 +20,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     recovery_params_json TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     recovery_method TEXT NOT NULL DEFAULT 'none',
-    last_recovery_error TEXT
+    last_recovery_error TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at_unix_nanos INTEGER,
+    last_activity_at_unix_nanos INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS transcripts (

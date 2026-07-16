@@ -674,18 +674,23 @@ impl Router {
 
     /// Lifecycle-management seam used by the server's future authenticated
     /// retention controls. Pinning never bypasses explicit `session/close`.
-    pub fn set_session_pinned(
+    pub async fn set_session_pinned(
         &mut self,
         tenant_id: &TenantId,
         gateway_session_id: &str,
         pinned: bool,
     ) -> Result<(), RouterError> {
         let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
-        if self.sessions.set_pinned(tenant_id, &gateway_id, pinned) {
-            Ok(())
-        } else {
-            Err(RouterError::UnknownSession(gateway_session_id.to_string()))
+        if self.sessions.resolve(tenant_id, &gateway_id).is_none() {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
+        if let Some(store) = self.persistence.clone() {
+            store
+                .update_session_pinned(gateway_session_id.to_string(), pinned, now_unix_nanos())
+                .await?;
+        }
+        self.sessions.set_pinned(tenant_id, &gateway_id, pinned);
+        Ok(())
     }
 
     fn admit_session(&self, tenant_id: &TenantId) -> Result<SessionAdmissionPermit, RouterError> {
@@ -909,6 +914,9 @@ impl Router {
                     status: RecoveryStatus::Active,
                     recovery_method: RecoveryMethod::Load,
                     last_recovery_error: None,
+                    created_at_unix_nanos: Some(now_unix_nanos()),
+                    last_activity_at_unix_nanos: Some(now_unix_nanos()),
+                    pinned: entry.pinned,
                 },
             )
             .await?;
@@ -1148,10 +1156,10 @@ impl Router {
                 backend_session_id: BackendSessionId(record.backend_session_id.clone()),
                 profile_name: record.profile_name.clone(),
                 cwd: record.cwd.clone(),
-                created_at: std::time::Instant::now(),
-                last_activity_at: std::time::Instant::now(),
+                created_at: restore_lifecycle_instant(record.created_at_unix_nanos),
+                last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
                 in_flight: 0,
-                pinned: false,
+                pinned: record.pinned,
             },
             admission,
             backend,
@@ -1773,10 +1781,10 @@ impl Router {
             backend_session_id: BackendSessionId(record.backend_session_id),
             profile_name: record.profile_name,
             cwd: record.cwd,
-            created_at: std::time::Instant::now(),
-            last_activity_at: std::time::Instant::now(),
+            created_at: restore_lifecycle_instant(record.created_at_unix_nanos),
+            last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
             in_flight: 0,
-            pinned: false,
+            pinned: record.pinned,
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -1879,6 +1887,15 @@ impl Router {
                 read_matching_response(&mut backend, &id, call_policy, None).await?;
             attach_updates(response, notifications, agent_requests)
         };
+        self.sessions.touch(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        );
+        if let Some(store) = self.persistence.clone() {
+            store
+                .update_session_activity(gateway_session_id.clone(), now_unix_nanos())
+                .await?;
+        }
         self.spawn_transcript(
             gateway_session_id.clone(),
             Direction::AgentToClient,
@@ -4189,6 +4206,11 @@ async fn dispatch_proxied_shared(
             0,
         );
     }
+    if let Some(store) = persistence.clone() {
+        store
+            .update_session_activity(gateway_session_id.clone(), now_unix_nanos())
+            .await?;
+    }
     let response = response_result?;
 
     spawn_transcript_fn(
@@ -4494,6 +4516,9 @@ async fn dispatch_session_new_shared(
                     status: RecoveryStatus::Active,
                     recovery_method: RecoveryMethod::Load,
                     last_recovery_error: None,
+                    created_at_unix_nanos: Some(now_unix_nanos()),
+                    last_activity_at_unix_nanos: Some(now_unix_nanos()),
+                    pinned: entry.pinned,
                 },
             )
             .await
@@ -4532,6 +4557,27 @@ fn now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
+}
+
+fn now_unix_nanos() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(now.as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// Rebuild a monotonic lifecycle deadline from durable wall time. A missing
+/// timestamp comes from a database predating lifecycle persistence, so it
+/// deliberately restarts at `now` instead of expiring the session on boot.
+fn restore_lifecycle_instant(stored_unix_nanos: Option<i64>) -> std::time::Instant {
+    let Some(stored_unix_nanos) = stored_unix_nanos.filter(|value| *value > 0) else {
+        return std::time::Instant::now();
+    };
+    let elapsed_nanos = now_unix_nanos().saturating_sub(stored_unix_nanos);
+    let elapsed_nanos = u64::try_from(elapsed_nanos).unwrap_or(u64::MAX);
+    std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_nanos(elapsed_nanos))
+        .unwrap_or_else(std::time::Instant::now)
 }
 
 /// Mask every value in a serialized `Profile`'s `launch_overrides` map

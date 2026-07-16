@@ -56,6 +56,20 @@ async fn session_new_persists_session_metadata_and_transcripts() {
     assert_eq!(sessions[0].gateway_session_id, gateway_id);
     assert_eq!(sessions[0].agent_id, "stand-in-agent");
     assert!(sessions[0].closed_at.is_none());
+    assert!(sessions[0].created_at_unix_nanos.is_some());
+    assert!(sessions[0].last_activity_at_unix_nanos.is_some());
+
+    router
+        .set_session_pinned(&acpx_core::TenantId::default_tenant(), &gateway_id, true)
+        .await
+        .expect("pin persisted session");
+    let pinned = store
+        .get_session(gateway_id.clone())
+        .await
+        .expect("get pinned session")
+        .expect("session exists");
+    assert!(pinned.pinned);
+    assert!(pinned.last_activity_at_unix_nanos.is_some());
 
     let mut transcripts = Vec::new();
     for _ in 0..150 {

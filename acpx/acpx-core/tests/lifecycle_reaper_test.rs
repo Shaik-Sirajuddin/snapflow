@@ -82,6 +82,7 @@ async fn pinned_session_is_not_a_reaper_candidate() {
     let session_id = new_session(&mut router, 1).await;
     router
         .set_session_pinned(&acpx_core::TenantId::default_tenant(), &session_id, true)
+        .await
         .expect("pin session");
     tokio::time::sleep(Duration::from_millis(1)).await;
     let report = router

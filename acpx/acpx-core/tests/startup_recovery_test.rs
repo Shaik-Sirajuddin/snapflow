@@ -9,6 +9,7 @@ use acpx_core::persistence::{
 use acpx_core::{
     recover_open_sessions_shared,
     router::{Router, StartupRecoveryPolicy},
+    LifecycleConfig,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -86,10 +87,18 @@ async fn seed_load_candidate(store: &PersistenceStore, gateway_id: &str, agent_i
                 status: RecoveryStatus::Active,
                 recovery_method: RecoveryMethod::Load,
                 last_recovery_error: None,
+                ..RecoveryMetadata::default()
             },
         )
         .await
         .expect("persist recovery candidate");
+}
+
+fn unix_nanos() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after unix epoch");
+    i64::try_from(now.as_nanos()).expect("current epoch nanos fit i64")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -112,6 +121,7 @@ async fn startup_recovery_loads_before_prompt_and_restores_gateway_session() {
                 status: RecoveryStatus::Active,
                 recovery_method: RecoveryMethod::Load,
                 last_recovery_error: None,
+                ..RecoveryMetadata::default()
             },
         )
         .await
@@ -202,6 +212,7 @@ async fn startup_recovery_uses_persisted_resume_method_before_prompt() {
                 status: RecoveryStatus::Active,
                 recovery_method: RecoveryMethod::Resume,
                 last_recovery_error: None,
+                ..RecoveryMetadata::default()
             },
         )
         .await
@@ -260,6 +271,111 @@ async fn startup_recovery_uses_persisted_resume_method_before_prompt() {
             .iter()
             .any(|line| line.starts_with("session/load\t")),
         "resume candidate must not be rewritten to session/load: {methods:?}"
+    );
+    let _ = tokio::fs::remove_file(log_path).await;
+}
+
+#[tokio::test]
+async fn startup_recovery_preserves_pinned_retention_state() {
+    let store = PersistenceStore::open_in_memory().expect("open persistence store");
+    let stale = unix_nanos() - 5_000_000_000;
+    store
+        .record_session_with_recovery(
+            "gateway-pinned",
+            "stand-in-agent",
+            "backend-pinned",
+            None,
+            "2026-01-01T00:00:00Z",
+            "default",
+            RecoveryMetadata {
+                cwd: Some("/workspace".to_string()),
+                recovery_params: Some(json!({"cwd": "/workspace"})),
+                status: RecoveryStatus::Active,
+                recovery_method: RecoveryMethod::Load,
+                last_recovery_error: None,
+                created_at_unix_nanos: Some(stale),
+                last_activity_at_unix_nanos: Some(stale),
+                pinned: true,
+            },
+        )
+        .await
+        .expect("persist pinned recovery candidate");
+
+    let log_path =
+        std::env::temp_dir().join(format!("acpx-pinned-recovery-{}.log", uuid::Uuid::new_v4()));
+    let mut router = Router::new("stand-in-agent")
+        .with_persistence(store)
+        .with_lifecycle_config(LifecycleConfig {
+            idle_session_ttl: Duration::from_millis(1),
+            ..Default::default()
+        });
+    router.register_agent("stand-in-agent", recording_backend_spec(&log_path));
+    assert_eq!(
+        router
+            .recover_open_sessions()
+            .await
+            .expect("startup recovery")
+            .restored,
+        1
+    );
+    let report = router.reap_expired_sessions(Instant::now()).await;
+    assert_eq!(report.closed, 0);
+    let _ = tokio::fs::remove_file(log_path).await;
+}
+
+#[tokio::test]
+async fn startup_recovery_retains_stale_activity_for_lifecycle_reaping() {
+    let store = PersistenceStore::open_in_memory().expect("open persistence store");
+    let stale = unix_nanos() - 5_000_000_000;
+    store
+        .record_session_with_recovery(
+            "gateway-stale",
+            "stand-in-agent",
+            "backend-stale",
+            None,
+            "2026-01-01T00:00:00Z",
+            "default",
+            RecoveryMetadata {
+                cwd: Some("/workspace".to_string()),
+                recovery_params: Some(json!({"cwd": "/workspace"})),
+                status: RecoveryStatus::Active,
+                recovery_method: RecoveryMethod::Load,
+                last_recovery_error: None,
+                created_at_unix_nanos: Some(stale),
+                last_activity_at_unix_nanos: Some(stale),
+                pinned: false,
+            },
+        )
+        .await
+        .expect("persist stale recovery candidate");
+
+    let log_path =
+        std::env::temp_dir().join(format!("acpx-stale-recovery-{}.log", uuid::Uuid::new_v4()));
+    let mut router = Router::new("stand-in-agent")
+        .with_persistence(store.clone())
+        .with_lifecycle_config(LifecycleConfig {
+            idle_session_ttl: Duration::from_millis(1),
+            ..Default::default()
+        });
+    router.register_agent("stand-in-agent", recording_backend_spec(&log_path));
+    assert_eq!(
+        router
+            .recover_open_sessions()
+            .await
+            .expect("startup recovery")
+            .restored,
+        1
+    );
+    let report = router.reap_expired_sessions(Instant::now()).await;
+    assert_eq!(report.closed, 1);
+    assert_eq!(
+        store
+            .get_session("gateway-stale")
+            .await
+            .expect("get stale session")
+            .expect("stale session exists")
+            .status,
+        RecoveryStatus::Closed
     );
     let _ = tokio::fs::remove_file(log_path).await;
 }
