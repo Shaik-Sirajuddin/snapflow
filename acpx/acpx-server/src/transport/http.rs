@@ -359,7 +359,7 @@ async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -
     if !state.auth.authorize(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let Some(bridge) = &state.bridge else {
+    let Some(runtime) = &state.bridge_runtime else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let tenant_id = resolve_tenant(&headers);
@@ -375,9 +375,10 @@ async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -
             Err(err) => return Json(json_rpc_error(&request, err)).into_response(),
         };
     let agents_result = response.get("result").cloned().unwrap_or_default();
+    runtime.refresh_models(&state.router).await;
     Json(serde_json::json!({
-        "defaultModel": bridge.default_model,
-        "models": bridge.public_models(&agents_result),
+        "defaultModel": runtime.config.default_model,
+        "models": runtime.public_models(&agents_result).await,
     }))
     .into_response()
 }

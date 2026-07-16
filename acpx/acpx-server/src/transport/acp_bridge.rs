@@ -6,15 +6,17 @@
 //! needs a backend. This module deliberately delegates all backend work to
 //! `acpx_core::Router`; it does not own a second process manager.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use acpx_bridge::BridgeConfig;
+use acpx_bridge::{BridgeConfig, BridgeModel};
 use acpx_core::router::{dispatch_shared_for_tenant, RouterError};
 use acpx_core::{
     BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
     BridgeSessionStore, TenantId,
 };
 use serde_json::{json, Value};
+use tokio::sync::RwLock;
 
 use super::SharedRouter;
 
@@ -45,14 +47,84 @@ pub enum BridgeDispatchError {
 pub struct BridgeRuntime {
     pub config: Arc<BridgeConfig>,
     pub sessions: BridgeSessionStore,
+    models: Arc<RwLock<Vec<BridgeModel>>>,
 }
 
 impl BridgeRuntime {
     pub fn new(config: Arc<BridgeConfig>) -> Self {
         Self {
+            models: Arc::new(RwLock::new(config.models.clone())),
             config,
             sessions: BridgeSessionStore::new(),
         }
+    }
+
+    /// Refreshes public models from each configured adapter's cached
+    /// capability probe. Static entries remain as an operator fallback, but
+    /// every discovered model is exposed without hand-maintaining aliases.
+    pub async fn refresh_models(&self, router: &SharedRouter) {
+        let agent_ids: Vec<String> = self
+            .config
+            .agent_ids()
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        let mut discovered = Vec::new();
+        for agent_id in agent_ids {
+            let capabilities = {
+                let mut router = router.lock().await;
+                router.probe_adapter_capabilities(&agent_id, "/tmp").await
+            };
+            let Ok(capabilities) = capabilities else {
+                continue;
+            };
+            let namespace = agent_id.strip_suffix("-acp").unwrap_or(&agent_id);
+            discovered.extend(capabilities.models.into_iter().map(|model| BridgeModel {
+                id: format!("{namespace}/{}", model.value),
+                name: Some(model.name),
+                agent_id: agent_id.clone(),
+                model_id: model.value,
+            }));
+        }
+        if discovered.is_empty() {
+            return;
+        }
+        let mut models = self.models.write().await;
+        let mut seen: HashSet<String> = models.iter().map(|model| model.id.clone()).collect();
+        models.extend(
+            discovered
+                .into_iter()
+                .filter(|model| seen.insert(model.id.clone())),
+        );
+    }
+
+    pub async fn resolve_model(&self, alias: &str) -> Option<BridgeModel> {
+        self.models
+            .read()
+            .await
+            .iter()
+            .find(|model| model.id == alias)
+            .cloned()
+    }
+
+    pub async fn model_config_options(&self) -> Value {
+        let models = self.models.read().await;
+        json!([{
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": self.config.default_model,
+            "options": models.iter().map(|model| json!({
+                "value": model.id,
+                "name": model.name.as_deref().unwrap_or(&model.id),
+            })).collect::<Vec<_>>(),
+        }])
+    }
+
+    pub async fn public_models(&self, agents_result: &Value) -> Vec<acpx_bridge::PublicModel> {
+        let models = self.models.read().await;
+        BridgeConfig::public_models_for(&models, agents_result)
     }
 
     pub fn bound_gateway_session_id(
@@ -81,8 +153,9 @@ pub async fn dispatch(
     tenant_id: &TenantId,
     request: Value,
 ) -> Result<Value, BridgeDispatchError> {
+    runtime.refresh_models(router).await;
     match request.get("method").and_then(Value::as_str) {
-        Some("session/new") => new_session(runtime, tenant_id, request),
+        Some("session/new") => new_session(runtime, tenant_id, request).await,
         Some("session/set_config_option") => {
             set_config_option(router, runtime, tenant_id, request).await
         }
@@ -102,7 +175,7 @@ pub async fn dispatch(
     }
 }
 
-fn new_session(
+async fn new_session(
     runtime: &BridgeRuntime,
     tenant_id: &TenantId,
     request: Value,
@@ -119,7 +192,7 @@ fn new_session(
         "id": request.get("id").cloned().unwrap_or(Value::Null),
         "result": {
             "sessionId": session_id.0,
-            "configOptions": runtime.config.model_config_options(),
+            "configOptions": runtime.model_config_options().await,
         }
     }))
 }
@@ -144,9 +217,9 @@ async fn set_config_option(
         return Err(BridgeDispatchError::InvalidModelSelection);
     }
     let selected = runtime
-        .config
         .resolve_model(model_alias)
-        .map_err(|_| BridgeDispatchError::UnknownModel(model_alias.to_string()))?;
+        .await
+        .ok_or_else(|| BridgeDispatchError::UnknownModel(model_alias.to_string()))?;
     let session = runtime
         .sessions
         .get(tenant_id, &session_id)
@@ -162,7 +235,7 @@ async fn set_config_option(
                 .select_model(tenant_id, &session_id, selected.id.clone())?;
             Ok(success(
                 &request,
-                json!({"configOptions": runtime.config.model_config_options()}),
+                json!({"configOptions": runtime.model_config_options().await}),
             ))
         }
         BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
@@ -173,9 +246,9 @@ async fn set_config_option(
                 .as_deref()
                 .unwrap_or(&runtime.config.default_model);
             let current = runtime
-                .config
                 .resolve_model(current_alias)
-                .map_err(|_| BridgeDispatchError::UnknownModel(current_alias.to_string()))?;
+                .await
+                .ok_or_else(|| BridgeDispatchError::UnknownModel(current_alias.to_string()))?;
             if current.agent_id != selected.agent_id {
                 return Err(BridgeDispatchError::CrossAdapterModelSwitch);
             }
@@ -191,7 +264,7 @@ async fn set_config_option(
                 if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
                     result
                         .entry("configOptions".to_string())
-                        .or_insert_with(|| runtime.config.model_config_options());
+                        .or_insert(runtime.model_config_options().await);
                 }
             }
             Ok(response)
@@ -319,9 +392,9 @@ async fn bind(
         .selected_public_model_alias
         .as_deref()
         .unwrap_or(&runtime.config.default_model);
-    let model = match runtime.config.resolve_model(model_alias) {
-        Ok(model) => model.clone(),
-        Err(_) => {
+    let model = match runtime.resolve_model(model_alias).await {
+        Some(model) => model,
+        None => {
             let _ = runtime.sessions.fail_binding(tenant_id, virtual_id);
             return Err(BridgeDispatchError::UnknownModel(model_alias.to_string()));
         }

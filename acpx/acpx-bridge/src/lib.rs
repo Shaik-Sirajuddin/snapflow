@@ -164,6 +164,15 @@ impl BridgeConfig {
     /// currently detected as installed; model entitlement validation is a
     /// later probe phase and must not be guessed here.
     pub fn public_models(&self, agents_result: &serde_json::Value) -> Vec<PublicModel> {
+        Self::public_models_for(&self.models, agents_result)
+    }
+
+    /// Same filtering as [`Self::public_models`], but accepts a runtime
+    /// discovered catalog maintained by the bridge transport.
+    pub fn public_models_for(
+        models: &[BridgeModel],
+        agents_result: &serde_json::Value,
+    ) -> Vec<PublicModel> {
         let installed_agents: HashSet<&str> = agents_result
             .get("agents")
             .and_then(serde_json::Value::as_array)
@@ -176,7 +185,7 @@ impl BridgeConfig {
             })
             .collect();
 
-        self.models
+        models
             .iter()
             .map(|model| PublicModel {
                 id: model.id.clone(),
