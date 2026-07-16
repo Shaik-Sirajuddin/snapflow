@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "acpx daemon entrypoint: transport layer + gateway API"
 
+[features]
+default = ["startup-session-recovery"]
+startup-session-recovery = ["acpx-core/startup-session-recovery"]
+
 [[bin]]
 name = "acpx-server"
 path = "src/main.rs"

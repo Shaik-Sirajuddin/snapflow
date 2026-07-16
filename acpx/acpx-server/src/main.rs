@@ -88,13 +88,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if config.startup_session_recovery_enabled {
-        let report = router.recover_open_sessions().await?;
-        tracing::info!(
-            restored = report.restored,
-            failed = report.failed,
-            skipped = report.skipped,
-            "completed startup session recovery"
-        );
+        #[cfg(feature = "startup-session-recovery")]
+        {
+            let report = router.recover_open_sessions().await?;
+            tracing::info!(
+                restored = report.restored,
+                failed = report.failed,
+                skipped = report.skipped,
+                "completed startup session recovery"
+            );
+        }
+        #[cfg(not(feature = "startup-session-recovery"))]
+        {
+            anyhow::bail!(
+                "ACPX_STARTUP_SESSION_RECOVERY_ENABLED requests startup recovery, \
+                 but this acpx-server build excludes the startup-session-recovery feature"
+            );
+        }
     } else {
         tracing::info!("startup session recovery disabled");
     }
