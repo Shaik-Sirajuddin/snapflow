@@ -15,13 +15,59 @@ use acpx_core::persistence::{sessions::RecoveryStatus, PersistenceStore};
 use acpx_core::router::{dispatch_shared_for_tenant, RouterError};
 use acpx_core::{
     BindingClaim, BridgeSession, BridgeSessionError, BridgeSessionId, BridgeSessionState,
-    BridgeSessionStore, TenantId,
+    BridgeSessionStore, InteractionBinding, InteractionHub, TenantId,
 };
 use acpx_proto::session::NewSessionParams;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 
 use super::SharedRouter;
+
+/// Live-connection hook so a backend-initiated request mid-`session/prompt`
+/// (`session/request_permission`, `fs/*`, `terminal/*`) reaches the actual
+/// `/acp` client instead of always falling through to the static
+/// `Profile`/`CallPolicy` auto-answer. Mirrors `transport::ws::handle_socket`'s
+/// native-transport binding, translated one level down: the bridge's virtual
+/// session id is not the key `InteractionHub` uses (it only ever knows the
+/// native/gateway session id), so binding must happen the moment a virtual
+/// session's native id becomes known -- i.e. inside [`bind`] itself, right
+/// before the very first `session/prompt` round trip that lazy-bind kicks
+/// off, not after the fact. A `POST /acp/rpc` one-shot call passes `None`,
+/// same "no persistent connection to hand an interactive request to"
+/// reasoning as every other one-shot path in this codebase.
+#[derive(Clone)]
+pub(crate) struct BridgeInteractionCtx {
+    pub hub: InteractionHub,
+    pub sender: mpsc::UnboundedSender<Value>,
+    /// Keyed by native/gateway session id (not the bridge's virtual id) so
+    /// a reconnect or a second bridge session sharing an agent process
+    /// never collide; owned by the WS connection so it can unbind every
+    /// entry on disconnect.
+    pub bindings: Arc<AsyncMutex<HashMap<String, InteractionBinding>>>,
+}
+
+impl BridgeInteractionCtx {
+    /// (Re-)assert this connection as the answerer for `native_id`. Safe to
+    /// call on every prompt-shaped request, not just the first: `bind`'s
+    /// "newer bind replaces older owner" semantics make this idempotent for
+    /// the common case (this same connection re-asserting itself) and
+    /// correct for the reconnect case (a new connection taking over from a
+    /// stale one).
+    async fn claim(&self, tenant_id: &TenantId, native_id: &str) {
+        let binding = self
+            .hub
+            .bind(tenant_id.clone(), native_id.to_string(), self.sender.clone())
+            .await;
+        let previous = self
+            .bindings
+            .lock()
+            .await
+            .insert(native_id.to_string(), binding);
+        if let Some(previous) = previous {
+            self.hub.unbind(&previous).await;
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeDispatchError {
@@ -257,6 +303,21 @@ pub async fn dispatch(
     tenant_id: &TenantId,
     request: Value,
 ) -> Result<Value, BridgeDispatchError> {
+    dispatch_with_interaction(router, runtime, tenant_id, request, None).await
+}
+
+/// Same as [`dispatch`], but callers on a persistent transport (currently
+/// only `transport::ws::handle_acp_socket`) pass `interaction` so a
+/// backend-initiated request mid-turn reaches this exact connection instead
+/// of the static policy fallback. See [`BridgeInteractionCtx`]'s doc comment
+/// for why this can't simply be bolted on after the fact.
+pub(crate) async fn dispatch_with_interaction(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    request: Value,
+    interaction: Option<&BridgeInteractionCtx>,
+) -> Result<Value, BridgeDispatchError> {
     runtime.refresh_models(router).await;
     match request.get("method").and_then(Value::as_str) {
         Some("session/new") => new_session(runtime, tenant_id, request).await,
@@ -266,11 +327,13 @@ pub async fn dispatch(
         Some("session/close") | Some("session/delete") => {
             close_or_delete(router, runtime, tenant_id, request).await
         }
-        Some("session/fork") => fork_session(router, runtime, tenant_id, request).await,
+        Some("session/fork") => {
+            fork_session(router, runtime, tenant_id, request, interaction).await
+        }
         Some(
             "session/prompt" | "session/cancel" | "session/load" | "session/resume"
             | "session/set_mode",
-        ) => forward_bound(router, runtime, tenant_id, request).await,
+        ) => forward_bound(router, runtime, tenant_id, request, interaction).await,
         Some(_) => {
             reject_acpx_extension(&request)?;
             Ok(dispatch_shared_for_tenant(router, tenant_id, request).await?)
@@ -448,6 +511,7 @@ async fn forward_bound(
     runtime: &BridgeRuntime,
     tenant_id: &TenantId,
     request: Value,
+    interaction: Option<&BridgeInteractionCtx>,
 ) -> Result<Value, BridgeDispatchError> {
     reject_acpx_extension(&request)?;
     let session_id = request_session_id(&request)?;
@@ -466,6 +530,15 @@ async fn forward_bound(
         BridgeSessionState::Failed => return Err(BridgeDispatchError::BindingFailed),
         BridgeSessionState::Bound => session,
     };
+    // Must happen before the round trip below, not after: this exact call
+    // (the lazy-bind case above included) is where a backend-initiated
+    // `session/request_permission` can be raised, and `try_forward_interaction`
+    // only ever gets one shot per request -- no live binding yet means it
+    // silently falls back to the static policy answer for this entire turn.
+    if let (Some(ctx), Some(native_id)) = (interaction, session.bound_gateway_session_id.as_deref())
+    {
+        ctx.claim(tenant_id, native_id).await;
+    }
     forward_session_request(router, tenant_id, &session, request).await
 }
 
@@ -474,6 +547,7 @@ async fn fork_session(
     runtime: &BridgeRuntime,
     tenant_id: &TenantId,
     request: Value,
+    interaction: Option<&BridgeInteractionCtx>,
 ) -> Result<Value, BridgeDispatchError> {
     reject_acpx_extension(&request)?;
     let source_id = request_session_id(&request)?;
@@ -489,6 +563,10 @@ async fn fork_session(
         BridgeSessionState::Failed => return Err(BridgeDispatchError::BindingFailed),
         BridgeSessionState::Bound => source,
     };
+    if let (Some(ctx), Some(native_id)) = (interaction, source.bound_gateway_session_id.as_deref())
+    {
+        ctx.claim(tenant_id, native_id).await;
+    }
     let mut native_request = request.clone();
     native_request["params"]["sessionId"] = Value::String(
         source
@@ -511,6 +589,13 @@ async fn fork_session(
         source.selected_adapter_config_options,
         native_fork_id.clone(),
     );
+    if let Some(ctx) = interaction {
+        // The fork's own native id is a distinct backend session; claim it
+        // too so a prompt against the fork on this same connection also
+        // gets live interactive forwarding without waiting on a second
+        // round trip to discover it.
+        ctx.claim(tenant_id, &native_fork_id).await;
+    }
     let fork = runtime
         .sessions
         .get(tenant_id, &public_fork_id)

@@ -110,7 +110,63 @@ async fn handle_acp_socket(
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(AsyncMutex::new(sink));
     let hub = { router.lock().await.notification_hub() };
-    let mut watched: HashSet<String> = HashSet::new();
+    // Shared (not a plain loop-local `HashSet`) because dispatch for each
+    // inbound frame is now spawned onto its own task below -- see that
+    // spawn's own doc comment for why this had to stop being inline.
+    let watched: Arc<AsyncMutex<HashSet<String>>> = Arc::new(AsyncMutex::new(HashSet::new()));
+    // Live-interaction wiring (see `acp_bridge::BridgeInteractionCtx`'s doc
+    // comment): without this, a backend-initiated `session/request_permission`
+    // mid-turn always falls through to the static policy auto-answer -- a
+    // connected `/acp` client (Zed, a real ACP-conformant harness, ...) can
+    // never be asked for confirmation or cancel a pending tool call, even
+    // though the exact same interactive round trip already works for the
+    // native (non-bridge) WS/stdio transports via this same `InteractionHub`.
+    let interaction_hub = { router.lock().await.interaction_hub() };
+    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let interaction_bindings: Arc<AsyncMutex<HashMap<String, InteractionBinding>>> =
+        Arc::new(AsyncMutex::new(HashMap::new()));
+    let interaction_ctx = super::http::acp_bridge::BridgeInteractionCtx {
+        hub: interaction_hub.clone(),
+        sender: interaction_tx,
+        bindings: Arc::clone(&interaction_bindings),
+    };
+    {
+        let interaction_sink = Arc::clone(&sink);
+        let forwarder_runtime = Arc::clone(&runtime);
+        let forwarder_tenant = tenant_id.clone();
+        tokio::spawn(async move {
+            while let Some(mut request) = interaction_rx.recv().await {
+                // The hub only ever knows the native/gateway session id
+                // (see `try_forward_interaction` in `router.rs`); a bridge
+                // client only ever understands its own virtual/public
+                // session id, exactly the same translation the
+                // `session/update` forwarder below already does.
+                if let Some(native_session_id) = request
+                    .pointer("/params/sessionId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                {
+                    if let Some(virtual_id) = forwarder_runtime
+                        .virtual_session_id(&forwarder_tenant, &native_session_id)
+                    {
+                        request["params"]["sessionId"] = serde_json::Value::String(virtual_id);
+                    }
+                }
+                let Ok(frame) = serde_json::to_string(&request) else {
+                    continue;
+                };
+                if interaction_sink
+                    .lock()
+                    .await
+                    .send(Message::Text(frame))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
     while let Some(message) = stream.next().await {
         let text = match message {
             Ok(Message::Text(text)) => text,
@@ -121,175 +177,220 @@ async fn handle_acp_socket(
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
         };
-        let mut request: serde_json::Value = match serde_json::from_str(&text) {
+        let request: serde_json::Value = match serde_json::from_str(&text) {
             Ok(request) => request,
             Err(_) => continue,
         };
-        let _resume_cursor = take_resume_cursor(&mut request);
-        let mut response =
-            match super::http::acp_bridge::dispatch(&router, &runtime, &tenant_id, request.clone())
+        // The client's answer to a backend-initiated interactive request
+        // (see above): correlated directly back to the pending request by
+        // `id`, must not enter bridge dispatch as if it were a new call.
+        if request.get("method").is_none() && request.get("id").is_some() {
+            interaction_hub.resolve(request).await;
+            continue;
+        }
+        // Spawned, not awaited inline: a bridge-lazy-bound `session/prompt`
+        // can block on a backend-initiated `session/request_permission`
+        // mid-turn (see `BridgeInteractionCtx`), which only ever gets
+        // answered by *this exact connection* sending back a reply frame --
+        // the "response with no method" branch just above. Awaiting
+        // dispatch inline here would starve that branch of ever running
+        // for the whole rest of this turn, deadlocking every interactive
+        // request until `DEFAULT_INTERACTION_TIMEOUT`: one read loop can't
+        // both block on a call's result and stay free to read that same
+        // call's own answer. Mirrors `transport::ws::handle_socket`'s
+        // identical `tokio::spawn` around its own dispatch call.
+        let router = Arc::clone(&router);
+        let runtime = Arc::clone(&runtime);
+        let tenant_id = tenant_id.clone();
+        let sink = Arc::clone(&sink);
+        let hub = hub.clone();
+        let watched = Arc::clone(&watched);
+        let interaction_ctx = interaction_ctx.clone();
+        tokio::spawn(async move {
+            let mut request = request;
+            let _resume_cursor = take_resume_cursor(&mut request);
+            let mut response =
+                match super::http::acp_bridge::dispatch_with_interaction(
+                    &router,
+                    &runtime,
+                    &tenant_id,
+                    request.clone(),
+                    Some(&interaction_ctx),
+                )
                 .await
-            {
-                Ok(response) => response,
-                Err(error) => super::http::bridge_json_rpc_error(&request, error),
-            };
-        // The first lazy-bound prompt cannot be subscribed before it binds,
-        // so Router buffers any early backend updates in its native
-        // `_acpx.updates` extension. Flush those as normal ACP frames before
-        // the final response; bridge clients must never need to understand
-        // ACPX-only response extensions.
-        if let Some(updates) = response
-            .get_mut("_acpx")
-            .and_then(|value| value.get_mut("updates"))
-            .and_then(|value| value.as_array_mut())
-        {
-            let mut flushed_updates = false;
-            for mut update in std::mem::take(updates) {
-                let Some(native_session_id) = update
-                    .pointer("/params/sessionId")
-                    .and_then(|value| value.as_str())
-                else {
-                    continue;
-                };
-                if runtime
-                    .bound_gateway_session_id(&tenant_id, native_session_id)
-                    .is_none()
                 {
-                    let Some(virtual_id) =
-                        runtime.virtual_session_id(&tenant_id, native_session_id)
+                    Ok(response) => response,
+                    Err(error) => super::http::bridge_json_rpc_error(&request, error),
+                };
+            // The first lazy-bound prompt cannot be subscribed before it
+            // binds, so Router buffers any early backend updates in its
+            // native `_acpx.updates` extension. Flush those as normal ACP
+            // frames before the final response; bridge clients must never
+            // need to understand ACPX-only response extensions.
+            if let Some(updates) = response
+                .get_mut("_acpx")
+                .and_then(|value| value.get_mut("updates"))
+                .and_then(|value| value.as_array_mut())
+            {
+                let mut flushed_updates = false;
+                for mut update in std::mem::take(updates) {
+                    let Some(native_session_id) = update
+                        .pointer("/params/sessionId")
+                        .and_then(|value| value.as_str())
                     else {
                         continue;
                     };
-                    update["params"]["sessionId"] = serde_json::Value::String(virtual_id);
+                    if runtime
+                        .bound_gateway_session_id(&tenant_id, native_session_id)
+                        .is_none()
+                    {
+                        let Some(virtual_id) =
+                            runtime.virtual_session_id(&tenant_id, native_session_id)
+                        else {
+                            continue;
+                        };
+                        update["params"]["sessionId"] = serde_json::Value::String(virtual_id);
+                    }
+                    let Ok(frame) = serde_json::to_string(&update) else {
+                        continue;
+                    };
+                    if sink.lock().await.send(Message::Text(frame)).await.is_err() {
+                        return;
+                    }
+                    flushed_updates = true;
                 }
-                let Ok(frame) = serde_json::to_string(&update) else {
-                    continue;
-                };
-                if sink.lock().await.send(Message::Text(frame)).await.is_err() {
-                    return;
+                if flushed_updates {
+                    // Some ACP clients dispatch notifications on separate
+                    // tasks. Give them one scheduling slice before the
+                    // prompt response completes the turn and they snapshot
+                    // accumulated text.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                flushed_updates = true;
             }
-            if flushed_updates {
-                // Some ACP clients dispatch notifications on separate tasks.
-                // Give them one scheduling slice before the prompt response
-                // completes the turn and they snapshot accumulated text.
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        }
-        if response
-            .get("_acpx")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|extension| {
-                extension
-                    .get("updates")
-                    .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty))
-            })
-        {
-            response
-                .get_mut("_acpx")
-                .and_then(serde_json::Value::as_object_mut)
-                .expect("checked extension object")
-                .remove("updates");
             if response
                 .get("_acpx")
                 .and_then(serde_json::Value::as_object)
-                .is_some_and(serde_json::Map::is_empty)
+                .is_some_and(|extension| {
+                    extension
+                        .get("updates")
+                        .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty))
+                })
             {
                 response
-                    .as_object_mut()
-                    .expect("JSON-RPC object")
-                    .remove("_acpx");
-            }
-        }
-        let method = request
-            .get("method")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        if let Some(public_id) = bridge_session_id_to_forget(&request, &response, method) {
-            if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
-                if watched.remove(&native_id) {
-                    hub.remove_stream(&tenant_id, &native_id).await;
+                    .get_mut("_acpx")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("checked extension object")
+                    .remove("updates");
+                if response
+                    .get("_acpx")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+                {
+                    response
+                        .as_object_mut()
+                        .expect("JSON-RPC object")
+                        .remove("_acpx");
                 }
             }
-        } else if let Some(public_id) = bridge_session_id_to_watch(&request, &response, method) {
-            if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
-                if watched.insert(native_id.clone()) {
-                    match hub
-                        .subscribe_resuming(
-                            &tenant_id,
-                            native_id.clone(),
-                            None,
-                            StreamResumeState::default(),
-                        )
-                        .await
-                    {
-                        Ok(mut rx) => {
-                            let forwarder_sink = Arc::clone(&sink);
-                            let forwarder_runtime = Arc::clone(&runtime);
-                            let forwarder_tenant = tenant_id.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    let mut update = match rx.recv().await {
-                                        Ok(update) => update.into_value(),
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
-                                            skipped,
-                                        )) => {
-                                            tracing::warn!(%skipped, "ACPX bridge notification subscriber lagged");
+            let method = request
+                .get("method")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if let Some(public_id) = bridge_session_id_to_forget(&request, &response, method) {
+                if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
+                    if watched.lock().await.remove(&native_id) {
+                        hub.remove_stream(&tenant_id, &native_id).await;
+                    }
+                }
+            } else if let Some(public_id) = bridge_session_id_to_watch(&request, &response, method)
+            {
+                if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
+                    if watched.lock().await.insert(native_id.clone()) {
+                        match hub
+                            .subscribe_resuming(
+                                &tenant_id,
+                                native_id.clone(),
+                                None,
+                                StreamResumeState::default(),
+                            )
+                            .await
+                        {
+                            Ok(mut rx) => {
+                                let forwarder_sink = Arc::clone(&sink);
+                                let forwarder_runtime = Arc::clone(&runtime);
+                                let forwarder_tenant = tenant_id.clone();
+                                tokio::spawn(async move {
+                                    loop {
+                                        let mut update = match rx.recv().await {
+                                            Ok(update) => update.into_value(),
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Lagged(
+                                                    skipped,
+                                                ),
+                                            ) => {
+                                                tracing::warn!(%skipped, "ACPX bridge notification subscriber lagged");
+                                                continue;
+                                            }
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Closed,
+                                            ) => break,
+                                        };
+                                        let Some(native_session_id) = update
+                                            .pointer("/params/sessionId")
+                                            .and_then(|value| value.as_str())
+                                        else {
                                             continue;
+                                        };
+                                        let Some(virtual_id) = forwarder_runtime
+                                            .virtual_session_id(&forwarder_tenant, native_session_id)
+                                        else {
+                                            continue;
+                                        };
+                                        update["params"]["sessionId"] =
+                                            serde_json::Value::String(virtual_id);
+                                        let Ok(frame) = serde_json::to_string(&update) else {
+                                            continue;
+                                        };
+                                        if forwarder_sink
+                                            .lock()
+                                            .await
+                                            .send(Message::Text(frame))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
                                         }
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                            break
-                                        }
-                                    };
-                                    let Some(native_session_id) = update
-                                        .pointer("/params/sessionId")
-                                        .and_then(|value| value.as_str())
-                                    else {
-                                        continue;
-                                    };
-                                    let Some(virtual_id) = forwarder_runtime
-                                        .virtual_session_id(&forwarder_tenant, native_session_id)
-                                    else {
-                                        continue;
-                                    };
-                                    update["params"]["sessionId"] =
-                                        serde_json::Value::String(virtual_id);
-                                    let Ok(frame) = serde_json::to_string(&update) else {
-                                        continue;
-                                    };
-                                    if forwarder_sink
-                                        .lock()
-                                        .await
-                                        .send(Message::Text(frame))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
                                     }
-                                }
-                            });
-                        }
-                        Err(error) => {
-                            watched.remove(&native_id);
-                            response = super::http::json_rpc_subscribe_error(&request, error);
+                                });
+                            }
+                            Err(error) => {
+                                watched.lock().await.remove(&native_id);
+                                response = super::http::json_rpc_subscribe_error(&request, error);
+                            }
                         }
                     }
                 }
             }
-        }
-        let Ok(frame) = serde_json::to_string(&response) else {
-            continue;
-        };
-        // A backend update published during this dispatch is already queued
-        // for the per-session forwarder. Yield before writing the terminal
-        // response so an ACP client observes streamed updates first.
-        tokio::task::yield_now().await;
-        if sink.lock().await.send(Message::Text(frame)).await.is_err() {
-            break;
-        }
+            let Ok(frame) = serde_json::to_string(&response) else {
+                return;
+            };
+            // A backend update published during this dispatch is already
+            // queued for the per-session forwarder. Yield before writing
+            // the terminal response so an ACP client observes streamed
+            // updates first.
+            tokio::task::yield_now().await;
+            let _ = sink.lock().await.send(Message::Text(frame)).await;
+        });
     }
     drop(watched);
+    // Disconnects must release every interaction binding this connection
+    // holds, or a future prompt on the same native session would forward
+    // its interactive requests to a channel nobody is reading from
+    // anymore, hanging until `DEFAULT_INTERACTION_TIMEOUT` instead of
+    // failing over to the policy fallback right away.
+    for binding in interaction_bindings.lock().await.values() {
+        interaction_hub.unbind(binding).await;
+    }
 }
 
 fn bridge_session_id_to_watch(

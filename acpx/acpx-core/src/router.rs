@@ -769,6 +769,51 @@ impl Router {
         policy
     }
 
+    /// [`call_policy`], but resolves `profile_name` (a session's own
+    /// persisted/explicit profile, `None` for native/unmanaged mode) the
+    /// same way `dispatch_session_new`/`dispatch_session_new_shared` now
+    /// do: an explicit profile name wins as before, but a `None` (every
+    /// native-mode session, which is what the `/acp` bridge always creates)
+    /// still picks up whatever profile [`Router::ensure_default_profiles_seeded`]
+    /// auto-seeded under this exact `agent_id`, instead of always falling
+    /// through to `BackendCallPolicy::default()`'s `false`/`false`. Without
+    /// this, a session's *first* backend round trip (`session/new`) could
+    /// declare `fs`/`terminal` capability `true` at `initialize` time (per
+    /// that same fallback) while every later `session/prompt`/`cancel`/...
+    /// against the very same session recomputed a call policy that denies
+    /// them anyway -- a declared-vs-enforced contradiction, not just an
+    /// inconsistency, since a well-behaved backend that trusted the
+    /// `initialize` declaration and asked would get a false "disabled for
+    /// this profile" error back.
+    async fn call_policy_for(
+        &mut self,
+        profile_name: Option<&str>,
+        agent_id: &str,
+    ) -> BackendCallPolicy {
+        if let Some(name) = profile_name {
+            return self.call_policy(self.profiles.get(name));
+        }
+        self.call_policy(self.profiles.get(agent_id))
+    }
+
+    /// Warm [`ensure_default_profiles_seeded`] once, outside any per-request
+    /// critical section -- call this right after constructing/registering
+    /// agents on a `Router`, before it ever serves a real request. Real
+    /// registry-agent auto-seeding (see that function's doc comment) can
+    /// do genuine network I/O the first time (`ensure_registry_loaded`'s
+    /// registry fetch) plus a `crate::detect::detect` subprocess check per
+    /// candidate agent; every `_shared` dispatch function in this file
+    /// exists specifically to never hold `router`'s lock across I/O like
+    /// that, so none of them call this themselves (confirmed as a real,
+    /// concurrency-test-caught regression, not a hypothetical one, when
+    /// this was tried inline in `call_policy_for` -- see git history).
+    /// `call_policy_for`'s own fallback lookup is a plain, cheap
+    /// `HashMap::get` either way; it just returns nothing to elevate on
+    /// until this has actually run once.
+    pub async fn warm_default_profiles(&mut self) {
+        self.ensure_default_profiles_seeded().await;
+    }
+
     /// Lifecycle-management seam used by the server's future authenticated
     /// retention controls. Pinning never bypasses explicit `session/close`.
     pub async fn set_session_pinned(
@@ -816,6 +861,16 @@ impl Router {
     /// just owns the `Supervisor` instance.
     pub fn register_agent(&mut self, agent_id: impl Into<String>, spec: acpx_conductor::SpawnSpec) {
         self.supervisor.register(agent_id, spec);
+    }
+
+    /// Diagnostic/test-only seam: `ProfileStore` has no CRUD wiring exposed
+    /// over any transport yet (no admin endpoint, no config-file loader --
+    /// `_acpx.profile` can currently only ever name a profile registered
+    /// this way, in-process, before the first request that references it).
+    /// Exists so integration tests can register one directly against
+    /// `Router` without needing that wiring to exist first.
+    pub fn register_profile(&mut self, profile: crate::profile::Profile) -> Result<(), crate::profile::ProfileStoreError> {
+        self.profiles.create(profile)
     }
 
     /// Revoke a custom definition from the live process manager after the
@@ -1162,12 +1217,9 @@ impl Router {
             });
             let result = async {
                 let backend = self.supervisor.ensure_running(&entry.agent_id).await?;
-                let call_policy = self.call_policy(
-                    entry
-                        .profile_name
-                        .as_deref()
-                        .and_then(|name| self.profiles.get(name)),
-                );
+                let call_policy = self
+                    .call_policy_for(entry.profile_name.as_deref(), &entry.agent_id)
+                    .await;
                 let mut backend = backend.lock().await;
                 ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
                 backend.writer.lock().await.write_value(&request).await?;
@@ -1254,12 +1306,9 @@ impl Router {
         };
         let admission = self.admit_session(&tenant_id)?;
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let call_policy = self.call_policy(
-            record
-                .profile_name
-                .as_deref()
-                .and_then(|name| self.profiles.get(name)),
-        );
+        let call_policy = self
+            .call_policy_for(record.profile_name.as_deref(), &agent_id)
+            .await;
         let request_id = format!("acpx-startup-recovery:{}", record.gateway_session_id);
         let request_id_value = serde_json::Value::String(request_id.clone());
         let recovery_method = match record.recovery_method {
@@ -1362,6 +1411,27 @@ impl Router {
             let profile = Profile {
                 name: agent.id.clone(),
                 agent_id: agent.id.clone(),
+                // Not `Profile::default()`'s `false`/`false`: every
+                // registry-listed agent (`claude-acp`/`codex-acp`/`gemini`)
+                // is a locally-spawned subprocess that already has
+                // unrestricted host filesystem/process access on its own,
+                // with or without ACPX's client-mediated `fs`/`terminal`
+                // capability -- declaring `false` here buys these agents
+                // no real isolation, it only breaks them. Verified against
+                // real backends: a real `claude-agent-acp` process silently
+                // stops using the ACP terminal/permission round trip at all
+                // (executes Bash directly, no `session/request_permission`,
+                // no `WaitingForConfirmation` a client could ever act on)
+                // when `terminal` is declared `false`; a real `codex-acp`
+                // process outright rejects `session/new` in its default
+                // `agent` mode when the client can't back that mode's
+                // terminal use. `Profile::default()`'s opt-in security
+                // reasoning is still correct for a hand-authored profile
+                // meant to sandbox an untrusted/remote backend -- it just
+                // doesn't apply to this auto-seeded, install-detected,
+                // always-local-subprocess case.
+                allow_fs_access: true,
+                allow_terminal_access: true,
                 ..Profile::default()
             };
             // Best-effort: `create` only fails on a name collision, which
@@ -1515,7 +1585,19 @@ impl Router {
 
         let admission = self.admit_session(tenant_id)?;
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let call_policy = self.call_policy(profile.as_ref());
+        // Native/unmanaged mode (no `_acpx.profile`, `profile` still `None`
+        // here) still benefits from whatever profile
+        // `ensure_default_profiles_seeded` auto-seeded under this exact
+        // `agent_id` -- see that seeding's own doc comment for why. Only
+        // borrowed for `call_policy`; `profile` itself (what gets persisted
+        // as this session's `profile_name` below, and what the `mcpServers`
+        // merge above already ran against) is untouched, so recovery/
+        // `session/list` semantics for native-mode sessions don't change.
+        // Doesn't call `ensure_default_profiles_seeded` itself -- see
+        // `Router::warm_default_profiles`'s doc comment for why that must
+        // happen once at startup, never inline here.
+        let call_policy_profile = profile.clone().or_else(|| self.profiles.get(&agent_id).cloned());
+        let call_policy = self.call_policy(call_policy_profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
@@ -2021,11 +2103,9 @@ impl Router {
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
-        let call_policy = self.call_policy(
-            profile_name
-                .as_deref()
-                .and_then(|name| self.profiles.get(name)),
-        );
+        let call_policy = self
+            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .await;
 
         // Rewrite gateway id -> backend id in place; everything else in
         // `params` is forwarded untouched, per the proxied-method contract
@@ -2148,11 +2228,9 @@ impl Router {
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
-        let call_policy = self.call_policy(
-            profile_name
-                .as_deref()
-                .and_then(|name| self.profiles.get(name)),
-        );
+        let call_policy = self
+            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .await;
 
         params["sessionId"] = serde_json::Value::String(backend_session_id);
 
@@ -4393,11 +4471,9 @@ async fn dispatch_proxied_shared(
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             1,
         );
-        let call_policy = r.call_policy(
-            profile_name
-                .as_deref()
-                .and_then(|name| r.profiles.get(name)),
-        );
+        let call_policy = r
+            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .await;
         (backend, r.persistence.clone(), call_policy, agent_id)
     };
 
@@ -4517,11 +4593,9 @@ async fn dispatch_session_fork_shared(
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        let call_policy = r.call_policy(
-            profile_name
-                .as_deref()
-                .and_then(|name| r.profiles.get(name)),
-        );
+        let call_policy = r
+            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .await;
         (
             backend,
             r.persistence.clone(),
@@ -4677,7 +4751,13 @@ async fn dispatch_session_new_shared(
         let admission = r.admit_session(tenant_id)?;
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        let call_policy = r.call_policy(profile.as_ref());
+        // See `dispatch_session_new`'s identical fallback for why: native/
+        // unmanaged mode still picks up whatever profile
+        // `ensure_default_profiles_seeded` auto-seeded under this
+        // `agent_id`, for `call_policy` purposes only. Doesn't trigger the
+        // seeding itself -- see `Router::warm_default_profiles`.
+        let call_policy_profile = profile.clone().or_else(|| r.profiles.get(&agent_id).cloned());
+        let call_policy = r.call_policy(call_policy_profile.as_ref());
         (
             agent_id,
             profile,

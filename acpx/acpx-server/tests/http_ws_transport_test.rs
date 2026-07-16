@@ -932,3 +932,152 @@ async fn strict_acp_ws_forwards_bound_session_updates_with_virtual_ids() {
     let final_response = receive(&mut socket).await;
     assert_eq!(final_response["id"], json!(3));
 }
+
+/// A backend that asks for permission (its own real-shaped
+/// `session/request_permission` *request*, id `999`, mid-`session/prompt`)
+/// and blocks reading further stdin until it sees a reply tagged with
+/// that exact id -- same dependency a real ACP adapter has (it can't
+/// produce the outer call's result until it gets an answer). Proves the
+/// `/acp` bridge's own WS surface (`transport::ws::handle_acp_socket`)
+/// forwards a backend-initiated interactive request to the bound client
+/// instead of always answering it via the static `Profile`/`CallPolicy`
+/// auto-decide fallback -- `acpx-core/tests/permission_request_test.rs`
+/// already covers that fallback path itself (no bound client), and
+/// `concurrency_test.rs`'s `http::acp_bridge::tests` module covers the
+/// native (non-bridge) WS transport's identical wiring; this is the one
+/// gap neither of those closes.
+fn permission_asking_backend_spec() -> SpawnSpec {
+    let script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-perm"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    printf '{"jsonrpc":"2.0","id":999,"method":"session/request_permission","params":{"sessionId":"backend-perm","toolCall":{"toolCallId":"call-1"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+    while IFS= read -r reply_line; do
+      echo "$reply_line" | grep -q '"id":"999"' && break
+      echo "$reply_line" | grep -q '"id":999' && break
+    done
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+    SpawnSpec::new("sh", vec!["-c".to_string(), script.to_string()])
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn strict_acp_ws_forwards_backend_permission_requests_to_the_bound_client() {
+    let mut router = Router::new("permission-agent");
+    router.register_agent("permission-agent", permission_asking_backend_spec());
+    let addr = spawn_server_with_bridge(
+        Arc::new(Mutex::new(router)),
+        BridgeConfig {
+            default_model: "perm/model".to_string(),
+            models: vec![BridgeModel {
+                id: "perm/model".to_string(),
+                name: None,
+                agent_id: "permission-agent".to_string(),
+                model_id: "perm-model".to_string(),
+            }],
+        },
+    )
+    .await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/acp/ws"))
+        .await
+        .expect("strict ACP websocket connect");
+
+    async fn send(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        value: serde_json::Value,
+    ) {
+        socket
+            .send(WsMessage::Text(value.to_string()))
+            .await
+            .expect("send frame");
+    }
+    async fn receive(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> serde_json::Value {
+        let frame = socket
+            .next()
+            .await
+            .expect("socket ended")
+            .expect("socket frame");
+        let WsMessage::Text(text) = frame else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).expect("JSON frame")
+    }
+
+    send(
+        &mut socket,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp"}}),
+    )
+    .await;
+    let created = receive(&mut socket).await;
+    let session_id = created["result"]["sessionId"].as_str().unwrap().to_string();
+
+    send(
+        &mut socket,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":session_id,"prompt":[]}}),
+    )
+    .await;
+
+    // If this were still falling through to the static auto-decide
+    // fallback (pre-fix behavior, or a regression of it), this frame would
+    // never arrive at all -- the backend's `999` request would just sit
+    // answered-by-policy on ACPX's side, invisible to this client, and the
+    // very next frame received would already be the final `id: 2` response.
+    let permission_request = receive(&mut socket).await;
+    assert_eq!(
+        permission_request["method"],
+        json!("session/request_permission"),
+        "expected the backend's permission request forwarded live, got {permission_request:?}"
+    );
+    assert_eq!(
+        permission_request["params"]["sessionId"],
+        json!(session_id),
+        "forwarded request must carry the client's own virtual session id, not the native one"
+    );
+    let interaction_id = permission_request["id"].clone();
+    assert_ne!(
+        interaction_id,
+        json!(999),
+        "the id the client sees must be InteractionHub's own opaque id, never the backend's raw one"
+    );
+
+    let reply_started = std::time::Instant::now();
+    send(
+        &mut socket,
+        json!({
+            "jsonrpc": "2.0",
+            "id": interaction_id,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}
+        }),
+    )
+    .await;
+
+    let final_response = receive(&mut socket).await;
+    let reply_latency = reply_started.elapsed();
+    assert!(
+        reply_latency < std::time::Duration::from_secs(5),
+        "final response took {reply_latency:?} after the client answered -- \
+         a fast round trip proves the live client reply actually unblocked \
+         the backend; anything near DEFAULT_INTERACTION_TIMEOUT (30s) means \
+         it fell through to the timeout/error fallback instead and the \
+         stand-in script's own id-999 grep just happened to also match \
+         that error reply, which would be a false pass"
+    );
+    assert_eq!(
+        final_response["id"],
+        json!(2),
+        "prompt call must still complete once the interactive request is answered, got {final_response:?}"
+    );
+    assert_eq!(final_response["result"]["stopReason"], json!("end_turn"));
+}

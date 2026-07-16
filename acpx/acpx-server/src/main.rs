@@ -70,6 +70,10 @@ async fn main() -> anyhow::Result<()> {
             config.stream_idle_retention,
         ));
     router.register_agent(config.default_agent_id.clone(), config.backend.clone());
+    // Once, here, before any listener starts accepting connections -- see
+    // `Router::warm_default_profiles`'s doc comment for why this must
+    // never happen lazily inside a request's own critical section.
+    router.warm_default_profiles().await;
 
     if let Ok(db_path) = std::env::var("ACPX_DB_PATH") {
         match acpx_core::PersistenceStore::open(std::path::Path::new(&db_path)) {
