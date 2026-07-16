@@ -127,7 +127,10 @@ async fn session_process_isolation_composes_with_tenant_process_isolation() {
         .process_id_for_session(&tenant_b, &session_b)
         .await
         .expect("tenant B session process");
-    assert_ne!(pid_a, pid_b, "distinct tenants and sessions never share a process");
+    assert_ne!(
+        pid_a, pid_b,
+        "distinct tenants and sessions never share a process"
+    );
 }
 
 /// Closing one session-isolated session must stop *only* its own
@@ -141,8 +144,10 @@ async fn reaping_one_session_isolated_session_stops_only_its_own_process() {
     let mut router = Router::new("unused").with_session_process_isolation(true);
     let tenant = TenantId::from("tenant-a");
     // Force every session to be immediately reap-eligible once idle.
-    let mut lifecycle = acpx_core::LifecycleConfig::default();
-    lifecycle.idle_session_ttl = Duration::from_millis(1);
+    let lifecycle = acpx_core::LifecycleConfig {
+        idle_session_ttl: Duration::from_millis(1),
+        ..Default::default()
+    };
     router = router.with_lifecycle_config(lifecycle);
     create_profile(&mut router).await;
 

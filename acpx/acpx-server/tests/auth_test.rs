@@ -98,9 +98,16 @@ async fn spawn_server_with_tenant_tokens(
 
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
-        serve_on_with_bridge_and_tenant_tokens(listener, router, auth_token, tenant_tokens, None, None)
-            .await
-            .expect("transport::serve_on_with_bridge_and_tenant_tokens");
+        serve_on_with_bridge_and_tenant_tokens(
+            listener,
+            router,
+            auth_token,
+            tenant_tokens,
+            None,
+            None,
+        )
+        .await
+        .expect("transport::serve_on_with_bridge_and_tenant_tokens");
     });
 
     for _ in 0..50 {

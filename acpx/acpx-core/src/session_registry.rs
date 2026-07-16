@@ -328,6 +328,13 @@ impl SessionRegistry {
         self.sessions.values().map(HashMap::len).sum()
     }
 
+    /// Required alongside `len` by clippy's `len_without_is_empty` --
+    /// also a legitimately useful check on its own (whether *any* tenant
+    /// currently has a live session at all).
+    pub fn is_empty(&self) -> bool {
+        self.sessions.values().all(HashMap::is_empty)
+    }
+
     /// Number of live gateway sessions owned by one tenant.
     pub fn len_for_tenant(&self, tenant_id: &TenantId) -> usize {
         self.sessions
@@ -354,9 +361,7 @@ impl SessionRegistry {
         agent_id: &str,
         backend_session_id: &str,
     ) -> Option<GatewaySessionId> {
-        let Some(inner) = self.sessions.get(tenant_id) else {
-            return None;
-        };
+        let inner = self.sessions.get(tenant_id)?;
         inner.iter().find_map(|(gid, entry)| {
             if entry.agent_id == agent_id && entry.backend_session_id.0 == backend_session_id {
                 Some(GatewaySessionId(gid.clone()))

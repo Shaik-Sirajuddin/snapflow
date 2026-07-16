@@ -21,6 +21,16 @@
 //! sequentially rather than in parallel -- acceptable since it's a small,
 //! fast file, and no other test file in the workspace is affected (each
 //! integration test file compiles to its own separate process).
+//!
+//! `clippy::await_holding_lock` is disabled file-wide: this file's whole
+//! point is a plain `std::sync::Mutex` guard held deliberately across
+//! every test body's `.await`s, so no *other* test in this same binary
+//! can interleave and race the shared `PATH` mutation described above --
+//! the "use an async-aware `Mutex`" suggestion the lint would otherwise
+//! make doesn't apply, since a tokio `Mutex` here would let concurrently
+//! running tests interleave freely, defeating the whole reason
+//! `serialize()` exists.
+#![allow(clippy::await_holding_lock)]
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::profile::Profile;

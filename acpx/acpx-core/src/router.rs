@@ -894,7 +894,10 @@ impl Router {
     /// this way, in-process, before the first request that references it).
     /// Exists so integration tests can register one directly against
     /// `Router` without needing that wiring to exist first.
-    pub fn register_profile(&mut self, profile: crate::profile::Profile) -> Result<(), crate::profile::ProfileStoreError> {
+    pub fn register_profile(
+        &mut self,
+        profile: crate::profile::Profile,
+    ) -> Result<(), crate::profile::ProfileStoreError> {
         self.profiles.create(profile)
     }
 
@@ -1731,7 +1734,9 @@ impl Router {
         // Doesn't call `ensure_default_profiles_seeded` itself -- see
         // `Router::warm_default_profiles`'s doc comment for why that must
         // happen once at startup, never inline here.
-        let call_policy_profile = profile.clone().or_else(|| self.profiles.get(&agent_id).cloned());
+        let call_policy_profile = profile
+            .clone()
+            .or_else(|| self.profiles.get(&agent_id).cloned());
         let call_policy = self.call_policy(call_policy_profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
@@ -3510,8 +3515,7 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
                 .map(|gateway_id| (tenant_id.clone(), gateway_id)),
             None => r
                 .sessions
-                .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id)
-                .map(|(tenant_id, gateway_id)| (tenant_id, gateway_id)),
+                .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id),
         };
         match resolved {
             Some((tenant_id, gateway_id)) => {
@@ -4689,9 +4693,7 @@ async fn dispatch_proxied_shared(
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             1,
         );
-        let call_policy = r
-            .call_policy_for(profile_name.as_deref(), &agent_id)
-            .await;
+        let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
         (backend, r.persistence.clone(), call_policy, agent_id)
     };
 
@@ -4811,9 +4813,7 @@ async fn dispatch_session_fork_shared(
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        let call_policy = r
-            .call_policy_for(profile_name.as_deref(), &agent_id)
-            .await;
+        let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
         (
             backend,
             r.persistence.clone(),
@@ -4892,7 +4892,16 @@ async fn dispatch_session_new_shared(
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
 
-    let (agent_id, profile, backend, persistence, cwd, admission, call_policy, pre_minted_gateway_id) = {
+    let (
+        agent_id,
+        profile,
+        backend,
+        persistence,
+        cwd,
+        admission,
+        call_policy,
+        pre_minted_gateway_id,
+    ) = {
         let mut r = router.lock().await;
         let params = request
             .get_mut("params")
@@ -4992,7 +5001,9 @@ async fn dispatch_session_new_shared(
         // `ensure_default_profiles_seeded` auto-seeded under this
         // `agent_id`, for `call_policy` purposes only. Doesn't trigger the
         // seeding itself -- see `Router::warm_default_profiles`.
-        let call_policy_profile = profile.clone().or_else(|| r.profiles.get(&agent_id).cloned());
+        let call_policy_profile = profile
+            .clone()
+            .or_else(|| r.profiles.get(&agent_id).cloned());
         let call_policy = r.call_policy(call_policy_profile.as_ref());
         (
             agent_id,

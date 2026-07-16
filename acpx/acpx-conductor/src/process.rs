@@ -162,10 +162,7 @@ impl BackendProcess {
     /// repeated calls after the process has exited keep returning the same
     /// value rather than erroring on a second wait.
     pub fn try_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        match self.child.try_wait() {
-            Ok(status) => status,
-            Err(_) => None,
-        }
+        self.child.try_wait().unwrap_or_default()
     }
 
     /// True if the process has exited (non-blocking check).

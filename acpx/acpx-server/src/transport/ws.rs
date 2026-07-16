@@ -74,7 +74,9 @@ pub async fn ws_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
     };
     ws.on_upgrade(move |socket| handle_socket(socket, state.router, tenant_id))
 }
@@ -93,7 +95,9 @@ pub async fn acp_ws_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
     };
     ws.on_upgrade(move |socket| handle_acp_socket(socket, state.router, runtime, tenant_id))
 }
@@ -143,8 +147,8 @@ async fn handle_acp_socket(
                     .and_then(|value| value.as_str())
                     .map(str::to_string)
                 {
-                    if let Some(virtual_id) = forwarder_runtime
-                        .virtual_session_id(&forwarder_tenant, &native_session_id)
+                    if let Some(virtual_id) =
+                        forwarder_runtime.virtual_session_id(&forwarder_tenant, &native_session_id)
                     {
                         request["params"]["sessionId"] = serde_json::Value::String(virtual_id);
                     }
@@ -206,19 +210,18 @@ async fn handle_acp_socket(
         tokio::spawn(async move {
             let mut request = request;
             let _resume_cursor = take_resume_cursor(&mut request);
-            let mut response =
-                match super::http::acp_bridge::dispatch_with_interaction(
-                    &router,
-                    &runtime,
-                    &tenant_id,
-                    request.clone(),
-                    Some(&interaction_ctx),
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => super::http::bridge_json_rpc_error(&request, error),
-                };
+            let mut response = match super::http::acp_bridge::dispatch_with_interaction(
+                &router,
+                &runtime,
+                &tenant_id,
+                request.clone(),
+                Some(&interaction_ctx),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => super::http::bridge_json_rpc_error(&request, error),
+            };
             // The first lazy-bound prompt cannot be subscribed before it
             // binds, so Router buffers any early backend updates in its
             // native `_acpx.updates` extension. Flush those as normal ACP
@@ -339,7 +342,10 @@ async fn handle_acp_socket(
                                             continue;
                                         };
                                         let Some(virtual_id) = forwarder_runtime
-                                            .virtual_session_id(&forwarder_tenant, native_session_id)
+                                            .virtual_session_id(
+                                                &forwarder_tenant,
+                                                native_session_id,
+                                            )
                                         else {
                                             continue;
                                         };

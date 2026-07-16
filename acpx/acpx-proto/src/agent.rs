@@ -26,17 +26,12 @@ pub enum AgentStatus {
     RuntimeMissing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSource {
+    #[default]
     Registry,
     Custom,
-}
-
-impl Default for AgentSource {
-    fn default() -> Self {
-        Self::Registry
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

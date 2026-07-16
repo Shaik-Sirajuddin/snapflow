@@ -186,7 +186,10 @@ impl AuthConfig {
     /// orthogonal to *how* a request authenticates -- both
     /// [`AuthConfig::new`] and [`AuthConfig::with_tenant_tokens`] deployments
     /// may or may not want it.
-    pub fn with_tenant_allowlist(mut self, allowlist: Option<std::collections::HashSet<String>>) -> Self {
+    pub fn with_tenant_allowlist(
+        mut self,
+        allowlist: Option<std::collections::HashSet<String>>,
+    ) -> Self {
         self.tenant_allowlist = allowlist.map(Arc::new);
         self
     }
@@ -395,15 +398,8 @@ pub async fn serve_on_with_bridge(
     auth_token: Option<String>,
     bridge: Option<acpx_bridge::BridgeConfig>,
 ) -> anyhow::Result<()> {
-    serve_on_with_bridge_and_tenant_tokens(
-        listener,
-        router,
-        auth_token,
-        Vec::new(),
-        None,
-        bridge,
-    )
-    .await
+    serve_on_with_bridge_and_tenant_tokens(listener, router, auth_token, Vec::new(), None, bridge)
+        .await
 }
 
 /// Same as [`serve_on_with_bridge`], additionally configuring
@@ -521,7 +517,9 @@ async fn rpc_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return unauthorized_response(&request),
-        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return tenant_mismatch_response(&request),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return tenant_mismatch_response(&request)
+        }
     };
     inject_profile_header(&headers, &mut request);
     let response =
@@ -542,7 +540,9 @@ async fn acp_rpc_handler(
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return unauthorized_response(&request),
-        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return tenant_mismatch_response(&request),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return tenant_mismatch_response(&request)
+        }
     };
     let Some(runtime) = &state.bridge_runtime else {
         return StatusCode::NOT_FOUND.into_response();
@@ -563,7 +563,9 @@ async fn acp_agents_handler(State(state): State<AppState>, headers: HeaderMap) -
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
     };
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -607,7 +609,9 @@ async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -
     let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
         Ok(tenant) => tenant,
         Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => return StatusCode::FORBIDDEN.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
     };
     let request = serde_json::json!({
         "jsonrpc": "2.0",

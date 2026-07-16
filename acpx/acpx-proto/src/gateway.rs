@@ -125,10 +125,11 @@ pub struct NameOnlyResult {
 
 /// Mirrors `acpx_core::profile::PermissionPolicy` -- see this module's
 /// doc comment for why this is a mirror rather than a direct reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionPolicySchema {
     AutoAllow,
+    #[default]
     AutoReject,
 }
 
@@ -154,12 +155,6 @@ pub struct ProfileSchema {
     pub allow_fs_access: bool,
     pub allow_terminal_access: bool,
     pub auth_method_id: Option<String>,
-}
-
-impl Default for PermissionPolicySchema {
-    fn default() -> Self {
-        Self::AutoReject
-    }
 }
 
 /// `profiles/list` result envelope.

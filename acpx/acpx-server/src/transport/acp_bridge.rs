@@ -56,7 +56,11 @@ impl BridgeInteractionCtx {
     async fn claim(&self, tenant_id: &TenantId, native_id: &str) {
         let binding = self
             .hub
-            .bind(tenant_id.clone(), native_id.to_string(), self.sender.clone())
+            .bind(
+                tenant_id.clone(),
+                native_id.to_string(),
+                self.sender.clone(),
+            )
             .await;
         let previous = self
             .bindings

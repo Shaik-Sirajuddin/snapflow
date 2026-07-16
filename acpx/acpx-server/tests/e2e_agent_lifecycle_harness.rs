@@ -3,14 +3,15 @@
 //!
 //! Modeled on Zed's `crates/agent_servers/src/e2e_tests.rs` `common_e2e_tests!`
 //! macro pattern: one shared test *body* (here, [`assert_detect_then_install`]
-//! + [`assert_full_use_round_trip`]) is instantiated once per registry agent
-//! id via the `agent_lifecycle_e2e_tests!` macro below, instead of three
-//! hand-duplicated Claude/Codex/Gemini suites. The macro is generic over
-//! "which registry agent id" (Zed's equivalent axis is "which `AgentServer`
-//! impl"); a `profile` axis is deliberately not exercised here since Phase 3
-//! profiles require a provider/key, which this environment has none of (see
-//! the limitation note below) -- native/unmanaged mode (no `_acpx.profile`)
-//! is what's actually driven per agent id.
+//! and [`assert_full_use_round_trip`]) is instantiated once per registry
+//! agent id via the `agent_lifecycle_e2e_tests!` macro below, instead of
+//! three hand-duplicated Claude/Codex/Gemini suites. The macro is generic
+//! over "which registry agent id" (Zed's equivalent axis is "which
+//! `AgentServer` impl"); a `profile` axis is deliberately not exercised
+//! here since Phase 3 profiles require a provider/key, which this
+//! environment has none of (see the limitation note below) --
+//! native/unmanaged mode (no `_acpx.profile`) is what's actually driven
+//! per agent id.
 //!
 //! Each instantiation drives the full lifecycle through the real
 //! `acpx_core::router::Router` -- the single dispatch entry point shared by
