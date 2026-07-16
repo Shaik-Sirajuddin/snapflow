@@ -8,9 +8,17 @@
 use crate::TenantId;
 use std::collections::HashMap;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::{broadcast, Mutex};
 
 const DEFAULT_STREAM_CAPACITY: usize = 256;
+const DEFAULT_MAX_SUBSCRIBERS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SubscribeError {
+    #[error("session already has the configured maximum of {max_subscribers} live subscribers")]
+    TooManySubscribers { max_subscribers: usize },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct StreamKey {
@@ -22,6 +30,7 @@ struct StreamKey {
 pub struct NotificationHub {
     streams: Arc<Mutex<HashMap<StreamKey, broadcast::Sender<serde_json::Value>>>>,
     capacity: usize,
+    max_subscribers: usize,
 }
 
 impl Default for NotificationHub {
@@ -36,9 +45,17 @@ impl NotificationHub {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_limits(capacity, DEFAULT_MAX_SUBSCRIBERS)
+    }
+
+    /// Configure bounded delivery and admission independently. Both values
+    /// must be positive so every created stream has a usable receiver and
+    /// a deterministic connection limit.
+    pub fn with_limits(capacity: usize, max_subscribers: usize) -> Self {
         Self {
             streams: Arc::new(Mutex::new(HashMap::new())),
             capacity: capacity.max(1),
+            max_subscribers: max_subscribers.max(1),
         }
     }
 
@@ -56,13 +73,18 @@ impl NotificationHub {
         &self,
         tenant_id: &TenantId,
         gateway_session_id: impl Into<String>,
-    ) -> broadcast::Receiver<serde_json::Value> {
+    ) -> Result<broadcast::Receiver<serde_json::Value>, SubscribeError> {
         let key = Self::key(tenant_id, gateway_session_id);
         let mut streams = self.streams.lock().await;
-        streams
+        let sender = streams
             .entry(key)
-            .or_insert_with(|| broadcast::channel(self.capacity).0)
-            .subscribe()
+            .or_insert_with(|| broadcast::channel(self.capacity).0);
+        if sender.receiver_count() >= self.max_subscribers {
+            return Err(SubscribeError::TooManySubscribers {
+                max_subscribers: self.max_subscribers,
+            });
+        }
+        Ok(sender.subscribe())
     }
 
     /// Remove a session's stream after the gateway session has closed.
@@ -105,8 +127,8 @@ mod tests {
     async fn two_subscribers_receive_the_same_update() {
         let hub = NotificationHub::new();
         let tenant = TenantId::from("tenant-a");
-        let mut first = hub.subscribe(&tenant, "session-1").await;
-        let mut second = hub.subscribe(&tenant, "session-1").await;
+        let mut first = hub.subscribe(&tenant, "session-1").await.unwrap();
+        let mut second = hub.subscribe(&tenant, "session-1").await.unwrap();
         assert!(
             hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
                 .await
@@ -120,8 +142,8 @@ mod tests {
         let hub = NotificationHub::new();
         let tenant_a = TenantId::from("tenant-a");
         let tenant_b = TenantId::from("tenant-b");
-        let mut a = hub.subscribe(&tenant_a, "forced-collision").await;
-        let mut b = hub.subscribe(&tenant_b, "forced-collision").await;
+        let mut a = hub.subscribe(&tenant_a, "forced-collision").await.unwrap();
+        let mut b = hub.subscribe(&tenant_b, "forced-collision").await.unwrap();
         assert!(
             hub.publish(
                 &tenant_a,
@@ -142,12 +164,31 @@ mod tests {
     async fn removed_stream_does_not_deliver_future_updates() {
         let hub = NotificationHub::new();
         let tenant = TenantId::from("tenant-a");
-        let mut receiver = hub.subscribe(&tenant, "session-1").await;
+        let mut receiver = hub.subscribe(&tenant, "session-1").await.unwrap();
         hub.remove_stream(&tenant, "session-1").await;
         assert!(receiver.recv().await.is_err());
         assert!(
             !hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn subscriber_limit_rejects_only_the_new_subscriber() {
+        let hub = NotificationHub::with_limits(8, 2);
+        let tenant = TenantId::from("tenant-a");
+        let mut first = hub.subscribe(&tenant, "session-1").await.unwrap();
+        let mut second = hub.subscribe(&tenant, "session-1").await.unwrap();
+
+        assert!(matches!(
+            hub.subscribe(&tenant, "session-1").await,
+            Err(SubscribeError::TooManySubscribers { max_subscribers: 2 })
+        ));
+        assert!(
+            hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
+                .await
+        );
+        assert_eq!(first.recv().await.unwrap(), serde_json::json!({"n": 1}));
+        assert_eq!(second.recv().await.unwrap(), serde_json::json!({"n": 1}));
     }
 }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use acpx_bridge::{BridgeConfig, BridgeModel};
 use acpx_conductor::SpawnSpec;
-use acpx_core::router::Router;
+use acpx_core::{router::Router, NotificationHub};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -564,6 +564,105 @@ async fn ws_round_trips_a_request() {
     // own "backend-abc" -- same invariant `router_dispatch_test.rs` checks
     // directly against `Router`.
     assert_ne!(body["result"]["sessionId"], json!("backend-abc"));
+}
+
+#[tokio::test]
+async fn ws_rejects_an_over_limit_subscriber_without_disrupting_the_existing_stream() {
+    let mut router =
+        Router::new("stand-in-agent").with_notification_hub(NotificationHub::with_limits(16, 1));
+    router.register_agent("stand-in-agent", streaming_backend_spec());
+    let addr = spawn_server(Arc::new(Mutex::new(router))).await;
+
+    let (mut first, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("first websocket connect");
+    first
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": "/tmp"}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("first session/new");
+    let created_frame = match first
+        .next()
+        .await
+        .expect("first session/new response")
+        .expect("first session/new frame")
+    {
+        WsMessage::Text(text) => text,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let created: serde_json::Value =
+        serde_json::from_str(&created_frame).expect("first session/new JSON");
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("gateway session id")
+        .to_string();
+
+    let (mut second, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("second websocket connect");
+    second
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": []}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("second prompt");
+    let rejected_frame = match second
+        .next()
+        .await
+        .expect("over-limit response")
+        .expect("over-limit frame")
+    {
+        WsMessage::Text(text) => text,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let rejected: serde_json::Value =
+        serde_json::from_str(&rejected_frame).expect("over-limit JSON");
+    assert_eq!(rejected["error"]["code"], json!(-32050));
+    assert_eq!(rejected["error"]["data"]["maxSubscribers"], json!(1));
+
+    first
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": []}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("first prompt");
+    let mut saw_update = false;
+    let mut saw_response = false;
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), first.next())
+            .await
+            .expect("first client timed out waiting for streamed turn")
+            .expect("first websocket closed")
+            .expect("first websocket frame error");
+        let text = match frame {
+            WsMessage::Text(text) => text,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(&text).expect("first client JSON");
+        saw_update |= body["method"] == json!("session/update");
+        saw_response |= body["id"] == json!(3) && body.get("error").is_none();
+    }
+    assert!(saw_update, "existing subscriber missed its streamed update");
+    assert!(saw_response, "existing subscriber's prompt was disrupted");
 }
 
 #[tokio::test]

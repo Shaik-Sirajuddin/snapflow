@@ -62,7 +62,7 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             }
         }
     });
-    let mut watched: HashSet<String> = HashSet::new();
+    let watched = Arc::new(Mutex::new(HashSet::<String>::new()));
     let interaction_bindings = Arc::new(Mutex::new(HashMap::<String, InteractionBinding>::new()));
     let tenant_id = std::env::var("ACPX_STDIO_TENANT")
         .ok()
@@ -108,20 +108,63 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             let previous = interaction_bindings
                 .lock()
                 .await
-                .insert(session_id, binding);
+                .insert(session_id.clone(), binding);
             if let Some(previous) = previous {
                 interaction_hub.unbind(&previous).await;
             }
+            let subscribe_after_response = watched.lock().await.insert(session_id.clone());
 
             let router = Arc::clone(&router);
             let tenant_id = tenant_id.clone();
             let stdout = Arc::clone(&stdout);
+            let hub = hub.clone();
+            let watched = Arc::clone(&watched);
             tokio::spawn(async move {
-                let response =
+                let mut response =
                     match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                         Ok(response) => response,
                         Err(error) => crate::transport::http::json_rpc_error(&request, error),
                     };
+                if subscribe_after_response && response.get("error").is_none() {
+                    match hub.subscribe(&tenant_id, session_id.clone()).await {
+                        Ok(mut rx) => {
+                            let forwarder_stdout = Arc::clone(&stdout);
+                            tokio::spawn(async move {
+                                loop {
+                                    let update = match rx.recv().await {
+                                        Ok(update) => update,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            skipped,
+                                        )) => {
+                                            tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                            continue;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break
+                                        }
+                                    };
+                                    let Ok(mut bytes) = serde_json::to_vec(&update) else {
+                                        continue;
+                                    };
+                                    bytes.push(b'\n');
+                                    let mut out = forwarder_stdout.lock().await;
+                                    if out.write_all(&bytes).await.is_err()
+                                        || out.flush().await.is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            watched.lock().await.remove(&session_id);
+                            response =
+                                crate::transport::http::json_rpc_subscribe_error(&request, error);
+                        }
+                    }
+                } else if subscribe_after_response {
+                    watched.lock().await.remove(&session_id);
+                }
                 let Ok(mut bytes) = serde_json::to_vec(&response) else {
                     return;
                 };
@@ -133,7 +176,7 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             continue;
         }
 
-        let response = {
+        let mut response = {
             match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                 Ok(response) => response,
                 Err(err) => {
@@ -148,33 +191,45 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             .and_then(|m| m.as_str())
             .unwrap_or_default();
         if let Some(forget) = session_id_to_forget(&request, &response, method) {
-            if watched.remove(&forget) {
+            if watched.lock().await.remove(&forget) {
                 hub.remove_stream(&tenant_id, &forget).await;
             }
         } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
-            if watched.insert(watch.clone()) {
-                let mut rx = hub.subscribe(&tenant_id, watch).await;
-                let forwarder_stdout = Arc::clone(&stdout);
-                tokio::spawn(async move {
-                    loop {
-                        let update = match rx.recv().await {
-                            Ok(update) => update,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                tracing::warn!(%skipped, "ACPX notification subscriber lagged");
-                                continue;
+            if watched.lock().await.insert(watch.clone()) {
+                match hub.subscribe(&tenant_id, watch.clone()).await {
+                    Ok(mut rx) => {
+                        let forwarder_stdout = Arc::clone(&stdout);
+                        tokio::spawn(async move {
+                            loop {
+                                let update = match rx.recv().await {
+                                    Ok(update) => update,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        skipped,
+                                    )) => {
+                                        tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                };
+                                let Ok(mut bytes) = serde_json::to_vec(&update) else {
+                                    continue;
+                                };
+                                bytes.push(b'\n');
+                                let mut out = forwarder_stdout.lock().await;
+                                if out.write_all(&bytes).await.is_err()
+                                    || out.flush().await.is_err()
+                                {
+                                    break;
+                                }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        };
-                        let Ok(mut bytes) = serde_json::to_vec(&update) else {
-                            continue;
-                        };
-                        bytes.push(b'\n');
-                        let mut out = forwarder_stdout.lock().await;
-                        if out.write_all(&bytes).await.is_err() || out.flush().await.is_err() {
-                            break;
-                        }
+                        });
                     }
-                });
+                    Err(error) => {
+                        watched.lock().await.remove(&watch);
+                        response =
+                            crate::transport::http::json_rpc_subscribe_error(&request, error);
+                    }
+                }
             }
         }
 
@@ -186,7 +241,6 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
             out.flush().await?;
         }
     }
-    drop(watched);
     for (_, binding) in interaction_bindings.lock().await.drain() {
         interaction_hub.unbind(&binding).await;
     }

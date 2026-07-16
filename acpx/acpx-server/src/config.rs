@@ -44,6 +44,9 @@ pub struct ServerConfig {
     /// `ACPX_UNBOUND_BRIDGE_SESSION_TTL_SECONDS`, and optionally
     /// `ACPX_SESSION_ABSOLUTE_TTL_SECONDS` (`off` disables it).
     pub lifecycle: LifecycleConfig,
+    /// Maximum concurrent persistent stdio/WS subscribers for one
+    /// tenant-scoped gateway session.
+    pub max_subscribers_per_session: usize,
 }
 
 impl ServerConfig {
@@ -147,6 +150,7 @@ impl ServerConfig {
         lifecycle
             .validate()
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));
+        let max_subscribers_per_session = positive_usize("ACPX_MAX_SUBSCRIBERS_PER_SESSION", 16);
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -159,17 +163,20 @@ impl ServerConfig {
             lifecycle_reaper_enabled,
             lifecycle_reaper_interval,
             lifecycle,
+            max_subscribers_per_session,
         }
     }
 }
 
 fn positive_usize(name: &str, default: usize) -> usize {
-    match std::env::var(name) {
+    let parsed = match std::env::var(name) {
         Ok(value) => value
             .parse::<usize>()
             .unwrap_or_else(|err| panic!("{name}={value:?} is not a positive integer: {err}")),
         Err(_) => default,
-    }
+    };
+    assert!(parsed > 0, "{name} must be greater than zero");
+    parsed
 }
 
 fn positive_duration(name: &str, default: std::time::Duration) -> std::time::Duration {
@@ -203,5 +210,11 @@ mod tests {
     #[should_panic(expected = "must be greater than zero")]
     fn rejects_zero_lifecycle_duration() {
         parse_positive_duration("ACPX_SESSION_IDLE_TTL_SECONDS", "0");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be greater than zero")]
+    fn rejects_zero_subscriber_limit() {
+        positive_usize("ACPX_MAX_SUBSCRIBERS_PER_SESSION", 0);
     }
 }

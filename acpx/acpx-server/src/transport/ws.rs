@@ -52,7 +52,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use acpx_core::router::dispatch_shared_for_tenant;
 use acpx_core::{InteractionBinding, TenantId};
 
-use super::http::{json_rpc_error, AppState, SharedRouter};
+use super::http::{json_rpc_error, json_rpc_subscribe_error, AppState, SharedRouter};
 use super::live::{session_id_to_forget, session_id_to_watch};
 
 /// Axum handler for `GET /ws`: upgrades the connection, then hands off to
@@ -214,46 +214,58 @@ async fn handle_acp_socket(
         } else if let Some(public_id) = bridge_session_id_to_watch(&request, &response, method) {
             if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
                 if watched.insert(native_id.clone()) {
-                    let mut rx = hub.subscribe(&tenant_id, native_id).await;
-                    let forwarder_sink = Arc::clone(&sink);
-                    let forwarder_runtime = Arc::clone(&runtime);
-                    let forwarder_tenant = tenant_id.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            let mut update = match rx.recv().await {
-                                Ok(update) => update,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                    tracing::warn!(%skipped, "ACPX bridge notification subscriber lagged");
-                                    continue;
+                    match hub.subscribe(&tenant_id, native_id.clone()).await {
+                        Ok(mut rx) => {
+                            let forwarder_sink = Arc::clone(&sink);
+                            let forwarder_runtime = Arc::clone(&runtime);
+                            let forwarder_tenant = tenant_id.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    let mut update = match rx.recv().await {
+                                        Ok(update) => update,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            skipped,
+                                        )) => {
+                                            tracing::warn!(%skipped, "ACPX bridge notification subscriber lagged");
+                                            continue;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break
+                                        }
+                                    };
+                                    let Some(native_session_id) = update
+                                        .pointer("/params/sessionId")
+                                        .and_then(|value| value.as_str())
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(virtual_id) = forwarder_runtime
+                                        .virtual_session_id(&forwarder_tenant, native_session_id)
+                                    else {
+                                        continue;
+                                    };
+                                    update["params"]["sessionId"] =
+                                        serde_json::Value::String(virtual_id);
+                                    let Ok(frame) = serde_json::to_string(&update) else {
+                                        continue;
+                                    };
+                                    if forwarder_sink
+                                        .lock()
+                                        .await
+                                        .send(Message::Text(frame))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            };
-                            let Some(native_session_id) = update
-                                .pointer("/params/sessionId")
-                                .and_then(|value| value.as_str())
-                            else {
-                                continue;
-                            };
-                            let Some(virtual_id) = forwarder_runtime
-                                .virtual_session_id(&forwarder_tenant, native_session_id)
-                            else {
-                                continue;
-                            };
-                            update["params"]["sessionId"] = serde_json::Value::String(virtual_id);
-                            let Ok(frame) = serde_json::to_string(&update) else {
-                                continue;
-                            };
-                            if forwarder_sink
-                                .lock()
-                                .await
-                                .send(Message::Text(frame))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
+                            });
                         }
-                    });
+                        Err(error) => {
+                            watched.remove(&native_id);
+                            response = super::http::json_rpc_subscribe_error(&request, error);
+                        }
+                    }
                 }
             }
         }
@@ -431,39 +443,53 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             let tenant_id = tenant_id.clone();
             let sink = Arc::clone(&sink);
             let hub = hub.clone();
+            let deferred_watches = Arc::clone(&deferred_watches);
             tokio::spawn(async move {
-                let response =
+                let mut response =
                     match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                         Ok(response) => response,
                         Err(error) => json_rpc_error(&request, error),
                     };
                 if subscribe_after_response && response.get("error").is_none() {
-                    let mut rx = hub.subscribe(&tenant_id, session_id).await;
-                    let forwarder_sink = Arc::clone(&sink);
-                    tokio::spawn(async move {
-                        loop {
-                            let update = match rx.recv().await {
-                                Ok(update) => update,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                    tracing::warn!(%skipped, "ACPX notification subscriber lagged");
-                                    continue;
+                    match hub.subscribe(&tenant_id, session_id.clone()).await {
+                        Ok(mut rx) => {
+                            let forwarder_sink = Arc::clone(&sink);
+                            tokio::spawn(async move {
+                                loop {
+                                    let update = match rx.recv().await {
+                                        Ok(update) => update,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            skipped,
+                                        )) => {
+                                            tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                            continue;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break
+                                        }
+                                    };
+                                    let Ok(payload) = serde_json::to_string(&update) else {
+                                        continue;
+                                    };
+                                    if forwarder_sink
+                                        .lock()
+                                        .await
+                                        .send(Message::Text(payload))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            };
-                            let Ok(payload) = serde_json::to_string(&update) else {
-                                continue;
-                            };
-                            if forwarder_sink
-                                .lock()
-                                .await
-                                .send(Message::Text(payload))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
+                            });
                         }
-                    });
+                        Err(error) => {
+                            deferred_watches.lock().await.remove(&session_id);
+                            response = json_rpc_subscribe_error(&request, error);
+                        }
+                    }
+                } else if subscribe_after_response {
+                    deferred_watches.lock().await.remove(&session_id);
                 }
                 let Ok(payload) = serde_json::to_string(&response) else {
                     return;
@@ -473,7 +499,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             continue;
         }
 
-        let response = {
+        let mut response = {
             match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                 Ok(response) => response,
                 Err(err) => json_rpc_error(&request, err),
@@ -488,34 +514,45 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             if watched.remove(&forget) {
                 hub.remove_stream(&tenant_id, &forget).await;
             }
+            deferred_watches.lock().await.remove(&forget);
         } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
             if watched.insert(watch.clone()) {
-                let mut rx = hub.subscribe(&tenant_id, watch).await;
-                let forwarder_sink = Arc::clone(&sink);
-                tokio::spawn(async move {
-                    loop {
-                        let update = match rx.recv().await {
-                            Ok(update) => update,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                tracing::warn!(%skipped, "ACPX notification subscriber lagged");
-                                continue;
+                match hub.subscribe(&tenant_id, watch.clone()).await {
+                    Ok(mut rx) => {
+                        deferred_watches.lock().await.insert(watch.clone());
+                        let forwarder_sink = Arc::clone(&sink);
+                        tokio::spawn(async move {
+                            loop {
+                                let update = match rx.recv().await {
+                                    Ok(update) => update,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        skipped,
+                                    )) => {
+                                        tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                };
+                                let Ok(payload) = serde_json::to_string(&update) else {
+                                    continue;
+                                };
+                                if forwarder_sink
+                                    .lock()
+                                    .await
+                                    .send(Message::Text(payload))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        };
-                        let Ok(payload) = serde_json::to_string(&update) else {
-                            continue;
-                        };
-                        if forwarder_sink
-                            .lock()
-                            .await
-                            .send(Message::Text(payload))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                        });
                     }
-                });
+                    Err(error) => {
+                        watched.remove(&watch);
+                        response = json_rpc_subscribe_error(&request, error);
+                    }
+                }
             }
         }
 

@@ -18,7 +18,7 @@ mod config;
 mod provisioning;
 mod transport;
 
-use acpx_core::router::Router;
+use acpx_core::{router::Router, NotificationHub};
 use config::ServerConfig;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -45,11 +45,16 @@ async fn main() -> anyhow::Result<()> {
         session_idle_ttl_secs = config.lifecycle.idle_session_ttl.as_secs(),
         unbound_bridge_session_ttl_secs = config.lifecycle.unbound_bridge_session_ttl.as_secs(),
         session_absolute_ttl_secs = ?config.lifecycle.absolute_session_ttl.map(|ttl| ttl.as_secs()),
+        max_subscribers_per_session = config.max_subscribers_per_session,
         "starting acpx-server"
     );
 
     let mut router = Router::new(config.default_agent_id.clone())
-        .with_lifecycle_config(config.lifecycle.clone());
+        .with_lifecycle_config(config.lifecycle.clone())
+        .with_notification_hub(NotificationHub::with_limits(
+            256,
+            config.max_subscribers_per_session,
+        ));
     router.register_agent(config.default_agent_id.clone(), config.backend.clone());
 
     if let Ok(db_path) = std::env::var("ACPX_DB_PATH") {

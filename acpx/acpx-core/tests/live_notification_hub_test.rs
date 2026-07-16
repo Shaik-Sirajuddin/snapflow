@@ -68,7 +68,8 @@ async fn a_subscribed_session_receives_updates_live_and_the_response_carries_no_
     let hub = { router.lock().await.notification_hub() };
     let mut rx = hub
         .subscribe(&TenantId::default(), gateway_id.clone())
-        .await;
+        .await
+        .expect("subscription should fit the default limit");
 
     let prompt_response = dispatch_shared(
         &router,
@@ -168,7 +169,8 @@ async fn unsubscribing_mid_stream_falls_back_to_buffering_for_the_rest_of_that_c
     // actually arrives.
     let _rx = hub
         .subscribe(&TenantId::default(), gateway_id.clone())
-        .await;
+        .await
+        .expect("subscription should fit the default limit");
     hub.remove_stream(&TenantId::default(), &gateway_id).await;
 
     let prompt_response = dispatch_shared(
@@ -261,7 +263,8 @@ done
     let hub = { router.lock().await.notification_hub() };
     let mut rx = hub
         .subscribe(&TenantId::default(), gateway_id.clone())
-        .await;
+        .await
+        .expect("subscription should fit the default limit");
 
     let slow_router = Arc::clone(&router);
     let slow_gateway_id = gateway_id.clone();

@@ -3109,3 +3109,24 @@ cannot -- see `tests/openhands_integration/README.md`'s pre-existing
 "a note on `ps` snapshot stability" section; not a new issue, not an
 acpx/OpenHands bug, and the test degrades gracefully to a partial-skip
 rather than a false failure).
+
+## Phase 31: bounded persistent session subscribers
+
+Added `ACPX_MAX_SUBSCRIBERS_PER_SESSION` (default `16`) to cap live
+stdio/WebSocket subscribers per tenant-scoped gateway session. The
+notification hub now admits a new receiver atomically with the stream
+lookup and returns an explicit `TooManySubscribers` result without
+evicting existing receivers. Persistent transports surface that result
+as ACPX-reserved JSON-RPC error `-32050`, with
+`error.data.maxSubscribers` for client-side retry/backoff policy.
+
+`ws_rejects_an_over_limit_subscriber_without_disrupting_the_existing_
+stream` drives two real WebSocket clients through the production
+transport against a synthetic streaming ACP backend: client two receives
+the distinct error while client one still receives `session/update` and
+its successful `session/prompt` response. This also caught and fixed a
+duplicate-subscription path where a client that subscribed during
+`session/new` retried subscription on its first prompt.
+
+Verified with `cargo test --workspace --no-fail-fast`: all default tests
+passed; credentialed ambient tests remain intentionally ignored.

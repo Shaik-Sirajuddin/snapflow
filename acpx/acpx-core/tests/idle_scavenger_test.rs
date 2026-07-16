@@ -79,7 +79,8 @@ async fn an_idle_notification_between_calls_still_reaches_a_live_subscriber_with
     let hub = { router.lock().await.notification_hub() };
     let mut rx = hub
         .subscribe(&TenantId::default(), gateway_id.clone())
-        .await;
+        .await
+        .expect("subscription should fit the default limit");
 
     let prompt_response = dispatch_shared(
         &router,

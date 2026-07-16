@@ -456,3 +456,24 @@ pub(crate) fn json_rpc_error(request: &serde_json::Value, err: RouterError) -> s
         }
     })
 }
+
+/// ACPX-reserved server error for a persistent stream whose configured
+/// subscriber cap has been reached. This is intentionally distinct from
+/// backend-proxied ACP errors, which retain their original error codes.
+pub(crate) fn json_rpc_subscribe_error(
+    request: &serde_json::Value,
+    error: acpx_core::SubscribeError,
+) -> serde_json::Value {
+    let max_subscribers = match error {
+        acpx_core::SubscribeError::TooManySubscribers { max_subscribers } => max_subscribers,
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "error": {
+            "code": -32050,
+            "message": error.to_string(),
+            "data": { "maxSubscribers": max_subscribers }
+        }
+    })
+}

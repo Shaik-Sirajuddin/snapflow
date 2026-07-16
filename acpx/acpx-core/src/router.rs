@@ -602,6 +602,13 @@ impl Router {
         self
     }
 
+    /// Replace the live notification hub before transports are attached.
+    /// The server uses this to apply deployment-level subscriber limits.
+    pub fn with_notification_hub(mut self, notification_hub: NotificationHub) -> Self {
+        self.notification_hub = notification_hub;
+        self
+    }
+
     /// Lifecycle-management seam used by the server's future authenticated
     /// retention controls. Pinning never bypasses explicit `session/close`.
     pub fn set_session_pinned(
