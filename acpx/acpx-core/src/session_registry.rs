@@ -99,6 +99,16 @@ pub struct SessionEntry {
     /// A reaper must never evict a session while a backend operation is
     /// executing against it.
     pub in_flight: usize,
+    /// **`active_turn_deadline`.** When `in_flight` most recently
+    /// transitioned from `0` to non-zero -- `None` whenever `in_flight`
+    /// is `0`. Backs `SessionRegistry::stuck_in_flight_candidates`: a
+    /// turn that has been continuously in-flight since before
+    /// `LifecycleConfig::active_turn_deadline` ago is a candidate for
+    /// bounded cancellation rather than an indefinite reaper skip. Kept
+    /// separate from `last_activity_at` (which `set_in_flight(0)`
+    /// refreshes) because the deadline measures how long the *current*
+    /// turn has run, not how recently the session was last touched.
+    pub in_flight_since: Option<Instant>,
     /// Explicit retention override controlled by ACPX administration.
     pub pinned: bool,
     /// **`retention_administration`.** Per-session idle-TTL override, set
@@ -177,6 +187,7 @@ impl SessionRegistry {
                 created_at: Instant::now(),
                 last_activity_at: Instant::now(),
                 in_flight: 0,
+                in_flight_since: None,
                 pinned: false,
                 custom_idle_ttl: None,
             },
@@ -244,9 +255,17 @@ impl SessionRegistry {
         else {
             return false;
         };
+        let was_idle = entry.in_flight == 0;
         entry.in_flight = in_flight;
         if in_flight == 0 {
             entry.last_activity_at = Instant::now();
+            entry.in_flight_since = None;
+        } else if was_idle {
+            // Only stamp on a genuine `0 -> non-zero` transition, not on
+            // a same-turn re-assertion (e.g. a caller re-marking an
+            // already in-flight session), so the deadline measures the
+            // current turn's actual start.
+            entry.in_flight_since = Some(Instant::now());
         }
         true
     }
@@ -343,6 +362,57 @@ impl SessionRegistry {
                 })
             })
             .collect()
+    }
+
+    /// **`active_turn_deadline`.** Lists sessions whose *current* turn
+    /// has been continuously in-flight for at least `deadline` -- a
+    /// no-op (always empty) when `LifecycleConfig::active_turn_deadline`
+    /// is `None`, matching the unbounded-skip behavior that predates
+    /// this field. Disjoint from [`Self::reap_candidates`] by
+    /// construction: that method only ever selects `in_flight == 0`
+    /// entries, this one only ever selects `in_flight != 0` entries with
+    /// a recorded start time, so a caller can run both passes over the
+    /// same tick without double-selecting a session.
+    pub fn stuck_in_flight_candidates(
+        &self,
+        now: Instant,
+        lifecycle: &LifecycleConfig,
+    ) -> Vec<(TenantId, GatewaySessionId)> {
+        let Some(deadline) = lifecycle.active_turn_deadline else {
+            return Vec::new();
+        };
+        self.sessions
+            .iter()
+            .flat_map(|(tenant, sessions)| {
+                sessions.iter().filter_map(move |(id, entry)| {
+                    let since = entry.in_flight_since?;
+                    if entry.in_flight == 0 {
+                        return None;
+                    }
+                    (now.saturating_duration_since(since) >= deadline)
+                        .then(|| (tenant.clone(), GatewaySessionId(id.clone())))
+                })
+            })
+            .collect()
+    }
+
+    /// **`connector_reference_lifecycle`.** Count of currently-live
+    /// sessions (any tenant) whose `agent_id` (a supervisor key -- a
+    /// bare registered agent id in native mode, or `profile:<name>[...]`
+    /// once resolved through a profile, see `Router::resolve_profile`)
+    /// equals `supervisor_key`. Backs `Router`'s connector-idle-shutdown
+    /// reference counting: a shared backend process under a given key is
+    /// only a real idle-shutdown candidate once this reaches zero.
+    pub fn count_by_agent_id(&self, supervisor_key: &str) -> usize {
+        self.sessions
+            .values()
+            .map(|tenant_sessions| {
+                tenant_sessions
+                    .values()
+                    .filter(|entry| entry.agent_id == supervisor_key)
+                    .count()
+            })
+            .sum()
     }
 
     pub fn remove(
@@ -709,5 +779,66 @@ mod tests {
         let then = Instant::now() + std::time::Duration::from_secs(31 * 60);
         let candidates = reg.reap_candidates(then, &LifecycleConfig::default());
         assert_eq!(candidates, vec![(tenant, idle)]);
+    }
+
+    /// **`active_turn_deadline`.** `stuck_in_flight_candidates` only
+    /// selects a session whose *current* turn has run at least the
+    /// configured deadline, is disabled entirely (`None`) by default,
+    /// and never overlaps `reap_candidates`' own selection (that method
+    /// only ever selects `in_flight == 0` entries).
+    #[test]
+    fn stuck_in_flight_candidates_respects_the_configured_deadline() {
+        let mut reg = SessionRegistry::new();
+        let tenant = TenantId::default_tenant();
+        let stuck = reg.register(
+            &tenant,
+            "agent",
+            BackendSessionId("stuck".to_string()),
+            None,
+            None,
+        );
+        let idle = reg.register(
+            &tenant,
+            "agent",
+            BackendSessionId("idle".to_string()),
+            None,
+            None,
+        );
+        reg.set_in_flight(&tenant, &stuck, 1);
+
+        let deadline = std::time::Duration::from_secs(60);
+        let default_lifecycle = LifecycleConfig::default();
+        assert!(
+            reg.stuck_in_flight_candidates(
+                Instant::now() + deadline * 10,
+                &default_lifecycle
+            )
+            .is_empty(),
+            "disabled (None) active_turn_deadline must never select anything"
+        );
+
+        let lifecycle = LifecycleConfig {
+            active_turn_deadline: Some(deadline),
+            ..LifecycleConfig::default()
+        };
+        // Neither an idle (never in-flight) nor a freshly in-flight
+        // session is a candidate yet.
+        let too_soon = reg.stuck_in_flight_candidates(Instant::now(), &lifecycle);
+        assert!(too_soon.is_empty());
+
+        // Only `stuck` (in-flight since before this call) qualifies once
+        // the deadline has passed; `idle` (never in-flight at all) never
+        // does, no matter how far `now` is pushed forward.
+        let candidates =
+            reg.stuck_in_flight_candidates(Instant::now() + deadline * 10, &lifecycle);
+        assert_eq!(candidates, vec![(tenant.clone(), stuck.clone())]);
+        assert!(!candidates.contains(&(tenant.clone(), idle)));
+
+        // Clearing in-flight (as `Router::cancel_stuck_turns` does after
+        // delivering the cancellation) removes it from future candidacy.
+        reg.set_in_flight(&tenant, &stuck, 0);
+        assert!(reg
+            .stuck_in_flight_candidates(Instant::now() + deadline * 10, &lifecycle)
+            .is_empty());
     }
 }

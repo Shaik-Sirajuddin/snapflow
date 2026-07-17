@@ -349,6 +349,16 @@ pub struct Router {
     /// process mutex. Native/unmanaged sessions (no `_acpx.profile`) are
     /// unaffected regardless of this setting -- see `dispatch_session_new`.
     session_process_isolation: bool,
+    /// **`connector_reference_lifecycle`.** Supervisor keys currently
+    /// observed to have zero referencing live sessions, mapped to when
+    /// that was first observed. Only populated/consulted when
+    /// `LifecycleConfig::connector_idle_shutdown_ttl` is `Some` --
+    /// `mark_unreferenced_if_idle`/`reap_unreferenced_backends` are the
+    /// only readers/writers. A key is removed the moment any session
+    /// references it again (see `dispatch_session_new`'s bookkeeping),
+    /// so re-use before the TTL elapses cancels a pending shutdown
+    /// cleanly rather than racing it.
+    unreferenced_backends: HashMap<String, std::time::Instant>,
 }
 
 /// Outcome of proactively restoring durable sessions during startup.
@@ -680,6 +690,7 @@ impl Router {
             scavenged_backends: HashSet::new(),
             tenant_process_isolation: false,
             session_process_isolation: false,
+            unreferenced_backends: HashMap::new(),
         }
     }
 
@@ -1492,6 +1503,147 @@ impl Router {
         }
     }
 
+    /// **`connector_reference_lifecycle`.** Called after any session
+    /// removal (reap, explicit `session/close`, or persistence-failure
+    /// rollback): if `supervisor_key` is no longer referenced by any
+    /// live session, and connector-idle-shutdown is enabled, records
+    /// when it first became unreferenced (a no-op if already recorded --
+    /// the timer starts once, not on every later check). A session-
+    /// scoped key (`stop_if_session_scoped` already stopped it
+    /// unconditionally, so it is never a real candidate) is skipped, and
+    /// a bare native/unmanaged agent id (never resolved through a
+    /// profile) is also skipped -- shutting down a directly-`register_
+    /// agent`-registered backend that a client may reference again at
+    /// any moment via native mode (no `session/new` failure to recover
+    /// from the way a profile-backed respawn has) is out of scope for
+    /// this opt-in feature.
+    fn mark_unreferenced_if_idle(&mut self, supervisor_key: &str) {
+        let Some(_ttl) = self.lifecycle.connector_idle_shutdown_ttl else {
+            return;
+        };
+        if Self::is_session_scoped_supervisor_key(supervisor_key)
+            || !supervisor_key.starts_with("profile:")
+        {
+            return;
+        }
+        if self.sessions.count_by_agent_id(supervisor_key) == 0 {
+            self.unreferenced_backends
+                .entry(supervisor_key.to_string())
+                .or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// Cancels a pending idle-shutdown for `supervisor_key` -- called
+    /// whenever a session is (re-)registered under it, so a backend that
+    /// gains a new referencing session before its grace period elapses
+    /// is never stopped out from under that session.
+    fn cancel_unreferenced_shutdown(&mut self, supervisor_key: &str) {
+        self.unreferenced_backends.remove(supervisor_key);
+    }
+
+    /// **`connector_reference_lifecycle`.** Stops every supervisor key
+    /// that has been continuously unreferenced (zero live sessions) for
+    /// at least `LifecycleConfig::connector_idle_shutdown_ttl`. No-op
+    /// (returns `0` immediately) unless that config is `Some` --
+    /// intended to be polled periodically by the same caller driving
+    /// [`Self::reap_expired_sessions`] (see `acpx-server`'s `main.rs`),
+    /// but is itself independent of it: this only ever stops a process,
+    /// never touches `SessionRegistry` (there is nothing left in it
+    /// referencing an already-unreferenced key by definition).
+    /// Double-checks the reference count at stop time (not just at the
+    /// original observation) in case a new session raced in after
+    /// `mark_unreferenced_if_idle` recorded it but before this call --
+    /// that session's own `cancel_unreferenced_shutdown` call may not
+    /// yet have run if this is invoked concurrently, so this is the
+    /// final, authoritative check.
+    pub async fn reap_unreferenced_backends(&mut self, now: std::time::Instant) -> usize {
+        let Some(ttl) = self.lifecycle.connector_idle_shutdown_ttl else {
+            return 0;
+        };
+        let expired: Vec<String> = self
+            .unreferenced_backends
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= ttl)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut stopped = 0;
+        for key in expired {
+            self.unreferenced_backends.remove(&key);
+            if self.sessions.count_by_agent_id(&key) != 0 {
+                continue; // Raced with a new session -- leave it running.
+            }
+            if let Err(error) = self.supervisor.stop(&key).await {
+                tracing::warn!(
+                    %error,
+                    supervisor_key = %key,
+                    "failed to stop an idle, unreferenced backend process"
+                );
+                continue;
+            }
+            stopped += 1;
+        }
+        stopped
+    }
+
+    /// **`active_turn_deadline`.** Best-effort bounded recovery for a
+    /// turn that has been continuously in-flight for at least
+    /// `LifecycleConfig::active_turn_deadline` (see
+    /// `SessionRegistry::stuck_in_flight_candidates`). For each stuck
+    /// session: sends the backend the exact same `session/cancel`
+    /// notification `Router::dispatch_session_cancel` would (through
+    /// `Supervisor::cancel_writer`, independent of the per-process lock
+    /// the stuck `dispatch_proxied`/`dispatch_proxied_shared` call is
+    /// still holding -- see that method's doc comment for why that
+    /// separate writer handle is what makes delivery possible at all
+    /// while a call is still blocked reading a response), then
+    /// force-clears `in_flight` so the session is no longer
+    /// unconditionally skipped by every future `reap_expired_sessions`/
+    /// `stuck_in_flight_candidates` pass.
+    ///
+    /// Deliberately does **not** itself close, remove, or touch the
+    /// persisted session row -- the still-running backend call this is
+    /// racing may yet resolve normally (this only ever asks the backend
+    /// to *stop*, it cannot force an in-progress `read_matching_response`
+    /// await in another task to return early), and forcibly tearing down
+    /// the gateway session out from under that still-live call would
+    /// turn one stuck turn into a second, worse bug: a response the
+    /// original caller is still awaiting racing a session the registry
+    /// no longer knows about. Once cleared, the *next* reaper tick's
+    /// ordinary idle-TTL pass becomes the real backstop if the backend
+    /// never actually confirms the cancellation -- exactly the "recovery
+    /// policy" half of this report, not just "cancellation".
+    pub async fn cancel_stuck_turns(&mut self, now: std::time::Instant) -> usize {
+        let candidates = self.sessions.stuck_in_flight_candidates(now, &self.lifecycle);
+        let mut cancelled = 0;
+        for (tenant_id, gateway_id) in candidates {
+            let Some(entry) = self.sessions.resolve(&tenant_id, &gateway_id).cloned() else {
+                continue;
+            };
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": { "sessionId": entry.backend_session_id.0 }
+            });
+            if let Some(writer) = self.supervisor.cancel_writer(&entry.agent_id) {
+                if let Err(error) = writer.lock().await.write_value(&notification).await {
+                    tracing::warn!(
+                        %error,
+                        gateway_session_id = %gateway_id.0,
+                        "failed to deliver best-effort session/cancel for a stuck turn"
+                    );
+                }
+            }
+            self.spawn_transcript(gateway_id.0.clone(), Direction::ClientToAgent, notification);
+            self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
+            tracing::warn!(
+                gateway_session_id = %gateway_id.0,
+                "cancelled a turn that exceeded the active-turn deadline"
+            );
+            cancelled += 1;
+        }
+        cancelled
+    }
+
     /// Fire-and-forget one transcript append, if persistence is attached.
     /// Never awaited by the caller -- spawned onto the runtime so a slow
     /// sqlite write can't add latency to the client-visible request path.
@@ -1608,11 +1760,16 @@ impl Router {
                             None,
                         )
                         .await?;
+                    // See `dispatch_session_new`'s identical cancellation
+                    // -- this startup-restore path re-registers a session
+                    // against `entry.agent_id`'s supervisor key too.
+                    let supervisor_key_for_cancel = entry.agent_id.clone();
                     self.sessions.insert(
                         &tenant_id,
                         acpx_proto::session::GatewaySessionId(record.gateway_session_id.clone()),
                         entry,
                     );
+                    self.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
                     admission.commit();
                     report.restored += 1;
                 }
@@ -1697,6 +1854,7 @@ impl Router {
             if let Some(removed) = self.sessions.remove(&tenant_id, &gateway_id) {
                 self.release_live_session(&tenant_id);
                 self.stop_if_session_scoped(&removed.agent_id).await;
+                self.mark_unreferenced_if_idle(&removed.agent_id);
                 report.closed += 1;
             } else {
                 report.skipped += 1;
@@ -1776,6 +1934,7 @@ impl Router {
                 created_at: restore_lifecycle_instant(record.created_at_unix_nanos),
                 last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
                 in_flight: 0,
+                in_flight_since: None,
                 pinned: record.pinned,
                 custom_idle_ttl: record
                     .custom_idle_ttl_seconds
@@ -2092,6 +2251,13 @@ impl Router {
         };
 
         let backend_session_id = extract_backend_session_id(&response)?;
+        // **`connector_reference_lifecycle`.** A freshly-registered
+        // session references `agent_id`'s supervisor key again -- cancel
+        // any pending idle-shutdown timer that started while it had zero
+        // referencing sessions (a no-op when the feature is disabled or
+        // no timer is pending). Cloned before the match below moves
+        // `agent_id` into whichever registration branch runs.
+        let supervisor_key_for_cancel = agent_id.clone();
         let gateway_id = match pre_minted_gateway_id {
             Some(gid) => self.sessions.register_with_id(
                 tenant_id,
@@ -2109,6 +2275,7 @@ impl Router {
                 cwd,
             ),
         };
+        self.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
 
         // Rewrite the backend's own session id into the gateway-issued one
         // before it ever reaches the client -- the client only ever sees
@@ -2138,6 +2305,7 @@ impl Router {
                 &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
             ) {
                 self.stop_if_session_scoped(&removed.agent_id).await;
+                self.mark_unreferenced_if_idle(&removed.agent_id);
             }
             return Err(error);
         }
@@ -2517,6 +2685,7 @@ impl Router {
             created_at: restore_lifecycle_instant(record.created_at_unix_nanos),
             last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
             in_flight: 0,
+            in_flight_since: None,
             pinned: record.pinned,
             custom_idle_ttl: record
                 .custom_idle_ttl_seconds
@@ -2549,6 +2718,7 @@ impl Router {
             acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
             entry.clone(),
         );
+        self.cancel_unreferenced_shutdown(&entry.agent_id);
         admission.commit();
         Ok(entry)
     }
@@ -2651,15 +2821,28 @@ impl Router {
             // closed sessions as still live indefinitely. `remove` already
             // existed on `SessionRegistry` but was never called from
             // anywhere in this file until now.
-            if self
+            // **Second real bug fix, found while auditing the
+            // `connector_reference_lifecycle` gap:** this evicted the
+            // `SessionRegistry` entry but never called
+            // `stop_if_session_scoped` -- unlike the reap path just above
+            // in this file, which does. Under `ACPX_SESSION_PROCESS_
+            // ISOLATION`, an explicit client `session/close` (the common
+            // case -- a well-behaved client closes when done, rather than
+            // waiting for the idle reaper) leaked that session's
+            // dedicated backend process forever, with no other code path
+            // ever able to stop it again (its supervisor key is unique to
+            // this one session, so no other session/reap ever revisits
+            // it). A no-op for the default shared-process model.
+            if let Some(removed) = self
                 .sessions
                 .remove(
                     tenant_id,
                     &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
                 )
-                .is_some()
             {
                 self.release_live_session(tenant_id);
+                self.stop_if_session_scoped(&removed.agent_id).await;
+                self.mark_unreferenced_if_idle(&removed.agent_id);
             }
         }
         Ok(response)
@@ -4662,11 +4845,14 @@ async fn run_recovery_candidate(
         )
         .await?;
     let mut router = router.lock().await;
+    // See `dispatch_session_new`'s identical cancellation.
+    let supervisor_key_for_cancel = job.entry.agent_id.clone();
     router.sessions.insert(
         &job.tenant_id,
         acpx_proto::session::GatewaySessionId(record.gateway_session_id),
         job.entry,
     );
+    router.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
     job.admission.commit();
     Ok(true)
 }
@@ -5181,14 +5367,16 @@ async fn dispatch_proxied_shared(
         // closed session from the shared `SessionRegistry` too, so the
         // two dispatch paths never drift apart on this behavior.
         let mut r = router.lock().await;
-        if r.sessions
+        if let Some(removed) = r
+            .sessions
             .remove(
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             )
-            .is_some()
         {
             r.release_live_session(tenant_id);
+            r.stop_if_session_scoped(&removed.agent_id).await;
+            r.mark_unreferenced_if_idle(&removed.agent_id);
         }
     }
     Ok(response)
@@ -5477,6 +5665,8 @@ async fn dispatch_session_new_shared(
 
     let (gateway_session_id_str, entry) = {
         let mut r = router.lock().await;
+        // See `dispatch_session_new`'s identical cancellation for why.
+        let supervisor_key_for_cancel = agent_id.clone();
         let gateway_id = match pre_minted_gateway_id.clone() {
             Some(gid) => r.sessions.register_with_id(
                 tenant_id,
@@ -5494,6 +5684,7 @@ async fn dispatch_session_new_shared(
                 cwd,
             ),
         };
+        r.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
@@ -5544,6 +5735,7 @@ async fn dispatch_session_new_shared(
                 &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
             ) {
                 r.stop_if_session_scoped(&removed.agent_id).await;
+                r.mark_unreferenced_if_idle(&removed.agent_id);
             }
             return Err(error.into());
         }

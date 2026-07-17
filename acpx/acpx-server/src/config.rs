@@ -288,6 +288,31 @@ impl ServerConfig {
                 })),
                 Err(_) => lifecycle.max_pinned_sessions_per_tenant,
             };
+        lifecycle.connector_idle_shutdown_ttl =
+            match std::env::var("ACPX_CONNECTOR_IDLE_SHUTDOWN_TTL_SECONDS") {
+                Ok(value)
+                    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") =>
+                {
+                    None
+                }
+                Ok(value) => Some(parse_positive_duration(
+                    "ACPX_CONNECTOR_IDLE_SHUTDOWN_TTL_SECONDS",
+                    &value,
+                )),
+                Err(_) => lifecycle.connector_idle_shutdown_ttl,
+            };
+        lifecycle.active_turn_deadline = match std::env::var("ACPX_ACTIVE_TURN_DEADLINE_SECONDS") {
+            Ok(value)
+                if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") =>
+            {
+                None
+            }
+            Ok(value) => Some(parse_positive_duration(
+                "ACPX_ACTIVE_TURN_DEADLINE_SECONDS",
+                &value,
+            )),
+            Err(_) => lifecycle.active_turn_deadline,
+        };
         lifecycle
             .validate()
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));

@@ -60,6 +60,8 @@ async fn main() -> anyhow::Result<()> {
         unbound_bridge_session_ttl_secs = config.lifecycle.unbound_bridge_session_ttl.as_secs(),
         session_absolute_ttl_secs = ?config.lifecycle.absolute_session_ttl.map(|ttl| ttl.as_secs()),
         max_pinned_sessions_per_tenant = ?config.lifecycle.max_pinned_sessions_per_tenant,
+        connector_idle_shutdown_ttl_secs = ?config.lifecycle.connector_idle_shutdown_ttl.map(|ttl| ttl.as_secs()),
+        active_turn_deadline_secs = ?config.lifecycle.active_turn_deadline.map(|ttl| ttl.as_secs()),
         max_subscribers_per_session = config.max_subscribers_per_session,
         stream_replay_buffer_size = config.stream_replay_buffer_size,
         stream_idle_retention_secs = config.stream_idle_retention.as_secs(),
@@ -233,17 +235,39 @@ async fn main() -> anyhow::Result<()> {
             ticker.tick().await; // Establish interval without delaying the first full tick.
             loop {
                 ticker.tick().await;
-                let report = lifecycle_router
-                    .lock()
-                    .await
-                    .reap_expired_sessions(std::time::Instant::now())
+                let mut guard = lifecycle_router.lock().await;
+                let report = guard.reap_expired_sessions(std::time::Instant::now()).await;
+                // **`connector_reference_lifecycle`.** Piggybacks on the
+                // same reaper tick rather than a second timer -- a no-op
+                // whenever `connector_idle_shutdown_ttl` is unset, and
+                // otherwise stops shared backend processes that have had
+                // zero referencing live sessions for at least that TTL.
+                let stopped_backends = guard
+                    .reap_unreferenced_backends(std::time::Instant::now())
                     .await;
+                // **`active_turn_deadline`.** Same tick, same rationale as
+                // `reap_unreferenced_backends` above -- a no-op whenever
+                // `active_turn_deadline` is unset.
+                let cancelled_turns = guard.cancel_stuck_turns(std::time::Instant::now()).await;
+                drop(guard);
                 if report.closed != 0 || report.failed != 0 {
                     tracing::info!(
                         closed = report.closed,
                         failed = report.failed,
                         skipped = report.skipped,
                         "completed ACPX lifecycle reaper pass"
+                    );
+                }
+                if stopped_backends != 0 {
+                    tracing::info!(
+                        stopped_backends,
+                        "stopped idle, unreferenced backend processes"
+                    );
+                }
+                if cancelled_turns != 0 {
+                    tracing::warn!(
+                        cancelled_turns,
+                        "cancelled turns that exceeded the active-turn deadline"
                     );
                 }
             }

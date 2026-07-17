@@ -24,6 +24,38 @@ pub struct LifecycleConfig {
     /// JSON-RPC methods instead of a zero quota, which would be a
     /// confusing way to spell "no pinning allowed").
     pub max_pinned_sessions_per_tenant: Option<usize>,
+    /// **`connector_reference_lifecycle`.** How long a shared backend
+    /// process (a supervisor key with zero currently-referencing live
+    /// sessions) must stay unreferenced before `Router::reap_
+    /// unreferenced_backends` stops it. `None` (the default) disables
+    /// this entirely -- unchanged behavior from before this field
+    /// existed: a shared process, once spawned, otherwise only ever
+    /// stops via an explicit `profiles/delete` or the whole daemon
+    /// exiting. Deliberately independent of `idle_session_ttl`/
+    /// `absolute_session_ttl` (which govern *session* retention, not
+    /// *process* retention) -- a session can be reaped/closed while its
+    /// backend process is still referenced by a sibling session under
+    /// the same key, and conversely the last session under a key can
+    /// close well before that key's own grace period elapses.
+    pub connector_idle_shutdown_ttl: Option<std::time::Duration>,
+    /// **`active_turn_deadline`.** How long a session's *current* turn
+    /// may stay in-flight (`SessionEntry::in_flight != 0`, i.e. a
+    /// `session/prompt`/`session/resume`/`session/load` round trip mid-
+    /// flight against the backend) before `Router::cancel_stuck_turns`
+    /// treats it as stuck: it sends the backend a best-effort
+    /// `session/cancel` notification, then force-clears the session's
+    /// in-flight bookkeeping so it stops being skipped by every future
+    /// reaper pass (a genuinely still-running backend call already in
+    /// flight is not itself interrupted -- there is no way to abort an
+    /// in-progress `read_matching_response` await from outside the task
+    /// running it -- but the *session* is no longer indefinitely
+    /// reap-exempt because of it). `None` (the default) disables this
+    /// entirely: unchanged, indefinite-skip behavior from before this
+    /// field existed. Deliberately independent of `idle_session_ttl` --
+    /// an in-flight session is by definition not idle, so it would
+    /// never be selected by `SessionRegistry::reap_candidates` no matter
+    /// how long the idle TTL is.
+    pub active_turn_deadline: Option<std::time::Duration>,
 }
 
 impl Default for LifecycleConfig {
@@ -35,6 +67,8 @@ impl Default for LifecycleConfig {
             unbound_bridge_session_ttl: std::time::Duration::from_secs(5 * 60),
             absolute_session_ttl: None,
             max_pinned_sessions_per_tenant: None,
+            connector_idle_shutdown_ttl: None,
+            active_turn_deadline: None,
         }
     }
 }
@@ -62,6 +96,17 @@ impl LifecycleConfig {
             return Err(LifecycleConfigError::ZeroLimit(
                 "max_pinned_sessions_per_tenant",
             ));
+        }
+        if self
+            .connector_idle_shutdown_ttl
+            .is_some_and(|ttl| ttl.is_zero())
+        {
+            return Err(LifecycleConfigError::ZeroDuration(
+                "connector_idle_shutdown_ttl",
+            ));
+        }
+        if self.active_turn_deadline.is_some_and(|ttl| ttl.is_zero()) {
+            return Err(LifecycleConfigError::ZeroDuration("active_turn_deadline"));
         }
         Ok(())
     }

@@ -189,3 +189,182 @@ async fn reaping_one_session_isolated_session_stops_only_its_own_process() {
     assert_eq!(router.process_status(&key_a), ProcessStatus::NotStarted);
     assert_eq!(router.process_status(&key_b), ProcessStatus::NotStarted);
 }
+
+/// **Regression test for a real bug** (`connector_reference_lifecycle`
+/// hardening): an explicit client `session/close` -- the common case,
+/// not just idle reaping -- used to evict the `SessionRegistry` entry
+/// without ever calling `stop_if_session_scoped`, so a session-isolated
+/// backend process leaked forever the moment a well-behaved client
+/// closed its own session rather than letting it idle out. Covers
+/// `Router::dispatch` (`dispatch_proxied`)'s direct path; the
+/// concurrency-safe `dispatch_shared`/`dispatch_proxied_shared` twin
+/// shares the exact same fix in the same commit.
+#[tokio::test]
+async fn explicit_session_close_stops_its_own_session_isolated_process() {
+    use acpx_conductor::supervisor::ProcessStatus;
+
+    let mut router = Router::new("unused").with_session_process_isolation(true);
+    let tenant = TenantId::from("tenant-a");
+    create_profile(&mut router).await;
+
+    let session_a = open_profile_session(&mut router, &tenant, 2).await;
+    let key_a = router
+        .supervisor_key_for_session(&tenant, &session_a)
+        .expect("session A supervisor key");
+    router
+        .process_id_for_session(&tenant, &session_a)
+        .await
+        .expect("session A process running before close");
+
+    let response = router
+        .dispatch_for_tenant(
+            &tenant,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/close",
+                "params": {"sessionId": session_a}
+            }),
+        )
+        .await
+        .expect("session/close");
+    assert!(response.get("result").is_some(), "{response:?}");
+
+    assert_eq!(
+        router.process_status(&key_a),
+        ProcessStatus::NotStarted,
+        "explicit session/close must stop the session's own dedicated process, \
+         not just leave it running until an idle reap"
+    );
+}
+
+/// **`connector_reference_lifecycle`.** `connector_idle_shutdown_ttl`
+/// covers the *shared*, profile-scoped backend process model (session
+/// process isolation off): a shared process must survive as long as
+/// *any* session still references its supervisor key, get a grace
+/// period once the last one closes, and only actually stop once
+/// `reap_unreferenced_backends` observes that grace period has fully
+/// elapsed with the key still unreferenced.
+#[tokio::test]
+async fn shared_backend_stops_after_idle_shutdown_ttl_once_unreferenced() {
+    use acpx_conductor::supervisor::ProcessStatus;
+    use acpx_core::lifecycle::LifecycleConfig;
+
+    let ttl = std::time::Duration::from_secs(30);
+    let mut router = Router::new("unused").with_lifecycle_config(LifecycleConfig {
+        connector_idle_shutdown_ttl: Some(ttl),
+        ..LifecycleConfig::default()
+    });
+    let tenant = TenantId::from("tenant-a");
+    create_profile(&mut router).await;
+
+    let session_a = open_profile_session(&mut router, &tenant, 1).await;
+    let session_b = open_profile_session(&mut router, &tenant, 2).await;
+    let key = router
+        .supervisor_key_for_session(&tenant, &session_a)
+        .expect("shared supervisor key");
+    assert_eq!(
+        key,
+        router
+            .supervisor_key_for_session(&tenant, &session_b)
+            .expect("shared supervisor key"),
+        "both sessions share the same profile-backed process"
+    );
+
+    // Closing one of two referencing sessions must not touch the still-
+    // referenced shared process.
+    close_session(&mut router, &tenant, &session_a, 3).await;
+    assert_eq!(
+        router.reap_unreferenced_backends(std::time::Instant::now()).await,
+        0,
+        "process is still referenced by session B"
+    );
+    assert_eq!(router.process_status(&key), ProcessStatus::Running);
+
+    // Closing the last referencing session starts the grace period, but
+    // a check before the TTL elapses must not stop it yet.
+    close_session(&mut router, &tenant, &session_b, 4).await;
+    assert_eq!(
+        router
+            .reap_unreferenced_backends(std::time::Instant::now() + ttl / 2)
+            .await,
+        0,
+        "grace period has not elapsed yet"
+    );
+    assert_eq!(router.process_status(&key), ProcessStatus::Running);
+
+    // Once the TTL has fully elapsed with the key still unreferenced,
+    // the shared process is stopped. `Instant::now() + ttl` (rather than
+    // an earlier fixed baseline plus `ttl`) guarantees this is strictly
+    // after whatever real `Instant::now()` `mark_unreferenced_if_idle`
+    // itself recorded above, regardless of how much wall time the
+    // preceding dispatch calls actually took.
+    assert_eq!(
+        router
+            .reap_unreferenced_backends(std::time::Instant::now() + ttl)
+            .await,
+        1,
+        "grace period elapsed with zero referencing sessions"
+    );
+    assert_eq!(router.process_status(&key), ProcessStatus::NotStarted);
+}
+
+/// A new session opened against the same profile before the grace
+/// period elapses cancels the pending shutdown -- the shared process
+/// must never be stopped out from under a session that started
+/// referencing it again in time.
+#[tokio::test]
+async fn shared_backend_idle_shutdown_is_cancelled_by_a_new_session() {
+    use acpx_conductor::supervisor::ProcessStatus;
+    use acpx_core::lifecycle::LifecycleConfig;
+
+    let ttl = std::time::Duration::from_secs(30);
+    let mut router = Router::new("unused").with_lifecycle_config(LifecycleConfig {
+        connector_idle_shutdown_ttl: Some(ttl),
+        ..LifecycleConfig::default()
+    });
+    let tenant = TenantId::from("tenant-a");
+    create_profile(&mut router).await;
+
+    let session_a = open_profile_session(&mut router, &tenant, 1).await;
+    let key = router
+        .supervisor_key_for_session(&tenant, &session_a)
+        .expect("shared supervisor key");
+    close_session(&mut router, &tenant, &session_a, 2).await;
+    assert_eq!(
+        router
+            .reap_unreferenced_backends(std::time::Instant::now())
+            .await,
+        0
+    );
+
+    // A fresh session against the same profile re-references the key
+    // before the TTL elapses.
+    let _session_b = open_profile_session(&mut router, &tenant, 3).await;
+    assert_eq!(
+        router
+            .reap_unreferenced_backends(std::time::Instant::now() + ttl)
+            .await,
+        0,
+        "a new referencing session must cancel the pending shutdown"
+    );
+    assert_eq!(router.process_status(&key), ProcessStatus::Running);
+}
+
+/// Closes `session_id` via a real `session/close` dispatch and asserts
+/// it succeeded.
+async fn close_session(router: &mut Router, tenant: &TenantId, session_id: &str, id: u64) {
+    let response = router
+        .dispatch_for_tenant(
+            tenant,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/close",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await
+        .expect("session/close");
+    assert!(response.get("result").is_some(), "{response:?}");
+}
