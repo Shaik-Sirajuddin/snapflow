@@ -158,20 +158,64 @@ to; `POST /rpc` has no such push channel and is unaffected (see
 
 `SessionRegistry` ([`session_registry.rs`](../acpx-core/src/session_registry.rs))
 maps an opaque `GatewaySessionId` (minted by acpx at `session/new`) to a
-`SessionEntry { agent_id, backend_session_id, profile_name, cwd }`. This
-mapping, and the `Supervisor`'s `HashMap<agent_id, SharedBackendProcess>`
-of running child processes, are both **in-memory only, owned by the
-daemon process, not by any client transport connection**:
+`SessionEntry { agent_id, backend_session_id, profile_name, cwd,
+created_at, last_activity_at, in_flight, in_flight_since, pinned,
+custom_idle_ttl }`. This mapping, and the `Supervisor`'s
+`HashMap<agent_id, SharedBackendProcess>` of running child processes, are
+both **in-memory only, owned by the daemon process, not by any client
+transport connection**:
 
 - A WS/stdio disconnect only unsubscribes that connection's
   `NotificationHub` watches (`transport/ws.rs`'s `handle_socket` cleanup
   loop). It never touches `Supervisor` or `SessionRegistry`. A backend
-  process is only ever killed by an explicit `profiles/delete` call
-  (`Supervisor::stop`) or the whole daemon process exiting.
+  process is never killed just because a transport connection dropped.
 - This means reconnecting a transport (new WS connection, a fresh
   `POST /rpc`) and reusing the same `GatewaySessionId` resumes
   instantly: `Supervisor::ensure_running` returns the already-running
   `Arc` with no respawn, and the session mapping is already present.
+
+### Retention, idle expiry, and the lifecycle reaper
+
+`acpx-session-lifecycle` plan
+([`lifecycle.rs`](../acpx-core/src/lifecycle.rs)): a session left idle
+(no in-flight turn) too long is safely closed and evicted, but an
+in-flight turn is never interrupted by TTL alone. Controlled by
+`LifecycleConfig`, all of it overridable via env (see
+[`setup.md`](./setup.md)'s environment variable table):
+
+| Policy | Field | Effect |
+| --- | --- | --- |
+| Idle session TTL | `idle_session_ttl` (default 30m) | An unpinned, not-in-flight session with no activity for this long becomes a reap candidate. |
+| Absolute session TTL | `absolute_session_ttl` (default off) | Optional hard ceiling on session age, regardless of activity -- still never interrupts an in-flight turn. |
+| Pinning | `SessionEntry::pinned` | Exempts a session from idle/absolute reaping entirely, subject to `max_pinned_sessions_per_tenant`. |
+| Per-session TTL override | `SessionEntry::custom_idle_ttl` | Replaces the deployment-wide idle TTL for one session. |
+| Capacity | `max_sessions_total` / `max_sessions_per_tenant` | Admission limits enforced before a backend session is even created. |
+| Active-turn deadline | `active_turn_deadline` (default off) | Bounds how long a turn may stay in-flight (`SessionEntry::in_flight_since`) before `Router::cancel_stuck_turns` sends the backend a best-effort `session/cancel` and clears in-flight bookkeeping, so a turn that never completes stops being unconditionally reap-exempt. Does not itself close the session -- a later idle-TTL pass is the real backstop. |
+| Connector idle shutdown | `connector_idle_shutdown_ttl` (default off) | Once a shared backend process (a supervisor key) has zero referencing live sessions for this long, `Router::reap_unreferenced_backends` stops it. Independent of session TTLs: a session can close while its process is still referenced by a sibling session under the same key. |
+
+A daemon-owned reaper task (`ACPX_LIFECYCLE_REAPER_ENABLED`, ticking
+every `ACPX_LIFECYCLE_REAPER_INTERVAL_SECONDS`, wired in
+[`main.rs`](../acpx-server/src/main.rs)) drives all three passes each
+tick: `Router::reap_expired_sessions` (idle/absolute TTL), `Router::
+reap_unreferenced_backends` (connector idle shutdown), and `Router::
+cancel_stuck_turns` (active-turn deadline).
+
+### Retention administration (gateway-native, tenant-scoped)
+
+Not ACP methods -- acpx-native JSON-RPC methods under the
+`session/retention/*` namespace, dispatched the same way as
+`agents/*`/`profiles/*`. Every call is scoped to the caller's own tenant
+(`X-Acpx-Tenant`/native tenant identity) and emits a sanitized
+`tracing::info!` audit event (tenant id + gateway session id only, never
+prompt/transcript content):
+
+| Method | Effect |
+| --- | --- |
+| `session/retention/get` | Returns one session's pin state, custom TTL, idle/age seconds, and in-flight count. |
+| `session/retention/list` | Same, for every session the caller's tenant owns. |
+| `session/retention/pin` | Pins a session (exempt from idle/absolute reaping), subject to `max_pinned_sessions_per_tenant`. |
+| `session/retention/unpin` | Restores default TTL behavior. |
+| `session/retention/set_ttl` | Sets (or clears) a per-session idle-TTL override. |
 
 ## Persistence and restart recovery
 
@@ -302,6 +346,53 @@ Auth (`ACPX_AUTH_TOKEN`, constant-time bearer-token compare) applies to
 both `POST /rpc` and the WS upgrade; unset means no auth on that
 transport (pair with a TLS-terminating reverse proxy for any
 non-loopback bind -- acpx itself never terminates TLS).
+
+### The `/acp` compatibility bridge
+
+Opt-in (`ACPX_ACP_BRIDGE_ENABLED=1` + `ACPX_ACP_BRIDGE_CONFIG_FILE`),
+mounted on the same HTTP/WS listener at `/acp/rpc` and `/acp/ws`
+([`transport/acp_bridge.rs`](../acpx-server/src/transport/acp_bridge.rs)).
+Exists for strict ACP clients that expect a plain agent endpoint with a
+small, fixed model list rather than acpx's own profile/provider
+machinery -- notably **Zed** and **OpenHands**, both of which support ACP
+model discovery (`GET /acp/models`, secret-free: id/name/agent id/
+availability only). A bridge session:
+
+- Selects a model from `ACPX_ACP_BRIDGE_CONFIG_FILE`'s `models` list
+  (`{"id", "agent_id", "model_id", "name"?}`) via `session/set_config_
+  option`, or uses `default_model` if the client never picks one --
+  *lazily* bound to a real native gateway session on first
+  `session/prompt`, not at `session/new`, so a client that only ever
+  lists models never spawns a backend process.
+- Is a **virtual session**: the client-visible id never equals the real
+  gateway session id underneath it (see `bridge_sessions.rs`). An
+  unbound virtual session (picked a model, or not, but never prompted)
+  is reaped after `unbound_bridge_session_ttl` (default 5m) without ever
+  spawning a backend.
+- Forwards backend-initiated interactive requests
+  (`session/request_permission`, `fs/*`, `terminal/*`) to the bound `/acp`
+  client with session-id translation in both directions -- proven live
+  against a real Zed checkout, see
+  `memory/acpx/gen/plans/acpx-acp-compatibility/reports/zed-e2e-verification.md`.
+- Is capped per tenant by `max_virtual_sessions_per_tenant` (bridge
+  config file field, default unlimited).
+
+`acpx-acp-bridge` ([`acpx-bridge/`](../acpx-bridge/)) is a small separate
+binary a client spawns as its own ACP stdio subprocess; it does nothing
+but forward stdio <-> the shared daemon's `/acp/ws`. See
+`scripts/openhands-acpx-bridge.sh` for the OpenHands wiring and
+`setup.md`'s "ACP compatibility bridge" section for a full worked
+example (config file, daemon invocation, Zed/OpenHands client config).
+
+### Admin surface
+
+Optional, separate listener (`ACPX_ADMIN_BIND`, off by default),
+authenticated by a *different* token (`ACPX_ADMIN_TOKEN`) than the
+client-facing `ACPX_AUTH_TOKEN` -- deliberately not interchangeable, so a
+leaked client token can never reach admin routes. Covers custom-agent
+CRUD and other operator-only concerns that are not part of the ACP
+surface at all; see
+[`acpx-server/src/transport/admin.rs`](../acpx-server/src/transport/admin.rs).
 
 ## Agent detection and managed vs. native mode
 

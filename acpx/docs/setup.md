@@ -67,6 +67,57 @@ connection with live `session/update` streaming.
 | `ACPX_MASTER_KEYRING_ROTATE` | unset | Set to `1` on a given startup to rotate the master key and re-encrypt every persisted secret once. Not a schedule. |
 | `ACPX_CONFIG_FILE` | unset | Path to a startup provisioning JSON file (providers/central MCP servers/profiles), applied before either transport accepts requests. Malformed/rejected file fails startup outright. |
 
+### Session lifecycle and retention
+
+See [`architecture.md`](./architecture.md)'s "Retention, idle expiry,
+and the lifecycle reaper" for what each of these actually does.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ACPX_MAX_SESSIONS_TOTAL` | `128` | Daemon-wide live session cap. |
+| `ACPX_MAX_SESSIONS_PER_TENANT` | `16` | Per-tenant live session cap. |
+| `ACPX_SESSION_IDLE_TTL_SECONDS` | `1800` (30m) | Idle TTL before an unpinned, not-in-flight session becomes reap-eligible. |
+| `ACPX_SESSION_ABSOLUTE_TTL_SECONDS` | `off` | Optional hard age ceiling, independent of activity. `off`/`none` disables it. |
+| `ACPX_MAX_PINNED_SESSIONS_PER_TENANT` | `off` (unlimited) | Caps `session/retention/pin` per tenant. `off`/`none` disables the cap. |
+| `ACPX_UNBOUND_BRIDGE_SESSION_TTL_SECONDS` | `300` (5m) | TTL for a `/acp` bridge virtual session that never sent its first prompt. |
+| `ACPX_CONNECTOR_IDLE_SHUTDOWN_TTL_SECONDS` | `off` | Stops a shared backend process once it has zero referencing live sessions for this long. `off`/`none` disables it (a process, once spawned, only stops via `profiles/delete` or daemon exit). |
+| `ACPX_ACTIVE_TURN_DEADLINE_SECONDS` | `off` | Bounds how long a turn may stay in-flight before a best-effort backend `session/cancel` fires and in-flight bookkeeping is cleared. `off`/`none` disables it (an in-flight turn is skipped indefinitely). |
+| `ACPX_LIFECYCLE_REAPER_ENABLED` | `1` | Runs the daemon-owned reaper task driving all of the above. |
+| `ACPX_LIFECYCLE_REAPER_INTERVAL_SECONDS` | `60` | Reaper tick interval. |
+
+### Startup session recovery
+
+Only meaningful with `ACPX_DB_PATH` set -- see [`architecture.md`](./architecture.md)'s
+"Persistence and restart recovery".
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ACPX_STARTUP_SESSION_RECOVERY_ENABLED` | `0` | Restore load/resume-capable persisted sessions before either transport starts serving requests. Requires the `startup-session-recovery` build feature. |
+| `ACPX_STARTUP_SESSION_RECOVERY_TIMEOUT_SECONDS` | `30` | Per-session recovery timeout; a session that exceeds it is marked `recovery_failed` and its recovery backend process is stopped. |
+| `ACPX_STARTUP_SESSION_RECOVERY_CONCURRENCY` | `4` | Bounded concurrency for recovering distinct connectors in parallel. |
+| `ACPX_STARTUP_SESSION_RECOVERY_FAIL_FAST` | `0` | `1` aborts startup entirely on the first recovery failure instead of continuing best-effort. |
+
+### Multi-tenant, process isolation, and admin
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ACPX_TENANT_ALLOWLIST` | unset (any tenant) | Comma-separated allowed `X-Acpx-Tenant` values; a disallowed tenant is rejected before any session work. |
+| `ACPX_AUTH_TENANT_TOKENS` | unset | Per-tenant bearer tokens (`tenant:token,tenant:token`), binding tenant identity to the authenticated caller rather than trusting a self-declared header. |
+| `ACPX_TENANT_PROCESS_ISOLATION` | `0` | One dedicated backend process per (profile, tenant) pair instead of one shared process per profile. |
+| `ACPX_SESSION_PROCESS_ISOLATION` | `0` | One dedicated backend process per *session* (profile-backed sessions only) instead of sharing a process. |
+| `ACPX_ADMIN_BIND` | unset (admin surface off) | Separate bind address for operator-only routes (custom-agent CRUD, etc.) -- see [`architecture.md`](./architecture.md)'s "Admin surface". |
+| `ACPX_ADMIN_TOKEN` | unset | Bearer token for `ACPX_ADMIN_BIND` routes. A distinct token from `ACPX_AUTH_TOKEN` on purpose -- never interchangeable. |
+
+### ACP compatibility bridge
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ACPX_ACP_BRIDGE_ENABLED` | `0` | Mounts `/acp/rpc`, `/acp/ws`, `GET /acp/models` on the same HTTP/WS listener. Requires `ACPX_ACP_BRIDGE_CONFIG_FILE`. |
+| `ACPX_ACP_BRIDGE_CONFIG_FILE` | required when enabled | Path to the bridge's model list (below). |
+
+See "ACP compatibility bridge setup (OpenHands, Zed)" below for a full
+worked example.
+
 ## Provisioning file (`ACPX_CONFIG_FILE`)
 
 Schema (`ProvisioningFile`/`ProfileEntry`,
@@ -109,6 +160,72 @@ Notes:
 - Once provisioned, a client selects a profile via `session/new`'s
   `_acpx.profile` field. Omitting it entirely stays in native/unmanaged
   mode against `ACPX_DEFAULT_AGENT_ID`, regardless of what's provisioned.
+
+## ACP compatibility bridge setup (OpenHands, Zed)
+
+For a strict ACP client that expects a plain agent with a small, fixed
+model list and supports ACP model discovery -- **Zed** and **OpenHands**
+both qualify -- run one shared daemon with the bridge enabled, then point
+the client at a small stdio-to-WS forwarder (`acpx-acp-bridge`) instead
+of `acpx-server` directly. See [`architecture.md`](./architecture.md)'s
+"The `/acp` compatibility bridge" for how model selection and virtual
+sessions work; this section is the runnable version.
+
+1. **Bridge model config** (`acpx-bridge-config.json`) -- one entry per
+   selectable model, each naming a real registered/native `agent_id`:
+
+   ```json
+   {
+     "default_model": "claude/haiku",
+     "models": [
+       {"id": "claude/haiku", "name": "Claude Haiku", "agent_id": "claude-acp", "model_id": "haiku"},
+       {"id": "codex/default", "name": "Codex", "agent_id": "codex-acp", "model_id": "default"}
+     ]
+   }
+   ```
+
+2. **Start the shared daemon** with the bridge enabled:
+
+   ```sh
+   ACPX_HTTP_BIND=127.0.0.1:8790 \
+   ACPX_ACP_BRIDGE_ENABLED=1 \
+   ACPX_ACP_BRIDGE_CONFIG_FILE=/path/to/acpx-bridge-config.json \
+     target/release/acpx-server
+   ```
+
+   `GET http://127.0.0.1:8790/acp/models` should now list both models
+   (secret-free: id/name/agent id/availability only).
+
+3. **Zed**: point a `CustomAgentServer`/`context_server` entry (or Zed's
+   generic ACP custom-agent settings) at `acpx-acp-bridge`:
+
+   ```sh
+   ACPX_ACP_BRIDGE_URL=ws://127.0.0.1:8790/acp/ws \
+     target/release/acpx-acp-bridge
+   ```
+
+   Verified end-to-end against a real Zed checkout and a real
+   `claude-agent-acp` backend -- see
+   `../memory/acpx/gen/plans/acpx-acp-compatibility/reports/zed-e2e-verification.md`
+   for the exact harness, commands, and results (including two real
+   ACPX bugs this verification found and fixed).
+
+4. **OpenHands**: use `scripts/openhands-acpx-bridge.sh` as the
+   `ACPAgentSettings.acp_command` (`acp_server="custom"`) -- it never
+   spawns its own `acpx-server`, only forwards stdio to the already-running
+   shared daemon's `/acp/ws`:
+
+   ```sh
+   ACPX_ACP_BRIDGE_URL=ws://127.0.0.1:8790/acp/ws \
+   ACPX_ACP_BRIDGE_BIN=/path/to/acpx-acp-bridge \
+     scripts/openhands-acpx-bridge.sh
+   ```
+
+   For OpenHands's per-conversation (no shared daemon, no model picker)
+   integration instead, use `scripts/openhands-acpx-claude.sh` /
+   `scripts/openhands-acpx-codex.sh` -- native/unmanaged mode, one
+   disposable `acpx-server` per conversation, no bridge involved. See
+   each script's own header comment for the tradeoff.
 
 ## Verifying a fresh setup
 
