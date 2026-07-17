@@ -809,11 +809,8 @@ mod tests {
         let deadline = std::time::Duration::from_secs(60);
         let default_lifecycle = LifecycleConfig::default();
         assert!(
-            reg.stuck_in_flight_candidates(
-                Instant::now() + deadline * 10,
-                &default_lifecycle
-            )
-            .is_empty(),
+            reg.stuck_in_flight_candidates(Instant::now() + deadline * 10, &default_lifecycle)
+                .is_empty(),
             "disabled (None) active_turn_deadline must never select anything"
         );
 
@@ -829,8 +826,7 @@ mod tests {
         // Only `stuck` (in-flight since before this call) qualifies once
         // the deadline has passed; `idle` (never in-flight at all) never
         // does, no matter how far `now` is pushed forward.
-        let candidates =
-            reg.stuck_in_flight_candidates(Instant::now() + deadline * 10, &lifecycle);
+        let candidates = reg.stuck_in_flight_candidates(Instant::now() + deadline * 10, &lifecycle);
         assert_eq!(candidates, vec![(tenant.clone(), stuck.clone())]);
         assert!(!candidates.contains(&(tenant.clone(), idle)));
 

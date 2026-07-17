@@ -1613,7 +1613,9 @@ impl Router {
     /// never actually confirms the cancellation -- exactly the "recovery
     /// policy" half of this report, not just "cancellation".
     pub async fn cancel_stuck_turns(&mut self, now: std::time::Instant) -> usize {
-        let candidates = self.sessions.stuck_in_flight_candidates(now, &self.lifecycle);
+        let candidates = self
+            .sessions
+            .stuck_in_flight_candidates(now, &self.lifecycle);
         let mut cancelled = 0;
         for (tenant_id, gateway_id) in candidates {
             let Some(entry) = self.sessions.resolve(&tenant_id, &gateway_id).cloned() else {
@@ -2833,13 +2835,10 @@ impl Router {
             // ever able to stop it again (its supervisor key is unique to
             // this one session, so no other session/reap ever revisits
             // it). A no-op for the default shared-process model.
-            if let Some(removed) = self
-                .sessions
-                .remove(
-                    tenant_id,
-                    &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
-                )
-            {
+            if let Some(removed) = self.sessions.remove(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            ) {
                 self.release_live_session(tenant_id);
                 self.stop_if_session_scoped(&removed.agent_id).await;
                 self.mark_unreferenced_if_idle(&removed.agent_id);
@@ -5367,13 +5366,10 @@ async fn dispatch_proxied_shared(
         // closed session from the shared `SessionRegistry` too, so the
         // two dispatch paths never drift apart on this behavior.
         let mut r = router.lock().await;
-        if let Some(removed) = r
-            .sessions
-            .remove(
-                tenant_id,
-                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
-            )
-        {
+        if let Some(removed) = r.sessions.remove(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        ) {
             r.release_live_session(tenant_id);
             r.stop_if_session_scoped(&removed.agent_id).await;
             r.mark_unreferenced_if_idle(&removed.agent_id);

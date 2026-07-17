@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use acpx_conductor::SpawnSpec;
-use acpx_core::router::Router;
 use acpx_core::lifecycle::LifecycleConfig;
+use acpx_core::router::Router;
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -185,7 +185,10 @@ async fn stuck_turn_is_cancelled_and_no_longer_reap_exempt_once_the_deadline_ela
     );
 
     let cancelled = router.lock().await.cancel_stuck_turns(Instant::now()).await;
-    assert_eq!(cancelled, 1, "exactly the one stuck session must be cancelled");
+    assert_eq!(
+        cancelled, 1,
+        "exactly the one stuck session must be cancelled"
+    );
 
     let after = rpc(
         &client,
@@ -213,9 +216,7 @@ async fn stuck_turn_is_cancelled_and_no_longer_reap_exempt_once_the_deadline_ela
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        seen.expect(
-            "backend captured the cancel notification while session/prompt was still open",
-        )
+        seen.expect("backend captured the cancel notification while session/prompt was still open")
     };
     let _ = std::fs::remove_file(&capture_path);
     assert!(captured.contains("backend-abc"));

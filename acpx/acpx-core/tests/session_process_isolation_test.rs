@@ -275,7 +275,9 @@ async fn shared_backend_stops_after_idle_shutdown_ttl_once_unreferenced() {
     // referenced shared process.
     close_session(&mut router, &tenant, &session_a, 3).await;
     assert_eq!(
-        router.reap_unreferenced_backends(std::time::Instant::now()).await,
+        router
+            .reap_unreferenced_backends(std::time::Instant::now())
+            .await,
         0,
         "process is still referenced by session B"
     );
