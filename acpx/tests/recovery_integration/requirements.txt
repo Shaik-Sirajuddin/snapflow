@@ -1,0 +1,3 @@
+# `acp_ws_client.py`'s only third-party dependency -- see that module's
+# own doc comment for why a WebSocket client can't be stdlib-only.
+websockets>=12,<17
