@@ -10,6 +10,12 @@ See the design docs at
 (goal, architecture, crate layout, phased plan, open risks). This workspace
 is being built out phase by phase per that plan; status is tracked below.
 
+**Setup guides:** [`README.native.md`](./README.native.md) for acpx's own
+native surface (profiles, providers, retention administration), or
+[`README.acp-compatibility.md`](./README.acp-compatibility.md) for the
+strict-ACP-compatible bridge used by clients with model discovery (Zed,
+OpenHands). Full reference docs live under [`docs/`](./docs/).
+
 ## Workspace layout
 
 - `acpx-proto` -- shared ACP wire types (JSON-RPC envelope + `session/*`/`agent/*` payloads).
