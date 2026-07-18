@@ -20,15 +20,22 @@ export component SearchableDropdown inherits Rectangle {
     in property <string> placeholder: "Search...";
     in property <length> popup-width: 200px;
     in property <length> popup-max-height: 220px;
+    // When true, the popup's right edge lines up with the trigger's right
+    // edge (opens leftward). Needed for right-side call sites like the
+    // compose-bar Config selector, where the default left-align would push
+    // a wider popup past the window/panel edge.
+    in property <bool> popup-align-end: false;
     callback entry-selected(string /* id */, string /* value */);
 
     property <bool> open: false;
     property <string> filter: "";
     property <bool> show-search: searchable && options.length >= 4;
-    property <length> row-h: 26px;
+    // Option-row size: taller than the trigger so horizontal padding
+    // (space-5 below) has room without crowding the label.
+    property <length> row-h: 30px;
     property <length> search-block-h: show-search ? 36px : 0px;
     property <length> content-h: Math.min(
-        search-block-h + options.length * row-h + 2 * Metrics.space-2,
+        search-block-h + options.length * row-h + 2 * Metrics.space-3,
         popup-max-height);
 
     public function close() {
@@ -77,7 +84,7 @@ export component SearchableDropdown inherits Rectangle {
     }
 
     if open : Rectangle {
-        x: 0px;
+        x: root.popup-align-end ? root.width - root.popup-width : 0px;
         y: -root.content-h - Metrics.space-2;
         width: root.popup-width;
         height: root.content-h;
@@ -86,7 +93,7 @@ export component SearchableDropdown inherits Rectangle {
         border-width: 1px;
         border-radius: Theme.radius-md;
         VerticalLayout {
-            padding: Metrics.space-2;
+            padding: Metrics.space-3;
             spacing: Metrics.space-1;
             if root.show-search : Rectangle {
                 height: 28px;
@@ -95,8 +102,8 @@ export component SearchableDropdown inherits Rectangle {
                 border-width: 1px;
                 border-radius: Theme.radius-sm;
                 HorizontalLayout {
-                    padding-left: Metrics.space-3;
-                    padding-right: Metrics.space-3;
+                    padding-left: Metrics.space-5;
+                    padding-right: Metrics.space-5;
                     spacing: Metrics.space-2;
                     VerticalLayout {
                         alignment: center;
@@ -164,8 +171,8 @@ export component SearchableDropdown inherits Rectangle {
                             }
                         }
                         HorizontalLayout {
-                            padding-left: Metrics.space-3;
-                            padding-right: Metrics.space-3;
+                            padding-left: Metrics.space-5;
+                            padding-right: Metrics.space-5;
                             Text {
                                 text: entry.is-header ? entry.label + ":" : entry.label;
                                 color: entry.is-header ? Theme.text-secondary

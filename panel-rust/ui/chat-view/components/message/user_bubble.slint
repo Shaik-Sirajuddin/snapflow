@@ -3,11 +3,8 @@ import { Metrics } from "../../../tokens/metrics.slint";
 import { MessageItem } from "../../../types.slint";
 
 // User message bubble -- chat-items-redesign.md #1. Tertiary background
-// (not the plain `bg-user-bubble` `message_card.slint` used) with one
-// corner deliberately squared off on the sender side, the classic
-// speech-bubble "tail corner" -- LTR layouts omit the radius on the
-// bottom-left corner per the spec (the opposite corner from where a
-// right-anchored sender bubble's tail visually attaches).
+// (not the plain `bg-user-bubble` `message_card.slint` used). All four
+// corners use the shared md radius so user and agent cards match.
 export component UserBubble inherits Rectangle {
     in property <MessageItem> item;
 
@@ -16,10 +13,7 @@ export component UserBubble inherits Rectangle {
     background: Theme.bg-tertiary;
     border-color: Theme.border-tertiary;
     border-width: 1px;
-    border-top-left-radius: Theme.radius-md;
-    border-top-right-radius: Theme.radius-md;
-    border-bottom-right-radius: Theme.radius-md;
-    border-bottom-left-radius: Metrics.radius-corner-cut;
+    border-radius: Theme.radius-md;
 
     content := VerticalLayout {
         padding: Metrics.space-5;
