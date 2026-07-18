@@ -1181,6 +1181,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
+                    // Open immediately so a slow/failed gateway list cannot
+                    // leave the user thinking Settings is dead.
+                    component.set_settings_open(true);
                     let defaults = load_panel_prefs(None);
                     component.set_default_profile(
                         defaults.profile_name.unwrap_or_default().into(),
@@ -1210,7 +1213,6 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         component.set_background_override(selected_override.unwrap_or(false));
                     }
                     panel.refresh_settings_gateway_lists();
-                   component.set_settings_open(true);
                 }
             });
         });

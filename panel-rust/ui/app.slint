@@ -299,7 +299,18 @@ export component ChatPanel inherits Window {
             }
             key-input(text) => { local-terminal-key-input(text); }
         }
+        // Full-size host for SettingsPage. A bare Rectangle with no
+        // width/height under FocusScope collapses to 0×0; SettingsPage
+        // then binds width/height to that parent and never paints even
+        // when `settings-open` is true (sidebar click / Ctrl+, look dead).
         if settings-open : Rectangle {
+            width: root.width;
+            height: root.height;
+            // Dim chat behind the sheet so the overlay is obvious.
+            background: #00000088;
+            // Click-through guard on the dimmer (close is via X / Escape).
+            TouchArea { }
+
             SettingsPage {
                 x: 8px;
                 y: 8px;
