@@ -7,4 +7,10 @@ export global TextUtil {
     // the implementation, which is harmless (nothing matches -> the caller
     // simply shows its list unfiltered).
     pure callback contains-ci(string, string) -> bool;
+    // Byte offset of the start of the word immediately before `cursor`
+    // (given as a byte offset into the text) -- skips any run of
+    // whitespace directly before the cursor, then the word itself. Used to
+    // implement word-wise backspace by selecting `[result, cursor)`.
+    // Returns `cursor` unchanged until Rust installs the implementation.
+    pure callback word-boundary-before(string, int) -> int;
 }

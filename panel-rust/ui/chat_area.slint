@@ -3,6 +3,7 @@ import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
 import { IconButton } from "./base/icon_button.slint";
 import { SearchableDropdown } from "./base/searchable_dropdown.slint";
+import { TextUtil } from "./base/text_util.slint";
 import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -511,6 +512,16 @@ export component ChatArea inherits Rectangle {
                                     if (event.text == Key.Return && !event.modifiers.shift) {
                                         send-requested();
                                         return EventResult.accept;
+                                    }
+                                    // Ctrl+Backspace deletes the previous word:
+                                    // select it, then let the default backspace
+                                    // remove the selection (Slint has no string
+                                    // splice, so the boundary is found in Rust).
+                                    if (event.text == Key.Backspace && event.modifiers.control) {
+                                        self.set-selection-offsets(
+                                            TextUtil.word-boundary-before(self.text, self.cursor-position-byte-offset),
+                                            self.cursor-position-byte-offset);
+                                        return EventResult.reject;
                                     }
                                     return EventResult.reject;
                                 }

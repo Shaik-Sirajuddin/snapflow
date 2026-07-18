@@ -779,6 +779,22 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .on_contains_ci(|haystack, needle| {
                 haystack.to_lowercase().contains(&needle.to_lowercase())
             });
+        component
+            .global::<TextUtil>()
+            .on_word_boundary_before(|text, cursor| {
+                let text = text.as_str();
+                let cursor = (cursor.max(0) as usize).min(text.len());
+                if !text.is_char_boundary(cursor) {
+                    return cursor as i32;
+                }
+                let prefix = &text[..cursor];
+                let trimmed = prefix.trim_end_matches(char::is_whitespace);
+                let start = trimmed
+                    .rfind(char::is_whitespace)
+                    .map(|i| i + trimmed[i..].chars().next().map_or(1, char::len_utf8))
+                    .unwrap_or(0);
+                start as i32
+            });
         component.set_compact(width < 320);
         component.set_narrow(width < 220);
         window.window().request_redraw();
