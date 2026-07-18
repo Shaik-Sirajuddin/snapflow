@@ -55,12 +55,12 @@ export component Sidebar inherits Rectangle {
     VerticalLayout {
         width: parent.width;
         height: parent.height;
-        spacing: 10px;
+        spacing: Metrics.space-5;
         Rectangle {
             height: 36px;
             background: Theme.bg-card;
             HorizontalLayout {
-                padding: compact ? 4px : 8px;
+                padding: compact ? Metrics.space-2 : Metrics.space-4;
                 spacing: compact ? 2px : 6px;
                 IconButton {
                     button-accessible-label: expanded ? "Collapse thread sidebar" : "Expand thread sidebar";
@@ -94,8 +94,8 @@ export component Sidebar inherits Rectangle {
             height: expanded ? 32px : 0px;
             background: Theme.bg-canvas;
             HorizontalLayout {
-                padding: 6px;
-                spacing: 4px;
+                padding: Metrics.space-3;
+                spacing: Metrics.space-2;
                 VerticalLayout {
                     alignment: center;
                     Icon {
@@ -141,11 +141,15 @@ export component Sidebar inherits Rectangle {
             min-height: 0px;
             viewport-height: threads.length * 58px;
             VerticalLayout {
-                spacing: 2px;
+                spacing: Metrics.space-1;
                 for thread[i] in threads : Rectangle {
                     height: 56px;
-                    background: i == selected-thread ? Theme.bg-chat : Theme.bg-sidebar;
+                    background: i == selected-thread ? Theme.bg-chat
+                        : thread-select.has-hover ? Theme.bg-primary-container
+                        : Theme.bg-sidebar;
+                    animate background { duration: 100ms; }
                     thread-select := TouchArea {
+                        mouse-cursor: pointer;
                         accessible-role: button;
                         accessible-label: thread.name;
                         accessible-action-default => { thread-selected(i); }
@@ -227,15 +231,11 @@ export component Sidebar inherits Rectangle {
                                 // confirm -- same two-step pattern as
                                 // `settings_sheet.slint`'s profile
                                 // delete control.
-                                if expanded && !thread.closed && root.pending-close-index != i : Rectangle {
-                                    width: 18px;
-                                    height: 18px;
-                                    thread-close-arm := TouchArea {
-                                        accessible-role: button;
-                                        accessible-label: "Close thread " + thread.name;
-                                        accessible-action-default => { root.pending-close-index = i; }
-                                        clicked => { root.pending-close-index = i; }
-                                    }
+                                if expanded && !thread.closed && root.pending-close-index != i : IconButton {
+                                    btn-width: 18px;
+                                    btn-height: 18px;
+                                    button-accessible-label: "Close thread " + thread.name;
+                                    clicked => { root.pending-close-index = i; }
                                     Icon {
                                         source: @image-url("../assets/icons/power.svg");
                                         size: 13px;
@@ -243,21 +243,14 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && !thread.closed && root.pending-close-index == i : HorizontalLayout {
-                                    spacing: 2px;
-                                    Rectangle {
-                                        width: 18px;
-                                        height: 18px;
-                                        thread-close-confirm := TouchArea {
-                                            accessible-role: button;
-                                            accessible-label: "Confirm close thread " + thread.name;
-                                            accessible-action-default => {
-                                                root.pending-close-index = -1;
-                                                root.thread-close-requested(i);
-                                            }
-                                            clicked => {
-                                                root.pending-close-index = -1;
-                                                root.thread-close-requested(i);
-                                            }
+                                    spacing: Metrics.space-1;
+                                    IconButton {
+                                        btn-width: 18px;
+                                        btn-height: 18px;
+                                        button-accessible-label: "Confirm close thread " + thread.name;
+                                        clicked => {
+                                            root.pending-close-index = -1;
+                                            root.thread-close-requested(i);
                                         }
                                         Icon {
                                             source: @image-url("../assets/icons/check.svg");
@@ -265,15 +258,11 @@ export component Sidebar inherits Rectangle {
                                             color: Theme.bg-primary;
                                         }
                                     }
-                                    Rectangle {
-                                        width: 18px;
-                                        height: 18px;
-                                        thread-close-cancel := TouchArea {
-                                            accessible-role: button;
-                                            accessible-label: "Cancel close thread " + thread.name;
-                                            accessible-action-default => { root.pending-close-index = -1; }
-                                            clicked => { root.pending-close-index = -1; }
-                                        }
+                                    IconButton {
+                                        btn-width: 18px;
+                                        btn-height: 18px;
+                                        button-accessible-label: "Cancel close thread " + thread.name;
+                                        clicked => { root.pending-close-index = -1; }
                                         Icon {
                                             source: @image-url("../assets/icons/x.svg");
                                             size: 13px;
@@ -281,15 +270,11 @@ export component Sidebar inherits Rectangle {
                                         }
                                     }
                                 }
-                                if expanded && thread.closed && root.pending-delete-index != i : Rectangle {
-                                    width: 18px;
-                                    height: 18px;
-                                    thread-delete-arm := TouchArea {
-                                        accessible-role: button;
-                                        accessible-label: "Delete thread " + thread.name;
-                                        accessible-action-default => { root.pending-delete-index = i; }
-                                        clicked => { root.pending-delete-index = i; }
-                                    }
+                                if expanded && thread.closed && root.pending-delete-index != i : IconButton {
+                                    btn-width: 18px;
+                                    btn-height: 18px;
+                                    button-accessible-label: "Delete thread " + thread.name;
+                                    clicked => { root.pending-delete-index = i; }
                                     Icon {
                                         source: @image-url("../assets/icons/trash-2.svg");
                                         size: 13px;
@@ -297,21 +282,14 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && thread.closed && root.pending-delete-index == i : HorizontalLayout {
-                                    spacing: 2px;
-                                    Rectangle {
-                                        width: 18px;
-                                        height: 18px;
-                                        thread-delete-confirm := TouchArea {
-                                            accessible-role: button;
-                                            accessible-label: "Confirm delete thread " + thread.name;
-                                            accessible-action-default => {
-                                                root.pending-delete-index = -1;
-                                                root.thread-delete-requested(i);
-                                            }
-                                            clicked => {
-                                                root.pending-delete-index = -1;
-                                                root.thread-delete-requested(i);
-                                            }
+                                    spacing: Metrics.space-1;
+                                    IconButton {
+                                        btn-width: 18px;
+                                        btn-height: 18px;
+                                        button-accessible-label: "Confirm delete thread " + thread.name;
+                                        clicked => {
+                                            root.pending-delete-index = -1;
+                                            root.thread-delete-requested(i);
                                         }
                                         Icon {
                                             source: @image-url("../assets/icons/check.svg");
@@ -319,15 +297,11 @@ export component Sidebar inherits Rectangle {
                                             color: Theme.bg-primary;
                                         }
                                     }
-                                    Rectangle {
-                                        width: 18px;
-                                        height: 18px;
-                                        thread-delete-cancel := TouchArea {
-                                            accessible-role: button;
-                                            accessible-label: "Cancel delete thread " + thread.name;
-                                            accessible-action-default => { root.pending-delete-index = -1; }
-                                            clicked => { root.pending-delete-index = -1; }
-                                        }
+                                    IconButton {
+                                        btn-width: 18px;
+                                        btn-height: 18px;
+                                        button-accessible-label: "Cancel delete thread " + thread.name;
+                                        clicked => { root.pending-delete-index = -1; }
                                         Icon {
                                             source: @image-url("../assets/icons/x.svg");
                                             size: 13px;
@@ -335,15 +309,11 @@ export component Sidebar inherits Rectangle {
                                         }
                                     }
                                 }
-                                if expanded : Rectangle {
-                                    width: 18px;
-                                    height: 18px;
-                                    thread-archive := TouchArea {
-                                        accessible-role: button;
-                                        accessible-label: "Archive thread " + thread.name;
-                                        accessible-action-default => { root.thread-archive-requested(i); }
-                                        clicked => { root.thread-archive-requested(i); }
-                                    }
+                                if expanded : IconButton {
+                                    btn-width: 18px;
+                                    btn-height: 18px;
+                                    button-accessible-label: "Archive thread " + thread.name;
+                                    clicked => { root.thread-archive-requested(i); }
                                     Icon {
                                         source: @image-url("../assets/icons/archive.svg");
                                         size: 13px;
@@ -387,8 +357,8 @@ export component Sidebar inherits Rectangle {
                 clicked => { root.settings-requested(); }
             }
             HorizontalLayout {
-                padding: compact ? 4px : 8px;
-                spacing: 6px;
+                padding: compact ? Metrics.space-2 : Metrics.space-4;
+                spacing: Metrics.space-3;
                 VerticalLayout {
                     alignment: center;
                     Icon {
