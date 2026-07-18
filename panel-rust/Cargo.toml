@@ -6,6 +6,9 @@ description = "Real chat-panel crate. Renders a Slint UI (software renderer, CPU
 
 [dependencies]
 slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
+# Streaming markdown for agent bodies (src/markdown.rs).
+pulldown-cmark = "0.12"
+textwrap = "0.16"
 # Phase 2 (chat-panel-production-ui/execution-plan.md): the former
 # rui-acp-client/rui-acpx-client wrapper crates were folded directly
 # into this crate (src/protocol_types.rs, src/jsonl_store.rs, src/

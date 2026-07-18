@@ -425,3 +425,25 @@ SNAPSHOTD_HOME=/tmp/snapshotd-smoke-home /tmp/snapshotd-smoke status
 #    and are picked back up by the reconciliation sweep) and was reaped
 #    manually for this smoke test.
 ```
+
+## Bundled acpx-server (optional child)
+
+Env (see `docs/acpx-bundled-gateway.md`):
+
+| Variable | Meaning |
+|----------|---------|
+| `SNAPSHOTD_ACPX_ENABLED` | Spawn child when bin found (default on if discoverable) |
+| `SNAPSHOTD_ACPX_BIN` | Path to `acpx-server` (else sibling / checkout search) |
+| `SNAPSHOTD_ACPX_HTTP_BIND` | Default `127.0.0.1:8790` |
+| `SNAPSHOTD_ACPX_CONFIG` | Generated config path under `$SNAPSHOTD_HOME` |
+
+Panel clients should set:
+
+```sh
+export RUI_ACPX_CODEX_URL=http://127.0.0.1:8790
+export RUI_ACPX_CLAUDE_URL=http://127.0.0.1:8790
+# or single: RUI_ACPX_DEFAULT_URL=...
+export RUI_ACPX_NO_AUTOSPAWN=1   # when snapshotd owns the gateway
+```
+
+Smoke (curl + logs only): `snapshotd/scripts/e2e_acpx_panel.sh`.

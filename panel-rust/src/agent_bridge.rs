@@ -790,10 +790,35 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
     if let Ok(url) = std::env::var(&env_key) {
         return Ok(url);
     }
+    // Shared snapshotd-owned gateway (default bind): prefer env
+    // RUI_ACPX_DEFAULT_URL when set for all providers.
+    if let Ok(url) = std::env::var("RUI_ACPX_DEFAULT_URL") {
+        return Ok(url);
+    }
 
     let default_port: u16 = if provider == "codex" { 8790 } else { 8791 };
     if probe_acpx_gateway_for_agent(default_port, Some(provider)) {
         return Ok(format!("http://127.0.0.1:{default_port}"));
+    }
+    // Healthy gateway on default codex port may still serve both providers
+    // when snapshotd bundles one acpx-server — reuse if any acpx answers.
+    if provider != "codex" && probe_acpx_gateway(default_port) {
+        return Ok(format!("http://127.0.0.1:{default_port}"));
+    }
+
+    // When snapshotd (or an operator) owns acpx, do not auto-spawn a second
+    // gateway. RUI_ACPX_NO_AUTOSPAWN=1 or SNAPSHOTD_ACPX_ENABLED=1 with a
+    // healthy URL already handled above; if neither env URL nor probe hit,
+    // fail closed rather than fork a competing process.
+    let no_autospawn = std::env::var_os("RUI_ACPX_NO_AUTOSPAWN").is_some()
+        || std::env::var("SNAPSHOTD_ACPX_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if no_autospawn {
+        return Err(format!(
+            "no acpx gateway for {provider} at env URL or :{default_port}; \
+             auto-spawn disabled (RUI_ACPX_NO_AUTOSPAWN / SNAPSHOTD_ACPX_ENABLED)"
+        ));
     }
 
     // Nothing acpx-shaped answering the default port -- decide which

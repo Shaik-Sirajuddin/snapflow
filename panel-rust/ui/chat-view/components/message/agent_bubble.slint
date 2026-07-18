@@ -6,12 +6,13 @@ import { MarkdownView } from "../../../base/markdown_view.slint";
 // Agent / thinking bubble — chat-items-redesign.md #3 / #10.
 // Agent: elevated fill, no label, 3-corner radius (bottom-left cut).
 // Thinking: transparent, muted, no card chrome.
-// Body: MarkdownView (StyledText when has-body-styled).
+// Body: streaming MarkdownView (visual lines from `markdown.rs`).
 export component AgentBubble inherits Rectangle {
     in property <MessageItem> item;
     callback link-clicked(string);
 
     property <bool> is-thinking: item.kind == "thinking";
+    property <bool> is-agent: item.kind == "agent";
 
     vertical-stretch: 0;
 
@@ -24,8 +25,6 @@ export component AgentBubble inherits Rectangle {
 
     content := VerticalLayout {
         padding: is-thinking ? Metrics.space-2 : Metrics.space-4;
-        // Proven content-height pattern (UserBubble): Flickable height
-        // tracks the body's preferred-height at the laid-out width.
         Flickable {
             height: md.preferred-height;
             viewport-height: md.preferred-height;
@@ -34,14 +33,11 @@ export component AgentBubble inherits Rectangle {
             min-width: 0px;
             md := MarkdownView {
                 width: parent.width;
-                source: item.text;
-                body-styled: item.body-styled;
-                has-body-styled: item.has-body-styled;
-                text-color: is-thinking ? Theme.text-muted : Theme.text-primary;
-                font-size: (is-thinking ? 11px : 12px) * Theme.font-scale;
-                font-family: Theme.font-sans;
-                plain-italic: is-thinking;
-                link-clicked(link) => { root.link-clicked(link); }
+                row-width: parent.width;
+                // Agent rows carry pre-parsed lines; thinking falls back
+                // to plain text (empty lines model).
+                lines: item.markdown-lines;
+                fallback-text: item.text;
             }
         }
     }

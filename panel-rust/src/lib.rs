@@ -20,6 +20,7 @@ mod conversation;
 pub mod gateway_actor;
 pub mod jsonl_store;
 mod local_terminal;
+mod markdown;
 mod models;
 mod permission;
 pub mod protocol_types;
@@ -253,9 +254,79 @@ struct PanelSingleton {
     /// local_terminal_for`'s change-detection -- see that method's doc
     /// comment.
     local_terminal_last_text: RefCell<String>,
+    /// Set by [`settings_file::SettingsWatcher`]; drained on poll to
+    /// refresh open settings fields without clobbering dirty edits.
+    settings_reload_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Suppress self-write feedback from settings save for a short window.
+    settings_ignore_watch_until: Cell<Option<std::time::Instant>>,
+    _settings_watcher: Option<settings_file::SettingsWatcher>,
 }
 
 impl PanelSingleton {
+    /// Gateway index for settings RPCs: selected real thread, else first
+    /// bound thread, else `0` only as last resort when the bridge exists.
+    fn settings_gateway_index(&self) -> usize {
+        if let Some(idx) = self.real_index(self.component.get_selected_thread() as usize) {
+            if self
+                .bridge
+                .as_ref()
+                .and_then(|b| b.thread_binding(idx))
+                .is_some()
+            {
+                return idx;
+            }
+        }
+        let n = self.thread_names.borrow().len();
+        if let Some(bridge) = self.bridge.as_ref() {
+            for idx in 0..n {
+                if bridge.thread_binding(idx).is_some() {
+                    return idx;
+                }
+            }
+        }
+        0
+    }
+
+    /// Refresh gateway-backed settings lists (profiles / MCP / agents /
+    /// recoverable sessions) using [`Self::settings_gateway_index`].
+    fn refresh_settings_gateway_lists(&self) {
+        let Some(bridge) = &self.bridge else {
+            self.component
+                .set_available_profiles(models::to_profile_options(vec![]));
+            self.component
+                .set_available_mcp_servers(models::to_mcp_server_options(vec![]));
+            self.component
+                .set_agent_catalog(models::to_agent_catalog_entries(vec![]));
+            self.component
+                .set_recoverable_sessions(models::to_remote_session_options(vec![], ""));
+            return;
+        };
+        let gw = self.settings_gateway_index();
+        self.component
+            .set_available_profiles(models::to_profile_options(bridge.list_profiles(gw)));
+        self.component.set_available_mcp_servers(models::to_mcp_server_options(
+            bridge.list_mcp_servers(gw),
+        ));
+        self.component
+            .set_agent_catalog(models::to_agent_catalog_entries(bridge.list_agents(gw)));
+        let recovery_provider = bridge.thread_provider(gw).unwrap_or_default();
+        self.component.set_recoverable_sessions(models::to_remote_session_options(
+            bridge.recoverable_sessions(gw),
+            &recovery_provider,
+        ));
+    }
+
+    fn apply_json_prefs_to_component(&self) {
+        let defaults = load_panel_prefs(None);
+        self.component
+            .set_default_profile(defaults.profile_name.unwrap_or_default().into());
+        self.component.set_permission_profile(
+            defaults.permission_profile.unwrap_or_default().into(),
+        );
+        self.component
+            .set_background_default(defaults.background_session);
+    }
+
     /// Derives a conservative PTY grid from the actual dock viewport.
     /// The client terminal remains bounded in its card, but its backend
     /// process must still receive a real resize whenever the host changes
@@ -976,6 +1047,20 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 (None, vec![ThreadState::Error; initial_names.len()])
             }
         };
+        let settings_reload_pending = std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        let settings_watcher = {
+            let pending = settings_reload_pending.clone();
+            let paths = settings_file::SettingsPaths::from_env();
+            Some(settings_file::SettingsWatcher::start(
+                paths,
+                std::time::Duration::from_millis(250),
+                std::sync::Arc::new(std::sync::Mutex::new(move |_resolved| {
+                    pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                })),
+            ))
+        };
         let panel = PanelSingleton {
             window,
             component,
@@ -1005,6 +1090,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             displayed_thread: Cell::new(None),
             expanded_terminal_id: RefCell::new(None),
             local_terminal_last_text: RefCell::new(String::new()),
+            settings_reload_pending,
+            settings_ignore_watch_until: Cell::new(None),
+            _settings_watcher: settings_watcher,
         };
         panel.refresh_threads_model();
         // Multi-process prefs live in JSON; selected thread stays in SQLite.
@@ -1078,6 +1166,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         }
                     }
                     panel.refresh_messages_for(real_idx);
+                    // Settings lists must follow the selected gateway.
+                    if panel.component.get_settings_open() {
+                        panel.refresh_settings_gateway_lists();
+                    }
                 }
             });
         });
@@ -1117,40 +1209,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         component.set_background_override_set(selected_override.is_some());
                         component.set_background_override(selected_override.unwrap_or(false));
                     }
-                    // Profile-picker addition: populate the chip row
-                    // from a real `profiles/list` call against thread
-                    // 0's bound gateway -- profiles are gateway-wide
-                    // (registered once per acpx-server process, not
-                    // per-thread), so any bound thread's connection can
-                    // answer this; thread 0 always exists once the
-                    // fixed v1 thread list has been created.
-                   if let Some(bridge) = &panel.bridge {
-                       component.set_available_profiles(models::to_profile_options(
-                           bridge.list_profiles(0),
-                       ));
-                       component.set_available_mcp_servers(models::to_mcp_server_options(
-                           bridge.list_mcp_servers(0),
-                       ));
-                       component.set_agent_catalog(models::to_agent_catalog_entries(
-                           bridge.list_agents(0),
-                       ));
-                        // Recovery/import: scoped to the *active* thread's
-                        // own provider (unlike profiles/MCP/agents, which
-                        // are gateway-wide and can be read off any bound
-                        // thread) -- recoverable sessions are inherently
-                        // per-provider, so thread 0's provider would be
-                        // wrong whenever a non-thread-0 row is selected.
-                        let recovery_idx = panel
-                            .real_index(component.get_selected_thread() as usize)
-                            .unwrap_or(0);
-                        let recovery_provider = bridge
-                            .thread_provider(recovery_idx)
-                            .unwrap_or_default();
-                        component.set_recoverable_sessions(models::to_remote_session_options(
-                            bridge.recoverable_sessions(recovery_idx),
-                            &recovery_provider,
-                        ));
-                   }
+                    panel.refresh_settings_gateway_lists();
                    component.set_settings_open(true);
                 }
             });
@@ -1184,13 +1243,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         eprintln!("panel-rust: failed to save panel settings JSON: {error}");
                         return;
                     }
+                    // Mark self-write so the file watcher does not bounce UI.
+                    panel.settings_ignore_watch_until.set(Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(500),
+                    ));
                     if let Some(store) = panel.panel_state.as_ref() {
-                        // Dual-write selected thread + transitional SQLite
-                        // defaults so older readers stay consistent.
-                        if let Err(error) = store.save_defaults(&defaults) {
-                            eprintln!(
-                                "panel-rust: failed to dual-write chat defaults to SQLite: {error}"
-                            );
+                        // Selected thread stays process-local SQLite only.
+                        if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
+                            if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
+                                eprintln!(
+                                    "panel-rust: failed to persist selected chat thread: {error}"
+                                );
+                            }
                         }
                         if let Some(thread_id) = defaults.selected_thread_id.as_deref() {
                             let override_value = component
@@ -1273,9 +1337,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     // for`. A failed create still triggers a re-list so
                     // the sheet reflects reality (e.g. a duplicate name
                     // the gateway rejected).
-                    bridge.create_mcp_server(0, entry);
+                    let gw = panel.settings_gateway_index();
+                    bridge.create_mcp_server(gw, entry);
                     component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(0),
+                        bridge.list_mcp_servers(gw),
                     ));
                 }
             });
@@ -1291,9 +1356,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     let Some(bridge) = &panel.bridge else {
                         return;
                     };
-                    bridge.delete_mcp_server(0, &name);
+                    let gw = panel.settings_gateway_index();
+                    bridge.delete_mcp_server(gw, &name);
                     component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(0),
+                        bridge.list_mcp_servers(gw),
                     ));
                 }
             });
@@ -1325,9 +1391,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         // failed create still triggers a re-list so the
                         // sheet reflects reality (e.g. a duplicate name
                         // the gateway rejected).
-                        bridge.create_profile(0, entry);
+                        let gw = panel.settings_gateway_index();
+                        bridge.create_profile(gw, entry);
                         component.set_available_profiles(models::to_profile_options(
-                            bridge.list_profiles(0),
+                            bridge.list_profiles(gw),
                         ));
                     }
                 });
@@ -1343,9 +1410,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     let Some(bridge) = &panel.bridge else {
                         return;
                     };
-                    bridge.delete_profile(0, &name);
+                    let gw = panel.settings_gateway_index();
+                    bridge.delete_profile(gw, &name);
                     component.set_available_profiles(models::to_profile_options(
-                        bridge.list_profiles(0),
+                        bridge.list_profiles(gw),
                     ));
                 }
             });
@@ -1369,9 +1437,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     // is an explicitly open, undecided item (see acpx-
                     // client::ext::registry::install's own doc comment)
                     // -- not addressed by this call site.
-                   bridge.install_agent(0, &agent_id);
+                   let gw = panel.settings_gateway_index();
+                   bridge.install_agent(gw, &agent_id);
                    component.set_agent_catalog(models::to_agent_catalog_entries(
-                       bridge.list_agents(0),
+                       bridge.list_agents(gw),
                    ));
                }
            });
@@ -1512,12 +1581,31 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 // whichever profile is currently set as the settings
                 // sheet's default (empty means native/unmanaged mode,
                 // matching `add_thread`'s prior always-`None` behavior).
-                let default_profile = component.get_default_profile().to_string();
-                let profile = non_empty(default_profile);
+                // Prefer resolved JSON prefs (multi-process) then UI field.
+                let prefs = load_panel_prefs(None);
+                let default_profile = non_empty(component.get_default_profile().to_string())
+                    .or(prefs.profile_name);
+                let mut profile = default_profile;
+                // Resolve gateway index before mutably borrowing the bridge.
+                let gw = panel.settings_gateway_index();
                 let (real_idx, binding, provider) = {
                     let Some(bridge) = panel.bridge.as_mut() else {
                         return;
                     };
+                    // Validate profile name against gateway list when set.
+                    if let Some(ref p) = profile {
+                        let names: Vec<String> = bridge
+                            .list_profiles(gw)
+                            .into_iter()
+                            .map(|s| s.name)
+                            .collect();
+                        if !names.is_empty() && !names.iter().any(|n| n == p) {
+                            eprintln!(
+                                "panel-rust: default profile {p:?} not in gateway list {names:?}; opening unmanaged"
+                            );
+                            profile = None;
+                        }
+                    }
                     let Ok(real_idx) = bridge.add_thread_with_profile(&name, profile.as_deref())
                     else {
                         return;
@@ -2298,6 +2386,27 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         };
         let bridge_changed = panel.apply_bridge_events();
         panel.sync_thread_records();
+        // Multi-process settings watch: reload prefs when another process
+        // rewrote the global/project JSON (skip during our own save window).
+        let mut settings_changed = false;
+        if panel
+            .settings_reload_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let ignore = panel
+                .settings_ignore_watch_until
+                .get()
+                .is_some_and(|until| std::time::Instant::now() < until);
+            if !ignore && panel.component.get_settings_open() {
+                // v1 dirty policy: always refresh when settings open
+                // (operator multi-process sync wins over half-edited form).
+                panel.apply_json_prefs_to_component();
+                settings_changed = true;
+            } else if !ignore {
+                panel.apply_json_prefs_to_component();
+                settings_changed = true;
+            }
+        }
         // Client-local PTY terminal output arrives on its own
         // background reader thread, never through `AgentBridge::
         // poll()`'s event queue -- refresh it unconditionally on every
@@ -2311,7 +2420,7 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let connection_changed = selected
             .map(|idx| panel.refresh_connection_status_for(idx))
             .unwrap_or(false);
-        bridge_changed || local_terminal_changed || connection_changed
+        bridge_changed || local_terminal_changed || connection_changed || settings_changed
     })
 }
 

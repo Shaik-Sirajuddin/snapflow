@@ -1,51 +1,132 @@
 import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { MarkdownLine, MarkdownRun } from "../types.slint";
 
-// chat-items-redesign.md #10 — agent/thinking prose via Slint StyledText.
+// Renders `MessageItem.markdown-lines` (see `src/markdown.rs` / `types.
+// slint`'s doc comments). Each `MarkdownLine` is already a fully wrapped
+// visual row -- the Rust side did the word-wrapping (`markdown::
+// wrap_runs`) because Slint's `Text` element has no native way to mix
+// differently-styled runs inside one reflowing, wrapped line the way
+// grok-build's ratatui-based renderer does with `Span`s. So this view
+// never wraps text itself: it just lays each line's runs out
+// horizontally and stacks lines vertically, styling each row by `kind`.
 //
-// Host (Rust) fills `body-styled` via `models::styled_text_from_markdown`.
-// Fixtures set the same field with `@markdown("…")` so slint-viewer shows
-// real formatting without the host.
-//
-// Supported: bold/italic/strike/inline-code, links, lists, `<u>`/`<font>`.
-// Unsupported (sanitized in Rust): headings, tables, fences, blockquotes,
-// images. Real table *grid* is a later phase.
+// Known simplifications vs. the ratatui original (acceptable for a v1
+// chat body, see markdown.rs's module doc for the full rationale):
+// no code-fence syntax highlighting, no clickable link targets, tables
+// render as a single unwrapped monospace row per row, and `strike` runs
+// are shown muted rather than with a real strikethrough decoration
+// (Slint's `Text` has no text-decoration property to draw one).
 export component MarkdownView inherits VerticalLayout {
-    in property <string> source: "";
-    in property <styled-text> body-styled;
-    in property <bool> has-body-styled: false;
-    in property <brush> text-color: Theme.text-primary;
-    in property <length> font-size: 12px * Theme.font-scale;
-    in property <string> font-family: Theme.font-sans;
-    in property <bool> plain-italic: false;
-
-    callback link-clicked(string);
+    in property <[MarkdownLine]> lines: [];
+    // Shown as plain wrapped text when `lines` is empty -- covers a
+    // "agent" row cached before `markdown-lines` existed (see
+    // `MessageItem.markdown-lines`'s doc comment) and any non-agent
+    // caller that hasn't bothered to markdown-parse its body.
+    in property <string> fallback-text: "";
+    in property <length> row-width: 0px;
 
     spacing: 0px;
-    padding: 0px;
-    // VerticalLayout preferred-height = children; no id-forwarding needed.
 
-    if has-body-styled : StyledText {
-        width: 100%;
-        text: root.body-styled;
-        default-color: root.text-color;
-        default-font-family: root.font-family;
-        default-font-size: root.font-size;
-        horizontal-alignment: left;
-        vertical-alignment: top;
-        link-color: Theme.bg-primary;
-        link-clicked(link) => { root.link-clicked(link); }
+    function same-code-group(idx: int) -> bool {
+        idx > 0 && root.lines[idx].kind == "code" && root.lines[idx - 1].kind == "code"
+            && root.lines[idx].code-block-id == root.lines[idx - 1].code-block-id
     }
 
-    if !has-body-styled : Text {
-        width: 100%;
-        text: root.source;
-        color: root.text-color;
-        font-family: root.font-family;
-        font-size: root.font-size;
-        font-italic: root.plain-italic;
+    if lines.length == 0 : Text {
+        text: fallback-text;
+        font-family: Theme.font-sans;
+        font-size: 12px * Theme.font-scale;
+        color: Theme.text-primary;
         wrap: word-wrap;
         horizontal-alignment: left;
-        vertical-alignment: top;
-        overflow: elide;
+        width: row-width > 0px ? row-width : parent.width;
+    }
+
+    for line[i] in lines : VerticalLayout {
+        property <bool> is-code: line.kind == "code";
+        property <bool> is-quote: line.kind == "quote";
+        property <bool> is-hr: line.kind == "hr";
+        property <bool> is-li: line.kind == "li" || line.kind == "li-ordered";
+        property <bool> is-heading: line.kind == "h1" || line.kind == "h2" || line.kind == "h3"
+            || line.kind == "h4" || line.kind == "h5" || line.kind == "h6";
+        property <bool> group-start: !is-code || !root.same-code-group(i);
+        property <bool> group-end: !is-code
+            || i + 1 >= root.lines.length
+            || !(root.lines[i + 1].kind == "code" && root.lines[i + 1].code-block-id == line.code-block-id);
+        // Contiguous lines in the same code-fence group sit flush
+        // against each other (one continuous background box); every
+        // other line gets a small breathing-room gap above it.
+        if i > 0 && !(is-code && !group-start) : Rectangle { height: Metrics.space-2; }
+
+        HorizontalLayout {
+            padding-left: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);
+            padding-right: is-code ? Metrics.space-4 : 0px;
+            padding-top: is-code ? (group-start ? Metrics.space-3 : 0px) : 0px;
+            padding-bottom: is-code ? (group-end ? Metrics.space-3 : 0px) : 0px;
+            spacing: Metrics.space-2;
+
+            Rectangle {
+                // Code background box -- rounded only at the top/bottom
+                // of a contiguous fenced-block group so grouped lines
+                // read as one seamless card, not stacked separate boxes.
+                visible: is-code;
+                background: Theme.bg-terminal;
+                border-color: Theme.border-terminal;
+                border-width: 1px;
+                border-top-left-radius: group-start ? Theme.radius-sm : 0px;
+                border-top-right-radius: group-start ? Theme.radius-sm : 0px;
+                border-bottom-left-radius: group-end ? Theme.radius-sm : 0px;
+                border-bottom-right-radius: group-end ? Theme.radius-sm : 0px;
+            }
+
+            // Blockquote left accent bar.
+            if is-quote : Rectangle {
+                width: 2px;
+                background: Theme.border-strong;
+            }
+
+            if is-hr : Rectangle {
+                height: 1px;
+                horizontal-stretch: 1;
+                y: parent.height / 2;
+                background: Theme.border-default;
+            }
+
+            if is-li : Text {
+                text: line.kind == "li-ordered" ? line.ordinal + "." : "\u{2022}";
+                font-family: Theme.font-sans;
+                font-size: 12px * Theme.font-scale;
+                color: Theme.text-secondary;
+                vertical-alignment: top;
+            }
+
+            if !is-hr : HorizontalLayout {
+                horizontal-stretch: 1;
+                for run[ri] in line.runs : Text {
+                    text: run.text;
+                    font-family: (run.code || is-code) ? Theme.font-mono : Theme.font-sans;
+                    font-size: (is-heading ? heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
+                    font-weight: (run.bold || is-heading) ? 700 : 400;
+                    font-italic: run.italic;
+                    color: run.strike ? Theme.text-muted
+                        : is-code ? Theme.text-terminal
+                        : Theme.text-primary;
+                    vertical-alignment: top;
+                }
+            }
+        }
+    }
+
+    pure function heading-size(kind: string) -> length {
+        if kind == "h1" {
+            18px
+        } else if kind == "h2" {
+            16px
+        } else if kind == "h3" {
+            14px
+        } else {
+            13px
+        }
     }
 }

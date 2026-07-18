@@ -29,6 +29,24 @@ export struct ThreadItem {
     model: string,
 }
 
+
+// Streaming markdown (from streaming-markdown-slint): visual lines/runs.
+export struct MarkdownRun {
+    text: string,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    strike: bool,
+}
+
+export struct MarkdownLine {
+    kind: string,
+    runs: [MarkdownRun],
+    indent: int,
+    ordinal: int,
+    code-block-id: int,
+}
+
 export struct MessageItem {
     // chat-items-redesign.md #5/#11: "tool-call" is being retired in
     // favor of the finer taxonomy `models::classify_tool_call_kind`
@@ -38,12 +56,9 @@ export struct MessageItem {
     // matches the old one until `chat_area.slint`'s routing change lands.
     kind: string, // "user" | "agent" | "thinking" | "tool-call" | "tool_use" | "mcp_server_call" | "skill_load" | "skill_use"
     text: string,
-    // chat-items-redesign.md #10: pre-parsed agent/thinking body for
-    // `StyledText` (`models::styled_text_from_markdown`). Empty +
-    // `has-body-styled: false` means MarkdownView falls back to plain
-    // `text` (fixtures / non-markdown kinds).
-    body-styled: styled-text,
-    has-body-styled: bool,
+    // Default agent bodies: pre-parsed streaming markdown visual lines.
+    // Empty => MarkdownView falls back to plain `text`.
+    markdown-lines: [MarkdownLine],
     // Phase 3: tool-call execution status, already-uppercased display
     // text (e.g. "COMPLETED") or "" for non-tool-call kinds / messages
     // cached before this field existed -- monochrome text badge only,
