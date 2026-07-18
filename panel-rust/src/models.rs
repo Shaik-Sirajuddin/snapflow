@@ -385,22 +385,45 @@ pub fn to_message_model_from_transcript(
     let rows: Vec<MessageItem> = items
         .into_iter()
         .filter_map(|item| {
-            // `raw-input`/`raw-output` stay "" here -- `TranscriptItem::Tool`
-            // doesn't carry `ChatMessage`'s `raw_input`/`raw_output` yet
-            // (conversation.rs's reducer drops them same as
-            // `classify_raw_update` used to), a separate follow-up wiring
-            // pass, not part of this kind-string migration.
-            let (kind, text, status): (&str, String, String) = match item {
-                TranscriptItem::User { text, .. } => ("user", text, String::new()),
-                TranscriptItem::Assistant { text, .. } => ("agent", text, String::new()),
-                TranscriptItem::Thought { text, .. } => ("thinking", text, String::new()),
-                TranscriptItem::Tool { title, status, .. } => (
-                    classify_tool_call_kind(&title, None),
+            // Live tool details: raw_input/raw_output flow from
+            // ChatMessage → TranscriptItem::Tool → MessageItem (UI
+            // expand/hide payload). Skill/MCP kind uses raw_input JSON
+            // when present.
+            let (kind, text, status, raw_input, raw_output): (
+                &str,
+                String,
+                String,
+                String,
+                String,
+            ) = match item {
+                TranscriptItem::User { text, .. } => {
+                    ("user", text, String::new(), String::new(), String::new())
+                }
+                TranscriptItem::Assistant { text, .. } => {
+                    ("agent", text, String::new(), String::new(), String::new())
+                }
+                TranscriptItem::Thought { text, .. } => {
+                    ("thinking", text, String::new(), String::new(), String::new())
+                }
+                TranscriptItem::Tool {
                     title,
-                    // Same uppercasing convention `to_message_model`
-                    // documents above.
-                    status.map(|s| s.to_uppercase()).unwrap_or_default(),
-                ),
+                    status,
+                    raw_input,
+                    raw_output,
+                    ..
+                } => {
+                    let raw_in = raw_input.unwrap_or_default();
+                    let raw_out = raw_output.unwrap_or_default();
+                    let raw_val = serde_json::from_str(&raw_in).ok();
+                    let kind = classify_tool_call_kind(&title, raw_val.as_ref());
+                    (
+                        kind,
+                        title,
+                        status.map(|s| s.to_uppercase()).unwrap_or_default(),
+                        raw_in,
+                        raw_out,
+                    )
+                }
                 TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. } => return None,
             };
             let first_use = if kind == "skill_use" {
@@ -417,8 +440,8 @@ pub fn to_message_model_from_transcript(
                 status: status.into(),
                 expanded: expanded.get(index as usize).copied().unwrap_or(false),
                 index,
-                raw_input: String::new().into(),
-                raw_output: String::new().into(),
+                raw_input: raw_input.into(),
+                raw_output: raw_output.into(),
                 // Transcript items are always already-dispatched; the send
                 // queue lives outside the merged transcript view.
                 queued: false,
@@ -1157,5 +1180,33 @@ mod tests {
     fn translate_local_terminal_key_forwards_printable_text_verbatim() {
         assert_eq!(translate_local_terminal_key("a"), b"a".to_vec());
         assert_eq!(translate_local_terminal_key("unicode"), b"unicode".to_vec());
+    }
+}
+
+
+#[cfg(test)]
+mod transcript_model_tests {
+    use super::*;
+    use crate::conversation::{ConversationEvent, ConversationState};
+    use slint::Model;
+
+    #[test]
+    fn to_message_model_from_transcript_preserves_tool_raw() {
+        let mut state = ConversationState::new("t1");
+        state.apply(ConversationEvent::ToolCall {
+            thread_id: "t1".into(),
+            tool_call_id: "tc1".into(),
+            title: Some("Skill".into()),
+            status: Some("completed".into()),
+            detail: None,
+            raw_input: Some(r#"{"skill":"artifact-design"}"#.into()),
+            raw_output: Some(r#"{"ok":true}"#.into()),
+        });
+        let model = to_message_model_from_transcript(state.items().to_vec(), &[false]);
+        let row = model.row_data(0).expect("one row");
+        assert_eq!(row.kind.as_str(), "skill_use");
+        assert!(row.first_use);
+        assert_eq!(row.raw_input.as_str(), r#"{"skill":"artifact-design"}"#);
+        assert_eq!(row.raw_output.as_str(), r#"{"ok":true}"#);
     }
 }

@@ -1178,6 +1178,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         );
                         return;
                     }
+                    // Threads model feeds sidebar moon + ChatArea
+                    // active-thread-background binding.
                     panel.refresh_threads_model();
                 }
             });
@@ -1488,6 +1490,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 panel.thread_state.borrow_mut().push(ThreadState::Idle);
                 panel.thread_errors.borrow_mut().push(String::new());
                 panel.search_query.borrow_mut().clear();
+                // New session: clear compose so it never carries over.
+                component.set_compose_text("".into());
                 panel.refresh_threads_model();
                 let filtered_idx = {
                     let visible_indices = panel.visible_indices.borrow();
@@ -1502,6 +1506,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                             eprintln!("panel-rust: failed to persist selected chat thread: {error}");
                         }
                     }
+                    // Fresh empty transcript for the new session row.
                     panel.refresh_messages_for(real_idx);
                 }
             });
@@ -1608,29 +1613,58 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // the Slint-side (possibly search-filtered) row index, same
         // "translate through `real_index` before touching the bridge"
         // convention every other sidebar-row callback here uses.
+        let component_weak = panel.component.as_weak();
         panel.component.on_thread_close_requested(move |filtered_idx| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     let Some(idx) = panel.real_index(filtered_idx as usize) else {
                         return;
                     };
                     let Some(bridge) = &panel.bridge else { return };
-                    if bridge.close_thread(idx) {
-                        panel.refresh_threads_model();
+                    if !bridge.close_thread(idx) {
+                        return;
+                    }
+                    // Stop treating a closed session as in-flight.
+                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
+                        if *slot == ThreadState::Loading || *slot == ThreadState::Cancelling {
+                            *slot = ThreadState::Idle;
+                        }
+                    }
+                    panel.refresh_threads_model();
+                    // If the closed row is still selected, re-project history
+                    // (read-only) so the UI reflects closed without a blank
+                    // reload race; send path already rejects closed threads.
+                    if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
+                        panel.refresh_messages_for(idx);
                     }
                 }
             });
         });
 
+        let component_weak = panel.component.as_weak();
         panel.component.on_thread_delete_requested(move |filtered_idx| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     let Some(idx) = panel.real_index(filtered_idx as usize) else {
                         return;
                     };
                     let Some(bridge) = &panel.bridge else { return };
-                    bridge.delete_thread(idx);
+                    if !bridge.delete_thread(idx) {
+                        return;
+                    }
+                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
+                        *slot = ThreadState::Idle;
+                    }
                     panel.refresh_threads_model();
+                    if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
+                        panel.refresh_messages_for(idx);
+                    }
                 }
             });
         });

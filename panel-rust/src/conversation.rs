@@ -11,19 +11,13 @@
 //! cache's on-disk row format, and many existing tests/consumers
 //! already depend on its exact per-chunk shape/count), and calls this
 //! function to derive a *merged* [`ConversationState`] from that feed
-//! for anything UI-facing. `ChatMessage` itself only carries `kind`/
-//! `text`/`status`/an optional `id` (the wire's own `messageId`/
-//! `toolCallId` when a backend provides one -- an RFD, not required in
-//! ACP v1, see agentclientprotocol.com/rfds/message-id) -- not the
-//! full `ConversationEvent` vocabulary this module defines, so this
-//! function also owns the synthetic-id-when-absent heuristic real v1
-//! backends need: consecutive Assistant/Thought chunks with no real id
-//! share one synthetic id (so they still merge into one growing
-//! message), and that synthetic run resets the moment a different
-//! event kind interrupts it (a `ToolCall`, a `User` message, or the
-//! end of `history`) -- matching the "clients infer message boundaries
-//! by detection heuristics" convention the RFD itself describes for
-//! backends that omit the field.
+//! for anything UI-facing. `ChatMessage` carries `kind`/`text`/`status`/
+//! optional `id` (wire `messageId`/`toolCallId`) plus optional
+//! `raw_input`/`raw_output` for tool payloads (forwarded into
+//! `TranscriptItem::Tool` for Slint details). This function also owns
+//! the synthetic-id-when-absent heuristic: consecutive Assistant/
+//! Thought chunks with no real id share one synthetic id, reset when a
+//! different event kind interrupts (ToolCall, User, end of history).
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptItem {
@@ -46,6 +40,10 @@ pub enum TranscriptItem {
         title: String,
         status: Option<String>,
         detail: Option<String>,
+        /// Pre-serialized JSON for Slint `MessageItem.raw-input/output`
+        /// (live tool details). Empty/`None` when the wire had no payload.
+        raw_input: Option<String>,
+        raw_output: Option<String>,
     },
     Terminal {
         terminal_id: String,
@@ -83,6 +81,8 @@ pub enum ConversationEvent {
         title: Option<String>,
         status: Option<String>,
         detail: Option<String>,
+        raw_input: Option<String>,
+        raw_output: Option<String>,
     },
     TerminalCreated {
         thread_id: String,
@@ -182,8 +182,10 @@ impl ConversationState {
                 title,
                 status,
                 detail,
+                raw_input,
+                raw_output,
                 ..
-            } => self.upsert_tool(tool_call_id, title, status, detail),
+            } => self.upsert_tool(tool_call_id, title, status, detail, raw_input, raw_output),
             ConversationEvent::TerminalCreated {
                 terminal_id, title, ..
             } => self.upsert_terminal(terminal_id, Some(title), None, None),
@@ -259,11 +261,15 @@ impl ConversationState {
         title: Option<String>,
         status: Option<String>,
         detail: Option<String>,
+        raw_input: Option<String>,
+        raw_output: Option<String>,
     ) {
         if let Some(TranscriptItem::Tool {
             title: stored_title,
             status: stored_status,
             detail: stored_detail,
+            raw_input: stored_raw_input,
+            raw_output: stored_raw_output,
             ..
         }) = self.items.iter_mut().find(|item| {
             matches!(item, TranscriptItem::Tool { tool_call_id: id, .. } if id == &tool_call_id)
@@ -277,6 +283,14 @@ impl ConversationState {
             if detail.is_some() {
                 *stored_detail = detail;
             }
+            // Later tool_call_update wins when it carries a payload; keep
+            // prior values when the update omits them.
+            if raw_input.is_some() {
+                *stored_raw_input = raw_input;
+            }
+            if raw_output.is_some() {
+                *stored_raw_output = raw_output;
+            }
             return;
         }
         self.items.push(TranscriptItem::Tool {
@@ -284,6 +298,8 @@ impl ConversationState {
             title: title.unwrap_or_default(),
             status,
             detail,
+            raw_input,
+            raw_output,
         });
     }
 
@@ -412,6 +428,8 @@ pub fn rebuild_from_chat_messages(
                     title: (!msg.text.is_empty()).then(|| msg.text.clone()),
                     status: msg.status.clone(),
                     detail: None,
+                    raw_input: msg.raw_input.as_ref().map(|v| v.to_string()),
+                    raw_output: msg.raw_output.as_ref().map(|v| v.to_string()),
                 });
             }
         }
@@ -463,6 +481,8 @@ mod tests {
             title: Some("Read file".to_owned()),
             status: Some("in_progress".to_owned()),
             detail: None,
+            raw_input: Some(r#"{"path":"src/main.rs"}"#.to_owned()),
+            raw_output: None,
         });
         state.apply(ConversationEvent::ToolCall {
             thread_id: "thread-a".to_owned(),
@@ -470,14 +490,24 @@ mod tests {
             title: None,
             status: Some("completed".to_owned()),
             detail: Some("src/main.rs".to_owned()),
+            raw_input: None,
+            raw_output: Some(r#"{"ok":true}"#.to_owned()),
         });
         assert_eq!(state.items().len(), 1);
         assert!(matches!(
             &state.items()[0],
-            TranscriptItem::Tool { title, status, detail, .. }
-                if title == "Read file"
-                    && status.as_deref() == Some("completed")
-                    && detail.as_deref() == Some("src/main.rs")
+            TranscriptItem::Tool {
+                title,
+                status,
+                detail,
+                raw_input,
+                raw_output,
+                ..
+            } if title == "Read file"
+                && status.as_deref() == Some("completed")
+                && detail.as_deref() == Some("src/main.rs")
+                && raw_input.as_deref() == Some(r#"{"path":"src/main.rs"}"#)
+                && raw_output.as_deref() == Some(r#"{"ok":true}"#)
         ));
     }
 
