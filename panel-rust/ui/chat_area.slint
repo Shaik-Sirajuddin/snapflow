@@ -77,6 +77,9 @@ export component ChatArea inherits Rectangle {
     // focus returns to the composer instead of remaining on stale terminal
     // content or falling back to the host dock.
     callback restore-compose-focus();
+    // Panel-level keybindings (app.slint) re-dispatched while the compose
+    // TextInput owns focus -- returns accept when a shortcut was handled.
+    callback panel-shortcut(KeyEvent) -> EventResult;
     out property <bool> compose-has-focus: compose.has-focus;
     out property <bool> local-terminal-has-focus:
         local-terminal.open && local-terminal-card.has-focus;
@@ -577,7 +580,15 @@ export component ChatArea inherits Rectangle {
                                 // Shift+Enter falls through to TextInput's
                                 // default newline insertion.
                                 key-pressed(event) => {
-                                    if (event.text == Key.Return && !event.modifiers.shift) {
+                                    // Panel chords first (Ctrl+B/N/K/,, Escape,
+                                    // Ctrl+Enter approve) so they still work
+                                    // while the composer owns focus.
+                                    if (panel-shortcut(event) == EventResult.accept) {
+                                        return EventResult.accept;
+                                    }
+                                    // Plain Enter sends; Ctrl+Enter is reserved
+                                    // for approve (panel-shortcut above).
+                                    if (event.text == Key.Return && !event.modifiers.shift && !event.modifiers.control) {
                                         send-requested();
                                         return EventResult.accept;
                                     }

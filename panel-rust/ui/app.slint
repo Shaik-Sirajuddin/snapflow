@@ -29,6 +29,9 @@ export component ChatPanel inherits Window {
     default-font-family: Theme.font-sans;
     default-font-size: 13px * Theme.font-scale;
     background: Theme.bg-chat;
+    // Forward window focus into the keybinding FocusScope so panel
+    // shortcuts work even when no TextInput currently owns focus.
+    forward-focus: panel-keys;
     out property <bool> compose-has-focus: chat-area.compose-has-focus;
     out property <bool> local-terminal-has-focus:
         chat-area.local-terminal-has-focus
@@ -119,134 +122,213 @@ export component ChatPanel inherits Window {
     callback config-option-selected(string, string);
     callback thread-toggle-background(int);
 
-    Rectangle {
-        width: root.width;
-        height: root.height;
-        background: Theme.bg-chat;
-        sidebar := Sidebar {
-            x: 0px;
-            y: 0px;
-            height: parent.height;
-            // Mobile/narrow no longer hides the sidebar outright -- it
-            // collapses to the same icon-only rail the desktop "collapse"
-            // toggle already produces (only the left-end state icon per
-            // row stays visible), so a thread's live status is still
-            // glanceable without spending any horizontal space on text.
-            threads: threads;
-            selected-thread: selected-thread;
-            compact: compact;
-            expanded: root.narrow ? false : sidebar-expanded;
-            thread-selected(i) => {
-                selected-thread = i;
-                thread-selected(i);
+    // layout-redesign.md Phase 5 -- panel-level shortcuts. Also re-run
+    // from the compose TextInput (chat_area) so they still fire while the
+    // composer owns focus (TextInput swallows keys before this scope).
+    function handle-panel-shortcut(event: KeyEvent) -> EventResult {
+        // Escape: reject pending permission, else close the top overlay /
+        // settings sheet. Always wins over type-to-compose.
+        if (event.text == Key.Escape) {
+            if (pending-request.active) {
+                reject-request();
+                return EventResult.accept;
             }
-            new-thread-requested => { new-thread-requested(); }
-            thread-close-requested(i) => { thread-close-requested(i); }
-            thread-delete-requested(i) => { thread-delete-requested(i); }
-            thread-archive-requested(i) => { thread-archive-requested(i); }
-            settings-requested => { settings-requested(); }
-            search-changed(q) => { search-changed(q); }
-            toggle-expanded => { sidebar-expanded = !sidebar-expanded; }
-        }
-        chat-area := ChatArea {
-            x: sidebar.width;
-            y: 0px;
-            width: root.width - self.x;
-            height: parent.height;
-            compact: compact;
-            narrow: root.narrow;
-            active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
-            active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
-            active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
-            toggle-background => { thread-toggle-background(selected-thread); }
-            messages: messages;
-            has-older-messages: has-older-messages;
-            loading-older-messages <=> loading-older-messages;
-            load-older-requested => { load-older-requested(); }
-            agent-badge: agent-badge;
-            connection-status: connection-status;
-            sending: threads.length > 0
-                ? threads[selected-thread].status == "loading"
-                    || threads[selected-thread].status == "cancelling"
-                : false;
-            compose-text <=> compose-text;
-            send-requested => { send-requested(); }
-            stop-requested => { stop-requested(); }
-            settings-requested => { settings-requested(); }
-            new-thread-requested => { new-thread-requested(); }
-            toggle-expanded(i) => { toggle-expanded(i); }
-            pending-request: pending-request;
-            approve-request => { approve-request(); }
-            reject-request => { reject-request(); }
-            terminals: terminals;
-            expand-terminal(id) => { expand-terminal(id); }
-            local-terminal: local-terminal;
-            local-terminal-toggle-requested => { local-terminal-toggle-requested(); }
-            local-terminal-key-input(text) => { local-terminal-key-input(text); }
-            local-terminal-expand-requested => { local-terminal-overlay-open = true; }
-            local-terminal-close-requested => { local-terminal-close-requested(); }
-            mode-dropdown-entries: mode-dropdown-entries;
-            config-dropdown-entries: config-dropdown-entries;
-            mode-trigger-label: mode-trigger-label;
-            mode-selected(id) => { mode-selected(id); }
-            config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
-        }
-    }
-    if expanded-terminal.terminal-id != "" : TerminalOverlay {
-        item: expanded-terminal;
-        container-width: root.width;
-        container-height: root.height;
-        close => {
-            expanded-terminal = { terminal-id: "" };
-            close-terminal-overlay();
-            chat-area.restore-compose-focus();
-        }
-    }
-    local-terminal-overlay := LocalTerminalOverlay {
-        visible: local-terminal-overlay-open;
-        item: local-terminal;
-        container-width: root.width;
-        container-height: root.height;
-        close => {
-            local-terminal-overlay-open = false;
-            chat-area.restore-compose-focus();
-        }
-        close-requested => {
-            local-terminal-overlay-open = false;
-            local-terminal-close-requested();
-            chat-area.restore-compose-focus();
-        }
-        key-input(text) => { local-terminal-key-input(text); }
-    }
-    if settings-open : Rectangle {
-        SettingsPage {
-            x: 8px;
-            y: 8px;
-            width: parent.width - 16px;
-            height: parent.height - 16px;
-            default-profile <=> default-profile;
-            permission-profile <=> permission-profile;
-            background-default <=> background-default;
-            background-override-set <=> background-override-set;
-            background-override <=> background-override;
-            available-profiles: available-profiles;
-            available-mcp-servers: available-mcp-servers;
-            agent-catalog: agent-catalog;
-            recoverable-sessions: recoverable-sessions;
-            save => { settings-save(); }
-            close => {
+            if (expanded-terminal.terminal-id != "") {
+                expanded-terminal = { terminal-id: "" };
+                close-terminal-overlay();
+                chat-area.restore-compose-focus();
+                return EventResult.accept;
+            }
+            if (local-terminal-overlay-open) {
+                local-terminal-overlay-open = false;
+                chat-area.restore-compose-focus();
+                return EventResult.accept;
+            }
+            if (settings-open) {
                 settings-open = false;
                 settings-close();
                 chat-area.restore-compose-focus();
+                return EventResult.accept;
             }
-            mcp-server-create(name, command) => { mcp-server-create(name, command); }
-            mcp-server-delete(name) => { mcp-server-delete(name); }
-            profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
-                profile-create(name, agent-id, terminal-enabled, fs-enabled);
+            return EventResult.reject;
+        }
+        if (event.modifiers.control) {
+            // Ctrl+B -- toggle sidebar (no-op while narrow forces rail).
+            if (event.text == "b" || event.text == "B") {
+                if (!root.narrow) {
+                    sidebar-expanded = !sidebar-expanded;
+                }
+                return EventResult.accept;
             }
-            profile-delete(name) => { profile-delete(name); }
-            agent-install-requested(id) => { agent-install-requested(id); }
-            recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
+            // Ctrl+N -- new thread.
+            if (event.text == "n" || event.text == "N") {
+                new-thread-requested();
+                return EventResult.accept;
+            }
+            // Ctrl+, -- open settings.
+            if (event.text == ",") {
+                settings-requested();
+                return EventResult.accept;
+            }
+            // Ctrl+K -- focus thread search (expand rail first if needed).
+            if (event.text == "k" || event.text == "K") {
+                if (!root.narrow) {
+                    sidebar-expanded = true;
+                }
+                sidebar.focus-search();
+                return EventResult.accept;
+            }
+            // Ctrl+Enter -- approve pending permission request.
+            if ((event.text == Key.Return || event.text == "\n") && pending-request.active) {
+                approve-request();
+                return EventResult.accept;
+            }
+        }
+        return EventResult.reject;
+    }
+
+    panel-keys := FocusScope {
+        key-pressed(event) => {
+            // Don't steal keystrokes from a focused local/agent terminal.
+            if (root.local-terminal-has-focus) {
+                return EventResult.reject;
+            }
+            return root.handle-panel-shortcut(event);
+        }
+        Rectangle {
+            width: root.width;
+            height: root.height;
+            background: Theme.bg-chat;
+            sidebar := Sidebar {
+                x: 0px;
+                y: 0px;
+                height: parent.height;
+                // Mobile/narrow no longer hides the sidebar outright -- it
+                // collapses to the same icon-only rail the desktop "collapse"
+                // toggle already produces (only the left-end state icon per
+                // row stays visible), so a thread's live status is still
+                // glanceable without spending any horizontal space on text.
+                threads: threads;
+                selected-thread: selected-thread;
+                compact: compact;
+                expanded: root.narrow ? false : sidebar-expanded;
+                thread-selected(i) => {
+                    selected-thread = i;
+                    thread-selected(i);
+                }
+                new-thread-requested => { new-thread-requested(); }
+                thread-close-requested(i) => { thread-close-requested(i); }
+                thread-delete-requested(i) => { thread-delete-requested(i); }
+                thread-archive-requested(i) => { thread-archive-requested(i); }
+                settings-requested => { settings-requested(); }
+                search-changed(q) => { search-changed(q); }
+                toggle-expanded => { sidebar-expanded = !sidebar-expanded; }
+            }
+            chat-area := ChatArea {
+                x: sidebar.width;
+                y: 0px;
+                width: root.width - self.x;
+                height: parent.height;
+                compact: compact;
+                narrow: root.narrow;
+                active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
+                active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
+                active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
+                toggle-background => { thread-toggle-background(selected-thread); }
+                messages: messages;
+                has-older-messages: has-older-messages;
+                loading-older-messages <=> loading-older-messages;
+                load-older-requested => { load-older-requested(); }
+                agent-badge: agent-badge;
+                connection-status: connection-status;
+                sending: threads.length > 0
+                    ? threads[selected-thread].status == "loading"
+                        || threads[selected-thread].status == "cancelling"
+                    : false;
+                compose-text <=> compose-text;
+                send-requested => { send-requested(); }
+                stop-requested => { stop-requested(); }
+                settings-requested => { settings-requested(); }
+                new-thread-requested => { new-thread-requested(); }
+                toggle-expanded(i) => { toggle-expanded(i); }
+                pending-request: pending-request;
+                approve-request => { approve-request(); }
+                reject-request => { reject-request(); }
+                terminals: terminals;
+                expand-terminal(id) => { expand-terminal(id); }
+                local-terminal: local-terminal;
+                local-terminal-toggle-requested => { local-terminal-toggle-requested(); }
+                local-terminal-key-input(text) => { local-terminal-key-input(text); }
+                local-terminal-expand-requested => { local-terminal-overlay-open = true; }
+                local-terminal-close-requested => { local-terminal-close-requested(); }
+                mode-dropdown-entries: mode-dropdown-entries;
+                config-dropdown-entries: config-dropdown-entries;
+                mode-trigger-label: mode-trigger-label;
+                mode-selected(id) => { mode-selected(id); }
+                config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+                // Compose owns focus for typing -- re-dispatch panel chords
+                // so Ctrl+B/N/K/, and Escape still work while composing.
+                panel-shortcut(event) => {
+                    return root.handle-panel-shortcut(event);
+                }
+            }
+        }
+        if expanded-terminal.terminal-id != "" : TerminalOverlay {
+            item: expanded-terminal;
+            container-width: root.width;
+            container-height: root.height;
+            close => {
+                expanded-terminal = { terminal-id: "" };
+                close-terminal-overlay();
+                chat-area.restore-compose-focus();
+            }
+        }
+        local-terminal-overlay := LocalTerminalOverlay {
+            visible: local-terminal-overlay-open;
+            item: local-terminal;
+            container-width: root.width;
+            container-height: root.height;
+            close => {
+                local-terminal-overlay-open = false;
+                chat-area.restore-compose-focus();
+            }
+            close-requested => {
+                local-terminal-overlay-open = false;
+                local-terminal-close-requested();
+                chat-area.restore-compose-focus();
+            }
+            key-input(text) => { local-terminal-key-input(text); }
+        }
+        if settings-open : Rectangle {
+            SettingsPage {
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                height: parent.height - 16px;
+                default-profile <=> default-profile;
+                permission-profile <=> permission-profile;
+                background-default <=> background-default;
+                background-override-set <=> background-override-set;
+                background-override <=> background-override;
+                available-profiles: available-profiles;
+                available-mcp-servers: available-mcp-servers;
+                agent-catalog: agent-catalog;
+                recoverable-sessions: recoverable-sessions;
+                save => { settings-save(); }
+                close => {
+                    settings-open = false;
+                    settings-close();
+                    chat-area.restore-compose-focus();
+                }
+                mcp-server-create(name, command) => { mcp-server-create(name, command); }
+                mcp-server-delete(name) => { mcp-server-delete(name); }
+                profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
+                    profile-create(name, agent-id, terminal-enabled, fs-enabled);
+                }
+                profile-delete(name) => { profile-delete(name); }
+                agent-install-requested(id) => { agent-install-requested(id); }
+                recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
+            }
         }
     }
 }
