@@ -91,11 +91,12 @@ export component Sidebar inherits Rectangle {
             }
         }
         Rectangle {
-            height: expanded ? 32px : 0px;
+            height: 32px;
             background: Theme.bg-canvas;
             HorizontalLayout {
                 padding: Metrics.space-3;
                 spacing: Metrics.space-2;
+                alignment: expanded ? stretch : center;
                 VerticalLayout {
                     alignment: center;
                     Icon {
@@ -104,7 +105,8 @@ export component Sidebar inherits Rectangle {
                         color: Theme.text-muted;
                     }
                 }
-                Rectangle {
+                if expanded : Rectangle {
+                    horizontal-stretch: 1;
                     // TextInput has no built-in placeholder support
                     // (that's std-widgets' LineEdit, which pulls in a
                     // heavier widget style dependency this crate doesn't
@@ -359,6 +361,7 @@ export component Sidebar inherits Rectangle {
             HorizontalLayout {
                 padding: compact ? Metrics.space-2 : Metrics.space-4;
                 spacing: Metrics.space-3;
+                alignment: expanded ? start : center;
                 VerticalLayout {
                     alignment: center;
                     Icon {
