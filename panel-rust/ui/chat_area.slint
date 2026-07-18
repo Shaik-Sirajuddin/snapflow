@@ -258,17 +258,7 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
-                IconButton {
-                    button-accessible-label: "Open chat settings";
-                    clicked => { settings-requested(); }
-                    Text {
-                        text: "\u{2699}";
-                        color: Theme.text-secondary;
-                        font-size: 13px * Theme.font-scale;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
+                // Settings lives at the bottom of the thread sidebar only.
             }
         }
         Rectangle {

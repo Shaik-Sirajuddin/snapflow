@@ -31,5 +31,15 @@ export component IconButton inherits Rectangle {
         accessible-action-default => { root.clicked(); }
         clicked => { root.clicked(); }
     }
-    @children
+    // Center icon/glyph on both axes so header rows share one baseline
+    // with adjacent Text (e.g. sidebar "Chats" + collapse/new buttons).
+    VerticalLayout {
+        width: 100%;
+        height: 100%;
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            @children
+        }
+    }
 }

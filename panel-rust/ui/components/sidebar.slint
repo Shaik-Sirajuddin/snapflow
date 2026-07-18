@@ -53,15 +53,27 @@ export component Sidebar inherits Rectangle {
     animate width { duration: 180ms; easing: ease-in-out; }
     background: Theme.bg-sidebar;
 
+    // Settings footer: outer margin + box height. Main column ends above it
+    // so the control always snaps to the bottom of the thread bar.
+    property <length> settings-margin: Metrics.pad-sm;
+    property <length> settings-box-h: compact ? 32px : 36px;
+    property <length> settings-footer-h: settings-box-h + 2 * settings-margin;
+
+    // Header + search + thread list only (fills space above settings).
     VerticalLayout {
         width: parent.width;
-        height: parent.height;
+        height: parent.height - settings-footer-h;
+        y: 0px;
         spacing: Metrics.space-5;
         Rectangle {
             height: 36px;
             background: Theme.bg-card;
+            // Collapse / "Chats" / new-thread on one vertical midline.
             HorizontalLayout {
-                padding: compact ? Metrics.space-2 : Metrics.space-4;
+                width: 100%;
+                height: 100%;
+                padding-left: compact ? Metrics.space-2 : Metrics.space-4;
+                padding-right: compact ? Metrics.space-2 : Metrics.space-4;
                 spacing: compact ? 2px : 6px;
                 IconButton {
                     button-accessible-label: expanded ? "Collapse thread sidebar" : "Expand thread sidebar";
@@ -77,15 +89,24 @@ export component Sidebar inherits Rectangle {
                     color: Theme.text-primary;
                     font-size: 14px * Theme.font-scale;
                     font-family: Theme.font-sans;
+                    font-weight: 600;
                     vertical-alignment: center;
+                    horizontal-stretch: 0;
                 }
-                Rectangle { horizontal-stretch: 1; preferred-width: 0px; min-width: 0px; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    vertical-stretch: 0;
+                    height: 0px;
+                    preferred-height: 0px;
+                }
                 if expanded : IconButton {
                     button-accessible-label: "New thread";
                     clicked => { new-thread-requested(); }
                     Icon {
                         source: @image-url("../assets/icons/plus.svg");
-                        size: 18px;
+                        size: 16px;
                         color: Theme.bg-primary;
                     }
                 }
@@ -140,11 +161,7 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
-        // Thread card -- Phase 3 adds the one-line description (see
-        // `models::describe_thread`) and an "ACTIVE" tag on the
-        // selected row, matching index.html's `renderThreads()` (title
-        // + truncated desc + state indicator + left accent border on
-        // the active row).
+        // Thread card: title row (+ optional model). No description line.
         Flickable {
             vertical-stretch: 1;
             preferred-height: 0px;
@@ -153,7 +170,8 @@ export component Sidebar inherits Rectangle {
             thread-list-col := VerticalLayout {
                 spacing: Metrics.space-1;
                 for thread[i] in threads : HoverSurface {
-                    height: expanded && thread.model != "" ? 66px : 56px;
+                    // Taller only when the model line is shown under the name.
+                    height: expanded && thread.model != "" ? 52px : 44px;
                     idle-bg: Theme.bg-sidebar;
                     selected-bg: Theme.bg-chat;
                     selected: i == selected-thread;
@@ -330,19 +348,7 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                             }
-                            if expanded : Text {
-                                text: thread.status == "error" ? "! " + thread.description : thread.description;
-                                color: Theme.text-secondary;
-                                font-size: 10px * Theme.font-scale;
-                                font-family: Theme.font-sans;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                                preferred-width: 0px;
-                                min-width: 0px;
-                            }
-                            // Phase 8: the thread's active model (prefixed with
-                            // its provider when known) -- shown only where a
-                            // model is actually advertised.
+                            // Phase 8: active model (provider · model when known).
                             if expanded && thread.model != "" : Text {
                                 text: thread.provider != "" ? thread.provider + " \u{00B7} " + thread.model : thread.model;
                                 color: Theme.text-muted;
@@ -362,27 +368,40 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
-        // Settings management bar -- moved here from the header's gear
-        // glyph (which was placement-only, no click behavior) so it's a
-        // real, always-reachable control regardless of collapse state,
-        // matching the rest of this footer row's "always visible" role.
-        HoverSurface {
-            height: compact ? 28px : 40px;
-            idle-bg: Theme.bg-card;
+    }
+
+    // Settings — absolute bottom of the thread bar: margined box, bg + radius, no border.
+    settings-footer := Rectangle {
+        x: 0px;
+        y: parent.height - self.height;
+        width: parent.width;
+        height: root.settings-footer-h;
+        background: Theme.bg-sidebar;
+        // Inset margin around the settings chip.
+        settings-box := HoverSurface {
+            x: root.settings-margin;
+            y: root.settings-margin;
+            width: parent.width - 2 * root.settings-margin;
+            height: root.settings-box-h;
+            idle-bg: Theme.bg-tertiary;
             selected: false;
             button-accessible-label: "Open settings";
             clicked => { root.settings-requested(); }
-            border-color: Theme.border-default;
-            border-width: 1px;
+            border-width: 0px;
+            border-radius: Theme.radius-md;
             HorizontalLayout {
-                padding: compact ? Metrics.space-2 : Metrics.space-4;
-                spacing: Metrics.space-3;
+                width: 100%;
+                height: 100%;
+                padding-left: Metrics.pad-sm;
+                padding-right: Metrics.pad-sm;
+                spacing: Metrics.gap-sm;
                 alignment: expanded ? start : center;
                 VerticalLayout {
                     alignment: center;
+                    horizontal-stretch: 0;
                     Icon {
                         source: @image-url("../assets/icons/settings.svg");
-                        size: 15px;
+                        size: Metrics.icon-md;
                         color: Theme.text-secondary;
                     }
                 }
@@ -392,6 +411,7 @@ export component Sidebar inherits Rectangle {
                     font-size: 11px * Theme.font-scale;
                     font-family: Theme.font-sans;
                     vertical-alignment: center;
+                    horizontal-stretch: 1;
                 }
             }
         }
