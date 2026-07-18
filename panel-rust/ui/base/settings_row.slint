@@ -26,10 +26,24 @@ export component SettingsRow inherits Rectangle {
     in property <string> hint-font-family: Theme.font-sans;
 
     height: root.hint == "" ? root.row-height : root.row-height + 12px;
-    background: Theme.bg-sidebar;
+    background: row-hover.has-hover ? Theme.bg-primary-container.with-alpha(0.35) : Theme.bg-sidebar;
+    animate background { duration: 100ms; }
     border-radius: Theme.radius-sm;
 
+    row-hover := TouchArea {
+        // Hover-only -- doesn't intercept clicked, the row has no default
+        // action of its own (the trailing control in `@children` does).
+    }
+
     HorizontalLayout {
+        // Explicit -- this Rectangle's sole-child HorizontalLayout doesn't
+        // reliably auto-fill its parent's width (same class of bug fixed
+        // repeatedly elsewhere in this settings page); left unbound, a
+        // row with several trailing controls (transport tag/status/Connect/
+        // Toggle/Remove, see `mcp_servers_view.slint`) sized itself to its
+        // own natural/wider preferred width instead of the row's real
+        // available width, overflowing past the page edge.
+        width: parent.width;
         padding-left: Metrics.space-4;
         padding-right: Metrics.space-4;
         spacing: Metrics.space-4;

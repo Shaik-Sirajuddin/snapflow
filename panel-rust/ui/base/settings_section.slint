@@ -1,0 +1,77 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+
+// Layer 3 (base) -- the shared "vertical stack of settings sections/rows
+// with one consistent rhythm" primitives. Every per-section settings view
+// (`ui/pages/settings/views/*`) previously hand-rolled its own top-level
+// `VerticalLayout { spacing: ... }` plus its own mix of bold section
+// headers (font-size 13-16px, inconsistently), 1px dividers, and row
+// lists -- so the same conceptual gap (caption-to-control, row-to-row,
+// section-to-section) ended up a different `Metrics.space-N` per file.
+// These components pin each conceptual gap to one token so all three
+// views share it, matching the "layer 3 base primitive" convention
+// `settings_row.slint` and `labeled_select.slint` already establish.
+//
+// Deliberate three-tier spacing scale (each tier = one semantic level):
+//   * section-to-section / around-headers : `space-6` (12px)  -- SettingsSection
+//   * row-to-row in a homogeneous list    : `space-2`  (4px)  -- SettingsRowGroup
+//   * caption-to-control                  : `space-1`  (2px)  -- SettingsField
+// (`space-1` also matches `labeled_select.slint`'s caption-to-Select gap.)
+
+// Top-level container a settings view mounts directly. Section-to-section
+// rhythm lives here. NOTE: a component can't bind its own root element's
+// `width` to `parent.width` from *within* its own definition -- `parent`
+// only resolves for a *nested* element referencing its containing element
+// in the same component, not for the component's own outermost element
+// referencing whatever embeds it (that's a real Slint compile error:
+// "Cannot access id 'parent'", hit and fixed here). So every call site
+// still needs its own explicit `SettingsSection { width: parent.width;
+// ... }`, same convention `settings_page.slint` already uses for
+// `SettingsSearchBar` -- stretch factors don't reliably propagate width
+// down this Vertical/Horizontal + Flickable page (see `settings_page.
+// slint`), so don't drop that binding when using this component.
+export component SettingsSection inherits VerticalLayout {
+    spacing: Metrics.space-6;
+    @children
+}
+
+// Bold section header. `subsection` picks the two-level type hierarchy:
+// a view's top title (16px) vs. a sub-section header inside it (13px) --
+// previously chosen ad hoc per header. No divider of its own; place a
+// `SettingsDivider` before it when a section needs a rule above.
+export component SettingsSectionHeader inherits Text {
+    in property <bool> subsection: false;
+    color: Theme.text-primary;
+    font-size: (root.subsection ? 13px : 16px) * Theme.font-scale;
+    font-weight: 700;
+}
+
+// A homogeneous list of rows (e.g. stacked `SettingsRow`s). Tighter than
+// the section rhythm so a run of rows reads as one list, not as a stack
+// of separate sections.
+export component SettingsRowGroup inherits VerticalLayout {
+    spacing: Metrics.space-2;
+    @children
+}
+
+// A caption above its own control (text field, chip row, etc.) -- the
+// same silhouette as `labeled_select.slint`, but the control is
+// caller-supplied via `@children` instead of a fixed `Select`. Tight
+// caption-to-control gap so the label binds to its field.
+export component SettingsField inherits VerticalLayout {
+    in property <string> label;
+    spacing: Metrics.space-1;
+    Text {
+        text: root.label;
+        color: Theme.text-secondary;
+        font-size: 11px * Theme.font-scale;
+    }
+    @children
+}
+
+// A 1px section rule. One place for the height + color so every view's
+// divider is identical.
+export component SettingsDivider inherits Rectangle {
+    height: 1px;
+    background: Theme.border-default;
+}

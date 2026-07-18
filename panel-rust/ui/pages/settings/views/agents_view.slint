@@ -2,6 +2,9 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Button } from "../../../base/button.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
+import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider } from "../../../base/settings_section.slint";
+import { SettingsSearchBar } from "../components/search_bar.slint";
+import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
 
 // Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
@@ -28,6 +31,14 @@ export component AgentsView inherits Rectangle {
     callback profile-delete(string);
     callback agent-install-requested(string);
     callback recover-session-attach(string, string, string);
+    // Connect/disconnect a single agent's live session. UI-only
+    // placeholders -- there is no per-agent connect/disconnect RPC in
+    // `src/agent_bridge.rs` today (only `agents/install`), so these are
+    // terminated here (empty handlers on the cards) exactly like
+    // `mcp_servers_view.slint`'s "Connect" button. Declared so the seam
+    // exists when a real `agents/connect` round trip lands.
+    callback agent-connect-requested(string);
+    callback agent-disconnect-requested(string);
 
     property <string> new-profile-name: "";
     property <string> new-profile-agent-id: "";
@@ -38,15 +49,44 @@ export component AgentsView inherits Rectangle {
     // two-step confirm rather than an immediate delete.
     property <string> profile-pending-delete: "";
 
+    // Agents-grid-local search -- scoped to just this grid, separate from
+    // the page-level `SettingsSearchBar` in `settings_page.slint` (which
+    // filters nothing yet either, per that component's own doc comment --
+    // Slint's `string` type has no `contains`/`index-of` builtin, so real
+    // substring filtering needs a small Rust-side helper; wiring the query
+    // itself now and leaving actual filtering for that later pass, same
+    // posture the page-level bar already takes).
+    property <string> agent-search-query: "";
+    property <string> default-agent-id: "";
+
     background: transparent;
 
-    VerticalLayout {
-        spacing: Metrics.space-6;
+    SettingsSection {
+        width: parent.width;
 
-        Text { text: "Chat Defaults"; color: Theme.text-primary; font-size: 16px * Theme.font-scale; font-weight: 700; }
+        SettingsSectionHeader { text: "Chat Defaults"; }
 
-        Text { text: "Profile"; color: Theme.text-secondary; font-size: 11px * Theme.font-scale; }
-        TextInput { text <=> root.default-profile; color: Theme.text-primary; font-size: 12px * Theme.font-scale; }
+        SettingsField {
+            width: parent.width;
+            label: "Profile";
+            Rectangle {
+                height: 26px;
+                background: Theme.bg-sidebar;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                border-radius: Theme.radius-sm;
+                TextInput {
+                    accessible-label: "Default profile";
+                    accessible-action-default => { self.focus(); }
+                    text <=> root.default-profile;
+                    color: Theme.text-primary;
+                    font-size: 12px * Theme.font-scale;
+                    x: 6px;
+                    width: parent.width - 12px;
+                    vertical-alignment: center;
+                }
+            }
+        }
 
         Flickable {
             height: root.available-profiles.length > 0 ? 30px : 0px;
@@ -101,8 +141,6 @@ export component AgentsView inherits Rectangle {
                             btn-height: 24px;
                             font-size: 10px;
                             font-weight: 400;
-                            bg: Theme.bg-card;
-                            fg: Theme.text-secondary;
                             clicked => { root.profile-pending-delete = profile.name; }
                         }
                         if root.profile-pending-delete == profile.name : HorizontalLayout {
@@ -127,8 +165,6 @@ export component AgentsView inherits Rectangle {
                                 btn-height: 24px;
                                 font-size: 9px;
                                 font-weight: 400;
-                                bg: Theme.bg-card;
-                                fg: Theme.text-secondary;
                                 clicked => { root.profile-pending-delete = ""; }
                             }
                         }
@@ -137,8 +173,13 @@ export component AgentsView inherits Rectangle {
             }
         }
 
-        Rectangle { height: 1px; background: Theme.border-default; }
+        SettingsDivider { width: parent.width; }
 
+        // Add Profile -- commented out of view for now (kept in source, not
+        // deleted, per request while the Agents view is being reworked into
+        // a grid layout). Re-enable once the redesign settles on where
+        // profile creation belongs in the new layout.
+        /*
         Text { text: "Add Profile"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
         HorizontalLayout {
             spacing: Metrics.space-3;
@@ -146,6 +187,8 @@ export component AgentsView inherits Rectangle {
                 horizontal-stretch: 1;
                 height: 26px;
                 background: Theme.bg-sidebar;
+                border-width: 1px;
+                border-color: Theme.border-default;
                 border-radius: Theme.radius-sm;
                 TextInput {
                     accessible-label: "New profile name";
@@ -161,6 +204,8 @@ export component AgentsView inherits Rectangle {
                 horizontal-stretch: 1;
                 height: 26px;
                 background: Theme.bg-sidebar;
+                border-width: 1px;
+                border-color: Theme.border-default;
                 border-radius: Theme.radius-sm;
                 TextInput {
                     accessible-label: "New profile agent id";
@@ -217,50 +262,139 @@ export component AgentsView inherits Rectangle {
                 }
             }
         }
+        */
 
-        Text { text: "Permission profile"; color: Theme.text-secondary; font-size: 11px * Theme.font-scale; }
-        TextInput { text <=> root.permission-profile; color: Theme.text-primary; font-size: 12px * Theme.font-scale; }
-
-        Rectangle { height: 1px; background: Theme.border-default; }
-
-        Text { text: "Agents"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
-        for agent in root.agent-catalog : SettingsRow {
-            label: agent.name != "" ? agent.name : agent.id;
-            hint: agent.status;
-            hint-font-family: Theme.font-mono;
-            Button {
-                label: "Install";
-                button-accessible-label: "Install agent " + agent.name;
-                btn-width: 52px;
-                btn-height: 20px;
-                font-size: 9px;
-                font-weight: 400;
-                bg: Theme.bg-card;
-                fg: Theme.text-secondary;
-                clicked => { root.agent-install-requested(agent.id); }
+        SettingsField {
+            width: parent.width;
+            label: "Permission profile";
+            Rectangle {
+                height: 26px;
+                background: Theme.bg-sidebar;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                border-radius: Theme.radius-sm;
+                TextInput {
+                    accessible-label: "Permission profile";
+                    accessible-action-default => { self.focus(); }
+                    text <=> root.permission-profile;
+                    color: Theme.text-primary;
+                    font-size: 12px * Theme.font-scale;
+                    x: 6px;
+                    width: parent.width - 12px;
+                    vertical-alignment: center;
+                }
             }
         }
 
-        Rectangle { height: 1px; background: Theme.border-default; }
+        SettingsDivider { width: parent.width; }
 
-        Text { text: "Recoverable Sessions"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
-        if root.recoverable-sessions.length == 0 : Text {
-            text: "No orphaned sessions for this provider.";
-            color: Theme.text-muted;
-            font-size: 10px * Theme.font-scale;
+        SettingsSectionHeader { text: "Agents"; subsection: true; }
+
+        SettingsSearchBar {
+            width: parent.width;
+            query <=> root.agent-search-query;
         }
-        for session in root.recoverable-sessions : SettingsRow {
-            label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
-            Button {
-                label: "Attach";
-                button-accessible-label: "Attach recovered session " + session.session-id;
-                btn-width: 52px;
-                btn-height: 20px;
-                font-size: 9px;
-                font-weight: 400;
-                bg: Theme.bg-card;
-                fg: Theme.text-secondary;
-                clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
+
+        // Wrapping grid of `AgentCard` tiles, per the settings-pane-redesign
+        // plan's "Agents view is a grid, not a row list" section. Slint's
+        // layout primitives have no flex-wrap (confirmed against the
+        // "Slint layout defaults" reference), so a real `GridLayout` can't
+        // do this (it's compile-time-fixed, no `for`/`if` inside it) --
+        // but a manually-built `VerticalLayout` of `HorizontalLayout`s
+        // (via `for row-idx in row-count`) is the idiomatic dynamic-grid
+        // pattern, and lets the layout engine own the actual x/y
+        // placement instead of hand-computed pixel math. An earlier
+        // version of this grid used raw `x`/`y` arithmetic (`Math.mod(i,
+        // 2) * 270px`, `(i / 2) * 240px`) and shipped a real bug from it:
+        // Slint's `/` on two `int`s is float division, not truncating
+        // (`1 / 2 == 0.5`, confirmed via a standalone debug grid after
+        // "row 0.5" showed up), so row 1 rendered at half a row's height
+        // instead of a full one. The layout-engine version below has no
+        // such division at all in the positioning path -- only in slicing
+        // the catalog into pairs of two, which is far lower-stakes than
+        // getting it wrong in a pixel coordinate.
+        //
+        // CONNECTED-FIRST + SEPARATOR (`changes.yaml` task 3): connected
+        // ("installed") agents render first, then a full-width separator
+        // line, then the rest. True in-Slint reordering isn't possible --
+        // Slint 1.17.1 has no array sort/filter, so the connected-first
+        // *grouping* relies on the catalog already arriving connected-first
+        // from the backend (`agents/list`) -- the dev preview data is
+        // ordered that way to match. The separator is now a `SettingsDivider`
+        // inserted as its own row, right before the first row whose
+        // *first* (even-index) agent is not connected -- a row-granularity
+        // adaptation of the old per-card boundary check (which could land
+        // mid-row); if the actual transition falls on an odd index (col 1
+        // of an otherwise-connected row), the divider now appears one row
+        // later than it strictly would per-card, which reads better than a
+        // divider slicing through a row anyway. Making the default agent
+        // *physically jump* to the top on toggle (vs. the connected-status
+        // grouping here) would need a real reorder primitive Slint doesn't
+        // have and is deferred to a Rust-side ordering pass -- the default
+        // card still reads as default via its own tint wherever it sits.
+        //
+        // Default-model/permission-profile per card are local, UI-only
+        // placeholder state for now -- `AgentCatalogEntry` has no per-agent
+        // model/profile fields yet (see the plan's "Open questions": no ACP
+        // RPC returns a model list keyed by agent id today), and mapping
+        // `available-profiles` (`[ProfileOption]`) into the `[string]`
+        // `Select.options` each card needs isn't expressible in pure Slint
+        // (no array-map primitive) without a small Rust-side helper --
+        // deferred until the real per-agent settings storage exists.
+        VerticalLayout {
+            width: parent.width;
+            spacing: Metrics.space-6;
+
+            property <int> agent-count: root.agent-catalog.length;
+            // Ceiling division for row count -- exact by construction
+            // (subtract the remainder first), not the classic `(N+1)/2`
+            // truncating-int trick, since `/` doesn't truncate here.
+            property <int> row-count:
+                ((agent-count + 1) - Math.mod(agent-count + 1, 2)) / 2;
+
+            for row-idx in row-count : VerticalLayout {
+                spacing: Metrics.space-6;
+
+                if root.agent-catalog[row-idx * 2].status != "installed"
+                    && (row-idx == 0 || root.agent-catalog[row-idx * 2 - 1].status == "installed")
+                    : SettingsDivider { width: parent.width; }
+
+                HorizontalLayout {
+                    spacing: Metrics.space-6;
+                    alignment: start;
+
+                    AgentCard {
+                        agent-id: root.agent-catalog[row-idx * 2].id;
+                        agent-name: root.agent-catalog[row-idx * 2].name != ""
+                            ? root.agent-catalog[row-idx * 2].name : root.agent-catalog[row-idx * 2].id;
+                        status: root.agent-catalog[row-idx * 2].status;
+                        is-default: root.agent-catalog[row-idx * 2].id == root.default-agent-id;
+                        model-options: ["default", "gpt-5.2", "gpt-5.2-codex", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5", "gemini-3-pro"];
+                        profile-options: ["default", "readonly", "full-access"];
+                        set-default(new-default) => {
+                            root.default-agent-id = new-default ? root.agent-catalog[row-idx * 2].id : "";
+                        }
+                        install-requested => { root.agent-install-requested(root.agent-catalog[row-idx * 2].id); }
+                        connect-requested => { root.agent-connect-requested(root.agent-catalog[row-idx * 2].id); }
+                        disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[row-idx * 2].id); }
+                    }
+
+                    if row-idx * 2 + 1 < root.agent-catalog.length : AgentCard {
+                        agent-id: root.agent-catalog[row-idx * 2 + 1].id;
+                        agent-name: root.agent-catalog[row-idx * 2 + 1].name != ""
+                            ? root.agent-catalog[row-idx * 2 + 1].name : root.agent-catalog[row-idx * 2 + 1].id;
+                        status: root.agent-catalog[row-idx * 2 + 1].status;
+                        is-default: root.agent-catalog[row-idx * 2 + 1].id == root.default-agent-id;
+                        model-options: ["default", "gpt-5.2", "gpt-5.2-codex", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5", "gemini-3-pro"];
+                        profile-options: ["default", "readonly", "full-access"];
+                        set-default(new-default) => {
+                            root.default-agent-id = new-default ? root.agent-catalog[row-idx * 2 + 1].id : "";
+                        }
+                        install-requested => { root.agent-install-requested(root.agent-catalog[row-idx * 2 + 1].id); }
+                        connect-requested => { root.agent-connect-requested(root.agent-catalog[row-idx * 2 + 1].id); }
+                        disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[row-idx * 2 + 1].id); }
+                    }
+                }
             }
         }
     }

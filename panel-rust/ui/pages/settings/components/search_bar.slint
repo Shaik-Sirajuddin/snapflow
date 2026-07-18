@@ -16,7 +16,9 @@ export component SettingsSearchBar inherits Rectangle {
     in-out property <string> query: "";
 
     height: 28px;
-    background: Theme.bg-sidebar;
+    background: Theme.bg-tertiary;
+    border-width: 1px;
+    border-color: Theme.border-default;
     border-radius: Theme.radius-sm;
 
     TextInput {
@@ -27,6 +29,14 @@ export component SettingsSearchBar inherits Rectangle {
         font-size: 11px * Theme.font-scale;
         x: Metrics.space-4;
         width: parent.width - 2 * Metrics.space-4;
+        vertical-alignment: center;
+    }
+    if root.query == "" : Text {
+        text: "Search settings...";
+        color: Theme.text-muted;
+        font-size: 11px * Theme.font-scale;
+        x: Metrics.space-4;
+        height: parent.height;
         vertical-alignment: center;
     }
 }

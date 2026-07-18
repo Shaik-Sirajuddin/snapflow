@@ -1,0 +1,52 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { Select } from "select.slint";
+
+// Layer 3 (base) -- "small label + Select control" pair. Both
+// `agent_card.slint`'s Model row and its Profile row hand-rolled the exact
+// same `Text` + `Select` shape (same font-size/color, same spacing) before
+// this was extracted -- same reasoning `settings_row.slint` documents for
+// why the label/hint/control row shape got centralized. Tighter
+// label-to-control gap (`space-1`) than a generic vertical stack would
+// default to, since the label reads as this control's caption, not a
+// separate row.
+export component LabeledSelect inherits VerticalLayout {
+    in property <string> label;
+    in property <[string]> options: [];
+    in-out property <string> value: "";
+    in property <string> placeholder: "Select...";
+    in property <bool> searchable: false;
+    in property <string> select-accessible-label: label;
+    callback selected(string);
+
+    // NOTE: no width binding on this component's own root, same reason
+    // as `select.slint`'s root -- a component can't bind its own root
+    // element's width to `parent.width` from within its own definition.
+    // Every call site must bind `width:` explicitly (e.g. `LabeledSelect
+    // { width: parent.width; ... }`, as `agent_card.slint` does).
+    //
+    // `Metrics.space-1` (2px, the smallest token -- "xs") kept as real
+    // spacing, not zeroed out. What actually read as "too much" was the
+    // label `Text`'s own *implicit* line-height stacking on top of that
+    // token (its default leading beyond the glyphs themselves, not the
+    // token value) -- fixed by pinning the label to an explicit `height`
+    // below instead of letting it claim its unstated default line-height.
+    spacing: Metrics.space-1;
+
+    Text {
+        text: root.label;
+        color: Theme.text-secondary;
+        font-size: 10px * Theme.font-scale;
+        height: 12px * Theme.font-scale;
+        vertical-alignment: center;
+    }
+    Select {
+        width: parent.width;
+        value <=> root.value;
+        options: root.options;
+        placeholder: root.placeholder;
+        searchable: root.searchable;
+        select-accessible-label: root.select-accessible-label;
+        selected(v) => { root.selected(v); }
+    }
+}

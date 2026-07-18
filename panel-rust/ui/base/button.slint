@@ -19,7 +19,15 @@ export component Button inherits Rectangle {
     in property <length> btn-height: 26px;
     in property <length> font-size: 10px;
     in property <int> font-weight: 600;
-    in property <color> bg: primary ? Theme.bg-primary : Theme.bg-sidebar;
+    // Secondary default is a tinted container fill, not a plain surface
+    // tone -- `Theme.bg-card` and `Theme.bg-sidebar` resolve to the exact
+    // same color in dark mode, so a secondary button sitting on either
+    // surface (a `SettingsRow`, an `AgentCard`) using either as its own
+    // background was invisible except for its 1px border. Every call site
+    // that used to override `bg: Theme.bg-card` for a "quiet" secondary
+    // look hit this same collision -- fixed once here instead of at each
+    // site.
+    in property <color> bg: primary ? Theme.bg-primary : Theme.bg-primary-container.with-alpha(0.6);
     in property <color> fg: primary ? Theme.text-on-primary : Theme.text-primary;
     in property <color> border-col: Theme.border-default;
     in property <length> border-w: primary ? 0px : 1px;
@@ -29,8 +37,8 @@ export component Button inherits Rectangle {
     height: btn-height;
     // Hover feedback -- previously missing entirely (this component had
     // no visual response to `has-hover` at all). Primary buttons dim
-    // slightly on hover; secondary/bordered ones pick up the same
-    // hover-container tint `IconButton`/sidebar rows already use.
+    // slightly on hover; secondary/bordered ones go from the tinted idle
+    // fill above to the full-strength container tint on hover.
     background: touch.has-hover
         ? (primary ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary-container)
         : bg;

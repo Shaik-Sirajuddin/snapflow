@@ -1,0 +1,46 @@
+Agent brand logos
+=================
+
+This folder vendors the official brand marks shown next to each agent in the
+Settings > Agents grid (see `ui/pages/settings/components/agent_logo.slint`).
+One SVG per agent id. Documented here the same way `ui/assets/icons/LICENSE`
+documents the vendored Lucide icons.
+
+These are third-party brand/trademark assets, included solely to identify each
+agent. They are NOT covered by this repository's own license; each remains the
+property of its respective owner and is used nominatively (to name the product).
+Refer to each owner's brand guidelines before reproducing these marks elsewhere.
+
+
+claude-code.svg  --  "Claude"  (Anthropic)
+  Source : Simple Icons  https://cdn.simpleicons.org/claude
+  Upstream: https://github.com/simple-icons/simple-icons  (icon slug: claude)
+  License: Simple Icons artwork is released under CC0 1.0 (public domain). The
+           mark itself is a trademark of Anthropic PBC.
+  Native brand color baked into the SVG (fill #D97757). Rendered un-colorized.
+
+gemini-cli.svg  --  "Google Gemini"  (Google)
+  Source : Simple Icons  https://cdn.simpleicons.org/googlegemini
+  Upstream: https://github.com/simple-icons/simple-icons  (icon slug: googlegemini)
+  License: Simple Icons artwork is CC0 1.0 (public domain). The mark is a
+           trademark of Google LLC.
+  Native brand color baked into the SVG (fill #8E75B2). Rendered un-colorized.
+
+codex.svg  --  OpenAI mark, standing in for "Codex"  (OpenAI)
+  Source : openai/codex (the Codex CLI's own repository -- first-party)
+           https://raw.githubusercontent.com/openai/codex/main/codex-rs/skills/src/assets/samples/openai-docs/assets/openai-small.svg
+  SUBSTITUTION: there is no distinct "Codex" brand mark. Simple Icons no longer
+           carries an OpenAI icon (removed upstream). This is OpenAI's own
+           logomark, taken directly from the Codex product repository, used as
+           the closest official mark for the `codex` agent.
+  License: subject to OpenAI's brand/trademark terms. Monochrome SVG
+           (fill="currentColor"); rendered colorized to the theme text color.
+
+amp.svg  --  "Amp"  (Sourcegraph)
+  Source : ampcode.com (Amp's own site -- first-party)  https://ampcode.com/amp-mark.svg
+  NOTE   : Simple Icons' "amp" slug is Google AMP (Accelerated Mobile Pages), a
+           different product, so it was NOT used. This is the real Sourcegraph
+           Amp mark pulled from the product's own domain.
+  License: subject to Sourcegraph's brand/trademark terms. The mark ships as a
+           monochrome white glyph (fill="white"); rendered colorized to the
+           theme text color so it is visible on both light and dark surfaces.

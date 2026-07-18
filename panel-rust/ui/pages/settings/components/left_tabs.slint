@@ -12,6 +12,7 @@ export component SettingsLeftTabs inherits Rectangle {
     callback section-selected(string);
 
     width: 128px;
+    background: Theme.bg-sidebar;
 
     VerticalLayout {
         spacing: Metrics.space-2;
@@ -19,8 +20,11 @@ export component SettingsLeftTabs inherits Rectangle {
         mcp-tab := Rectangle {
             height: 30px;
             border-radius: Theme.radius-sm;
-            background: root.active-section == "mcp_servers" ? Theme.bg-primary-container : transparent;
-            TouchArea {
+            background: root.active-section == "mcp_servers"
+                ? Theme.bg-primary-container
+                : (mcp-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
+            animate background { duration: 100ms; }
+            mcp-touch := TouchArea {
                 mouse-cursor: pointer;
                 accessible-role: button;
                 accessible-label: "MCP Servers section";
@@ -39,8 +43,11 @@ export component SettingsLeftTabs inherits Rectangle {
         agents-tab := Rectangle {
             height: 30px;
             border-radius: Theme.radius-sm;
-            background: root.active-section == "agents" ? Theme.bg-primary-container : transparent;
-            TouchArea {
+            background: root.active-section == "agents"
+                ? Theme.bg-primary-container
+                : (agents-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
+            animate background { duration: 100ms; }
+            agents-touch := TouchArea {
                 mouse-cursor: pointer;
                 accessible-role: button;
                 accessible-label: "Agents section";
@@ -59,8 +66,11 @@ export component SettingsLeftTabs inherits Rectangle {
         harness-tab := Rectangle {
             height: 30px;
             border-radius: Theme.radius-sm;
-            background: root.active-section == "harness" ? Theme.bg-primary-container : transparent;
-            TouchArea {
+            background: root.active-section == "harness"
+                ? Theme.bg-primary-container
+                : (harness-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
+            animate background { duration: 100ms; }
+            harness-touch := TouchArea {
                 mouse-cursor: pointer;
                 accessible-role: button;
                 accessible-label: "Harness section";

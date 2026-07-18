@@ -10,15 +10,19 @@ export component SettingsTopTabs inherits Rectangle {
     in property <string> scope: "project"; // "project" | "global"
     callback scope-selected(string);
 
-    height: 32px;
+    height: 28px;
 
     HorizontalLayout {
+        alignment: start;
         spacing: Metrics.space-2;
 
         Rectangle {
-            horizontal-stretch: 1;
+            width: 72px;
             border-radius: Theme.radius-sm;
-            background: root.scope == "project" ? Theme.bg-primary : Theme.bg-sidebar;
+            background: root.scope == "project"
+                ? Theme.bg-primary-container
+                : (project-tab.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
+            animate background { duration: 100ms; }
             project-tab := TouchArea {
                 mouse-cursor: pointer;
                 accessible-role: button;
@@ -28,7 +32,7 @@ export component SettingsTopTabs inherits Rectangle {
             }
             Text {
                 text: "Project";
-                color: root.scope == "project" ? Theme.text-on-primary : Theme.text-secondary;
+                color: root.scope == "project" ? Theme.text-primary : Theme.text-secondary;
                 font-size: 11px * Theme.font-scale;
                 font-weight: 600;
                 horizontal-alignment: center;
@@ -36,9 +40,12 @@ export component SettingsTopTabs inherits Rectangle {
             }
         }
         Rectangle {
-            horizontal-stretch: 1;
+            width: 72px;
             border-radius: Theme.radius-sm;
-            background: root.scope == "global" ? Theme.bg-primary : Theme.bg-sidebar;
+            background: root.scope == "global"
+                ? Theme.bg-primary-container
+                : (global-tab.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
+            animate background { duration: 100ms; }
             global-tab := TouchArea {
                 mouse-cursor: pointer;
                 accessible-role: button;
@@ -48,7 +55,7 @@ export component SettingsTopTabs inherits Rectangle {
             }
             Text {
                 text: "Global";
-                color: root.scope == "global" ? Theme.text-on-primary : Theme.text-secondary;
+                color: root.scope == "global" ? Theme.text-primary : Theme.text-secondary;
                 font-size: 11px * Theme.font-scale;
                 font-weight: 600;
                 horizontal-alignment: center;

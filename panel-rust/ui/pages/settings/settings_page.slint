@@ -58,27 +58,68 @@ export component SettingsPage inherits Rectangle {
     border-radius: Theme.radius-md;
 
     VerticalLayout {
+        width: parent.width;
+        height: parent.height;
         padding: Metrics.space-7;
         spacing: Metrics.space-6;
 
-        SettingsTopTabs {
+        top-tabs := SettingsTopTabs {
             scope: root.scope;
             scope-selected(new-scope) => { root.scope = new-scope; }
         }
 
         HorizontalLayout {
+            // Deterministic height AND width, not `vertical-stretch` /
+            // `horizontal-stretch` -- in this three-level Vertical >
+            // Horizontal > Vertical > Flickable nesting, stretch factors
+            // never actually propagated real space down from an ancestor
+            // (confirmed for height by giving this row a hardcoded height,
+            // which *did* expand correctly; the same turned out to be true
+            // for width once the "agents tab still doesn't take full
+            // width" symptom was traced the same way). This row's own
+            // width IS safe to bind to a concrete expression here (unlike
+            // lower down the tree) because the outer `VerticalLayout`
+            // above has an explicit, concrete `width: parent.width` of
+            // its own (ultimately anchored to the page's real width, not
+            // another stretch factor) -- binding to a concrete ancestor
+            // is fine, binding to a still-unresolved stretch-based one is
+            // what caused binding-loop compile errors earlier.
+            //
+            // MUST subtract padding here -- this row is a *direct* child
+            // of that padded outer VerticalLayout (`padding:
+            // Metrics.space-7`). `width: parent.width` (this row's
+            // previous binding) reads the padded layout's *raw* box
+            // width, not its padding-inset content width -- the padding
+            // property only gets applied automatically by the layout's
+            // own default `alignment: stretch` sizing, which an explicit
+            // width override replaces entirely. The `height` binding
+            // right below already (correctly) subtracts `2 *
+            // Metrics.space-7`; `width` never did, which is the actual
+            // root cause behind "the search bar doesn't respect the
+            // window edge" and every other padding complaint on this
+            // page -- literally everything (search bar, MCP/Agents/
+            // Harness views) nests inside this one row, so its own
+            // padding-bypass cascaded into all of them at once.
+            width: parent.width - 2 * Metrics.space-7;
+            height: parent.height - 2 * Metrics.space-7
+                - top-tabs.height - save-row.height - 2 * Metrics.space-6;
             spacing: Metrics.space-6;
 
-            SettingsLeftTabs {
+            left-tabs := SettingsLeftTabs {
                 active-section: root.active-section;
                 section-selected(new-section) => { root.active-section = new-section; }
             }
 
             VerticalLayout {
-                horizontal-stretch: 1;
+                // Computed from the now-concrete parent width, same
+                // reasoning as above -- `horizontal-stretch: 1` alone
+                // wasn't propagating real width down this chain either.
+                width: parent.width - left-tabs.width - Metrics.space-6;
+                vertical-stretch: 1;
                 spacing: Metrics.space-4;
 
                 SettingsSearchBar {
+                    width: parent.width;
                     query <=> root.search-query;
                 }
 
@@ -91,16 +132,20 @@ export component SettingsPage inherits Rectangle {
                 // which a plain binding can't rely on inside a
                 // `VerticalLayout`).
                 Flickable {
+                    width: parent.width;
                     vertical-stretch: 1;
                     preferred-height: 0px;
                     min-height: 0px;
                     content := VerticalLayout {
+                        width: parent.width;
                         if root.active-section == "mcp_servers" : McpServersView {
+                            width: parent.width;
                             servers: root.available-mcp-servers;
                             mcp-server-create(name, command) => { root.mcp-server-create(name, command); }
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }
                         }
                         if root.active-section == "agents" : AgentsView {
+                            width: parent.width;
                             default-profile <=> root.default-profile;
                             permission-profile <=> root.permission-profile;
                             available-profiles: root.available-profiles;
@@ -116,6 +161,7 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
                         if root.active-section == "harness" : HarnessView {
+                            width: parent.width;
                             background-default <=> root.background-default;
                             background-override-set <=> root.background-override-set;
                             background-override <=> root.background-override;
@@ -125,8 +171,10 @@ export component SettingsPage inherits Rectangle {
             }
         }
 
-        HorizontalLayout {
+        save-row := HorizontalLayout {
+            height: 30px;
             spacing: Metrics.space-4;
+            alignment: end;
             Button {
                 label: "Save";
                 button-accessible-label: "Save chat settings";
