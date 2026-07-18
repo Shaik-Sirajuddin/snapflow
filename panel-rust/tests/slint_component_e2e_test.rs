@@ -1,7 +1,7 @@
 use i_slint_backend_testing::ElementHandle;
 use panel_rust::{
-    AgentCatalogEntry, ChatPanel, ConfigOptionRow, LocalTerminalItem, McpServerOption,
-    MessageItem, ModeOption, PendingRequestItem, ProfileOption, RemoteSessionOption,
+    AgentCatalogEntry, ChatPanel, DropdownEntry, LocalTerminalItem, McpServerOption,
+    MessageItem, PendingRequestItem, ProfileOption, RemoteSessionOption,
     TerminalItem, ThreadItem,
 };
 use slint::platform::{Key, WindowEvent};
@@ -456,45 +456,52 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         });
     }
 
-    panel.set_available_modes(ModelRc::new(VecModel::from(vec![ModeOption {
+    panel.set_mode_trigger_label("Ask".into());
+    panel.set_mode_dropdown_entries(ModelRc::new(VecModel::from(vec![DropdownEntry {
         id: "plan".into(),
-        name: "Plan".into(),
-        description: "Plan before editing".into(),
+        label: "Plan".into(),
+        value: "".into(),
+        is_header: false,
+        is_current: false,
     }])));
-    panel.set_current_mode_id("ask".into());
-    panel.set_config_option_rows(ModelRc::new(VecModel::from(vec![
-        ConfigOptionRow {
-            option_id: "reasoning".into(),
-            is_header: true,
-            name: "Reasoning".into(),
-            description: "".into(),
+    panel.set_config_dropdown_entries(ModelRc::new(VecModel::from(vec![
+        DropdownEntry {
+            id: "reasoning".into(),
+            label: "Reasoning".into(),
             value: "".into(),
+            is_header: true,
             is_current: false,
         },
-        ConfigOptionRow {
-            option_id: "reasoning".into(),
-            is_header: false,
-            name: "High".into(),
-            description: "".into(),
+        DropdownEntry {
+            id: "reasoning".into(),
+            label: "High".into(),
             value: "high".into(),
+            is_header: false,
             is_current: false,
         },
     ])));
 
-    let select_mode = ElementHandle::find_by_accessible_label(&panel, "Select mode Plan")
+    // The mode selector is a dropdown now: open it (its trigger is labelled
+    // by the current mode), then pick "Plan".
+    let mode_trigger = ElementHandle::find_by_accessible_label(&panel, "Ask")
         .next()
-        .expect("mode option must be accessible");
-    assert_eq!(select_mode.id().as_deref(), Some("ChatArea::mode-option"));
+        .expect("mode selector trigger must be accessible");
+    mode_trigger.invoke_accessible_default_action();
+    let select_mode = ElementHandle::find_by_accessible_label(&panel, "Plan")
+        .next()
+        .expect("mode option must be accessible once the dropdown is open");
     select_mode.invoke_accessible_default_action();
     assert_eq!(&*mode_selection.borrow(), &["plan"]);
 
-    let select_config = ElementHandle::find_by_accessible_label(&panel, "Select High")
+    // Same for the model/config selector -- open the "Config" trigger, then
+    // pick the "High" value row.
+    let config_trigger = ElementHandle::find_by_accessible_label(&panel, "Config")
         .next()
-        .expect("config option must be accessible");
-    assert_eq!(
-        select_config.id().as_deref(),
-        Some("ChatArea::config-option")
-    );
+        .expect("model selector trigger must be accessible");
+    config_trigger.invoke_accessible_default_action();
+    let select_config = ElementHandle::find_by_accessible_label(&panel, "High")
+        .next()
+        .expect("config option must be accessible once the dropdown is open");
     select_config.invoke_accessible_default_action();
     assert_eq!(
         &*config_selection.borrow(),

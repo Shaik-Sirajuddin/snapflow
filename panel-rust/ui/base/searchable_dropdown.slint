@@ -1,0 +1,182 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { DropdownEntry } from "../types.slint";
+import { TextUtil } from "text_util.slint";
+import { Icon } from "icon.slint";
+
+// Layer 3 (base) -- a trigger button that opens a list of `DropdownEntry`
+// rows, with an optional filter box. The filter box only appears once the
+// list is long enough to warrant it (>= 4 rows) and can be suppressed
+// entirely via `searchable: false` ("disable search" mode). Domain-neutral:
+// it depends only on `DropdownEntry`, so the compose bar's mode/model
+// selectors and (later) the slash-command popup all share it. The list
+// opens upward (anchored above the trigger, drawn as an in-tree overlay so
+// it renders over the message stream) since every current call site lives
+// in the bottom compose bar.
+export component SearchableDropdown inherits Rectangle {
+    in property <string> trigger-label;
+    in property <[DropdownEntry]> options: [];
+    in property <bool> searchable: true;
+    in property <string> placeholder: "Search...";
+    in property <length> popup-width: 200px;
+    in property <length> popup-max-height: 220px;
+    callback entry-selected(string /* id */, string /* value */);
+
+    property <bool> open: false;
+    property <string> filter: "";
+    property <bool> show-search: searchable && options.length >= 4;
+    property <length> row-h: 26px;
+    property <length> search-block-h: show-search ? 36px : 0px;
+    property <length> content-h: Math.min(
+        search-block-h + options.length * row-h + 2 * Metrics.space-2,
+        popup-max-height);
+
+    public function close() {
+        open = false;
+        filter = "";
+    }
+
+    height: 24px;
+    min-width: 72px;
+    background: trigger-touch.has-hover || open ? Theme.bg-primary-container : Theme.bg-canvas;
+    animate background { duration: 100ms; }
+    border-color: Theme.border-default;
+    border-width: 1px;
+    border-radius: Theme.radius-sm;
+
+    trigger-touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.trigger-label;
+        accessible-action-default => { root.filter = ""; root.open = !root.open; }
+        clicked => { root.filter = ""; root.open = !root.open; }
+    }
+    HorizontalLayout {
+        padding-left: Metrics.space-3;
+        padding-right: Metrics.space-3;
+        spacing: Metrics.space-2;
+        Text {
+            text: root.trigger-label;
+            color: Theme.text-primary;
+            font-family: Theme.font-mono;
+            font-size: 10px * Theme.font-scale;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            text: "\u{25BE}";
+            color: Theme.text-muted;
+            font-size: 9px * Theme.font-scale;
+            vertical-alignment: center;
+        }
+    }
+
+    if open : Rectangle {
+        x: 0px;
+        y: -root.content-h - Metrics.space-2;
+        width: root.popup-width;
+        height: root.content-h;
+        background: Theme.bg-card;
+        border-color: Theme.border-strong;
+        border-width: 1px;
+        border-radius: Theme.radius-md;
+        VerticalLayout {
+            padding: Metrics.space-2;
+            spacing: Metrics.space-1;
+            if root.show-search : Rectangle {
+                height: 28px;
+                background: Theme.bg-sidebar;
+                border-color: Theme.border-default;
+                border-width: 1px;
+                border-radius: Theme.radius-sm;
+                HorizontalLayout {
+                    padding-left: Metrics.space-3;
+                    padding-right: Metrics.space-3;
+                    spacing: Metrics.space-2;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            source: @image-url("../assets/icons/search.svg");
+                            size: Metrics.icon-sm;
+                            color: Theme.text-muted;
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        Text {
+                            text: root.placeholder;
+                            color: Theme.text-muted;
+                            font-family: Theme.font-sans;
+                            font-size: 11px * Theme.font-scale;
+                            vertical-alignment: center;
+                            x: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            visible: search-input.text == "";
+                        }
+                        search-input := TextInput {
+                            accessible-label: "Filter options";
+                            color: Theme.text-primary;
+                            font-family: Theme.font-sans;
+                            font-size: 11px * Theme.font-scale;
+                            vertical-alignment: center;
+                            width: parent.width;
+                            height: parent.height;
+                            edited => { root.filter = self.text; }
+                        }
+                    }
+                }
+            }
+            Flickable {
+                vertical-stretch: 1;
+                viewport-height: options-col.preferred-height;
+                options-col := VerticalLayout {
+                    alignment: start;
+                    for entry in root.options : Rectangle {
+                        property <bool> hidden: !entry.is-header
+                            && root.filter != ""
+                            && !TextUtil.contains-ci(entry.label, root.filter);
+                        height: hidden ? 0px : root.row-h;
+                        clip: true;
+                        background: entry.is-header ? transparent
+                            : entry.is-current ? Theme.bg-primary
+                            : row-touch.has-hover ? Theme.bg-primary-container
+                            : transparent;
+                        animate background { duration: 100ms; }
+                        border-radius: Theme.radius-sm;
+                        row-touch := TouchArea {
+                            enabled: !entry.is-header && !hidden;
+                            mouse-cursor: entry.is-header ? default : pointer;
+                            accessible-role: button;
+                            accessible-label: entry.label;
+                            accessible-action-default => {
+                                root.entry-selected(entry.id, entry.value);
+                                root.close();
+                            }
+                            clicked => {
+                                root.entry-selected(entry.id, entry.value);
+                                root.close();
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: Metrics.space-3;
+                            padding-right: Metrics.space-3;
+                            Text {
+                                text: entry.is-header ? entry.label + ":" : entry.label;
+                                color: entry.is-header ? Theme.text-secondary
+                                    : entry.is-current ? Theme.text-on-primary
+                                    : Theme.text-primary;
+                                font-family: Theme.font-mono;
+                                font-size: (entry.is-header ? 9px : 10px) * Theme.font-scale;
+                                font-weight: entry.is-header ? 700 : 400;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

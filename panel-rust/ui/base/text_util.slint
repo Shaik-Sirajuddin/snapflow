@@ -1,0 +1,10 @@
+// Layer 3 (base) helper -- string operations Slint's expression language
+// lacks natively in this build (it has `to-lowercase` but no substring
+// search), backed by a Rust implementation installed once at startup.
+// Kept domain-free so any base primitive can depend on it.
+export global TextUtil {
+    // Case-insensitive substring test. Returns false until Rust installs
+    // the implementation, which is harmless (nothing matches -> the caller
+    // simply shows its list unfiltered).
+    pure callback contains-ci(string, string) -> bool;
+}

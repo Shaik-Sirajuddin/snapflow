@@ -9,8 +9,8 @@
 
 use crate::agent_bridge::TerminalBuffer;
 use crate::{
-    AgentCatalogEntry, ConfigOptionRow, LocalTerminalItem, McpServerOption, MessageItem,
-    ModeOption, ProfileOption, TerminalItem, ThreadItem,
+    AgentCatalogEntry, DropdownEntry, LocalTerminalItem, McpServerOption, MessageItem,
+    ProfileOption, TerminalItem, ThreadItem,
 };
 use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::platform::Key;
@@ -198,20 +198,40 @@ pub fn to_message_model_from_transcript(
     ModelRc::new(VecModel::from(rows))
 }
 
-/// Builds the mode-selector's chip row model from a thread's currently
-/// advertised `AgentBridge::session_modes` -- `None` (no `modes` field
-/// advertised at all, or `session/new` hasn't resolved yet) maps to an
-/// empty model, which the Slint side's capability-gating (`available-
-/// modes.length > 0`) treats as "hide the selector entirely."
-pub fn to_mode_options(modes: Option<SessionModesEvent>) -> ModelRc<ModeOption> {
-    let items: Vec<ModeOption> = modes
+/// The display name of the thread's currently active mode, for the compose
+/// bar's mode-selector trigger label. Empty when no modes are advertised or
+/// the current id has no matching entry (the Slint side falls back to a
+/// generic label then).
+pub fn current_mode_name(modes: &Option<SessionModesEvent>) -> String {
+    modes
+        .as_ref()
+        .and_then(|m| {
+            m.available
+                .iter()
+                .find(|mode| mode.id == m.current_mode_id)
+                .map(|mode| mode.name.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// The mode selector's dropdown model -- the thread's `session_modes`
+/// advertisement mapped into the domain-neutral `DropdownEntry` the compose
+/// bar's `SearchableDropdown` consumes. `None` (no modes advertised, or
+/// `session/new` unresolved) yields an empty model, which capability-gates
+/// the selector out. `is_current` is resolved against the advertisement's
+/// own `current_mode_id`.
+pub fn to_mode_dropdown_entries(modes: Option<SessionModesEvent>) -> ModelRc<DropdownEntry> {
+    let items: Vec<DropdownEntry> = modes
         .map(|m| {
+            let current = m.current_mode_id.clone();
             m.available
                 .into_iter()
-                .map(|mode| ModeOption {
+                .map(|mode| DropdownEntry {
+                    is_current: mode.id == current,
                     id: mode.id.into(),
-                    name: mode.name.into(),
-                    description: mode.description.unwrap_or_default().into(),
+                    label: mode.name.into(),
+                    value: String::new().into(),
+                    is_header: false,
                 })
                 .collect()
         })
@@ -219,34 +239,28 @@ pub fn to_mode_options(modes: Option<SessionModesEvent>) -> ModelRc<ModeOption> 
     ModelRc::new(VecModel::from(items))
 }
 
-/// Builds the config-option selector's flat row model from a thread's
-/// currently advertised `AgentBridge::config_options` -- see
-/// `ConfigOptionRow`'s doc comment for the header-then-values flattening
-/// this performs. An option with no `options[]` entries at all (a
-/// `select`-kind option a backend advertised with an empty choice list,
-/// or a future non-`select` `kind` this UI doesn't render values for
-/// yet) still emits its header row, so its `current_value` remains
-/// visible even though nothing is clickable for it.
-pub fn to_config_option_rows(options: Vec<ConfigOptionInfo>) -> ModelRc<ConfigOptionRow> {
-    let mut items: Vec<ConfigOptionRow> = Vec::new();
+/// The model selector's dropdown model -- the thread's `config_options`
+/// advertisement flattened into `DropdownEntry` rows (one `is_header` row
+/// per option, then one selectable row per value carrying its
+/// `session/set_config_option` `value` payload).
+pub fn to_config_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+    let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
-        items.push(ConfigOptionRow {
-            option_id: option.id.clone().into(),
-            is_header: true,
-            name: option.name.into(),
-            description: option.description.unwrap_or_default().into(),
+        items.push(DropdownEntry {
+            id: option.id.clone().into(),
+            label: option.name.into(),
             value: String::new().into(),
+            is_header: true,
             is_current: false,
         });
         for value in option.options {
             let is_current = option.current_value.as_deref() == Some(value.value.as_str());
-            items.push(ConfigOptionRow {
-                option_id: option.id.clone().into(),
-                is_header: false,
-                name: value.name.into(),
-                description: value.description.unwrap_or_default().into(),
-                value: value.value.into(),
+            items.push(DropdownEntry {
                 is_current,
+                id: option.id.clone().into(),
+                label: value.name.into(),
+                value: value.value.into(),
+                is_header: false,
             });
         }
     }

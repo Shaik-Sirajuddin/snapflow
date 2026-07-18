@@ -1,12 +1,13 @@
 import { Theme } from "tokens/theme.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
 import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
 import { SettingsPage } from "pages/settings/settings_page.slint";
+import { TextUtil } from "base/text_util.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, Theme }
+export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, TextUtil, Theme }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -79,9 +80,9 @@ export component ChatPanel inherits Window {
     // comment on these properties; passed straight through to `ChatArea`
     // below (this root component owns no mode/config state of its own,
     // same "just plumbing" role it plays for every other ChatArea prop).
-    in property <[ModeOption]> available-modes: [];
-    in property <string> current-mode-id: "";
-    in property <[ConfigOptionRow]> config-option-rows: [];
+    in property <[DropdownEntry]> mode-dropdown-entries: [];
+    in property <[DropdownEntry]> config-dropdown-entries: [];
+    in property <string> mode-trigger-label: "";
     // Set by Rust whenever `expand-terminal` fires (looked up from
     // `terminals` at that moment, since Slint has no `for`-as-expression
     // find/filter construct) -- an empty `terminal-id` means no overlay
@@ -184,9 +185,9 @@ export component ChatPanel inherits Window {
             local-terminal-key-input(text) => { local-terminal-key-input(text); }
             local-terminal-expand-requested => { local-terminal-overlay-open = true; }
             local-terminal-close-requested => { local-terminal-close-requested(); }
-            available-modes: available-modes;
-            current-mode-id: current-mode-id;
-            config-option-rows: config-option-rows;
+            mode-dropdown-entries: mode-dropdown-entries;
+            config-dropdown-entries: config-dropdown-entries;
+            mode-trigger-label: mode-trigger-label;
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
         }

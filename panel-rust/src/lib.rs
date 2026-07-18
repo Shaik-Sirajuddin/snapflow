@@ -459,15 +459,14 @@ impl PanelSingleton {
     fn refresh_capabilities_for(&self, real_idx: usize) {
         let Some(bridge) = &self.bridge else { return };
         let modes = bridge.session_modes(real_idx);
-        let current_mode_id = modes
-            .as_ref()
-            .map(|m| m.current_mode_id.clone())
-            .unwrap_or_default();
         self.component
-            .set_available_modes(models::to_mode_options(modes));
-        self.component.set_current_mode_id(current_mode_id.into());
+            .set_mode_trigger_label(models::current_mode_name(&modes).into());
         self.component
-            .set_config_option_rows(models::to_config_option_rows(bridge.config_options(real_idx)));
+            .set_mode_dropdown_entries(models::to_mode_dropdown_entries(modes));
+        self.component
+            .set_config_dropdown_entries(models::to_config_dropdown_entries(
+                bridge.config_options(real_idx),
+            ));
     }
 
     /// Rebuilds the `pending-request` property for `real_idx` from the
@@ -775,6 +774,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
+        component
+            .global::<TextUtil>()
+            .on_contains_ci(|haystack, needle| {
+                haystack.to_lowercase().contains(&needle.to_lowercase())
+            });
         component.set_compact(width < 320);
         component.set_narrow(width < 220);
         window.window().request_redraw();

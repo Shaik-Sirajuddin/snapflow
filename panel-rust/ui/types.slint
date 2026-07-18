@@ -193,3 +193,19 @@ export struct LocalTerminalItem {
     cursor-col: int,
     has-exited: bool,
 }
+
+// Domain-neutral option row for `base/searchable_dropdown.slint` -- kept
+// out of the chat-specific structs above so the base primitive depends on
+// no domain type. Callers (the compose bar's mode/model selectors, later
+// the slash-command popup) build these from their own source data (Rust
+// `models::to_*_dropdown_entries`). A row with `is-header: true` renders
+// as a non-selectable section label; `value` is the opaque payload handed
+// back to the selection callback alongside `id` (e.g. a config option's
+// `session/set_config_option` value; empty for a plain mode row).
+export struct DropdownEntry {
+    id: string,
+    label: string,
+    value: string,
+    is-header: bool,
+    is-current: bool,
+}
