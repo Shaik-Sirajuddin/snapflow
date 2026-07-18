@@ -1,0 +1,35 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+
+// Layer 3 (base) -- the repeated "bordered box + inset TextInput" pattern
+// hand-rolled at every free-text input site across the settings page
+// (MCP server name/command, agent default-profile/permission-profile) --
+// same background/border/radius, same left-inset TextInput. Extracted so
+// every call site shares one definition instead of repeating the shape.
+// Inset uses `Metrics.pad-md` (bumped up from `pad-sm`, the semantic
+// alias for the `6px` every call site originally hardcoded -- felt too
+// tight for a real bordered input box once extracted).
+export component TextField inherits Rectangle {
+    in-out property <string> text: "";
+    in property <string> field-accessible-label: "";
+    in property <length> field-font-size: 11px;
+    callback edited();
+
+    height: 26px;
+    background: Theme.bg-sidebar;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-sm;
+
+    TextInput {
+        accessible-label: root.field-accessible-label;
+        accessible-action-default => { self.focus(); }
+        text <=> root.text;
+        color: Theme.text-primary;
+        font-size: root.field-font-size * Theme.font-scale;
+        x: Metrics.pad-md;
+        width: parent.width - 2 * Metrics.pad-md;
+        vertical-alignment: center;
+        edited => { root.edited(); }
+    }
+}

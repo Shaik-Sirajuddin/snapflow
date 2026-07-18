@@ -56,11 +56,13 @@ export component SettingsRowGroup inherits VerticalLayout {
 
 // A caption above its own control (text field, chip row, etc.) -- the
 // same silhouette as `labeled_select.slint`, but the control is
-// caller-supplied via `@children` instead of a fixed `Select`. Tight
-// caption-to-control gap so the label binds to its field.
+// caller-supplied via `@children` instead of a fixed `Select`.
+// `gap-sm` caption-to-control gap -- was `space-1` (2px), too tight once
+// used for a real bordered input box (vs. `labeled_select.slint`'s
+// tighter caption-to-Select gap, which stays as-is by design).
 export component SettingsField inherits VerticalLayout {
     in property <string> label;
-    spacing: Metrics.space-1;
+    spacing: Metrics.gap-sm;
     Text {
         text: root.label;
         color: Theme.text-secondary;

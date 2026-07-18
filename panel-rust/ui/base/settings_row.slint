@@ -73,7 +73,11 @@ export component SettingsRow inherits Rectangle {
         HorizontalLayout {
             horizontal-stretch: 0;
             alignment: end;
-            spacing: Metrics.space-2;
+            // `gap-md`, up from `gap-sm` -- MCP server rows in particular
+            // pack several trailing items (status line, Connect, Tools
+            // count, enable Toggle, Remove) and read as too cramped at
+            // the tighter gap.
+            spacing: Metrics.gap-md;
             @children
         }
     }

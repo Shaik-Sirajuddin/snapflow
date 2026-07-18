@@ -45,7 +45,7 @@ export component Toggle inherits Rectangle {
         border-radius: self.height / 2;
         background: root.checked ? Theme.text-on-primary : Theme.text-muted;
         y: (parent.height - self.height) / 2;
-        x: root.checked ? parent.width - self.width - 2px : 2px;
+        x: root.checked ? parent.width - self.width - Metrics.space-1 : Metrics.space-1;
         animate x, background { duration: 100ms; }
     }
 }

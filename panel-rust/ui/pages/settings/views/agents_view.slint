@@ -1,6 +1,7 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Button } from "../../../base/button.slint";
+import { TextField } from "../../../base/text_field.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider } from "../../../base/settings_section.slint";
 import { SettingsSearchBar } from "../components/search_bar.slint";
@@ -69,22 +70,10 @@ export component AgentsView inherits Rectangle {
         SettingsField {
             width: parent.width;
             label: "Profile";
-            Rectangle {
-                height: 26px;
-                background: Theme.bg-sidebar;
-                border-width: 1px;
-                border-color: Theme.border-default;
-                border-radius: Theme.radius-sm;
-                TextInput {
-                    accessible-label: "Default profile";
-                    accessible-action-default => { self.focus(); }
-                    text <=> root.default-profile;
-                    color: Theme.text-primary;
-                    font-size: 12px * Theme.font-scale;
-                    x: 6px;
-                    width: parent.width - 12px;
-                    vertical-alignment: center;
-                }
+            TextField {
+                text <=> root.default-profile;
+                field-accessible-label: "Default profile";
+                field-font-size: 12px;
             }
         }
 
@@ -105,13 +94,13 @@ export component AgentsView inherits Rectangle {
                     // accessible-element geometry (see the original of
                     // this row, `components/settings_sheet.slint`, for the
                     // bisection that found this).
-                    width: profile-chip-label.preferred-width + 16px
-                        + 2px
+                    width: profile-chip-label.preferred-width + Metrics.pad-lg
+                        + Metrics.space-1
                         + (root.profile-pending-delete == profile.name ? 114px : 20px);
                     HorizontalLayout {
-                        spacing: 2px;
+                        spacing: Metrics.space-1;
                         Rectangle {
-                            width: profile-chip-label.preferred-width + 16px;
+                            width: profile-chip-label.preferred-width + Metrics.pad-lg;
                             height: 24px;
                             background: profile.name == root.default-profile ? Theme.bg-primary : Theme.bg-sidebar;
                             border-color: Theme.border-default;
@@ -144,7 +133,7 @@ export component AgentsView inherits Rectangle {
                             clicked => { root.profile-pending-delete = profile.name; }
                         }
                         if root.profile-pending-delete == profile.name : HorizontalLayout {
-                            spacing: 2px;
+                            spacing: Metrics.space-1;
                             Button {
                                 label: "Confirm";
                                 button-accessible-label: "Confirm delete profile " + profile.name;
@@ -267,22 +256,10 @@ export component AgentsView inherits Rectangle {
         SettingsField {
             width: parent.width;
             label: "Permission profile";
-            Rectangle {
-                height: 26px;
-                background: Theme.bg-sidebar;
-                border-width: 1px;
-                border-color: Theme.border-default;
-                border-radius: Theme.radius-sm;
-                TextInput {
-                    accessible-label: "Permission profile";
-                    accessible-action-default => { self.focus(); }
-                    text <=> root.permission-profile;
-                    color: Theme.text-primary;
-                    font-size: 12px * Theme.font-scale;
-                    x: 6px;
-                    width: parent.width - 12px;
-                    vertical-alignment: center;
-                }
+            TextField {
+                text <=> root.permission-profile;
+                field-accessible-label: "Permission profile";
+                field-font-size: 12px;
             }
         }
 
