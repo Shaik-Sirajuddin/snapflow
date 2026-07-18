@@ -1,6 +1,7 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
+import { IconButton } from "../../../base/icon_button.slint";
 
 // A user message still in the send queue -- chat-items-redesign.md #2.
 // Tertiary background (same role as `UserBubble`, since a queued message
@@ -39,45 +40,33 @@ export component QueuedMessageBar inherits Rectangle {
             preferred-width: 0px;
             min-width: 0px;
         }
-        if can-edit && !sending : Rectangle {
-            width: 18px;
-            height: 18px;
-            edit-touch := TouchArea {
-                accessible-role: button;
-                accessible-label: "Edit queued message";
-                accessible-action-default => { edit-requested(); }
-                clicked => { edit-requested(); }
-            }
+        if can-edit && !sending : IconButton {
+            btn-width: 18px;
+            btn-height: 18px;
+            button-accessible-label: "Edit queued message";
+            clicked => { edit-requested(); }
             Icon {
                 source: @image-url("../../../assets/icons/pencil.svg");
                 size: 13px;
                 color: Theme.text-secondary;
             }
         }
-        if sending : Rectangle {
-            width: 18px;
-            height: 18px;
-            stop-touch := TouchArea {
-                accessible-role: button;
-                accessible-label: "Stop sending";
-                accessible-action-default => { stop-requested(); }
-                clicked => { stop-requested(); }
-            }
+        if sending : IconButton {
+            btn-width: 18px;
+            btn-height: 18px;
+            button-accessible-label: "Stop sending";
+            clicked => { stop-requested(); }
             Icon {
                 source: @image-url("../../../assets/icons/x.svg");
                 size: 13px;
                 color: Theme.text-secondary;
             }
         }
-        if !sending : Rectangle {
-            width: 18px;
-            height: 18px;
-            cancel-touch := TouchArea {
-                accessible-role: button;
-                accessible-label: "Cancel queued message";
-                accessible-action-default => { cancel-requested(); }
-                clicked => { cancel-requested(); }
-            }
+        if !sending : IconButton {
+            btn-width: 18px;
+            btn-height: 18px;
+            button-accessible-label: "Cancel queued message";
+            clicked => { cancel-requested(); }
             Icon {
                 source: @image-url("../../../assets/icons/x.svg");
                 size: 13px;

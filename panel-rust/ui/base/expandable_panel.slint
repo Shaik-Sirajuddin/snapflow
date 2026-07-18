@@ -18,21 +18,36 @@ export component ExpandablePanel {
     VerticalLayout {
         spacing: Metrics.space-2;
         Flickable {
-            height: expanded ? self.preferred-height : min(self.preferred-height, collapsed-max-height);
+            // A bare `Flickable { @children }` doesn't reliably report its
+            // own `preferred-height` from arbitrary child content (it's a
+            // scroll viewport, not a layout) -- wrapping `@children` in a
+            // named `VerticalLayout` gives a real preferred-height to
+            // measure against, same fix `ToolEventRow`'s own inline text
+            // Flickable already relies on (binding off a named child
+            // instead of `self`).
+            height: expanded ? content-wrapper.preferred-height : min(content-wrapper.preferred-height, collapsed-max-height);
+            viewport-height: content-wrapper.preferred-height;
             animate height { duration: 150ms; easing: ease-in-out; }
-            @children
-        }
-        expand-toggle := TouchArea {
-            height: 18px;
-            accessible-role: button;
-            accessible-label: expanded ? "Collapse view" : "Open full view";
-            accessible-action-default => {
-                expanded = !expanded;
-                toggled(expanded);
+            content-wrapper := VerticalLayout {
+                @children
             }
-            clicked => {
-                expanded = !expanded;
-                toggled(expanded);
+        }
+        Rectangle {
+            height: 18px;
+            background: expand-toggle.has-hover ? Theme.bg-primary-container : transparent;
+            animate background { duration: 100ms; }
+            expand-toggle := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: expanded ? "Collapse view" : "Open full view";
+                accessible-action-default => {
+                    expanded = !expanded;
+                    toggled(expanded);
+                }
+                clicked => {
+                    expanded = !expanded;
+                    toggled(expanded);
+                }
             }
             Text {
                 text: expanded ? "Show less" : "Open full view";

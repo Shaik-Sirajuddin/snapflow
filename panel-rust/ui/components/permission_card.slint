@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { PendingRequestItem } from "../types.slint";
 
@@ -22,10 +23,10 @@ export component PermissionCard inherits Rectangle {
     border-radius: Theme.radius-md;
 
     VerticalLayout {
-        padding: 10px;
-        spacing: 6px;
+        padding: Metrics.space-5;
+        spacing: Metrics.space-3;
         HorizontalLayout {
-            spacing: 6px;
+            spacing: Metrics.space-3;
             Text {
                 text: "\u{26A0}"; // warning-triangle glyph, stand-in for a permission-shield icon
                 color: Theme.bg-primary;
@@ -61,7 +62,7 @@ export component PermissionCard inherits Rectangle {
             overflow: elide;
         }
         if item.supported : HorizontalLayout {
-            spacing: 8px;
+            spacing: Metrics.space-4;
             Rectangle { }
             Button {
                 label: "Reject";

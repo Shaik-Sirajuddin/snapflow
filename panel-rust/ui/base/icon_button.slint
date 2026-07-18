@@ -11,12 +11,17 @@ export component IconButton inherits Rectangle {
     in property <string> button-accessible-label;
     in property <length> btn-width: 24px;
     in property <length> btn-height: 24px;
+    // Sticky "on" state (e.g. a toggle whose panel is currently open) --
+    // renders the same tint as `has-hover` even while the pointer isn't
+    // over the button, so a caller can show both states with the one
+    // primitive instead of re-deriving the hover tint itself.
+    in property <bool> active: false;
     callback clicked();
 
     width: btn-width;
     height: btn-height;
     border-radius: Theme.radius-sm;
-    background: touch.has-hover ? Theme.bg-primary-container : transparent;
+    background: (active || touch.has-hover) ? Theme.bg-primary-container : transparent;
     animate background { duration: 100ms; }
 
     touch := TouchArea {

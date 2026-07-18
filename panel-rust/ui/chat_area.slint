@@ -1,6 +1,7 @@
 import { Theme } from "./tokens/theme.slint";
 import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
+import { IconButton } from "./base/icon_button.slint";
 import { MessageItem, PendingRequestItem, TerminalItem, ModeOption, ConfigOptionRow, LocalTerminalItem } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -147,10 +148,10 @@ export component ChatArea inherits Rectangle {
                     border-width: 1px;
                     border-radius: Theme.radius-sm;
                     HorizontalLayout {
-                        padding-left: 6px;
-                        padding-right: 6px;
-                        padding-top: 2px;
-                        padding-bottom: 2px;
+                        padding-left: Metrics.space-3;
+                        padding-right: Metrics.space-3;
+                        padding-top: Metrics.space-1;
+                        padding-bottom: Metrics.space-1;
                         Text {
                             text: agent-badge;
                             color: Theme.text-primary;
@@ -199,17 +200,9 @@ export component ChatArea inherits Rectangle {
                         overflow: elide;
                     }
                 }
-                if narrow : Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: Theme.radius-sm;
-                    background: Theme.bg-canvas;
-                    narrow-new-thread := TouchArea {
-                        accessible-role: button;
-                        accessible-label: "New thread";
-                        accessible-action-default => { new-thread-requested(); }
-                        clicked => { new-thread-requested(); }
-                    }
+                if narrow : IconButton {
+                    button-accessible-label: "New thread";
+                    clicked => { new-thread-requested(); }
                     Text {
                         text: "+";
                         color: Theme.bg-primary;
@@ -219,17 +212,10 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
-                Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: Theme.radius-sm;
-                    background: local-terminal.open ? Theme.bg-primary-container : Theme.bg-canvas;
-                    local-terminal-toggle := TouchArea {
-                        accessible-role: button;
-                        accessible-label: "Toggle local terminal";
-                        accessible-action-default => { local-terminal-toggle-requested(); }
-                        clicked => { local-terminal-toggle-requested(); }
-                    }
+                IconButton {
+                    active: local-terminal.open;
+                    button-accessible-label: "Toggle local terminal";
+                    clicked => { local-terminal-toggle-requested(); }
                     Text {
                         text: "\u{2318}"; // same terminal glyph stand-in as TerminalCard
                         color: local-terminal.open ? Theme.bg-primary : Theme.text-secondary;
@@ -238,17 +224,9 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
-                Rectangle {
-                    width: 24px;
-                    height: 24px;
-                    border-radius: Theme.radius-sm;
-                    background: Theme.bg-canvas;
-                    settings-button := TouchArea {
-                        accessible-role: button;
-                        accessible-label: "Open chat settings";
-                        accessible-action-default => { settings-requested(); }
-                        clicked => { settings-requested(); }
-                    }
+                IconButton {
+                    button-accessible-label: "Open chat settings";
+                    clicked => { settings-requested(); }
                     Text {
                         text: "\u{2699}";
                         color: Theme.text-secondary;
@@ -283,17 +261,21 @@ export component ChatArea inherits Rectangle {
             mode-chip-row := HorizontalLayout {
                 padding-left: compact ? 6px : 12px;
                 padding-right: compact ? 6px : 12px;
-                padding-top: 2px;
-                padding-bottom: 2px;
-                spacing: 6px;
+                padding-top: Metrics.space-1;
+                padding-bottom: Metrics.space-1;
+                spacing: Metrics.space-3;
                 for mode in available-modes : Rectangle {
                     width: mode-chip-label.preferred-width + 14px;
                     height: 20px;
-                    background: mode.id == current-mode-id ? Theme.bg-primary : Theme.bg-canvas;
+                    background: mode.id == current-mode-id ? Theme.bg-primary
+                        : mode-option.has-hover ? Theme.bg-primary-container
+                        : Theme.bg-canvas;
+                    animate background { duration: 100ms; }
                     border-color: Theme.border-default;
                     border-width: 1px;
                     border-radius: Theme.radius-sm;
                     mode-option := TouchArea {
+                        mouse-cursor: pointer;
                         accessible-role: button;
                         accessible-label: "Select mode " + mode.name;
                         accessible-action-default => { mode-selected(mode.id); }
@@ -316,9 +298,9 @@ export component ChatArea inherits Rectangle {
             config-chip-row := HorizontalLayout {
                 padding-left: compact ? 6px : 12px;
                 padding-right: compact ? 6px : 12px;
-                padding-top: 2px;
-                padding-bottom: 2px;
-                spacing: 6px;
+                padding-top: Metrics.space-1;
+                padding-bottom: Metrics.space-1;
+                spacing: Metrics.space-3;
                 for row in config-option-rows : Rectangle {
                     width: row.is-header
                         ? config-row-label.preferred-width + 6px
@@ -326,11 +308,16 @@ export component ChatArea inherits Rectangle {
                     height: 20px;
                     background: row.is-header
                         ? transparent
-                        : (row.is-current ? Theme.bg-primary : Theme.bg-canvas);
+                        : (row.is-current ? Theme.bg-primary
+                            : config-option.has-hover ? Theme.bg-primary-container
+                            : Theme.bg-canvas);
+                    animate background { duration: 100ms; }
                     border-color: row.is-header ? transparent : Theme.border-default;
                     border-width: row.is-header ? 0px : 1px;
                     border-radius: Theme.radius-sm;
-                    if !row.is-header : config-option := TouchArea {
+                    config-option := TouchArea {
+                        enabled: !row.is-header;
+                        mouse-cursor: row.is-header ? default : pointer;
                         accessible-role: button;
                         accessible-label: "Select " + row.name;
                         accessible-action-default => {
@@ -379,8 +366,10 @@ export component ChatArea inherits Rectangle {
                 if has-older-messages : Rectangle {
                     height: 22px;
                     border-radius: Theme.radius-sm;
-                    background: Theme.bg-sidebar;
+                    background: load-older-button.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
+                    animate background { duration: 100ms; }
                     load-older-button := TouchArea {
+                        mouse-cursor: loading-older-messages ? default : pointer;
                         accessible-role: button;
                         accessible-label: "Load older messages";
                         enabled: !loading-older-messages;
@@ -441,6 +430,15 @@ export component ChatArea inherits Rectangle {
                         kind: msg.kind;
                         text: msg.text;
                         cap-height: root.height * 0.3;
+                        // chat-items-remaining-wiring.md #4: execution-view
+                        // content (terminal/api-call) click-to-open state,
+                        // same `expanded`/`index` round-trip `MessageCard`
+                        // already uses for its own log body.
+                        raw-input: msg.raw-input;
+                        raw-output: msg.raw-output;
+                        expanded: msg.expanded;
+                        index: msg.index;
+                        toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
                     if !is-user && !is-tool-event : card := MessageCard {
                         horizontal-stretch: 1;
@@ -532,13 +530,13 @@ export component ChatArea inherits Rectangle {
             height: compact ? 72px : 78px;
             background: Theme.bg-chat;
             VerticalLayout {
-                padding-left: 10px;
-                padding-right: 10px;
-                padding-top: 8px;
-                padding-bottom: 8px;
+                padding-left: Metrics.space-5;
+                padding-right: Metrics.space-5;
+                padding-top: Metrics.space-4;
+                padding-bottom: Metrics.space-4;
                 spacing: 5px;
                 HorizontalLayout {
-                    spacing: 8px;
+                    spacing: Metrics.space-4;
                     Rectangle {
                         height: 34px;
                         horizontal-stretch: 1;
@@ -596,10 +594,14 @@ export component ChatArea inherits Rectangle {
                     Rectangle {
                         width: compact ? 44px : 116px;
                         height: 26px;
-                        background: sending ? Theme.border-default : Theme.bg-primary;
+                        background: sending ? Theme.border-default
+                            : send-stop-button.has-hover ? Theme.bg-primary.with-alpha(0.85)
+                            : Theme.bg-primary;
+                        animate background { duration: 100ms; }
                         border-radius: Theme.radius-sm;
                         opacity: sending ? 0.7 : 1.0;
                         send-stop-button := TouchArea {
+                            mouse-cursor: pointer;
                             accessible-role: button;
                             accessible-label: sending ? "Stop response" : "Send message";
                             accessible-action-default => {
@@ -615,8 +617,8 @@ export component ChatArea inherits Rectangle {
                         HorizontalLayout {
                             padding-left: compact ? 8px : 14px;
                             padding-right: compact ? 8px : 14px;
-                            padding-top: 4px;
-                            padding-bottom: 4px;
+                            padding-top: Metrics.space-2;
+                            padding-bottom: Metrics.space-2;
                             alignment: center;
                             Text {
                                 text: sending ? "Stop" : compact ? "\u{27A4}" : "Send Command";

@@ -1,5 +1,7 @@
 import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
+import { IconButton } from "../base/icon_button.slint";
 import { LocalTerminalItem } from "../types.slint";
 
 // Client-local PTY terminal view -- companion to `terminal_card.slint`'s
@@ -33,11 +35,14 @@ export component LocalTerminalCard inherits Rectangle {
             accept
         }
         VerticalLayout {
-            padding: 8px;
-            spacing: 4px;
+            padding: Metrics.space-4;
+            spacing: Metrics.space-2;
             Rectangle {
                 height: 18px;
-                TouchArea {
+                background: header-touch.has-hover ? Theme.bg-primary-container : transparent;
+                animate background { duration: 100ms; }
+                header-touch := TouchArea {
+                    mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Focus local terminal";
                     accessible-action-default => {
@@ -48,7 +53,7 @@ export component LocalTerminalCard inherits Rectangle {
                     }
                 }
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: Metrics.space-3;
                     Text {
                         text: "\u{2318}"; // terminal glyph stand-in, same as TerminalCard
                         color: Theme.bg-primary;
@@ -92,11 +97,10 @@ export component LocalTerminalCard inherits Rectangle {
                         fg: Theme.text-secondary;
                         clicked => { close-requested(); }
                     }
-                    local-terminal-expand := TouchArea {
-                        width: 16px;
-                        accessible-role: button;
-                        accessible-label: "Expand local terminal";
-                        accessible-action-default => { expand(); }
+                    local-terminal-expand := IconButton {
+                        btn-width: 16px;
+                        btn-height: 16px;
+                        button-accessible-label: "Expand local terminal";
                         clicked => { expand(); }
                         Text {
                             text: "\u{2922}"; // expand glyph, same as TerminalCard
@@ -151,10 +155,10 @@ export component LocalTerminalOverlay inherits Rectangle {
             accept
         }
         VerticalLayout {
-            padding: 10px;
-            spacing: 8px;
+            padding: Metrics.space-5;
+            spacing: Metrics.space-4;
             HorizontalLayout {
-                spacing: 6px;
+                spacing: Metrics.space-3;
                 Text {
                     text: "local terminal" + (item.has-exited ? " (exited)" : "");
                     color: Theme.text-primary;

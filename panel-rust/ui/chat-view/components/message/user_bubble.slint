@@ -22,7 +22,7 @@ export component UserBubble inherits Rectangle {
     border-bottom-left-radius: Metrics.radius-corner-cut;
 
     content := VerticalLayout {
-        padding: 10px;
+        padding: Metrics.space-5;
         // Same `Flickable` sized to the Text's own `preferred-height`
         // pattern already proven working in `ToolEventRow` -- a bare
         // `VerticalLayout` wrapping a single `Text` was blowing up to
