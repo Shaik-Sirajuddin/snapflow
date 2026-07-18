@@ -802,7 +802,8 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
     }
     // Healthy gateway on default codex port may still serve both providers
     // when snapshotd bundles one acpx-server — reuse if any acpx answers.
-    if provider != "codex" && probe_acpx_gateway(default_port) {
+    // Any acpx on the shared default port (snapshotd single gateway).
+    if provider != "codex" && probe_acpx_gateway_once(default_port, None) {
         return Ok(format!("http://127.0.0.1:{default_port}"));
     }
 
