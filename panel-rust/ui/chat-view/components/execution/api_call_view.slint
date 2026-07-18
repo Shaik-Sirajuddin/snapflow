@@ -1,0 +1,102 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+
+// Execution-view content variant for `tool_use`/`mcp_server_call` rows --
+// chat-items-remaining-wiring.md #4 (chat-items-redesign.md #9). First-cut
+// rendering of the only structured payload ACP actually carries for a
+// tool call: `raw_input`/`raw_output` (already JSON-serialized to a
+// display string on the Rust side -- see `models::to_message_model`;
+// `""` means the backend didn't provide one, same convention `status`
+// already uses). No timing/duration data exists anywhere in the backend
+// yet, so this component doesn't attempt to render any -- see
+// `chat-items-remaining-wiring.md`'s Rust follow-up note for why.
+//
+// Meant to be placed inside `ExpandablePanel` (`base/expandable_panel.
+// slint`) by the caller (`ToolEventRow`), which already provides the
+// capped-height/scroll/expand shell -- this component only lays out its
+// own content, no scrolling/height-capping of its own.
+export component ApiCallView inherits VerticalLayout {
+    in property <string> raw-input;
+    in property <string> raw-output;
+
+    spacing: Metrics.space-2;
+    padding: Metrics.space-2;
+
+    if raw-input != "" : VerticalLayout {
+        spacing: Metrics.space-1;
+        Text {
+            text: "INPUT";
+            font-family: Theme.font-mono;
+            font-size: 9px * Theme.font-scale;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: Theme.text-muted;
+        }
+        Rectangle {
+            background: Theme.bg-terminal;
+            border-color: Theme.border-terminal;
+            border-width: 1px;
+            border-radius: Theme.radius-sm;
+            VerticalLayout {
+                padding: Metrics.space-2;
+                Flickable {
+                    height: input-text.preferred-height;
+                    viewport-height: input-text.preferred-height;
+                    input-text := Text {
+                        text: root.raw-input;
+                        font-family: Theme.font-mono;
+                        font-size: 10px * Theme.font-scale;
+                        color: Theme.text-terminal;
+                        wrap: word-wrap;
+                        horizontal-alignment: left;
+                        vertical-alignment: top;
+                        width: parent.width;
+                    }
+                }
+            }
+        }
+    }
+
+    if raw-output != "" : VerticalLayout {
+        spacing: Metrics.space-1;
+        Text {
+            text: "OUTPUT";
+            font-family: Theme.font-mono;
+            font-size: 9px * Theme.font-scale;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: Theme.text-muted;
+        }
+        Rectangle {
+            background: Theme.bg-terminal;
+            border-color: Theme.border-terminal;
+            border-width: 1px;
+            border-radius: Theme.radius-sm;
+            VerticalLayout {
+                padding: Metrics.space-2;
+                Flickable {
+                    height: output-text.preferred-height;
+                    viewport-height: output-text.preferred-height;
+                    output-text := Text {
+                        text: root.raw-output;
+                        font-family: Theme.font-mono;
+                        font-size: 10px * Theme.font-scale;
+                        color: Theme.text-terminal;
+                        wrap: word-wrap;
+                        horizontal-alignment: left;
+                        vertical-alignment: top;
+                        width: parent.width;
+                    }
+                }
+            }
+        }
+    }
+
+    if raw-input == "" && raw-output == "" : Text {
+        text: "No structured payload available for this call.";
+        font-family: Theme.font-sans;
+        font-size: 10px * Theme.font-scale;
+        font-italic: true;
+        color: Theme.text-muted;
+    }
+}

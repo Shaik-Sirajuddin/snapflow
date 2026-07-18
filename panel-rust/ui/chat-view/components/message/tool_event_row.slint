@@ -1,6 +1,8 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
+import { ExpandablePanel } from "../../../base/expandable_panel.slint";
+import { ApiCallView } from "../execution/api_call_view.slint";
 
 // One tool-taxonomy event row -- chat-items-redesign.md #5/#6. Transparent
 // background (these are inline stream markers, not cards); a dot + an
@@ -17,73 +19,136 @@ export component ToolEventRow inherits Rectangle {
     // becomes internally scrollable instead of eliding to one line.
     in property <length> cap-height: 90px;
 
+    // chat-items-remaining-wiring.md #4 (execution-view content):
+    // `MessageItem::raw-input`/`raw-output`, already JSON-serialized to a
+    // display string Rust-side -- "" when the backend didn't provide one.
+    // Only meaningful for `kind: "tool_use"`/`"mcp_server_call"`; ignored
+    // for the two skill kinds, same as `first-use` above.
+    in property <string> raw-input;
+    in property <string> raw-output;
+    // Same shape `MessageCard` uses for its own log-body collapse state
+    // (`MessageItem::expanded`/`index`, round-tripped through
+    // `toggle-expanded(int)`) -- kept Rust-side so the open/closed state
+    // survives a re-render (e.g. a new streamed message growing the
+    // list), instead of resetting every time this row is rebuilt.
+    in property <bool> expanded;
+    in property <int> index;
+    callback toggle-expanded(int);
+
     background: transparent;
 
     property <bool> is-skill-use: kind == "skill_use";
+    // Execution-view content only applies to the two non-skill kinds --
+    // chat-items-redesign.md #7-#9 never describes a terminal/api-call
+    // view for `skill_load`/`skill_use`.
+    property <bool> has-execution-content: (kind == "tool_use" || kind == "mcp_server_call")
+        && (raw-input != "" || raw-output != "");
 
-    HorizontalLayout {
-        padding: Metrics.space-2;
+    VerticalLayout {
         spacing: Metrics.space-1;
-        VerticalLayout {
-            alignment: start;
-            Rectangle {
-                width: 4px;
-                height: 4px;
-                border-radius: 2px;
-                background: Theme.text-muted;
+
+        HorizontalLayout {
+            padding: Metrics.space-2;
+            spacing: Metrics.space-1;
+            VerticalLayout {
+                alignment: start;
+                Rectangle {
+                    width: 4px;
+                    height: 4px;
+                    border-radius: 2px;
+                    background: Theme.text-muted;
+                }
+            }
+            VerticalLayout {
+                alignment: start;
+                Icon {
+                    source: @image-url("../../../assets/icons/wrench.svg");
+                    visible: kind == "tool_use";
+                    size: Metrics.icon-sm;
+                    color: Theme.text-secondary;
+                }
+            }
+            VerticalLayout {
+                alignment: start;
+                Icon {
+                    source: @image-url("../../../assets/icons/book-open.svg");
+                    visible: kind == "skill_load";
+                    size: Metrics.icon-sm;
+                    color: Theme.text-secondary;
+                }
+            }
+            VerticalLayout {
+                alignment: start;
+                Icon {
+                    source: @image-url("../../../assets/icons/sparkles.svg");
+                    visible: kind == "skill_use";
+                    size: Metrics.icon-sm;
+                    color: Theme.text-secondary;
+                }
+            }
+            VerticalLayout {
+                alignment: start;
+                Icon {
+                    source: @image-url("../../../assets/icons/plug-zap.svg");
+                    visible: kind == "mcp_server_call";
+                    size: Metrics.icon-sm;
+                    color: Theme.text-secondary;
+                }
+            }
+            Flickable {
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                height: min(text-content.preferred-height, root.cap-height);
+                viewport-height: text-content.preferred-height;
+                text-content := Text {
+                    text: root.text;
+                    font-family: Theme.font-sans;
+                    font-size: 11px * Theme.font-scale;
+                    color: is-skill-use && first-use ? Theme.text-accent-bright : Theme.text-tertiary;
+                    horizontal-alignment: left;
+                    vertical-alignment: top;
+                    wrap: word-wrap;
+                    width: parent.width;
+                }
             }
         }
-        VerticalLayout {
-            alignment: start;
-            Icon {
-                source: @image-url("../../../assets/icons/wrench.svg");
-                visible: kind == "tool_use";
-                size: Metrics.icon-sm;
-                color: Theme.text-secondary;
-            }
-        }
-        VerticalLayout {
-            alignment: start;
-            Icon {
-                source: @image-url("../../../assets/icons/book-open.svg");
-                visible: kind == "skill_load";
-                size: Metrics.icon-sm;
-                color: Theme.text-secondary;
-            }
-        }
-        VerticalLayout {
-            alignment: start;
-            Icon {
-                source: @image-url("../../../assets/icons/sparkles.svg");
-                visible: kind == "skill_use";
-                size: Metrics.icon-sm;
-                color: Theme.text-secondary;
-            }
-        }
-        VerticalLayout {
-            alignment: start;
-            Icon {
-                source: @image-url("../../../assets/icons/plug-zap.svg");
-                visible: kind == "mcp_server_call";
-                size: Metrics.icon-sm;
-                color: Theme.text-secondary;
-            }
-        }
-        Flickable {
-            horizontal-stretch: 1;
-            preferred-width: 0px;
-            min-width: 0px;
-            height: min(text-content.preferred-height, root.cap-height);
-            viewport-height: text-content.preferred-height;
-            text-content := Text {
-                text: root.text;
-                font-family: Theme.font-sans;
-                font-size: 11px * Theme.font-scale;
-                color: is-skill-use && first-use ? Theme.text-accent-bright : Theme.text-tertiary;
-                horizontal-alignment: left;
-                vertical-alignment: top;
-                wrap: word-wrap;
-                width: parent.width;
+
+        // Click-to-open wiring for the execution-view content --
+        // chat-items-remaining-wiring.md #4. A plain `Rectangle` (not a
+        // layout) so the `TouchArea` can cover the whole
+        // toggle-row+panel area, same idiom `message_card.slint`'s
+        // tool-call log body uses.
+        if has-execution-content : Rectangle {
+            VerticalLayout {
+                spacing: Metrics.space-1;
+                toggle-area := TouchArea {
+                    height: 16px;
+                    accessible-role: button;
+                    accessible-label: root.expanded ? "Hide call details" : "Show call details";
+                    accessible-action-default => { toggle-expanded(root.index); }
+                    clicked => { toggle-expanded(root.index); }
+                    HorizontalLayout {
+                        padding-left: Metrics.space-2 + Metrics.icon-sm + Metrics.space-2;
+                        Text {
+                            text: root.expanded ? "[-] hide details" : "[+] show details";
+                            font-family: Theme.font-mono;
+                            font-size: 9px * Theme.font-scale;
+                            color: Theme.text-secondary;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                if root.expanded : HorizontalLayout {
+                    padding-left: Metrics.space-2 + Metrics.icon-sm + Metrics.space-2;
+                    ExpandablePanel {
+                        collapsed-max-height: root.cap-height * 2;
+                        ApiCallView {
+                            raw-input: root.raw-input;
+                            raw-output: root.raw-output;
+                        }
+                    }
+                }
             }
         }
     }

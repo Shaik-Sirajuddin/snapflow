@@ -88,6 +88,8 @@ export component DevRoot inherits ChatPanel {
             status: "COMPLETED",
             expanded: true,
             index: 2,
+            raw-input: "{\"pattern\":\"wait_for_upload\",\"path\":\"tests/\"}",
+            raw-output: "tests/support/upload_helpers.rs:42:pub fn wait_for_upload(...)\ntests/e2e/upload_flow.rs:18:    wait_for_upload(&client, id).await;",
         },
         {
             kind: "agent",
@@ -170,8 +172,10 @@ export component DevRoot inherits ChatPanel {
             kind: "mcp_server_call",
             text: "mcp__claude-in-chrome__tabs_context_mcp",
             status: "COMPLETED",
-            expanded: false,
+            expanded: true,
             index: 14,
+            raw-input: "{}",
+            raw-output: "{\"tabs\":[{\"id\":7,\"title\":\"GitHub PR #142\",\"active\":true}]}",
         },
         {
             kind: "tool_use",

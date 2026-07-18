@@ -1,0 +1,82 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+
+// Execution-view content variant for a terminal-style tool call --
+// chat-items-remaining-wiring.md #4 (chat-items-redesign.md #8). Renders
+// a shell-style command line plus its output in a monospace terminal
+// block, same visual language as `ApiCallView`'s INPUT/OUTPUT blocks and
+// `message_card.slint`'s old tool-call log body.
+//
+// NOT WIRED YET: this component has no live data source. Per
+// `chat-items-remaining-wiring.md`'s #4, `ToolCallContent::Terminal`
+// (the ACP variant that would carry a real command/output pair) isn't
+// threaded through `classify_raw_update`/`conversation.rs` at all --
+// that variant's exact wire shape hasn't even been confirmed yet, and
+// `raw_input`/`raw_output` (the only payload this crate currently
+// extracts) aren't reliably a command/output pair for arbitrary
+// `tool_use` calls, so `ToolEventRow` can't safely tell "this is a
+// terminal call" from "this is some other tool_use call" today. Left as
+// a ready-to-wire component (generic `command`/`output`/`exit-code`
+// properties, not tied to any particular Rust struct) for whenever that
+// Rust-side classification lands, rather than guessing a heuristic here.
+export component TerminalView inherits VerticalLayout {
+    in property <string> command;
+    in property <string> output;
+    // -1 means "unknown/still running" -- no exit code to show yet.
+    in property <int> exit-code: -1;
+
+    spacing: Metrics.space-2;
+    padding: Metrics.space-2;
+
+    if command != "" : HorizontalLayout {
+        spacing: Metrics.space-1;
+        Text {
+            text: "$";
+            font-family: Theme.font-mono;
+            font-size: 10px * Theme.font-scale;
+            font-weight: 700;
+            color: Theme.text-muted;
+        }
+        Text {
+            text: root.command;
+            font-family: Theme.font-mono;
+            font-size: 10px * Theme.font-scale;
+            color: Theme.text-primary;
+            wrap: word-wrap;
+            horizontal-alignment: left;
+            horizontal-stretch: 1;
+        }
+    }
+
+    Rectangle {
+        background: Theme.bg-terminal;
+        border-color: Theme.border-terminal;
+        border-width: 1px;
+        border-radius: Theme.radius-sm;
+        visible: root.output != "";
+        VerticalLayout {
+            padding: Metrics.space-2;
+            Flickable {
+                height: output-text.preferred-height;
+                viewport-height: output-text.preferred-height;
+                output-text := Text {
+                    text: root.output;
+                    font-family: Theme.font-mono;
+                    font-size: 10px * Theme.font-scale;
+                    color: Theme.text-terminal;
+                    wrap: word-wrap;
+                    horizontal-alignment: left;
+                    vertical-alignment: top;
+                    width: parent.width;
+                }
+            }
+        }
+    }
+
+    if exit-code >= 0 : Text {
+        text: "exit code " + exit-code;
+        font-family: Theme.font-mono;
+        font-size: 9px * Theme.font-scale;
+        color: exit-code == 0 ? Theme.text-muted : Theme.text-primary;
+    }
+}

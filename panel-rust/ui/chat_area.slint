@@ -441,6 +441,15 @@ export component ChatArea inherits Rectangle {
                         kind: msg.kind;
                         text: msg.text;
                         cap-height: root.height * 0.3;
+                        // chat-items-remaining-wiring.md #4: execution-view
+                        // content (terminal/api-call) click-to-open state,
+                        // same `expanded`/`index` round-trip `MessageCard`
+                        // already uses for its own log body.
+                        raw-input: msg.raw-input;
+                        raw-output: msg.raw-output;
+                        expanded: msg.expanded;
+                        index: msg.index;
+                        toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
                     if !is-user && !is-tool-event : card := MessageCard {
                         horizontal-stretch: 1;
