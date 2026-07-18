@@ -203,6 +203,9 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         index: 0,
         raw_input: "".into(),
         raw_output: "".into(),
+        queued: false,
+        can_edit: false,
+        sending: false,
     }])));
     assert!(
         panel.get_compose_has_focus(),

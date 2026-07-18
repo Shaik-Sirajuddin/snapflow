@@ -54,6 +54,19 @@ export struct MessageItem {
     // already uses for its own optional field.
     raw-input: string,
     raw-output: string,
+    // chat-items-remaining-wiring.md #5 (queued-message send-state): a
+    // user message still in the per-thread send queue rather than
+    // dispatched -- routed to `QueuedMessageBar` instead of `UserBubble`.
+    // `can-edit` is true only for the most-recent queued entry (the spec's
+    // edit rule, resolved caller-side against queue order); `sending` is
+    // true while its dispatch is actually in flight. All three default
+    // false, i.e. an ordinary already-sent transcript message. The Rust
+    // send-queue that drives these true is a separate, still-undecided
+    // behavioral pass (the plan flags the queue/cancel/edit/stop semantics
+    // as a design decision) -- this struct addition is the schema only.
+    queued: bool,
+    can-edit: bool,
+    sending: bool,
 }
 
 // Interactive-relay addition: one pending agent-initiated request

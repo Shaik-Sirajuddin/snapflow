@@ -131,6 +131,11 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                 .unwrap_or_default()
                 .into(),
             text: m.text.into(),
+            // Send-queue state is not modelled by the raw `ChatMessage`
+            // feed -- a message reaching here has already been dispatched.
+            queued: false,
+            can_edit: false,
+            sending: false,
         })
         .collect();
     ModelRc::new(VecModel::from(items))
@@ -190,6 +195,11 @@ pub fn to_message_model_from_transcript(
                 index,
                 raw_input: String::new().into(),
                 raw_output: String::new().into(),
+                // Transcript items are always already-dispatched; the send
+                // queue lives outside the merged transcript view.
+                queued: false,
+                can_edit: false,
+                sending: false,
             };
             index += 1;
             Some(row)
