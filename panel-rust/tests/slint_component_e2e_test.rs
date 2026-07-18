@@ -746,6 +746,8 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         background: false,
         description: "".into(),
         closed: false,
+        provider: "".into(),
+        model: "".into(),
     }])));
 
     let closed_index = Rc::new(Cell::new(-1i32));
@@ -826,6 +828,8 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         background: false,
         description: "".into(),
         closed: true,
+        provider: "".into(),
+        model: "".into(),
     }])));
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")

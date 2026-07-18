@@ -20,6 +20,13 @@ export struct ThreadItem {
     // `"closed"` and swaps the sidebar row's close control for a
     // delete control. Never set implicitly by window/process teardown.
     closed: bool,
+    // layout-redesign.md Phase 8: the thread's real provider (persisted
+    // `AgentBridge::thread_provider`) and active model (the `"model"`
+    // config option's current value, the same `configOptions[]` feed the
+    // compose bar's model selector reads). Either is "" when unknown --
+    // the sidebar row shows the model label only when non-empty.
+    provider: string,
+    model: string,
 }
 
 export struct MessageItem {

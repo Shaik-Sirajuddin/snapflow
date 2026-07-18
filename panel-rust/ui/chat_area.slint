@@ -88,6 +88,16 @@ export component ChatArea inherits Rectangle {
     in property <bool> narrow: false;
     background: Theme.bg-chat;
 
+    // Phase 6 (scroll-position preservation + jump-to-latest): whether the
+    // user is following the newest message. Live updates only snap the
+    // message Flickable back to the bottom while this holds; a user scroll
+    // away flips it off (and reveals the floating jump button), a scroll
+    // back to the bottom flips it on again. Pure UI state, no Rust.
+    property <bool> stick-to-bottom: true;
+    // How far the message Flickable can scroll -- viewport-y ranges from
+    // `-msg-max-scroll` (bottom) to 0 (top).
+    property <length> msg-max-scroll: Math.max(0px, message-scroll.viewport-height - message-scroll.height);
+
     main-layout := VerticalLayout {
         width: parent.width;
         height: parent.height;
@@ -265,25 +275,37 @@ export component ChatArea inherits Rectangle {
             height: 1px;
             background: Theme.border-default;
         }
-        message-scroll := Flickable {
-            // This is the one elastic region in the chat column. It consumes
-            // spare height so the compose surface remains at the bottom.
+        message-area := Rectangle {
+            // The one elastic region in the chat column: the Flickable fills
+            // it and the floating jump-to-latest button overlays its
+            // bottom-right corner.
             vertical-stretch: 1;
             preferred-height: 0px;
             min-height: 0px;
-            // Flickable forwards wheel remainder at a boundary to its parent.
-            // Only a user-originated movement (`flicked`) at its real top
-            // boundary may start paging; programmatic model updates cannot
-            // accidentally request another page.
-            flicked => {
-                if has-older-messages
-                    && !loading-older-messages
-                    && self.viewport-y >= -1px {
-                    loading-older-messages = true;
-                    load-older-requested();
+            message-scroll := Flickable {
+                width: 100%;
+                height: 100%;
+                // Live updates grow `viewport-height`; snap back to the bottom
+                // only while the user is following the latest message, so a
+                // read-back-in-history scroll position is never stolen.
+                changed viewport-height => {
+                    if (root.stick-to-bottom) {
+                        self.viewport-y = -root.msg-max-scroll;
+                    }
                 }
-            }
-            VerticalLayout {
+                // A user scroll updates whether they're following the bottom
+                // and -- only a user-originated movement at the real top
+                // boundary -- may page in older history.
+                flicked => {
+                    root.stick-to-bottom = (self.viewport-y + root.msg-max-scroll) < 8px;
+                    if has-older-messages
+                        && !loading-older-messages
+                        && self.viewport-y >= -1px {
+                        loading-older-messages = true;
+                        load-older-requested();
+                    }
+                }
+                VerticalLayout {
                 padding-left: compact ? Metrics.space-8 : Metrics.space-10;
                 padding-right: compact ? Metrics.space-8 : Metrics.space-10;
                 padding-top: compact ? 6px : 12px;
@@ -374,6 +396,43 @@ export component ChatArea inherits Rectangle {
                         toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
                     Rectangle { width: 0px; }
+                }
+            }
+            }
+            // Floating jump-to-latest button -- shown only while the user has
+            // scrolled away from the bottom. It swaps its down-arrow for the
+            // approval "hand" glyph when a permission request is pending, so a
+            // scrolled-up user still gets a single affordance pointing at the
+            // decision waiting below (the docked PermissionCard).
+            if !root.stick-to-bottom : Rectangle {
+                width: 32px;
+                height: 32px;
+                x: parent.width - self.width - Metrics.space-6;
+                y: parent.height - self.height - Metrics.space-6;
+                border-radius: self.height / 2;
+                background: jump-touch.has-hover ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary;
+                animate background { duration: 100ms; }
+                border-color: Theme.border-strong;
+                border-width: 1px;
+                jump-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: pending-request.active ? "Jump to pending request" : "Jump to latest message";
+                    accessible-action-default => {
+                        root.stick-to-bottom = true;
+                        message-scroll.viewport-y = -root.msg-max-scroll;
+                    }
+                    clicked => {
+                        root.stick-to-bottom = true;
+                        message-scroll.viewport-y = -root.msg-max-scroll;
+                    }
+                }
+                Icon {
+                    source: pending-request.active
+                        ? @image-url("./assets/icons/hand.svg")
+                        : @image-url("./assets/icons/arrow-down.svg");
+                    size: Metrics.icon-sm;
+                    color: Theme.text-on-primary;
                 }
             }
         }
