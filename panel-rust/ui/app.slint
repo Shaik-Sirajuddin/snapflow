@@ -122,6 +122,16 @@ export component ChatPanel inherits Window {
     callback config-option-selected(string, string);
     callback thread-toggle-background(int);
 
+    // Open the settings overlay in Slint itself, then notify the host.
+    // Pure viewers (slint-viewer --auto-reload) have no Rust callback that
+    // can set `settings-open`; only firing the callback left the UI stuck
+    // closed. Hosts that listen still get `settings-requested` for prefs
+    // load / gateway list refresh (and may set open again — harmless).
+    function open-settings() {
+        settings-open = true;
+        settings-requested();
+    }
+
     // layout-redesign.md Phase 5 -- panel-level shortcuts. Also re-run
     // from the compose TextInput (chat_area) so they still fire while the
     // composer owns focus (TextInput swallows keys before this scope).
@@ -167,7 +177,7 @@ export component ChatPanel inherits Window {
             }
             // Ctrl+, -- open settings.
             if (event.text == ",") {
-                settings-requested();
+                root.open-settings();
                 return EventResult.accept;
             }
             // Ctrl+K -- focus thread search (expand rail first if needed).
@@ -220,7 +230,7 @@ export component ChatPanel inherits Window {
                 thread-close-requested(i) => { thread-close-requested(i); }
                 thread-delete-requested(i) => { thread-delete-requested(i); }
                 thread-archive-requested(i) => { thread-archive-requested(i); }
-                settings-requested => { settings-requested(); }
+                settings-requested => { root.open-settings(); }
                 search-changed(q) => { search-changed(q); }
                 toggle-expanded => { sidebar-expanded = !sidebar-expanded; }
             }
@@ -248,7 +258,7 @@ export component ChatPanel inherits Window {
                 compose-text <=> compose-text;
                 send-requested => { send-requested(); }
                 stop-requested => { stop-requested(); }
-                settings-requested => { settings-requested(); }
+                settings-requested => { root.open-settings(); }
                 new-thread-requested => { new-thread-requested(); }
                 toggle-expanded(i) => { toggle-expanded(i); }
                 pending-request: pending-request;
