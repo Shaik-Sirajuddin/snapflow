@@ -26,7 +26,7 @@ pub mod protocol_types;
 mod state_store;
 mod theme;
 
-use agent_bridge::{resolve_cache_dir, AgentBridge};
+use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec};
 use appearance::{AppearanceState, ColorScheme, HostAppearance};
 use models::{build_thread_items, describe_thread, to_message_model_from_transcript, ThreadState};
 use protocol_types::{AgentEvent, ChatMessage, MessageKind};
@@ -35,8 +35,9 @@ use slint::platform::software_renderer::{
 };
 use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{ModelRc, SharedString, VecModel};
-use state_store::{PanelDefaults, PanelStateStore};
+use state_store::{PanelDefaults, PanelStateStore, ThreadRecord};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
 
@@ -84,7 +85,20 @@ fn map_qt_key(qt_key: c_int, text: &str) -> Option<SharedString> {
         return Some(k.into());
     }
     if text.is_empty() {
-        None
+        // QQuickItem receives an empty `QKeyEvent::text()` for some printable
+        // keys when the host also owns a shortcut for that key. Qt still
+        // provides the ASCII `Qt::Key_*` code, so recover that character for
+        // a focused composer instead of letting host shortcuts eat the input.
+        // Shifted/non-ASCII input continues to use Qt's non-empty text path.
+        match u32::try_from(qt_key)
+            .ok()
+            .and_then(char::from_u32)
+            .filter(|ch| ch.is_ascii_graphic() || *ch == ' ')
+        {
+            Some(ch) if ch.is_ascii_uppercase() => Some(ch.to_ascii_lowercase().into()),
+            Some(ch) => Some(ch.into()),
+            None => None,
+        }
     } else {
         Some(SharedString::from(text))
     }
@@ -93,6 +107,15 @@ fn map_qt_key(qt_key: c_int, text: &str) -> Option<SharedString> {
 fn non_empty(value: String) -> Option<String> {
     let value = value.trim().to_owned();
     (!value.is_empty()).then_some(value)
+}
+
+/// Opt-in host-event diagnostics for the real-process harness. Disabled by
+/// default because key text may be sensitive; when enabled, this writes only
+/// to Shotcut's stderr and never changes input routing.
+fn trace_host_input(message: impl std::fmt::Display) {
+    if std::env::var_os("RUI_PANEL_INPUT_TRACE").is_some() {
+        eprintln!("panel-rust input: {message}");
+    }
 }
 
 // Slint UI markup moved to `panel-rust/ui/*.slint` (Phase 1 of
@@ -123,6 +146,14 @@ struct PanelSingleton {
     panel_state: Option<PanelStateStore>,
     appearance: RefCell<AppearanceState>,
     thread_names: RefCell<Vec<String>>,
+    /// Immutable ACPX profile bindings, held alongside the display names so
+    /// a background session attachment can persist a complete `ThreadRecord`
+    /// as soon as its session ID becomes available.
+    thread_profiles: RefCell<Vec<Option<String>>>,
+    thread_permission_profiles: RefCell<Vec<Option<String>>>,
+    /// Host-test trace deduplication for asynchronous attachment readiness.
+    /// This never affects persistence or routing.
+    traced_attachment_threads: RefCell<HashSet<String>>,
     thread_state: RefCell<Vec<ThreadState>>,
     thread_errors: RefCell<Vec<String>>,
     /// Phase 2 (chat-panel-ui-theme-parity.md): current sidebar search
@@ -165,6 +196,77 @@ struct PanelSingleton {
 }
 
 impl PanelSingleton {
+    /// Derives a conservative PTY grid from the actual dock viewport.
+    /// The client terminal remains bounded in its card, but its backend
+    /// process must still receive a real resize whenever the host changes
+    /// the panel geometry.
+    fn local_terminal_dimensions(&self) -> (u16, u16) {
+        let cols = (self.width / 8).clamp(20, 240) as u16;
+        let rows = (self.height / 18).clamp(8, 120) as u16;
+        (cols, rows)
+    }
+
+    fn resize_local_terminals_for_viewport(&self) {
+        let Some(bridge) = &self.bridge else { return };
+        let (cols, rows) = self.local_terminal_dimensions();
+        for idx in 0..self.thread_names.borrow().len() {
+            if bridge.has_local_terminal(idx) {
+                bridge.resize_local_terminal(idx, cols, rows);
+            }
+        }
+    }
+
+    /// Persist thread identity only after the asynchronous ACPX attachment
+    /// has supplied a concrete session ID. Creation deliberately returns
+    /// before that attachment finishes so cached UI can render immediately;
+    /// attempting this work only during creation silently skipped every
+    /// initial record and made the next host process unable to reattach.
+    fn sync_thread_records(&self) {
+        let (Some(store), Some(bridge)) = (&self.panel_state, &self.bridge) else {
+            return;
+        };
+        let names = self.thread_names.borrow();
+        let profiles = self.thread_profiles.borrow();
+        let permission_profiles = self.thread_permission_profiles.borrow();
+        for idx in 0..names.len() {
+            let Some(binding) = bridge.thread_binding(idx) else {
+                continue;
+            };
+            let Some(provider) = bridge.thread_provider(idx) else {
+                continue;
+            };
+            let record = ThreadRecord {
+                thread_id: binding.thread_id,
+                display_name: names[idx].clone(),
+                provider,
+                session_id: binding.session_id,
+                profile_name: profiles.get(idx).cloned().flatten(),
+                permission_profile: permission_profiles.get(idx).cloned().flatten(),
+                background_session: None,
+            };
+            match store.save_thread_record(&record) {
+                Ok(()) => {
+                    if self
+                        .traced_attachment_threads
+                        .borrow_mut()
+                        .insert(record.thread_id.clone())
+                    {
+                        trace_host_input(format_args!(
+                            "attachment ready thread={idx} session={:?}",
+                            record.session_id
+                        ));
+                    }
+                }
+                Err(error) => {
+                    // A record may already have a deliberately immutable
+                    // profile/permission binding. Keep the live session usable
+                    // and leave that durable identity untouched.
+                    eprintln!("panel-rust: failed to persist chat thread binding: {error}");
+                }
+            }
+        }
+    }
+
     /// Rebuilds and pushes the `threads` model from the dynamic thread list +
     /// current `thread_state`, narrowed by `search_query` (Phase 2's
     /// real client-side filter -- see `models::build_thread_items`).
@@ -194,7 +296,42 @@ impl PanelSingleton {
                 }
             })
             .collect();
-        let items = build_thread_items(&*names, &state, &descriptions, &query);
+        let background_sessions: Vec<bool> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let Some(store) = self.panel_state.as_ref() else {
+                    return false;
+                };
+                let Some(thread_id) = self
+                    .bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_binding(idx))
+                    .map(|binding| binding.thread_id)
+                else {
+                    return false;
+                };
+                store.effective_background_session(&thread_id).unwrap_or(false)
+            })
+            .collect();
+        let closed: Vec<bool> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                self.bridge
+                    .as_ref()
+                    .map(|bridge| bridge.thread_closed(idx))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let items = build_thread_items(
+            &*names,
+            &state,
+            &descriptions,
+            &background_sessions,
+            &closed,
+            &query,
+        );
         *self.visible_indices.borrow_mut() = items.iter().map(|i| i.real_index).collect();
         let items: Vec<ThreadItem> = items.into_iter().map(|i| i.item).collect();
         self.component
@@ -224,11 +361,38 @@ impl PanelSingleton {
         // `history` feed -- see `models::to_message_model_from_
         // transcript`'s doc comment.
         let transcript = bridge.transcript(real_idx);
+        // Coverage-matrix "tool stream" host scenario: a compact,
+        // opt-in trace of the *typed reducer transcript*'s own tail
+        // (kind + a truncated text preview per entry), so a host test
+        // can confirm the rendered thought/tool-call/message
+        // discriminator sequence and content without a screenshot --
+        // this is the same Slint model `to_message_model_from_
+        // transcript` below turns into `MessageItem`s, just observed
+        // from the Rust side instead of the render tree.
+        if std::env::var_os("RUI_PANEL_INPUT_TRACE").is_some() {
+            use crate::conversation::TranscriptItem;
+            let tail_start = transcript.len().saturating_sub(3);
+            for (offset, entry) in transcript[tail_start..].iter().enumerate() {
+                let (kind, raw_text) = match entry {
+                    TranscriptItem::User { text, .. } => ("user", text.as_str()),
+                    TranscriptItem::Assistant { text, .. } => ("agent", text.as_str()),
+                    TranscriptItem::Thought { text, .. } => ("thinking", text.as_str()),
+                    TranscriptItem::Tool { title, .. } => ("tool-call", title.as_str()),
+                    TranscriptItem::Terminal { title, .. } => ("terminal", title.as_str()),
+                    TranscriptItem::Notice { text, .. } => ("notice", text.as_str()),
+                };
+                let preview: String = raw_text.chars().take(60).collect();
+                let preview = preview.replace('\n', " ");
+                trace_host_input(format_args!(
+                    "transcript thread={real_idx} index={} kind={kind} text={preview:?}",
+                    tail_start + offset,
+                ));
+            }
+        }
         let expanded = self.expanded.borrow();
         self.component
             .set_messages(to_message_model_from_transcript(transcript, &expanded));
-        // Phase 3 step 2: whether an explicit "Load older messages"
-        // affordance should show at the top of the list.
+        // Phase 3 step 2: whether another predecessor page exists.
         self.component
             .set_has_older_messages(bridge.has_older_page(real_idx));
     }
@@ -266,6 +430,20 @@ impl PanelSingleton {
         self.refresh_terminals_for(real_idx);
         self.refresh_capabilities_for(real_idx);
         self.refresh_local_terminal_for(real_idx);
+        self.refresh_connection_status_for(real_idx);
+    }
+
+    fn refresh_connection_status_for(&self, real_idx: usize) -> bool {
+        let status = self
+            .bridge
+            .as_ref()
+            .map(|bridge| bridge.transport_status(real_idx))
+            .unwrap_or_else(|| "Unavailable".to_owned());
+        let changed = self.component.get_connection_status().as_str() != status;
+        if changed {
+            self.component.set_connection_status(status.into());
+        }
+        changed
     }
 
     /// Rebuilds the `available-modes`/`current-mode-id`/`config-option-
@@ -306,6 +484,16 @@ impl PanelSingleton {
         let item = match pending.first() {
             Some(event) => {
                 let view = permission::to_pending_request_view(event);
+                let size = self.component.window().size();
+                let scale = self.component.window().scale_factor();
+                trace_host_input(format_args!(
+                    "pending request active thread={real_idx} method={} window_size={}x{} scale={scale} compact={} narrow={}",
+                    event.method,
+                    size.width,
+                    size.height,
+                    self.component.get_compact(),
+                    self.component.get_narrow()
+                ));
                 PendingRequestItem {
                     active: true,
                     relay_id: view.relay_id.into(),
@@ -387,6 +575,27 @@ impl PanelSingleton {
             .unwrap_or_default();
         let changed = *self.local_terminal_last_text.borrow() != new_text;
         *self.local_terminal_last_text.borrow_mut() = new_text;
+        if changed {
+            // Coverage-matrix "client PTY" host scenario: a real shell's
+            // own screen buffer changing (not a UI flag flip) is the one
+            // observable signal that a genuine PTY is running -- traces
+            // a tail preview so a host test can confirm it without a
+            // screenshot.
+            let preview: String = self
+                .local_terminal_last_text
+                .borrow()
+                .chars()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let preview = preview.replace('\n', "\\n");
+            trace_host_input(format_args!(
+                "local terminal output thread={real_idx} tail={preview:?}"
+            ));
+        }
         self.component
             .set_local_terminal(models::to_local_terminal_item(snapshot));
         changed
@@ -404,6 +613,10 @@ impl PanelSingleton {
             return;
         };
         let pending = bridge.pending_requests(real_idx);
+        trace_host_input(format_args!(
+            "answer pending request invoked thread={real_idx} approved={approved} pending_count={}",
+            pending.len()
+        ));
         let Some(event) = pending.first() else { return };
         let response = permission::build_response(event, approved);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
@@ -437,13 +650,19 @@ impl PanelSingleton {
                 if let Some(slot) = state.get_mut(idx) {
                     match &ev.event {
                         AgentEvent::Message(_) => {} // status unchanged while streaming
-                        AgentEvent::TurnEnded(_) => {
+                        AgentEvent::TurnEnded(reason) => {
+                            trace_host_input(format_args!(
+                                "turn ended thread={idx} reason={reason:?}"
+                            ));
                             *slot = ThreadState::Idle;
                             if let Some(error) = self.thread_errors.borrow_mut().get_mut(idx) {
                                 error.clear();
                             }
                         }
                         AgentEvent::Error(error) => {
+                            trace_host_input(format_args!(
+                                "bridge error thread={idx} error={error:?}"
+                            ));
                             *slot = ThreadState::Error;
                             if let Some(slot_error) = self.thread_errors.borrow_mut().get_mut(idx) {
                                 *slot_error = error.clone();
@@ -530,6 +749,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 existing.width = width;
                 existing.height = height;
                 existing.component.set_compact(width < 320);
+                existing.component.set_narrow(width < 220);
+                existing.resize_local_terminals_for_viewport();
                 existing.window.window().request_redraw();
             }
             return &SENTINEL as *const PanelHandle as *mut PanelHandle;
@@ -555,6 +776,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             Err(_) => return std::ptr::null_mut(),
         };
         component.set_compact(width < 320);
+        component.set_narrow(width < 220);
         window.window().request_redraw();
 
         // Bridge init failure degrades gracefully rather than aborting
@@ -567,18 +789,6 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // (RUI_ACPX_<PROVIDER>_URL env override, else a local
         // dev-checkout `acpx-server` auto-spawned against
         // RUI_ACP_AGENT_CMD/the dev-checkout rui-mock-agent path).
-        let initial_names: Vec<String> = DEFAULT_THREAD_NAMES
-            .iter()
-            .map(|name| (*name).into())
-            .collect();
-        let initial_name_refs: Vec<&str> = initial_names.iter().map(String::as_str).collect();
-        let (bridge, initial_state) = match AgentBridge::new(&initial_name_refs) {
-            Ok(b) => (Some(b), vec![ThreadState::Idle; initial_names.len()]),
-            Err(e) => {
-                eprintln!("panel-rust: agent bridge unavailable, chat panel is display-only: {e}");
-                (None, vec![ThreadState::Error; initial_names.len()])
-            }
-        };
         let panel_state = {
             let path = resolve_cache_dir().join("panel-state.sqlite3");
             match PanelStateStore::open(path) {
@@ -589,7 +799,59 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
             }
         };
-
+        let restored_records = panel_state
+            .as_ref()
+            .and_then(|store| match store.thread_records() {
+                Ok(records) => Some(records),
+                Err(error) => {
+                    eprintln!("panel-rust: failed to restore chat thread records: {error}");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
+            DEFAULT_THREAD_NAMES
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| ThreadSpec {
+                    display_name: (*name).to_owned(),
+                    provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
+                    session_id: None,
+                    profile_name: None,
+                })
+                .collect()
+        } else {
+            restored_records
+                .iter()
+                .map(|record| ThreadSpec {
+                    display_name: record.display_name.clone(),
+                    provider: record.provider.clone(),
+                    session_id: Some(record.session_id.clone()),
+                    profile_name: record.profile_name.clone(),
+                })
+                .collect()
+        };
+        let initial_names: Vec<String> = initial_specs
+            .iter()
+            .map(|spec| spec.display_name.clone())
+            .collect();
+        let initial_profiles: Vec<Option<String>> = initial_specs
+            .iter()
+            .map(|spec| spec.profile_name.clone())
+            .collect();
+        let initial_permission_profiles: Vec<Option<String>> = restored_records
+            .iter()
+            .map(|record| record.permission_profile.clone())
+            .chain(std::iter::repeat(None))
+            .take(initial_names.len())
+            .collect();
+        let (bridge, initial_state) = match AgentBridge::new_with_thread_specs(&initial_specs) {
+            Ok(b) => (Some(b), vec![ThreadState::Idle; initial_names.len()]),
+            Err(e) => {
+                eprintln!("panel-rust: agent bridge unavailable, chat panel is display-only: {e}");
+                (None, vec![ThreadState::Error; initial_names.len()])
+            }
+        };
         let panel = PanelSingleton {
             window,
             component,
@@ -608,6 +870,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             panel_state,
             appearance: RefCell::new(AppearanceState::default()),
             thread_names: RefCell::new(initial_names),
+            thread_profiles: RefCell::new(initial_profiles),
+            thread_permission_profiles: RefCell::new(initial_permission_profiles),
+            traced_attachment_threads: RefCell::new(HashSet::new()),
             thread_state: RefCell::new(initial_state),
             thread_errors: RefCell::new(Vec::new()),
             search_query: RefCell::new(String::new()),
@@ -628,10 +893,32 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 );
                 panel.component
                     .set_background_default(defaults.background_session);
+                if let Some(selected_thread_id) = defaults.selected_thread_id {
+                    if let Some(real_idx) = panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| {
+                            (0..panel.thread_names.borrow().len()).find(|idx| {
+                                bridge
+                                    .thread_binding(*idx)
+                                    .is_some_and(|binding| binding.thread_id == selected_thread_id)
+                            })
+                        })
+                    {
+                        if let Some(filtered_idx) = panel
+                            .visible_indices
+                            .borrow()
+                            .iter()
+                            .position(|idx| *idx == real_idx)
+                        {
+                            panel.component.set_selected_thread(filtered_idx as i32);
+                        }
+                    }
+                }
             }
         }
-        if !panel.thread_names.borrow().is_empty() {
-            panel.refresh_messages_for(0);
+        if let Some(real_idx) = panel.real_index(panel.component.get_selected_thread() as usize) {
+            panel.refresh_messages_for(real_idx);
         }
 
         let component_weak = panel.component.as_weak();
@@ -646,6 +933,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     let Some(real_idx) = panel.real_index(idx as usize) else {
                         return;
                     };
+                    if let (Some(store), Some(binding)) = (
+                        panel.panel_state.as_ref(),
+                        panel
+                            .bridge
+                            .as_ref()
+                            .and_then(|bridge| bridge.thread_binding(real_idx)),
+                    ) {
+                        if let Err(error) =
+                            store.set_selected_thread_id(Some(&binding.thread_id))
+                        {
+                            eprintln!("panel-rust: failed to persist selected chat thread: {error}");
+                        }
+                    }
                     panel.refresh_messages_for(real_idx);
                 }
             });
@@ -666,9 +966,27 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                             component.set_permission_profile(
                                 defaults.permission_profile.unwrap_or_default().into(),
                             );
-                           component.set_background_default(defaults.background_session);
-                       }
-                   }
+                            component.set_background_default(defaults.background_session);
+                        }
+                        let selected_override = panel
+                            .real_index(component.get_selected_thread() as usize)
+                            .and_then(|idx| {
+                                panel
+                                    .bridge
+                                    .as_ref()
+                                    .and_then(|bridge| bridge.thread_binding(idx))
+                                    .map(|binding| binding.thread_id)
+                            })
+                            .and_then(|thread_id| {
+                                store
+                                    .thread_settings(&thread_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|settings| settings.background_session)
+                            });
+                        component.set_background_override_set(selected_override.is_some());
+                        component.set_background_override(selected_override.unwrap_or(false));
+                    }
                     // Profile-picker addition: populate the chip row
                     // from a real `profiles/list` call against thread
                     // 0's bound gateway -- profiles are gateway-wide
@@ -676,18 +994,34 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     // per-thread), so any bound thread's connection can
                     // answer this; thread 0 always exists once the
                     // fixed v1 thread list has been created.
-                    if let Some(bridge) = &panel.bridge {
-                        component.set_available_profiles(models::to_profile_options(
-                            bridge.list_profiles(0),
+                   if let Some(bridge) = &panel.bridge {
+                       component.set_available_profiles(models::to_profile_options(
+                           bridge.list_profiles(0),
+                       ));
+                       component.set_available_mcp_servers(models::to_mcp_server_options(
+                           bridge.list_mcp_servers(0),
+                       ));
+                       component.set_agent_catalog(models::to_agent_catalog_entries(
+                           bridge.list_agents(0),
+                       ));
+                        // Recovery/import: scoped to the *active* thread's
+                        // own provider (unlike profiles/MCP/agents, which
+                        // are gateway-wide and can be read off any bound
+                        // thread) -- recoverable sessions are inherently
+                        // per-provider, so thread 0's provider would be
+                        // wrong whenever a non-thread-0 row is selected.
+                        let recovery_idx = panel
+                            .real_index(component.get_selected_thread() as usize)
+                            .unwrap_or(0);
+                        let recovery_provider = bridge
+                            .thread_provider(recovery_idx)
+                            .unwrap_or_default();
+                        component.set_recoverable_sessions(models::to_remote_session_options(
+                            bridge.recoverable_sessions(recovery_idx),
+                            &recovery_provider,
                         ));
-                        component.set_available_mcp_servers(models::to_mcp_server_options(
-                            bridge.list_mcp_servers(0),
-                        ));
-                        component.set_agent_catalog(models::to_agent_catalog_entries(
-                            bridge.list_agents(0),
-                        ));
-                    }
-                    component.set_settings_open(true);
+                   }
+                   component.set_settings_open(true);
                 }
             });
         });
@@ -703,13 +1037,44 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         profile_name: non_empty(component.get_default_profile().to_string()),
                         permission_profile: non_empty(component.get_permission_profile().to_string()),
                         background_session: component.get_background_default(),
+                        selected_thread_id: panel
+                            .real_index(component.get_selected_thread() as usize)
+                            .and_then(|idx| {
+                                panel
+                                    .bridge
+                                    .as_ref()
+                                    .and_then(|bridge| bridge.thread_binding(idx))
+                                    .map(|binding| binding.thread_id)
+                            }),
                     };
                     if let Some(store) = panel.panel_state.as_ref() {
                         if let Err(error) = store.save_defaults(&defaults) {
                             eprintln!("panel-rust: failed to save chat defaults: {error}");
                             return;
                         }
+                        if let Some(thread_id) = panel
+                            .real_index(component.get_selected_thread() as usize)
+                            .and_then(|idx| {
+                                panel
+                                    .bridge
+                                    .as_ref()
+                                    .and_then(|bridge| bridge.thread_binding(idx))
+                                    .map(|binding| binding.thread_id)
+                            })
+                        {
+                            let override_value = component
+                                .get_background_override_set()
+                                .then_some(component.get_background_override());
+                            if let Err(error) =
+                                store.set_background_override(&thread_id, override_value)
+                            {
+                                eprintln!(
+                                    "panel-rust: failed to save background-session override: {error}"
+                                );
+                            }
+                        }
                     }
+                    panel.refresh_threads_model();
                     component.set_settings_open(false);
                 }
             });
@@ -770,6 +1135,58 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         });
 
         let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_profile_create(move |name, agent_id, terminal_enabled, fs_enabled| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        let Some(bridge) = &panel.bridge else {
+                            return;
+                        };
+                        let mut entry = serde_json::json!({
+                            "name": name.to_string(),
+                            "allow_terminal_access": terminal_enabled,
+                            "allow_fs_access": fs_enabled,
+                        });
+                        if !agent_id.is_empty() {
+                            entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
+                        }
+                        // Don't optimistically append -- re-list from
+                        // the gateway's own state either way, same
+                        // posture as `on_mcp_server_create` above. A
+                        // failed create still triggers a re-list so the
+                        // sheet reflects reality (e.g. a duplicate name
+                        // the gateway rejected).
+                        bridge.create_profile(0, entry);
+                        component.set_available_profiles(models::to_profile_options(
+                            bridge.list_profiles(0),
+                        ));
+                    }
+                });
+            });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_profile_delete(move |name| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(bridge) = &panel.bridge else {
+                        return;
+                    };
+                    bridge.delete_profile(0, &name);
+                    component.set_available_profiles(models::to_profile_options(
+                        bridge.list_profiles(0),
+                    ));
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
         panel.component.on_agent_install_requested(move |agent_id| {
             let Some(component) = component_weak.upgrade() else {
                 return;
@@ -787,13 +1204,132 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     // is an explicitly open, undecided item (see acpx-
                     // client::ext::registry::install's own doc comment)
                     // -- not addressed by this call site.
-                    bridge.install_agent(0, &agent_id);
-                    component.set_agent_catalog(models::to_agent_catalog_entries(
-                        bridge.list_agents(0),
-                    ));
-                }
+                   bridge.install_agent(0, &agent_id);
+                   component.set_agent_catalog(models::to_agent_catalog_entries(
+                       bridge.list_agents(0),
+                   ));
+               }
+           });
+       });
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_recover_session_attach(move |session_id, provider, title| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    let Some(panel) = slot.as_mut() else {
+                        return;
+                    };
+                    // Recovery/import (Coverage Matrix `session/list`
+                    // row): a brand-new local thread row, bound via
+                    // `session/load` to a pre-existing remote session --
+                    // explicitly never `session/new`. Name derives from
+                    // the backend's own `title` when it has one (real
+                    // ACP metadata), falling back to a short, still-
+                    // unique session-id-derived label otherwise, same
+                    // "always produce a valid slug" posture `on_new_
+                    // thread_requested`'s own `format!("New thread
+                    // {next_number}")` fallback establishes for its own
+                    // case.
+                    let title = title.to_string();
+                    let base_name = if title.trim().is_empty() {
+                        format!(
+                            "Recovered {}",
+                            session_id.chars().take(8).collect::<String>()
+                        )
+                    } else {
+                        title
+                    };
+                    let mut name = base_name.clone();
+                    let mut suffix = 2;
+                    while panel
+                        .thread_names
+                        .borrow()
+                        .iter()
+                        .any(|existing| existing == &name)
+                    {
+                        name = format!("{base_name} ({suffix})");
+                        suffix += 1;
+                    }
+                    let (real_idx, binding, thread_provider) = {
+                        let Some(bridge) = panel.bridge.as_mut() else {
+                            return;
+                        };
+                        let Ok(real_idx) = bridge.add_thread_recovering_session(
+                            &name,
+                            provider.as_str(),
+                            session_id.as_str(),
+                        ) else {
+                            return;
+                        };
+                        (
+                            real_idx,
+                            bridge.thread_binding(real_idx),
+                            bridge.thread_provider(real_idx),
+                        )
+                    };
+                    if let (Some(store), Some(binding), Some(thread_provider)) = (
+                        panel.panel_state.as_ref(),
+                        binding.as_ref(),
+                        thread_provider.as_ref(),
+                    ) {
+                        let record = ThreadRecord {
+                            thread_id: binding.thread_id.clone(),
+                            display_name: name.clone(),
+                            provider: thread_provider.clone(),
+                            session_id: binding.session_id.clone(),
+                            profile_name: None,
+                            permission_profile: None,
+                            background_session: None,
+                        };
+                        if let Err(error) = store.save_thread_record(&record) {
+                            eprintln!(
+                                "panel-rust: failed to persist recovered chat thread: {error}"
+                            );
+                        }
+                    }
+                    panel.thread_names.borrow_mut().push(name);
+                    panel.thread_profiles.borrow_mut().push(None);
+                    panel.thread_permission_profiles.borrow_mut().push(None);
+                    panel.thread_state.borrow_mut().push(ThreadState::Idle);
+                    panel.thread_errors.borrow_mut().push(String::new());
+                    panel.search_query.borrow_mut().clear();
+                    panel.refresh_threads_model();
+                    // The recovered session is now bound locally --
+                    // refresh the sheet's own list so it no longer
+                    // shows as recoverable (matches `recoverable_
+                    // sessions`'s own "already bound" exclusion).
+                    if let Some(bridge) = panel.bridge.as_ref() {
+                        let recovery_provider = bridge.thread_provider(real_idx).unwrap_or_default();
+                        component.set_recoverable_sessions(models::to_remote_session_options(
+                            bridge.recoverable_sessions(real_idx),
+                            &recovery_provider,
+                        ));
+                    }
+                    let filtered_idx = {
+                        let visible_indices = panel.visible_indices.borrow();
+                        visible_indices.iter().position(|idx| *idx == real_idx)
+                    };
+                    if let Some(filtered_idx) = filtered_idx {
+                        component.set_selected_thread(filtered_idx as i32);
+                        if let (Some(store), Some(binding)) = (panel.panel_state.as_ref(), binding)
+                        {
+                            if let Err(error) =
+                                store.set_selected_thread_id(Some(&binding.thread_id))
+                            {
+                                eprintln!(
+                                    "panel-rust: failed to persist selected chat thread: {error}"
+                                );
+                            }
+                        }
+                        panel.refresh_messages_for(real_idx);
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_new_thread_requested(move || {
@@ -807,20 +1343,52 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 let next_number = panel.thread_names.borrow().len() + 1;
                 let name = format!("New thread {next_number}");
-               let Some(bridge) = panel.bridge.as_mut() else {
-                   return;
-               };
                 // Profile-picker addition: a new thread opens with
                 // whichever profile is currently set as the settings
                 // sheet's default (empty means native/unmanaged mode,
                 // matching `add_thread`'s prior always-`None` behavior).
                 let default_profile = component.get_default_profile().to_string();
                 let profile = non_empty(default_profile);
-                let Ok(real_idx) = bridge.add_thread_with_profile(&name, profile.as_deref())
-                else {
-                    return;
+                let (real_idx, binding, provider) = {
+                    let Some(bridge) = panel.bridge.as_mut() else {
+                        return;
+                    };
+                    let Ok(real_idx) = bridge.add_thread_with_profile(&name, profile.as_deref())
+                    else {
+                        return;
+                    };
+                    (
+                        real_idx,
+                        bridge.thread_binding(real_idx),
+                        bridge.thread_provider(real_idx),
+                    )
                 };
+                if let (Some(store), Some(binding), Some(provider)) = (
+                    panel.panel_state.as_ref(),
+                    binding.as_ref(),
+                    provider.as_ref(),
+                ) {
+                    let record = ThreadRecord {
+                        thread_id: binding.thread_id.clone(),
+                        display_name: name.clone(),
+                        provider: provider.clone(),
+                        session_id: binding.session_id.clone(),
+                        profile_name: profile.clone(),
+                        permission_profile: non_empty(
+                            component.get_permission_profile().to_string(),
+                        ),
+                        background_session: None,
+                    };
+                    if let Err(error) = store.save_thread_record(&record) {
+                        eprintln!("panel-rust: failed to persist new chat thread: {error}");
+                    }
+                }
                 panel.thread_names.borrow_mut().push(name);
+                panel.thread_profiles.borrow_mut().push(profile);
+                panel
+                    .thread_permission_profiles
+                    .borrow_mut()
+                    .push(non_empty(component.get_permission_profile().to_string()));
                 panel.thread_state.borrow_mut().push(ThreadState::Idle);
                 panel.thread_errors.borrow_mut().push(String::new());
                 panel.search_query.borrow_mut().clear();
@@ -831,6 +1399,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 if let Some(filtered_idx) = filtered_idx {
                     component.set_selected_thread(filtered_idx as i32);
+                    if let (Some(store), Some(binding)) = (panel.panel_state.as_ref(), binding) {
+                        if let Err(error) =
+                            store.set_selected_thread_id(Some(&binding.thread_id))
+                        {
+                            eprintln!("panel-rust: failed to persist selected chat thread: {error}");
+                        }
+                    }
                     panel.refresh_messages_for(real_idx);
                 }
             });
@@ -844,9 +1419,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             let text = component.get_compose_text().to_string();
             let text = text.trim();
             if text.is_empty() {
+                trace_host_input("send requested with empty composer");
                 return;
             }
             let filtered_idx = component.get_selected_thread() as usize;
+            trace_host_input(format_args!(
+                "send requested selected_thread={filtered_idx} text={text:?}"
+            ));
             component.set_compose_text("".into());
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
@@ -860,6 +1439,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         .get(idx)
                         .is_some_and(|state| *state == ThreadState::Loading)
                     {
+                        trace_host_input(format_args!(
+                            "send ignored real_thread={idx} because it is already loading"
+                        ));
+                        return;
+                    }
+                    if bridge.thread_closed(idx) {
+                        trace_host_input(format_args!(
+                            "send ignored real_thread={idx} because the thread is closed"
+                        ));
                         return;
                     }
                     if let Some(error) = panel.thread_errors.borrow_mut().get_mut(idx) {
@@ -872,6 +1460,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                             text: text.to_string(),
                             status: None,
                             id: None,
+                            raw_input: None,
+                            raw_output: None,
                         },
                     );
                     if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
@@ -882,6 +1472,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         panel.refresh_messages_for(idx);
                     }
                     bridge.send_prompt(idx, text.to_string());
+                    trace_host_input(format_args!("send dispatched real_thread={idx}"));
                 }
             });
         });
@@ -911,6 +1502,39 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         .bridge
                         .as_ref()
                         .map(|bridge| bridge.cancel_prompt(idx));
+                }
+            });
+        });
+
+        // Coverage Matrix `session/close`/`session/delete` row --
+        // explicit, opt-in-only thread lifecycle controls, gated by the
+        // sidebar row's own two-step arm/confirm UI. `filtered_idx` is
+        // the Slint-side (possibly search-filtered) row index, same
+        // "translate through `real_index` before touching the bridge"
+        // convention every other sidebar-row callback here uses.
+        panel.component.on_thread_close_requested(move |filtered_idx| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(idx) = panel.real_index(filtered_idx as usize) else {
+                        return;
+                    };
+                    let Some(bridge) = &panel.bridge else { return };
+                    if bridge.close_thread(idx) {
+                        panel.refresh_threads_model();
+                    }
+                }
+            });
+        });
+
+        panel.component.on_thread_delete_requested(move |filtered_idx| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(idx) = panel.real_index(filtered_idx as usize) else {
+                        return;
+                    };
+                    let Some(bridge) = &panel.bridge else { return };
+                    bridge.delete_thread(idx);
+                    panel.refresh_threads_model();
                 }
             });
         });
@@ -991,6 +1615,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
+            trace_host_input("local terminal toggle callback invoked");
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     let Some(bridge) = &panel.bridge else { return };
@@ -1000,15 +1625,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     };
                     if bridge.has_local_terminal(real_idx) {
                         bridge.close_local_terminal(real_idx);
+                        trace_host_input(format_args!(
+                            "local terminal toggled thread={real_idx} open=false"
+                        ));
                     } else {
-                        // 80x24 is the conventional default terminal
-                        // size (same default `xterm`/most emulators
-                        // start at) -- the card's own pixel size isn't
-                        // translated into a live cols/rows resize yet
-                        // (a future increment; `resize_local_terminal`
-                        // already exists for it), so this is a fixed
-                        // starting size, not a measured one.
-                        bridge.open_local_terminal(real_idx, 80, 24);
+                        let (cols, rows) = panel.local_terminal_dimensions();
+                        bridge.open_local_terminal(real_idx, cols, rows);
+                        trace_host_input(format_args!(
+                            "local terminal toggled thread={real_idx} open=true cols={cols} rows={rows}"
+                        ));
                     }
                     panel.refresh_local_terminal_for(real_idx);
                 }
@@ -1030,6 +1655,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     let bytes = models::translate_local_terminal_key(text.as_str());
                     if !bytes.is_empty() {
                         bridge.write_local_terminal_input(real_idx, &bytes);
+                        trace_host_input(format_args!(
+                            "local terminal key thread={real_idx} bytes={:?}",
+                            String::from_utf8_lossy(&bytes)
+                        ));
                     }
                 }
             });
@@ -1153,15 +1782,12 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
-        // Phase 3 step 2: "Load older messages" row, explicit-action
-        // counterpart to a scroll-to-top auto-fetch -- see `chat_area.
-        // slint`'s own doc comment. `AgentBridge::load_older_page`
-        // prepends the next older jsonl-cache page into `history`
-        // (local disk read, but still dispatched off the render path
-        // through this callback rather than inline during a redraw).
+        // Phase 3 step 2: invoked by the message Flickable's real top-edge
+        // gesture or its accessible fallback action. Slint raises the
+        // loading guard before this callback, so reset it on every outcome.
         let component_weak = panel.component.as_weak();
         panel.component.on_load_older_requested(move || {
-            let Some(_component) = component_weak.upgrade() else {
+            let Some(component) = component_weak.upgrade() else {
                 return;
             };
             PANEL.with(|cell| {
@@ -1191,6 +1817,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     }
                 }
             });
+            component.set_loading_older_messages(false);
         });
 
         *slot = Some(panel);
@@ -1226,6 +1853,49 @@ pub extern "C" fn panel_rust_input_click(_handle: *mut PanelHandle, x: c_uint, y
         position: pos,
         button: PointerEventButton::Left,
     });
+    let (compose_has_focus, selected_thread, selected_state) = PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return (false, -1, String::from("no-panel"));
+        };
+        let selected_thread = panel.component.get_selected_thread();
+        let selected_state = panel
+            .real_index(selected_thread.max(0) as usize)
+            .and_then(|idx| panel.thread_state.borrow().get(idx).cloned())
+            .map(|state| format!("{state:?}"))
+            .unwrap_or_else(|| String::from("no-thread"));
+        (
+            panel.component.get_compose_has_focus(),
+            selected_thread,
+            selected_state,
+        )
+    });
+    trace_host_input(format_args!(
+        "click x={x} y={y} compose_focus={compose_has_focus} selected_thread={selected_thread} state={selected_state}"
+    ));
+    true
+}
+
+/// Forwards a Qt wheel/touchpad gesture in logical pixels. Slint's nested
+/// Flickables consume only the scroll they can apply and automatically bubble
+/// any boundary remainder to their parent surface.
+#[no_mangle]
+pub extern "C" fn panel_rust_input_scroll(
+    _handle: *mut PanelHandle,
+    x: f32,
+    y: f32,
+    delta_x: f32,
+    delta_y: f32,
+) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window.window().dispatch_event(WindowEvent::PointerScrolled {
+        position: slint::LogicalPosition::new(x, y),
+        delta_x,
+        delta_y,
+    });
     true
 }
 
@@ -1253,15 +1923,52 @@ pub extern "C" fn panel_rust_input_key(
         let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
         std::str::from_utf8(bytes).unwrap_or("")
     };
+    // The host must not consume editor shortcuts unless an editable Slint
+    // surface owns focus. Besides the composer, a local PTY terminal is a
+    // genuine keyboard target and must receive printable keys, editing keys,
+    // and arrows without Shotcut handling them as global shortcuts.
+    let (compose_has_focus, local_terminal_has_focus) = PANEL.with(|cell| {
+        cell.borrow().as_ref().map_or((false, false), |panel| {
+            (
+                panel.component.get_compose_has_focus(),
+                panel.component.get_local_terminal_has_focus(),
+            )
+        })
+    });
+    if !compose_has_focus && !local_terminal_has_focus {
+        trace_host_input(format_args!(
+            "key qt_key={qt_key:#x} pressed={pressed} text={text:?} \
+             compose_focus=false local_terminal_focus=false"
+        ));
+        return false;
+    }
+    // TextInput consumes text on key press. Forwarding Qt's matching release
+    // with the same text can make a character appear twice in an embedded
+    // host, so consume releases after the focus guard without redispatching
+    // their text to Slint.
+    if !pressed {
+        trace_host_input(format_args!(
+            "key qt_key={qt_key:#x} pressed=false text={text:?} \
+             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus}"
+        ));
+        return true;
+    }
     let Some(key_text) = map_qt_key(qt_key, text) else {
+        trace_host_input(format_args!(
+            "key qt_key={qt_key:#x} pressed=true text={text:?} \
+             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+             mapped=false"
+        ));
         return false;
     };
-    let win = window.window();
-    if pressed {
-        win.dispatch_event(WindowEvent::KeyPressed { text: key_text });
-    } else {
-        win.dispatch_event(WindowEvent::KeyReleased { text: key_text });
-    }
+    trace_host_input(format_args!(
+        "key qt_key={qt_key:#x} pressed=true text={text:?} \
+         compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+         mapped={key_text:?}"
+    ));
+    window
+        .window()
+        .dispatch_event(WindowEvent::KeyPressed { text: key_text });
     true
 }
 
@@ -1286,7 +1993,7 @@ pub extern "C" fn panel_rust_set_theme(
             let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
             std::str::from_utf8(bytes).unwrap_or("dark")
         };
-        Palette::get(&panel.component).set_theme(text.into());
+        Theme::get(&panel.component).set_theme(text.into());
         true
     })
 }
@@ -1299,11 +2006,49 @@ pub extern "C" fn panel_rust_apply_appearance(
     generation: u64,
     dark: bool,
 ) -> bool {
+    panel_rust_apply_host_appearance(
+        _handle,
+        generation,
+        dark,
+        std::ptr::null(),
+        0,
+        std::ptr::null(),
+        0,
+        1.0,
+        1.0,
+    )
+}
+
+/// Applies a full, generation-ordered host appearance snapshot. UTF-8
+/// strings are copied before they reach Slint, so Qt-owned buffers never
+/// outlive this call.
+#[no_mangle]
+pub extern "C" fn panel_rust_apply_host_appearance(
+    _handle: *mut PanelHandle,
+    generation: u64,
+    dark: bool,
+    language_ptr: *const c_uchar,
+    language_len: usize,
+    font_ptr: *const c_uchar,
+    font_len: usize,
+    font_scale: f32,
+    density: f32,
+) -> bool {
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
             return false;
         };
+        let decode_utf8 = |ptr: *const c_uchar, len: usize| {
+            if ptr.is_null() || len == 0 {
+                String::new()
+            } else {
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+                std::str::from_utf8(bytes).unwrap_or("").to_owned()
+            }
+        };
+        let font_scale = font_scale.clamp(0.5, 3.0);
+        let density = density.clamp(0.5, 4.0);
         let appearance = HostAppearance {
             generation,
             color_scheme: if dark {
@@ -1311,15 +2056,30 @@ pub extern "C" fn panel_rust_apply_appearance(
             } else {
                 ColorScheme::Light
             },
-            language_tag: String::new(),
-            bundled_font: String::new(),
-            font_scale: 1.0,
-            density: 1.0,
+            language_tag: decode_utf8(language_ptr, language_len),
+            bundled_font: decode_utf8(font_ptr, font_len),
+            font_scale,
+            density,
         };
         if !panel.appearance.borrow_mut().apply(appearance) {
             return false;
         }
-        Palette::get(&panel.component).set_theme(if dark { "dark" } else { "light" }.into());
+        let appearance_state = panel.appearance.borrow();
+        let appearance = appearance_state
+            .current()
+            .expect("appearance was applied above");
+        let theme = Theme::get(&panel.component);
+        theme.set_theme(if dark { "dark" } else { "light" }.into());
+        theme.set_host_language_tag(appearance.language_tag.clone().into());
+        theme.set_host_font_sans(appearance.bundled_font.clone().into());
+        theme.set_host_font_scale(appearance.font_scale);
+        theme.set_host_density(appearance.density);
+        panel
+            .window
+            .window()
+            .dispatch_event(WindowEvent::ScaleFactorChanged {
+                scale_factor: appearance.density,
+            });
         panel.window.window().request_redraw();
         true
     })
@@ -1340,6 +2100,7 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
             return false;
         };
         let bridge_changed = panel.apply_bridge_events();
+        panel.sync_thread_records();
         // Client-local PTY terminal output arrives on its own
         // background reader thread, never through `AgentBridge::
         // poll()`'s event queue -- refresh it unconditionally on every
@@ -1350,7 +2111,10 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let local_terminal_changed = selected
             .map(|idx| panel.refresh_local_terminal_for(idx))
             .unwrap_or(false);
-        bridge_changed || local_terminal_changed
+        let connection_changed = selected
+            .map(|idx| panel.refresh_connection_status_for(idx))
+            .unwrap_or(false);
+        bridge_changed || local_terminal_changed || connection_changed
     })
 }
 
@@ -1433,6 +2197,48 @@ mod lifecycle_tests {
         assert_eq!(panel_rust_width(first), 96);
         assert_eq!(panel_rust_height(first), 64);
         assert!(panel_rust_render(first));
+        assert!(panel_rust_input_scroll(first, 48.0, 32.0, 0.0, -40.0));
+        PANEL.with(|cell| {
+            let panel = cell.borrow();
+            let panel = panel.as_ref().expect("panel exists");
+            panel.component.set_compose_text("preserve this draft".into());
+        });
+        assert!(panel_rust_apply_host_appearance(
+            first,
+            1,
+            false,
+            b"fr-FR".as_ptr(),
+            b"fr-FR".len(),
+            b"Noto Sans".as_ptr(),
+            b"Noto Sans".len(),
+            1.25,
+            2.0,
+        ));
+        PANEL.with(|cell| {
+            let panel = cell.borrow();
+            let panel = panel.as_ref().expect("panel exists");
+            let appearance = panel.appearance.borrow();
+            assert_eq!(appearance.current().unwrap().language_tag, "fr-FR");
+            assert_eq!(appearance.current().unwrap().bundled_font, "Noto Sans");
+            assert_eq!(panel.component.get_compose_text(), "preserve this draft");
+            let theme = Theme::get(&panel.component);
+            assert_eq!(theme.get_theme(), "light");
+            assert_eq!(theme.get_host_language_tag(), "fr-FR");
+            assert_eq!(theme.get_host_font_sans(), "Noto Sans");
+            assert_eq!(theme.get_host_font_scale(), 1.25);
+            assert_eq!(theme.get_host_density(), 2.0);
+        });
+        assert!(!panel_rust_apply_host_appearance(
+            first,
+            1,
+            true,
+            b"en-US".as_ptr(),
+            b"en-US".len(),
+            b"Different".as_ptr(),
+            b"Different".len(),
+            1.0,
+            1.0,
+        ));
         panel_rust_destroy(first);
         assert_eq!(panel_rust_width(first), 0);
 

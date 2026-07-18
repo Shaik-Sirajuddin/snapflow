@@ -13,7 +13,9 @@
 //! crate diffs against `session/list`'s response, per Decision 2's
 //! local-first / lazy-verify sequencing.
 
-use crate::protocol_types::ChatMessage;
+use crate::protocol_types::{
+    AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -65,6 +67,33 @@ enum Line {
 pub struct CachedThread {
     pub messages: Vec<ChatMessage>,
     pub trailer: Option<ThreadTrailer>,
+}
+
+/// Durable typed UI state kept independently of the JSONL transcript and
+/// trailer. The transcript remains the source for message/tool rows; this
+/// sidecar preserves interaction state that cannot be reconstructed from a
+/// replay alone, notably live terminal buffers, pending relayed requests,
+/// and advertised configuration capabilities.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRuntimeSnapshot {
+    #[serde(default)]
+    pub pending_requests: Vec<AgentRequestEvent>,
+    #[serde(default)]
+    pub terminals: Vec<TerminalRuntimeSnapshot>,
+    #[serde(default)]
+    pub session_modes: Option<SessionModesEvent>,
+    #[serde(default)]
+    pub config_options: Vec<ConfigOptionInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRuntimeSnapshot {
+    pub terminal_id: String,
+    pub output: String,
+    pub truncated: bool,
+    pub exit_status: Option<(Option<i32>, Option<i32>)>,
 }
 
 /// Owns the cache directory; one `.jsonl` file per thread id.
@@ -245,6 +274,53 @@ impl JsonlStore {
 
     fn trailer_path_for(&self, thread_id: &str) -> PathBuf {
         self.dir.join(format!("{thread_id}.trailer.json"))
+    }
+
+    fn runtime_snapshot_path_for(&self, thread_id: &str) -> PathBuf {
+        self.dir.join(format!("{thread_id}.runtime.json"))
+    }
+
+    /// Loads one typed interaction-state snapshot. Missing files are a
+    /// normal first-run condition; malformed snapshots degrade only this
+    /// state surface and never prevent the transcript tail from rendering.
+    pub fn runtime_snapshot(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadRuntimeSnapshot, CacheError> {
+        let path = self.runtime_snapshot_path_for(thread_id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ThreadRuntimeSnapshot::default())
+            }
+            Err(source) => return Err(CacheError::Io { path, source }),
+        };
+        serde_json::from_slice(&bytes).map_err(|source| CacheError::Parse {
+            path,
+            line_no: 0,
+            source,
+        })
+    }
+
+    /// Atomically replaces the typed interaction snapshot without touching
+    /// transcript data, its index, or its trailer metadata.
+    pub fn write_runtime_snapshot(
+        &self,
+        thread_id: &str,
+        snapshot: &ThreadRuntimeSnapshot,
+    ) -> Result<(), CacheError> {
+        let path = self.runtime_snapshot_path_for(thread_id);
+        let tmp_path = self.dir.join(format!("{thread_id}.runtime.json.tmp"));
+        let bytes = serde_json::to_vec(snapshot).map_err(|source| CacheError::Parse {
+            path: tmp_path.clone(),
+            line_no: 0,
+            source,
+        })?;
+        fs::write(&tmp_path, bytes).map_err(|source| CacheError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+        fs::rename(&tmp_path, &path).map_err(|source| CacheError::Io { path, source })
     }
 
     /// Writes `trailer` to `<thread_id>.trailer.json`, atomically (same
@@ -530,7 +606,9 @@ pub struct MessagePage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol_types::MessageKind;
+    use crate::protocol_types::{
+        AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
+    };
 
     fn msg(text: &str) -> ChatMessage {
         ChatMessage {
@@ -538,6 +616,8 @@ mod tests {
             text: text.to_string(),
             status: None,
             id: None,
+            raw_input: None,
+            raw_output: None,
         }
     }
 
@@ -747,5 +827,67 @@ mod tests {
             &Some("Title".into()),
             &Some("2026-02-01".into())
         ));
+    }
+
+    #[test]
+    fn runtime_snapshot_round_trips_without_mutating_transcript_or_trailer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = JsonlStore::open(dir.path()).expect("open");
+        store
+            .overwrite("t1", &[msg("transcript")], &trailer())
+            .expect("seed transcript");
+        let snapshot = ThreadRuntimeSnapshot {
+            pending_requests: vec![AgentRequestEvent {
+                relay_id: "relay-1".into(),
+                method: "terminal/create".into(),
+                raw_request: serde_json::json!({"id": 7, "method": "terminal/create"}),
+            }],
+            terminals: vec![TerminalRuntimeSnapshot {
+                terminal_id: "term-1".into(),
+                output: "building\n".into(),
+                truncated: false,
+                exit_status: Some((Some(0), None)),
+            }],
+            session_modes: Some(SessionModesEvent {
+                current_mode_id: "ask".into(),
+                available: vec![SessionModeInfo {
+                    id: "ask".into(),
+                    name: "Ask".into(),
+                    description: None,
+                }],
+            }),
+            config_options: vec![ConfigOptionInfo {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: None,
+                kind: "select".into(),
+                current_value: Some("fast".into()),
+                options: vec![ConfigOptionValue {
+                    value: "fast".into(),
+                    name: "Fast".into(),
+                    description: None,
+                }],
+            }],
+        };
+        store
+            .write_runtime_snapshot("t1", &snapshot)
+            .expect("write runtime snapshot");
+
+        assert_eq!(store.runtime_snapshot("t1").expect("read snapshot"), snapshot);
+        assert_eq!(
+            store.load("t1").expect("read transcript").messages,
+            vec![msg("transcript")],
+            "writing interaction state must not rewrite message JSONL"
+        );
+        assert_eq!(
+            store
+                .trailer("t1")
+                .expect("read trailer")
+                .expect("trailer")
+                .acp_session_id,
+            "s1",
+            "writing interaction state must not rewrite transcript metadata"
+        );
     }
 }

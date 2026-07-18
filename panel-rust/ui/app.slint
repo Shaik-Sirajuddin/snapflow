@@ -1,12 +1,12 @@
-import { Palette } from "palette.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem } from "types.slint";
-import { Sidebar } from "sidebar.slint";
+import { Theme } from "tokens/theme.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption } from "types.slint";
+import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
-import { TerminalOverlay } from "terminal_card.slint";
-import { LocalTerminalOverlay } from "local_terminal_card.slint";
-import { SettingsSheet } from "settings_sheet.slint";
+import { TerminalOverlay } from "components/terminal_card.slint";
+import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
+import { SettingsSheet } from "components/settings_sheet.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem, Palette }
+export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, Theme }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -14,8 +14,9 @@ export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOptio
 // set_messages, on_thread_selected, on_send_requested, etc.) needed zero
 // changes for this phase. `theme` and `radius-preset` moved from
 // `ChatPanel` properties (pre-reskin: only `theme` existed, driving a
-// single `is-dark` bool) onto the `Palette` global directly -- Rust code
-// now reads/writes them via the generated `Palette::get(&component)`
+// single `is-dark` bool) onto the `Theme` global directly (formerly named
+// `Palette`, split into `tokens/` per `DESIGN_SYSTEM.md`) -- Rust code
+// now reads/writes them via the generated `Theme::get(&component)`
 // accessor (see `panel_rust_set_theme` in lib.rs) rather than
 // `component.set_theme(...)`, since Slint globals' `in` properties are
 // set through their own accessor, not by binding `Global.prop: expr;`
@@ -24,20 +25,33 @@ export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOptio
 // (Phase 0/1 addition), default-only for now -- no settings UI wires it
 // yet, tracked separately.
 export component ChatPanel inherits Window {
+    default-font-family: Theme.font-sans;
+    default-font-size: 13px * Theme.font-scale;
+    background: Theme.bg-chat;
+    out property <bool> compose-has-focus: chat-area.compose-has-focus;
+    out property <bool> local-terminal-has-focus:
+        chat-area.local-terminal-has-focus
+        || (local-terminal-overlay-open && local-terminal-overlay.has-focus);
     in-out property <int> selected-thread: 0;
     in-out property <[ThreadItem]> threads: [];
     in-out property <[MessageItem]> messages: [];
-    // Phase 3 step 2 addition -- see `chat_area.slint`'s own doc
-    // comment.
+    // Phase 3 paging state -- forwarded to the message Flickable so a
+    // top-edge gesture cannot queue duplicate predecessor-page loads.
     in property <bool> has-older-messages: false;
+    in-out property <bool> loading-older-messages: false;
     callback load-older-requested();
     in-out property <string> compose-text: "";
     in-out property <bool> settings-open: false;
     in-out property <string> default-profile: "";
     in-out property <string> permission-profile: "";
     in-out property <bool> background-default: false;
+    in-out property <bool> background-override-set: false;
+    in-out property <bool> background-override: false;
     in-out property <string> agent-badge: "agent . ask";
+    in property <string> connection-status: "Connecting...";
     in property <bool> compact: true;
+    in-out property <bool> narrow: false;
+    in-out property <bool> sidebar-expanded: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
     // Client-local PTY terminal addition -- see `chat_area.slint`'s own
@@ -60,6 +74,7 @@ export component ChatPanel inherits Window {
     // `available-profiles`.
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <[RemoteSessionOption]> recoverable-sessions: [];
     // Mode/config selector addition -- see chat_area.slint's own doc
     // comment on these properties; passed straight through to `ChatArea`
     // below (this root component owns no mode/config state of its own,
@@ -76,6 +91,9 @@ export component ChatPanel inherits Window {
 
     callback thread-selected(int);
     callback new-thread-requested();
+    callback thread-close-requested(int);
+    callback thread-delete-requested(int);
+    callback thread-archive-requested(int);
     callback send-requested();
     callback stop-requested();
     callback settings-requested();
@@ -83,7 +101,10 @@ export component ChatPanel inherits Window {
     callback settings-close();
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
+    callback profile-create(string, string, bool, bool);
+    callback profile-delete(string);
     callback agent-install-requested(string);
+    callback recover-session-attach(string, string, string);
     callback search-changed(string);
     callback toggle-expanded(int);
     callback approve-request();
@@ -96,33 +117,50 @@ export component ChatPanel inherits Window {
     callback mode-selected(string);
     callback config-option-selected(string, string);
 
-    HorizontalLayout {
-        Sidebar {
+    Rectangle {
+        width: root.width;
+        height: root.height;
+        background: Theme.bg-chat;
+        sidebar := Sidebar {
+            x: 0px;
+            y: 0px;
+            height: parent.height;
+            // Mobile/narrow no longer hides the sidebar outright -- it
+            // collapses to the same icon-only rail the desktop "collapse"
+            // toggle already produces (only the left-end state icon per
+            // row stays visible), so a thread's live status is still
+            // glanceable without spending any horizontal space on text.
             threads: threads;
             selected-thread: selected-thread;
             compact: compact;
+            expanded: root.narrow ? false : sidebar-expanded;
             thread-selected(i) => {
                 selected-thread = i;
                 thread-selected(i);
             }
             new-thread-requested => { new-thread-requested(); }
+            thread-close-requested(i) => { thread-close-requested(i); }
+            thread-delete-requested(i) => { thread-delete-requested(i); }
+            thread-archive-requested(i) => { thread-archive-requested(i); }
+            settings-requested => { settings-requested(); }
             search-changed(q) => { search-changed(q); }
+            toggle-expanded => { sidebar-expanded = !sidebar-expanded; }
         }
-        ChatArea {
-            // The native dock is intentionally narrow. Force the chat
-            // column to consume the remaining width instead of allowing
-            // long message text to expand the root layout beyond the
-            // QQuick item's viewport.
-            horizontal-stretch: 1;
-            preferred-width: 0px;
-            min-width: 0px;
+        chat-area := ChatArea {
+            x: sidebar.width;
+            y: 0px;
+            width: root.width - self.x;
+            height: parent.height;
             compact: compact;
+            narrow: root.narrow;
             active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
             active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
             messages: messages;
             has-older-messages: has-older-messages;
+            loading-older-messages <=> loading-older-messages;
             load-older-requested => { load-older-requested(); }
             agent-badge: agent-badge;
+            connection-status: connection-status;
             sending: threads.length > 0
                 ? threads[selected-thread].status == "loading"
                     || threads[selected-thread].status == "cancelling"
@@ -131,6 +169,7 @@ export component ChatPanel inherits Window {
             send-requested => { send-requested(); }
             stop-requested => { stop-requested(); }
             settings-requested => { settings-requested(); }
+            new-thread-requested => { new-thread-requested(); }
             toggle-expanded(i) => { toggle-expanded(i); }
             pending-request: pending-request;
             approve-request => { approve-request(); }
@@ -156,16 +195,22 @@ export component ChatPanel inherits Window {
         close => {
             expanded-terminal = { terminal-id: "" };
             close-terminal-overlay();
+            chat-area.restore-compose-focus();
         }
     }
-    if local-terminal-overlay-open : LocalTerminalOverlay {
+    local-terminal-overlay := LocalTerminalOverlay {
+        visible: local-terminal-overlay-open;
         item: local-terminal;
         container-width: root.width;
         container-height: root.height;
-        close => { local-terminal-overlay-open = false; }
+        close => {
+            local-terminal-overlay-open = false;
+            chat-area.restore-compose-focus();
+        }
         close-requested => {
             local-terminal-overlay-open = false;
             local-terminal-close-requested();
+            chat-area.restore-compose-focus();
         }
         key-input(text) => { local-terminal-key-input(text); }
     }
@@ -178,14 +223,26 @@ export component ChatPanel inherits Window {
             default-profile <=> default-profile;
             permission-profile <=> permission-profile;
             background-default <=> background-default;
+            background-override-set <=> background-override-set;
+            background-override <=> background-override;
             available-profiles: available-profiles;
             available-mcp-servers: available-mcp-servers;
             agent-catalog: agent-catalog;
+            recoverable-sessions: recoverable-sessions;
             save => { settings-save(); }
-            close => { settings-close(); }
+            close => {
+                settings-open = false;
+                settings-close();
+                chat-area.restore-compose-focus();
+            }
             mcp-server-create(name, command) => { mcp-server-create(name, command); }
             mcp-server-delete(name) => { mcp-server-delete(name); }
+            profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
+                profile-create(name, agent-id, terminal-enabled, fs-enabled);
+            }
+            profile-delete(name) => { profile-delete(name); }
             agent-install-requested(id) => { agent-install-requested(id); }
+            recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
         }
     }
 }

@@ -2,9 +2,9 @@
 // This file is intentionally renderer-only: it does not start ACPX or
 // require the Qt FFI bridge. Open it with the Slint extension to review the
 // complete narrow side-panel composition using representative data.
-import { Palette } from "palette.slint";
+import { Theme } from "tokens/theme.slint";
 import { ThreadItem, MessageItem } from "types.slint";
-import { Sidebar } from "sidebar.slint";
+import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 
 export component ChatPanelPreview inherits Window {

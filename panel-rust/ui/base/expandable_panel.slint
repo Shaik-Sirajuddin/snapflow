@@ -1,0 +1,47 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+
+// Capped-height + scroll + expand-on-click shell -- chat-items-redesign.md
+// #7 ("execution-view"). Hidden/collapsed by default per the spec's
+// "opt-in via param, default not visible" -- callers control the opt-in via
+// `collapsed-by-default`, not this component (it only knows how to show a
+// bounded scrollable preview vs. the full expanded content, not whether it
+// should exist at all). The inner content is whatever the caller passes as
+// children -- this component has no opinion on it (terminal view, api-call
+// view, or anything else `chat-items-redesign.md` #8/#9 add later).
+export component ExpandablePanel {
+    in property <length> collapsed-max-height: 140px;
+    in property <bool> collapsed-by-default: true;
+    property <bool> expanded: !collapsed-by-default;
+    callback toggled(bool);
+
+    VerticalLayout {
+        spacing: Metrics.space-2;
+        Flickable {
+            height: expanded ? self.preferred-height : min(self.preferred-height, collapsed-max-height);
+            animate height { duration: 150ms; easing: ease-in-out; }
+            @children
+        }
+        expand-toggle := TouchArea {
+            height: 18px;
+            accessible-role: button;
+            accessible-label: expanded ? "Collapse view" : "Open full view";
+            accessible-action-default => {
+                expanded = !expanded;
+                toggled(expanded);
+            }
+            clicked => {
+                expanded = !expanded;
+                toggled(expanded);
+            }
+            Text {
+                text: expanded ? "Show less" : "Open full view";
+                color: Theme.text-secondary;
+                font-size: 9px * Theme.font-scale;
+                font-family: Theme.font-mono;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

@@ -1,0 +1,36 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Layer 3 (base) -- the repeated "status badge/chip" pattern: a small
+// bordered rounded box with small text, no click behavior (see
+// `message_card.slint`'s tool-call status badge). Deliberately
+// non-interactive -- unlike `Button`, it never wraps a `TouchArea`.
+export component Badge inherits Rectangle {
+    in property <string> label;
+    in property <color> bg: Theme.bg-sidebar;
+    in property <color> fg: Theme.text-secondary;
+    in property <color> border-col: Theme.border-default;
+    in property <length> border-w: 1px;
+    in property <length> font-size: 9px;
+    in property <string> badge-font-family: Theme.font-mono;
+    in property <length> pad-h: 6px;
+    in property <length> pad-v: 2px;
+
+    background: bg;
+    border-color: border-col;
+    border-width: border-w;
+    border-radius: Theme.radius-sm;
+
+    HorizontalLayout {
+        padding-left: pad-h;
+        padding-right: pad-h;
+        padding-top: pad-v;
+        padding-bottom: pad-v;
+        Text {
+            text: root.label;
+            color: root.fg;
+            font-family: root.badge-font-family;
+            font-size: root.font-size * Theme.font-scale;
+            vertical-alignment: center;
+        }
+    }
+}

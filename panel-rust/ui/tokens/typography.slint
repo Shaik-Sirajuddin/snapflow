@@ -1,0 +1,13 @@
+// Layer 1 (tokens) -- font-family / font-scale constants that carry no
+// dark/light or host-appearance logic. `host-font-sans`/`host-font-scale`
+// themselves stay on `Theme` (tokens/theme.slint) rather than here, since
+// Rust's FFI accessor (`Theme::get(&component)`, see `src/lib.rs`) can
+// only set/get properties declared directly on the `Theme` global itself
+// -- this file only holds the static values `Theme` composes those with.
+export global Typography {
+    out property <string> font-mono: "JetBrains Mono";
+    // `Theme.font-scale` = `host-font-scale * font-scale-base` -- every
+    // explicit component font consumes `Theme.font-scale` so host
+    // accessibility scaling and this base multiplier compose cleanly.
+    out property <float> font-scale-base: 1.3;
+}

@@ -300,3 +300,80 @@ async fn agent_catalog_list_status_and_install_reach_the_real_registry() {
         "expected agents/install against an unknown id to fail with a real gateway error"
     );
 }
+
+/// Real end-to-end proof of the Coverage Matrix's `profiles/create/
+/// update/delete` row through `AcpxThreadHandle` -- companion to
+/// `mcp_servers_crud_round_trips_through_the_thread_actor` above, same
+/// "list reflects create/update/delete in order" discipline (a client-
+/// side stub that always returned `Ok(())` without re-listing would
+/// pass a weaker assertion set that never checked the list).
+#[tokio::test]
+async fn profiles_crud_round_trips_through_the_thread_actor() {
+    let script_dir = tempfile::tempdir().expect("script tempdir");
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let handle = spawn_acpx_thread(gateway.base_url.clone());
+
+    // Starts with no profiles named after this test's fixture -- a
+    // fresh gateway process registers nothing by default.
+    let initial = handle.list_profiles().await.expect("list_profiles");
+    assert!(
+        !initial.iter().any(|p| p.name == "crud-test-profile"),
+        "expected no crud-test-profile yet, got {initial:?}"
+    );
+
+    let created = handle
+        .create_profile(serde_json::json!({
+            "name": "crud-test-profile",
+            "agent_id": "mcp-agents-test-agent",
+            "allow_terminal_access": false,
+            "allow_fs_access": false,
+        }))
+        .await
+        .expect("create_profile");
+    assert_eq!(created["name"], "crud-test-profile");
+
+    let after_create = handle.list_profiles().await.expect("list_profiles");
+    let found = after_create
+        .iter()
+        .find(|p| p.name == "crud-test-profile")
+        .expect("expected the created profile to be listed");
+    assert!(!found.allow_terminal_access);
+    assert!(!found.allow_fs_access);
+
+    handle
+        .update_profile(serde_json::json!({
+            "name": "crud-test-profile",
+            "agent_id": "mcp-agents-test-agent",
+            "allow_terminal_access": true,
+            "allow_fs_access": true,
+        }))
+        .await
+        .expect("update_profile");
+    let after_update = handle.list_profiles().await.expect("list_profiles");
+    let updated = after_update
+        .iter()
+        .find(|p| p.name == "crud-test-profile")
+        .expect("expected the updated profile to still be listed under the same name");
+    assert!(
+        updated.allow_terminal_access && updated.allow_fs_access,
+        "expected update to have replaced the entry's capability flags, got {updated:?}"
+    );
+    assert_eq!(
+        after_update
+            .iter()
+            .filter(|p| p.name == "crud-test-profile")
+            .count(),
+        1,
+        "expected update to replace the entry, not append a second one"
+    );
+
+    handle
+        .delete_profile("crud-test-profile")
+        .await
+        .expect("delete_profile");
+    let after_delete = handle.list_profiles().await.expect("list_profiles");
+    assert!(
+        !after_delete.iter().any(|p| p.name == "crud-test-profile"),
+        "expected the profile to be gone after delete, got {after_delete:?}"
+    );
+}

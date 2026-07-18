@@ -1,0 +1,11 @@
+// Generic show-transition wrapper -- chat-items-redesign.md #4 (tool-call
+// gets a min fade-in on appear; "thinking" explicitly gets none, so that
+// branch must NOT wrap its content in this). Any content passed as this
+// component's children fades from 0 to full opacity once, at first layout.
+export component FadeIn {
+    property <bool> shown: false;
+    opacity: shown ? 1.0 : 0.0;
+    animate opacity { duration: 120ms; easing: ease-out; }
+    init => { shown = true; }
+    @children
+}

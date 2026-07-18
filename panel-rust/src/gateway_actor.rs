@@ -51,8 +51,8 @@ pub use crate::protocol_types::{
     SessionModesEvent,
 };
 pub use thread_actor::{
-    spawn_acpx_thread, spawn_acpx_thread_with_gateway, AcpxThreadError, AcpxThreadHandle,
-    ProfileSummary, RemoteThreadInfo,
+    spawn_acpx_thread, spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_gateway,
+    AcpxThreadError, AcpxThreadGatewaySetter, AcpxThreadHandle, ProfileSummary, RemoteThreadInfo,
 };
 
 /// Maps one raw `session/update` JSON-RPC notification (as returned in
@@ -89,6 +89,12 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
+    // chat-items-redesign.md #9 (execution-view "api-call" variant):
+    // `rawInput`/`rawOutput` are real wire fields on `tool_call`/
+    // `tool_call_update` (`ToolCallUpdateFields`/`ToolCall` in
+    // `agent-client-protocol`) that this classifier previously discarded
+    // entirely -- not missing data, just unread data.
+    let raw_of = |field: &str| -> Option<serde_json::Value> { session_update.get(field).cloned() };
 
     match kind {
         "agent_message_chunk" => text_of(session_update).map(|text| ChatMessage {
@@ -96,18 +102,24 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
             text,
             status: None,
             id: id_of("messageId"),
+            raw_input: None,
+            raw_output: None,
         }),
         "agent_thought_chunk" => text_of(session_update).map(|text| ChatMessage {
             kind: MessageKind::Thinking,
             text,
             status: None,
             id: id_of("messageId"),
+            raw_input: None,
+            raw_output: None,
         }),
         "user_message_chunk" => text_of(session_update).map(|text| ChatMessage {
             kind: MessageKind::User,
             text,
             status: None,
             id: None,
+            raw_input: None,
+            raw_output: None,
         }),
         // `tool_call`'s wire shape carries `toolCallId`/`title`/`status`
         // directly under `update` (not nested under a separate "fields"
@@ -130,6 +142,8 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
                 text: title,
                 status,
                 id: id_of("toolCallId"),
+                raw_input: raw_of("rawInput"),
+                raw_output: raw_of("rawOutput"),
             })
         }
         // A status-only update (no title change) must still surface --
@@ -154,6 +168,8 @@ pub(crate) fn classify_raw_update(update: &serde_json::Value) -> Option<ChatMess
                 text: title.unwrap_or_default(),
                 status,
                 id: id_of("toolCallId"),
+                raw_input: raw_of("rawInput"),
+                raw_output: raw_of("rawOutput"),
             })
         }
         _ => None,

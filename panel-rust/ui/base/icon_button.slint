@@ -1,0 +1,30 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Layer 3 (base) -- the repeated hand-rolled "icon-only hover button"
+// pattern found across `sidebar.slint` (collapse toggle, new-thread,
+// settings-bar): a square/rect `Rectangle` whose background tints on
+// hover, a sibling `TouchArea` (accessible-role/label/action/clicked),
+// pointer cursor, and caller-supplied icon content via `@children`.
+// Distinct from `Button` (fixed-size pill with a text label) -- this one
+// has no label of its own and sizes to whatever's passed in.
+export component IconButton inherits Rectangle {
+    in property <string> button-accessible-label;
+    in property <length> btn-width: 24px;
+    in property <length> btn-height: 24px;
+    callback clicked();
+
+    width: btn-width;
+    height: btn-height;
+    border-radius: Theme.radius-sm;
+    background: touch.has-hover ? Theme.bg-primary-container : transparent;
+    animate background { duration: 100ms; }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.button-accessible-label;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+    }
+    @children
+}

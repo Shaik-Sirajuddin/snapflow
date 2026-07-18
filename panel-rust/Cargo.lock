@@ -3812,6 +3812,7 @@ version = "0.1.0"
 dependencies = [
  "acpx-client",
  "agent-client-protocol",
+ "i-slint-backend-testing",
  "portable-pty",
  "reqwest",
  "rusqlite",

@@ -1,0 +1,410 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { Icon } from "../base/icon.slint";
+import { IconButton } from "../base/icon_button.slint";
+import { ThreadItem } from "../types.slint";
+
+// Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
+// extend this with a real search box + filtered model and a footer
+// identity chip, without touching app.slint or chat-area.slint.
+export component Sidebar inherits Rectangle {
+    in property <[ThreadItem]> threads: [];
+    in property <int> selected-thread: 0;
+    in property <bool> compact: true;
+    in property <bool> expanded: false;
+    callback thread-selected(int);
+    callback new-thread-requested();
+    callback search-changed(string);
+    callback toggle-expanded();
+    callback thread-close-requested(int);
+    callback thread-delete-requested(int);
+    callback thread-archive-requested(int);
+    callback settings-requested();
+
+    // Two-step arm/confirm state for the sidebar row close/delete
+    // controls -- same pattern as `settings_sheet.slint`'s
+    // `profile-pending-delete`, keyed by row index (not name -- thread
+    // names are not guaranteed unique) rather than an `in property`
+    // since this is purely local UI state no Rust caller needs to
+    // drive or observe.
+    property <int> pending-close-index: -1;
+    property <int> pending-delete-index: -1;
+
+    // Per-thread identity accent -- deliberately the one departure from
+    // this project's usual monochrome status language (see theme.slint's
+    // note), scoped narrowly to "which thread is this" rather than "what
+    // state is this thread in". Cycled by row index so it stays stable
+    // as long as thread order doesn't change, with no per-thread color
+    // field on `ThreadItem` itself to keep this a presentation-only
+    // concern.
+    property <[color]> thread-accent-colors: [
+        #f43f5e, #f97316, #eab308, #22c55e,
+        #06b6d4, #6366f1, #a855f7, #ec4899,
+    ];
+    function thread-accent(i: int) -> color {
+        return thread-accent-colors[Math.mod(i, thread-accent-colors.length)];
+    }
+
+    // Reserve enough width for the active chat at the native 20%-width
+    // dock target. The list remains selectable; secondary chat metadata
+    // collapses in ChatArea when the remaining column is compact.
+    width: expanded ? (compact ? 200px : 260px) : 48px;
+    animate width { duration: 180ms; easing: ease-in-out; }
+    background: Theme.bg-sidebar;
+
+    VerticalLayout {
+        width: parent.width;
+        height: parent.height;
+        spacing: 10px;
+        Rectangle {
+            height: 36px;
+            background: Theme.bg-card;
+            HorizontalLayout {
+                padding: compact ? 4px : 8px;
+                spacing: compact ? 2px : 6px;
+                IconButton {
+                    button-accessible-label: expanded ? "Collapse thread sidebar" : "Expand thread sidebar";
+                    clicked => { toggle-expanded(); }
+                    Icon {
+                        source: @image-url("../assets/icons/panel-left.svg");
+                        size: 16px;
+                        color: Theme.text-secondary;
+                    }
+                }
+                if expanded : Text {
+                    text: "Chats";
+                    color: Theme.text-primary;
+                    font-size: 14px * Theme.font-scale;
+                    font-family: Theme.font-sans;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; preferred-width: 0px; min-width: 0px; }
+                if expanded : IconButton {
+                    button-accessible-label: "New thread";
+                    clicked => { new-thread-requested(); }
+                    Icon {
+                        source: @image-url("../assets/icons/plus.svg");
+                        size: 18px;
+                        color: Theme.bg-primary;
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: expanded ? 32px : 0px;
+            background: Theme.bg-canvas;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 4px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: @image-url("../assets/icons/search.svg");
+                        size: 13px;
+                        color: Theme.text-muted;
+                    }
+                }
+                Rectangle {
+                    // TextInput has no built-in placeholder support
+                    // (that's std-widgets' LineEdit, which pulls in a
+                    // heavier widget style dependency this crate doesn't
+                    // otherwise use) -- a manually-overlaid Text shown
+                    // only while empty reproduces the HTML's "Search
+                    // active threads..." placeholder with no new deps.
+                    Text {
+                        text: "Search active threads...";
+                        color: Theme.text-muted;
+                        font-family: Theme.font-sans;
+                        font-size: 11px * Theme.font-scale;
+                        vertical-alignment: center;
+                        visible: search-input.text == "";
+                    }
+                    search-input := TextInput {
+                        accessible-label: "Search threads";
+                        color: Theme.text-primary;
+                        font-family: Theme.font-sans;
+                        font-size: 11px * Theme.font-scale;
+                        vertical-alignment: center;
+                        edited => { search-changed(self.text); }
+                    }
+                }
+            }
+        }
+        // Thread card -- Phase 3 adds the one-line description (see
+        // `models::describe_thread`) and an "ACTIVE" tag on the
+        // selected row, matching index.html's `renderThreads()` (title
+        // + truncated desc + state indicator + left accent border on
+        // the active row).
+        Flickable {
+            vertical-stretch: 1;
+            preferred-height: 0px;
+            min-height: 0px;
+            viewport-height: threads.length * 58px;
+            VerticalLayout {
+                spacing: 2px;
+                for thread[i] in threads : Rectangle {
+                    height: 56px;
+                    background: i == selected-thread ? Theme.bg-chat : Theme.bg-sidebar;
+                    thread-select := TouchArea {
+                        accessible-role: button;
+                        accessible-label: thread.name;
+                        accessible-action-default => { thread-selected(i); }
+                        clicked => { thread-selected(i); }
+                    }
+                    HorizontalLayout {
+                        Rectangle {
+                            width: 3px;
+                            background: i == selected-thread ? Theme.bg-primary : transparent;
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            padding-left: compact ? Metrics.space-6 : Metrics.space-8;
+                            padding-right: compact ? Metrics.space-6 : Metrics.space-8;
+                            padding-top: Metrics.space-5;
+                            padding-bottom: Metrics.space-5;
+                            spacing: Metrics.space-3;
+                            alignment: center;
+                            HorizontalLayout {
+                                spacing: Metrics.space-4;
+                                // Left-end state icon: a spinner glyph while the thread
+                                // is actively fetching (blink disabled for now -- static
+                                // icon only), a raised-hand glyph when it needs user
+                                // attention (error/awaiting input), otherwise the plain
+                                // status dot this replaced.
+                                state-icon-blink := Timer {
+                                    interval: 500ms;
+                                    running: false;
+                                    triggered => { state-icon-lit = !state-icon-lit; }
+                                }
+                                property <bool> state-icon-lit: true;
+                                if thread.status == "loading" : Icon {
+                                    source: @image-url("../assets/icons/loader-circle.svg");
+                                    size: 14px;
+                                    color: Theme.bg-primary;
+                                    opacity: state-icon-lit ? 1.0 : 0.3;
+                                    animate opacity { duration: 200ms; }
+                                }
+                                if thread.status == "error" : Icon {
+                                    source: @image-url("../assets/icons/hand.svg");
+                                    size: 14px;
+                                    color: Theme.text-secondary;
+                                }
+                                if thread.status != "loading" && thread.status != "error" : Rectangle {
+                                    width: 6px;
+                                    height: 6px;
+                                    border-radius: 3px;
+                                    background: Theme.text-muted;
+                                }
+                                if expanded : Text {
+                                    text: thread.name;
+                                    color: i == selected-thread ? Theme.bg-primary : Theme.text-primary;
+                                    font-size: 11px * Theme.font-scale;
+                                    font-weight: 700;
+                                    font-family: Theme.font-sans;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                    preferred-width: 0px;
+                                    min-width: 0px;
+                                }
+                                if expanded : Text {
+                                    text: thread.background ? "BG" : (i == selected-thread ? "ACTIVE" : "");
+                                    color: Theme.text-muted;
+                                    font-size: 8px * Theme.font-scale;
+                                    font-family: Theme.font-mono;
+                                    vertical-alignment: center;
+                                }
+                                // Coverage Matrix `session/close`/
+                                // `session/delete` row: explicit,
+                                // confirm-gated lifecycle controls per
+                                // thread row -- an open thread shows a
+                                // close (power) icon, a closed one
+                                // shows a delete (trash) icon instead,
+                                // both armed by a first click and only
+                                // acted on by a second, explicit
+                                // confirm -- same two-step pattern as
+                                // `settings_sheet.slint`'s profile
+                                // delete control.
+                                if expanded && !thread.closed && root.pending-close-index != i : Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    thread-close-arm := TouchArea {
+                                        accessible-role: button;
+                                        accessible-label: "Close thread " + thread.name;
+                                        accessible-action-default => { root.pending-close-index = i; }
+                                        clicked => { root.pending-close-index = i; }
+                                    }
+                                    Icon {
+                                        source: @image-url("../assets/icons/power.svg");
+                                        size: 13px;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+                                if expanded && !thread.closed && root.pending-close-index == i : HorizontalLayout {
+                                    spacing: 2px;
+                                    Rectangle {
+                                        width: 18px;
+                                        height: 18px;
+                                        thread-close-confirm := TouchArea {
+                                            accessible-role: button;
+                                            accessible-label: "Confirm close thread " + thread.name;
+                                            accessible-action-default => {
+                                                root.pending-close-index = -1;
+                                                root.thread-close-requested(i);
+                                            }
+                                            clicked => {
+                                                root.pending-close-index = -1;
+                                                root.thread-close-requested(i);
+                                            }
+                                        }
+                                        Icon {
+                                            source: @image-url("../assets/icons/check.svg");
+                                            size: 13px;
+                                            color: Theme.bg-primary;
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: 18px;
+                                        height: 18px;
+                                        thread-close-cancel := TouchArea {
+                                            accessible-role: button;
+                                            accessible-label: "Cancel close thread " + thread.name;
+                                            accessible-action-default => { root.pending-close-index = -1; }
+                                            clicked => { root.pending-close-index = -1; }
+                                        }
+                                        Icon {
+                                            source: @image-url("../assets/icons/x.svg");
+                                            size: 13px;
+                                            color: Theme.text-secondary;
+                                        }
+                                    }
+                                }
+                                if expanded && thread.closed && root.pending-delete-index != i : Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    thread-delete-arm := TouchArea {
+                                        accessible-role: button;
+                                        accessible-label: "Delete thread " + thread.name;
+                                        accessible-action-default => { root.pending-delete-index = i; }
+                                        clicked => { root.pending-delete-index = i; }
+                                    }
+                                    Icon {
+                                        source: @image-url("../assets/icons/trash-2.svg");
+                                        size: 13px;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+                                if expanded && thread.closed && root.pending-delete-index == i : HorizontalLayout {
+                                    spacing: 2px;
+                                    Rectangle {
+                                        width: 18px;
+                                        height: 18px;
+                                        thread-delete-confirm := TouchArea {
+                                            accessible-role: button;
+                                            accessible-label: "Confirm delete thread " + thread.name;
+                                            accessible-action-default => {
+                                                root.pending-delete-index = -1;
+                                                root.thread-delete-requested(i);
+                                            }
+                                            clicked => {
+                                                root.pending-delete-index = -1;
+                                                root.thread-delete-requested(i);
+                                            }
+                                        }
+                                        Icon {
+                                            source: @image-url("../assets/icons/check.svg");
+                                            size: 13px;
+                                            color: Theme.bg-primary;
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: 18px;
+                                        height: 18px;
+                                        thread-delete-cancel := TouchArea {
+                                            accessible-role: button;
+                                            accessible-label: "Cancel delete thread " + thread.name;
+                                            accessible-action-default => { root.pending-delete-index = -1; }
+                                            clicked => { root.pending-delete-index = -1; }
+                                        }
+                                        Icon {
+                                            source: @image-url("../assets/icons/x.svg");
+                                            size: 13px;
+                                            color: Theme.text-secondary;
+                                        }
+                                    }
+                                }
+                                if expanded : Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    thread-archive := TouchArea {
+                                        accessible-role: button;
+                                        accessible-label: "Archive thread " + thread.name;
+                                        accessible-action-default => { root.thread-archive-requested(i); }
+                                        clicked => { root.thread-archive-requested(i); }
+                                    }
+                                    Icon {
+                                        source: @image-url("../assets/icons/archive.svg");
+                                        size: 13px;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+                            }
+                            if expanded : Text {
+                                text: thread.status == "error" ? "! " + thread.description : thread.description;
+                                color: Theme.text-secondary;
+                                font-size: 10px * Theme.font-scale;
+                                font-family: Theme.font-sans;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                preferred-width: 0px;
+                                min-width: 0px;
+                            }
+                        }
+                        Rectangle {
+                            width: 3px;
+                            background: expanded ? transparent : root.thread-accent(i);
+                        }
+                    }
+                }
+            }
+        }
+        // Settings management bar -- moved here from the header's gear
+        // glyph (which was placement-only, no click behavior) so it's a
+        // real, always-reachable control regardless of collapse state,
+        // matching the rest of this footer row's "always visible" role.
+        Rectangle {
+            height: compact ? 28px : 40px;
+            background: settings-bar-touch.has-hover ? Theme.bg-primary-container : Theme.bg-card;
+            border-color: Theme.border-default;
+            border-width: 1px;
+            settings-bar-touch := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Open settings";
+                accessible-action-default => { root.settings-requested(); }
+                clicked => { root.settings-requested(); }
+            }
+            HorizontalLayout {
+                padding: compact ? 4px : 8px;
+                spacing: 6px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: @image-url("../assets/icons/settings.svg");
+                        size: 15px;
+                        color: Theme.text-secondary;
+                    }
+                }
+                if expanded : Text {
+                    text: "Settings";
+                    color: Theme.text-secondary;
+                    font-size: 11px * Theme.font-scale;
+                    font-family: Theme.font-sans;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

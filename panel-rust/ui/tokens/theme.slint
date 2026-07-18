@@ -1,0 +1,121 @@
+import { ColorScale } from "colors.slint";
+import { Typography } from "typography.slint";
+import { Metrics } from "metrics.slint";
+
+// Layer 2 -- the merged `Theme` global every other file imports. This
+// used to be the flat `ui/palette.slint`'s `Palette` global; the role is
+// unchanged (Phase 1 of chat-panel-ui-theme-parity.md's Slint-side
+// palette/radius tokens, transcribed verbatim from `panel-rust/src/
+// theme.rs` and unit-tested against `ui_html/index.html`'s
+// `:root`/`.dark` CSS blocks -- if either file changes, the other must be
+// updated to match, `theme.rs`'s doc comment cross-references this file
+// for the same reason), just split across `tokens/colors.slint` +
+// `tokens/typography.slint` + `tokens/metrics.slint` per
+// `DESIGN_SYSTEM.md`, with the old `sys-*` role names renamed to this
+// doc's `bg-*`/`text-*`/`border-*` utility-prefix convention:
+//
+//   sys-outer               -> bg-canvas
+//   sys-sidebar             -> bg-sidebar
+//   sys-card                -> bg-card
+//   sys-chat                -> bg-chat
+//   sys-border              -> border-default
+//   sys-border-strong       -> border-strong
+//   sys-text-primary        -> text-primary
+//   sys-text-secondary      -> text-secondary
+//   sys-text-muted          -> text-muted
+//   sys-primary             -> bg-primary
+//   sys-primary-container   -> bg-primary-container
+//   sys-on-primary          -> text-on-primary
+//   sys-on-primary-container -> text-on-primary-container
+//   sys-user-bubble         -> bg-user-bubble
+//   sys-user-bubble-border  -> border-user-bubble
+//   sys-user-bubble-text    -> text-user-bubble
+//   sys-agent-bubble        -> bg-agent-bubble
+//   sys-agent-bubble-border -> border-agent-bubble
+//   sys-agent-bubble-text   -> text-agent-bubble
+//   sys-terminal-bg         -> bg-terminal
+//   sys-terminal-border     -> border-terminal
+//   sys-terminal-text       -> text-terminal
+//
+// `theme`/`radius-preset`/`host-*` keep their exact pre-existing names --
+// `panel-rust/src/lib.rs` sets them through the generated
+// `Theme::get(&component)` FFI accessor (previously `Palette::get`), and
+// Slint's generated bindings only expose properties declared directly on
+// the global being accessed, so these cannot be relocated onto
+// `tokens/typography.slint`/`tokens/metrics.slint` even though they are
+// conceptually typography/metrics inputs.
+//
+// Status is deliberately monochrome (see `theme.rs`'s module doc) -- no
+// status-color properties are defined here by design.
+export global Theme {
+    in property <string> theme: "dark";
+    in property <string> radius-preset: "classic";
+    // Host-owned selectors. The panel intentionally keeps all colors and
+    // component tokens local; only these environment values cross the Qt ABI.
+    in property <string> host-language-tag: "";
+    in property <string> host-font-sans: "";
+    in property <float> host-font-scale: 1.0;
+    in property <float> host-density: 1.0;
+    // Every explicit component font consumes this token, so host
+    // accessibility scaling and the panel's base scale compose cleanly.
+    out property <float> font-scale: host-font-scale * Typography.font-scale-base;
+
+    property <bool> is-dark: theme != "light";
+
+    // bg-* / text-* / border-* role aliases, dark value first / light
+    // value second per role -- table + md-sys-color source names
+    // documented in theme.rs.
+    out property <color> bg-canvas: is-dark ? ColorScale.night-black : ColorScale.day-white;
+    out property <color> bg-sidebar: is-dark ? ColorScale.dark-surface-1 : ColorScale.light-surface-1;
+    out property <color> bg-card: is-dark ? ColorScale.dark-surface-1 : ColorScale.day-white;
+    out property <color> bg-chat: is-dark ? ColorScale.dark-surface-2 : ColorScale.light-surface-2;
+    out property <color> border-default: is-dark ? ColorScale.dark-border : ColorScale.light-border;
+    out property <color> border-strong: is-dark ? ColorScale.dark-border-strong : ColorScale.light-border-strong;
+    out property <color> text-primary: is-dark ? ColorScale.dark-text-primary : ColorScale.light-text-primary;
+    out property <color> text-secondary: is-dark ? ColorScale.dark-text-secondary : ColorScale.light-text-secondary;
+    out property <color> text-muted: is-dark ? ColorScale.dark-text-muted : ColorScale.light-text-muted;
+    out property <color> bg-primary: is-dark ? ColorScale.day-white : ColorScale.night-black;
+    out property <color> bg-primary-container: is-dark ? ColorScale.dark-primary-container : ColorScale.light-primary-container;
+    out property <color> text-on-primary: is-dark ? ColorScale.night-black : ColorScale.day-white;
+    out property <color> text-on-primary-container: is-dark ? ColorScale.day-white : ColorScale.night-black;
+    // Same-value aliases per theme.rs's SysRoles mapping table.
+    out property <color> bg-user-bubble: is-dark ? ColorScale.dark-user-bubble : ColorScale.light-user-bubble;
+    out property <color> border-user-bubble: border-default;
+    out property <color> text-user-bubble: text-primary;
+    out property <color> bg-agent-bubble: bg-sidebar;
+    out property <color> border-agent-bubble: border-default;
+    out property <color> text-agent-bubble: text-primary;
+    out property <color> bg-terminal: bg-sidebar;
+    out property <color> border-terminal: border-default;
+    out property <color> text-terminal: text-secondary;
+
+    // Tertiary role, per chat-items-redesign.md (memory/rui/gen/plans/ui/) --
+    // queued-message bar + user-bubble restyle. `text-accent-bright` is the
+    // "first skill invocation" bright variant (chat-items-redesign.md #6);
+    // aliased to the existing brightest text tone rather than a new hue, to
+    // keep this project's established monochrome-only status language (see
+    // this file's own module doc) intact even for this new role.
+    out property <color> bg-tertiary: is-dark ? ColorScale.dark-tertiary : ColorScale.light-tertiary;
+    out property <color> border-tertiary: border-default;
+    out property <color> text-tertiary: text-secondary;
+    out property <color> text-accent-bright: text-primary;
+
+    // Radius "finish" presets -- verbatim from index.html's
+    // `radiusPresets` object (theme.rs::RadiusPreset::scale()).
+    property <bool> is-sharp: radius-preset == "sharp";
+    property <bool> is-organic: radius-preset == "organic";
+    out property <length> radius-sm: is-sharp ? Metrics.radius-sm-sharp : is-organic ? Metrics.radius-sm-organic : Metrics.radius-sm-classic;
+    out property <length> radius-md: is-sharp ? Metrics.radius-md-sharp : is-organic ? Metrics.radius-md-organic : Metrics.radius-md-classic;
+    out property <length> radius-lg: is-sharp ? Metrics.radius-lg-sharp : is-organic ? Metrics.radius-lg-organic : Metrics.radius-lg-classic;
+
+    // Font families -- theme.rs::FontTokens. Registered at startup via
+    // `slint::register_font_from_memory` in `panel_rust_create` (Phase 1
+    // note: bundling the actual .ttf bytes is a separate, explicitly
+    // tracked sub-step -- see the theme-parity plan's Phase 1 acceptance
+    // criteria; until the fonts are bundled, these names fall back to
+    // Slint's default font, which is an accepted interim state, not
+    // silently pretending the fonts are embedded).
+    // Match the host editor whenever it provides a UI family.
+    out property <string> font-sans: host-font-sans != "" ? host-font-sans : "Sans Serif";
+    out property <string> font-mono: Typography.font-mono;
+}

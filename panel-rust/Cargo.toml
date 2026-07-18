@@ -22,6 +22,7 @@ vt100 = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
+i-slint-backend-testing = "1.17.1"
 # Raw profiles/create + mcp_servers/create HTTP calls in this crate's
 # ported real-process e2e tests (tests/gateway_actor_*_e2e_test.rs,
 # ported directly from the former rui-acpx-client crate's own test

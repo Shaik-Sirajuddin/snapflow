@@ -1,0 +1,61 @@
+// Layer 1 (tokens) -- raw hex values only, no theme/dark-light logic, no
+// semantic meaning attached. Transcribed verbatim from the same source
+// `palette.slint` used to (`panel-rust/src/theme.rs`, Phase 0, unit-tested
+// against `ui_html/index.html`'s `:root`/`.dark` CSS blocks).
+//
+// This app has semantic dark/light *pairs* per role rather than a
+// Tailwind-style numeric 50..950 scale, so these are named after the
+// role-pair they back (see `theme.slint`'s doc comment for how each pair
+// resolves to a single `Theme.*` value based on `Theme.theme`), not after
+// an arbitrary lightness index -- that would invent structure that isn't
+// there. Every literal below appears exactly once here; `theme.slint` is
+// the only file allowed to reference `ColorScale` or write a raw hex
+// literal.
+export global ColorScale {
+    out property <color> night-black: #000000;
+    out property <color> day-white: #ffffff;
+
+    // sys-sidebar / sys-card dark vs light
+    out property <color> dark-surface-1: #09090b;
+    out property <color> light-surface-1: #f4f4f7;
+
+    // sys-chat dark vs light
+    out property <color> dark-surface-2: #131313;
+    out property <color> light-surface-2: #fafafc8c;
+
+    // sys-border dark vs light
+    out property <color> dark-border: #ffffff3c;
+    out property <color> light-border: #0000000f;
+
+    // sys-border-strong dark vs light
+    out property <color> dark-border-strong: #ffffff78;
+    out property <color> light-border-strong: #0000001f;
+
+    // sys-text-primary dark vs light
+    out property <color> dark-text-primary: #f2f2f7;
+    out property <color> light-text-primary: #121212;
+
+    // sys-text-secondary dark vs light
+    out property <color> dark-text-secondary: #a1a1a6;
+    out property <color> light-text-secondary: #555558;
+
+    // sys-text-muted dark vs light
+    out property <color> dark-text-muted: #636366;
+    out property <color> light-text-muted: #8a8a8f;
+
+    // sys-primary-container dark vs light
+    out property <color> dark-primary-container: #1c1c1e;
+    out property <color> light-primary-container: #e5e5ea;
+
+    // sys-user-bubble dark vs light
+    out property <color> dark-user-bubble: #151518;
+    out property <color> light-user-bubble: #eaeaea;
+
+    // tertiary surface dark vs light -- chat-items-redesign.md's "tertiary
+    // variant" (queued-message bar, user bubble restyle). A step up in
+    // contrast from the card/sidebar surface tier, a step down from
+    // primary-container, so a queued/pending state reads distinctly from
+    // both an ordinary card and the bold primary-container chip treatment.
+    out property <color> dark-tertiary: #232326;
+    out property <color> light-tertiary: #dcdce2;
+}

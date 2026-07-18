@@ -1,0 +1,92 @@
+import { Theme } from "../tokens/theme.slint";
+import { Button } from "../base/button.slint";
+import { PendingRequestItem } from "../types.slint";
+
+// Interactive agent-request relay addition: renders one pending
+// `session/request_permission`/`fs/*`/`terminal/create` decision as a
+// full-width card docked above the compose bar -- see
+// `panel-rust/src/permission.rs`'s module doc comment for the
+// per-method summary/response contract this visualizes. Deliberately
+// monochrome, matching `message_card.slint`'s "status stays monochrome"
+// convention -- approve is the filled/primary action (visually the same
+// treatment as the compose bar's own Send button), reject is a plain
+// bordered secondary action, no red/green semantic coloring.
+export component PermissionCard inherits Rectangle {
+    in property <PendingRequestItem> item;
+    callback approve();
+    callback reject();
+
+    background: Theme.bg-card;
+    border-color: Theme.border-strong;
+    border-width: 1px;
+    border-radius: Theme.radius-md;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: "\u{26A0}"; // warning-triangle glyph, stand-in for a permission-shield icon
+                color: Theme.bg-primary;
+                font-size: 12px * Theme.font-scale;
+                vertical-alignment: center;
+            }
+            Text {
+                text: item.title;
+                color: Theme.text-primary;
+                font-family: Theme.font-sans;
+                font-size: 12px * Theme.font-scale;
+                font-weight: 700;
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+            Text {
+                text: item.method;
+                color: Theme.text-muted;
+                font-family: Theme.font-mono;
+                font-size: 9px * Theme.font-scale;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: item.summary;
+            color: Theme.text-secondary;
+            font-family: Theme.font-sans;
+            font-size: 11px * Theme.font-scale;
+            wrap: word-wrap;
+            overflow: elide;
+        }
+        if item.supported : HorizontalLayout {
+            spacing: 8px;
+            Rectangle { }
+            Button {
+                label: "Reject";
+                button-accessible-label: "Reject request";
+                btn-width: 72px;
+                btn-height: 26px;
+                clicked => { reject(); }
+            }
+            Button {
+                label: "Approve";
+                button-accessible-label: "Approve request";
+                primary: true;
+                btn-width: 72px;
+                btn-height: 26px;
+                font-weight: 700;
+                clicked => { approve(); }
+            }
+        }
+        if !item.supported : Text {
+            text: "This request kind isn't supported by this UI build yet -- the agent's own request timeout/fallback policy will resolve it.";
+            color: Theme.text-muted;
+            font-family: Theme.font-sans;
+            font-size: 10px * Theme.font-scale;
+            font-italic: true;
+            wrap: word-wrap;
+        }
+    }
+}

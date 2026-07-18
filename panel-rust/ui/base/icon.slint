@@ -1,0 +1,16 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Generic SVG icon primitive -- every icon in `components/` should go
+// through this rather than hand-rolling font-size/colorize/fit on a raw
+// `Image`. Source SVGs live in `ui/assets/icons/` (vendored from Lucide,
+// ISC-licensed -- see that folder's LICENSE), passed in per call site
+// since `@image-url(...)` requires a compile-time-constant literal path
+// and so can't be resolved dynamically from a `name: string` property.
+export component Icon inherits Image {
+    in property <length> size: 16px;
+    in property <color> color: Theme.text-primary;
+    width: size;
+    height: size;
+    colorize: color;
+    image-fit: contain;
+}

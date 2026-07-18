@@ -39,6 +39,8 @@ pub enum AcpxThreadError {
 pub struct RemoteThreadInfo {
     pub acp_session_id: String,
     pub agent_id: String,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 enum Command {
@@ -66,11 +68,19 @@ enum Command {
         cwd: PathBuf,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    /// ACP's lighter `session/resume` reattachment path. Unlike
+    /// `session/load`, it does not replay prior history.
+    ReattachSession {
+        session_id: String,
+        cwd: PathBuf,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     SendPrompt {
         text: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
    ListSessions {
+       agent_id: Option<String>,
        resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
    },
     /// `profiles/list` -- every profile the bound gateway currently has
@@ -86,7 +96,20 @@ enum Command {
     /// imply session close by default, only an explicit caller
     /// (a future per-thread "close on exit" setting) should ever send
     /// this.
-    CloseSession {
+   CloseSession {
+       resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+   },
+    /// Real, stable v1 ACP `session/delete` -- permanently removes a
+    /// session (backend-forwarded `Proxied` method, see `acpx-core::
+    /// router`'s own doc comment on this method's classification).
+    /// Deliberately requires an explicit caller, same "never sent by
+    /// shutdown()/Drop" posture as [`Command::CloseSession`] -- in
+    /// practice a caller should `session/close` first (this crate's own
+    /// `acpx-core::router` rehydration test suite exercises exactly
+    /// that close-then-delete order), but this command sends whatever
+    /// `session_id` this handle currently knows regardless of whether
+    /// it was ever explicitly closed first.
+    DeleteSession {
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `session/set_mode` -- see [`AcpxThreadHandle::set_mode`]'s doc
@@ -120,8 +143,28 @@ enum Command {
         entry: serde_json::Value,
         resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
     },
-    /// `mcp_servers/delete`.
-    DeleteMcpServer {
+   /// `mcp_servers/delete`.
+   DeleteMcpServer {
+       name: String,
+       resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+   },
+    /// `profiles/create`. `entry` must include a `"name"` field (the
+    /// merge key `acpx-core::profile::ProfileStore` uses). See
+    /// `acpx_client::ext::profiles::create`'s doc comment for the
+    /// accepted payload shape (`name`, `agent_id`, `provider`,
+    /// `key_ref`, `launch_overrides`, `mcp_servers`, and the
+    /// create/update-only `secret` field).
+    CreateProfile {
+        entry: serde_json::Value,
+        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+    },
+    /// `profiles/update` -- same payload shape as create.
+    UpdateProfile {
+        entry: serde_json::Value,
+        resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
+    },
+    /// `profiles/delete`.
+    DeleteProfile {
         name: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
@@ -166,6 +209,20 @@ pub struct AcpxThreadHandle {
     /// until the prompt call itself returns).
     respond_tx: mpsc::UnboundedSender<RespondCommand>,
     pub events: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+/// Delivers the shared provider gateway to an actor created before its
+/// connection has completed. The bridge uses this during restored-session
+/// startup so cached UI state is available before network reconciliation.
+#[derive(Clone)]
+pub struct AcpxThreadGatewaySetter {
+    gateway_tx: watch::Sender<Option<Arc<Gateway>>>,
+}
+
+impl AcpxThreadGatewaySetter {
+    pub fn set_gateway(&self, gateway: Arc<Gateway>) {
+        let _ = self.gateway_tx.send(Some(gateway));
+    }
 }
 
 struct RespondCommand {
@@ -234,6 +291,23 @@ impl AcpxThreadHandle {
         .await
     }
 
+    /// Attaches this client connection to an existing session with ACP's
+    /// no-history-replay `session/resume` operation.
+    pub async fn reattach_session(
+        &self,
+        session_id: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+    ) -> Result<(), AcpxThreadError> {
+        let session_id = session_id.into();
+        let cwd = cwd.into();
+        self.call(|resp| Command::ReattachSession {
+            session_id,
+            cwd,
+            resp,
+        })
+        .await
+    }
+
     /// Send a prompt on the currently open/resumed session and drain the
     /// turn to completion, forwarding every `session/update` the gateway
     /// aggregated (`_acpx.updates`) to `events` in order, then a final
@@ -247,7 +321,21 @@ impl AcpxThreadHandle {
     /// backend *this gateway* currently supervises, not just this
     /// thread's own.
    pub async fn list_sessions(&self) -> Result<Vec<RemoteThreadInfo>, AcpxThreadError> {
-       self.call(|resp| Command::ListSessions { resp }).await
+       self.call(|resp| Command::ListSessions {
+           agent_id: None,
+           resp,
+       })
+       .await
+   }
+
+    /// Typed, per-backend `session/list`, preserving ACP `title` and
+    /// `updatedAt` metadata for cache reconciliation.
+    pub async fn list_sessions_for_agent(
+        &self,
+        agent_id: impl Into<String>,
+    ) -> Result<Vec<RemoteThreadInfo>, AcpxThreadError> {
+        let agent_id = Some(agent_id.into());
+        self.call(|resp| Command::ListSessions { agent_id, resp }).await
    }
 
     /// `profiles/list` against this thread's bound gateway -- what a
@@ -258,9 +346,15 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ListProfiles { resp }).await
     }
 
-    /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
-    pub async fn close_session(&self) -> Result<(), AcpxThreadError> {
-        self.call(|resp| Command::CloseSession { resp }).await
+   /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
+   pub async fn close_session(&self) -> Result<(), AcpxThreadError> {
+       self.call(|resp| Command::CloseSession { resp }).await
+   }
+
+    /// Real `session/delete` -- opt-in only, see [`Command::
+    /// DeleteSession`]'s doc comment on ordering vs. `close_session`.
+    pub async fn delete_session(&self) -> Result<(), AcpxThreadError> {
+        self.call(|resp| Command::DeleteSession { resp }).await
     }
 
     /// `session/set_mode` against this thread's bound session --
@@ -333,10 +427,36 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::UpdateMcpServer { entry, resp }).await
     }
 
-    /// `mcp_servers/delete`.
-    pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+   /// `mcp_servers/delete`.
+   pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+       let name = name.into();
+       self.call(|resp| Command::DeleteMcpServer { name, resp }).await
+   }
+
+    /// `profiles/create`. `entry` must include a `"name"` field, same
+    /// shape `AcpxThreadHandle::list_profiles`'s `ProfileSummary`
+    /// narrows down for read -- this is the raw create/update payload,
+    /// so it accepts every field `acpx-core::profile::Profile` supports
+    /// (see [`Command::CreateProfile`]'s doc comment).
+    pub async fn create_profile(
+        &self,
+        entry: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpxThreadError> {
+        self.call(|resp| Command::CreateProfile { entry, resp }).await
+    }
+
+    /// `profiles/update` -- same payload shape as [`Self::create_profile`].
+    pub async fn update_profile(
+        &self,
+        entry: serde_json::Value,
+    ) -> Result<serde_json::Value, AcpxThreadError> {
+        self.call(|resp| Command::UpdateProfile { entry, resp }).await
+    }
+
+    /// `profiles/delete`.
+    pub async fn delete_profile(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
         let name = name.into();
-        self.call(|resp| Command::DeleteMcpServer { name, resp }).await
+        self.call(|resp| Command::DeleteProfile { name, resp }).await
     }
 
     /// `agents/list` -- the registry's agent catalogue with this
@@ -437,10 +557,10 @@ impl AcpxThreadHandle {
 /// instead of this one.
 pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
     let base_url = base_url.into();
-    let (handle, ready_tx) = spawn_acpx_thread_pending();
+    let (handle, gateway_setter) = spawn_acpx_thread_pending();
     tokio::spawn(async move {
         let gateway = Arc::new(Gateway::connect(base_url).await);
-        let _ = ready_tx.send(Some(gateway));
+        gateway_setter.set_gateway(gateway);
     });
     handle
 }
@@ -462,9 +582,16 @@ pub fn spawn_acpx_thread(base_url: impl Into<String>) -> AcpxThreadHandle {
 /// never blocks another thread's cancel/respond/prompt call from
 /// completing on the same shared connection.
 pub fn spawn_acpx_thread_with_gateway(gateway: Arc<Gateway>) -> AcpxThreadHandle {
-    let (handle, ready_tx) = spawn_acpx_thread_pending();
-    let _ = ready_tx.send(Some(gateway));
+    let (handle, gateway_setter) = spawn_acpx_thread_pending();
+    gateway_setter.set_gateway(gateway);
     handle
+}
+
+/// Spawn an actor immediately, with its gateway delivered later through the
+/// returned setter. Commands may be submitted before delivery; its workers
+/// wait for the shared gateway rather than failing the command.
+pub fn spawn_acpx_thread_with_delayed_gateway() -> (AcpxThreadHandle, AcpxThreadGatewaySetter) {
+    spawn_acpx_thread_pending()
 }
 
 /// Shared plumbing for both public constructors above: sets up every
@@ -477,7 +604,7 @@ pub fn spawn_acpx_thread_with_gateway(gateway: Arc<Gateway>) -> AcpxThreadHandle
 /// channel seeded once) since four independent tasks (main loop, cancel
 /// worker, respond worker, plus this function's own caller) all need to
 /// read the same connected `Gateway` exactly once.
-fn spawn_acpx_thread_pending() -> (AcpxThreadHandle, watch::Sender<Option<Arc<Gateway>>>) {
+fn spawn_acpx_thread_pending() -> (AcpxThreadHandle, AcpxThreadGatewaySetter) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
     let (respond_tx, respond_rx) = mpsc::unbounded_channel();
@@ -499,7 +626,7 @@ fn spawn_acpx_thread_pending() -> (AcpxThreadHandle, watch::Sender<Option<Arc<Ga
             respond_tx,
             events: event_rx,
         },
-        gateway_tx,
+        AcpxThreadGatewaySetter { gateway_tx },
     )
 }
 
@@ -851,10 +978,21 @@ async fn run_thread_actor(
     }
     let mut session_id: Option<String> = None;
 
-    while let Some(cmd) = cmd_rx.recv().await {
-        while let Ok(update) = live_rx.try_recv() {
-            forward_updates(&[update], &event_tx);
-        }
+    // Keep forwarding live session updates even while the user is idle.
+    // `session/load` is allowed to replay after its RPC response; waiting
+    // only inside a command handler stranded those late frames in
+    // `live_rx` until the next user action.
+    loop {
+        let cmd = tokio::select! {
+            Some(update) = live_rx.recv() => {
+                forward_updates(&[update], &event_tx);
+                continue;
+            }
+            command = cmd_rx.recv() => match command {
+                Some(command) => command,
+                None => break,
+            },
+        };
         match cmd {
             Command::OpenSession { cwd, profile, resp } => {
                 let params = serde_json::json!({
@@ -917,8 +1055,14 @@ async fn run_thread_actor(
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
                             forward_updates(&updates, &event_tx);
+                            // A session/load replay is allowed to start
+                            // before its RPC response, but a busy real
+                            // host can schedule the WS reader just after
+                            // that response. Wait through one short UI
+                            // frame budget before declaring the replay
+                            // empty, then drain the rest already queued.
                             if let Ok(Some(update)) = tokio::time::timeout(
-                                std::time::Duration::from_millis(50),
+                                std::time::Duration::from_millis(500),
                                 live_rx.recv(),
                             )
                             .await
@@ -933,6 +1077,37 @@ async fn run_thread_actor(
                             Ok(())
                         }
                         Err(e) => Err(e.into()),
+                    };
+                    if result.is_ok() || attempt == 4 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                }
+                let _ = resp.send(result);
+            }
+            Command::ReattachSession {
+                session_id: sid,
+                cwd,
+                resp,
+            } => {
+                let params = serde_json::json!({
+                    "sessionId": sid,
+                    "cwd": cwd.to_string_lossy(),
+                });
+                let mut result = Err(AcpxThreadError::ActorGone);
+                for attempt in 0..5 {
+                    result = match client
+                        .call_with_updates("session/resume", params.clone(), None)
+                        .await
+                    {
+                        Ok((value, updates)) => {
+                            emit_capability_events(&value, &event_tx);
+                            forward_updates(&updates, &event_tx);
+                            session_id = Some(sid.clone());
+                            let _ = session_tx.send(Some(sid.clone()));
+                            Ok(())
+                        }
+                        Err(error) => Err(error.into()),
                     };
                     if result.is_ok() || attempt == 4 {
                         break;
@@ -965,16 +1140,24 @@ async fn run_thread_actor(
                 match outcome {
                     Ok((result, updates)) => {
                         forward_updates(&updates, &event_tx);
-                        if let Ok(Some(update)) = tokio::time::timeout(
-                            std::time::Duration::from_millis(100),
-                            live_rx.recv(),
-                        )
-                        .await
-                        {
-                            forward_updates(&[update], &event_tx);
-                        }
-                        while let Ok(update) = live_rx.try_recv() {
-                            forward_updates(&[update], &event_tx);
+                        // A resumed WS subscription can receive a burst of
+                        // final notifications just after the prompt response.
+                        // Keep draining until the stream is briefly quiet,
+                        // bounded by a hard deadline so a bad backend can
+                        // never hold the turn open indefinitely.
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+                        let mut wait = std::time::Duration::from_millis(250);
+                        while tokio::time::Instant::now() < deadline {
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            match tokio::time::timeout(wait.min(remaining), live_rx.recv()).await {
+                                Ok(Some(update)) => {
+                                    forward_updates(&[update], &event_tx);
+                                    wait = std::time::Duration::from_millis(75);
+                                }
+                                Ok(None) | Err(_) => break,
+                            }
                         }
                         let stop_reason = result
                             .get("stopReason")
@@ -990,25 +1173,25 @@ async fn run_thread_actor(
                     }
                 }
             }
-            Command::ListSessions { resp } => {
-                let result = client
-                    .call("session/list", serde_json::json!({}), None)
-                    .await
-                    .map(|value| {
-                        value["sessions"]
-                            .as_array()
-                            .cloned()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter_map(|session| {
-                                Some(RemoteThreadInfo {
-                                    acp_session_id: session.get("sessionId")?.as_str()?.to_owned(),
-                                    agent_id: session.get("agentId")?.as_str()?.to_owned(),
-                                })
-                            })
-                            .collect()
-                    });
-               let _ = resp.send(result.map_err(Into::into));
+            Command::ListSessions { agent_id, resp } => {
+                let result = match agent_id {
+                    Some(agent_id) => {
+                        acpx_client::ext::sessions::list_for_agent(&client, &agent_id).await
+                    }
+                    None => acpx_client::ext::sessions::list_gateway(&client).await,
+                }
+                .map(|sessions| {
+                    sessions
+                        .into_iter()
+                        .map(|session| RemoteThreadInfo {
+                            acp_session_id: session.session_id,
+                            agent_id: session.agent_id,
+                            title: session.title,
+                            updated_at: session.updated_at,
+                        })
+                        .collect()
+                });
+                let _ = resp.send(result.map_err(Into::into));
            }
             Command::ListProfiles { resp } => {
                 let result = client
@@ -1042,16 +1225,26 @@ async fn run_thread_actor(
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
-            Command::CloseSession { resp } => {
+           Command::CloseSession { resp } => {
+               let Some(sid) = session_id.clone() else {
+                   // Never opened -- closing a session that was never
+                   // opened on this handle is a no-op success, not an
+                   // error (nothing gateway-side to close).
+                   let _ = resp.send(Ok(()));
+                   continue;
+               };
+               let params = serde_json::json!({ "sessionId": sid });
+               let result = client.call("session/close", params, None).await;
+               let _ = resp.send(result.map(|_| ()).map_err(Into::into));
+           }
+            Command::DeleteSession { resp } => {
                 let Some(sid) = session_id.clone() else {
-                    // Never opened -- closing a session that was never
-                    // opened on this handle is a no-op success, not an
-                    // error (nothing gateway-side to close).
+                    // Never opened -- nothing gateway-side to delete.
                     let _ = resp.send(Ok(()));
                     continue;
                 };
                 let params = serde_json::json!({ "sessionId": sid });
-                let result = client.call("session/close", params, None).await;
+                let result = client.call("session/delete", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::SetMode { mode_id, resp } => {
@@ -1127,9 +1320,24 @@ async fn run_thread_actor(
                 let result = client.call("mcp_servers/update", entry, None).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
-            Command::DeleteMcpServer { name, resp } => {
+           Command::DeleteMcpServer { name, resp } => {
+               let result = client
+                   .call("mcp_servers/delete", serde_json::json!({ "name": name }), None)
+                   .await
+                   .map(|_| ());
+               let _ = resp.send(result.map_err(Into::into));
+           }
+            Command::CreateProfile { entry, resp } => {
+                let result = client.call("profiles/create", entry, None).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::UpdateProfile { entry, resp } => {
+                let result = client.call("profiles/update", entry, None).await;
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::DeleteProfile { name, resp } => {
                 let result = client
-                    .call("mcp_servers/delete", serde_json::json!({ "name": name }), None)
+                    .call("profiles/delete", serde_json::json!({ "name": name }), None)
                     .await
                     .map(|_| ());
                 let _ = resp.send(result.map_err(Into::into));

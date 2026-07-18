@@ -1,0 +1,184 @@
+// Dev-only viewer wrapper -- NOT part of production ui/ sources.
+// Gives the real ChatPanel a sane initial window size around it so
+// slint-viewer (which has no --width/--height flag and no host to
+// drive resize) doesn't render at its cramped natural minimum size.
+// Uses preferred-width/preferred-height (initial-size hint only) rather
+// than width/height (which Slint treats as a fixed, non-resizable
+// window size) so the window stays freely resizable/maximizable via
+// the window manager after launch.
+// Imports the real app.slint unmodified, so --auto-reload still
+// picks up edits to any production .slint file.
+//
+// Mock chat data below is set as plain property-override bindings
+// (not --load-data JSON) -- --load-data only reflects properties
+// declared directly on the loaded component, not ones inherited
+// from ChatPanel, so JSON-driven mock data silently fails
+// ("ignoring unknown property: threads" etc). Overriding via normal
+// Slint inheritance (like width/height below) works because these
+// bindings are compiled directly against DevRoot, same mechanism.
+import { ChatPanel } from "__CHATPANEL_SLINT__";
+
+export component DevRoot inherits ChatPanel {
+    preferred-width: 1600px;
+    preferred-height: 1000px;
+    selected-thread: 1;
+    connection-status: "Connected";
+    compact: false;
+    sidebar-expanded: true;
+    narrow: false;
+    agent-badge: "codex . ask";
+    has-older-messages: true;
+    loading-older-messages: false;
+    threads: [
+        {
+            name: "Refactor auth middleware",
+            status: "idle",
+            busy: false,
+            open: true,
+            background: false,
+            description: "Split session validation into its own module",
+            closed: false,
+        },
+        {
+            name: "Fix flaky upload test",
+            status: "loading",
+            busy: true,
+            open: true,
+            background: false,
+            description: "Reproducing the race in CI, adding a retry",
+            closed: false,
+        },
+        {
+            name: "Investigate memory leak",
+            status: "error",
+            busy: false,
+            open: true,
+            background: true,
+            description: "Heap growth in the render worker after ~2h",
+            closed: false,
+        },
+        {
+            name: "Docs: onboarding guide",
+            status: "closed",
+            busy: false,
+            open: true,
+            background: false,
+            description: "Draft reviewed and merged",
+            closed: true,
+        },
+    ];
+    messages: [
+        {
+            kind: "user",
+            text: "The upload integration test fails about 1 in 10 runs on CI, can you find out why?",
+            status: "",
+            expanded: false,
+            index: 0,
+        },
+        {
+            kind: "thinking",
+            text: "Likely a race between the upload finishing and the test asserting on the resulting file -- checking the test harness's wait condition first.",
+            status: "",
+            expanded: false,
+            index: 1,
+        },
+        {
+            kind: "tool_use",
+            text: "grep -rn \"wait_for_upload\" tests/",
+            status: "COMPLETED",
+            expanded: true,
+            index: 2,
+        },
+        {
+            kind: "agent",
+            text: "Found it: `wait_for_upload` polls the DB row but not the object-store write, so the test can see the row committed before the blob is actually flushed. I'll add a blob-existence check to the poll loop.",
+            status: "",
+            expanded: false,
+            index: 3,
+        },
+        {
+            kind: "tool_use",
+            text: "apply_patch tests/support/upload_helpers.rs",
+            status: "COMPLETED",
+            expanded: false,
+            index: 4,
+        },
+        {
+            kind: "user",
+            text: "Nice catch. Run the suite a few times to make sure it's stable now.",
+            status: "",
+            expanded: false,
+            index: 5,
+        },
+        {
+            kind: "tool_use",
+            text: "cargo test upload_flow -- --test-threads=1 --repeat=20",
+            status: "RUNNING",
+            expanded: true,
+            index: 6,
+        },
+        {
+            kind: "agent",
+            text: "Running 20 iterations now, will report back once it finishes.",
+            status: "",
+            expanded: false,
+            index: 7,
+        },
+        {
+            kind: "user",
+            text: "lets start it this way can you find out professional video editing softwares popular amount video editors , software , website , opensource , github , users , mit or gpl or apache licence , licence type , created at , learning curve in time period ( week , month, e.t.c ) for a hi",
+            status: "",
+            expanded: false,
+            index: 8,
+        },
+        {
+            kind: "agent",
+            text: "There isn't one — `OPENCODE_SERVER_PASSWORD` was never set, so the server started unauthenticated (it printed `Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.` on boot). Anyone who can reach `127.0.0.1:7770` on this machine can use it as-is, no credentials requ",
+            status: "",
+            expanded: false,
+            index: 9,
+        },
+        {
+            kind: "thinking",
+            text: "The user has run the `/model haiku` command, which set the model to Haiku (claude-haiku-4-5-20251001). This is just a local command caveat that I should not respond to unless explicitly asked. However, they also want me to reply with exactly: \"ACPX_HTTP_400_RECHECK_OK\" This seems",
+            status: "",
+            expanded: false,
+            index: 10,
+        },
+        {
+            kind: "tool_use",
+            text: "ls -la /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main | head -50 && echo \"---\" && find /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main -iname \"*opencode*\" -not -path \"*/node_modules/*\" 2>/dev/null",
+            status: "COMPLETED",
+            expanded: false,
+            index: 11,
+        },
+        {
+            kind: "tool_use",
+            text: "Edit opencode.json",
+            status: "COMPLETED",
+            expanded: false,
+            index: 12,
+        },
+        {
+            kind: "skill_use",
+            text: "artifact-design",
+            status: "",
+            expanded: false,
+            index: 13,
+        },
+        {
+            kind: "mcp_server_call",
+            text: "mcp__claude-in-chrome__tabs_context_mcp",
+            status: "COMPLETED",
+            expanded: false,
+            index: 14,
+        },
+        {
+            kind: "tool_use",
+            text: "latest AI news 2026",
+            status: "RUNNING",
+            expanded: true,
+            index: 15,
+        },
+    ];
+}

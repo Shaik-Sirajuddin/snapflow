@@ -194,7 +194,8 @@ async fn resume_session_replays_history_via_session_load() {
     let db_dir = tempfile::tempdir().expect("tempdir");
     let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
 
-    let opener = spawn_acpx_thread(gateway.base_url.clone());
+    let mut opener = spawn_acpx_thread(gateway.base_url.clone());
+    let mut opener_events = opener.take_events();
     let session_id = opener
         .open_session(std::env::current_dir().unwrap())
         .await
@@ -203,6 +204,16 @@ async fn resume_session_replays_history_via_session_load() {
         .send_prompt("history before relaunch")
         .await
         .expect("seed session history");
+    assert!(
+        wait_for_message_containing(
+            &mut opener_events,
+            "HISTORY BEFORE RELAUNCH",
+            Duration::from_secs(10),
+        )
+        .await
+        .is_some(),
+        "seed prompt must finish before simulating a panel relaunch"
+    );
     opener.shutdown();
 
     // Fresh handle/actor, same gateway -- proves resume works against a
@@ -224,6 +235,63 @@ async fn resume_session_replays_history_via_session_load() {
     assert!(
         reply.is_some(),
         "expected session/load's replayed-history reply via the gateway"
+    );
+}
+
+#[tokio::test]
+async fn reattach_session_uses_resume_without_replaying_history() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
+
+    let opener = spawn_acpx_thread(gateway.base_url.clone());
+    let session_id = opener
+        .open_session(std::env::current_dir().unwrap())
+        .await
+        .expect("open_session");
+    opener
+        .send_prompt("history must stay cached locally")
+        .await
+        .expect("seed session history");
+    opener.shutdown();
+
+    let mut reattacher = spawn_acpx_thread(gateway.base_url.clone());
+    let mut events_rx = reattacher.take_events();
+    reattacher
+        .reattach_session(session_id, std::env::current_dir().unwrap())
+        .await
+        .expect("session/resume");
+
+    let replayed = tokio::time::timeout(Duration::from_millis(250), events_rx.recv()).await;
+    assert!(
+        !matches!(replayed, Ok(Some(AgentEvent::Message(_)))),
+        "session/resume must not replay cached history: {replayed:?}"
+    );
+
+    reattacher
+        .send_prompt("new turn after reattach")
+        .await
+        .expect("prompt after session/resume");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut reply = None;
+    let mut observed = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Some(event)) =
+            tokio::time::timeout(remaining.min(Duration::from_millis(250)), events_rx.recv()).await
+        else {
+            continue;
+        };
+        match &event {
+            AgentEvent::Message(message) if message.text.contains("NEW TURN AFTER REATTACH") => {
+                reply = Some(message.text.clone());
+                break;
+            }
+            _ => observed.push(format!("{event:?}")),
+        }
+    }
+    assert!(
+        reply.is_some(),
+        "reattached session did not emit its next prompt response; observed {observed:?}"
     );
 }
 
@@ -372,5 +440,182 @@ async fn window_close_does_not_close_the_gateway_session() {
     assert!(
         sessions.iter().any(|s| s.acp_session_id == session_id),
         "session {session_id} should still be live after local handle shutdown (no session/close was sent); got {sessions:?}"
+    );
+}
+
+/// Coverage Matrix `session/close`, `session/delete` row -- real,
+/// backend-forwarded ACP methods (see `acpx-core::router`'s own
+/// `MethodClass::Proxied` classification and doc comment on both), not
+/// gateway-native bookkeeping alone. Proven with the same "only the live
+/// relay path could produce this evidence" technique the rest of this
+/// project's real-process tests use: `rui-mock-agent` is told (via
+/// `RUI_MOCK_AGENT_EVENT_LOG`) to append one JSON line per `session/
+/// close`/`session/delete` request it actually receives on its own
+/// stdio, tagged with the real session id -- if `close_session`/
+/// `delete_session` had silently no-op'd locally (e.g. because
+/// `session_id` was never captured on the actor, the real bug class
+/// `Command::CloseSession`'s own "never opened" no-op branch exists to
+/// distinguish from), this log would stay empty or short a line and the
+/// test would fail, not pass by coincidence.
+#[tokio::test]
+async fn close_then_delete_session_round_trip_through_a_real_gateway() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let event_log = db_dir.path().join("backend-events.jsonl");
+    let persona = "codex".to_string();
+    let db_path = db_dir.path().join("acpx.sqlite3");
+    let event_log_for_env = event_log.clone();
+    let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
+        command
+            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env(
+                "ACPX_BACKEND_CMD",
+                mock_agent_bin().to_string_lossy().to_string(),
+            )
+            .env("ACPX_DEFAULT_AGENT_ID", &persona)
+            .env("ACPX_DB_PATH", &db_path)
+            .env("RUI_MOCK_AGENT_PERSONA", &persona)
+            .env("RUI_MOCK_AGENT_EVENT_LOG", &event_log_for_env)
+            .env("RUST_LOG", "error");
+    });
+    let gateway = GatewayProcess { child, base_url };
+
+    let handle = spawn_acpx_thread(gateway.base_url.clone());
+    let session_id = handle
+        .open_session(std::env::current_dir().unwrap())
+        .await
+        .expect("open_session");
+
+    handle.close_session().await.expect("close_session");
+
+    // `session/close` evicts the in-memory registry entry -- proven at
+    // the `acpx-core::router` unit-test layer already
+    // (`session_load_rehydration_test.rs`); here, proven through the
+    // real gateway process: `session/list` must no longer report a
+    // closed session as live.
+    let checker = spawn_acpx_thread(gateway.base_url.clone());
+    let sessions_after_close = checker.list_sessions().await.expect("list_sessions");
+    assert!(
+        !sessions_after_close
+            .iter()
+            .any(|s| s.acp_session_id == session_id),
+        "closed session {session_id} must not be reported as live by session/list; got {sessions_after_close:?}"
+    );
+
+    handle.delete_session().await.expect("delete_session");
+
+    let events = std::fs::read_to_string(&event_log).unwrap_or_default();
+    // The backend log records *its own* native session id
+    // (`mock-session-N`), not the gateway-issued `session_id` this test
+    // otherwise deals in -- `acpx-core::router::translate_or_register_
+    // backend_session` deliberately never leaks the gateway id to the
+    // backend. This test only ever opens one session, so an unscoped
+    // method-name match is unambiguous; a real regression (the relay
+    // silently no-op'ing instead of reaching the backend) would leave
+    // these lines entirely absent, not merely mis-attributed.
+    let close_line = events.lines().find(|line| line.contains("\"session/close\""));
+    let delete_line = events.lines().find(|line| line.contains("\"session/delete\""));
+    assert!(
+        close_line.is_some(),
+        "expected a real session/close request to reach the backend for {session_id}; log:\n{events}"
+    );
+    assert!(
+        delete_line.is_some(),
+        "expected a real session/delete request to reach the backend for {session_id}; log:\n{events}"
+    );
+}
+
+/// Coverage-matrix `session/cancel` row, host-scenario prerequisite: proves
+/// the real, compiled `rui-mock-agent` binary itself (not the throwaway
+/// bash stand-in `agent_bridge.rs`'s own cancel test uses) correctly
+/// implements the `slow `-prefixed-prompt-blocks-until-`session/cancel`
+/// contract the host XTEST Stop-button scenario needs. If `rui-mock-
+/// agent`'s new cancel-notification handler never actually reached the
+/// blocked prompt (e.g. the dispatch loop serialized instead of
+/// concurrently running the notification handler while the prompt handler
+/// was still pending -- a real risk this exact crate's own docs warn
+/// about), this would hang until the prompt's own 20s safety-net timeout
+/// and resolve with `"end_turn"` instead of `"cancelled"`, not the crate
+/// panicking or erroring outright -- so this asserts the *reason string*
+/// specifically, not merely that the turn eventually ended.
+#[tokio::test]
+async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let event_log = db_dir.path().join("backend-events.jsonl");
+    let persona = "codex".to_string();
+    let db_path = db_dir.path().join("acpx.sqlite3");
+    let event_log_for_env = event_log.clone();
+    let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
+        command
+            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env(
+                "ACPX_BACKEND_CMD",
+                mock_agent_bin().to_string_lossy().to_string(),
+            )
+            .env("ACPX_DEFAULT_AGENT_ID", &persona)
+            .env("ACPX_DB_PATH", &db_path)
+            .env("RUI_MOCK_AGENT_PERSONA", &persona)
+            .env("RUI_MOCK_AGENT_EVENT_LOG", &event_log_for_env)
+            .env("RUST_LOG", "error");
+    });
+    let gateway = GatewayProcess { child, base_url };
+
+    let mut handle = spawn_acpx_thread(gateway.base_url.clone());
+    let mut events_rx = handle.take_events();
+    handle
+        .open_session(std::env::current_dir().unwrap())
+        .await
+        .expect("open_session");
+
+    // Critical, easy to get wrong: `AcpxThreadHandle::send_prompt`'s own
+    // doc comment says it "drain[s] the turn to completion" before
+    // resolving -- it does not return once the request is merely
+    // dispatched, unlike `AgentBridge::send_prompt` (the higher layer
+    // `agent_bridge.rs`'s own slow-turn test uses, which really is
+    // fire-and-forget). A first version of this test `.await`ed
+    // `send_prompt` directly, which made it impossible to ever reach the
+    // `cancel_session()` call while the prompt was still in flight --
+    // the test still "worked" in the sense of eventually finishing (via
+    // the mock agent's own 20s safety-net timeout), which is exactly the
+    // kind of silent false pass this project's own established testing
+    // discipline warns about; it was caught by asserting the *reason
+    // string* specifically instead of merely "the turn ended eventually".
+    // Fixed by polling the backend's own event log for real receipt of
+    // the prompt and calling `cancel_session()` in an independent
+    // concurrently-polled future via `tokio::join!`, so both genuinely
+    // run at once on this one task instead of strictly sequentially.
+    let prompt_fut = handle.send_prompt("slow cancel me");
+    let coordinator_fut = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut prompt_seen = false;
+        while std::time::Instant::now() < deadline && !prompt_seen {
+            let events = std::fs::read_to_string(&event_log).unwrap_or_default();
+            prompt_seen = events.lines().any(|line| line.contains("\"session/prompt\""));
+            if !prompt_seen {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        assert!(
+            prompt_seen,
+            "mock agent never recorded receiving the slow session/prompt request"
+        );
+        handle.cancel_session().await.expect("cancel_session");
+    };
+    let (prompt_result, ()) = tokio::join!(prompt_fut, coordinator_fut);
+    prompt_result.expect("send_prompt");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut stop_reason = None;
+    while tokio::time::Instant::now() < deadline && stop_reason.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(Some(AgentEvent::TurnEnded(reason))) =
+            tokio::time::timeout(remaining.min(Duration::from_millis(200)), events_rx.recv()).await
+        {
+            stop_reason = Some(reason);
+        }
+    }
+    assert_eq!(
+        stop_reason.as_deref(),
+        Some("cancelled"),
+        "expected the slow turn to end with stopReason \"cancelled\" after cancel_session(), got {stop_reason:?}"
     );
 }

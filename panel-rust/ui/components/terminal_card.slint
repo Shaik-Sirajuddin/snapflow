@@ -1,5 +1,6 @@
-import { Palette } from "palette.slint";
-import { TerminalItem } from "types.slint";
+import { Theme } from "../tokens/theme.slint";
+import { Button } from "../base/button.slint";
+import { TerminalItem } from "../types.slint";
 
 // Real embedded terminal view -- Phase 4 terminal-view addition. Two
 // components:
@@ -27,10 +28,10 @@ export component TerminalCard inherits Rectangle {
     in property <bool> compact: true;
     callback expand();
 
-    background: Palette.sys-terminal-bg;
-    border-color: Palette.sys-terminal-border;
+    background: Theme.bg-terminal;
+    border-color: Theme.border-terminal;
     border-width: 1px;
-    border-radius: Palette.radius-md;
+    border-radius: Theme.radius-md;
     height: compact ? 96px : 140px;
 
     VerticalLayout {
@@ -38,20 +39,25 @@ export component TerminalCard inherits Rectangle {
         spacing: 4px;
         Rectangle {
             height: 18px;
-            TouchArea { clicked => { expand(); } }
+            terminal-expand := TouchArea {
+                accessible-role: button;
+                accessible-label: "Expand terminal " + item.terminal-id;
+                accessible-action-default => { expand(); }
+                clicked => { expand(); }
+            }
             HorizontalLayout {
                 spacing: 6px;
                 Text {
                     text: "\u{2318}"; // terminal glyph stand-in
-                    color: Palette.sys-primary;
-                    font-size: 11px;
+                    color: Theme.bg-primary;
+                    font-size: 11px * Theme.font-scale;
                     vertical-alignment: center;
                 }
                 Text {
                     text: "terminal " + item.terminal-id;
-                    color: Palette.sys-text-primary;
-                    font-family: Palette.font-mono;
-                    font-size: 10px;
+                    color: Theme.text-primary;
+                    font-family: Theme.font-mono;
+                    font-size: 10px * Theme.font-scale;
                     font-weight: 700;
                     horizontal-stretch: 1;
                     preferred-width: 0px;
@@ -61,22 +67,22 @@ export component TerminalCard inherits Rectangle {
                 }
                 if item.has-exited : Text {
                     text: "exit " + item.exit-code;
-                    color: Palette.sys-text-muted;
-                    font-family: Palette.font-mono;
-                    font-size: 9px;
+                    color: Theme.text-muted;
+                    font-family: Theme.font-mono;
+                    font-size: 9px * Theme.font-scale;
                     vertical-alignment: center;
                 }
                 if !item.has-exited : Text {
                     text: "running";
-                    color: Palette.sys-text-secondary;
-                    font-family: Palette.font-mono;
-                    font-size: 9px;
+                    color: Theme.text-secondary;
+                    font-family: Theme.font-mono;
+                    font-size: 9px * Theme.font-scale;
                     vertical-alignment: center;
                 }
                 Text {
                     text: "\u{2922}"; // expand glyph
-                    color: Palette.sys-text-muted;
-                    font-size: 11px;
+                    color: Theme.text-muted;
+                    font-size: 11px * Theme.font-scale;
                     vertical-alignment: center;
                 }
             }
@@ -85,9 +91,9 @@ export component TerminalCard inherits Rectangle {
             viewport-height: log.preferred-height;
             log := Text {
                 text: item.output + (item.truncated ? "\n... (truncated)" : "");
-                color: Palette.sys-terminal-text;
-                font-family: Palette.font-mono;
-                font-size: 10px;
+                color: Theme.text-terminal;
+                font-family: Theme.font-mono;
+                font-size: 10px * Theme.font-scale;
                 wrap: word-wrap;
                 overflow: clip;
                 horizontal-stretch: 1;
@@ -117,10 +123,10 @@ export component TerminalOverlay inherits Rectangle {
     y: 8px;
     width: container-width - 16px;
     height: container-height - 16px;
-    background: Palette.sys-terminal-bg;
-    border-color: Palette.sys-border-strong;
+    background: Theme.bg-terminal;
+    border-color: Theme.border-strong;
     border-width: 1px;
-    border-radius: Palette.radius-md;
+    border-radius: Theme.radius-md;
 
     VerticalLayout {
         padding: 10px;
@@ -129,9 +135,9 @@ export component TerminalOverlay inherits Rectangle {
             spacing: 6px;
             Text {
                 text: "terminal " + item.terminal-id;
-                color: Palette.sys-text-primary;
-                font-family: Palette.font-mono;
-                font-size: 12px;
+                color: Theme.text-primary;
+                font-family: Theme.font-mono;
+                font-size: 12px * Theme.font-scale;
                 font-weight: 700;
                 horizontal-stretch: 1;
                 preferred-width: 0px;
@@ -141,39 +147,31 @@ export component TerminalOverlay inherits Rectangle {
             }
             if item.has-exited : Text {
                 text: "exit " + item.exit-code;
-                color: Palette.sys-text-muted;
-                font-family: Palette.font-mono;
-                font-size: 10px;
+                color: Theme.text-muted;
+                font-family: Theme.font-mono;
+                font-size: 10px * Theme.font-scale;
                 vertical-alignment: center;
             }
-            Rectangle {
-                width: 60px;
-                height: 24px;
-                background: Palette.sys-sidebar;
-                border-color: Palette.sys-border;
-                border-width: 1px;
-                border-radius: Palette.radius-sm;
-                TouchArea { clicked => { close(); } }
-                Text {
-                    text: "Close";
-                    color: Palette.sys-text-primary;
-                    font-size: 10px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+            Button {
+                label: "Close";
+                button-accessible-label: "Close terminal overlay";
+                btn-width: 60px;
+                btn-height: 24px;
+                font-weight: 400;
+                clicked => { close(); }
             }
         }
         Rectangle {
             height: 1px;
-            background: Palette.sys-border;
+            background: Theme.border-default;
         }
         Flickable {
             viewport-height: full-log.preferred-height;
             full-log := Text {
                 text: item.output + (item.truncated ? "\n... (truncated)" : "");
-                color: Palette.sys-terminal-text;
-                font-family: Palette.font-mono;
-                font-size: 11px;
+                color: Theme.text-terminal;
+                font-family: Theme.font-mono;
+                font-size: 11px * Theme.font-scale;
                 wrap: word-wrap;
                 overflow: clip;
                 horizontal-stretch: 1;

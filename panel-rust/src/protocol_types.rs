@@ -55,6 +55,18 @@ pub struct ChatMessage {
     /// for the same old-cache-line compatibility reason as `status`.
     #[serde(default)]
     pub id: Option<String>,
+    /// chat-items-redesign.md #9 (execution-view "api-call" variant):
+    /// the tool call's own `rawInput`/`rawOutput` wire fields, when the
+    /// backend provided them -- real structured payload data ACP already
+    /// carries (`ToolCallUpdateFields`/`ToolCall` in `agent-client-
+    /// protocol`), just not previously read by `classify_raw_update`.
+    /// `None` for non-tool-call kinds and for every message cached
+    /// before this field existed; `#[serde(default)]` for the same
+    /// old-cache-line compatibility reason as `status`/`id`.
+    #[serde(default)]
+    pub raw_input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub raw_output: Option<serde_json::Value>,
 }
 
 /// Events flowing out of a bound thread's gateway actor, consumed from
@@ -110,7 +122,7 @@ pub enum AgentEvent {
 /// One mode an ACP agent advertises as selectable for a session. See
 /// [`AgentEvent::SessionModes`]'s doc comment for the wire origin and
 /// why this crate still tracks the older `modes` shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionModeInfo {
     pub id: String,
     pub name: String,
@@ -119,7 +131,7 @@ pub struct SessionModeInfo {
 
 /// The full `modes` advertisement from a `session/new`/`session/load`/
 /// `session/resume` response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionModesEvent {
     pub current_mode_id: String,
     pub available: Vec<SessionModeInfo>,
@@ -129,7 +141,7 @@ pub struct SessionModesEvent {
 /// options`] list -- `{value, name, description?}` per
 /// agentclientprotocol.com/protocol/session-config-options's documented
 /// example response shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigOptionValue {
     pub value: String,
     pub name: String,
@@ -146,7 +158,7 @@ pub struct ConfigOptionValue {
 /// a parse failure -- a UI that doesn't recognize a `kind` can still
 /// fall back to a generic read-only display of `current_value` rather
 /// than dropping the option silently.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigOptionInfo {
     pub id: String,
     pub name: String,
@@ -158,7 +170,7 @@ pub struct ConfigOptionInfo {
 }
 
 /// See [`AgentEvent::TerminalOutput`]'s doc comment.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalOutputEvent {
     pub terminal_id: String,
     pub output: String,
@@ -178,7 +190,7 @@ pub struct TerminalOutputEvent {
 /// request kind -- consistent with `gateway_actor::classify_raw_update`'s
 /// "operate on the raw JSON shape, don't re-derive a typed ACP schema"
 /// convention.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentRequestEvent {
     /// Echoed back unchanged to whichever `respond_*` call answers this
     /// request -- the relay's own correlation id, distinct from

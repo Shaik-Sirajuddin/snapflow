@@ -13,6 +13,7 @@ pub struct PanelDefaults {
     pub profile_name: Option<String>,
     pub permission_profile: Option<String>,
     pub background_session: bool,
+    pub selected_thread_id: Option<String>,
 }
 
 impl Default for PanelDefaults {
@@ -21,6 +22,7 @@ impl Default for PanelDefaults {
             profile_name: None,
             permission_profile: None,
             background_session: false,
+            selected_thread_id: None,
         }
     }
 }
@@ -29,6 +31,19 @@ impl Default for PanelDefaults {
 pub struct ThreadSettings {
     pub thread_id: String,
     pub session_id: Option<String>,
+    pub profile_name: Option<String>,
+    pub permission_profile: Option<String>,
+    pub background_session: Option<bool>,
+}
+
+/// The durable identity needed to restore a panel thread before its transcript
+/// cache and ACPX session are reconciled.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRecord {
+    pub thread_id: String,
+    pub display_name: String,
+    pub provider: String,
+    pub session_id: String,
     pub profile_name: Option<String>,
     pub permission_profile: Option<String>,
     pub background_session: Option<bool>,
@@ -65,21 +80,69 @@ impl PanelStateStore {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 profile_name TEXT,
                 permission_profile TEXT,
-                background_session INTEGER NOT NULL CHECK (background_session IN (0, 1))
+                background_session INTEGER NOT NULL CHECK (background_session IN (0, 1)),
+                selected_thread_id TEXT
             );
             CREATE TABLE IF NOT EXISTS thread_settings (
                 thread_id TEXT PRIMARY KEY NOT NULL,
                 session_id TEXT,
                 profile_name TEXT,
                 permission_profile TEXT,
-                background_session INTEGER CHECK (background_session IN (0, 1))
+                background_session INTEGER CHECK (background_session IN (0, 1)),
+                display_name TEXT,
+                provider TEXT
             );
-            PRAGMA user_version = 1;
             ",
         )?;
+        Self::add_column_if_missing(&connection, "display_name", "TEXT")?;
+        Self::add_column_if_missing(&connection, "provider", "TEXT")?;
+        Self::add_defaults_column_if_missing(&connection, "selected_thread_id", "TEXT")?;
+        connection.execute_batch("PRAGMA user_version = 3;")?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    fn add_column_if_missing(
+        connection: &Connection,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), StateStoreError> {
+        let exists = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('thread_settings') WHERE name = ?1
+             )",
+            [column],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            connection.execute(
+                &format!("ALTER TABLE thread_settings ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn add_defaults_column_if_missing(
+        connection: &Connection,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), StateStoreError> {
+        let exists = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('panel_defaults') WHERE name = ?1
+             )",
+            [column],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            connection.execute(
+                &format!("ALTER TABLE panel_defaults ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -91,7 +154,7 @@ impl PanelStateStore {
         let connection = self.connection.lock().expect("panel state mutex poisoned");
         connection
             .query_row(
-                "SELECT profile_name, permission_profile, background_session
+                "SELECT profile_name, permission_profile, background_session, selected_thread_id
                  FROM panel_defaults WHERE id = 1",
                 [],
                 |row| {
@@ -99,6 +162,7 @@ impl PanelStateStore {
                         profile_name: row.get(0)?,
                         permission_profile: row.get(1)?,
                         background_session: row.get::<_, i64>(2)? != 0,
+                        selected_thread_id: row.get(3)?,
                     })
                 },
             )
@@ -110,17 +174,39 @@ impl PanelStateStore {
     pub fn save_defaults(&self, defaults: &PanelDefaults) -> Result<(), StateStoreError> {
         let connection = self.connection.lock().expect("panel state mutex poisoned");
         connection.execute(
-            "INSERT INTO panel_defaults (id, profile_name, permission_profile, background_session)
-             VALUES (1, ?1, ?2, ?3)
+            "INSERT INTO panel_defaults
+                (id, profile_name, permission_profile, background_session, selected_thread_id)
+             VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
-                 profile_name = excluded.profile_name,
-                 permission_profile = excluded.permission_profile,
-                 background_session = excluded.background_session",
+                profile_name = excluded.profile_name,
+                permission_profile = excluded.permission_profile,
+                background_session = excluded.background_session,
+                selected_thread_id = excluded.selected_thread_id",
             params![
                 defaults.profile_name,
                 defaults.permission_profile,
                 i64::from(defaults.background_session),
+                defaults.selected_thread_id,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the active panel thread independently of settings-sheet
+    /// edits, so selecting a thread is durable even when the sheet is never
+    /// opened or saved in that host session.
+    pub fn set_selected_thread_id(
+        &self,
+        selected_thread_id: Option<&str>,
+    ) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        connection.execute(
+            "INSERT INTO panel_defaults
+                (id, profile_name, permission_profile, background_session, selected_thread_id)
+             VALUES (1, NULL, NULL, 0, ?1)
+             ON CONFLICT(id) DO UPDATE SET
+                selected_thread_id = excluded.selected_thread_id",
+            [selected_thread_id],
         )?;
         Ok(())
     }
@@ -147,6 +233,56 @@ impl PanelStateStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Returns restoreable thread records in stable insertion order. Legacy
+    /// rows without a display name/provider are intentionally skipped: they
+    /// remain available through `thread_settings`, but do not provide enough
+    /// information to safely reconstruct a live panel thread.
+    pub fn thread_records(&self) -> Result<Vec<ThreadRecord>, StateStoreError> {
+        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT thread_id, display_name, provider, session_id,
+                    profile_name, permission_profile, background_session
+             FROM thread_settings
+             WHERE display_name IS NOT NULL
+               AND provider IS NOT NULL
+               AND session_id IS NOT NULL
+             ORDER BY rowid",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ThreadRecord {
+                thread_id: row.get(0)?,
+                display_name: row.get(1)?,
+                provider: row.get(2)?,
+                session_id: row.get(3)?,
+                profile_name: row.get(4)?,
+                permission_profile: row.get(5)?,
+                background_session: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Persists a thread's local identity once an ACPX session is bound.
+    /// Session/profile immutability is enforced by `bind_session`; this method
+    /// only adds the panel-specific display name and provider needed on the
+    /// next host launch.
+    pub fn save_thread_record(&self, record: &ThreadRecord) -> Result<(), StateStoreError> {
+        self.bind_session(
+            &record.thread_id,
+            &record.session_id,
+            record.profile_name.as_deref(),
+            record.permission_profile.as_deref(),
+        )?;
+        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        connection.execute(
+            "UPDATE thread_settings
+             SET display_name = ?2, provider = ?3
+             WHERE thread_id = ?1",
+            params![record.thread_id, record.display_name, record.provider],
+        )?;
+        Ok(())
     }
 
     /// Profile and permission bindings become immutable once `session/new`
@@ -228,6 +364,7 @@ mod tests {
             profile_name: Some("codex".to_owned()),
             permission_profile: Some("review".to_owned()),
             background_session: true,
+            selected_thread_id: Some("thread-b".to_owned()),
         };
         store.save_defaults(&defaults).unwrap();
         store
@@ -237,6 +374,10 @@ mod tests {
         assert_eq!(store.defaults().unwrap(), defaults);
         assert!(!store.effective_background_session("thread-a").unwrap());
         assert!(store.effective_background_session("thread-b").unwrap());
+        assert_eq!(
+            store.defaults().unwrap().selected_thread_id.as_deref(),
+            Some("thread-b")
+        );
     }
 
     #[test]
@@ -256,5 +397,77 @@ mod tests {
             store.bind_session("thread-a", "session-1", Some("claude"), Some("review")),
             Err(StateStoreError::BoundSettingsConflict { .. })
         ));
+    }
+
+    #[test]
+    fn thread_records_restore_in_creation_order_with_their_binding() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let first = ThreadRecord {
+            thread_id: "timeline".to_owned(),
+            display_name: "Fix timeline".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-1".to_owned(),
+            profile_name: Some("review".to_owned()),
+            permission_profile: None,
+            background_session: None,
+        };
+        let second = ThreadRecord {
+            thread_id: "filters".to_owned(),
+            display_name: "Refactor filters".to_owned(),
+            provider: "claude".to_owned(),
+            session_id: "session-2".to_owned(),
+            profile_name: None,
+            permission_profile: Some("confirm".to_owned()),
+            background_session: Some(true),
+        };
+        store.save_thread_record(&first).unwrap();
+        store
+            .set_background_override(&second.thread_id, second.background_session)
+            .unwrap();
+        store.save_thread_record(&second).unwrap();
+
+        assert_eq!(store.thread_records().unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn migrates_existing_v1_database_without_losing_thread_settings() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE panel_defaults (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    profile_name TEXT,
+                permission_profile TEXT,
+                    background_session INTEGER NOT NULL CHECK (background_session IN (0, 1))
+                );
+                CREATE TABLE thread_settings (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT,
+                    profile_name TEXT,
+                    permission_profile TEXT,
+                    background_session INTEGER CHECK (background_session IN (0, 1))
+                );
+                INSERT INTO thread_settings
+                    (thread_id, session_id, profile_name, permission_profile, background_session)
+                VALUES ('legacy-thread', 'legacy-session', 'codex', 'review', 1);
+                PRAGMA user_version = 1;
+                ",
+            )
+            .unwrap();
+
+        let store = PanelStateStore::from_connection(connection).unwrap();
+        assert_eq!(
+            store.thread_settings("legacy-thread").unwrap(),
+            Some(ThreadSettings {
+                thread_id: "legacy-thread".to_owned(),
+                session_id: Some("legacy-session".to_owned()),
+                profile_name: Some("codex".to_owned()),
+                permission_profile: Some("review".to_owned()),
+                background_session: Some(true),
+            })
+        );
+        assert!(store.thread_records().unwrap().is_empty());
+        assert_eq!(store.defaults().unwrap().selected_thread_id, None);
     }
 }

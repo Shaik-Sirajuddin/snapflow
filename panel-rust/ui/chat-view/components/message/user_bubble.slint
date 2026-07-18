@@ -1,0 +1,48 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+import { MessageItem } from "../../../types.slint";
+
+// User message bubble -- chat-items-redesign.md #1. Tertiary background
+// (not the plain `bg-user-bubble` `message_card.slint` used) with one
+// corner deliberately squared off on the sender side, the classic
+// speech-bubble "tail corner" -- LTR layouts omit the radius on the
+// bottom-left corner per the spec (the opposite corner from where a
+// right-anchored sender bubble's tail visually attaches).
+export component UserBubble inherits Rectangle {
+    in property <MessageItem> item;
+
+    vertical-stretch: 0;
+
+    background: Theme.bg-tertiary;
+    border-color: Theme.border-tertiary;
+    border-width: 1px;
+    border-top-left-radius: Theme.radius-md;
+    border-top-right-radius: Theme.radius-md;
+    border-bottom-right-radius: Theme.radius-md;
+    border-bottom-left-radius: Metrics.radius-corner-cut;
+
+    content := VerticalLayout {
+        padding: 10px;
+        // Same `Flickable` sized to the Text's own `preferred-height`
+        // pattern already proven working in `ToolEventRow` -- a bare
+        // `VerticalLayout` wrapping a single `Text` was blowing up to
+        // fill the row's leftover height regardless of `vertical-stretch:
+        // 0` on the outer `Rectangle`; this sidesteps that entirely by
+        // giving the Text an explicit, self-contained height binding.
+        Flickable {
+            height: bubble-text.preferred-height;
+            viewport-height: bubble-text.preferred-height;
+            bubble-text := Text {
+                text: item.text;
+                font-family: Theme.font-sans;
+                font-size: 12px * Theme.font-scale;
+                color: Theme.text-primary;
+                wrap: word-wrap;
+                overflow: elide;
+                horizontal-alignment: left;
+                vertical-alignment: top;
+                width: parent.width;
+            }
+        }
+    }
+}

@@ -1,5 +1,6 @@
-import { Palette } from "palette.slint";
-import { MessageItem } from "types.slint";
+import { Theme } from "../tokens/theme.slint";
+import { Badge } from "../base/badge.slint";
+import { MessageItem } from "../types.slint";
 
 // One reusable message card, parameterized by kind (user/agent/tool-call/
 // thinking) -- Phase 3 of chat-panel-ui-theme-parity.md. Visual source:
@@ -11,7 +12,7 @@ import { MessageItem } from "types.slint";
 // since the HTML's own bubble-layout tool rendering is a flat text dump
 // with no collapse affordance and this plan explicitly asks for one.
 //
-// Status stays deliberately monochrome (see palette.slint's note) --
+// Status stays deliberately monochrome (see tokens/theme.slint's note) --
 // `item.status` is already uppercased by `models::to_message_model`, so
 // this file only lays it out, never colors by value.
 export component MessageCard inherits Rectangle {
@@ -29,14 +30,14 @@ export component MessageCard inherits Rectangle {
     // for non-bubble content; user/agent/tool-call all get a bordered
     // card.
     background: is-thinking ? transparent
-        : is-user ? Palette.sys-user-bubble
-        : is-tool-call ? Palette.sys-card
-        : Palette.sys-agent-bubble;
-    border-color: is-user ? Palette.sys-user-bubble-border
-        : is-tool-call ? Palette.sys-border
-        : Palette.sys-agent-bubble-border;
+        : is-user ? Theme.bg-user-bubble
+        : is-tool-call ? Theme.bg-card
+        : Theme.bg-agent-bubble;
+    border-color: is-user ? Theme.border-user-bubble
+        : is-tool-call ? Theme.border-default
+        : Theme.border-agent-bubble;
     border-width: is-thinking ? 0px : 1px;
-    border-radius: Palette.radius-md;
+    border-radius: Theme.radius-md;
 
     VerticalLayout {
         padding: is-thinking ? 4px : 10px;
@@ -48,50 +49,45 @@ export component MessageCard inherits Rectangle {
             spacing: 6px;
             Text {
                 text: header-label;
-                font-family: Palette.font-mono;
-                font-size: 9px;
+                font-family: Theme.font-mono;
+                font-size: 9px * Theme.font-scale;
                 font-weight: 700;
                 letter-spacing: 0.5px;
-                color: Palette.sys-text-muted;
+                color: Theme.text-muted;
                 vertical-alignment: center;
             }
-            if is-tool-call && item.status != "" : Rectangle {
-                background: Palette.sys-sidebar;
-                border-color: Palette.sys-border;
-                border-width: 1px;
-                border-radius: Palette.radius-sm;
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    padding-top: 2px;
-                    padding-bottom: 2px;
-                    Text {
-                        text: item.status;
-                        font-family: Palette.font-mono;
-                        font-size: 9px;
-                        color: Palette.sys-text-secondary;
-                        vertical-alignment: center;
-                    }
-                }
+            if is-tool-call && item.status != "" : Badge {
+                label: item.status;
             }
             Rectangle { }
         }
 
         // Body -- plain wrapped text for user/agent/thinking; for
         // tool-call, a clickable summary line that toggles the log box.
-        if !is-tool-call : Text {
-            text: item.text;
-            font-italic: is-thinking;
-            font-family: Palette.font-sans;
-            font-size: is-thinking ? 11px : 12px;
-            color: is-user ? Palette.sys-user-bubble-text
-                : is-thinking ? Palette.sys-text-muted
-                : Palette.sys-agent-bubble-text;
-            wrap: word-wrap;
-            overflow: elide;
+        // Flickable-wrapped, height bound to the Text's own
+        // `preferred-height` -- same fix `user_bubble.slint` needed for
+        // its own body text (a bare stretch-sized Text in this position
+        // risked blowing up to fill leftover row height).
+        if !is-tool-call : Flickable {
+            height: body-text.preferred-height;
+            viewport-height: body-text.preferred-height;
             horizontal-stretch: 1;
             preferred-width: 0px;
             min-width: 0px;
+            body-text := Text {
+                text: item.text;
+                font-italic: is-thinking;
+                font-family: Theme.font-sans;
+                font-size: (is-thinking ? 11px : 12px) * Theme.font-scale;
+                color: is-user ? Theme.text-user-bubble
+                    : is-thinking ? Theme.text-muted
+                    : Theme.text-agent-bubble;
+                wrap: word-wrap;
+                overflow: elide;
+                horizontal-alignment: left;
+                vertical-alignment: top;
+                width: parent.width;
+            }
         }
         // Plain `Rectangle` (not a layout) so a sibling `TouchArea` can
         // cover the whole clickable summary+toggle-label area -- same
@@ -107,10 +103,10 @@ export component MessageCard inherits Rectangle {
                     spacing: 6px;
                     Text {
                         text: item.text;
-                        font-family: Palette.font-sans;
-                        font-size: 12px;
+                        font-family: Theme.font-sans;
+                        font-size: 12px * Theme.font-scale;
                         font-weight: 600;
-                        color: Palette.sys-text-primary;
+                        color: Theme.text-primary;
                         wrap: word-wrap;
                         overflow: elide;
                         horizontal-stretch: 1;
@@ -119,25 +115,25 @@ export component MessageCard inherits Rectangle {
                     }
                     Text {
                         text: item.expanded ? "[-] hide logs" : "[+] show logs";
-                        font-family: Palette.font-mono;
-                        font-size: 9px;
-                        color: Palette.sys-text-secondary;
+                        font-family: Theme.font-mono;
+                        font-size: 9px * Theme.font-scale;
+                        color: Theme.text-secondary;
                         vertical-alignment: center;
                     }
                     Rectangle { }
                 }
                 if item.expanded : Rectangle {
-                    background: Palette.sys-terminal-bg;
-                    border-color: Palette.sys-terminal-border;
+                    background: Theme.bg-terminal;
+                    border-color: Theme.border-terminal;
                     border-width: 1px;
-                    border-radius: Palette.radius-sm;
+                    border-radius: Theme.radius-sm;
                     HorizontalLayout {
                         padding: 8px;
                         Text {
                             text: item.text;
-                            font-family: Palette.font-mono;
-                            font-size: 10px;
-                            color: Palette.sys-terminal-text;
+                            font-family: Theme.font-mono;
+                            font-size: 10px * Theme.font-scale;
+                            color: Theme.text-terminal;
                             wrap: word-wrap;
                             overflow: elide;
                             horizontal-stretch: 1;

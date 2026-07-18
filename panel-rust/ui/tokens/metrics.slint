@@ -1,0 +1,45 @@
+// Layer 1 (tokens) -- radius "finish" presets, verbatim from
+// index.html's `radiusPresets` object (`theme.rs::RadiusPreset::scale()`).
+// Raw scale only -- resolving which preset is active (`Theme.radius-preset`,
+// an FFI-set `in` property) stays in `theme.slint`.
+export global Metrics {
+    out property <length> radius-sm-classic: 4px;
+    out property <length> radius-md-classic: 6px;
+    out property <length> radius-lg-classic: 8px;
+
+    out property <length> radius-sm-sharp: 0px;
+    out property <length> radius-md-sharp: 0px;
+    out property <length> radius-lg-sharp: 0px;
+
+    out property <length> radius-sm-organic: 12px;
+    out property <length> radius-md-organic: 18px;
+    out property <length> radius-lg-organic: 28px;
+
+    // Spacing scale -- shared padding/gap steps so call sites reference
+    // one name instead of repeating a literal `Npx` everywhere. Not
+    // theme/preset-dependent (unlike the radius scale above), so these
+    // are plain constants rather than resolved through `theme.slint`.
+    out property <length> space-1: 2px;
+    out property <length> space-2: 4px;
+    out property <length> space-3: 6px;
+    out property <length> space-4: 8px;
+    out property <length> space-5: 10px;
+    out property <length> space-6: 12px;
+    out property <length> space-7: 16px;
+    out property <length> space-8: 24px;
+    out property <length> space-9: 32px;
+    out property <length> space-10: 40px;
+
+    // Shared icon-size tiers -- so a "header icon" and a "sidebar row
+    // icon" agree on what "md" means instead of each picking its own
+    // literal px value.
+    out property <length> icon-sm: 12px;
+    out property <length> icon-md: 16px;
+    out property <length> icon-lg: 20px;
+
+    // The squared-off corner on a message bubble's sender-side corner
+    // (chat-items-redesign.md #1) -- always 0, independent of the
+    // radius-preset scale above, since the whole point is that one corner
+    // stays sharp regardless of which "finish" preset is active.
+    out property <length> radius-corner-cut: 0px;
+}

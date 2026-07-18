@@ -13,6 +13,7 @@ use crate::{
     ModeOption, ProfileOption, TerminalItem, ThreadItem,
 };
 use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
+use slint::platform::Key;
 use slint::{ModelRc, VecModel};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,12 +35,62 @@ impl ThreadState {
     }
 }
 
-fn message_kind_str(kind: &MessageKind) -> &'static str {
+/// `title` only matters for `MessageKind::ToolCall` (routed through
+/// `classify_tool_call_kind`); ignored for every other kind.
+fn message_kind_str(kind: &MessageKind, title: &str) -> &'static str {
     match kind {
         MessageKind::User => "user",
         MessageKind::Agent => "agent",
         MessageKind::Thinking => "thinking",
-        MessageKind::ToolCall => "tool-call",
+        MessageKind::ToolCall => classify_tool_call_kind(title),
+    }
+}
+
+/// chat-items-redesign.md #5/#6 tool-event taxonomy classifier, wired
+/// into `message_kind_str` below. `chat_area.slint` must route on the
+/// new `"tool_use"`/`"mcp_server_call"` strings (not just
+/// `message_card.slint`'s old `item.kind == "tool-call"` check) for this
+/// to render correctly -- see that file's own routing change.
+///
+/// Title-string matching, not a protocol-level distinction --
+/// `agent-client-protocol`'s own `ToolKind` enum has no MCP/skill
+/// variant (confirmed against `agent-client-protocol-schema`'s
+/// `tool_call.rs`), and `title` is the only identifying text the wire
+/// carries at all (no separate tool-name field). This mirrors Zed's own
+/// client-side convention (`context_server_registry.rs`'s
+/// `format_mcp_initial_title`), which is itself just a title-string
+/// heuristic, not something the ACP spec guarantees any agent follows.
+///
+/// Skill detection is deliberately NOT implemented here yet -- Zed's own
+/// skill tool identifies itself by tool *name* (`"skill"`), a field this
+/// wire shape doesn't carry (only `title`), and no equivalent title
+/// convention has been confirmed against a real skill-invocation capture
+/// from this project's own backend. Guessing a title pattern here would
+/// silently misclassify rather than correctly leave it as `tool_use`.
+fn classify_tool_call_kind(title: &str) -> &'static str {
+    if title.starts_with("Run MCP tool `") {
+        "mcp_server_call"
+    } else {
+        "tool_use"
+    }
+}
+
+#[cfg(test)]
+mod classify_tool_call_kind_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_title_prefix_classifies_as_mcp_server_call() {
+        assert_eq!(
+            classify_tool_call_kind("Run MCP tool `search_docs`"),
+            "mcp_server_call"
+        );
+    }
+
+    #[test]
+    fn plain_tool_title_classifies_as_tool_use() {
+        assert_eq!(classify_tool_call_kind("edit.add_transition(...)"), "tool_use");
+        assert_eq!(classify_tool_call_kind(""), "tool_use");
     }
 }
 
@@ -55,8 +106,7 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
         .into_iter()
         .enumerate()
         .map(|(i, m)| MessageItem {
-            kind: message_kind_str(&m.kind).into(),
-            text: m.text.into(),
+            kind: message_kind_str(&m.kind, &m.text).into(),
             // Slint side uppercases nothing itself -- source HTML always
             // renders `item.status.toUpperCase()`, so this crate does the
             // same once here rather than duplicating casing logic in
@@ -68,6 +118,19 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                 .into(),
             expanded: expanded.get(i).copied().unwrap_or(false),
             index: i as i32,
+            raw_input: m
+                .raw_input
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+                .into(),
+            raw_output: m
+                .raw_output
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+                .into(),
+            text: m.text.into(),
         })
         .collect();
     ModelRc::new(VecModel::from(items))
@@ -101,12 +164,17 @@ pub fn to_message_model_from_transcript(
     let rows: Vec<MessageItem> = items
         .into_iter()
         .filter_map(|item| {
-            let (kind, text, status) = match item {
+            // `raw-input`/`raw-output` stay "" here -- `TranscriptItem::Tool`
+            // doesn't carry `ChatMessage`'s `raw_input`/`raw_output` yet
+            // (conversation.rs's reducer drops them same as
+            // `classify_raw_update` used to), a separate follow-up wiring
+            // pass, not part of this kind-string migration.
+            let (kind, text, status): (&str, String, String) = match item {
                 TranscriptItem::User { text, .. } => ("user", text, String::new()),
                 TranscriptItem::Assistant { text, .. } => ("agent", text, String::new()),
                 TranscriptItem::Thought { text, .. } => ("thinking", text, String::new()),
                 TranscriptItem::Tool { title, status, .. } => (
-                    "tool-call",
+                    classify_tool_call_kind(&title),
                     title,
                     // Same uppercasing convention `to_message_model`
                     // documents above.
@@ -120,6 +188,8 @@ pub fn to_message_model_from_transcript(
                 status: status.into(),
                 expanded: expanded.get(index as usize).copied().unwrap_or(false),
                 index,
+                raw_input: String::new().into(),
+                raw_output: String::new().into(),
             };
             index += 1;
             Some(row)
@@ -230,6 +300,8 @@ pub fn build_thread_items<N: AsRef<str>>(
     names: &[N],
     state: &[ThreadState],
     descriptions: &[String],
+    background_sessions: &[bool],
+    closed: &[bool],
     query: &str,
 ) -> Vec<VisibleThreadItem> {
     let query_lower = query.trim().to_lowercase();
@@ -244,14 +316,21 @@ pub fn build_thread_items<N: AsRef<str>>(
             real_index,
             item: ThreadItem {
                 name: name.as_ref().into(),
-                status: st.as_str().into(),
+                status: if closed.get(real_index).copied().unwrap_or(false) {
+                    "closed"
+                } else {
+                    st.as_str()
+                }
+                .into(),
                 busy: matches!(st, ThreadState::Loading),
                 open: true,
+                background: background_sessions.get(real_index).copied().unwrap_or(false),
                 description: descriptions
                     .get(real_index)
                     .cloned()
                     .unwrap_or_default()
                     .into(),
+                closed: closed.get(real_index).copied().unwrap_or(false),
             },
         })
         .collect()
@@ -328,6 +407,25 @@ pub fn to_mcp_server_options(
     ModelRc::new(VecModel::from(items))
 }
 
+/// Builds the recovery/import sheet's row model from a real
+/// `AgentBridge::recoverable_sessions` result (Coverage Matrix
+/// `session/list` row).
+pub fn to_remote_session_options(
+    sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
+    provider: &str,
+) -> ModelRc<crate::RemoteSessionOption> {
+    let items: Vec<crate::RemoteSessionOption> = sessions
+        .into_iter()
+        .map(|session| crate::RemoteSessionOption {
+            session_id: session.acp_session_id.into(),
+            provider: provider.into(),
+            title: session.title.unwrap_or_default().into(),
+            updated_at: session.updated_at.unwrap_or_default().into(),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
+}
+
 /// Builds the settings sheet's agent-catalog row model from a real
 /// `agents/list` result (`AgentBridge::list_agents`). `status` is
 /// forwarded verbatim as the registry's own snake_case detection tag
@@ -384,15 +482,24 @@ pub fn to_local_terminal_item(
 /// keystrokes as bytes, not as a Rust-level "insert this string"
 /// operation. Only one real remapping needed: Slint's `Key::Return`
 /// produces `"\n"` as its `text`, but a PTY in the OS's usual line
-/// discipline expects Enter as carriage return (`\r`) -- every other
-/// character (printable UTF-8, `\x7f` Backspace, `\x1b` Escape, `\t`
-/// Tab, Ctrl-key combinations, arrow-key escape sequences Slint already
-/// encodes as private-use-area text) is forwarded verbatim.
+/// discipline expects Enter as carriage return (`\r`). Slint represents
+/// non-printing navigation keys as private-use characters, so map those
+/// explicitly to the ANSI byte sequences a real PTY expects instead of
+/// writing those private-use codepoints into the shell.
 pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
-    if text == "\n" {
-        vec![b'\r']
-    } else {
-        text.as_bytes().to_vec()
+    match text.chars().collect::<Vec<_>>().as_slice() {
+        [ch] if *ch == char::from(Key::Return) => vec![b'\r'],
+        [ch] if *ch == char::from(Key::Backspace) => vec![0x7f],
+        [ch] if *ch == char::from(Key::Delete) => b"\x1b[3~".to_vec(),
+        [ch] if *ch == char::from(Key::Escape) => vec![0x1b],
+        [ch] if *ch == char::from(Key::Tab) => vec![b'\t'],
+        [ch] if *ch == char::from(Key::LeftArrow) => b"\x1b[D".to_vec(),
+        [ch] if *ch == char::from(Key::UpArrow) => b"\x1b[A".to_vec(),
+        [ch] if *ch == char::from(Key::RightArrow) => b"\x1b[C".to_vec(),
+        [ch] if *ch == char::from(Key::DownArrow) => b"\x1b[B".to_vec(),
+        [ch] if *ch == char::from(Key::Home) => b"\x1b[H".to_vec(),
+        [ch] if *ch == char::from(Key::End) => b"\x1b[F".to_vec(),
+        _ => text.as_bytes().to_vec(),
     }
 }
 
@@ -414,10 +521,12 @@ mod tests {
         ThreadState::Idle,
     ];
     const NO_DESCRIPTIONS: &[String] = &[];
+    const BACKGROUND: &[bool] = &[false, true, false, false];
+    const NO_CLOSED: &[bool] = &[false, false, false, false];
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].item.name, "Fix timeline crash");
         assert_eq!(items[0].real_index, 0);
@@ -427,7 +536,7 @@ mod tests {
 
     #[test]
     fn substring_match_is_case_insensitive() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "FADE");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "FADE");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
         // Real index must survive filtering -- "Add fade transition" is
@@ -435,7 +544,7 @@ mod tests {
         // list. This is exactly the mismatch `real_index` exists to fix.
         assert_eq!(items[0].real_index, 1);
 
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "fade");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
     }
@@ -445,7 +554,7 @@ mod tests {
         // "x" appears in 2 non-adjacent names (index 0 and 3); must come
         // back in the same relative order as NAMES, not re-sorted, and
         // must skip the non-matching ones in between.
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "x");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "x");
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
         assert_eq!(
             matched_names,
@@ -457,21 +566,42 @@ mod tests {
 
     #[test]
     fn no_match_returns_empty_not_error() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "zzz-no-such-thread");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            "zzz-no-such-thread",
+        );
         assert!(items.is_empty());
     }
 
     #[test]
     fn whitespace_only_query_behaves_like_empty() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "   ");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "   ");
         assert_eq!(items.len(), 4);
     }
 
     #[test]
     fn status_is_carried_through_unfiltered() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
         assert_eq!(items[1].item.status, "loading");
         assert_eq!(items[2].item.status, "error");
+    }
+
+    #[test]
+    fn closed_thread_reports_closed_status_regardless_of_thread_state() {
+        // Coverage Matrix `session/close`/`session/delete` row: once a
+        // thread is closed, its sidebar row must display "closed", not
+        // whatever transient `ThreadState` it was last in -- STATE[1]
+        // is `Loading` here, proving the override wins even over that.
+        let closed: &[bool] = &[false, true, false, false];
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, "");
+        assert_eq!(items[1].item.status, "closed");
+        assert!(items[1].item.closed);
+        assert_eq!(items[0].item.status, "idle");
+        assert!(!items[0].item.closed);
     }
 
     #[test]
@@ -482,15 +612,21 @@ mod tests {
             "".into(),
             "Bug still open".into(),
         ];
-        let items = build_thread_items(NAMES, STATE, &descriptions, "fade");
+        let items = build_thread_items(NAMES, STATE, &descriptions, BACKGROUND, NO_CLOSED, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.description, "Added a fade");
     }
 
     #[test]
     fn description_defaults_to_empty_when_shorter_than_names() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
         assert!(items.iter().all(|i| i.item.description.is_empty()));
+    }
+
+    #[test]
+    fn background_policy_is_preserved_after_filtering() {
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
+        assert!(items[0].item.background);
     }
 
     fn chat_msg(kind: MessageKind, text: &str, status: Option<&str>) -> ChatMessage {
@@ -499,6 +635,8 @@ mod tests {
             text: text.to_string(),
             status: status.map(str::to_string),
             id: None,
+            raw_input: None,
+            raw_output: None,
         }
     }
 
@@ -621,11 +759,43 @@ mod tests {
     #[test]
     fn translate_local_terminal_key_maps_return_to_carriage_return() {
         assert_eq!(translate_local_terminal_key("\n"), vec![b'\r']);
+        assert_eq!(
+            translate_local_terminal_key(&char::from(Key::Return).to_string()),
+            vec![b'\r']
+        );
     }
 
     #[test]
-    fn translate_local_terminal_key_forwards_other_text_verbatim() {
+    fn translate_local_terminal_key_maps_editing_and_navigation_keys_to_pty_bytes() {
+        assert_eq!(
+            translate_local_terminal_key(&char::from(Key::Backspace).to_string()),
+            vec![0x7f]
+        );
+        assert_eq!(
+            translate_local_terminal_key(&char::from(Key::Delete).to_string()),
+            b"\x1b[3~"
+        );
+        assert_eq!(
+            translate_local_terminal_key(&char::from(Key::LeftArrow).to_string()),
+            b"\x1b[D"
+        );
+        assert_eq!(
+            translate_local_terminal_key(&char::from(Key::RightArrow).to_string()),
+            b"\x1b[C"
+        );
+        assert_eq!(
+            translate_local_terminal_key(&char::from(Key::UpArrow).to_string()),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            translate_local_terminal_key(&char::from(Key::DownArrow).to_string()),
+            b"\x1b[B"
+        );
+    }
+
+    #[test]
+    fn translate_local_terminal_key_forwards_printable_text_verbatim() {
         assert_eq!(translate_local_terminal_key("a"), b"a".to_vec());
-        assert_eq!(translate_local_terminal_key("\u{7f}"), vec![0x7f]);
+        assert_eq!(translate_local_terminal_key("unicode"), b"unicode".to_vec());
     }
 }

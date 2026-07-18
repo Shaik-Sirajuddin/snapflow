@@ -1,0 +1,58 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Layer 3 (base) -- the repeated hand-rolled "small pill button" pattern
+// found across `components/`: a fixed-size `Rectangle` with a
+// background/border, a sibling `TouchArea` (accessible-role: button +
+// accessible-label + accessible-action-default + clicked), and a
+// centered `Text` label. Two variants existed by convention (never
+// declared as such): a filled "primary" action (approve/save/add, the
+// same treatment as the compose bar's Send button) and a bordered
+// "secondary" action (reject/close/cancel/remove) -- `primary` below
+// picks between them. Every other visual knob the call sites varied
+// (size, font size/weight, exact color) stays overridable so this one
+// component can replace every instance without changing pixels.
+export component Button inherits Rectangle {
+    in property <string> label;
+    in property <string> button-accessible-label: label;
+    in property <bool> primary: false;
+    in property <length> btn-width: 72px;
+    in property <length> btn-height: 26px;
+    in property <length> font-size: 10px;
+    in property <int> font-weight: 600;
+    in property <color> bg: primary ? Theme.bg-primary : Theme.bg-sidebar;
+    in property <color> fg: primary ? Theme.text-on-primary : Theme.text-primary;
+    in property <color> border-col: Theme.border-default;
+    in property <length> border-w: primary ? 0px : 1px;
+    callback clicked();
+
+    width: btn-width;
+    height: btn-height;
+    // Hover feedback -- previously missing entirely (this component had
+    // no visual response to `has-hover` at all). Primary buttons dim
+    // slightly on hover; secondary/bordered ones pick up the same
+    // hover-container tint `IconButton`/sidebar rows already use.
+    background: touch.has-hover
+        ? (primary ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary-container)
+        : bg;
+    animate background { duration: 100ms; }
+    border-color: border-col;
+    border-width: border-w;
+    border-radius: Theme.radius-sm;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.button-accessible-label;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.label;
+        color: root.fg;
+        font-family: Theme.font-sans;
+        font-size: root.font-size * Theme.font-scale;
+        font-weight: root.font-weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}

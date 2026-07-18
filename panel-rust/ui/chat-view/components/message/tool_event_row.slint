@@ -1,0 +1,90 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+import { Icon } from "../../../base/icon.slint";
+
+// One tool-taxonomy event row -- chat-items-redesign.md #5/#6. Transparent
+// background (these are inline stream markers, not cards); a dot + an
+// icon keyed by `kind` + the event's own text. `first-use` only means
+// anything for `kind: "skill_use"` (a skill's first invocation in the
+// thread renders brighter, subsequent ones fall back to the tertiary
+// text tone) -- the spec gives no equivalent distinction for the other
+// three kinds, so `first-use` is silently ignored for those.
+export component ToolEventRow inherits Rectangle {
+    in property <string> kind; // "tool_use" | "skill_load" | "skill_use" | "mcp_server_call"
+    in property <string> text;
+    in property <bool> first-use: true;
+    // Adaptive height -- grows with wrapped text up to this cap, then
+    // becomes internally scrollable instead of eliding to one line.
+    in property <length> cap-height: 90px;
+
+    background: transparent;
+
+    property <bool> is-skill-use: kind == "skill_use";
+
+    HorizontalLayout {
+        padding: Metrics.space-2;
+        spacing: Metrics.space-1;
+        VerticalLayout {
+            alignment: start;
+            Rectangle {
+                width: 4px;
+                height: 4px;
+                border-radius: 2px;
+                background: Theme.text-muted;
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            Icon {
+                source: @image-url("../../../assets/icons/wrench.svg");
+                visible: kind == "tool_use";
+                size: Metrics.icon-sm;
+                color: Theme.text-secondary;
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            Icon {
+                source: @image-url("../../../assets/icons/book-open.svg");
+                visible: kind == "skill_load";
+                size: Metrics.icon-sm;
+                color: Theme.text-secondary;
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            Icon {
+                source: @image-url("../../../assets/icons/sparkles.svg");
+                visible: kind == "skill_use";
+                size: Metrics.icon-sm;
+                color: Theme.text-secondary;
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            Icon {
+                source: @image-url("../../../assets/icons/plug-zap.svg");
+                visible: kind == "mcp_server_call";
+                size: Metrics.icon-sm;
+                color: Theme.text-secondary;
+            }
+        }
+        Flickable {
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            height: min(text-content.preferred-height, root.cap-height);
+            viewport-height: text-content.preferred-height;
+            text-content := Text {
+                text: root.text;
+                font-family: Theme.font-sans;
+                font-size: 11px * Theme.font-scale;
+                color: is-skill-use && first-use ? Theme.text-accent-bright : Theme.text-tertiary;
+                horizontal-alignment: left;
+                vertical-alignment: top;
+                wrap: word-wrap;
+                width: parent.width;
+            }
+        }
+    }
+}
