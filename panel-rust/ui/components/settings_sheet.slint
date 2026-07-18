@@ -14,6 +14,7 @@
 // same "don't trust a client-side echo" posture the mode/config
 // selector already established.
 import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { ProfileOption, McpServerOption, AgentCatalogEntry, RemoteSessionOption } from "../types.slint";
 
@@ -68,7 +69,7 @@ export component SettingsSheet inherits Rectangle {
         viewport-height: body.preferred-height + 32px;
         body := VerticalLayout {
             width: parent.width;
-            padding: 16px;
+            padding: Metrics.space-7;
             spacing: 14px;
 
             Text { text: "Chat Defaults"; color: Theme.text-primary; font-size: 16px * Theme.font-scale; font-weight: 700; }
@@ -101,7 +102,7 @@ export component SettingsSheet inherits Rectangle {
                 height: available-profiles.length > 0 ? 30px : 0px;
                 viewport-width: profile-chip-row.preferred-width;
                 profile-chip-row := HorizontalLayout {
-                    spacing: 6px;
+                    spacing: Metrics.space-3;
                     for profile in available-profiles : Rectangle {
                         height: 24px;
                         // Width computed purely from leaf `Text.preferred-width`s
@@ -117,15 +118,19 @@ export component SettingsSheet inherits Rectangle {
                             + 2px
                             + (root.profile-pending-delete == profile.name ? 114px : 20px);
                         HorizontalLayout {
-                            spacing: 2px;
+                            spacing: Metrics.space-1;
                             Rectangle {
                                 width: profile-chip-label.preferred-width + 16px;
                                 height: 24px;
-                                background: profile.name == root.default-profile ? Theme.bg-primary : Theme.bg-sidebar;
+                                background: profile.name == root.default-profile ? Theme.bg-primary
+                                    : profile-chip.has-hover ? Theme.bg-primary-container
+                                    : Theme.bg-sidebar;
+                                animate background { duration: 100ms; }
                                 border-color: Theme.border-default;
                                 border-width: 1px;
                                 border-radius: Theme.radius-sm;
                                 profile-chip := TouchArea {
+                                    mouse-cursor: pointer;
                                     accessible-role: button;
                                     accessible-label: "Select profile " + profile.name;
                                     accessible-action-default => { root.default-profile = profile.name; }
@@ -154,7 +159,7 @@ export component SettingsSheet inherits Rectangle {
                                 clicked => { root.profile-pending-delete = profile.name; }
                             }
                             if root.profile-pending-delete == profile.name : HorizontalLayout {
-                                spacing: 2px;
+                                spacing: Metrics.space-1;
                                 Button {
                                     label: "Confirm";
                                     button-accessible-label: "Confirm delete profile " + profile.name;
@@ -192,7 +197,7 @@ export component SettingsSheet inherits Rectangle {
             // is the delete affordance); this section is create-only.
             Text { text: "Add Profile"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
             HorizontalLayout {
-                spacing: 6px;
+                spacing: Metrics.space-3;
                 Rectangle {
                     horizontal-stretch: 1;
                     height: 26px;
@@ -274,9 +279,11 @@ export component SettingsSheet inherits Rectangle {
 
             Rectangle {
                 height: 28px;
-                background: Theme.bg-sidebar;
+                background: background-default-toggle.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
+                animate background { duration: 100ms; }
                 border-radius: Theme.radius-sm;
                 background-default-toggle := TouchArea {
+                    mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Toggle background session default";
                     accessible-action-default => { root.background-default = !root.background-default; }
@@ -289,9 +296,11 @@ export component SettingsSheet inherits Rectangle {
             }
             Rectangle {
                 height: 28px;
-                background: Theme.bg-sidebar;
+                background: background-override-toggle.has-hover ? Theme.bg-primary-container : Theme.bg-sidebar;
+                animate background { duration: 100ms; }
                 border-radius: Theme.radius-sm;
                 background-override-toggle := TouchArea {
+                    mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Toggle background session override";
                     accessible-action-default => {
@@ -319,11 +328,13 @@ export component SettingsSheet inherits Rectangle {
             }
             if root.background-override-set : Rectangle {
                 height: 24px;
-                background: Theme.bg-card;
+                background: background-override-value-toggle.has-hover ? Theme.bg-primary-container : Theme.bg-card;
+                animate background { duration: 100ms; }
                 border-color: Theme.border-default;
                 border-width: 1px;
                 border-radius: Theme.radius-sm;
                 background-override-value-toggle := TouchArea {
+                    mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Toggle selected chat background session";
                     accessible-action-default => {
@@ -353,9 +364,9 @@ export component SettingsSheet inherits Rectangle {
                 background: Theme.bg-sidebar;
                 border-radius: Theme.radius-sm;
                 HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
+                    padding-left: Metrics.space-4;
+                    padding-right: Metrics.space-4;
+                    spacing: Metrics.space-4;
                     Text {
                         text: server.name;
                         color: Theme.text-primary;
@@ -387,7 +398,7 @@ export component SettingsSheet inherits Rectangle {
                 }
             }
             HorizontalLayout {
-                spacing: 6px;
+                spacing: Metrics.space-3;
                 Rectangle {
                     horizontal-stretch: 1;
                     height: 26px;
@@ -448,9 +459,9 @@ export component SettingsSheet inherits Rectangle {
                 background: Theme.bg-sidebar;
                 border-radius: Theme.radius-sm;
                 HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
+                    padding-left: Metrics.space-4;
+                    padding-right: Metrics.space-4;
+                    spacing: Metrics.space-4;
                     Text {
                         text: agent.name != "" ? agent.name : agent.id;
                         color: Theme.text-primary;
@@ -503,9 +514,9 @@ export component SettingsSheet inherits Rectangle {
                 background: Theme.bg-sidebar;
                 border-radius: Theme.radius-sm;
                 HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 8px;
+                    padding-left: Metrics.space-4;
+                    padding-right: Metrics.space-4;
+                    spacing: Metrics.space-4;
                     Text {
                         text: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
                         color: Theme.text-primary;
@@ -530,7 +541,7 @@ export component SettingsSheet inherits Rectangle {
 
             Rectangle { height: 6px; }
             HorizontalLayout {
-                spacing: 8px;
+                spacing: Metrics.space-4;
                 Button {
                     label: "Save";
                     button-accessible-label: "Save chat settings";

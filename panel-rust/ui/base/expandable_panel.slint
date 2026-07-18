@@ -32,17 +32,22 @@ export component ExpandablePanel {
                 @children
             }
         }
-        expand-toggle := TouchArea {
+        Rectangle {
             height: 18px;
-            accessible-role: button;
-            accessible-label: expanded ? "Collapse view" : "Open full view";
-            accessible-action-default => {
-                expanded = !expanded;
-                toggled(expanded);
-            }
-            clicked => {
-                expanded = !expanded;
-                toggled(expanded);
+            background: expand-toggle.has-hover ? Theme.bg-primary-container : transparent;
+            animate background { duration: 100ms; }
+            expand-toggle := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: expanded ? "Collapse view" : "Open full view";
+                accessible-action-default => {
+                    expanded = !expanded;
+                    toggled(expanded);
+                }
+                clicked => {
+                    expanded = !expanded;
+                    toggled(expanded);
+                }
             }
             Text {
                 text: expanded ? "Show less" : "Open full view";

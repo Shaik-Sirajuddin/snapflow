@@ -122,12 +122,17 @@ export component ToolEventRow inherits Rectangle {
         if has-execution-content : Rectangle {
             VerticalLayout {
                 spacing: Metrics.space-1;
-                toggle-area := TouchArea {
+                Rectangle {
                     height: 16px;
-                    accessible-role: button;
-                    accessible-label: root.expanded ? "Hide call details" : "Show call details";
-                    accessible-action-default => { toggle-expanded(root.index); }
-                    clicked => { toggle-expanded(root.index); }
+                    background: toggle-area.has-hover ? Theme.bg-primary-container : transparent;
+                    animate background { duration: 100ms; }
+                    toggle-area := TouchArea {
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: root.expanded ? "Hide call details" : "Show call details";
+                        accessible-action-default => { toggle-expanded(root.index); }
+                        clicked => { toggle-expanded(root.index); }
+                    }
                     HorizontalLayout {
                         padding-left: Metrics.space-2 + Metrics.icon-sm + Metrics.space-2;
                         Text {

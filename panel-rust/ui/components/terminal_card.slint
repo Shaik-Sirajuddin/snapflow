@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { TerminalItem } from "../types.slint";
 
@@ -35,18 +36,21 @@ export component TerminalCard inherits Rectangle {
     height: compact ? 96px : 140px;
 
     VerticalLayout {
-        padding: 8px;
-        spacing: 4px;
+        padding: Metrics.space-4;
+        spacing: Metrics.space-2;
         Rectangle {
             height: 18px;
+            background: terminal-expand.has-hover ? Theme.bg-primary-container : transparent;
+            animate background { duration: 100ms; }
             terminal-expand := TouchArea {
+                mouse-cursor: pointer;
                 accessible-role: button;
                 accessible-label: "Expand terminal " + item.terminal-id;
                 accessible-action-default => { expand(); }
                 clicked => { expand(); }
             }
             HorizontalLayout {
-                spacing: 6px;
+                spacing: Metrics.space-3;
                 Text {
                     text: "\u{2318}"; // terminal glyph stand-in
                     color: Theme.bg-primary;
@@ -129,10 +133,10 @@ export component TerminalOverlay inherits Rectangle {
     border-radius: Theme.radius-md;
 
     VerticalLayout {
-        padding: 10px;
-        spacing: 8px;
+        padding: Metrics.space-5;
+        spacing: Metrics.space-4;
         HorizontalLayout {
-            spacing: 6px;
+            spacing: Metrics.space-3;
             Text {
                 text: "terminal " + item.terminal-id;
                 color: Theme.text-primary;
