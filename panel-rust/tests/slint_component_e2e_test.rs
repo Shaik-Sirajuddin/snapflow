@@ -708,13 +708,18 @@ fn connection_status_is_exposed_to_accessibility() {
     panel.set_compact(false);
     panel.set_connection_status("HTTP fallback - approvals unavailable".into());
 
-    let status = ElementHandle::find_by_accessible_label(&panel, "Connection status")
-        .next()
-        .expect("connection state must be exposed");
-    assert_eq!(
-        status.accessible_value().as_deref(),
-        Some("HTTP fallback - approvals unavailable")
-    );
+    // `accessible-role: text` doesn't support `accessible-value` (only
+    // certain roles do) -- the status is folded into `accessible-label`
+    // itself instead, per that established convention (see
+    // `chat_area.slint`'s connection-status element).
+    let status =
+        ElementHandle::find_by_accessible_label(&panel, "Connection status: HTTP fallback - approvals unavailable")
+            .next()
+            .expect("connection state must be exposed");
+    assert!(status
+        .accessible_label()
+        .as_deref()
+        .is_some_and(|label| label.contains("HTTP fallback - approvals unavailable")));
 }
 
 /// Coverage Matrix `session/close`/`session/delete` row -- sidebar's
