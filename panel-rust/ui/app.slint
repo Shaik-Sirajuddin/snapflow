@@ -116,6 +116,7 @@ export component ChatPanel inherits Window {
     callback local-terminal-close-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback thread-toggle-background(int);
 
     Rectangle {
         width: root.width;
@@ -155,6 +156,8 @@ export component ChatPanel inherits Window {
             narrow: root.narrow;
             active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
             active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
+            active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
+            toggle-background => { thread-toggle-background(selected-thread); }
             messages: messages;
             has-older-messages: has-older-messages;
             loading-older-messages <=> loading-older-messages;

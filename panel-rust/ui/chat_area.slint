@@ -21,6 +21,11 @@ import { LocalTerminalCard } from "./components/local_terminal_card.slint";
 export component ChatArea inherits Rectangle {
     in property <string> active-thread-name: "";
     in property <string> active-thread-description: "";
+    // The active thread's effective background-session mode -- drives the
+    // header toggle's active state; flipping it re-runs the same per-thread
+    // override the settings sheet writes.
+    in property <bool> active-thread-background: false;
+    callback toggle-background();
     in property <[MessageItem]> messages: [];
     // Phase 3 step 2: an upward user scroll which reaches the actual top
     // boundary asks Rust to prepend the next local JSONL page. The visible
@@ -210,6 +215,18 @@ export component ChatArea inherits Rectangle {
                         font-weight: 700;
                         horizontal-alignment: center;
                         vertical-alignment: center;
+                    }
+                }
+                IconButton {
+                    active: active-thread-background;
+                    button-accessible-label: active-thread-background
+                        ? "Disable background mode for this thread"
+                        : "Enable background mode for this thread";
+                    clicked => { toggle-background(); }
+                    Icon {
+                        source: @image-url("./assets/icons/moon.svg");
+                        size: Metrics.icon-sm;
+                        color: active-thread-background ? Theme.text-tertiary : Theme.text-secondary;
                     }
                 }
                 IconButton {

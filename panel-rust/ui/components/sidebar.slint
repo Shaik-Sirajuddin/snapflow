@@ -215,8 +215,13 @@ export component Sidebar inherits Rectangle {
                                     preferred-width: 0px;
                                     min-width: 0px;
                                 }
-                                if expanded : Text {
-                                    text: thread.background ? "BG" : (i == selected-thread ? "ACTIVE" : "");
+                                if expanded && thread.background : Icon {
+                                    source: @image-url("../assets/icons/moon.svg");
+                                    size: Metrics.icon-sm;
+                                    color: Theme.text-tertiary;
+                                }
+                                if expanded && !thread.background && i == selected-thread : Text {
+                                    text: "ACTIVE";
                                     color: Theme.text-muted;
                                     font-size: 8px * Theme.font-scale;
                                     font-family: Theme.font-mono;

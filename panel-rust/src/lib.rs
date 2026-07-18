@@ -1087,6 +1087,38 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             }
         });
 
+        panel.component.on_thread_toggle_background(move |slint_index| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(store) = panel.panel_state.as_ref() else {
+                        return;
+                    };
+                    let Some(thread_id) = panel
+                        .real_index(slint_index as usize)
+                        .and_then(|idx| {
+                            panel
+                                .bridge
+                                .as_ref()
+                                .and_then(|bridge| bridge.thread_binding(idx))
+                                .map(|binding| binding.thread_id)
+                        })
+                    else {
+                        return;
+                    };
+                    let next = !store
+                        .effective_background_session(&thread_id)
+                        .unwrap_or(false);
+                    if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
+                        eprintln!(
+                            "panel-rust: failed to toggle background-session override: {error}"
+                        );
+                        return;
+                    }
+                    panel.refresh_threads_model();
+                }
+            });
+        });
+
         let component_weak = panel.component.as_weak();
         panel.component.on_mcp_server_create(move |name, command| {
             let Some(component) = component_weak.upgrade() else {
