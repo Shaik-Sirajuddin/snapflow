@@ -48,6 +48,8 @@ export component ChatPanelPreview inherits Window {
         {
             kind: "user",
             text: "The timeline crashes when I scrub past frame 900. Can you investigate?",
+            body-styled: @markdown(""),
+            has-body-styled: false,
             status: "",
             expanded: false,
             index: 0
@@ -55,6 +57,8 @@ export component ChatPanelPreview inherits Window {
         {
             kind: "thinking",
             text: "Checking the timeline state and recent edits...",
+            body-styled: @markdown(""),
+            has-body-styled: false,
             status: "",
             expanded: false,
             index: 1
@@ -62,6 +66,8 @@ export component ChatPanelPreview inherits Window {
         {
             kind: "tool-call",
             text: "timeline.inspect",
+            body-styled: @markdown(""),
+            has-body-styled: false,
             status: "COMPLETED",
             expanded: false,
             index: 2
@@ -69,6 +75,8 @@ export component ChatPanelPreview inherits Window {
         {
             kind: "agent",
             text: "The crash is caused by an invalid frame range. I can patch the guard and rerun the timeline check.",
+            body-styled: @markdown(""),
+            has-body-styled: false,
             status: "",
             expanded: false,
             index: 3

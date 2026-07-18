@@ -14,7 +14,135 @@ use crate::{
 };
 use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::platform::Key;
-use slint::{ModelRc, VecModel};
+use slint::{ModelRc, StyledText, VecModel};
+
+/// chat-items-redesign.md #10: map agent/thinking markdown into Slint
+/// `StyledText`. Unsupported CommonMark (headings, tables, code fences,
+/// blockquotes, images) is rewritten to a supported subset first; on any
+/// remaining parse error we fall back to plain text so the bubble never
+/// goes blank.
+pub fn styled_text_from_markdown(source: &str) -> (StyledText, bool) {
+    if source.is_empty() {
+        return (StyledText::from_plain_text(""), false);
+    }
+    let sanitized = sanitize_markdown_for_slint(source);
+    match StyledText::from_markdown(&sanitized) {
+        Ok(styled) => (styled, true),
+        Err(_) => match StyledText::from_markdown(source) {
+            Ok(styled) => (styled, true),
+            Err(_) => (StyledText::from_plain_text(source), true),
+        },
+    }
+}
+
+/// Rewrites constructs Slint's StyledText subset rejects so most agent
+/// prose still gets bold/italic/lists/links. Tables become mono rows so
+/// column data stays readable until a real grid lands.
+fn sanitize_markdown_for_slint(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_fence = false;
+    for line in input.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            out.push('\n');
+            continue;
+        }
+        if in_fence {
+            // Fenced blocks unsupported — emit each line as inline code.
+            out.push('`');
+            out.push_str(line);
+            out.push('`');
+            out.push('\n');
+            continue;
+        }
+        // GFM table separator or row → mono line (no real grid yet).
+        if is_markdown_table_line(trimmed) {
+            if is_markdown_table_separator(trimmed) {
+                continue; // drop |---|---|
+            }
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect();
+            if !cells.is_empty() {
+                out.push('`');
+                out.push_str(&cells.join(" · "));
+                out.push('`');
+                out.push('\n');
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let title = rest.trim_start_matches('#').trim();
+            if !title.is_empty() {
+                out.push_str("**");
+                out.push_str(title);
+                out.push_str("**\n\n");
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            out.push_str(rest.trim_start());
+            out.push('\n');
+            continue;
+        }
+        // Images -> alt text only.
+        let mut line_out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '!' && chars.peek() == Some(&'[') {
+                chars.next(); // [
+                let mut alt = String::new();
+                for a in chars.by_ref() {
+                    if a == ']' {
+                        break;
+                    }
+                    alt.push(a);
+                }
+                if chars.peek() == Some(&'(') {
+                    chars.next();
+                    for a in chars.by_ref() {
+                        if a == ')' {
+                            break;
+                        }
+                    }
+                }
+                line_out.push_str(&alt);
+            } else {
+                line_out.push(c);
+            }
+        }
+        out.push_str(&line_out);
+        out.push('\n');
+    }
+    out
+}
+
+fn is_markdown_table_line(trimmed: &str) -> bool {
+    trimmed.starts_with('|') && trimmed.matches('|').count() >= 2
+}
+
+fn is_markdown_table_separator(trimmed: &str) -> bool {
+    if !is_markdown_table_line(trimmed) {
+        return false;
+    }
+    trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '))
+}
+
+fn body_styled_for_kind(kind: &str, text: &str) -> (StyledText, bool) {
+    if kind == "agent" || kind == "thinking" {
+        styled_text_from_markdown(text)
+    } else {
+        (StyledText::default(), false)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ThreadState {
@@ -131,6 +259,32 @@ mod classify_tool_call_kind_tests {
     }
 
     #[test]
+    fn styled_text_from_markdown_accepts_bold_and_lists() {
+        let (styled, ok) = styled_text_from_markdown("Hello **world**\n\n- one\n- two");
+        assert!(ok);
+        // Non-empty parse / plain fallback both produce content.
+        let _ = styled;
+    }
+
+    #[test]
+    fn sanitize_markdown_rewrites_headings() {
+        let s = sanitize_markdown_for_slint("# Title\n\nbody");
+        assert!(s.contains("**Title**"), "{s}");
+        assert!(s.contains("body"), "{s}");
+    }
+
+    #[test]
+    fn sanitize_markdown_table_rows_become_mono() {
+        let s = sanitize_markdown_for_slint(
+            "| A | B |\n| --- | --- |\n| 1 | 2 |\n",
+        );
+        assert!(s.contains("A · B"), "{s}");
+        assert!(s.contains("1 · 2"), "{s}");
+        assert!(!s.contains("---"), "{s}");
+    }
+
+
+    #[test]
     fn skill_load_title_classifies_as_skill_load() {
         assert_eq!(
             classify_tool_call_kind("Skill load trailer-writer", None),
@@ -161,6 +315,7 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
             } else {
                 false
             };
+            let (body_styled, has_body_styled) = body_styled_for_kind(kind, &m.text);
             MessageItem {
             kind: kind.into(),
             // Slint side uppercases nothing itself -- source HTML always
@@ -186,7 +341,9 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                 .map(|v| v.to_string())
                 .unwrap_or_default()
                 .into(),
-            text: m.text.into(),
+            text: m.text.clone().into(),
+            body_styled,
+            has_body_styled,
             // Send-queue state is not modelled by the raw `ChatMessage`
             // feed -- a message reaching here has already been dispatched.
             queued: false,
@@ -251,9 +408,12 @@ pub fn to_message_model_from_transcript(
             } else {
                 false
             };
+            let (body_styled, has_body_styled) = body_styled_for_kind(kind, &text);
             let row = MessageItem {
                 kind: kind.into(),
                 text: text.into(),
+                body_styled,
+                has_body_styled,
                 status: status.into(),
                 expanded: expanded.get(index as usize).copied().unwrap_or(false),
                 index,

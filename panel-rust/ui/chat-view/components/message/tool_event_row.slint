@@ -2,6 +2,7 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { ExpandablePanel } from "../../../base/expandable_panel.slint";
+import { CollapseExpand } from "../../../base/collapse_expand.slint";
 import { ApiCallView } from "../execution/api_call_view.slint";
 
 // One tool-taxonomy event row -- chat-items-redesign.md #5/#6. Transparent
@@ -36,6 +37,8 @@ export component ToolEventRow inherits Rectangle {
     callback toggle-expanded(int);
 
     background: transparent;
+    // Content-sized height — do not stretch and steal space from compose.
+    vertical-stretch: 0;
 
     property <bool> is-skill-use: kind == "skill_use";
     // Execution-view content only applies to the two non-skill kinds --
@@ -44,14 +47,35 @@ export component ToolEventRow inherits Rectangle {
     property <bool> has-execution-content: (kind == "tool_use" || kind == "mcp_server_call")
         && (raw-input != "" || raw-output != "");
 
-    VerticalLayout {
-        spacing: Metrics.space-1;
+    // Local open state tracks the host `expanded` prop until the user
+    // clicks (assignment breaks the binding). That keeps the button
+    // working in slint-viewer / fixtures where `toggle-expanded` has no
+    // Rust handler, while production still gets the callback so the
+    // host vec stays in sync.
+    property <bool> details-open: root.expanded;
+    changed expanded => { details-open = root.expanded; }
 
+    // Dot + icon lead for details indent (matches first-row layout).
+    property <length> lead-indent: Metrics.pad-sm + 4px + Metrics.gap-sm + Metrics.icon-sm + Metrics.gap-sm;
+
+    VerticalLayout {
+        spacing: Metrics.gap-sm;
+
+        // First row: dot + kind icon + name. pad-sm horizontal, left text.
+        // Keep default HorizontalLayout alignment (stretch) so the name
+        // Flickable can use horizontal-stretch: 1 — alignment:start made
+        // preferred-width:0 collapse to zero width (name disappeared).
+        // Dot/icon wrappers use alignment: center so they sit on the
+        // vertical midline of the row (cross-axis), not the top.
         HorizontalLayout {
-            padding: Metrics.space-2;
-            spacing: Metrics.space-1;
+            padding-left: Metrics.pad-sm;
+            padding-right: Metrics.pad-sm;
+            padding-top: Metrics.pad-xs;
+            padding-bottom: Metrics.pad-xs;
+            spacing: Metrics.gap-sm;
             VerticalLayout {
-                alignment: start;
+                alignment: center;
+                horizontal-stretch: 0;
                 Rectangle {
                     width: 4px;
                     height: 4px;
@@ -59,38 +83,39 @@ export component ToolEventRow inherits Rectangle {
                     background: Theme.text-muted;
                 }
             }
-            VerticalLayout {
-                alignment: start;
+            // Only the matching kind icon participates in layout.
+            if kind == "tool_use" : VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
                 Icon {
                     source: @image-url("../../../assets/icons/wrench.svg");
-                    visible: kind == "tool_use";
                     size: Metrics.icon-sm;
                     color: Theme.text-secondary;
                 }
             }
-            VerticalLayout {
-                alignment: start;
+            if kind == "skill_load" : VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
                 Icon {
                     source: @image-url("../../../assets/icons/book-open.svg");
-                    visible: kind == "skill_load";
                     size: Metrics.icon-sm;
                     color: Theme.text-secondary;
                 }
             }
-            VerticalLayout {
-                alignment: start;
+            if kind == "skill_use" : VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
                 Icon {
                     source: @image-url("../../../assets/icons/sparkles.svg");
-                    visible: kind == "skill_use";
                     size: Metrics.icon-sm;
                     color: Theme.text-secondary;
                 }
             }
-            VerticalLayout {
-                alignment: start;
+            if kind == "mcp_server_call" : VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
                 Icon {
                     source: @image-url("../../../assets/icons/plug-zap.svg");
-                    visible: kind == "mcp_server_call";
                     size: Metrics.icon-sm;
                     color: Theme.text-secondary;
                 }
@@ -107,47 +132,60 @@ export component ToolEventRow inherits Rectangle {
                     font-size: 11px * Theme.font-scale;
                     color: is-skill-use && first-use ? Theme.text-accent-bright : Theme.text-tertiary;
                     horizontal-alignment: left;
-                    vertical-alignment: top;
+                    vertical-alignment: center;
                     wrap: word-wrap;
                     width: parent.width;
                 }
             }
         }
 
-        // Click-to-open wiring for the execution-view content --
-        // chat-items-remaining-wiring.md #4. A plain `Rectangle` (not a
-        // layout) so the `TouchArea` can cover the whole
-        // toggle-row+panel area, same idiom `message_card.slint`'s
-        // tool-call log body uses.
-        if has-execution-content : Rectangle {
-            VerticalLayout {
-                spacing: Metrics.space-1;
-                Rectangle {
-                    height: 16px;
-                    background: toggle-area.has-hover ? Theme.bg-primary-container : transparent;
-                    animate background { duration: 100ms; }
-                    toggle-area := TouchArea {
-                        mouse-cursor: pointer;
-                        accessible-role: button;
-                        accessible-label: root.expanded ? "Hide call details" : "Show call details";
-                        accessible-action-default => { toggle-expanded(root.index); }
-                        clicked => { toggle-expanded(root.index); }
+        // Click-to-open execution-view (chat-items-remaining-wiring.md #4).
+        // Details body stays mounted and uses CollapseExpand (height +
+        // opacity) so show/hide is smooth — same approach as sidebar
+        // width animate and ExpandablePanel height animate.
+        if has-execution-content : VerticalLayout {
+            vertical-stretch: 0;
+            spacing: Metrics.gap-sm;
+            Rectangle {
+                height: 18px;
+                background: toggle-area.has-hover ? Theme.bg-primary-container : transparent;
+                animate background { duration: 100ms; }
+                toggle-area := TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: root.details-open ? "Hide call details" : "Show call details";
+                    accessible-action-default => {
+                        root.details-open = !root.details-open;
+                        root.toggle-expanded(root.index);
                     }
-                    HorizontalLayout {
-                        padding-left: Metrics.space-2 + Metrics.icon-sm + Metrics.space-2;
-                        Text {
-                            text: root.expanded ? "[-] hide details" : "[+] show details";
-                            font-family: Theme.font-mono;
-                            font-size: 9px * Theme.font-scale;
-                            color: Theme.text-secondary;
-                            vertical-alignment: center;
-                        }
+                    clicked => {
+                        root.details-open = !root.details-open;
+                        root.toggle-expanded(root.index);
                     }
                 }
-                if root.expanded : HorizontalLayout {
-                    padding-left: Metrics.space-2 + Metrics.icon-sm + Metrics.space-2;
+                HorizontalLayout {
+                    padding-left: root.lead-indent;
+                    Text {
+                        text: root.details-open ? "[-] hide details" : "[+] show details";
+                        font-family: Theme.font-mono;
+                        font-size: 9px * Theme.font-scale;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            CollapseExpand {
+                open: root.details-open;
+                // Vertical height + opacity; full width (no width shrink —
+                // that would reflow mono payloads mid-animation).
+                animate-width: false;
+                HorizontalLayout {
+                    padding-left: root.lead-indent;
                     ExpandablePanel {
+                        // When the outer shell is open, start at the
+                        // capped preview; user can still "Open full view".
                         collapsed-max-height: root.cap-height * 2;
+                        collapsed-by-default: true;
                         ApiCallView {
                             raw-input: root.raw-input;
                             raw-output: root.raw-output;

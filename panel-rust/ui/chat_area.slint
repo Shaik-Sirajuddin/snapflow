@@ -6,6 +6,7 @@ import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerm
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
+import { AgentBubble } from "./chat-view/components/message/agent_bubble.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
 import { PermissionCard } from "./components/permission_card.slint";
 import { TerminalCard } from "./components/terminal_card.slint";
@@ -76,6 +77,9 @@ export component ChatArea inherits Rectangle {
     // focus returns to the composer instead of remaining on stale terminal
     // content or falling back to the host dock.
     callback restore-compose-focus();
+    // Panel-level keybindings (app.slint) re-dispatched while compose owns
+    // focus — returns accept when a shortcut was handled.
+    callback panel-shortcut(KeyEvent) -> EventResult;
     out property <bool> compose-has-focus: chat-input.compose-has-focus;
     out property <bool> local-terminal-has-focus:
         local-terminal.open && local-terminal-card.has-focus;
@@ -305,11 +309,13 @@ export component ChatArea inherits Rectangle {
                     }
                 }
                 VerticalLayout {
-                padding-left: compact ? Metrics.space-8 : Metrics.space-10;
-                padding-right: compact ? Metrics.space-8 : Metrics.space-10;
-                padding-top: compact ? 6px : 12px;
-                padding-bottom: compact ? 6px : 12px;
-                spacing: compact ? 8px : 10px;
+                // Match ChatInputLayout shell (pad-2xl H / pad-xl V) so the
+                // message column lines up with the compose bar.
+                padding-left: Metrics.pad-2xl;
+                padding-right: Metrics.pad-2xl;
+                padding-top: Metrics.pad-xl;
+                padding-bottom: Metrics.pad-xl;
+                spacing: compact ? Metrics.gap-md : Metrics.gap-lg;
                 if has-older-messages : Rectangle {
                     height: 22px;
                     border-radius: Theme.radius-sm;
@@ -341,16 +347,12 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
-                // chat-items-redesign.md #11: tool events render as their
-                // own transparent sibling row (`ToolEventRow`), not nested
-                // inside a `MessageCard`; "user" gets the tertiary-bg
-                // `UserBubble` instead of `MessageCard`'s old inline
-                // `is-user` branch. `agent`/`thinking` still fall through
-                // to `MessageCard` -- `agent_bubble.slint`/markdown_view
-                // (chat-items-redesign.md #10, last phase) haven't landed
-                // yet, so there is nothing better to route them to.
+                // chat-items-redesign.md #11: kind switch — user /
+                // agent|thinking / tool-event / legacy MessageCard.
                 for msg[i] in messages : HorizontalLayout {
                     property <bool> is-user: msg.kind == "user";
+                    property <bool> is-agent-side: msg.kind == "agent"
+                        || msg.kind == "thinking";
                     property <bool> is-tool-event: msg.kind == "tool_use"
                         || msg.kind == "mcp_server_call"
                         || msg.kind == "skill_load"
@@ -370,10 +372,18 @@ export component ChatArea inherits Rectangle {
                         min-width: 0px;
                         item: msg;
                     }
+                    if is-agent-side : AgentBubble {
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        vertical-stretch: 0;
+                        item: msg;
+                    }
                     if is-tool-event : ToolEventRow {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
+                        vertical-stretch: 0;
                         kind: msg.kind;
                         first-use: msg.first-use;
                         text: msg.text;
@@ -388,7 +398,7 @@ export component ChatArea inherits Rectangle {
                         index: msg.index;
                         toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
-                    if !is-user && !is-tool-event : card := MessageCard {
+                    if !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
@@ -514,6 +524,7 @@ export component ChatArea inherits Rectangle {
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+            panel-shortcut(event) => { return panel-shortcut(event); }
         }
     }
     restore-compose-focus => { chat-input.focus-compose(); }

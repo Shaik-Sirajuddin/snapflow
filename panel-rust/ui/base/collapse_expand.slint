@@ -1,0 +1,34 @@
+// Smooth collapse / expand shell — height + opacity (and optional
+// horizontal clip). Same idea as:
+//   - sidebar.slint `animate width` on the rail toggle
+//   - expandable_panel.slint `animate height` on the scroll viewport
+//
+// Always keep children mounted; animate this wrapper so open/close is
+// smooth instead of an `if` mount/unmount pop. Callers set `open`.
+export component CollapseExpand inherits Rectangle {
+    in property <bool> open: false;
+    // When true, width also eases from 0 → full (use sparingly; height
+    // is usually enough for vertical panels).
+    in property <bool> animate-width: false;
+
+    clip: true;
+    vertical-stretch: 0;
+    horizontal-stretch: 1;
+
+    height: open ? body.preferred-height : 0px;
+    animate height { duration: 180ms; easing: ease-in-out; }
+
+    opacity: open ? 1.0 : 0.0;
+    animate opacity { duration: 140ms; easing: ease-out; }
+
+    // Horizontal expand: clip from left while width grows to parent.
+    width: animate-width ? (open ? 100% : 0%) : 100%;
+    animate width { duration: 180ms; easing: ease-in-out; }
+
+    body := VerticalLayout {
+        width: 100%;
+        spacing: 0px;
+        padding: 0px;
+        @children
+    }
+}

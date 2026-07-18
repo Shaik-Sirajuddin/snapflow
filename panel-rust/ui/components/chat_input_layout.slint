@@ -23,6 +23,9 @@ export component ChatInputLayout inherits Rectangle {
     callback stop-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    // Panel chords (Ctrl+B/N/K/,, Escape, Ctrl+Enter approve) re-dispatched
+    // while the composer owns focus — wired by ChatArea → ChatPanel.
+    callback panel-shortcut(KeyEvent) -> EventResult;
 
     out property <bool> compose-has-focus: compose.has-focus;
     callback focus-compose();
@@ -41,7 +44,8 @@ export component ChatInputLayout inherits Rectangle {
         padding-right: Metrics.pad-2xl;
         padding-top: Metrics.pad-xl;
         padding-bottom: Metrics.pad-xl;
-        spacing: Metrics.gap-sm;
+        // Vertical gap between input row and mode/model row.
+        spacing: Metrics.gap-lg;
 
         // Row 1 — input fills remaining width; send fixed, bottom-aligned.
         HorizontalLayout {
@@ -84,7 +88,12 @@ export component ChatInputLayout inherits Rectangle {
                         single-line: false;
                         wrap: word-wrap;
                         key-pressed(event) => {
-                            if (event.text == Key.Return && !event.modifiers.shift) {
+                            // Panel chords first so they still work while composing.
+                            if (root.panel-shortcut(event) == EventResult.accept) {
+                                return EventResult.accept;
+                            }
+                            // Plain Enter sends; Ctrl+Enter reserved for approve.
+                            if (event.text == Key.Return && !event.modifiers.shift && !event.modifiers.control) {
                                 root.send-requested();
                                 return EventResult.accept;
                             }

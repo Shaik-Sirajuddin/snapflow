@@ -198,6 +198,8 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
         kind: "agent".into(),
         text: "streamed response".into(),
+        body_styled: Default::default(),
+        has_body_styled: false,
         status: "streaming".into(),
         expanded: false,
         index: 0,

@@ -1,0 +1,51 @@
+import { Theme } from "../tokens/theme.slint";
+
+// chat-items-redesign.md #10 — agent/thinking prose via Slint StyledText.
+//
+// Host (Rust) fills `body-styled` via `models::styled_text_from_markdown`.
+// Fixtures set the same field with `@markdown("…")` so slint-viewer shows
+// real formatting without the host.
+//
+// Supported: bold/italic/strike/inline-code, links, lists, `<u>`/`<font>`.
+// Unsupported (sanitized in Rust): headings, tables, fences, blockquotes,
+// images. Real table *grid* is a later phase.
+export component MarkdownView inherits VerticalLayout {
+    in property <string> source: "";
+    in property <styled-text> body-styled;
+    in property <bool> has-body-styled: false;
+    in property <brush> text-color: Theme.text-primary;
+    in property <length> font-size: 12px * Theme.font-scale;
+    in property <string> font-family: Theme.font-sans;
+    in property <bool> plain-italic: false;
+
+    callback link-clicked(string);
+
+    spacing: 0px;
+    padding: 0px;
+    // VerticalLayout preferred-height = children; no id-forwarding needed.
+
+    if has-body-styled : StyledText {
+        width: 100%;
+        text: root.body-styled;
+        default-color: root.text-color;
+        default-font-family: root.font-family;
+        default-font-size: root.font-size;
+        horizontal-alignment: left;
+        vertical-alignment: top;
+        link-color: Theme.bg-primary;
+        link-clicked(link) => { root.link-clicked(link); }
+    }
+
+    if !has-body-styled : Text {
+        width: 100%;
+        text: root.source;
+        color: root.text-color;
+        font-family: root.font-family;
+        font-size: root.font-size;
+        font-italic: root.plain-italic;
+        wrap: word-wrap;
+        horizontal-alignment: left;
+        vertical-alignment: top;
+        overflow: elide;
+    }
+}
