@@ -74,6 +74,10 @@ export struct MessageItem {
     queued: bool,
     can-edit: bool,
     sending: bool,
+    // chat-items-remaining-wiring.md #6: true on a skill_use row the first
+    // time its skill name appears in the thread (drives ToolEventRow's
+    // bright accent). False for repeats and every non-skill kind.
+    first-use: bool,
 }
 
 // Interactive-relay addition: one pending agent-initiated request

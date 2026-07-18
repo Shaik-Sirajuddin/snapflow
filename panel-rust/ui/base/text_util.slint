@@ -13,4 +13,13 @@ export global TextUtil {
     // implement word-wise backspace by selecting `[result, cursor)`.
     // Returns `cursor` unchanged until Rust installs the implementation.
     pure callback word-boundary-before(string, int) -> int;
+    // Compose slash-command helpers (layout-redesign.md Phase 4). The
+    // "active token" is the whitespace-delimited run containing `cursor`.
+    // Prefix is "/", "#", or "@" when that token starts with one of those
+    // (else ""). Query is the rest of the token after the prefix.
+    pure callback active-token-prefix(string, int) -> string;
+    pure callback active-token-query(string, int) -> string;
+    // Replace the full active token with `replacement` (caller usually
+    // includes a trailing space). Returns the new full text.
+    pure callback replace-active-token(string, int, string) -> string;
 }

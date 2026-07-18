@@ -37,12 +37,16 @@ impl ThreadState {
 
 /// `title` only matters for `MessageKind::ToolCall` (routed through
 /// `classify_tool_call_kind`); ignored for every other kind.
-fn message_kind_str(kind: &MessageKind, title: &str) -> &'static str {
+fn message_kind_str(
+    kind: &MessageKind,
+    title: &str,
+    raw_input: Option<&serde_json::Value>,
+) -> &'static str {
     match kind {
         MessageKind::User => "user",
         MessageKind::Agent => "agent",
         MessageKind::Thinking => "thinking",
-        MessageKind::ToolCall => classify_tool_call_kind(title),
+        MessageKind::ToolCall => classify_tool_call_kind(title, raw_input),
     }
 }
 
@@ -52,45 +56,86 @@ fn message_kind_str(kind: &MessageKind, title: &str) -> &'static str {
 /// `message_card.slint`'s old `item.kind == "tool-call"` check) for this
 /// to render correctly -- see that file's own routing change.
 ///
-/// Title-string matching, not a protocol-level distinction --
+/// Title-string matching plus an optional `raw_input` JSON probe --
 /// `agent-client-protocol`'s own `ToolKind` enum has no MCP/skill
 /// variant (confirmed against `agent-client-protocol-schema`'s
-/// `tool_call.rs`), and `title` is the only identifying text the wire
-/// carries at all (no separate tool-name field). This mirrors Zed's own
-/// client-side convention (`context_server_registry.rs`'s
-/// `format_mcp_initial_title`), which is itself just a title-string
-/// heuristic, not something the ACP spec guarantees any agent follows.
-///
-/// Skill detection is deliberately NOT implemented here yet -- Zed's own
-/// skill tool identifies itself by tool *name* (`"skill"`), a field this
-/// wire shape doesn't carry (only `title`), and no equivalent title
-/// convention has been confirmed against a real skill-invocation capture
-/// from this project's own backend. Guessing a title pattern here would
-/// silently misclassify rather than correctly leave it as `tool_use`.
-fn classify_tool_call_kind(title: &str) -> &'static str {
-    if title.starts_with("Run MCP tool `") {
-        "mcp_server_call"
-    } else {
-        "tool_use"
+/// `tool_call.rs`). MCP detection mirrors Zed's title-string convention
+/// (`Run MCP tool \``…). Skill detection uses the Claude-Code lead from
+/// chat-items-redesign.md (tool titled `"Skill"` and/or `raw_input`
+/// carrying a `"skill"` key) -- still a client-side heuristic, not an
+/// ACP-spec guarantee, but confirmed enough to drive first-use tracking.
+fn classify_tool_call_kind(title: &str, raw_input: Option<&serde_json::Value>) -> &'static str {
+    if title.starts_with("Run MCP tool `") || title.starts_with("mcp__") {
+        return "mcp_server_call";
     }
+    let has_skill_key = raw_input
+        .and_then(|v| v.get("skill"))
+        .and_then(|s| s.as_str())
+        .is_some();
+    let skillish = has_skill_key
+        || title.eq_ignore_ascii_case("Skill")
+        || title.starts_with("Skill:")
+        || title.starts_with("Skill ")
+        || title.to_ascii_lowercase().starts_with("skill:");
+    if skillish {
+        if title.to_ascii_lowercase().contains("load") {
+            return "skill_load";
+        }
+        return "skill_use";
+    }
+    "tool_use"
+}
+
+/// Display / tracking name for a skill tool row -- prefers the
+/// `raw_input.skill` string when present, else the title itself.
+fn skill_tracking_name(title: &str, raw_input: Option<&serde_json::Value>) -> String {
+    raw_input
+        .and_then(|v| v.get("skill"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| title.to_string())
 }
 
 #[cfg(test)]
 mod classify_tool_call_kind_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn mcp_title_prefix_classifies_as_mcp_server_call() {
         assert_eq!(
-            classify_tool_call_kind("Run MCP tool `search_docs`"),
+            classify_tool_call_kind("Run MCP tool `search_docs`", None),
             "mcp_server_call"
         );
     }
 
     #[test]
     fn plain_tool_title_classifies_as_tool_use() {
-        assert_eq!(classify_tool_call_kind("edit.add_transition(...)"), "tool_use");
-        assert_eq!(classify_tool_call_kind(""), "tool_use");
+        assert_eq!(
+            classify_tool_call_kind("edit.add_transition(...)", None),
+            "tool_use"
+        );
+        assert_eq!(classify_tool_call_kind("", None), "tool_use");
+    }
+
+    #[test]
+    fn skill_title_and_raw_input_classify_as_skill_use() {
+        assert_eq!(classify_tool_call_kind("Skill", None), "skill_use");
+        assert_eq!(
+            classify_tool_call_kind(
+                "some tool",
+                Some(&json!({"skill": "trailer-writer"}))
+            ),
+            "skill_use"
+        );
+    }
+
+    #[test]
+    fn skill_load_title_classifies_as_skill_load() {
+        assert_eq!(
+            classify_tool_call_kind("Skill load trailer-writer", None),
+            "skill_load"
+        );
     }
 }
 
@@ -102,11 +147,22 @@ mod classify_tool_call_kind_tests {
 /// `PanelSingleton::expanded` in `lib.rs` for how the vec is kept in
 /// sync as history grows).
 pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<MessageItem> {
+    // First-use skill tracking: walk the list in order, mark a skill_use
+    // row first-use only the first time its tracking name appears.
+    let mut seen_skills = std::collections::HashSet::<String>::new();
     let items: Vec<MessageItem> = msgs
         .into_iter()
         .enumerate()
-        .map(|(i, m)| MessageItem {
-            kind: message_kind_str(&m.kind, &m.text).into(),
+        .map(|(i, m)| {
+            let kind = message_kind_str(&m.kind, &m.text, m.raw_input.as_ref());
+            let first_use = if kind == "skill_use" {
+                let name = skill_tracking_name(&m.text, m.raw_input.as_ref());
+                seen_skills.insert(name)
+            } else {
+                false
+            };
+            MessageItem {
+            kind: kind.into(),
             // Slint side uppercases nothing itself -- source HTML always
             // renders `item.status.toUpperCase()`, so this crate does the
             // same once here rather than duplicating casing logic in
@@ -136,6 +192,8 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
             queued: false,
             can_edit: false,
             sending: false,
+            first_use,
+        }
         })
         .collect();
     ModelRc::new(VecModel::from(items))
@@ -166,6 +224,7 @@ pub fn to_message_model_from_transcript(
     use crate::conversation::TranscriptItem;
 
     let mut index = 0i32;
+    let mut seen_skills = std::collections::HashSet::<String>::new();
     let rows: Vec<MessageItem> = items
         .into_iter()
         .filter_map(|item| {
@@ -179,13 +238,18 @@ pub fn to_message_model_from_transcript(
                 TranscriptItem::Assistant { text, .. } => ("agent", text, String::new()),
                 TranscriptItem::Thought { text, .. } => ("thinking", text, String::new()),
                 TranscriptItem::Tool { title, status, .. } => (
-                    classify_tool_call_kind(&title),
+                    classify_tool_call_kind(&title, None),
                     title,
                     // Same uppercasing convention `to_message_model`
                     // documents above.
                     status.map(|s| s.to_uppercase()).unwrap_or_default(),
                 ),
                 TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. } => return None,
+            };
+            let first_use = if kind == "skill_use" {
+                seen_skills.insert(text.clone())
+            } else {
+                false
             };
             let row = MessageItem {
                 kind: kind.into(),
@@ -200,12 +264,107 @@ pub fn to_message_model_from_transcript(
                 queued: false,
                 can_edit: false,
                 sending: false,
+                first_use,
             };
             index += 1;
             Some(row)
         })
         .collect();
     ModelRc::new(VecModel::from(rows))
+}
+
+// ---------------------------------------------------------------------------
+// Compose slash-token helpers (layout-redesign.md Phase 4) -- also installed
+// as `TextUtil` callbacks from `lib.rs`.
+// ---------------------------------------------------------------------------
+
+fn token_bounds(text: &str, cursor: usize) -> Option<(usize, usize)> {
+    if text.is_empty() {
+        return None;
+    }
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let start = match text[..cursor].rfind(|c: char| c.is_whitespace()) {
+        Some(i) => {
+            let ch = text[i..].chars().next()?;
+            i + ch.len_utf8()
+        }
+        None => 0,
+    };
+    let end = text[cursor..]
+        .find(|c: char| c.is_whitespace())
+        .map(|i| cursor + i)
+        .unwrap_or(text.len());
+    if start >= end {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Leading trigger char of the whitespace-delimited token at `cursor`
+/// when it is `/`, `#`, or `@`; otherwise empty.
+pub fn active_token_prefix(text: &str, cursor: i32) -> String {
+    let cursor = (cursor.max(0) as usize).min(text.len());
+    let Some((start, end)) = token_bounds(text, cursor) else {
+        return String::new();
+    };
+    match text[start..end].chars().next() {
+        Some(c @ ('/' | '#' | '@')) => c.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Token text after the leading `/`/`#`/`@` (may be empty right after the
+/// trigger is typed).
+pub fn active_token_query(text: &str, cursor: i32) -> String {
+    let cursor = (cursor.max(0) as usize).min(text.len());
+    let Some((start, end)) = token_bounds(text, cursor) else {
+        return String::new();
+    };
+    let token = &text[start..end];
+    match token.chars().next() {
+        Some('/' | '#' | '@') => token.chars().skip(1).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Replace the full active token with `replacement` (typically includes a
+/// trailing space). When no token is active, appends `replacement`.
+pub fn replace_active_token(text: &str, cursor: i32, replacement: &str) -> String {
+    let cursor = (cursor.max(0) as usize).min(text.len());
+    if let Some((start, end)) = token_bounds(text, cursor) {
+        let mut out = String::with_capacity(text.len() + replacement.len());
+        out.push_str(&text[..start]);
+        out.push_str(replacement);
+        out.push_str(&text[end..]);
+        out
+    } else {
+        let mut out = text.to_string();
+        out.push_str(replacement);
+        out
+    }
+}
+
+#[cfg(test)]
+mod slash_token_tests {
+    use super::*;
+
+    #[test]
+    fn detects_slash_prefix_and_query() {
+        assert_eq!(active_token_prefix("hello /he", 9), "/");
+        assert_eq!(active_token_query("hello /he", 9), "he");
+        assert_eq!(active_token_prefix("plain", 5), "");
+    }
+
+    #[test]
+    fn replaces_active_token() {
+        assert_eq!(
+            replace_active_token("run /he now", 7, "/help "),
+            "run /help  now"
+        );
+    }
 }
 
 /// The display name of the thread's currently active mode, for the compose

@@ -823,6 +823,22 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     .unwrap_or(0);
                 start as i32
             });
+        // Compose slash-token helpers -- see `models::active_token_*`.
+        component
+            .global::<TextUtil>()
+            .on_active_token_prefix(|text, cursor| {
+                models::active_token_prefix(text.as_str(), cursor).into()
+            });
+        component
+            .global::<TextUtil>()
+            .on_active_token_query(|text, cursor| {
+                models::active_token_query(text.as_str(), cursor).into()
+            });
+        component
+            .global::<TextUtil>()
+            .on_replace_active_token(|text, cursor, replacement| {
+                models::replace_active_token(text.as_str(), cursor, replacement.as_str()).into()
+            });
         component.set_compact(width < 320);
         component.set_narrow(width < 220);
         window.window().request_redraw();
