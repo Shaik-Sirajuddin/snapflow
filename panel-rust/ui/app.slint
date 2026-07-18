@@ -71,7 +71,7 @@ export component ChatPanel inherits Window {
     // "selected profile" property -- picking a chip is exactly
     // equivalent to typing that exact name into the existing free-text
     // field, just without the user needing to know exact profile names.
-    in property <[ProfileOption]> available-profiles: [];
+    in-out property <[ProfileOption]> available-profiles: [];
     // Settings-sheet addition: real `mcp_servers/list`/`agents/list`
     // results (see `SettingsSheet`'s own doc comment) -- populated by
     // `lib.rs` whenever the settings sheet opens, same convention as
@@ -83,9 +83,9 @@ export component ChatPanel inherits Window {
     // comment on these properties; passed straight through to `ChatArea`
     // below (this root component owns no mode/config state of its own,
     // same "just plumbing" role it plays for every other ChatArea prop).
-    in property <[DropdownEntry]> mode-dropdown-entries: [];
-    in property <[DropdownEntry]> config-dropdown-entries: [];
-    in property <string> mode-trigger-label: "";
+    in-out property <[DropdownEntry]> mode-dropdown-entries: [];
+    in-out property <[DropdownEntry]> config-dropdown-entries: [];
+    in-out property <string> mode-trigger-label: "";
     // Set by Rust whenever `expand-terminal` fires (looked up from
     // `terminals` at that moment, since Slint has no `for`-as-expression
     // find/filter construct) -- an empty `terminal-id` means no overlay

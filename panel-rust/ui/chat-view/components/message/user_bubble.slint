@@ -2,27 +2,24 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { MessageItem } from "../../../types.slint";
 
-// User message bubble -- chat-items-redesign.md #1. Tertiary background
-// (not the plain `bg-user-bubble` `message_card.slint` used). All four
-// corners use the shared md radius so user and agent cards match.
+// User bubble — tertiary fill, no border, larger 3-corner radius with
+// LTR outgoing cut (bottom-right). Keeps the proven Flickable + preferred-
+// height body pattern from the working baseline (do not replace with a
+// bare Text that re-introduces stretch-height bugs).
 export component UserBubble inherits Rectangle {
     in property <MessageItem> item;
 
     vertical-stretch: 0;
 
     background: Theme.bg-tertiary;
-    border-color: Theme.border-tertiary;
-    border-width: 1px;
-    border-radius: Theme.radius-md;
+    border-width: 0px;
+    border-top-left-radius: Theme.radius-lg;
+    border-top-right-radius: Theme.radius-lg;
+    border-bottom-left-radius: Theme.radius-lg;
+    border-bottom-right-radius: Metrics.radius-corner-cut;
 
     content := VerticalLayout {
-        padding: Metrics.space-5;
-        // Same `Flickable` sized to the Text's own `preferred-height`
-        // pattern already proven working in `ToolEventRow` -- a bare
-        // `VerticalLayout` wrapping a single `Text` was blowing up to
-        // fill the row's leftover height regardless of `vertical-stretch:
-        // 0` on the outer `Rectangle`; this sidesteps that entirely by
-        // giving the Text an explicit, self-contained height binding.
+        padding: Metrics.space-4;
         Flickable {
             height: bubble-text.preferred-height;
             viewport-height: bubble-text.preferred-height;

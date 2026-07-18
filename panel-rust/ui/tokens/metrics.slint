@@ -19,6 +19,7 @@ export global Metrics {
     // one name instead of repeating a literal `Npx` everywhere. Not
     // theme/preset-dependent (unlike the radius scale above), so these
     // are plain constants rather than resolved through `theme.slint`.
+    // Prefer the semantic pad-* / gap-* aliases below at new call sites.
     out property <length> space-1: 2px;
     out property <length> space-2: 4px;
     out property <length> space-3: 6px;
@@ -29,6 +30,29 @@ export global Metrics {
     out property <length> space-8: 24px;
     out property <length> space-9: 32px;
     out property <length> space-10: 40px;
+
+    // Layout padding tiers (sm / md / lg / …) — semantic aliases over
+    // space-*. Use these for component/box padding so UI code says
+    // "pad-md" rather than picking a raw space-N ad hoc. Same idea as
+    // icon-sm/md/lg and radius-sm/md/lg.
+    //
+    //   pad-xs   4px   dense chips, micro insets
+    //   pad-sm   6px   tight gaps, compact rows
+    //   pad-md  12px   default surface / bar padding
+    //   pad-lg  16px   roomy control interiors
+    //   pad-xl  24px   section margins / field vertical
+    //   pad-2xl 32px   large field horizontal
+    out property <length> pad-xs: space-2;
+    out property <length> pad-sm: space-3;
+    out property <length> pad-md: space-6;
+    out property <length> pad-lg: space-7;
+    out property <length> pad-xl: space-8;
+    out property <length> pad-2xl: space-9;
+
+    // Layout gap tiers (spacing between siblings in a row/column).
+    out property <length> gap-sm: space-3;
+    out property <length> gap-md: space-4;
+    out property <length> gap-lg: space-6;
 
     // Shared icon-size tiers -- so a "header icon" and a "sidebar row
     // icon" agree on what "md" means instead of each picking its own

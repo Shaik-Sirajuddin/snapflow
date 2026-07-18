@@ -21,7 +21,9 @@ import { ChatPanel } from "__CHATPANEL_SLINT__";
 export component DevRoot inherits ChatPanel {
     preferred-width: 1600px;
     preferred-height: 1000px;
-    selected-thread: 1;
+    // Index 0 is idle — must not pick a "loading" thread or ChatArea
+    // sets sending=true and disables the compose TextInput.
+    selected-thread: 0;
     connection-status: "Connected";
     compact: false;
     sidebar-expanded: true;
@@ -29,6 +31,35 @@ export component DevRoot inherits ChatPanel {
     agent-badge: "codex . ask";
     has-older-messages: true;
     loading-older-messages: false;
+
+    // Settings / permission profile mocks so the sheet has chips to click.
+    default-profile: "default";
+    permission-profile: "default";
+    available-profiles: [
+        { name: "default", agent-id: "codex", terminal-enabled: true, fs-enabled: true },
+        { name: "read-only", agent-id: "codex", terminal-enabled: false, fs-enabled: false },
+        { name: "full-access", agent-id: "claude", terminal-enabled: true, fs-enabled: true },
+    ];
+
+    // Compose bar row 2 -- mode + model selectors. Capability-gated on
+    // non-empty lists; seed them here so the VNC/slint-viewer fixture
+    // shows the same controls the host fills from ACP.
+    mode-trigger-label: "ask";
+    mode-dropdown-entries: [
+        { id: "ask", label: "ask", value: "ask", is-header: false, is-current: true },
+        { id: "code", label: "code", value: "code", is-header: false, is-current: false },
+        { id: "plan", label: "plan", value: "plan", is-header: false, is-current: false },
+        { id: "architect", label: "architect", value: "architect", is-header: false, is-current: false },
+    ];
+    config-dropdown-entries: [
+        { id: "model-hdr", label: "model", value: "", is-header: true, is-current: false },
+        { id: "model-sonnet", label: "claude-sonnet-4", value: "claude-sonnet-4", is-header: false, is-current: true },
+        { id: "model-haiku", label: "claude-haiku-4", value: "claude-haiku-4", is-header: false, is-current: false },
+        { id: "model-opus", label: "claude-opus-4", value: "claude-opus-4", is-header: false, is-current: false },
+        { id: "model-gpt", label: "gpt-4.1", value: "gpt-4.1", is-header: false, is-current: false },
+        { id: "model-o3", label: "o3", value: "o3", is-header: false, is-current: false },
+    ];
+
     threads: [
         {
             name: "Refactor auth middleware",
@@ -38,6 +69,8 @@ export component DevRoot inherits ChatPanel {
             background: false,
             description: "Split session validation into its own module",
             closed: false,
+            provider: "codex",
+            model: "gpt-4.1",
         },
         {
             name: "Fix flaky upload test",
@@ -47,6 +80,8 @@ export component DevRoot inherits ChatPanel {
             background: false,
             description: "Reproducing the race in CI, adding a retry",
             closed: false,
+            provider: "claude",
+            model: "claude-sonnet-4",
         },
         {
             name: "Investigate memory leak",
@@ -56,6 +91,8 @@ export component DevRoot inherits ChatPanel {
             background: true,
             description: "Heap growth in the render worker after ~2h",
             closed: false,
+            provider: "claude",
+            model: "claude-haiku-4",
         },
         {
             name: "Docs: onboarding guide",
@@ -65,6 +102,8 @@ export component DevRoot inherits ChatPanel {
             background: false,
             description: "Draft reviewed and merged",
             closed: true,
+            provider: "",
+            model: "",
         },
     ];
     messages: [
@@ -74,6 +113,12 @@ export component DevRoot inherits ChatPanel {
             status: "",
             expanded: false,
             index: 0,
+            raw-input: "",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "thinking",
@@ -81,15 +126,25 @@ export component DevRoot inherits ChatPanel {
             status: "",
             expanded: false,
             index: 1,
+            raw-input: "",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "tool_use",
             text: "grep -rn \"wait_for_upload\" tests/",
             status: "COMPLETED",
-            expanded: true,
+            expanded: false,
             index: 2,
             raw-input: "{\"pattern\":\"wait_for_upload\",\"path\":\"tests/\"}",
             raw-output: "tests/support/upload_helpers.rs:42:pub fn wait_for_upload(...)\ntests/e2e/upload_flow.rs:18:    wait_for_upload(&client, id).await;",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "agent",
@@ -97,6 +152,12 @@ export component DevRoot inherits ChatPanel {
             status: "",
             expanded: false,
             index: 3,
+            raw-input: "",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "tool_use",
@@ -104,6 +165,12 @@ export component DevRoot inherits ChatPanel {
             status: "COMPLETED",
             expanded: false,
             index: 4,
+            raw-input: "",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "user",
@@ -111,13 +178,25 @@ export component DevRoot inherits ChatPanel {
             status: "",
             expanded: false,
             index: 5,
+            raw-input: "",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "tool_use",
             text: "cargo test upload_flow -- --test-threads=1 --repeat=20",
             status: "RUNNING",
-            expanded: true,
+            expanded: false,
             index: 6,
+            raw-input: "",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "agent",
@@ -125,41 +204,12 @@ export component DevRoot inherits ChatPanel {
             status: "",
             expanded: false,
             index: 7,
-        },
-        {
-            kind: "user",
-            text: "lets start it this way can you find out professional video editing softwares popular amount video editors , software , website , opensource , github , users , mit or gpl or apache licence , licence type , created at , learning curve in time period ( week , month, e.t.c ) for a hi",
-            status: "",
-            expanded: false,
-            index: 8,
-        },
-        {
-            kind: "agent",
-            text: "There isn't one — `OPENCODE_SERVER_PASSWORD` was never set, so the server started unauthenticated (it printed `Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.` on boot). Anyone who can reach `127.0.0.1:7770` on this machine can use it as-is, no credentials requ",
-            status: "",
-            expanded: false,
-            index: 9,
-        },
-        {
-            kind: "thinking",
-            text: "The user has run the `/model haiku` command, which set the model to Haiku (claude-haiku-4-5-20251001). This is just a local command caveat that I should not respond to unless explicitly asked. However, they also want me to reply with exactly: \"ACPX_HTTP_400_RECHECK_OK\" This seems",
-            status: "",
-            expanded: false,
-            index: 10,
-        },
-        {
-            kind: "tool_use",
-            text: "ls -la /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main | head -50 && echo \"---\" && find /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main -iname \"*opencode*\" -not -path \"*/node_modules/*\" 2>/dev/null",
-            status: "COMPLETED",
-            expanded: false,
-            index: 11,
-        },
-        {
-            kind: "tool_use",
-            text: "Edit opencode.json",
-            status: "COMPLETED",
-            expanded: false,
-            index: 12,
+            raw-input: "",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
         {
             kind: "skill_use",
@@ -167,6 +217,12 @@ export component DevRoot inherits ChatPanel {
             status: "",
             expanded: false,
             index: 13,
+            raw-input: "{\"skill\":\"artifact-design\"}",
+            raw-output: "",
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: true,
         },
         {
             kind: "mcp_server_call",
@@ -176,13 +232,10 @@ export component DevRoot inherits ChatPanel {
             index: 14,
             raw-input: "{}",
             raw-output: "{\"tabs\":[{\"id\":7,\"title\":\"GitHub PR #142\",\"active\":true}]}",
-        },
-        {
-            kind: "tool_use",
-            text: "latest AI news 2026",
-            status: "RUNNING",
-            expanded: true,
-            index: 15,
+            queued: false,
+            can-edit: false,
+            sending: false,
+            first-use: false,
         },
     ];
 }

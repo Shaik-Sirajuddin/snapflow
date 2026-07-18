@@ -1,0 +1,172 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { Icon } from "../base/icon.slint";
+import { SearchableDropdown } from "../base/searchable_dropdown.slint";
+import { TextUtil } from "../base/text_util.slint";
+import { DropdownEntry } from "../types.slint";
+
+// ChatInputLayout — bottom compose surface for ChatArea:
+//   row 1: multi-line user input + send/stop
+//   row 2: mode + config/model selectors (capability-gated, empty = hidden)
+//
+// Owns focus for the composer (`compose-has-focus`, `focus-compose`) so
+// ChatArea / overlays can restore keyboard focus without reaching into
+// the TextInput id.
+export component ChatInputLayout inherits Rectangle {
+    in-out property <string> compose-text: "";
+    in property <bool> sending: false;
+    in property <[DropdownEntry]> mode-dropdown-entries: [];
+    in property <[DropdownEntry]> config-dropdown-entries: [];
+    in property <string> mode-trigger-label: "";
+
+    callback send-requested();
+    callback stop-requested();
+    callback mode-selected(string);
+    callback config-option-selected(string, string);
+
+    out property <bool> compose-has-focus: compose.has-focus;
+    callback focus-compose();
+
+    width: 100%;
+    horizontal-stretch: 1;
+    // Bar chrome matches thread list (sidebar surface).
+    background: Theme.bg-sidebar;
+
+    // Full chat-column width: shell claims parent width so the input row
+    // has leftover space for horizontal-stretch (see Slint skill).
+    VerticalLayout {
+        width: 100%;
+        // Wrapper (ChatInputLayout shell): H = pad-2xl, V = pad-xl.
+        padding-left: Metrics.pad-2xl;
+        padding-right: Metrics.pad-2xl;
+        padding-top: Metrics.pad-xl;
+        padding-bottom: Metrics.pad-xl;
+        spacing: Metrics.gap-sm;
+
+        // Row 1 — input fills remaining width; send fixed, bottom-aligned.
+        HorizontalLayout {
+            width: 100%;
+            spacing: Metrics.gap-sm;
+            input-box := Rectangle {
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                // Field insets stay pad-lg H / half V (not the wrapper).
+                height: Math.clamp(compose.preferred-height + Metrics.pad-lg, 34px, 120px);
+                // Field fill only (no border) — contrast vs bar (bg-sidebar).
+                background: Theme.bg-tertiary;
+                border-radius: Theme.radius-md;
+                Text {
+                    text: root.sending ? "Agent is working..." : "Ask the agent to execute tools or run tasks...";
+                    color: Theme.text-muted;
+                    font-size: 11px * Theme.font-scale;
+                    font-family: Theme.font-sans;
+                    wrap: word-wrap;
+                    visible: compose.text == "";
+                    x: Metrics.pad-lg;
+                    y: Metrics.pad-lg / 2;
+                    width: parent.width - 2 * Metrics.pad-lg;
+                }
+                Flickable {
+                    x: Metrics.pad-lg;
+                    y: Metrics.pad-lg / 2;
+                    width: parent.width - 2 * Metrics.pad-lg;
+                    height: parent.height - Metrics.pad-lg;
+                    viewport-height: compose.preferred-height;
+                    compose := TextInput {
+                        accessible-label: "Compose message";
+                        text <=> root.compose-text;
+                        enabled: !root.sending;
+                        color: Theme.text-primary;
+                        font-family: Theme.font-sans;
+                        font-size: 11px * Theme.font-scale;
+                        width: parent.width;
+                        single-line: false;
+                        wrap: word-wrap;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return && !event.modifiers.shift) {
+                                root.send-requested();
+                                return EventResult.accept;
+                            }
+                            if (event.text == Key.Backspace && event.modifiers.control) {
+                                self.set-selection-offsets(
+                                    TextUtil.word-boundary-before(self.text, self.cursor-position-byte-offset),
+                                    self.cursor-position-byte-offset);
+                                return EventResult.reject;
+                            }
+                            return EventResult.reject;
+                        }
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: end;
+                horizontal-stretch: 0;
+                width: 34px;
+                Rectangle {
+                    width: 34px;
+                    height: 34px;
+                    background: root.sending ? Theme.border-default
+                        : !(root.sending || compose.text != "") ? Theme.border-default
+                        : send-stop-button.has-hover ? Theme.bg-primary.with-alpha(0.85)
+                        : Theme.bg-primary;
+                    animate background { duration: 100ms; }
+                    border-radius: Theme.radius-md;
+                    opacity: (root.sending || compose.text != "") ? 1.0 : 0.7;
+                    send-stop-button := TouchArea {
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: root.sending ? "Stop response" : "Send message";
+                        accessible-action-default => {
+                            if root.sending { root.stop-requested(); }
+                            else { root.send-requested(); }
+                        }
+                        enabled: root.sending || compose.text != "";
+                        clicked => {
+                            if root.sending { root.stop-requested(); }
+                            else { root.send-requested(); }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
+                            alignment: center;
+                            Icon {
+                                source: root.sending
+                                    ? @image-url("../assets/icons/square.svg")
+                                    : @image-url("../assets/icons/send.svg");
+                                size: Metrics.icon-sm;
+                                color: root.sending ? Theme.text-secondary
+                                    : (compose.text != "" ? Theme.text-on-primary : Theme.text-muted);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Row 2 — mode + model/config; left-aligned, capability-gated.
+        if root.mode-dropdown-entries.length > 0 || root.config-dropdown-entries.length > 0 : HorizontalLayout {
+            width: 100%;
+            spacing: Metrics.gap-sm;
+            if root.mode-dropdown-entries.length > 0 : SearchableDropdown {
+                horizontal-stretch: 0;
+                trigger-label: root.mode-trigger-label != "" ? root.mode-trigger-label : "Mode";
+                options: root.mode-dropdown-entries;
+                placeholder: "Search modes...";
+                popup-width: 200px;
+                entry-selected(id, value) => { root.mode-selected(id); }
+            }
+            if root.config-dropdown-entries.length > 0 : SearchableDropdown {
+                horizontal-stretch: 0;
+                trigger-label: "Model";
+                options: root.config-dropdown-entries;
+                placeholder: "Search models...";
+                popup-width: 220px;
+                entry-selected(id, value) => { root.config-option-selected(id, value); }
+            }
+        }
+    }
+
+    focus-compose => { compose.focus(); }
+}

@@ -3,19 +3,12 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Badge } from "../base/badge.slint";
 import { MessageItem } from "../types.slint";
 
-// One reusable message card, parameterized by kind (user/agent/tool-call/
-// thinking) -- Phase 3 of chat-panel-ui-theme-parity.md. Visual source:
-// ui_html/index.html's `renderChatBubbles()` for user/agent/thinking
-// (plain bordered bubble, uppercase mono label header, no timestamp --
-// this crate's `ChatMessage` carries no timestamp field, an accepted
-// data-model gap not in this plan's scope) and `renderTimeline()`'s
-// tool_use card for tool-call (status badge + collapsible log body),
-// since the HTML's own bubble-layout tool rendering is a flat text dump
-// with no collapse affordance and this plan explicitly asks for one.
-//
-// Status stays deliberately monochrome (see tokens/theme.slint's note) --
-// `item.status` is already uppercased by `models::to_message_model`, so
-// this file only lays it out, never colors by value.
+// Agent / thinking / legacy tool-call card.
+// Styling on top of the working baseline:
+// - Agent: no "AGENT" label, no border, elevated fill, 3-corner radius
+// - Thinking: transparent, small pad
+// - Body keeps Flickable + preferred-height (baseline-stable)
+// - Empty layout spacers must not fill parent height (Slint skill)
 export component MessageCard inherits Rectangle {
     in property <MessageItem> item;
     callback toggle-expanded(int);
@@ -26,27 +19,33 @@ export component MessageCard inherits Rectangle {
     property <bool> is-thinking: item.kind == "thinking";
     property <string> header-label: is-user ? "USER" : is-agent ? "AGENT" : is-thinking ? "THINKING" : "TOOL";
 
-    // Thinking renders as plain muted/italic text, no bubble chrome at
-    // all -- matches the timeline view's "agent text stream" treatment
-    // for non-bubble content; user/agent/tool-call all get a bordered
-    // card.
+    vertical-stretch: 0;
+
+    // Agent uses primary-container so it contrasts bg-chat without a border.
     background: is-thinking ? transparent
         : is-user ? Theme.bg-user-bubble
         : is-tool-call ? Theme.bg-card
-        : Theme.bg-agent-bubble;
-    border-color: is-user ? Theme.border-user-bubble
-        : is-tool-call ? Theme.border-default
-        : Theme.border-agent-bubble;
-    border-width: is-thinking ? 0px : 1px;
-    border-radius: Theme.radius-md;
+        : Theme.bg-primary-container;
+    border-color: is-tool-call ? Theme.border-default : transparent;
+    border-width: is-thinking ? 0px : is-tool-call ? 1px : 0px;
+
+    border-top-left-radius: is-thinking ? 0px : Theme.radius-lg;
+    border-top-right-radius: is-thinking ? 0px : Theme.radius-lg;
+    border-bottom-left-radius: is-thinking ? 0px
+        : is-agent ? Metrics.radius-corner-cut
+        : Theme.radius-lg;
+    border-bottom-right-radius: is-thinking ? 0px
+        : is-user ? Metrics.radius-corner-cut
+        : Theme.radius-lg;
 
     VerticalLayout {
-        padding: is-thinking ? Metrics.space-2 : Metrics.space-5;
+        padding: is-thinking ? Metrics.space-2
+            : is-agent ? Metrics.space-4
+            : Metrics.space-5;
         spacing: Metrics.space-3;
 
-        // Header row -- uppercase mono label, plus tool-name/status
-        // badges for tool-call only.
-        HorizontalLayout {
+        // No header for agent messages.
+        if !is-agent : HorizontalLayout {
             spacing: Metrics.space-3;
             Text {
                 text: header-label;
@@ -56,19 +55,20 @@ export component MessageCard inherits Rectangle {
                 letter-spacing: 0.5px;
                 color: Theme.text-muted;
                 vertical-alignment: center;
+                horizontal-stretch: 0;
             }
             if is-tool-call && item.status != "" : Badge {
                 label: item.status;
             }
-            Rectangle { }
+            // Horizontal-only spacer (empty rect fills parent by default).
+            Rectangle {
+                horizontal-stretch: 1;
+                vertical-stretch: 0;
+                height: 0px;
+                preferred-height: 0px;
+            }
         }
 
-        // Body -- plain wrapped text for user/agent/thinking; for
-        // tool-call, a clickable summary line that toggles the log box.
-        // Flickable-wrapped, height bound to the Text's own
-        // `preferred-height` -- same fix `user_bubble.slint` needed for
-        // its own body text (a bare stretch-sized Text in this position
-        // risked blowing up to fill leftover row height).
         if !is-tool-call : Flickable {
             height: body-text.preferred-height;
             viewport-height: body-text.preferred-height;
@@ -82,7 +82,7 @@ export component MessageCard inherits Rectangle {
                 font-size: (is-thinking ? 11px : 12px) * Theme.font-scale;
                 color: is-user ? Theme.text-user-bubble
                     : is-thinking ? Theme.text-muted
-                    : Theme.text-agent-bubble;
+                    : Theme.text-primary;
                 wrap: word-wrap;
                 overflow: elide;
                 horizontal-alignment: left;
@@ -90,10 +90,7 @@ export component MessageCard inherits Rectangle {
                 width: parent.width;
             }
         }
-        // Plain `Rectangle` (not a layout) so a sibling `TouchArea` can
-        // cover the whole clickable summary+toggle-label area -- same
-        // "TouchArea + Layout as siblings under a plain Rectangle" idiom
-        // already used for the sidebar's thread-row click targets.
+
         if is-tool-call : Rectangle {
             background: tool-toggle-touch.has-hover ? Theme.bg-primary-container : transparent;
             animate background { duration: 100ms; }
@@ -126,8 +123,14 @@ export component MessageCard inherits Rectangle {
                         font-size: 9px * Theme.font-scale;
                         color: Theme.text-secondary;
                         vertical-alignment: center;
+                        horizontal-stretch: 0;
                     }
-                    Rectangle { }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        vertical-stretch: 0;
+                        height: 0px;
+                        preferred-height: 0px;
+                    }
                 }
                 if item.expanded : Rectangle {
                     background: Theme.bg-terminal;
