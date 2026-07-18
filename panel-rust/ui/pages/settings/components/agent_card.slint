@@ -1,0 +1,250 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+import { Icon } from "../../../base/icon.slint";
+import { AgentLogo } from "../components/agent_logo.slint";
+import { Button } from "../../../base/button.slint";
+import { LabeledSelect } from "../../../base/labeled_select.slint";
+import { Toggle } from "../../../base/toggle.slint";
+
+// Grid tile for the Agents view -- one per catalog entry (auto-discovered
+// or installable), per the settings-pane-redesign plan's "Agents view is a
+// grid, not a row list" section.
+//
+// Layout (per the design-doc `changes.yaml` "rows" task):
+//   1. logo + name, left-aligned
+//   2. [status icon] status text, plus a "make default" toggle
+//   3. Model label + searchable model picker
+//   4. Profile label + permission-mode picker (same picker design)
+//   5. Install / Connect / Disconnect action per status
+//
+// LOGO REVERSAL: an earlier pass this session removed the agent logo per
+// an offhand "no logo" request; the checked-in `changes.yaml` task doc
+// then explicitly asks for "logo, name first row left align", so it is
+// back. `AgentCatalogEntry` has no per-agent logo/icon-url field, and
+// `@image-url` needs a compile-time-constant path (so a dynamic per-agent
+// URL couldn't render even if the struct carried one -- see
+// `icon.slint`'s doc comment). The per-agent official brand mark is
+// therefore resolved by `AgentLogo`, a static id->`@image-url` lookup over
+// the vendored logos in `ui/assets/logos/` (falling back to the generic
+// `sparkles` placeholder for unknown ids) -- see `agent_logo.slint`.
+//
+// Status is monochrome text + a `check`/`circle` glyph only -- never a
+// colored dot (this project's established no-status-color language, see
+// `theme.slint`'s module doc and `AgentCatalogEntry.status`'s doc
+// comment). Default selection is now an explicit `Toggle` (was a silent
+// whole-card click before).
+export component AgentCard inherits Rectangle {
+    in property <string> agent-id;
+    in property <string> agent-name;
+    // Registry wire status string (`AgentStatus::as_wire_str`):
+    // "installed" | "installed_no_session" | "not_installed" |
+    // "runtime_missing" | <unknown>. Derived into the three display states
+    // below rather than passed as separate bools, so the card owns the
+    // status->presentation mapping in one place.
+    in property <string> status: "";
+    in property <bool> is-default: false;
+    in-out property <string> default-model: "";
+    in property <[string]> model-options: [];
+    in-out property <string> permission-profile: "";
+    in property <[string]> profile-options: [];
+    callback set-default(bool);
+    callback install-requested();
+    callback connect-requested();
+    callback disconnect-requested();
+
+    // "installed" is the registry's "present with a live session" state --
+    // treat as connected. "installed_no_session" is present-but-not-running.
+    // Everything else (not_installed / runtime_missing / unknown) is
+    // not-found -> offer Install.
+    property <bool> is-connected: root.status == "installed";
+    property <bool> is-present: root.status == "installed" || root.status == "installed_no_session";
+
+    width: 260px;
+    height: 226px;
+    // Same tertiary tone the search box uses so cards read as one
+    // consistent surface with the rest of this page's chrome; the default
+    // card gets the primary-container tint to stand out. No hover tint on
+    // the card body itself -- only its interactive controls get hover
+    // feedback.
+    background: is-default ? Theme.bg-primary-container : Theme.bg-tertiary;
+    animate background { duration: 100ms; }
+    border-radius: Theme.radius-md;
+    // Defensive: contain any future internal overflow at this card's own
+    // boundary instead of letting it bleed into the neighboring grid
+    // column (no element anywhere on this page had `clip: true` before --
+    // real root cause of one visible bug was the Select width fix above,
+    // but nothing enforced a hard boundary if something else overflows
+    // later). Doesn't affect `Select`'s dropdown -- that's a real
+    // `PopupWindow`, which renders above everything, unaffected by an
+    // ancestor's `clip`.
+    clip: true;
+
+    VerticalLayout {
+        // Explicit fill -- this Rectangle's sole-child VerticalLayout
+        // doesn't reliably auto-fill a fixed-size parent (same class of
+        // bug found repeatedly elsewhere this session). Left unbound, a
+        // card whose content is shorter (e.g. a not-yet-installed agent,
+        // which skips the Model/Profile rows below) sized this layout to
+        // its own shorter natural height and centered it in the fixed
+        // 226px card box, showing as unexplained blank margin above the
+        // content instead of the bottom-pinned action row `vertical-
+        // stretch: 1` below is meant to produce.
+        width: parent.width;
+        height: parent.height;
+        padding: Metrics.space-6;
+        spacing: Metrics.space-3;
+
+        // Row 1: logo + name, left-aligned.
+        HorizontalLayout {
+            spacing: Metrics.space-2;
+            AgentLogo {
+                agent-id: root.agent-id;
+                size: 16px;
+                color: Theme.text-secondary;
+            }
+            Text {
+                text: root.agent-name;
+                color: Theme.text-primary;
+                font-size: 13px * Theme.font-scale;
+                font-weight: 700;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        // Row 2: [status icon] status text  +  make-default toggle.
+        HorizontalLayout {
+            spacing: Metrics.space-2;
+            Icon {
+                size: 12px;
+                color: Theme.text-secondary;
+                source: root.is-connected
+                    ? @image-url("../../../assets/icons/check.svg")
+                    : @image-url("../../../assets/icons/circle.svg");
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.is-connected ? "Connected" : (root.is-present ? "Installed" : "Not found");
+                color: Theme.text-secondary;
+                font-size: 10px * Theme.font-scale;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "Default";
+                color: Theme.text-secondary;
+                font-size: 10px * Theme.font-scale;
+                vertical-alignment: center;
+            }
+            // Split into two `if` branches (rather than one `Toggle`
+            // with `checked: root.is-default`) so the whole element gets
+            // destroyed and recreated -- and its `checked` binding fully
+            // reset -- whenever `is-default` flips. `Toggle.checked` is
+            // `in-out` and self-assigns on click (`toggle.slint`'s own
+            // `clicked` handler does `root.checked = !root.checked`),
+            // which is fine for `Toggle`'s other, single-instance,
+            // self-managed call sites (e.g. the MCP-server enable
+            // toggles), but a plain one-way `checked: root.is-default`
+            // binding gets permanently severed the first time a user
+            // clicks it -- so clicking a *different* card's default
+          // toggle afterward never turned this one back off, letting
+            // more than one card show as default at once. This is the
+            // reason "the default agent should only be one" broke.
+            if root.is-default : Toggle {
+                checked: true;
+                toggle-accessible-label: "Unset " + root.agent-name + " as default agent";
+                toggled(new-checked) => { root.set-default(new-checked); }
+            }
+            if !root.is-default : Toggle {
+                checked: false;
+                toggle-accessible-label: "Set " + root.agent-name + " as default agent";
+                toggled(new-checked) => { root.set-default(new-checked); }
+            }
+        }
+
+        // Rows 3-4: Model + Profile pickers (only meaningful once present).
+        // Both are the same "label + Select" shape -- `LabeledSelect`
+        // (base/labeled_select.slint) -- rather than each hand-rolling its
+        // own `Text` + `Select` pair.
+        // No explicit `width:` here -- this is a *direct* managed child of
+        // the padded outer VerticalLayout above (`padding:
+        // Metrics.space-6`), so its default `alignment: stretch` already
+        // sizes it correctly within the padding automatically. Binding
+        // `width: parent.width` here (as this used to) reads the padded
+        // layout's own *raw* box width, bypassing the padding inset the
+        // layout would otherwise apply -- that's why the Model/Profile
+        // pickers rendered flush to the card's outer edge instead of
+        // respecting the card's padding. The `width: parent.width`
+        // pattern used throughout this session is for cases where an
+        // element is *not* a direct layout child (nested deeper, or
+        // outside any layout at all) and genuinely doesn't get sized
+        // automatically -- it's the wrong fix for a direct child of a
+        // padded layout, which already gets sized correctly by default.
+        if root.is-present : VerticalLayout {
+            spacing: Metrics.space-2;
+            LabeledSelect {
+                width: parent.width;
+                label: "Model";
+                value <=> root.default-model;
+                options: root.model-options;
+                placeholder: "Default model";
+                searchable: root.model-options.length >= 5;
+                select-accessible-label: "Default model for " + root.agent-name;
+            }
+            LabeledSelect {
+                width: parent.width;
+                label: "Profile";
+                value <=> root.permission-profile;
+                options: root.profile-options;
+                placeholder: "Permission mode";
+                select-accessible-label: "Permission profile for " + root.agent-name;
+            }
+        }
+
+        // Row 5: primary action per status. All three are UI-only for now,
+        // same posture as `mcp_servers_view.slint`'s "Connect" button:
+        // there is no per-agent connect/disconnect RPC in
+        // `src/agent_bridge.rs` today (only `agents/install`), so Connect/
+        // Disconnect are placeholders wired up through the view; Install is
+        // the one real callback (`agents/install`).
+        Rectangle {
+            vertical-stretch: 1;
+            HorizontalLayout {
+                y: parent.height - self.height;
+                width: parent.width;
+                alignment: start;
+                if !root.is-present : Button {
+                    label: "Install";
+                    button-accessible-label: "Install agent " + root.agent-name;
+                    btn-width: 72px;
+                    btn-height: 24px;
+                    font-size: 10px;
+                    font-weight: 400;
+                    clicked => { root.install-requested(); }
+                }
+                if root.is-present && !root.is-connected : Button {
+                    label: "Connect";
+                    button-accessible-label: "Connect agent " + root.agent-name;
+                    btn-width: 72px;
+                    btn-height: 24px;
+                    font-size: 10px;
+                    font-weight: 400;
+                    // UI-only: no per-agent connect RPC exists yet (see
+                    // this row's doc comment).
+                    clicked => { root.connect-requested(); }
+                }
+                if root.is-connected : Button {
+                    label: "Disconnect";
+                    button-accessible-label: "Disconnect agent " + root.agent-name;
+                    btn-width: 84px;
+                    btn-height: 24px;
+                    font-size: 10px;
+                    font-weight: 400;
+                    // UI-only: no per-agent disconnect RPC exists yet.
+                    clicked => { root.disconnect-requested(); }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,67 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Icon } from "../../../base/icon.slint";
+
+// Per-agent brand logo, keyed by agent id. This is the "map" that lets a
+// card render a real official mark instead of one generic placeholder:
+// `@image-url(...)` needs a compile-time-constant literal path (so a
+// dynamic `@image-url(some_variable)` can't work -- see `base/icon.slint`'s
+// doc comment), so the lookup is a static `if agent-id == "..."` chain over
+// the known ids, each pointing at its own vendored SVG in
+// `ui/assets/logos/` (sourced + licensed there -- see that folder's
+// LICENSE). Any unknown id falls back to the same `sparkles` placeholder
+// `Icon` the rest of the settings UI uses.
+//
+// COLORIZE, per mark: brand marks that carry their own real brand color
+// (Claude orange, Gemini purple) render un-colorized so they show in their
+// native colors -- tinting them to `Theme.text-*` would destroy the brand.
+// Marks that ship as a single-color glyph with no distinctive brand color
+// (OpenAI's mono logomark, Amp's white lightning) ARE colorized to `color`
+// so they stay visible on both light and dark card surfaces (Amp's source
+// glyph is white, invisible on a light background otherwise). `Image`'s
+// default `colorize` is transparent (= no tint), which is what the native
+// branches rely on by simply not setting it.
+export component AgentLogo {
+    in property <string> agent-id;
+    in property <length> size: 16px;
+    // Only used for the colorized monochrome marks and the fallback Icon;
+    // the native-color marks ignore it by design.
+    in property <color> color: Theme.text-secondary;
+
+    width: size;
+    height: size;
+
+    if root.agent-id == "claude-code" : Image {
+        width: root.size;
+        height: root.size;
+        image-fit: contain;
+        source: @image-url("../../../assets/logos/claude-code.svg");
+    }
+    if root.agent-id == "gemini-cli" : Image {
+        width: root.size;
+        height: root.size;
+        image-fit: contain;
+        source: @image-url("../../../assets/logos/gemini-cli.svg");
+    }
+    if root.agent-id == "codex" : Image {
+        width: root.size;
+        height: root.size;
+        image-fit: contain;
+        colorize: root.color;
+        source: @image-url("../../../assets/logos/codex.svg");
+    }
+    if root.agent-id == "amp" : Image {
+        width: root.size;
+        height: root.size;
+        image-fit: contain;
+        colorize: root.color;
+        source: @image-url("../../../assets/logos/amp.svg");
+    }
+    if root.agent-id != "claude-code"
+        && root.agent-id != "gemini-cli"
+        && root.agent-id != "codex"
+        && root.agent-id != "amp" : Icon {
+        size: root.size;
+        color: root.color;
+        source: @image-url("../../../assets/icons/sparkles.svg");
+    }
+}

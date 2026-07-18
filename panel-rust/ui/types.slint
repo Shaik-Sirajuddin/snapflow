@@ -173,9 +173,84 @@ export struct ConfigOptionRow {
 // edit dialog -- full entry payloads (env, args, etc.) are opaque JSON
 // on the Rust side (`acpx-core::McpServerStore` never interprets more
 // than `"name"`), this struct only surfaces what the list view needs.
+//
+// One tool advertised by an MCP server (`tools/list`), individually
+// toggleable. Mirrors opencode's per-tool control (its global `tools`
+// glob config, e.g. `"my-mcp*": false`) plus its experimental
+// `mcp_lazy`/`mcp_search` deferred loading and Claude Code's ToolSearch
+// deferred-tool pattern. **UI-only** -- no `tools/list` round trip or
+// per-tool persistence exists yet.
+export struct McpToolOption {
+    name: string,
+    // Whether this tool is exposed to the model (opencode `tools` glob).
+    enabled: bool,
+    // Lazy-loaded: its schema is not injected up front but discovered
+    // on demand (opencode `mcp_lazy` / Claude Code ToolSearch). Shown as
+    // a monochrome "deferred" tag, never a colored marker.
+    deferred: bool,
+    // Approximate token cost of this tool's schema being included in the
+    // model's context (0 when unknown/not yet measured). UI-only estimate
+    // -- there is no real per-tool token accounting anywhere in this
+    // codebase yet; `mcp_servers_view.slint` shows it purely as a
+    // reference figure next to each tool.
+    token-usage: int,
+}
+
+// `transport`/`url`/`enabled`/`status`/`needs-auth`/`auth-status`/`tools`
+// are **UI-only for now** (settings-pane-redesign "shell phase, UI ahead
+// of backend" posture -- same convention `harness_view.slint` documents
+// for its own toggles). The real backend (`src/agent_bridge.rs`
+// `mcp_servers/*`) only supports create/delete by name+command today:
+// `models::to_mcp_server_options` default-fills these fields (`""`,
+// `false`, empty tool list) via `..Default::default()`. They mirror the
+// *set of real per-server config options* established coding agents
+// expose -- benchmarked here against opencode's `mcp` config schema
+// (https://opencode.ai/docs/mcp-servers): a `type` of `"local"`
+// (command child process) vs `"remote"` (a `url`, optional `oauth`), an
+// `enabled` flag, and -- via opencode's global `tools` glob config plus
+// its experimental `mcp_lazy`/`mcp_search` deferred-loading -- per-tool
+// enable/disable and lazy ("deferred") tool loading. Wiring these to a
+// real `mcp_servers/update` RPC, a live status feed, and a `tools/list`
+// round trip is a later phase.
 export struct McpServerOption {
     name: string,
     command: string,
+    // "stdio" (local command child process) | "http" (remote URL, may
+    // need OAuth) -- opencode's `type: "local"` vs `"remote"` split, Zed's
+    // command-vs-url, Codex's stdio-vs-streamable_http. Empty string
+    // renders no transport tag (pre-transport-field cached rows / backend
+    // not yet supplying it).
+    transport: string,
+    // Remote endpoint (opencode remote `url`) -- only meaningful when
+    // `transport == "http"`; "" for a stdio server. Kept distinct from
+    // `command` so the view stops overloading one field for two honestly
+    // different things (a shell command line vs. an HTTP endpoint).
+    url: string,
+    // Enable/disable without removing the entry -- opencode/Codex per-server
+    // `enabled = false`, Zed's context_servers_disabled.
+    enabled: bool,
+    // Live connection status, already-lowercased display text (e.g.
+    // "connected" | "disconnected" | "error" | "auth required") or "" when
+    // unknown -- rendered as plain monochrome text, not a colored dot,
+    // matching this project's no-status-color language (see
+    // `AgentCatalogEntry.status`'s doc comment).
+    status: string,
+    // Remote server that advertises an OAuth flow and is not yet
+    // authenticated -- surfaces a "Connect" action (opencode remote
+    // `oauth` / Codex's `codex mcp login <server>`). Only meaningful when
+    // `transport == "http"`.
+    needs-auth: bool,
+    // OAuth/auth outcome as already-lowercased monochrome display text
+    // (e.g. "authenticated" | "not authenticated" | "auth failed") or ""
+    // when auth doesn't apply (stdio server) -- distinct from `needs-auth`
+    // (which only gates whether "Connect" shows): this reports the actual
+    // authenticated-vs-not state, never as a colored badge.
+    auth-status: string,
+    // Tools this server advertises via MCP `tools/list`, each individually
+    // enable/disable-able and markable "deferred" (lazy-loaded). Empty
+    // list renders no tool section (backend not yet supplying a tool
+    // catalog -- always empty today).
+    tools: [McpToolOption],
 }
 
 // Recovery/import sheet addition (Coverage Matrix `session/list` row):

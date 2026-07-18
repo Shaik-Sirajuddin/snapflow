@@ -1,0 +1,217 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { Icon } from "icon.slint";
+
+// Layer 3 (base) -- generic single-select dropdown. Nothing in this
+// codebase had a reusable "pick one of a fixed list" control before this
+// (an earlier UI plan sketched a `searchable_dropdown.slint` for the
+// compose bar's mode/profile pickers, but it was never built) -- every
+// call site instead hand-rolled its own text field or chip row. A closed
+// box shows the current value; click to open a floating `PopupWindow`
+// list of `options` below it, click one to choose and close. Floating
+// rather than inline-expand (an earlier version pushed following content
+// down in place) because this is used inside `agent_card.slint`'s
+// fixed-size grid tiles -- an inline expansion grew the tile's own layout
+// height, breaking the tile's border and making cards inconsistent sizes.
+// A `PopupWindow` renders above everything without affecting any layout
+// box.
+//
+// The open list renders the currently-selected option with a distinct
+// container-tint background (not just a bold label) and a leading
+// `check.svg` tick, so the current choice is scannable at a glance.
+//
+// `searchable` adds a text field at the top of the popup for narrowing a
+// long option list (the settings-pane redesign's "model picker with
+// search for 5+ models"). NOTE: the query is wired but **does not filter
+// yet** -- Slint 1.17.1's `string` type has no `contains`/`index-of`/
+// substring/char-indexing at all (verified against this exact compiler
+// while building this: only `is-empty`/`to-lowercase`/`to-uppercase`/
+// `character-count` exist), and there is no pure-Slint way to test
+// substring membership. Real filtering needs a small Rust-side helper --
+// the exact same deferral, for the exact same documented reason, that
+// `components/search_bar.slint` and `agents_view.slint`'s own grid search
+// already take. The search box is a real affordance now; the filter is a
+// later Rust pass.
+export component Select inherits Rectangle {
+    in property <[string]> options: [];
+    in-out property <string> value: "";
+    in property <string> placeholder: "Select...";
+    in property <string> select-accessible-label: "Select";
+    // Show the in-popup search field. Off by default -- only long pickers
+    // (the model picker) opt in; short ones (the profile picker) reuse the
+    // same component and design with it simply hidden.
+    in property <bool> searchable: false;
+    callback selected(string);
+
+    // Local search text -- popup-scoped, reset each time the popup opens
+    // (see `head-touch` below). Not an `in` property: no call site drives
+    // it, it exists only to back the in-popup field.
+    property <string> query: "";
+
+    // NOTE: this component's Rectangle root has no width binding of its
+    // own -- every call site must bind `width:` explicitly (e.g.
+    // `Select { width: parent.width; ... }`, as `labeled_select.slint`
+    // does). A component's own root element can't bind its width to
+    // `parent.width` *from within its own definition* -- `parent` only
+    // resolves for a nested element referencing its containing element
+    // in the same component, not the component's own outermost element
+    // referencing whatever embeds it (a real Slint compile error,
+    // "Cannot access id 'parent'", hit and fixed here -- see the
+    // identical fix in `settings_section.slint`). Left unbound, this
+    // sized itself to its own natural/preferred width instead -- for a
+    // picker with long option strings (e.g. "claude-haiku-4-5"), that
+    // rendered wider than its actual container with nothing to clip it,
+    // bleeding into whatever sits next to it (this is what caused
+    // `agent_card.slint`'s Model/Profile pickers to visually spill into
+    // the neighboring grid column). Whatever a call site binds, use a
+    // concrete `parent.width`, not `%` -- per the Slint layout-defaults
+    // reference, a plain `%` on a layout child folds into that element's
+    // own layout constraints as a min-percentage rather than a
+    // straightforward fill, which can leak into how the parent layout
+    // sizes itself.
+    height: 26px;
+
+    background: head-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : Theme.bg-sidebar;
+    animate background { duration: 100ms; }
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-sm;
+
+    head-touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.select-accessible-label;
+        accessible-action-default => { root.query = ""; popup.show(); }
+        clicked => { root.query = ""; popup.show(); }
+    }
+
+    Text {
+        text: root.value != "" ? root.value : root.placeholder;
+        color: root.value != "" ? Theme.text-primary : Theme.text-muted;
+        font-size: 11px * Theme.font-scale;
+        x: Metrics.space-4;
+        width: parent.width - 2 * Metrics.space-4 - 14px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Icon {
+        x: parent.width - self.width - Metrics.space-3;
+        y: (parent.height - self.height) / 2;
+        size: 10px;
+        color: Theme.text-muted;
+        source: @image-url("../assets/icons/chevron-right.svg");
+        rotation-angle: 90deg;
+        rotation-origin-x: self.width / 2;
+        rotation-origin-y: self.height / 2;
+    }
+
+    popup := PopupWindow {
+        x: 0px;
+        y: root.height + 2px;
+        width: root.width;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            // `parent.width` (the `popup` PopupWindow, already bound to
+            // `root.width`), not `100%` -- same reasoning as the `Select`
+            // root above, applied consistently even though a
+            // `PopupWindow`'s own child isn't stretch-managed by a
+            // normal layout the same way.
+            width: parent.width;
+            height: (root.searchable ? 30px : 0px) + Math.min(root.options.length, 6) * 24px;
+            background: Theme.bg-card;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            border-radius: Theme.radius-sm;
+            clip: true;
+
+            VerticalLayout {
+                if root.searchable : Rectangle {
+                    height: 30px;
+                    background: Theme.bg-tertiary;
+                    border-width: 1px;
+                    border-color: Theme.border-default;
+                    // Same monochrome search-field treatment as
+                    // `search_bar.slint` -- see this component's own doc
+                    // comment for why the field is present but does not
+                    // filter yet.
+                    search-input := TextInput {
+                        accessible-label: root.select-accessible-label + " search";
+                        accessible-action-default => { self.focus(); }
+                        text <=> root.query;
+                        color: Theme.text-primary;
+                        font-size: 11px * Theme.font-scale;
+                        x: Metrics.space-4;
+                        width: parent.width - 2 * Metrics.space-4;
+                        vertical-alignment: center;
+                    }
+                    if root.query == "" : Text {
+                        text: "Search...";
+                        color: Theme.text-muted;
+                        font-size: 11px * Theme.font-scale;
+                        x: Metrics.space-4;
+                        height: parent.height;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Flickable {
+                    // `parent.width`, not `100%` -- this is a real
+                    // `VerticalLayout` child, where a plain `%` folds
+                    // into the layout's own constraint solving rather
+                    // than a straightforward fill (see the `Select` root
+                    // width binding above for the full reasoning).
+                    width: parent.width;
+                    // Explicit, not stretch -- a `Flickable` carries no
+                    // vertical stretch of its own inside a `VerticalLayout`,
+                    // so without a concrete height it collapses to its 0px
+                    // preferred height and the option rows never show.
+                    height: Math.min(root.options.length, 6) * 24px;
+                    viewport-height: root.options.length * 24px;
+                    VerticalLayout {
+                        for opt in root.options : Rectangle {
+                            height: 24px;
+                            background: opt == root.value
+                                ? Theme.bg-primary-container.with-alpha(0.7)
+                                : (opt-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.4) : transparent);
+                            animate background { duration: 100ms; }
+                            opt-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                accessible-role: button;
+                                accessible-label: "Select " + opt;
+                                accessible-action-default => { root.value = opt; root.selected(opt); popup.close(); }
+                                clicked => { root.value = opt; root.selected(opt); popup.close(); }
+                            }
+                            HorizontalLayout {
+                                padding-left: Metrics.space-3;
+                                padding-right: Metrics.space-3;
+                                spacing: Metrics.space-2;
+                                // Leading tick for the current value -- a
+                                // fixed-width slot either way so labels stay
+                                // column-aligned whether or not they're
+                                // ticked.
+                                Rectangle {
+                                    width: 12px;
+                                    if opt == root.value : Icon {
+                                        size: 12px;
+                                        color: Theme.text-secondary;
+                                        source: @image-url("../assets/icons/check.svg");
+                                    }
+                                }
+                                Text {
+                                    text: opt;
+                                    color: opt == root.value ? Theme.text-primary : Theme.text-secondary;
+                                    font-weight: opt == root.value ? 700 : 400;
+                                    font-size: 11px * Theme.font-scale;
+                                    horizontal-stretch: 1;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,15 +1,42 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Button } from "../../../base/button.slint";
+import { Toggle } from "../../../base/toggle.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
-import { McpServerOption } from "../../../types.slint";
+import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
+import { McpServerOption, McpToolOption } from "../../../types.slint";
 
-// MCP Servers left-tab view -- phase 1 shell: re-hosts the "MCP Servers"
-// section of the former `components/settings_sheet.slint` unchanged (same
-// `available-mcp-servers` model, same `mcp-server-create`/`mcp-server-delete`
-// round trip, same "no optimistic local mutation" posture -- see that
-// file's own doc comment). No new fields, no new data wiring; this view
-// only proves the section renders inside the new tabbed shell.
+// MCP Servers left-tab view. Started as a phase-1 shell that only re-hosted
+// the former `components/settings_sheet.slint` list unchanged (name +
+// command + Remove, plus a name/command add row). This pass fills the row
+// out to match the *set of per-server config options* established coding
+// agents expose for MCP management -- benchmarked against opencode's `mcp`
+// config schema (https://opencode.ai/docs/mcp-servers): a `type` of
+// `"local"` (a `command`) vs `"remote"` (a `url`, optional `oauth`), an
+// `enabled` flag, per-tool enable/disable (opencode's global `tools` glob
+// config), and deferred/lazy tool loading (opencode's experimental
+// `mcp_lazy`/`mcp_search`, mirroring Claude Code's ToolSearch). Cross-checked
+// against Zed's `context_servers` and Codex's `mcp_servers`, and the MCP
+// spec's `tools/list` (per-server tool catalog) + stdio/Streamable-HTTP
+// transports.
+//
+// Layout: each server is a header row (`SettingsRow`: name, command-or-url
+// hint, transport tag, auth status, connection status, OAuth "Connect",
+// enable toggle, Remove) plus, when it advertises tools, an expand/collapse
+// nested list of per-tool rows (name, "deferred" tag, enable toggle).
+//
+// Backend reality: `src/agent_bridge.rs`'s `mcp_servers/*` RPCs still only
+// support create/delete by name+command. So every per-row control beyond
+// create/delete (transport tag, url, status text, auth status, enable
+// toggle, OAuth "Connect", the whole per-tool list) is **UI-only** for now
+// -- driven by `McpServerOption`'s UI-only fields (which
+// `models::to_mcp_server_options` default-fills empty), the same "UI ahead
+// of backend" posture `harness_view.slint` documents for its own toggles.
+// Every toggle's state is local/visual only and is not persisted or read by
+// any runtime code; "Connect" is a placeholder for a future
+// `mcp_servers/authenticate` round trip; the tool list is a placeholder for
+// a future `tools/list` round trip (always empty today). Only the
+// create/delete round trip is wired to real Rust.
 export component McpServersView inherits Rectangle {
     in property <[McpServerOption]> servers: [];
     callback mcp-server-create(string, string);
@@ -20,25 +47,187 @@ export component McpServersView inherits Rectangle {
 
     background: transparent;
 
-    VerticalLayout {
-        spacing: Metrics.space-6;
+    SettingsSection {
+        width: parent.width;
 
-        Text { text: "MCP Servers"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
+        SettingsSectionHeader { text: "MCP Servers"; }
 
-        for server in root.servers : SettingsRow {
-            label: server.name;
-            label-font-family: Theme.font-mono;
-            hint: server.command;
-            Button {
-                label: "Remove";
-                button-accessible-label: "Remove MCP server " + server.name;
-                btn-width: 44px;
-                btn-height: 20px;
-                font-size: 9px;
-                font-weight: 400;
-                bg: Theme.bg-card;
-                fg: Theme.text-secondary;
-                clicked => { root.mcp-server-delete(server.name); }
+        SettingsRowGroup {
+            width: parent.width;
+
+            for server in root.servers : server-block := VerticalLayout {
+                width: parent.width;
+                spacing: Metrics.space-2;
+
+                // Per-instance expand state for this server's tool list -- UI-only
+                // and local (Slint has no round-trip need here: nothing persists
+                // it, unlike the chat-view's Rust-side `expanded` vec).
+                property <bool> tools-expanded: false;
+
+                // Transport + auth + connection status collapsed into one
+                // subtitle string -- structs (`McpServerOption`) can't carry
+                // computed fields in Slint, so this lives on the `for`
+                // template instead of on the struct itself.
+                property <string> status-line:
+                    server.transport
+                    + (server.auth-status != "" ? (server.transport != "" ? " · " : "") + server.auth-status : "")
+                    + (server.status != "" ? (server.transport != "" || server.auth-status != "" ? " · " : "") + server.status : "");
+
+                // Header row -- consolidated to 4 trailing controls (was 7:
+                // transport tag, auth-status, status and Connect were each
+                // their own item, competing with Tools/enable-Toggle/Remove
+                // for the same cramped trailing slot at 9-10px font sizes).
+                // Transport/auth/status now collapse into one combined
+                // subtitle line via `status-line` below; Connect only shows
+                // when actually relevant. This is also why the enable toggle
+                // read as "missing" -- it was there, just visually lost among
+                // too many same-sized neighbors.
+                SettingsRow {
+                    width: parent.width;
+                    label: server.name;
+                    label-font-family: Theme.font-mono;
+                    hint: server.transport == "http" ? server.url : server.command;
+                    hint-font-family: Theme.font-mono;
+
+                    // Transport + auth + connection status, combined into one
+                    // muted subtitle instead of three separate trailing items --
+                    // still plain monochrome text, never a colored badge.
+                    if server-block.status-line != "" : Text {
+                        text: server-block.status-line;
+                        color: Theme.text-muted;
+                        font-size: 9px * Theme.font-scale;
+                        vertical-alignment: center;
+                        // Capped + elided -- unbounded, this could still
+                        // overflow the row for a server with several
+                        // combined status segments (e.g. "http ·
+                        // not authenticated · auth required"), the same
+                        // class of overflow bug hit repeatedly earlier
+                        // this session.
+                        max-width: 120px;
+                        overflow: elide;
+                    }
+
+                    // OAuth "Connect" -- only for remote servers advertising an auth
+                    // flow (opencode remote `oauth`). UI-only placeholder for now.
+                    if server.transport == "http" && server.needs-auth : Button {
+                        label: "Connect";
+                        button-accessible-label: "Connect (authenticate) MCP server " + server.name;
+                        btn-width: 52px;
+                        btn-height: 20px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        // UI-only: no `mcp_servers/authenticate` RPC exists yet.
+                        clicked => { }
+                    }
+
+                    // Expand/collapse the per-tool list, with a tool count so
+                    // it's meaningful at a glance without expanding (only when
+                    // the server advertises tools -- always empty today, see
+                    // doc comment).
+                    if server.tools.length > 0 : Button {
+                        label: (server-block.tools-expanded ? "Hide tools" : "Tools")
+                            + " (" + server.tools.length + ")";
+                        button-accessible-label: (server-block.tools-expanded ? "Hide" : "Show")
+                            + " " + server.tools.length + " tools for MCP server " + server.name;
+                        btn-width: 76px;
+                        btn-height: 20px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        clicked => { server-block.tools-expanded = !server-block.tools-expanded; }
+                    }
+
+                    // Enable/disable without removing the entry (opencode/Codex
+                    // per-server `enabled`) -- always the second-to-last item,
+                    // right before Remove, with real spacing (`SettingsRow`'s
+                    // own trailing-group spacing, `Metrics.space-2`, plus this
+                    // row now has far fewer neighbors competing for room) so it
+                    // reads clearly at the row's right end.
+                    Toggle {
+                        checked: server.enabled;
+                        toggle-accessible-label: "Toggle MCP server " + server.name;
+                    }
+
+                    Button {
+                        label: "Remove";
+                        button-accessible-label: "Remove MCP server " + server.name;
+                        btn-width: 44px;
+                        btn-height: 20px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        clicked => { root.mcp-server-delete(server.name); }
+                    }
+                }
+
+                // Nested per-tool list (MCP `tools/list`) -- each tool individually
+                // enable/disable-able, with a "deferred" tag for lazy-loaded ones
+                // (opencode `mcp_lazy` / Claude Code ToolSearch). UI-only.
+                if server-block.tools-expanded && server.tools.length > 0 : Rectangle {
+                    width: parent.width;
+                    background: Theme.bg-sidebar;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border-default;
+
+                    VerticalLayout {
+                        width: parent.width;
+                        padding: Metrics.space-4;
+                        padding-left: Metrics.space-7;
+                        spacing: Metrics.space-3;
+
+                        // No explicit `width:` -- this is a *direct*
+                        // managed child of the padded VerticalLayout
+                        // above (`padding-left: Metrics.space-7`, meant
+                        // to indent the tool list under its server); an
+                        // explicit `width: parent.width` here (as this
+                        // used to be) reads that layout's raw box width,
+                        // bypassing the padding inset entirely -- same
+                        // bug class fixed in `agent_card.slint`'s Model/
+                        // Profile rows. Default `alignment: stretch`
+                        // already sizes a direct child correctly within
+                        // its parent's padding automatically.
+                        for tool in server.tools : HorizontalLayout {
+                            spacing: Metrics.space-4;
+
+                            Text {
+                                text: tool.name;
+                                color: Theme.text-primary;
+                                font-family: Theme.font-mono;
+                                font-size: 10px * Theme.font-scale;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+
+                            // Approximate context cost of this tool's schema --
+                            // UI-only reference figure, see `McpToolOption.
+                            // token-usage`'s own doc comment (no real per-tool
+                            // token accounting exists anywhere in this codebase).
+                            if tool.token-usage > 0 : Text {
+                                text: tool.token-usage + " tok";
+                                color: Theme.text-muted;
+                                font-family: Theme.font-mono;
+                                font-size: 9px * Theme.font-scale;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                            }
+
+                            // Lazy-loaded marker -- monochrome text tag only.
+                            if tool.deferred : Text {
+                                text: "deferred";
+                                color: Theme.text-muted;
+                                font-family: Theme.font-mono;
+                                font-size: 9px * Theme.font-scale;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                            }
+
+                            Toggle {
+                                checked: tool.enabled;
+                                toggle-accessible-label: "Toggle tool " + tool.name + " on MCP server " + server.name;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -48,6 +237,8 @@ export component McpServersView inherits Rectangle {
                 horizontal-stretch: 1;
                 height: 26px;
                 background: Theme.bg-sidebar;
+                border-width: 1px;
+                border-color: Theme.border-default;
                 border-radius: Theme.radius-sm;
                 TextInput {
                     accessible-label: "New MCP server name";
@@ -63,9 +254,11 @@ export component McpServersView inherits Rectangle {
                 horizontal-stretch: 1;
                 height: 26px;
                 background: Theme.bg-sidebar;
+                border-width: 1px;
+                border-color: Theme.border-default;
                 border-radius: Theme.radius-sm;
                 TextInput {
-                    accessible-label: "New MCP server command";
+                    accessible-label: "New MCP server command or URL";
                     accessible-action-default => { self.focus(); }
                     text <=> root.new-mcp-command;
                     color: Theme.text-primary;

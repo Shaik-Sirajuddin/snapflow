@@ -785,6 +785,14 @@ pub fn to_mcp_server_options(
         .map(|entry| McpServerOption {
             name: entry.name.into(),
             command: entry.command.unwrap_or_default().into(),
+            // UI-only fields (see `McpServerOption`'s doc in ui/types.slint):
+            // the backend only supplies name+command today, so transport/
+            // url/enabled/status/needs-auth/auth-status take their Slint-struct
+            // defaults (`""`/`false`) and `tools` an empty model. `enabled`
+            // defaulting to `false` is fine for now -- no runtime reads it yet;
+            // a real `mcp_servers/update`, a `tools/list` round trip, and a
+            // status/auth feed are a later phase.
+            ..Default::default()
         })
         .collect();
     ModelRc::new(VecModel::from(items))
