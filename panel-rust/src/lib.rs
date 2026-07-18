@@ -23,6 +23,7 @@ mod local_terminal;
 mod models;
 mod permission;
 pub mod protocol_types;
+mod settings_file;
 mod state_store;
 mod theme;
 
@@ -107,6 +108,65 @@ fn map_qt_key(qt_key: c_int, text: &str) -> Option<SharedString> {
 fn non_empty(value: String) -> Option<String> {
     let value = value.trim().to_owned();
     (!value.is_empty()).then_some(value)
+}
+
+/// One-shot seed: if the global JSON file is missing but SQLite still has
+/// panel prefs, write them so multi-process peers can read the same values.
+fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore) {
+    let paths = settings_file::SettingsPaths::from_env();
+    if paths.global.exists() {
+        return;
+    }
+    let Ok(defaults) = store.defaults() else {
+        return;
+    };
+    let has_prefs = defaults.profile_name.is_some()
+        || defaults.permission_profile.is_some()
+        || defaults.background_session;
+    if !has_prefs {
+        return;
+    }
+    let doc = settings_file::SettingsDocument {
+        schema_version: 1,
+        default_profile: defaults.profile_name,
+        permission_profile: defaults.permission_profile,
+        background_session_default: Some(defaults.background_session),
+        default_agent_id: None,
+        harness: None,
+    };
+    if let Err(error) = settings_file::save_document(&paths.global, &doc) {
+        eprintln!("panel-rust: failed to migrate panel defaults to JSON: {error}");
+    }
+}
+
+/// Load multi-process panel prefs from JSON (project → global → default).
+/// `selected_thread_id` remains process-local (SQLite) when provided.
+fn load_panel_prefs(selected_thread_id: Option<String>) -> PanelDefaults {
+    let paths = settings_file::SettingsPaths::from_env();
+    match paths.load_resolved() {
+        Ok(resolved) => {
+            settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id)
+        }
+        Err(error) => {
+            eprintln!("panel-rust: settings file load failed: {error}");
+            PanelDefaults {
+                selected_thread_id,
+                ..PanelDefaults::default()
+            }
+        }
+    }
+}
+
+/// Persist profile / permission / background-default into the global JSON
+/// file (atomic write). Preserves other keys already on disk (harness, …).
+fn save_panel_prefs_to_json(defaults: &PanelDefaults) -> Result<(), settings_file::SettingsFileError> {
+    let paths = settings_file::SettingsPaths::from_env();
+    let mut doc = settings_file::load_document(&paths.global).unwrap_or_default();
+    doc.schema_version = 1;
+    doc.default_profile = defaults.profile_name.clone();
+    doc.permission_profile = defaults.permission_profile.clone();
+    doc.background_session_default = Some(defaults.background_session);
+    settings_file::save_document(&paths.global, &doc)
 }
 
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
@@ -947,37 +1007,44 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             local_terminal_last_text: RefCell::new(String::new()),
         };
         panel.refresh_threads_model();
+        // Multi-process prefs live in JSON; selected thread stays in SQLite.
         if let Some(store) = panel.panel_state.as_ref() {
-            if let Ok(defaults) = store.defaults() {
-                panel.component.set_default_profile(
-                    defaults.profile_name.unwrap_or_default().into(),
-                );
-                panel.component.set_permission_profile(
-                    defaults.permission_profile.unwrap_or_default().into(),
-                );
-                panel.component
-                    .set_background_default(defaults.background_session);
-                if let Some(selected_thread_id) = defaults.selected_thread_id {
-                    if let Some(real_idx) = panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| {
-                            (0..panel.thread_names.borrow().len()).find(|idx| {
-                                bridge
-                                    .thread_binding(*idx)
-                                    .is_some_and(|binding| binding.thread_id == selected_thread_id)
-                            })
-                        })
-                    {
-                        if let Some(filtered_idx) = panel
-                            .visible_indices
-                            .borrow()
-                            .iter()
-                            .position(|idx| *idx == real_idx)
-                        {
-                            panel.component.set_selected_thread(filtered_idx as i32);
-                        }
-                    }
+            maybe_migrate_sqlite_defaults_to_json(store);
+        }
+        let selected_from_sqlite = panel
+            .panel_state
+            .as_ref()
+            .and_then(|store| store.defaults().ok())
+            .and_then(|d| d.selected_thread_id);
+        let defaults = load_panel_prefs(selected_from_sqlite);
+        panel.component.set_default_profile(
+            defaults.profile_name.clone().unwrap_or_default().into(),
+        );
+        panel.component.set_permission_profile(
+            defaults
+                .permission_profile
+                .clone()
+                .unwrap_or_default()
+                .into(),
+        );
+        panel
+            .component
+            .set_background_default(defaults.background_session);
+        if let Some(selected_thread_id) = defaults.selected_thread_id {
+            if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
+                (0..panel.thread_names.borrow().len()).find(|idx| {
+                    bridge
+                        .thread_binding(*idx)
+                        .is_some_and(|binding| binding.thread_id == selected_thread_id)
+                })
+            }) {
+                if let Some(filtered_idx) = panel
+                    .visible_indices
+                    .borrow()
+                    .iter()
+                    .position(|idx| *idx == real_idx)
+                {
+                    panel.component.set_selected_thread(filtered_idx as i32);
                 }
             }
         }
@@ -1022,16 +1089,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
+                    let defaults = load_panel_prefs(None);
+                    component.set_default_profile(
+                        defaults.profile_name.unwrap_or_default().into(),
+                    );
+                    component.set_permission_profile(
+                        defaults.permission_profile.unwrap_or_default().into(),
+                    );
+                    component.set_background_default(defaults.background_session);
                     if let Some(store) = panel.panel_state.as_ref() {
-                        if let Ok(defaults) = store.defaults() {
-                            component.set_default_profile(
-                                defaults.profile_name.unwrap_or_default().into(),
-                            );
-                            component.set_permission_profile(
-                                defaults.permission_profile.unwrap_or_default().into(),
-                            );
-                            component.set_background_default(defaults.background_session);
-                        }
                         let selected_override = panel
                             .real_index(component.get_selected_thread() as usize)
                             .and_then(|idx| {
@@ -1099,7 +1165,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 if let Some(panel) = cell.borrow().as_ref() {
                     let defaults = PanelDefaults {
                         profile_name: non_empty(component.get_default_profile().to_string()),
-                        permission_profile: non_empty(component.get_permission_profile().to_string()),
+                        permission_profile: non_empty(
+                            component.get_permission_profile().to_string(),
+                        ),
                         background_session: component.get_background_default(),
                         selected_thread_id: panel
                             .real_index(component.get_selected_thread() as usize)
@@ -1111,26 +1179,25 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                                     .map(|binding| binding.thread_id)
                             }),
                     };
+                    // JSON is the multi-process source of truth for prefs.
+                    if let Err(error) = save_panel_prefs_to_json(&defaults) {
+                        eprintln!("panel-rust: failed to save panel settings JSON: {error}");
+                        return;
+                    }
                     if let Some(store) = panel.panel_state.as_ref() {
+                        // Dual-write selected thread + transitional SQLite
+                        // defaults so older readers stay consistent.
                         if let Err(error) = store.save_defaults(&defaults) {
-                            eprintln!("panel-rust: failed to save chat defaults: {error}");
-                            return;
+                            eprintln!(
+                                "panel-rust: failed to dual-write chat defaults to SQLite: {error}"
+                            );
                         }
-                        if let Some(thread_id) = panel
-                            .real_index(component.get_selected_thread() as usize)
-                            .and_then(|idx| {
-                                panel
-                                    .bridge
-                                    .as_ref()
-                                    .and_then(|bridge| bridge.thread_binding(idx))
-                                    .map(|binding| binding.thread_id)
-                            })
-                        {
+                        if let Some(thread_id) = defaults.selected_thread_id.as_deref() {
                             let override_value = component
                                 .get_background_override_set()
                                 .then_some(component.get_background_override());
                             if let Err(error) =
-                                store.set_background_override(&thread_id, override_value)
+                                store.set_background_override(thread_id, override_value)
                             {
                                 eprintln!(
                                     "panel-rust: failed to save background-session override: {error}"

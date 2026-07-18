@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "default_profile": "default",
+  "permission_profile": "default",
+  "background_session_default": false,
+  "default_agent_id": null,
+  "harness": {
+    "notifications_enabled": true,
+    "notify_on_input_required": true,
+    "auto_resume_on_rate_limit_reset": false
+  }
+}

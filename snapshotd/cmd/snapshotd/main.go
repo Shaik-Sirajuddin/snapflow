@@ -17,9 +17,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"snapshotd/internal/acpxmgr"
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
 	"snapshotd/internal/daemonlock"
@@ -123,6 +125,36 @@ func cmdServe(cfg config.Config, args []string) error {
 		logger.Info("MCP SSE endpoint listening", "addr", cfg.MCPSSEAddr)
 	}
 
+	// Optional bundled acpx-server: single gateway owner under snapshotd serve.
+	var acpxMgr *acpxmgr.Manager
+	if cfg.AcpxEnabled && !*noMCP {
+		if cfg.AcpxBinPath == "" {
+			logger.Warn("SNAPSHOTD_ACPX_ENABLED but no acpx-server binary found; skip spawn")
+		} else {
+			startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			mgr, err := acpxmgr.Start(startCtx, acpxmgr.Config{
+				BinPath:        cfg.AcpxBinPath,
+				HttpBind:       cfg.AcpxHttpBind,
+				ConfigPath:     cfg.AcpxConfigPath,
+				DbPath:         filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
+				McpURL:         acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
+				DefaultAgentID: "default",
+				Log:            logger,
+			})
+			startCancel()
+			if err != nil {
+				logger.Error("failed to start bundled acpx-server", "err", err)
+			} else {
+				acpxMgr = mgr
+				logger.Info("bundled acpx-server started",
+					"bin", cfg.AcpxBinPath,
+					"bind", cfg.AcpxHttpBind,
+					"config", cfg.AcpxConfigPath,
+				)
+			}
+		}
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
@@ -135,10 +167,23 @@ func cmdServe(cfg config.Config, args []string) error {
 		}
 	case err := <-mcpErrCh:
 		logger.Error("MCP server exited", "err", err)
+	case <-func() <-chan struct{} {
+		if acpxMgr != nil {
+			return acpxMgr.Done()
+		}
+		// Never fires when no acpx child.
+		return make(chan struct{})
+	}():
+		logger.Warn("bundled acpx-server exited early; shutting down")
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if acpxMgr != nil {
+		if err := acpxMgr.Stop(); err != nil {
+			logger.Warn("acpx-server stop", "err", err)
+		}
+	}
 	if mcpServer != nil {
 		_ = mcpServer.Shutdown(shutdownCtx)
 	}

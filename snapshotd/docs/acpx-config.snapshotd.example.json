@@ -1,0 +1,18 @@
+{
+  "providers": [],
+  "mcp_servers": [
+    {
+      "type": "http",
+      "name": "snapshotd",
+      "url": "http://127.0.0.1:7777/mcp",
+      "headers": []
+    }
+  ],
+  "profiles": [
+    {
+      "name": "default",
+      "agent_id": "default",
+      "mcp_servers": ["snapshotd"]
+    }
+  ]
+}

@@ -58,6 +58,20 @@ type Config struct {
 	// disabled by default so agents cannot discover or call audio operations
 	// until an operator explicitly enables it.
 	AudioEnabled bool
+
+	// AcpxEnabled starts an optional long-lived acpx-server child under serve
+	// (snapshotd-bundled-acpx-gateway). Default: on when AcpxBinPath is found
+	// and SNAPSHOTD_ACPX_ENABLED is unset; explicit 0/1 always wins.
+	AcpxEnabled bool
+
+	// AcpxBinPath is the acpx-server binary (SNAPSHOTD_ACPX_BIN or discovery).
+	AcpxBinPath string
+
+	// AcpxHttpBind is ACPX_HTTP_BIND for the child (default 127.0.0.1:8790).
+	AcpxHttpBind string
+
+	// AcpxConfigPath is the generated ACPX_CONFIG_FILE path.
+	AcpxConfigPath string
 }
 
 // Default returns the v1 default configuration, honoring the handful of
@@ -85,6 +99,26 @@ func Default() Config {
 	}
 	audioEnabled, _ := strconv.ParseBool(os.Getenv("SNAPSHOTD_AUDIO_ENABLED"))
 
+	acpxBin := os.Getenv("SNAPSHOTD_ACPX_BIN")
+	if acpxBin == "" {
+		acpxBin = discoverAcpxServerBinPath()
+	}
+	acpxBind := os.Getenv("SNAPSHOTD_ACPX_HTTP_BIND")
+	if acpxBind == "" {
+		acpxBind = "127.0.0.1:8790"
+	}
+	acpxConfig := os.Getenv("SNAPSHOTD_ACPX_CONFIG")
+	if acpxConfig == "" {
+		acpxConfig = filepath.Join(home, "acpx-config.json")
+	}
+	acpxEnabled := false
+	if v, ok := os.LookupEnv("SNAPSHOTD_ACPX_ENABLED"); ok {
+		acpxEnabled, _ = strconv.ParseBool(v)
+	} else {
+		// Default on only when a binary is discoverable so plain serve stays quiet.
+		acpxEnabled = acpxBin != ""
+	}
+
 	return Config{
 		HomeDir:           home,
 		DBPath:            filepath.Join(home, "registry.db"),
@@ -95,7 +129,54 @@ func Default() Config {
 		SnapshotBinPath:   binPath,
 		MCPSSEAddr:        mcpAddr,
 		AudioEnabled:      audioEnabled,
+		AcpxEnabled:       acpxEnabled,
+		AcpxBinPath:       acpxBin,
+		AcpxHttpBind:      acpxBind,
+		AcpxConfigPath:    acpxConfig,
 	}
+}
+
+// discoverAcpxServerBinPath looks for acpx-server next to the running
+// executable or under a checkout's acpx/target/{release,debug}/.
+func discoverAcpxServerBinPath() string {
+	var roots []string
+	if cwd, err := os.Getwd(); err == nil {
+		roots = append(roots, cwd)
+		p := cwd
+		for i := 0; i < 6; i++ {
+			p = filepath.Dir(p)
+			roots = append(roots, p)
+		}
+	}
+	if execPath, err := os.Executable(); err == nil {
+		execDir := filepath.Dir(execPath)
+		roots = append(roots, execDir)
+		// Same directory as snapshotd binary (packaging layout).
+		sibling := filepath.Join(execDir, "acpx-server")
+		if st, err := os.Stat(sibling); err == nil && !st.IsDir() {
+			return sibling
+		}
+	}
+	var fallback string
+	for _, root := range roots {
+		candidates := []string{
+			filepath.Join(root, "acpx", "target", "release", "acpx-server"),
+			filepath.Join(root, "acpx", "target", "debug", "acpx-server"),
+		}
+		for _, candidate := range candidates {
+			st, err := os.Stat(candidate)
+			if err != nil || st.IsDir() {
+				continue
+			}
+			if strings.Contains(candidate, "release") {
+				return candidate
+			}
+			if fallback == "" {
+				fallback = candidate
+			}
+		}
+	}
+	return fallback
 }
 
 // discoverShotcutBinPath is the primary lookup: the real, production

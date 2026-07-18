@@ -48,8 +48,13 @@ internal/daemon            The daemon core: wires registry+session+procmgr+
                            point, used by both the SDP server and the MCP
                            adapter
 internal/mcpadapter         MCP access-point adapter (mark3labs/mcp-go),
-                           served over SSE, translating MCP tool calls into
-                           the same daemon.*/ForwardSAP calls
+                           served over SSE + Streamable HTTP (/mcp),
+                           translating MCP tool calls into the same
+                           daemon.*/ForwardSAP calls
+internal/acpxmgr            Optional long-lived acpx-server child under
+                           `serve`: writes ACPX_CONFIG_FILE with the live
+                           snapshotd MCP URL, spawns, health-polls, stops
+                           on SIGTERM (see docs/acpx-bundled-gateway.md)
 ```
 
 This mirrors 06-daemon-mcp-proxy.md's corrected picture: the daemon core
