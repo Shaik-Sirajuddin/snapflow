@@ -2,6 +2,7 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Button } from "../../../base/button.slint";
 import { Toggle } from "../../../base/toggle.slint";
+import { TextField } from "../../../base/text_field.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
 import { McpServerOption, McpToolOption } from "../../../types.slint";
@@ -57,7 +58,10 @@ export component McpServersView inherits Rectangle {
 
             for server in root.servers : server-block := VerticalLayout {
                 width: parent.width;
-                spacing: Metrics.space-2;
+                // `pad-xs` (4px) -- the compact pre-reveal gap between a
+                // server's header row and its (conditionally shown)
+                // expanded tool panel.
+                spacing: Metrics.pad-xs;
 
                 // Per-instance expand state for this server's tool list -- UI-only
                 // and local (Slint has no round-trip need here: nothing persists
@@ -150,8 +154,12 @@ export component McpServersView inherits Rectangle {
                     Button {
                         label: "Remove";
                         button-accessible-label: "Remove MCP server " + server.name;
-                        btn-width: 44px;
-                        btn-height: 20px;
+                        // Bumped from 44x20 -- `Button` has no separate
+                        // padding concept (fixed btn-width/btn-height with
+                        // centered text), so more breathing room around
+                        // the label means a larger box.
+                        btn-width: 56px;
+                        btn-height: 24px;
                         font-size: 9px;
                         font-weight: 400;
                         clicked => { root.mcp-server-delete(server.name); }
@@ -170,9 +178,17 @@ export component McpServersView inherits Rectangle {
 
                     VerticalLayout {
                         width: parent.width;
-                        padding: Metrics.space-4;
-                        padding-left: Metrics.space-7;
-                        spacing: Metrics.space-3;
+                        // `pad-md` (12px) -- matches `agent_card.slint`'s
+                        // own panel padding, was `space-4` (8px, an odd
+                        // value matching no semantic tier and
+                        // inconsistent with every other "boxed panel" on
+                        // this page). `padding-left` stays a deliberate,
+                        // larger override (`pad-lg`, 16px) so the tool
+                        // list visually indents under its server.
+                        padding: Metrics.pad-md;
+                        padding-left: Metrics.pad-lg;
+                        // `gap-sm` (6px) -- list-item gap between tool rows.
+                        spacing: Metrics.gap-sm;
 
                         // No explicit `width:` -- this is a *direct*
                         // managed child of the padded VerticalLayout
@@ -186,7 +202,10 @@ export component McpServersView inherits Rectangle {
                         // already sizes a direct child correctly within
                         // its parent's padding automatically.
                         for tool in server.tools : HorizontalLayout {
-                            spacing: Metrics.space-4;
+                            // `gap-md` (8px) -- gap between a tool row's
+                            // own inner items (name, token-usage tag,
+                            // deferred tag, enable Toggle).
+                            spacing: Metrics.gap-md;
 
                             Text {
                                 text: tool.name;
@@ -232,40 +251,18 @@ export component McpServersView inherits Rectangle {
         }
 
         HorizontalLayout {
-            spacing: Metrics.space-3;
-            Rectangle {
+            // `gap-sm` (6px) -- gap between the two add-server fields and
+            // the Add button.
+            spacing: Metrics.gap-sm;
+            TextField {
                 horizontal-stretch: 1;
-                height: 26px;
-                background: Theme.bg-sidebar;
-                border-width: 1px;
-                border-color: Theme.border-default;
-                border-radius: Theme.radius-sm;
-                TextInput {
-                    accessible-label: "New MCP server name";
-                    accessible-action-default => { self.focus(); }
-                    text <=> root.new-mcp-name;
-                    color: Theme.text-primary;
-                    font-size: 11px * Theme.font-scale;
-                    x: 6px;
-                    vertical-alignment: center;
-                }
+                text <=> root.new-mcp-name;
+                field-accessible-label: "New MCP server name";
             }
-            Rectangle {
+            TextField {
                 horizontal-stretch: 1;
-                height: 26px;
-                background: Theme.bg-sidebar;
-                border-width: 1px;
-                border-color: Theme.border-default;
-                border-radius: Theme.radius-sm;
-                TextInput {
-                    accessible-label: "New MCP server command or URL";
-                    accessible-action-default => { self.focus(); }
-                    text <=> root.new-mcp-command;
-                    color: Theme.text-primary;
-                    font-size: 11px * Theme.font-scale;
-                    x: 6px;
-                    vertical-alignment: center;
-                }
+                text <=> root.new-mcp-command;
+                field-accessible-label: "New MCP server command or URL";
             }
             Button {
                 label: "Add";
