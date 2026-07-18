@@ -1,0 +1,152 @@
+// Settings page root -- the settings-pane-redesign plan's `SettingsPage`
+// (see "Component layout"). Replaces the former flat, single-scroll
+// `components/settings_sheet.slint` with a two-level tab shell: top tabs
+// `[Project | Global]`, a left-tab section rail (`MCP Servers` / `Agents`
+// / `Harness`), and a search bar above the active section's content. This
+// phase is shell-only -- `scope`/`active-section`/`search-query` are new
+// page-local UI state, but every view still binds the exact same
+// ACP-RPC-driven models (`available-profiles`, `available-mcp-servers`,
+// `agent-catalog`, `recoverable-sessions`) `settings_sheet.slint` did, via
+// the same round-trip callbacks (`lib.rs` still owns re-populating those
+// lists after any create/update/delete/install call -- nothing here
+// optimistically mutates them). `scope` has no behavioral effect yet
+// (both Project and Global render the same live data) -- a real
+// per-scope `SettingsDocument` is a later phase (see the plan's
+// `settings_store.rs` phases), once the file-backed store exists to
+// actually differ between the two.
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { Button } from "../../base/button.slint";
+import { SettingsTopTabs } from "components/top_tabs.slint";
+import { SettingsLeftTabs } from "components/left_tabs.slint";
+import { SettingsSearchBar } from "components/search_bar.slint";
+import { McpServersView } from "views/mcp_servers_view.slint";
+import { AgentsView } from "views/agents_view.slint";
+import { HarnessView } from "views/harness_view.slint";
+import { ProfileOption, McpServerOption, AgentCatalogEntry, RemoteSessionOption } from "../../types.slint";
+
+export component SettingsPage inherits Rectangle {
+    // New shell-only state (settings-pane-redesign plan, phase 1).
+    in-out property <string> scope: "project"; // "project" | "global"
+    in-out property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness"
+    in-out property <string> search-query: "";
+
+    // Same public API `SettingsSheet` exposed -- unchanged so `app.slint`'s
+    // call site only needs its component name + import swapped.
+    in-out property <string> default-profile: "";
+    in-out property <string> permission-profile: "";
+    in-out property <bool> background-default: false;
+    in-out property <bool> background-override-set: false;
+    in-out property <bool> background-override: false;
+    in property <[ProfileOption]> available-profiles: [];
+    in property <[McpServerOption]> available-mcp-servers: [];
+    in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <[RemoteSessionOption]> recoverable-sessions: [];
+
+    callback save();
+    callback close();
+    callback mcp-server-create(string, string);
+    callback mcp-server-delete(string);
+    callback profile-create(string, string, bool, bool);
+    callback profile-delete(string);
+    callback agent-install-requested(string);
+    callback recover-session-attach(string, string, string);
+
+    background: Theme.bg-card;
+    border-color: Theme.border-strong;
+    border-width: 1px;
+    border-radius: Theme.radius-md;
+
+    VerticalLayout {
+        padding: Metrics.space-7;
+        spacing: Metrics.space-6;
+
+        SettingsTopTabs {
+            scope: root.scope;
+            scope-selected(new-scope) => { root.scope = new-scope; }
+        }
+
+        HorizontalLayout {
+            spacing: Metrics.space-6;
+
+            SettingsLeftTabs {
+                active-section: root.active-section;
+                section-selected(new-section) => { root.active-section = new-section; }
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: Metrics.space-4;
+
+                SettingsSearchBar {
+                    query <=> root.search-query;
+                }
+
+                // The one elastic region in this column -- same
+                // `vertical-stretch: 1` + `preferred-height: 0px` +
+                // `min-height: 0px` convention `chat_area.slint`'s own
+                // message-scroll Flickable uses, rather than binding
+                // `height: parent.height` (that only resolves once the
+                // layout has already assigned this Flickable a height,
+                // which a plain binding can't rely on inside a
+                // `VerticalLayout`).
+                Flickable {
+                    vertical-stretch: 1;
+                    preferred-height: 0px;
+                    min-height: 0px;
+                    content := VerticalLayout {
+                        if root.active-section == "mcp_servers" : McpServersView {
+                            servers: root.available-mcp-servers;
+                            mcp-server-create(name, command) => { root.mcp-server-create(name, command); }
+                            mcp-server-delete(name) => { root.mcp-server-delete(name); }
+                        }
+                        if root.active-section == "agents" : AgentsView {
+                            default-profile <=> root.default-profile;
+                            permission-profile <=> root.permission-profile;
+                            available-profiles: root.available-profiles;
+                            agent-catalog: root.agent-catalog;
+                            recoverable-sessions: root.recoverable-sessions;
+                            profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
+                                root.profile-create(name, agent-id, terminal-enabled, fs-enabled);
+                            }
+                            profile-delete(name) => { root.profile-delete(name); }
+                            agent-install-requested(id) => { root.agent-install-requested(id); }
+                            recover-session-attach(session-id, provider, title) => {
+                                root.recover-session-attach(session-id, provider, title);
+                            }
+                        }
+                        if root.active-section == "harness" : HarnessView {
+                            background-default <=> root.background-default;
+                            background-override-set <=> root.background-override-set;
+                            background-override <=> root.background-override;
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Metrics.space-4;
+            Button {
+                label: "Save";
+                button-accessible-label: "Save chat settings";
+                primary: true;
+                btn-width: 72px;
+                btn-height: 30px;
+                font-size: 13px;
+                font-weight: 400;
+                clicked => { root.save(); }
+            }
+            Button {
+                label: "Close";
+                button-accessible-label: "Close chat settings";
+                btn-width: 72px;
+                btn-height: 30px;
+                font-size: 13px;
+                font-weight: 400;
+                border-w: 0px;
+                clicked => { root.close(); }
+            }
+        }
+    }
+}

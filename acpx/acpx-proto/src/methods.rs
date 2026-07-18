@@ -176,6 +176,26 @@ pub const METHODS: &[MethodSchema] = &[
         alternate_result: None,
     },
     MethodSchema {
+        // **ACP compatibility gap closed post-review.** Real, stable v1
+        // ACP compatibility gap closed post-review.** Real (but, per
+        // upstream's own `unstable_session_fork` Cargo feature, not yet
+        // stabilized) v1 ACP method (`ForkSessionRequest`/
+        // `ForkSessionResponse`, `x-side: agent`) previously entirely
+        // unclassified in `router.rs`'s `classify()` -- see
+        // `MethodClass::SessionFork`'s doc comment there for the full
+        // story, including the real `claude-agent-acp` 0.58.1 adapter
+        // verified to advertise `sessionCapabilities.fork` support
+        // despite the draft status upstream. Response mints a new
+        // session id (like `session/new`'s `NewSessionResponse`), so its
+        // result type -- unlike every other `Proxied` method's -- is not
+        // shaped identically to its request.
+        method: "session/fork",
+        side: ClientToAgent,
+        params: Some(UpstreamAcp("ForkSessionRequest")),
+        result: Some(UpstreamAcp("ForkSessionResponse")),
+        alternate_result: None,
+    },
+    MethodSchema {
         // Dual-shape: no selector -> gateway-native aggregate list
         // (`result`); selector present -> proxies to the real backend's
         // `ListSessionsResponse` (`alternate_result`). Params always
@@ -346,14 +366,14 @@ mod tests {
     #[test]
     fn matches_router_classify_client_to_agent_method_count() {
         // Cross-checked directly against `acpx-core::router::classify`'s
-        // match arms (24 client-to-agent methods total) -- see this
+        // match arms (25 client-to-agent methods total) -- see this
         // module's doc comment. Kept as a plain count (rather than
         // importing `acpx-core`, which would invert the crate-layering
         // rule `gateway.rs` documents) so this file still catches a
         // method being silently added/removed here without the count
         // being revisited.
         let client_to_agent = METHODS.iter().filter(|m| m.side == ClientToAgent).count();
-        assert_eq!(client_to_agent, 24);
+        assert_eq!(client_to_agent, 25);
         let agent_to_client = METHODS.iter().filter(|m| m.side == AgentToClient).count();
         assert_eq!(agent_to_client, 8);
     }

@@ -152,6 +152,11 @@
         },
         {
           "type": "string",
+          "const": "configured",
+          "description": "An operator-configured custom command. Its executable is resolved\nwhen ACPX starts it; it is not a registry installation."
+        },
+        {
+          "type": "string",
           "const": "installed",
           "description": "Runtime present, adapter installed/resolvable (e.g. `node`+`npm` on\n`PATH` for an npx-distributed entry, or a fetched binary present)."
         },
@@ -181,6 +186,14 @@
         },
         "status": {
           "$ref": "#/$defs/AgentStatus"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "source": {
+          "$ref": "#/$defs/AgentSource",
+          "default": "registry"
         }
       },
       "required": [
@@ -188,6 +201,13 @@
         "name",
         "version",
         "status"
+      ]
+    },
+    "AgentSource": {
+      "type": "string",
+      "enum": [
+        "registry",
+        "custom"
       ]
     },
     "AgentIdParams": {

@@ -4,7 +4,7 @@ import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
 import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
-import { SettingsSheet } from "components/settings_sheet.slint";
+import { SettingsPage } from "pages/settings/settings_page.slint";
 
 export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, Theme }
 
@@ -215,7 +215,7 @@ export component ChatPanel inherits Window {
         key-input(text) => { local-terminal-key-input(text); }
     }
     if settings-open : Rectangle {
-        SettingsSheet {
+        SettingsPage {
             x: 8px;
             y: 8px;
             width: parent.width - 16px;

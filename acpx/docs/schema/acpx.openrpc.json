@@ -232,6 +232,24 @@
       "x-acpx-side": "client-to-agent"
     },
     {
+      "name": "session/fork",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ForkSessionRequest"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ForkSessionResponse"
+        }
+      },
+      "x-acpx-side": "client-to-agent"
+    },
+    {
       "name": "session/list",
       "params": [
         {
@@ -716,6 +734,11 @@
           },
           {
             "type": "string",
+            "const": "configured",
+            "description": "An operator-configured custom command. Its executable is resolved\nwhen ACPX starts it; it is not a registry installation."
+          },
+          {
+            "type": "string",
             "const": "installed",
             "description": "Runtime present, adapter installed/resolvable (e.g. `node`+`npm` on\n`PATH` for an npx-distributed entry, or a fetched binary present)."
           },
@@ -745,6 +768,14 @@
           },
           "status": {
             "$ref": "#/components/schemas/AgentStatus"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "source": {
+            "$ref": "#/components/schemas/AgentSource",
+            "default": "registry"
           }
         },
         "required": [
@@ -752,6 +783,13 @@
           "name",
           "version",
           "status"
+        ]
+      },
+      "AgentSource": {
+        "type": "string",
+        "enum": [
+          "registry",
+          "custom"
         ]
       },
       "AgentIdParams": {
@@ -1432,6 +1470,18 @@
             "description": "Whether the agent supports `additionalDirectories` on supported session lifecycle requests.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports `additionalDirectories` on\nsupported session lifecycle requests.\n\nAgents that also support `session/list` may return\n`SessionInfo.additionalDirectories` to report the complete ordered\nadditional-root list associated with a listed session.",
             "x-deserialize-default-on-error": true
           },
+          "fork": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionForkCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nWhether the agent supports `session/fork`.\n\nOptional. Omitted or `null` both mean the agent does not advertise support.\nSupplying `{}` means the agent supports forking sessions.",
+            "x-deserialize-default-on-error": true
+          },
           "resume": {
             "anyOf": [
               {
@@ -1512,6 +1562,21 @@
           }
         },
         "description": "Capabilities for additional session directories support.\n\nSupplying `{}` means the agent supports the `additionalDirectories` field on\nsupported session lifecycle requests. Agents that also support\n`session/list` may return `SessionInfo.additionalDirectories` to report the\ncomplete ordered additional-root list associated with a listed session."
+      },
+      "SessionForkCapabilities": {
+        "type": "object",
+        "properties": {
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nCapabilities for the `session/fork` method.\n\nSupplying `{}` means the agent supports forking sessions."
       },
       "SessionResumeCapabilities": {
         "type": "object",
@@ -3229,6 +3294,101 @@
         "description": "Response from deleting a session.",
         "x-side": "agent",
         "x-method": "session/delete"
+      },
+      "ForkSessionRequest": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "The ID of the session to fork."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "The working directory for this session. Must be an absolute path."
+          },
+          "additionalDirectories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional workspace roots to activate for this session. Each path must be absolute.\n\nWhen omitted or empty, no additional roots are activated. When non-empty,\nthis is the complete resulting additional-root list for the forked\nsession.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "mcpServers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/McpServer"
+            },
+            "description": "List of MCP servers to connect to for this session.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId",
+          "cwd"
+        ],
+        "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nRequest parameters for forking an existing session.\n\nCreates a new session based on the context of an existing one, allowing\noperations like generating summaries without affecting the original session's history.\n\nOnly available if the Agent supports the `session.fork` capability.",
+        "x-side": "agent",
+        "x-method": "session/fork"
+      },
+      "ForkSessionResponse": {
+        "type": "object",
+        "properties": {
+          "sessionId": {
+            "$ref": "#/components/schemas/SessionId",
+            "description": "Unique identifier for the newly created forked session."
+          },
+          "modes": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionModeState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Initial mode state if supported by the Agent\n\nSee protocol docs: [Session Modes](https://agentclientprotocol.com/protocol/session-modes)",
+            "x-deserialize-default-on-error": true
+          },
+          "configOptions": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/SessionConfigOption"
+            },
+            "description": "Initial session configuration options if supported by the Agent.",
+            "x-deserialize-default-on-error": true,
+            "x-deserialize-skip-invalid-items": true
+          },
+          "_meta": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true,
+            "description": "The _meta property is reserved by ACP to allow clients and agents to attach additional\nmetadata to their interactions. Implementations MUST NOT make assumptions about values at\nthese keys.\n\nSee protocol docs: [Extensibility](https://agentclientprotocol.com/protocol/extensibility)",
+            "x-deserialize-default-on-error": true
+          }
+        },
+        "required": [
+          "sessionId"
+        ],
+        "description": "**UNSTABLE**\n\nThis capability is not part of the spec yet, and may be removed or changed at any point.\n\nResponse from forking an existing session.",
+        "x-side": "agent",
+        "x-method": "session/fork"
       },
       "ListSessionsRequest": {
         "type": "object",

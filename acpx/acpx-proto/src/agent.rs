@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub enum AgentStatus {
     /// Registry entry known, nothing fetched/verified yet.
     NotInstalled,
+    /// An operator-configured custom command. Its executable is resolved
+    /// when ACPX starts it; it is not a registry installation.
+    Configured,
     /// Runtime present, adapter installed/resolvable (e.g. `node`+`npm` on
     /// `PATH` for an npx-distributed entry, or a fetched binary present).
     Installed,
@@ -23,10 +26,26 @@ pub enum AgentStatus {
     RuntimeMissing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSource {
+    #[default]
+    Registry,
+    Custom,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentListEntry {
     pub id: String,
     pub name: String,
     pub version: String,
     pub status: AgentStatus,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub source: AgentSource,
+}
+
+fn default_enabled() -> bool {
+    true
 }

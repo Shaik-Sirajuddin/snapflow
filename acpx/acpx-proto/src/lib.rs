@@ -7,6 +7,7 @@
 //! `session/new`'s profile-selection side channel -- never redefining the
 //! raw ACP shape itself.
 
+pub mod admin;
 pub mod agent;
 pub mod gateway;
 pub mod jsonrpc;

@@ -1,0 +1,80 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+
+// Settings page chrome -- the left-side section rail from the
+// settings-pane-redesign plan's "Component layout" section: `MCP Servers`
+// / `Agents` / `Harness`, same set for both Project and Global scope (the
+// plan notes Project mirrors Global's section list). Controlled by
+// `SettingsPage` via `active-section`/`section-selected`, same "dumb
+// strip" pattern as `SettingsTopTabs`.
+export component SettingsLeftTabs inherits Rectangle {
+    in property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness"
+    callback section-selected(string);
+
+    width: 128px;
+
+    VerticalLayout {
+        spacing: Metrics.space-2;
+
+        mcp-tab := Rectangle {
+            height: 30px;
+            border-radius: Theme.radius-sm;
+            background: root.active-section == "mcp_servers" ? Theme.bg-primary-container : transparent;
+            TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "MCP Servers section";
+                accessible-action-default => { root.section-selected("mcp_servers"); }
+                clicked => { root.section-selected("mcp_servers"); }
+            }
+            Text {
+                text: "MCP Servers";
+                color: root.active-section == "mcp_servers" ? Theme.text-primary : Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                font-weight: root.active-section == "mcp_servers" ? 700 : 400;
+                x: Metrics.space-4;
+                vertical-alignment: center;
+            }
+        }
+        agents-tab := Rectangle {
+            height: 30px;
+            border-radius: Theme.radius-sm;
+            background: root.active-section == "agents" ? Theme.bg-primary-container : transparent;
+            TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Agents section";
+                accessible-action-default => { root.section-selected("agents"); }
+                clicked => { root.section-selected("agents"); }
+            }
+            Text {
+                text: "Agents";
+                color: root.active-section == "agents" ? Theme.text-primary : Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                font-weight: root.active-section == "agents" ? 700 : 400;
+                x: Metrics.space-4;
+                vertical-alignment: center;
+            }
+        }
+        harness-tab := Rectangle {
+            height: 30px;
+            border-radius: Theme.radius-sm;
+            background: root.active-section == "harness" ? Theme.bg-primary-container : transparent;
+            TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Harness section";
+                accessible-action-default => { root.section-selected("harness"); }
+                clicked => { root.section-selected("harness"); }
+            }
+            Text {
+                text: "Harness";
+                color: root.active-section == "harness" ? Theme.text-primary : Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                font-weight: root.active-section == "harness" ? 700 : 400;
+                x: Metrics.space-4;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

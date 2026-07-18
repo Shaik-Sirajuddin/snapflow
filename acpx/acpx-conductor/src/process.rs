@@ -25,6 +25,8 @@ pub enum ProcessError {
 pub struct SpawnSpec {
     pub program: String,
     pub args: Vec<String>,
+    /// Optional process working directory for custom backend definitions.
+    pub cwd: Option<std::path::PathBuf>,
     /// Env vars to set/override on top of the inherited ambient
     /// environment. Empty in native/unmanaged mode.
     pub env: HashMap<String, String>,
@@ -35,8 +37,14 @@ impl SpawnSpec {
         Self {
             program: program.into(),
             args,
+            cwd: None,
             env: HashMap::new(),
         }
+    }
+
+    pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
     }
 }
 
@@ -123,6 +131,9 @@ impl BackendProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
 
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().ok_or(ProcessError::MissingPipes)?;
@@ -151,15 +162,17 @@ impl BackendProcess {
     /// repeated calls after the process has exited keep returning the same
     /// value rather than erroring on a second wait.
     pub fn try_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        match self.child.try_wait() {
-            Ok(status) => status,
-            Err(_) => None,
-        }
+        self.child.try_wait().unwrap_or_default()
     }
 
     /// True if the process has exited (non-blocking check).
     pub fn has_exited(&mut self) -> bool {
         self.try_exit_status().is_some()
+    }
+
+    /// Operating-system process id while the child is still running.
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
     }
 
     pub async fn kill(&mut self) -> Result<(), std::io::Error> {

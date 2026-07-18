@@ -1,0 +1,267 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+import { Button } from "../../../base/button.slint";
+import { SettingsRow } from "../../../base/settings_row.slint";
+import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
+
+// Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
+// former `components/settings_sheet.slint` that is agent/profile/session
+// shaped and doesn't cleanly belong under MCP Servers or Harness: the
+// profile picker + profile management (`profiles/*`, default agent
+// behavior per chat), the agent catalog itself (`agents/list`,
+// install-only per the current Rust-side reality -- see the
+// settings-pane-redesign plan's "Rust-side reality check"), and
+// Recoverable Sessions (real gateway sessions re-attached onto a thread
+// for a given agent/provider). All three are agent-catalog/profile-
+// adjacent, unlike the MCP-server registry or the (currently
+// thread-background-only) Harness section, so they land here rather than
+// being split into a fourth left tab that the plan's "Component layout"
+// section doesn't call for. No new fields, no new data wiring -- same
+// models/callbacks `settings_sheet.slint` already used.
+export component AgentsView inherits Rectangle {
+    in-out property <string> default-profile: "";
+    in-out property <string> permission-profile: "";
+    in property <[ProfileOption]> available-profiles: [];
+    in property <[AgentCatalogEntry]> agent-catalog: [];
+    in property <[RemoteSessionOption]> recoverable-sessions: [];
+    callback profile-create(string, string, bool, bool);
+    callback profile-delete(string);
+    callback agent-install-requested(string);
+    callback recover-session-attach(string, string, string);
+
+    property <string> new-profile-name: "";
+    property <string> new-profile-agent-id: "";
+    property <bool> new-profile-terminal-enabled: false;
+    property <bool> new-profile-fs-enabled: false;
+    // Armed-delete confirmation state -- see settings_sheet.slint's
+    // original doc comment on `profile-pending-delete` for why this is a
+    // two-step confirm rather than an immediate delete.
+    property <string> profile-pending-delete: "";
+
+    background: transparent;
+
+    VerticalLayout {
+        spacing: Metrics.space-6;
+
+        Text { text: "Chat Defaults"; color: Theme.text-primary; font-size: 16px * Theme.font-scale; font-weight: 700; }
+
+        Text { text: "Profile"; color: Theme.text-secondary; font-size: 11px * Theme.font-scale; }
+        TextInput { text <=> root.default-profile; color: Theme.text-primary; font-size: 12px * Theme.font-scale; }
+
+        Flickable {
+            height: root.available-profiles.length > 0 ? 30px : 0px;
+            viewport-width: profile-chip-row.preferred-width;
+            profile-chip-row := HorizontalLayout {
+                spacing: Metrics.space-3;
+                for profile in root.available-profiles : Rectangle {
+                    height: 24px;
+                    // Width computed purely from the leaf `Text.preferred-width`
+                    // below -- never bind a repeated item's own width to a
+                    // child layout's `preferred-width` when that child
+                    // layout has no explicit width of its own (it would
+                    // otherwise size to fill this same Rectangle): that is
+                    // a real binding cycle. Slint doesn't error on it, it
+                    // silently corrupts this whole window's later
+                    // accessible-element geometry (see the original of
+                    // this row, `components/settings_sheet.slint`, for the
+                    // bisection that found this).
+                    width: profile-chip-label.preferred-width + 16px
+                        + 2px
+                        + (root.profile-pending-delete == profile.name ? 114px : 20px);
+                    HorizontalLayout {
+                        spacing: 2px;
+                        Rectangle {
+                            width: profile-chip-label.preferred-width + 16px;
+                            height: 24px;
+                            background: profile.name == root.default-profile ? Theme.bg-primary : Theme.bg-sidebar;
+                            border-color: Theme.border-default;
+                            border-width: 1px;
+                            border-radius: Theme.radius-sm;
+                            TouchArea {
+                                accessible-role: button;
+                                accessible-label: "Select profile " + profile.name;
+                                accessible-action-default => { root.default-profile = profile.name; }
+                                clicked => { root.default-profile = profile.name; }
+                            }
+                            profile-chip-label := Text {
+                                text: profile.name
+                                    + (profile.terminal-enabled ? " T" : "")
+                                    + (profile.fs-enabled ? " F" : "");
+                                color: profile.name == root.default-profile ? Theme.text-on-primary : Theme.text-primary;
+                                font-family: Theme.font-mono;
+                                font-size: 10px * Theme.font-scale;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        if root.profile-pending-delete != profile.name : Button {
+                            label: "\u{2715}";
+                            button-accessible-label: "Remove profile " + profile.name;
+                            btn-width: 20px;
+                            btn-height: 24px;
+                            font-size: 10px;
+                            font-weight: 400;
+                            bg: Theme.bg-card;
+                            fg: Theme.text-secondary;
+                            clicked => { root.profile-pending-delete = profile.name; }
+                        }
+                        if root.profile-pending-delete == profile.name : HorizontalLayout {
+                            spacing: 2px;
+                            Button {
+                                label: "Confirm";
+                                button-accessible-label: "Confirm delete profile " + profile.name;
+                                primary: true;
+                                btn-width: 64px;
+                                btn-height: 24px;
+                                font-size: 9px;
+                                font-weight: 400;
+                                clicked => {
+                                    root.profile-pending-delete = "";
+                                    root.profile-delete(profile.name);
+                                }
+                            }
+                            Button {
+                                label: "Cancel";
+                                button-accessible-label: "Cancel delete profile " + profile.name;
+                                btn-width: 48px;
+                                btn-height: 24px;
+                                font-size: 9px;
+                                font-weight: 400;
+                                bg: Theme.bg-card;
+                                fg: Theme.text-secondary;
+                                clicked => { root.profile-pending-delete = ""; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: Theme.border-default; }
+
+        Text { text: "Add Profile"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
+        HorizontalLayout {
+            spacing: Metrics.space-3;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                background: Theme.bg-sidebar;
+                border-radius: Theme.radius-sm;
+                TextInput {
+                    accessible-label: "New profile name";
+                    accessible-action-default => { self.focus(); }
+                    text <=> root.new-profile-name;
+                    color: Theme.text-primary;
+                    font-size: 11px * Theme.font-scale;
+                    x: 6px;
+                    vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                background: Theme.bg-sidebar;
+                border-radius: Theme.radius-sm;
+                TextInput {
+                    accessible-label: "New profile agent id";
+                    accessible-action-default => { self.focus(); }
+                    text <=> root.new-profile-agent-id;
+                    color: Theme.text-primary;
+                    font-size: 11px * Theme.font-scale;
+                    x: 6px;
+                    vertical-alignment: center;
+                }
+            }
+            Button {
+                label: "T";
+                button-accessible-label: "Toggle new profile terminal access";
+                btn-width: 28px;
+                btn-height: 26px;
+                font-size: 10px;
+                font-weight: 400;
+                bg: root.new-profile-terminal-enabled ? Theme.bg-primary : Theme.bg-sidebar;
+                fg: root.new-profile-terminal-enabled ? Theme.text-on-primary : Theme.text-secondary;
+                clicked => { root.new-profile-terminal-enabled = !root.new-profile-terminal-enabled; }
+            }
+            Button {
+                label: "F";
+                button-accessible-label: "Toggle new profile filesystem access";
+                btn-width: 28px;
+                btn-height: 26px;
+                font-size: 10px;
+                font-weight: 400;
+                bg: root.new-profile-fs-enabled ? Theme.bg-primary : Theme.bg-sidebar;
+                fg: root.new-profile-fs-enabled ? Theme.text-on-primary : Theme.text-secondary;
+                clicked => { root.new-profile-fs-enabled = !root.new-profile-fs-enabled; }
+            }
+            Button {
+                label: "Add";
+                button-accessible-label: "Add profile";
+                primary: true;
+                btn-width: 56px;
+                btn-height: 26px;
+                font-size: 11px;
+                font-weight: 400;
+                clicked => {
+                    if (root.new-profile-name != "") {
+                        root.profile-create(
+                            root.new-profile-name,
+                            root.new-profile-agent-id,
+                            root.new-profile-terminal-enabled,
+                            root.new-profile-fs-enabled);
+                        root.new-profile-name = "";
+                        root.new-profile-agent-id = "";
+                        root.new-profile-terminal-enabled = false;
+                        root.new-profile-fs-enabled = false;
+                    }
+                }
+            }
+        }
+
+        Text { text: "Permission profile"; color: Theme.text-secondary; font-size: 11px * Theme.font-scale; }
+        TextInput { text <=> root.permission-profile; color: Theme.text-primary; font-size: 12px * Theme.font-scale; }
+
+        Rectangle { height: 1px; background: Theme.border-default; }
+
+        Text { text: "Agents"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
+        for agent in root.agent-catalog : SettingsRow {
+            label: agent.name != "" ? agent.name : agent.id;
+            hint: agent.status;
+            hint-font-family: Theme.font-mono;
+            Button {
+                label: "Install";
+                button-accessible-label: "Install agent " + agent.name;
+                btn-width: 52px;
+                btn-height: 20px;
+                font-size: 9px;
+                font-weight: 400;
+                bg: Theme.bg-card;
+                fg: Theme.text-secondary;
+                clicked => { root.agent-install-requested(agent.id); }
+            }
+        }
+
+        Rectangle { height: 1px; background: Theme.border-default; }
+
+        Text { text: "Recoverable Sessions"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
+        if root.recoverable-sessions.length == 0 : Text {
+            text: "No orphaned sessions for this provider.";
+            color: Theme.text-muted;
+            font-size: 10px * Theme.font-scale;
+        }
+        for session in root.recoverable-sessions : SettingsRow {
+            label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
+            Button {
+                label: "Attach";
+                button-accessible-label: "Attach recovered session " + session.session-id;
+                btn-width: 52px;
+                btn-height: 20px;
+                font-size: 9px;
+                font-weight: 400;
+                bg: Theme.bg-card;
+                fg: Theme.text-secondary;
+                clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
+            }
+        }
+    }
+}

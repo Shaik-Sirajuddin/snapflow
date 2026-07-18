@@ -2894,4 +2894,474 @@ change to wire dispatch behavior except the `NewSessionParams` schema
 type's field naming fix above (schema-accuracy only -- `router.rs`
 never consumed this type at runtime, so no behavior change to actual
 `session/new` handling).
-++ /home/siraj/Desktop/codebases/prv/multimedia_agent/multi_media_main/acpx/COVERAGE.md
+
+## 2026-07-15 -- three real ACP-compatibility gaps closed: default profile seeding, HTTP/WS bind resilience, `session/fork`
+
+Three independent, real gaps found and fixed while integrating a real
+external ACP client (OpenHands's `openhands-sdk`, `ACPAgent(acp_server=
+"custom", acp_command=[...])` spawning `acpx-server` as a per-conversation
+stdio subprocess) and, separately, re-deriving the ACP method surface
+from the real `agent-client-protocol` 1.2.0 crate's own macro
+invocations rather than trusting a prior summary.
+
+**1. `profiles/list`/`_acpx.profile` used to stay empty on a completely
+unconfigured gateway.** `agents/list` (registry catalog + local
+`node`/`npm`/`uv` detection) already reported `claude-acp`/`codex-acp`/
+`gemini` as `Installed` on a host with real CLI logins, but
+`profiles/list` -- the thing `session/new`'s `_acpx.profile` actually
+resolves against -- stayed empty until an operator ran `ACPX_CONFIG_FILE`
+or `profiles/create`. Fixed with `Router::ensure_default_profiles_seeded`
+(`router.rs`): idempotent, re-run on every `profiles/list` call and every
+`_acpx.profile` resolution, auto-creates one native (no provider/key)
+`Profile` per `Installed` registry agent, named after its registry id, if
+and only if nothing has already claimed that name. New coverage:
+`acpx-core/tests/default_profile_seeding_test.rs` (4 tests: seeding
+itself, idempotency, explicit-profile-wins, and a real `session/new`
+against an auto-seeded profile with zero prior provisioning). Several
+pre-existing tests asserting exact `profiles/list` lengths/indices had to
+be loosened to name-based lookups (`profile_resolution_test.rs`,
+`router_dispatch_test.rs`, `gateway_client_test.rs`,
+`provisioning_binary_test.rs`, `provisioning.rs`'s own unit test) since
+the list now legitimately contains more than just what a test explicitly
+created.
+
+**2. `acpx-server`'s HTTP/WS bind failure used to kill the whole
+process, stdio transport included.** Found integrating with OpenHands,
+which spawns one `acpx-server` instance per conversation as a stdio
+subprocess -- several concurrent conversations on one host all default
+to the same fixed `ACPX_HTTP_BIND=127.0.0.1:8790`, and none of them
+actually use the HTTP/WS surface at all. `main.rs` used to build the
+listener inside `transport::serve` and propagate a bind error straight
+out of the `tokio::select!`, tearing down the stdio task too. Fixed:
+`ServerConfig::http_bind_addr` is now `Option<SocketAddr>`
+(`ACPX_HTTP_BIND=off`/`none`, case-insensitive, disables the transport
+outright); `main.rs` now attempts the bind itself first and, on failure,
+logs a `tracing::warn!` and falls back to serving stdio only instead of
+exiting. `transport::http::serve_on` (new) takes an already-bound
+`TcpListener`; `serve` (kept, used by every pre-existing integration test
+via its own `#[path]`-included copy of this file) is a thin bind-then-
+call-`serve_on` wrapper. New coverage:
+`acpx-server/tests/binary_self_test.rs`'s
+`real_binary_with_http_bind_off_still_serves_stdio` and
+`real_binary_survives_a_concurrent_bind_conflict_and_still_serves_stdio`
+(two real `acpx-server` processes told to bind the same address; the
+second's stdio transport must still fully round-trip a real request).
+Also added `acpx/scripts/openhands-acpx-{claude,codex}.sh` (wrapper
+scripts OpenHands's `ACPAgentSettings.acp_command` points at, each
+setting `ACPX_HTTP_BIND=off` and a real backend's `ACPX_BACKEND_CMD`)
+and `acpx/tests/openhands_integration/` (a real, dependency-light Python
+pytest suite driving OpenHands's own `openhands-sdk` client against a
+real, already-running agent-server -- see its own `README.md` for
+prerequisites and what it proves; skips cleanly, doesn't fail, when no
+such stack is running).
+
+**3. `session/fork` was entirely unclassified -- a real, previously
+undiscovered ACP compatibility gap.** Found by cross-checking every
+`impl_jsonrpc_request!` macro invocation in the real
+`agent-client-protocol` 1.2.0 crate's own
+`src/schema/client_to_agent/requests.rs` against `router.rs`'s
+`classify()` match arms -- every method was covered except this one,
+which fell straight through to `MethodClass::Unknown`. Not yet
+stabilized upstream (gated behind `agent-client-protocol-schema`'s own
+`unstable_session_fork` Cargo feature, now enabled in the workspace root
+`Cargo.toml`), but a real, published adapter already advertises and
+implements it -- `claude-agent-acp` 0.58.1's own `session/new` response
+includes `sessionCapabilities.fork: {}}`, verified against the real
+npx-installed package during this same session's manual stdio probe.
+Neither `Proxied` (its response mints a *new* session id) nor `Hybrid`
+(it forwards against an *existing* session, not a fresh profile
+resolution) fit, so this got its own `MethodClass::SessionFork` bucket:
+resolve the source session (with the same `rehydrate_session` fallback
+`session/load`/`session/resume`/`session/delete` get), forward with the
+gateway id rewritten to the backend-native one, then register the
+backend's newly-forked session id under a brand-new gateway session id
+(persisted via `spawn_session_persistence` exactly like `session/new`,
+keyed to the new session, not the source one) and rewrite the response
+accordingly. Implemented on both dispatch paths
+(`Router::dispatch_session_fork` and `dispatch_session_fork_shared`, the
+production path every real transport uses). Schema surface updated to
+match: `acpx-proto/src/methods.rs`'s `METHODS` table (25 client-to-agent
+methods now, was 24), `acpx-proto/src/schema.rs`'s `register_all_defs`,
+and all three regenerated schema documents. New coverage:
+`acpx-core/tests/session_fork_test.rs` (4 tests: new-gateway-id-minted-
+and-distinct-from-source on both `Router::dispatch` and `dispatch_shared`,
+unknown-source-session errors cleanly, and interleaved `session/update`
+notifications still land in `_acpx.updates`).
+
+**A real, unrelated incident worth recording:** partway through this
+phase, `acpx-core/src/router.rs` was found reset to its last-committed
+state on disk -- both this phase's `session/fork` work *and* the
+already-tested/passing default-profile-seeding work from earlier the
+same session had vanished from the file, even though `git status` showed
+every other touched file (including this same phase's `Cargo.toml`/
+`acpx-proto` changes) still modified. Not caused by anything in this
+session's own tool calls (no `git checkout`/`reset` was ever run) --
+re-diagnosed by comparing `git status`/`git diff --stat` against what
+had just built and passed moments before, then both sets of changes were
+carefully reapplied from scratch and reverified with a full, uninterrupted
+`cargo test --workspace` run immediately afterward. Flagged here in case
+it recurs -- if `router.rs` (or any file) ever again shows as
+unexpectedly clean against `HEAD` mid-session, treat it as a real
+external event to re-diagnose, not a tooling illusion.
+
+Workspace test count after this phase: **285 passed, 0 failed, 8
+ignored** (up from 275/0/8 -- 4 new `default_profile_seeding_test`
+tests, 4 new `session_fork_test` tests, 2 new `binary_self_test`
+HTTP-bind-resilience tests). `cargo fmt --all --check` and `cargo build
+--workspace --tests` both clean. `cargo clippy` still not installed in
+this environment, same standing limitation as every prior phase.
+
+## Phase 30: full OpenHands HTTP-surface coverage (terminal, profiles,
+## approval flow, multi-session) + a real acpx `session/fork` transport
+## bug found and fixed
+
+Extended the OpenHands integration test package
+(`tests/openhands_integration/`, phase 28's Python test suite) from one
+base chat-round-trip file to full HTTP-surface coverage, all against the
+same real, already-running agent-server + real Claude/Codex backends --
+no new mocks, no synthetic transport:
+
+- `test_openhands_terminal.py` (4 tests) -- `/api/bash/*`: synchronous
+  `execute_bash_command`, a non-zero exit code, async `start_bash_command`
+  + poll via `search_bash_events`, and the shared host-level terminal
+  answering normally *while* a real acpx-backed conversation is running
+  concurrently (proves the terminal surface and the ACP subprocess
+  bridge don't contend for a lock).
+- `test_openhands_profiles.py` (6 tests, one parametrized x2 backends)
+  -- `/api/agent-profiles/*` (the launch-spec profile store, distinct
+  from `/api/profiles`'s LLM-config store): save/get/activate/
+  materialize CRUD round trip for an `ACPAgentProfile` naming each acpx
+  wrapper script, plus a from-a-stored-profile conversation that
+  launches the real backend process tree.
+- `test_openhands_approval_flow.py` (5 tests) -- confirmation-policy +
+  respond-to-confirmation + ask_agent against a real ACP-backed
+  conversation. Documents a real architectural finding (not an acpx
+  issue): `ACPAgentClient.request_permission` auto-approves every ACP
+  `session/request_permission` call, so OpenHands's confirmation-policy
+  pause is a verified no-op for ACP-backed conversations; the tests
+  assert on this actual behavior rather than an assumed one.
+- `test_openhands_multi_session.py` (2 tests) -- two real, concurrently
+  running acpx-backed conversations against the same agent-server: no
+  response cross-talk, distinct conversation ids, distinct process
+  trees (best-effort), and `GET /api/conversations/search` correctly
+  listing both independently.
+
+**A real, previously undiscovered acpx transport bug, found live while
+writing `test_ask_agent_side_channel_works_on_acp_conversation`:**
+`OpenHands.ask_agent` implements its side-channel question via a real
+ACP `session/fork` followed by a `session/prompt` against the newly
+forked session id -- exercising phase 28/29's `session/fork` dispatch
+support for the first time against a real client that actually calls it
+mid-conversation (rather than as an isolated protocol probe). Confirmed
+live (both via the raw stdio ACP client and the real OpenHands SDK) that
+the fork's `session/prompt` response always carried the correct final
+result, but its `session/update` notifications (the assistant's actual
+reply text) never reached the client -- `ask_agent` returned `""` every
+time despite the real backend replying normally.
+
+Root cause: `acpx-server/src/transport/live.rs::session_id_to_watch`
+(shared by both the stdio and WS transports, phase 14's live-notification
+wiring) special-cased only `session/new`'s freshly-minted
+`result.sessionId` for "start watching this new gateway session id
+for live push" -- not `session/fork`'s equally freshly-minted one. A
+`session/fork` request's own `params.sessionId` names the *source*
+session, so the generic "read the id the client supplied" fallback path
+picked that up instead, meaning a connection kept watching the source
+session and never subscribed to the forked one at all. The forked
+session's first `session/prompt` call then ran with zero live
+subscribers, so the router's `try_deliver_live` had nowhere to push its
+`session/update` notifications and they silently fell back to the
+`_acpx.updates` buffer embedded in the JSON-RPC response -- a proprietary
+acpx extension no standard ACP client (including OpenHands's
+`ACPAgentClient`) ever reads.
+
+Fixed by special-casing `session/fork` in `session_id_to_watch` exactly
+like `session/new` (read the *response's* minted `result.sessionId`, not
+the request's source one). New unit tests:
+`session_fork_watches_the_newly_minted_forked_gateway_id_not_the_
+source_one`, `a_failed_session_fork_yields_nothing_to_watch`. Verified
+end to end twice post-fix: a raw stdio ACP probe (fork + prompt on the
+forked session now returns the real `"pong"` reply instead of `""`) and
+the real OpenHands SDK `ask_agent` call against a live agent-server.
+
+Workspace test count after this phase: **293 passed, 0 failed, 8
+ignored** (up from 285/0/8 -- 8 new `transport::live` unit tests, 2 of
+them the fork-specific regression coverage above; the other 6 are the
+pre-existing `session/new`/`session/prompt`/`session/close` cases,
+recompiled and rerun as part of the same file). `cargo fmt --all --check`
+and `cargo build --workspace --tests` both clean. `cargo clippy` still
+not installed in this environment, same standing limitation as every
+prior phase.
+
+All four new Python test files pass live against a real running
+OpenHands agent-server stack + real Claude backend (Codex backend
+covered by the profile-CRUD parametrization; not separately re-run for
+the process-heavier tests in this phase to limit real spend): terminal
+4/4, profiles 5/5 non-billed + 1 billed (`test_conversation_from_stored_
+acp_profile_launches_real_backend`, requires the agent-server pid to be
+visible to `ps` -- see the multi-session note below), approval-flow 5/5,
+multi-session 1/1 (`test_conversation_search_lists_both_sessions_
+independently`, no model spend) plus the concurrent-two-conversations
+test's response-isolation assertions (the process-tree corroboration
+specifically needs `ps` to see the agent-server's pid, which this
+sandboxed tool-execution environment's own pytest-invoked processes
+cannot -- see `tests/openhands_integration/README.md`'s pre-existing
+"a note on `ps` snapshot stability" section; not a new issue, not an
+acpx/OpenHands bug, and the test degrades gracefully to a partial-skip
+rather than a false failure).
+
+## Phase 31: bounded persistent session subscribers
+
+Added `ACPX_MAX_SUBSCRIBERS_PER_SESSION` (default `16`) to cap live
+stdio/WebSocket subscribers per tenant-scoped gateway session. The
+notification hub now admits a new receiver atomically with the stream
+lookup and returns an explicit `TooManySubscribers` result without
+evicting existing receivers. Persistent transports surface that result
+as ACPX-reserved JSON-RPC error `-32050`, with
+`error.data.maxSubscribers` for client-side retry/backoff policy.
+
+`ws_rejects_an_over_limit_subscriber_without_disrupting_the_existing_
+stream` drives two real WebSocket clients through the production
+transport against a synthetic streaming ACP backend: client two receives
+the distinct error while client one still receives `session/update` and
+its successful `session/prompt` response. This also caught and fixed a
+duplicate-subscription path where a client that subscribed during
+`session/new` retried subscription on its first prompt.
+
+Verified with `cargo test --workspace --no-fail-fast`: all default tests
+passed; credentialed ambient tests remain intentionally ignored.
+
+## Phase 32: resumable persistent session updates
+
+Added per-session monotonic delivery sequences and a bounded replay ring.
+Every WebSocket and stdio `session/update` frame now carries additive
+`params._acpx.seq` metadata. `ACPX_STREAM_REPLAY_BUFFER_SIZE` controls
+the retained update count and defaults to `200`.
+
+Persistent clients resume with the ACPX-only cursor below on a
+session-bearing request such as `session/resume` or `session/load`:
+
+```json
+{
+  "params": {
+    "_acpx": {
+      "resume": { "lastSeq": 42, "epoch": "opaque-epoch-token" }
+    }
+  }
+}
+```
+
+The transport strips `_acpx.resume` before proxying the normal ACP
+request. Subscription occurs before the replay snapshot and before a
+resume/load backend round trip. Buffered records newer than `lastSeq`
+are delivered first; overlapping broadcast records are filtered, so the
+subscriber gets an ordered, exactly-once replay-plus-live stream.
+
+`ws_resume_replays_and_tails_updates_once_while_resume_is_in_flight`
+uses a real WebSocket server with a deliberately delayed
+`session/resume` backend and a two-record replay ring. It proves that a
+client receives one buffered record and three records published while
+the backend call is in flight, in sequence order `1, 2, 3, 4`, with no
+gap or duplicate. Verified with `cargo test --workspace --no-fail-fast`;
+credentialed ambient tests remain intentionally ignored.
+
+## Phase 33: stale resume epochs
+
+Resume cursors now require both `lastSeq` and the opaque epoch emitted in
+each update's `params._acpx` metadata. Epochs combine the tenant/session
+stream identity, backend session identity, a generation counter, and a
+per-daemon nonce, so tokens from a prior daemon lifetime cannot resume a
+new stream accidentally.
+
+Before stdio or WebSocket attaches a resume subscriber, ACPX compares the
+SQLite transcript count against the count written through its own
+`PersistenceStore`. A direct durable-state change bumps the epoch,
+clears replay history, and returns JSON-RPC error `-32051` with
+`error.data.reason = "resync_required"` plus the current `epoch` and
+`seq` baseline. Clients must perform a full `session/load` refresh
+before retaining a new cursor.
+
+`transcript_state_detects_an_out_of_band_database_write` performs a raw
+SQLite transcript insert after an ACPX-managed write and verifies the
+drift detector trips. `durable_drift_invalidates_the_epoch_and_requires_
+a_resync` verifies the hub returns the new epoch instead of replaying a
+stale stream. Verified with `cargo test --workspace --no-fail-fast`;
+credentialed ambient tests remain intentionally ignored.
+
+## Phase 34: idle stream reaping
+
+Added `ACPX_STREAM_IDLE_RETENTION_SECS` with a default of `300`. Every
+session stream starts one weak-reference reaper task. It retains replay
+state while subscribers are absent during the grace period, then removes
+the zero-subscriber stream without keeping its broadcast sender alive.
+An explicit `session/close` or `session/delete` still removes the stream
+immediately.
+
+Reaping records a per-session generation tombstone. A subsequent resume
+with a cursor from the discarded stream receives the existing
+`-32051 resync_required` response rather than silently attaching to an
+empty new stream. `reaped_stream_rejects_an_old_resume_cursor` verifies
+both removal and that rejection; `removed_stream_does_not_deliver_future_
+updates` verifies the weak task does not delay explicit stream closure.
+Verified with `cargo test --workspace --no-fail-fast`; credentialed
+ambient tests remain intentionally ignored.
+
+## Phase 35: tenant-qualified profile processes
+
+Added opt-in physical backend isolation for managed profiles.
+`ACPX_TENANT_PROCESS_ISOLATION=1` changes profile supervisor keys from
+`profile:{name}` to `profile:{name}:tenant:{tenant_id}`. Each tenant
+therefore receives a distinct backend process for the same profile,
+while the default remains one shared process per profile for backward
+compatibility and lower resource use.
+
+The router derives the qualified key for profile-backed `session/new`,
+real `session/list`, shared dispatch, durable rehydration, and startup
+recovery. `profiles/delete` stops every matching shared or
+tenant-qualified backend process. `tenant_process_isolation_test`
+launches real shell-backed ACP processes and asserts distinct OS PIDs
+when enabled and one stable shared PID when disabled. Verified with
+`cargo test --workspace --no-fail-fast`; credentialed ambient tests
+remain intentionally ignored.
+
+## Phase 36: bounded startup recovery
+
+Startup recovery now uses a bounded shared-router scheduler rather than
+holding the router mutex over every backend `session/load` or
+`session/resume` round trip. Configure it with
+`ACPX_STARTUP_SESSION_RECOVERY_TIMEOUT_SECONDS` (default `30`),
+`ACPX_STARTUP_SESSION_RECOVERY_CONCURRENCY` (default `2`), and
+`ACPX_STARTUP_SESSION_RECOVERY_FAIL_FAST=1`.
+
+Jobs prepare profile and connector state under the router lock, run the
+adapter RPC outside it, then atomically publish the durable status and
+gateway mapping. Different connector processes recover concurrently;
+one connector remains serialized by its stdio mutex. A timed-out restore
+stops that connector before marking the row `recovery_failed`, preventing
+a late stdio response from contaminating a later request. Fail-fast
+records the failed row and prevents daemon readiness.
+
+`startup_recovery_test` proves cross-connector concurrency, timeout
+cleanup and durable failure status, and fail-fast behavior using real
+shell-backed ACP processes. Verified with
+`cargo test --workspace --no-fail-fast`; credentialed ambient tests
+remain intentionally ignored.
+
+## Phase 37: durable lifecycle continuity
+
+The SQLite `sessions` record now persists the explicit pin flag plus
+wall-clock creation and last-activity timestamps. On recovery ACPX derives
+fresh monotonic `Instant` values from those timestamps, preserving idle and
+absolute-TTL age without depending on wall-clock continuity. Rows created by
+older releases retain NULL lifecycle timestamps and conservatively restart
+their TTL clock rather than being reaped immediately after migration.
+
+Session creation, completed proxied work, and explicit pin/unpin operations
+write the durable lifecycle state. Recovery restores pin state before the
+session enters the live registry. Focused tests cover migration defaults,
+persisted pinning, pinned recovery surviving an expired idle TTL, and stale
+recovered activity becoming eligible for safe backend close. Verified with
+`cargo test --workspace --no-fail-fast`; credentialed ambient tests remain
+intentionally ignored.
+
+## Phase 38: strict ACP bridge recovery continuity
+
+Strict `/acp` sessions now retain their virtual bridge id, selected public
+model alias, and accepted adapter configuration in the SQLite `sessions`
+row. Once native startup recovery has restored the gateway session, the
+HTTP bridge rebuilds the tenant-scoped virtual mapping before exposing
+`/acp/rpc` or `/acp/ws`. Model changes, bound adapter option changes, and
+forks update the same durable record; a failed initial durable write closes
+the just-created native session so it cannot become an untracked orphan.
+
+Focused tests cover SQLite migration defaults, bridge binding overwrite
+semantics, virtual mapping restoration, and strict HTTP bridge binding.
+Verified with `cargo test --workspace --no-fail-fast`; credentialed ambient
+tests remain intentionally ignored.
+
+## Phase 39: recovery readiness diagnostics
+
+`GET /health` now reports aggregate durable recovery state without exposing
+session ids, tenant ids, prompts, or stored recovery error text. The endpoint
+is protected by the same bearer-token policy as `/rpc` and `/ws`, reports
+`recovering` while any row is restoring, and returns service unavailable if
+the durable status query itself fails. Recovery error text is flattened and
+capped at 512 bytes before it reaches SQLite. Explicit `session/load` and
+`session/resume` against a restoring row return a retryable error instead of
+starting a duplicate restore.
+
+Focused persistence, transport-auth, and restoring-state tests pass, as do
+`cargo test --workspace --no-fail-fast` and
+`python3 -m unittest tests.bridge_integration.test_stdio_bridge`. Real
+credentialed Claude/Codex and OpenHands suites remain intentionally
+skip-gated.
+
+## Phase 40: black-box daemon recovery protocol
+
+`tests/recovery_integration/test_recovery_protocol.py` is a maintained,
+stdlib-only process harness. It launches daemon A with a recording ACP
+adapter, creates and verifies a durable session row, kills A, launches daemon
+B against the same SQLite database, checks `/health`, verifies the adapter
+observed `session/load`, and sends an ordinary `session/prompt` using the
+original gateway id. The adapter preserves both numeric and string JSON-RPC
+IDs, matching client traffic and startup recovery traffic respectively.
+
+Verified with `python3 -W error::ResourceWarning -m unittest
+tests.recovery_integration.test_recovery_protocol`. WebSocket restart,
+connector outage, and credentialed real-adapter/OpenHands restart cases
+remain tracked separately.
+
+## Phase 41: recovered WebSocket session delivery
+
+`real_binary_recovered_session_accepts_websocket_prompt` extends the
+real-binary recovery coverage to the production `/ws` transport. It seeds a
+recoverable SQLite row, starts `acpx-server` against the recording ACP
+adapter, connects through a real WebSocket upgrade, and prompts the restored
+`gateway-recovered` session. The test asserts both the successful prompt
+response and that adapter-side `session/load` completed before the WebSocket
+`session/prompt`.
+
+Verified with `cargo test -p acpx-server --test provisioning_binary_test
+real_binary_recovered_session_accepts_websocket_prompt -- --nocapture`.
+Connector-outage coverage and credentialed Codex/OpenHands recovery remain
+open.
+
+## Phase 42: connector-outage recovery retry
+
+`real_binary_survives_a_recovery_connector_outage` starts a real daemon from
+a recoverable SQLite row whose recording adapter exits during startup
+`session/load`. With non-fail-fast recovery, `/health` remains ready while
+reporting one failed recovery, and the unavailable gateway id cannot receive a
+prompt. After the adapter outage sentinel is removed, a native client
+`session/load` retries through the connector's bounded crash backoff, restores
+the session, permits `session/prompt`, and changes durable health from
+`failed: 1` to `restored: 1`.
+
+This test also fixed stale recovery diagnostics: successful client-initiated
+`session/load` or `session/resume` now clears `recovery_failed` for an open
+durable row in both direct and shared router dispatch paths. Verified with
+`cargo test -p acpx-core --test session_load_rehydration_test` and `cargo test
+-p acpx-server --test provisioning_binary_test
+real_binary_survives_a_recovery_connector_outage -- --nocapture`.
+
+## Phase 43: headless Codex ACP verification
+
+The Codex live gate now uses explicit noninteractive API-key authentication
+instead of the adapter's interactive `chat-gpt` device flow. It accepts only
+the opt-in `ACPX_LIVE_TEST_CODEX_API_KEY`, passes it as a profile-local
+`CODEX_API_KEY` override, selects the adapter's `api-key` auth method, and
+never writes or logs the credential.
+
+`scripts/openhands-acpx-codex.sh` also prefers an already-supplied
+`CODEX_API_KEY` and otherwise reads the same user's private
+`$HOME/.codex/auth.json` through an overrideable `ACPX_CODEX_AUTH_FILE`.
+This gives an OpenHands-supervised, non-TTY child the API key that the Codex
+CLI already stores locally, without changing ACPX router authentication.
+
+Verified on July 16, 2026 with `codex login status` reporting API-key auth,
+the wrapper key-presence gate, and
+`ACPX_LIVE_TEST_AMBIENT=1 ACPX_LIVE_TEST_CODEX_API_KEY=<private-key> cargo
+test -p acpx-server --test real_ambient_multi_agent_test
+ambient_codex_only_conversation_conforms_to_generated_schema -- --ignored
+--nocapture` (passed in 13.93 seconds). OpenHands live restart recovery
+remains externally gated by a running agent-server/session API key.

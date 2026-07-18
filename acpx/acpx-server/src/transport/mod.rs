@@ -1,6 +1,7 @@
 //! Transport implementations. Phase 1: `stdio` only. Phase 2 step 11 adds
 //! `http`/`ws` alongside it -- see `04-phased-plan.md`.
 
+pub mod admin;
 pub mod http;
 pub mod live;
 pub mod stdio;
@@ -9,4 +10,16 @@ pub mod ws;
 // Re-exported so `main.rs` can call `transport::serve(...)` / build a
 // `transport::SharedRouter` without reaching into `transport::http`
 // directly.
-pub use http::{serve, SharedRouter};
+// `serve_on_with_bridge` has no direct caller in this crate's own binary
+// any more (`main.rs` calls the tenant-token-aware variant below), but
+// stays re-exported/`#[allow(unused_imports)]`-silenced since every
+// integration test that exercises it does so via its own separately
+// compiled `#[path]`-included copy of `http.rs`, not through this module.
+#[allow(unused_imports)]
+pub use http::{serve_on_with_bridge, serve_on_with_bridge_and_tenant_tokens, SharedRouter};
+// `http::serve` (bind-then-serve convenience wrapper) is intentionally not
+// re-exported here: `main.rs` binds the listener itself via `serve_on` (see
+// `config.rs`'s `ACPX_HTTP_BIND=off` doc comment for why), and every
+// integration test that calls `serve` does so against its own `#[path]`-
+// included copy of `transport/http.rs` (see `tests/auth_test.rs`'s doc
+// comment), not through this re-export.

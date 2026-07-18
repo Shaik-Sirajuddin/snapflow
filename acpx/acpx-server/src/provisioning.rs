@@ -143,6 +143,18 @@ pub async fn apply(
         summary.providers += 1;
     }
 
+    // Names this exact `apply` call has already created, distinct from
+    // names that already existed *before* this call ran (e.g. loaded by
+    // `Router::enable_durable_config` from a prior boot's persisted
+    // state). A collision within the former set is a genuine duplicate
+    // in the provisioning file itself and must still fail startup (see
+    // `real_binary_refuses_to_start_with_an_invalid_provisioning_file`);
+    // a collision that is *not* in this set is instead treated as a
+    // declarative re-apply and turned into an update.
+    let mut applied_mcp_servers: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut applied_profiles: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for entry in file.mcp_servers.into_iter() {
         let name = entry
             .get("name")
@@ -155,13 +167,38 @@ pub async fn apply(
             "method": "mcp_servers/create",
             "params": entry,
         });
-        router
-            .dispatch(request)
-            .await
-            .map_err(|source| ProvisioningError::McpServer {
-                name: name.clone(),
-                source,
-            })?;
+        match router.dispatch(request.clone()).await {
+            Ok(_) => {
+                applied_mcp_servers.insert(name.clone());
+            }
+            // Declarative re-apply: with `durable_secret_and_configuration_
+            // store` (`Router::enable_durable_config`), a server that
+            // already persisted this exact mcp server on a prior boot
+            // loads it back *before* this provisioning file runs -- so a
+            // second/later boot with the same file must update, not
+            // fail, on a name that now already exists. Without durable
+            // config this branch is unreachable in practice (a fresh
+            // in-memory router never already has the name), so this is
+            // strictly additive. A name this *same* `apply` call already
+            // created is a real duplicate-in-file, not a pre-existing
+            // entry -- still a hard error, not retried.
+            Err(acpx_core::router::RouterError::McpServer(
+                acpx_core::mcp_servers::McpServerStoreError::AlreadyExists(_),
+            )) if !applied_mcp_servers.contains(&name) => {
+                let mut update_request = request;
+                update_request["method"] = serde_json::json!("mcp_servers/update");
+                router.dispatch(update_request).await.map_err(|source| {
+                    ProvisioningError::McpServer {
+                        name: name.clone(),
+                        source,
+                    }
+                })?;
+                applied_mcp_servers.insert(name.clone());
+            }
+            Err(source) => {
+                return Err(ProvisioningError::McpServer { name, source });
+            }
+        }
         summary.mcp_servers += 1;
     }
 
@@ -197,13 +234,30 @@ pub async fn apply(
             "method": "profiles/create",
             "params": params,
         });
-        router
-            .dispatch(request)
-            .await
-            .map_err(|source| ProvisioningError::Profile {
-                name: name.clone(),
-                source,
-            })?;
+        match router.dispatch(request.clone()).await {
+            Ok(_) => {
+                applied_profiles.insert(name.clone());
+            }
+            // Same declarative-re-apply reasoning as the mcp_servers loop
+            // above -- a name this same `apply` call already created is
+            // still a hard error, not retried.
+            Err(acpx_core::router::RouterError::Profile(
+                acpx_core::profile::ProfileStoreError::AlreadyExists(_),
+            )) if !applied_profiles.contains(&name) => {
+                let mut update_request = request;
+                update_request["method"] = serde_json::json!("profiles/update");
+                router.dispatch(update_request).await.map_err(|source| {
+                    ProvisioningError::Profile {
+                        name: name.clone(),
+                        source,
+                    }
+                })?;
+                applied_profiles.insert(name.clone());
+            }
+            Err(source) => {
+                return Err(ProvisioningError::Profile { name, source });
+            }
+        }
         summary.profiles += 1;
     }
 
@@ -313,8 +367,16 @@ done
             serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "profiles/list", "params": {}});
         let response = router.dispatch(list).await.unwrap();
         let profiles = response["result"]["profiles"].as_array().unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert!(profiles[0].get("key_ref").is_some_and(|v| !v.is_null()));
+        // `profiles/list` also includes auto-seeded profiles
+        // (`ensure_default_profiles_seeded`, see
+        // `acpx-core/tests/default_profile_seeding_test.rs`) alongside
+        // the provisioned "work" one, so find it by name rather than
+        // asserting the list's exact length.
+        let work = profiles
+            .iter()
+            .find(|p| p["name"] == "work")
+            .expect("provisioned \"work\" profile listed");
+        assert!(work.get("key_ref").is_some_and(|v| !v.is_null()));
     }
 
     #[tokio::test]

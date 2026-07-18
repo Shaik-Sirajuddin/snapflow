@@ -18,7 +18,10 @@
 //! absent differs.
 
 use acpx_conductor::SpawnSpec;
-use acpx_core::persistence::PersistenceStore;
+use acpx_core::persistence::{
+    sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
+    PersistenceStore,
+};
 use acpx_core::router::{Router, RouterError};
 use serde_json::json;
 use std::time::Duration;
@@ -212,4 +215,38 @@ async fn session_load_without_persistence_configured_fails_clearly() {
         .await
         .expect_err("session/load with no persistence and an unknown id must fail");
     assert!(matches!(err, RouterError::SessionNotPersisted(id) if id == "never-existed"));
+}
+
+#[tokio::test]
+async fn session_load_returns_retryable_error_while_durable_recovery_is_in_progress() {
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    store
+        .record_session_with_recovery(
+            "gateway-restoring",
+            "stand-in-agent",
+            "backend-restoring",
+            None,
+            "2026-07-16T00:00:00Z",
+            "default",
+            RecoveryMetadata {
+                cwd: Some("/tmp".to_string()),
+                recovery_params: Some(json!({"cwd": "/tmp"})),
+                status: RecoveryStatus::Restoring,
+                recovery_method: RecoveryMethod::Load,
+                ..RecoveryMetadata::default()
+            },
+        )
+        .await
+        .expect("seed restoring row");
+
+    let mut router = Router::new("stand-in-agent").with_persistence(store);
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let err = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/load",
+            "params": {"sessionId": "gateway-restoring", "cwd": "/tmp"}
+        }))
+        .await
+        .expect_err("restoring sessions must not start a duplicate recovery");
+    assert!(matches!(err, RouterError::SessionRestoring(id) if id == "gateway-restoring"));
 }

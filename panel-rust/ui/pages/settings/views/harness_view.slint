@@ -1,0 +1,95 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+
+// Harness left-tab view -- phase 1 shell. Re-hosts the background-session
+// toggles that were the only "Threads"-shaped state already in
+// `components/settings_sheet.slint` (background-default + this chat's own
+// override), unchanged. Per the settings-pane-redesign plan's resolved
+// open question, the rest of `HarnessSettings` (notifications,
+// notify-on-input-required, auto-resume-on-rate-limit-reset) is a later
+// phase's UI-only addition -- this view intentionally does not add those
+// yet, since phase 1 is shell-only (no new fields).
+export component HarnessView inherits Rectangle {
+    in-out property <bool> background-default: false;
+    in-out property <bool> background-override-set: false;
+    in-out property <bool> background-override: false;
+
+    background: transparent;
+
+    VerticalLayout {
+        spacing: Metrics.space-6;
+
+        Text { text: "Harness"; color: Theme.text-primary; font-size: 16px * Theme.font-scale; font-weight: 700; }
+
+        Rectangle {
+            height: 28px;
+            background: Theme.bg-sidebar;
+            border-radius: Theme.radius-sm;
+            TouchArea {
+                accessible-role: button;
+                accessible-label: "Toggle background session default";
+                accessible-action-default => { root.background-default = !root.background-default; }
+                clicked => { root.background-default = !root.background-default; }
+            }
+            Text {
+                text: root.background-default ? "Background sessions: enabled" : "Background sessions: disabled";
+                color: Theme.text-primary;
+                x: Metrics.space-4;
+                vertical-alignment: center;
+                font-size: 11px * Theme.font-scale;
+            }
+        }
+        Rectangle {
+            height: 28px;
+            background: Theme.bg-sidebar;
+            border-radius: Theme.radius-sm;
+            TouchArea {
+                accessible-role: button;
+                accessible-label: "Toggle background session override";
+                accessible-action-default => {
+                    root.background-override-set = !root.background-override-set;
+                    if (root.background-override-set) {
+                        root.background-override = root.background-default;
+                    }
+                }
+                clicked => {
+                    root.background-override-set = !root.background-override-set;
+                    if (root.background-override-set) {
+                        root.background-override = root.background-default;
+                    }
+                }
+            }
+            Text {
+                text: root.background-override-set
+                    ? "This chat: " + (root.background-override ? "background" : "foreground")
+                    : "This chat: use default";
+                color: Theme.text-primary;
+                x: Metrics.space-4;
+                vertical-alignment: center;
+                font-size: 11px * Theme.font-scale;
+            }
+        }
+        if root.background-override-set : Rectangle {
+            height: 24px;
+            background: Theme.bg-card;
+            border-color: Theme.border-default;
+            border-width: 1px;
+            border-radius: Theme.radius-sm;
+            TouchArea {
+                accessible-role: button;
+                accessible-label: "Toggle selected chat background session";
+                accessible-action-default => {
+                    root.background-override = !root.background-override;
+                }
+                clicked => { root.background-override = !root.background-override; }
+            }
+            Text {
+                text: root.background-override ? "Set this chat foreground" : "Set this chat background";
+                color: Theme.text-secondary;
+                x: Metrics.space-4;
+                vertical-alignment: center;
+                font-size: 10px * Theme.font-scale;
+            }
+        }
+    }
+}

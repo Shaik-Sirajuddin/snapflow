@@ -1,0 +1,66 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+
+// Layer 3 (base) -- the repeated "label + optional hint on the left,
+// one control on the right" row shape that `components/settings_sheet.slint`
+// hand-rolled per section (MCP server rows, agent rows, recoverable-session
+// rows all share this silhouette but never a common component). Generic on
+// purpose: no settings-domain knowledge lives here, only the label/hint/
+// control layout, so `ui/pages/settings/views/*` (and anything else that
+// wants a labeled row with a trailing control) can reuse it rather than
+// re-hand-rolling the same `Rectangle` + `HorizontalLayout` shape again.
+// The control itself is caller-supplied via `@children` -- this component
+// has no opinion on whether it's a `Button`, a toggle, a text field, or
+// several controls side by side.
+export component SettingsRow inherits Rectangle {
+    in property <string> label;
+    in property <string> hint: "";
+    in property <length> row-height: 30px;
+    // Per-call-site font-family override for the label/hint text --
+    // several settings_sheet.slint rows put the monospace treatment on
+    // whichever of the two held an identifier-shaped value (an MCP
+    // server's name, an agent's status string), never consistently on
+    // one or the other, so this stays a plain override rather than a
+    // fixed convention.
+    in property <string> label-font-family: Theme.font-sans;
+    in property <string> hint-font-family: Theme.font-sans;
+
+    height: root.hint == "" ? root.row-height : root.row-height + 12px;
+    background: Theme.bg-sidebar;
+    border-radius: Theme.radius-sm;
+
+    HorizontalLayout {
+        padding-left: Metrics.space-4;
+        padding-right: Metrics.space-4;
+        spacing: Metrics.space-4;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: Metrics.space-1;
+            Text {
+                text: root.label;
+                color: Theme.text-primary;
+                font-family: root.label-font-family;
+                font-size: 11px * Theme.font-scale;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            if root.hint != "" : Text {
+                text: root.hint;
+                color: Theme.text-muted;
+                font-family: root.hint-font-family;
+                font-size: 9px * Theme.font-scale;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        HorizontalLayout {
+            horizontal-stretch: 0;
+            alignment: end;
+            spacing: Metrics.space-2;
+            @children
+        }
+    }
+}

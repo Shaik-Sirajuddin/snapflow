@@ -8,9 +8,13 @@
 //! (see [`install::install`]). See
 //! `memory/acpx/gen/plans/acp-gateway-daemon/04-phased-plan.md` step 18-19.
 
+pub mod capabilities;
+pub mod capability_cache;
 pub mod index;
 pub mod install;
 
+pub use capabilities::{AdapterCapabilities, ConfigOption, SelectOption};
+pub use capability_cache::{CapabilityCache, CapabilityCacheKey};
 pub use index::{
     fallback_registry, fetch_registry, fetch_registry_or_fallback, Agent, BinaryDist, Distribution,
     NpxDist, Registry, RegistryError, REGISTRY_URL,

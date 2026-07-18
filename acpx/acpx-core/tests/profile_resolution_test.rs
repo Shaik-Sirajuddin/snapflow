@@ -89,7 +89,13 @@ async fn profiles_crud_round_trips_via_dispatch() {
         .dispatch(json!({"jsonrpc": "2.0", "id": 3, "method": "profiles/list", "params": {}}))
         .await
         .expect("profiles/list");
-    assert_eq!(list["result"]["profiles"].as_array().unwrap().len(), 1);
+    // As of `ensure_default_profiles_seeded`, `profiles/list` also
+    // includes one auto-seeded profile per `Installed` registry agent
+    // (claude-acp/codex-acp/gemini in this environment -- see
+    // `default_profile_seeding_test.rs`), so this asserts the explicit
+    // "work" profile specifically rather than the list's total length.
+    let profiles = list["result"]["profiles"].as_array().unwrap();
+    assert_eq!(profiles.iter().filter(|p| p["name"] == "work").count(), 1);
 
     let update = router
         .dispatch(json!({

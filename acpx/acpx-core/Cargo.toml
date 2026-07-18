@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "acpx gateway brain: session registry, profiles, providers, router, persistence"
 
+[features]
+default = []
+# Marker feature consumed by acpx-server. Keeping recovery code in core lets
+# embedded callers opt in without forcing daemon startup policy on them.
+startup-session-recovery = []
+
 [dependencies]
 acpx-proto = { workspace = true }
 acpx-conductor = { workspace = true }
@@ -23,6 +29,13 @@ reqwest = { workspace = true }
 # spawn_blocking) was picked over sqlx here. `bundled` vendors sqlite itself
 # so no system libsqlite3 is required.
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Encrypted-at-rest secret storage (`durable_secret_and_configuration_store`,
+# `acp-gateway-daemon`). AES-256-GCM: a real AEAD cipher, not a hand-rolled
+# or base64 stand-in -- see `src/keystore.rs`'s `MasterKeyring` doc comment
+# for the local-file key-management tier this backs (with a clear seam to
+# swap in a real OS-keychain/KMS provider later without changing callers).
+aes-gcm = "0.10"
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true }

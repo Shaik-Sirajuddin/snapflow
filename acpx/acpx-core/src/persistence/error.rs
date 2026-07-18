@@ -23,4 +23,13 @@ pub enum PersistenceError {
 
     #[error("no session found for gateway_session_id {0:?}")]
     SessionNotFound(String),
+
+    #[error("custom agent {0} already exists")]
+    CustomAgentAlreadyExists(String),
+
+    #[error("custom agent {0} was not found")]
+    CustomAgentNotFound(String),
+
+    #[error("agent enablement value {0} is invalid (expected 0 or 1)")]
+    InvalidAgentEnablement(i64),
 }

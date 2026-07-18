@@ -51,6 +51,25 @@
 //! not just `session/new` (unlike `X-Acpx-Profile`, which only matters
 //! for session creation) -- see that plan's `01-architecture.md` for why
 //! this is a header rather than an `_acpx.tenant` request field.
+//!
+//! **Identity-bound tenant auth (`acpx-tenant-isolation` hardening,
+//! `tenant_identity_boundary`).** The header-only scheme above is
+//! deliberately still supported unauthenticated (dev/loopback/cooperative
+//! deployments), but a hardened remote deployment can now configure
+//! `ACPX_AUTH_TENANT_TOKENS` (`tenant_id=token,tenant_id=token,...`) to
+//! bind specific bearer tokens to specific tenants server-side. When a
+//! request's `Authorization: Bearer <token>` matches one of these
+//! tenant-bound tokens, [`AuthConfig::authorize_tenant`] returns
+//! [`AuthOutcome::Bound`] and the tenant is taken from *that token*, not
+//! the caller-supplied `X-Acpx-Tenant` header -- an authenticated caller
+//! cannot claim a tenant its token was not issued for. If the header is
+//! present anyway and names a *different* tenant than the bound token,
+//! the request is rejected outright (`403`, [`TenantAuthError::Mismatch`])
+//! rather than silently overridden either way, so a misconfigured client
+//! fails loudly instead of landing in the wrong tenant's data. A request
+//! authorized only by the plain `ACPX_AUTH_TOKEN` (or with auth disabled
+//! entirely) falls back to the pre-existing self-declared header
+//! behavior unchanged -- tenant-bound tokens are strictly additive.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -64,6 +83,11 @@ use tokio::sync::Mutex;
 
 use acpx_core::router::{dispatch_shared_for_tenant, Router, RouterError};
 use acpx_core::TenantId;
+
+#[path = "acp_bridge.rs"]
+pub(crate) mod acp_bridge;
+
+use self::acp_bridge::BridgeRuntime;
 
 /// Shared, lockable handle to the one `Router` instance serving every
 /// concurrent HTTP/WS client. The `Mutex` here is intentionally *not* held
@@ -79,38 +103,142 @@ pub type SharedRouter = Arc<Mutex<Router>>;
 /// Optional bearer token required on every `POST /rpc` request and `GET
 /// /ws` upgrade. `None` (the default -- unset `ACPX_AUTH_TOKEN`) disables
 /// auth entirely, preserving this workspace's pre-existing unauthenticated
-/// behavior byte-for-byte. Cheaply `Clone`-able (`Arc<str>` inside) so it
+/// behavior byte-for-byte. Cheaply `Clone`-able (`Arc<...>` inside) so it
 /// can ride alongside `SharedRouter` in axum's per-request `State`.
 #[derive(Clone, Default)]
 pub struct AuthConfig {
     token: Option<Arc<str>>,
+    /// Tenant-bound tokens (`ACPX_AUTH_TENANT_TOKENS`), see this module's
+    /// doc comment. Empty by default -- every pre-existing caller of
+    /// [`AuthConfig::new`] gets exactly the old behavior.
+    tenant_tokens: Arc<Vec<(Arc<str>, TenantId)>>,
+    /// Optional tenant namespace allowlist (`ACPX_TENANT_ALLOWLIST`,
+    /// `tenant_namespace_governance` hardening item, `acpx-tenant-
+    /// isolation` plan). `None` (the default) keeps every pre-existing
+    /// deployment's "any caller-declared tenant string is a valid
+    /// namespace" behavior unchanged. `Some(set)` rejects (`403`) any
+    /// resolved tenant not in the set -- checked *after* auth/binding
+    /// resolution in [`resolve_authorized_tenant`], so it applies
+    /// equally to a self-declared header and an authenticated
+    /// tenant-bound token.
+    tenant_allowlist: Option<Arc<std::collections::HashSet<String>>>,
+}
+
+/// Result of resolving a request's authentication, distinguishing "no
+/// token was required/presented at all" from "a token was presented that
+/// happens to also bind a specific tenant" -- callers need this
+/// distinction to decide whether the caller-supplied `X-Acpx-Tenant`
+/// header is still authoritative (it is, for the first two cases) or
+/// must be cross-checked against an authenticated identity (the third).
+pub(crate) enum AuthOutcome {
+    /// No token is configured at all; auth is disabled.
+    Open,
+    /// A token was presented and matched the single global
+    /// `ACPX_AUTH_TOKEN`, which carries no tenant binding.
+    Global,
+    /// A token was presented and matched one of `ACPX_AUTH_TENANT_TOKENS`,
+    /// which authoritatively binds this request to the given tenant.
+    Bound(TenantId),
+    /// No configured token matched (or none was presented while at least
+    /// one is configured).
+    Unauthorized,
 }
 
 impl AuthConfig {
+    /// Not called from this crate's own `main.rs` any more (it always
+    /// configures tenant tokens via [`AuthConfig::with_tenant_tokens`],
+    /// even when the list is empty) -- kept for every integration test's
+    /// separately compiled `#[path]`-included copy of this file, and as
+    /// the simple entry point for anyone embedding this transport
+    /// without tenant-bound tokens. See `serve_on_with_bridge`'s doc
+    /// comment for the same "compiled elsewhere" caveat.
+    #[allow(dead_code)]
     pub fn new(token: Option<String>) -> Self {
         Self {
             token: token.map(|t| t.into()),
+            tenant_tokens: Arc::new(Vec::new()),
+            tenant_allowlist: None,
+        }
+    }
+
+    /// Same as [`AuthConfig::new`], additionally configuring tenant-bound
+    /// tokens (`ACPX_AUTH_TENANT_TOKENS`) -- see this module's doc
+    /// comment for the identity-bound tenant auth contract.
+    pub fn with_tenant_tokens(
+        token: Option<String>,
+        tenant_tokens: Vec<(String, TenantId)>,
+    ) -> Self {
+        Self {
+            token: token.map(|t| t.into()),
+            tenant_tokens: Arc::new(
+                tenant_tokens
+                    .into_iter()
+                    .map(|(t, tenant)| (Arc::<str>::from(t), tenant))
+                    .collect(),
+            ),
+            tenant_allowlist: None,
+        }
+    }
+
+    /// Attaches a tenant namespace allowlist (`ACPX_TENANT_ALLOWLIST`) to
+    /// an already-constructed config. Kept as a separate builder step
+    /// (rather than another constructor parameter) since it is
+    /// orthogonal to *how* a request authenticates -- both
+    /// [`AuthConfig::new`] and [`AuthConfig::with_tenant_tokens`] deployments
+    /// may or may not want it.
+    pub fn with_tenant_allowlist(
+        mut self,
+        allowlist: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.tenant_allowlist = allowlist.map(Arc::new);
+        self
+    }
+
+    fn tenant_allowed(&self, tenant: &TenantId) -> bool {
+        match &self.tenant_allowlist {
+            None => true,
+            Some(allowlist) => allowlist.contains(&tenant.0),
         }
     }
 
     /// True if this request's headers carry a valid bearer token, or auth
     /// is disabled entirely. `headers` missing the header, or carrying a
     /// non-`Bearer` / mismatched value, is unauthorized whenever a token
-    /// is configured.
+    /// is configured. Kept for call sites (e.g. `health_handler`) that
+    /// only need a yes/no gate and never resolve a tenant identity.
     pub(crate) fn authorize(&self, headers: &HeaderMap) -> bool {
-        let Some(expected) = &self.token else {
-            return true; // auth disabled
-        };
+        !matches!(self.authorize_tenant(headers), AuthOutcome::Unauthorized)
+    }
+
+    /// Resolve this request's [`AuthOutcome`] -- see that type's doc
+    /// comment for what each variant means. Checks tenant-bound tokens
+    /// first (a token that happens to equal both the global token and a
+    /// tenant-bound token, which would only happen via operator
+    /// misconfiguration, resolves to the more specific `Bound` binding).
+    pub(crate) fn authorize_tenant(&self, headers: &HeaderMap) -> AuthOutcome {
+        if self.token.is_none() && self.tenant_tokens.is_empty() {
+            return AuthOutcome::Open;
+        }
         let Some(header_value) = headers.get(axum::http::header::AUTHORIZATION) else {
-            return false;
+            return AuthOutcome::Unauthorized;
         };
         let Ok(header_value) = header_value.to_str() else {
-            return false;
+            return AuthOutcome::Unauthorized;
         };
         let Some(presented) = header_value.strip_prefix("Bearer ") else {
-            return false;
+            return AuthOutcome::Unauthorized;
         };
-        tokens_match(presented, expected)
+        for (candidate, tenant) in self.tenant_tokens.iter() {
+            if tokens_match(presented, candidate) {
+                return AuthOutcome::Bound(tenant.clone());
+            }
+        }
+        if let Some(expected) = &self.token {
+            if tokens_match(presented, expected) {
+                return AuthOutcome::Global;
+            }
+        }
+        AuthOutcome::Unauthorized
     }
 }
 
@@ -144,14 +272,12 @@ fn tokens_match(presented: &str, expected: &str) -> bool {
 pub struct AppState {
     pub router: SharedRouter,
     pub auth: AuthConfig,
-}
-
-async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !state.auth.authorize(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let agent_id = state.router.lock().await.default_agent_id().to_owned();
-    Json(serde_json::json!({ "status": "ok", "agentId": agent_id })).into_response()
+    /// `None` means `/acp/*` is intentionally not mounted. This is a
+    /// feature gate, not an authorization check.
+    pub bridge: Option<Arc<acpx_bridge::BridgeConfig>>,
+    /// Virtual-session state exists only alongside an enabled bridge
+    /// policy. It is shared by `/acp/rpc` and `/acp/ws`.
+    pub bridge_runtime: Option<Arc<BridgeRuntime>>,
 }
 
 /// Header carrying an explicit profile selection, highest precedence per
@@ -179,6 +305,48 @@ fn resolve_tenant(headers: &HeaderMap) -> TenantId {
         .unwrap_or_default()
 }
 
+/// Why a request was rejected while resolving its authorized tenant, so
+/// callers can pick the right HTTP status / JSON-RPC error code (`401`
+/// for no valid credential at all vs. `403` for a credential that is
+/// valid but authenticates a *different* tenant than the one claimed).
+pub(crate) enum TenantAuthError {
+    Unauthorized,
+    Mismatch,
+    /// Resolved tenant is not present in the configured
+    /// `ACPX_TENANT_ALLOWLIST`.
+    NotAllowed,
+}
+
+/// Combines [`AuthConfig::authorize_tenant`] with the pre-existing
+/// self-declared `X-Acpx-Tenant` header, implementing the precedence
+/// described in this module's "Identity-bound tenant auth" doc comment:
+/// a tenant-bound token is authoritative and rejects a conflicting
+/// header outright; every other outcome (no auth configured, or auth
+/// via the plain shared token) keeps the pre-existing cooperative,
+/// header-only behavior unchanged.
+pub(crate) fn resolve_authorized_tenant(
+    auth: &AuthConfig,
+    headers: &HeaderMap,
+) -> Result<TenantId, TenantAuthError> {
+    let tenant = match auth.authorize_tenant(headers) {
+        AuthOutcome::Unauthorized => Err(TenantAuthError::Unauthorized),
+        AuthOutcome::Open | AuthOutcome::Global => Ok(resolve_tenant(headers)),
+        AuthOutcome::Bound(tenant) => {
+            if let Some(claimed) = headers.get(TENANT_HEADER).and_then(|v| v.to_str().ok()) {
+                if TenantId::from(claimed) != tenant {
+                    return Err(TenantAuthError::Mismatch);
+                }
+            }
+            Ok(tenant)
+        }
+    }?;
+    if auth.tenant_allowed(&tenant) {
+        Ok(tenant)
+    } else {
+        Err(TenantAuthError::NotAllowed)
+    }
+}
+
 /// Start the HTTP/WS transport, serving `POST /rpc` and `GET /ws` against
 /// the given shared `Router` until the listener errors or the task is
 /// dropped/cancelled. Intended to be spawned as its own task (or awaited
@@ -188,26 +356,146 @@ fn resolve_tenant(headers: &HeaderMap) -> TenantId {
 /// behavior every test in this workspace already relies on) disables
 /// auth; `Some(token)` requires `Authorization: Bearer <token>` on every
 /// `POST /rpc` and the `GET /ws` upgrade. See this module's doc comment.
+/// Kept as a small bind-then-serve convenience wrapper around
+/// [`serve_on`] -- not called from this crate's own `main.rs` any more
+/// (see `transport/mod.rs`'s doc comment), but every integration test in
+/// this crate that exercises the HTTP/WS transport calls it against its
+/// own `#[path]`-included physical copy of this same file (`tests/
+/// auth_test.rs` et al.), where it very much is used; `#[allow(dead_code)]`
+/// only silences the *this-crate's-own-`acpx-server`-binary* lint, which
+/// has no visibility into those separately-compiled test copies.
+#[allow(dead_code)]
 pub async fn serve(
     router: SharedRouter,
     bind_addr: SocketAddr,
     auth_token: Option<String>,
 ) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    serve_on(listener, router, auth_token).await
+}
+
+/// Same as [`serve`], but against an already-bound [`tokio::net::TcpListener`]
+/// -- lets `main.rs` attempt the bind itself first (so a bind failure, e.g.
+/// the default port already taken by another concurrently-running
+/// `acpx-server` instance, can be handled as a non-fatal "run stdio only"
+/// fallback rather than propagating out of this function and killing the
+/// whole process, stdio transport included -- see `config.rs`'s
+/// `ACPX_HTTP_BIND=off` doc comment for the full rationale).
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    router: SharedRouter,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
+    serve_on_with_bridge(listener, router, auth_token, None).await
+}
+
+/// Same as [`serve_on`], with an explicitly enabled strict-ACP bridge.
+/// Kept separate so all pre-existing callers/tests retain their legacy
+/// `/rpc` + `/ws` surface without constructing bridge configuration.
+pub async fn serve_on_with_bridge(
+    listener: tokio::net::TcpListener,
+    router: SharedRouter,
+    auth_token: Option<String>,
+    bridge: Option<acpx_bridge::BridgeConfig>,
+) -> anyhow::Result<()> {
+    serve_on_with_bridge_and_tenant_tokens(listener, router, auth_token, Vec::new(), None, bridge)
+        .await
+}
+
+/// Same as [`serve_on_with_bridge`], additionally configuring
+/// identity-bound tenant tokens (`ACPX_AUTH_TENANT_TOKENS`) via
+/// [`AuthConfig::with_tenant_tokens`] -- see this module's doc comment
+/// for the full contract. Used by `main.rs` once tenant tokens are
+/// configured; every pre-existing caller of [`serve_on_with_bridge`]
+/// (and its own callers, `serve`/`serve_on`) gets an empty tenant-token
+/// list, preserving prior behavior byte-for-byte.
+pub async fn serve_on_with_bridge_and_tenant_tokens(
+    listener: tokio::net::TcpListener,
+    router: SharedRouter,
+    auth_token: Option<String>,
+    tenant_tokens: Vec<(String, TenantId)>,
+    tenant_allowlist: Option<std::collections::HashSet<String>>,
+    bridge: Option<acpx_bridge::BridgeConfig>,
+) -> anyhow::Result<()> {
     let state = AppState {
         router,
-        auth: AuthConfig::new(auth_token),
+        auth: AuthConfig::with_tenant_tokens(auth_token, tenant_tokens)
+            .with_tenant_allowlist(tenant_allowlist),
+        bridge: bridge.map(Arc::new),
+        bridge_runtime: None,
     };
-    let auth_enabled = state.auth.token.is_some();
-    let app = axum::Router::new()
-        .route("/health", get(health))
-        .route("/rpc", post(rpc_handler))
-        .route("/ws", get(super::ws::ws_handler))
-        .with_state(state);
+    let state = AppState {
+        bridge_runtime: state
+            .bridge
+            .as_ref()
+            .map(|config| Arc::new(BridgeRuntime::new(Arc::clone(config)))),
+        ..state
+    };
+    if let Some(runtime) = &state.bridge_runtime {
+        if let Some(store) = state.router.lock().await.persistence_store() {
+            let restored = runtime
+                .restore_recovered_sessions(&store)
+                .await
+                .map_err(anyhow::Error::from)?;
+            if restored != 0 {
+                tracing::info!(restored, "restored strict ACP bridge session mappings");
+            }
+        }
 
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        // **`virtual_and_pinned_resource_limits`.** A virtual bridge
+        // session that never received a first prompt (`Unbound` forever
+        // -- a client that called the bridge's `session/new` and then
+        // simply vanished) has no other lifecycle owner: it never became
+        // a real native gateway session, so `Router::reap_expired_
+        // sessions`'s TTL reaper never sees it either. Reuses the same
+        // deployment-configured `unbound_bridge_session_ttl` the native
+        // reaper's doc comment already names for this purpose (see
+        // `crate::config::ServerConfig`'s field of the same name) --
+        // one operator-facing knob, not two independently-tuned TTLs.
+        // Ticks at a quarter of the TTL (floored at 10s) so an
+        // `Unbound` session is reaped reasonably close to its TTL
+        // without a separate configuration knob for this cadence.
+        let ttl = state
+            .router
+            .lock()
+            .await
+            .lifecycle_config()
+            .unbound_bridge_session_ttl;
+        let tick_interval = (ttl / 4).max(std::time::Duration::from_secs(10));
+        let bridge_runtime = Arc::clone(runtime);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tick_interval);
+            ticker.tick().await; // Establish interval without delaying the first full tick.
+            loop {
+                ticker.tick().await;
+                let removed = bridge_runtime
+                    .sessions
+                    .reap_stale_unbound(std::time::Instant::now(), ttl);
+                if removed != 0 {
+                    tracing::info!(removed, "reaped stale unbound virtual bridge sessions");
+                }
+            }
+        });
+    }
+    let auth_enabled = state.auth.token.is_some();
+    let bridge_enabled = state.bridge.is_some();
+    let mut app = axum::Router::new()
+        .route("/health", get(health_handler))
+        .route("/rpc", post(rpc_handler))
+        .route("/ws", get(super::ws::ws_handler));
+    if bridge_enabled {
+        app = app
+            .route("/acp/agents", get(acp_agents_handler))
+            .route("/acp/models", get(acp_models_handler))
+            .route("/acp/rpc", post(acp_rpc_handler))
+            .route("/acp/ws", get(super::ws::acp_ws_handler));
+    }
+    let app = app.with_state(state);
+
     tracing::info!(
-        %bind_addr,
+        bind_addr = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
         auth_enabled,
+        bridge_enabled,
         "acpx-server HTTP/WS transport listening (no TLS -- see 05-open-risks.md; \
          set ACPX_AUTH_TOKEN for bearer-token auth)"
     );
@@ -215,22 +503,169 @@ pub async fn serve(
     Ok(())
 }
 
+/// Bounded readiness surface. It intentionally exposes aggregate recovery
+/// counts only; session identifiers and recovery error text stay private.
+async fn health_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let store = state.router.lock().await.persistence_store();
+    let Some(store) = store else {
+        return Json(serde_json::json!({
+            "status": "ready",
+            "persistenceEnabled": false,
+            "recovery": {
+                "active": 0,
+                "restoring": 0,
+                "restored": 0,
+                "failed": 0,
+                "closed": 0,
+            }
+        }))
+        .into_response();
+    };
+    match store.recovery_status_counts().await {
+        Ok(counts) => Json(serde_json::json!({
+            "status": if counts.restoring == 0 { "ready" } else { "recovering" },
+            "persistenceEnabled": true,
+            "recovery": {
+                "active": counts.active,
+                "restoring": counts.restoring,
+                "restored": counts.restored,
+                "failed": counts.recovery_failed,
+                "closed": counts.closed,
+            }
+        }))
+        .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "failed to read recovery health diagnostics");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
 async fn rpc_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut request): Json<serde_json::Value>,
 ) -> Response {
-    if !state.auth.authorize(&headers) {
-        return unauthorized_response(&request);
-    }
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return unauthorized_response(&request),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return tenant_mismatch_response(&request)
+        }
+    };
     inject_profile_header(&headers, &mut request);
-    let tenant_id = resolve_tenant(&headers);
     let response =
         match dispatch_shared_for_tenant(&state.router, &tenant_id, request.clone()).await {
             Ok(response) => response,
             Err(err) => json_rpc_error(&request, err),
         };
     Json(response).into_response()
+}
+
+/// Standard-ACP HTTP bridge. Unlike native `/rpc`, this route has no
+/// profile header injection and rejects `_acpx` request fields outright.
+async fn acp_rpc_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return unauthorized_response(&request),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return tenant_mismatch_response(&request)
+        }
+    };
+    let Some(runtime) = &state.bridge_runtime else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match acp_bridge::dispatch(&state.router, runtime, &tenant_id, request.clone()).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => Json(bridge_json_rpc_error(&request, error)).into_response(),
+    }
+}
+
+/// Secret-safe view of the bridge-enabled adapters, derived from ACPX's own
+/// native `agents/list` implementation rather than duplicating registry or
+/// install detection in the HTTP transport.
+async fn acp_agents_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(bridge) = &state.bridge else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
+    };
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "acp-bridge-agents",
+        "method": "agents/list",
+        "params": {}
+    });
+    let response =
+        match dispatch_shared_for_tenant(&state.router, &tenant_id, request.clone()).await {
+            Ok(response) => response,
+            Err(err) => return Json(json_rpc_error(&request, err)).into_response(),
+        };
+    let allowed = bridge.agent_ids();
+    let agents = response
+        .get("result")
+        .and_then(|result| result.get("agents"))
+        .and_then(serde_json::Value::as_array)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter(|agent| {
+                    agent
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| allowed.contains(id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Json(serde_json::json!({ "agents": agents })).into_response()
+}
+
+/// Public model aliases are bridge policy filtered through ACPX's native
+/// adapter detection result. No command, credential, profile, or provider
+/// information is emitted here.
+async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(runtime) = &state.bridge_runtime else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
+    };
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "acp-bridge-models",
+        "method": "agents/list",
+        "params": {}
+    });
+    let response =
+        match dispatch_shared_for_tenant(&state.router, &tenant_id, request.clone()).await {
+            Ok(response) => response,
+            Err(err) => return Json(json_rpc_error(&request, err)).into_response(),
+        };
+    let agents_result = response.get("result").cloned().unwrap_or_default();
+    runtime.refresh_models(&state.router).await;
+    Json(serde_json::json!({
+        "defaultModel": runtime.config.default_model,
+        "models": runtime.public_models(&agents_result).await,
+    }))
+    .into_response()
 }
 
 /// `401 Unauthorized` with a JSON-RPC-shaped error body (same envelope as
@@ -247,6 +682,41 @@ fn unauthorized_response(request: &serde_json::Value) -> Response {
         }
     });
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+}
+
+/// `403 Forbidden` with a JSON-RPC-shaped error body, mirroring
+/// [`unauthorized_response`] -- returned when a tenant-bound token
+/// authenticated the request but the caller-supplied `X-Acpx-Tenant`
+/// header names a *different* tenant (see [`TenantAuthError::Mismatch`]).
+fn tenant_mismatch_response(request: &serde_json::Value) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "error": {
+            "code": -32002,
+            "message": "forbidden: X-Acpx-Tenant does not match the authenticated tenant",
+        }
+    });
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+pub(crate) fn bridge_json_rpc_error(
+    request: &serde_json::Value,
+    error: acp_bridge::BridgeDispatchError,
+) -> serde_json::Value {
+    let code = match error {
+        acp_bridge::BridgeDispatchError::AcpxExtensionNotAllowed
+        | acp_bridge::BridgeDispatchError::InvalidModelSelection
+        | acp_bridge::BridgeDispatchError::UnknownModel(_)
+        | acp_bridge::BridgeDispatchError::CrossAdapterModelSwitch
+        | acp_bridge::BridgeDispatchError::MissingSessionId => -32602,
+        _ => -32020,
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "error": { "code": code, "message": error.to_string() }
+    })
 }
 
 /// Per the precedence rule, an `X-Acpx-Profile` header on a `session/new`
@@ -284,6 +754,39 @@ pub(crate) fn json_rpc_error(request: &serde_json::Value, err: RouterError) -> s
         "error": {
             "code": -32000,
             "message": err.to_string(),
+        }
+    })
+}
+
+/// ACPX-reserved server error for a persistent stream whose configured
+/// subscriber cap has been reached. This is intentionally distinct from
+/// backend-proxied ACP errors, which retain their original error codes.
+pub(crate) fn json_rpc_subscribe_error(
+    request: &serde_json::Value,
+    error: acpx_core::SubscribeError,
+) -> serde_json::Value {
+    let message = error.to_string();
+    let (code, data) = match error {
+        acpx_core::SubscribeError::TooManySubscribers { max_subscribers } => (
+            -32050,
+            serde_json::json!({ "maxSubscribers": max_subscribers }),
+        ),
+        acpx_core::SubscribeError::ResyncRequired { epoch, seq } => (
+            -32051,
+            serde_json::json!({
+                "reason": "resync_required",
+                "epoch": epoch,
+                "seq": seq
+            }),
+        ),
+    };
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "error": {
+            "code": code,
+            "message": message,
+            "data": data
         }
     })
 }

@@ -75,6 +75,15 @@ async fn initialize_declares_real_capabilities_not_the_unknown_method_error() {
         response["result"]["agentCapabilities"]["sessionCapabilities"]["list"],
         json!({})
     );
+    // **Post-review ACP compatibility fix:** `fork` belongs in this list
+    // too now -- `session/fork` is genuinely forwarded end to end (see
+    // `router.rs`'s `MethodClass::SessionFork` doc comment), so a
+    // spec-compliant client checking this capability before ever calling
+    // it must be able to discover acpx supports it.
+    assert_eq!(
+        response["result"]["agentCapabilities"]["sessionCapabilities"]["fork"],
+        json!({})
+    );
 
     // No backend process was ever spawned or even registered for this
     // router -- proves `initialize` really is gateway-native (Router::

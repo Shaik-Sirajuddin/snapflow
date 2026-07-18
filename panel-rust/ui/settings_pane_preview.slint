@@ -1,0 +1,202 @@
+// Rough visual mockup for settings-pane-redesign.md -- NOT wired to real
+// data, NOT the final component split (see that plan's "Component layout"
+// section for the real ui/components/settings/*.slint breakdown). Just
+// enough structure (top tabs, left tabs, search bar, two sample rows per
+// tab) to eyeball the layout live via slint-viewer --auto-reload before
+// committing to the real component split.
+import { Theme } from "tokens/theme.slint";
+import { Metrics } from "tokens/metrics.slint";
+import { Button } from "base/button.slint";
+
+export component SettingsPanePreview inherits Window {
+    preferred-width: 720px;
+    preferred-height: 480px;
+    title: "Settings Pane -- rough preview";
+    default-font-family: Theme.font-sans;
+    background: Theme.bg-canvas;
+
+    property <string> active-scope: "project"; // "project" | "global"
+    property <string> active-section: "mcp"; // "mcp" | "agents"
+    property <string> search-query: "";
+
+    VerticalLayout {
+        padding: Metrics.space-7;
+        spacing: Metrics.space-6;
+
+        // Top tabs -- [Project | Global]
+        HorizontalLayout {
+            spacing: Metrics.space-4;
+            height: 32px;
+            for tab[i] in [{ id: "project", label: "Project" }, { id: "global", label: "Global" }] : Rectangle {
+                width: 100px;
+                border-radius: Theme.radius-sm;
+                background: active-scope == tab.id ? Theme.bg-primary-container : transparent;
+                border-width: active-scope == tab.id ? 0px : 1px;
+                border-color: Theme.border-default;
+                Text {
+                    text: tab.label;
+                    color: active-scope == tab.id ? Theme.text-on-primary-container : Theme.text-secondary;
+                    font-size: 12px * Theme.font-scale;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { active-scope = tab.id; }
+                }
+            }
+        }
+
+        Rectangle { height: 1px; background: Theme.border-default; }
+
+        HorizontalLayout {
+            spacing: Metrics.space-6;
+
+            // Left tabs -- section rail
+            VerticalLayout {
+                width: 160px;
+                spacing: Metrics.space-2;
+                for section[i] in [{ id: "mcp", label: "MCP Servers" }, { id: "agents", label: "Agents" }] : Rectangle {
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    background: active-section == section.id ? Theme.bg-sidebar : transparent;
+                    Text {
+                        text: section.label;
+                        color: active-section == section.id ? Theme.text-primary : Theme.text-secondary;
+                        font-size: 12px * Theme.font-scale;
+                        font-weight: active-section == section.id ? 600 : 400;
+                        vertical-alignment: center;
+                        x: Metrics.space-5;
+                    }
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { active-section = section.id; }
+                    }
+                }
+            }
+
+            Rectangle { width: 1px; background: Theme.border-default; }
+
+            // Content area: search bar + two sample rows for the active section
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: Metrics.space-6;
+
+                Rectangle {
+                    height: 30px;
+                    border-radius: Theme.radius-sm;
+                    background: Theme.bg-sidebar;
+                    border-width: 1px;
+                    border-color: Theme.border-default;
+                    search-input := TextInput {
+                        x: Metrics.space-5;
+                        width: parent.width - Metrics.space-5 * 2;
+                        y: 0;
+                        height: parent.height;
+                        vertical-alignment: center;
+                        font-size: 12px * Theme.font-scale;
+                        color: Theme.text-primary;
+                        text <=> search-query;
+                    }
+                    if search-query == "" : Text {
+                        x: Metrics.space-5;
+                        text: "Search settings...";
+                        color: Theme.text-muted;
+                        font-size: 12px * Theme.font-scale;
+                        vertical-alignment: center;
+                        height: parent.height;
+                    }
+                }
+
+                if active-section == "mcp" : VerticalLayout {
+                    spacing: Metrics.space-5;
+
+                    // Sample row 1: text-value row
+                    HorizontalLayout {
+                        height: 40px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text { text: "Default command timeout"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
+                            Text { text: "Seconds before an MCP server call is considered stalled"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                        }
+                        Rectangle {
+                            width: 60px;
+                            height: 26px;
+                            border-radius: Theme.radius-sm;
+                            border-width: 1px;
+                            border-color: Theme.border-default;
+                            Text { text: "30s"; color: Theme.text-primary; font-size: 11px * Theme.font-scale; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+
+                    // Sample row 2: toggle row
+                    HorizontalLayout {
+                        height: 40px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text { text: "Auto-restart on failure"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
+                            Text { text: "Relaunch a crashed MCP server process automatically"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                        }
+                        property <bool> checked: true;
+                        Rectangle {
+                            width: 36px;
+                            height: 20px;
+                            border-radius: 10px;
+                            background: checked ? Theme.bg-primary : Theme.bg-sidebar;
+                            border-width: 1px;
+                            border-color: Theme.border-default;
+                            Rectangle {
+                                width: 14px;
+                                height: 14px;
+                                border-radius: 7px;
+                                background: checked ? Theme.text-on-primary : Theme.text-muted;
+                                x: checked ? parent.width - self.width - 3px : 3px;
+                                y: 3px;
+                                animate x { duration: 100ms; }
+                            }
+                            TouchArea { mouse-cursor: pointer; clicked => { checked = !checked; } }
+                        }
+                    }
+                }
+
+                if active-section == "agents" : VerticalLayout {
+                    spacing: Metrics.space-5;
+
+                    // Sample row 1: default agent picker (text stand-in)
+                    HorizontalLayout {
+                        height: 40px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text { text: "Default agent"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
+                            Text { text: "Used when a new thread doesn't specify one"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                        }
+                        Rectangle {
+                            width: 100px;
+                            height: 26px;
+                            border-radius: Theme.radius-sm;
+                            border-width: 1px;
+                            border-color: Theme.border-default;
+                            Text { text: "codex"; color: Theme.text-primary; font-size: 11px * Theme.font-scale; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+
+                    // Sample row 2: installable agent row with install button
+                    HorizontalLayout {
+                        height: 40px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text { text: "claude-code (installable)"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
+                            Text { text: "Not yet installed on this machine"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                        }
+                        Button { label: "Install"; btn-width: 64px; }
+                    }
+                }
+            }
+        }
+    }
+}

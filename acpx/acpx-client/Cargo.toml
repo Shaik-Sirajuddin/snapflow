@@ -23,6 +23,8 @@ tokio-tungstenite = "0.24"
 # real running gateway instead of a hand-rolled fake HTTP server.
 acpx-core = { workspace = true }
 acpx-conductor = { workspace = true }
+acpx-bridge = { workspace = true }
+acpx-registry = { workspace = true }
 axum = { version = "0.7", features = ["ws"] }
 tracing = { workspace = true }
 # **Phase 14 addition** -- `transport/ws.rs` (compiled in here via

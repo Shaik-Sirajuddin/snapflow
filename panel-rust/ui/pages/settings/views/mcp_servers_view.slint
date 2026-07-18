@@ -1,0 +1,95 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+import { Button } from "../../../base/button.slint";
+import { SettingsRow } from "../../../base/settings_row.slint";
+import { McpServerOption } from "../../../types.slint";
+
+// MCP Servers left-tab view -- phase 1 shell: re-hosts the "MCP Servers"
+// section of the former `components/settings_sheet.slint` unchanged (same
+// `available-mcp-servers` model, same `mcp-server-create`/`mcp-server-delete`
+// round trip, same "no optimistic local mutation" posture -- see that
+// file's own doc comment). No new fields, no new data wiring; this view
+// only proves the section renders inside the new tabbed shell.
+export component McpServersView inherits Rectangle {
+    in property <[McpServerOption]> servers: [];
+    callback mcp-server-create(string, string);
+    callback mcp-server-delete(string);
+
+    property <string> new-mcp-name: "";
+    property <string> new-mcp-command: "";
+
+    background: transparent;
+
+    VerticalLayout {
+        spacing: Metrics.space-6;
+
+        Text { text: "MCP Servers"; color: Theme.text-primary; font-size: 13px * Theme.font-scale; font-weight: 700; }
+
+        for server in root.servers : SettingsRow {
+            label: server.name;
+            label-font-family: Theme.font-mono;
+            hint: server.command;
+            Button {
+                label: "Remove";
+                button-accessible-label: "Remove MCP server " + server.name;
+                btn-width: 44px;
+                btn-height: 20px;
+                font-size: 9px;
+                font-weight: 400;
+                bg: Theme.bg-card;
+                fg: Theme.text-secondary;
+                clicked => { root.mcp-server-delete(server.name); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Metrics.space-3;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                background: Theme.bg-sidebar;
+                border-radius: Theme.radius-sm;
+                TextInput {
+                    accessible-label: "New MCP server name";
+                    accessible-action-default => { self.focus(); }
+                    text <=> root.new-mcp-name;
+                    color: Theme.text-primary;
+                    font-size: 11px * Theme.font-scale;
+                    x: 6px;
+                    vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                background: Theme.bg-sidebar;
+                border-radius: Theme.radius-sm;
+                TextInput {
+                    accessible-label: "New MCP server command";
+                    accessible-action-default => { self.focus(); }
+                    text <=> root.new-mcp-command;
+                    color: Theme.text-primary;
+                    font-size: 11px * Theme.font-scale;
+                    x: 6px;
+                    vertical-alignment: center;
+                }
+            }
+            Button {
+                label: "Add";
+                button-accessible-label: "Add MCP server";
+                primary: true;
+                btn-width: 56px;
+                btn-height: 26px;
+                font-size: 11px;
+                font-weight: 400;
+                clicked => {
+                    if (root.new-mcp-name != "") {
+                        root.mcp-server-create(root.new-mcp-name, root.new-mcp-command);
+                        root.new-mcp-name = "";
+                        root.new-mcp-command = "";
+                    }
+                }
+            }
+        }
+    }
+}

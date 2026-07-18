@@ -65,17 +65,18 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
-use acpx_core::agent_relay::AgentRequestHub;
-use acpx_core::notify::NotificationHub;
-use acpx_core::router::dispatch_shared_for_tenant;
-use acpx_core::TenantId;
+use acpx_core::router::{dispatch_shared_for_tenant, stream_resume_state_shared};
+use acpx_core::{InteractionBinding, StreamResumeState, TenantId};
 
-use super::http::{json_rpc_error, AppState, SharedRouter};
-use super::live::{session_id_to_forget, session_id_to_watch};
+use super::http::{
+    json_rpc_error, json_rpc_subscribe_error, resolve_authorized_tenant, AppState, SharedRouter,
+    TenantAuthError,
+};
+use super::live::{session_id_to_forget, session_id_to_watch, take_resume_cursor};
 
 type WsSink = futures_util::stream::SplitSink<WebSocket, Message>;
 
@@ -86,20 +87,19 @@ pub async fn ws_handler(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !state.auth.authorize(&headers) {
-        // Reject the upgrade outright -- there is no later point in a WS
-        // connection's lifetime where an `Authorization` header is
-        // available again, so this is the only place auth can be
-        // enforced for this transport. `401` here means the handshake
-        // itself never completes (the client sees a plain HTTP 401
-        // response to its upgrade request, not a WS close frame).
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let tenant_id = headers
-        .get("x-acpx-tenant")
-        .and_then(|v| v.to_str().ok())
-        .map(TenantId::from)
-        .unwrap_or_default();
+    // Reject the upgrade outright on auth failure or a tenant-identity
+    // mismatch -- there is no later point in a WS connection's lifetime
+    // where headers are available again, so this is the only place
+    // either can be enforced for this transport (see this module's doc
+    // comment). The client sees a plain HTTP 401/403 response to its
+    // upgrade request, never a WS close frame.
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
+        }
+    };
     ws.on_upgrade(move |socket| handle_socket(socket, state.router, tenant_id))
 }
 
@@ -122,69 +122,422 @@ async fn write_frame(sink: &Arc<AsyncMutex<WsSink>>, value: &serde_json::Value) 
     }
 }
 
-/// Subscribe this connection to `session_id`'s live `NotificationHub` and
-/// `AgentRequestHub` streams, if it isn't already -- a no-op (not a
-/// double-subscribe) when `session_id` is already in `watched`, matching
-/// both hubs' own "last subscriber wins" contract, which this avoids
-/// relying on unless truly needed. Spawns one small forwarder task per
-/// hub, each writing its own frame shape out via [`write_frame`] for as
-/// long as this connection (or its subscription) lasts.
-async fn subscribe_if_new(
-    watched: &Arc<AsyncMutex<HashSet<String>>>,
-    hub: &NotificationHub,
-    agent_relay: &AgentRequestHub,
-    sink: &Arc<AsyncMutex<WsSink>>,
-    session_id: String,
-) {
-    let newly_watched = watched.lock().await.insert(session_id.clone());
-    if !newly_watched {
-        return;
-    }
-
-    let mut updates_rx = hub.subscribe(session_id.clone()).await;
-    let updates_sink = Arc::clone(sink);
-    tokio::spawn(async move {
-        while let Some(update) = updates_rx.recv().await {
-            write_frame(&updates_sink, &update).await;
+/// Strict ACP bridge counterpart to [`ws_handler`]. It shares the same
+/// auth and tenant boundary, but routes every frame through the bridge
+/// virtual-session dispatcher so clients never need ACPX profile fields.
+pub async fn acp_ws_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let Some(runtime) = state.bridge_runtime.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let tenant_id = match resolve_authorized_tenant(&state.auth, &headers) {
+        Ok(tenant) => tenant,
+        Err(TenantAuthError::Unauthorized) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(TenantAuthError::Mismatch | TenantAuthError::NotAllowed) => {
+            return StatusCode::FORBIDDEN.into_response()
         }
-    });
-
-    let mut relay_rx = agent_relay.subscribe(session_id.clone()).await;
-    let relay_sink = Arc::clone(sink);
-    tokio::spawn(async move {
-        while let Some(envelope) = relay_rx.recv().await {
-            let frame = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "acpx/agent_request",
-                "params": {
-                    "relayId": envelope.relay_id,
-                    "sessionId": envelope.gateway_session_id,
-                    "request": envelope.request,
-                }
-            });
-            write_frame(&relay_sink, &frame).await;
-        }
-    });
+    };
+    ws.on_upgrade(move |socket| handle_acp_socket(socket, state.router, runtime, tenant_id))
 }
 
-/// One WS connection's request/response loop: each inbound text/binary
-/// frame is parsed as a single JSON-RPC request, dispatched against the
-/// shared `Router` in its own spawned task (see this module's "per-request
-/// concurrency" doc comment above for why), and the JSON-RPC response
-/// written back as one outbound frame once that dispatch completes,
-/// possibly out of order relative to other in-flight requests on this
-/// same connection. Malformed frames are logged and dropped rather than
+async fn handle_acp_socket(
+    socket: WebSocket,
+    router: SharedRouter,
+    runtime: Arc<super::http::acp_bridge::BridgeRuntime>,
+    tenant_id: TenantId,
+) {
+    let (sink, mut stream) = socket.split();
+    let sink = Arc::new(AsyncMutex::new(sink));
+    let hub = { router.lock().await.notification_hub() };
+    // Shared (not a plain loop-local `HashSet`) because dispatch for each
+    // inbound frame is now spawned onto its own task below -- see that
+    // spawn's own doc comment for why this had to stop being inline.
+    let watched: Arc<AsyncMutex<HashSet<String>>> = Arc::new(AsyncMutex::new(HashSet::new()));
+    // Live-interaction wiring (see `acp_bridge::BridgeInteractionCtx`'s doc
+    // comment): without this, a backend-initiated `session/request_permission`
+    // mid-turn always falls through to the static policy auto-answer -- a
+    // connected `/acp` client (Zed, a real ACP-conformant harness, ...) can
+    // never be asked for confirmation or cancel a pending tool call, even
+    // though the exact same interactive round trip already works for the
+    // native (non-bridge) WS/stdio transports via this same `InteractionHub`.
+    let interaction_hub = { router.lock().await.interaction_hub() };
+    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let interaction_bindings: Arc<AsyncMutex<HashMap<String, InteractionBinding>>> =
+        Arc::new(AsyncMutex::new(HashMap::new()));
+    let interaction_ctx = super::http::acp_bridge::BridgeInteractionCtx {
+        hub: interaction_hub.clone(),
+        sender: interaction_tx,
+        bindings: Arc::clone(&interaction_bindings),
+    };
+    {
+        let interaction_sink = Arc::clone(&sink);
+        let forwarder_runtime = Arc::clone(&runtime);
+        let forwarder_tenant = tenant_id.clone();
+        tokio::spawn(async move {
+            while let Some(mut request) = interaction_rx.recv().await {
+                // The hub only ever knows the native/gateway session id
+                // (see `try_forward_interaction` in `router.rs`); a bridge
+                // client only ever understands its own virtual/public
+                // session id, exactly the same translation the
+                // `session/update` forwarder below already does.
+                if let Some(native_session_id) = request
+                    .pointer("/params/sessionId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                {
+                    if let Some(virtual_id) =
+                        forwarder_runtime.virtual_session_id(&forwarder_tenant, &native_session_id)
+                    {
+                        request["params"]["sessionId"] = serde_json::Value::String(virtual_id);
+                    }
+                }
+                let Ok(frame) = serde_json::to_string(&request) else {
+                    continue;
+                };
+                if interaction_sink
+                    .lock()
+                    .await
+                    .send(Message::Text(frame))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+    while let Some(message) = stream.next().await {
+        let text = match message {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Binary(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => continue,
+            },
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+        };
+        let request: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        // The client's answer to a backend-initiated interactive request
+        // (see above): correlated directly back to the pending request by
+        // `id`, must not enter bridge dispatch as if it were a new call.
+        if request.get("method").is_none() && request.get("id").is_some() {
+            interaction_hub.resolve(request).await;
+            continue;
+        }
+        // Spawned, not awaited inline: a bridge-lazy-bound `session/prompt`
+        // can block on a backend-initiated `session/request_permission`
+        // mid-turn (see `BridgeInteractionCtx`), which only ever gets
+        // answered by *this exact connection* sending back a reply frame --
+        // the "response with no method" branch just above. Awaiting
+        // dispatch inline here would starve that branch of ever running
+        // for the whole rest of this turn, deadlocking every interactive
+        // request until `DEFAULT_INTERACTION_TIMEOUT`: one read loop can't
+        // both block on a call's result and stay free to read that same
+        // call's own answer. Mirrors `transport::ws::handle_socket`'s
+        // identical `tokio::spawn` around its own dispatch call.
+        let router = Arc::clone(&router);
+        let runtime = Arc::clone(&runtime);
+        let tenant_id = tenant_id.clone();
+        let sink = Arc::clone(&sink);
+        let hub = hub.clone();
+        let watched = Arc::clone(&watched);
+        let interaction_ctx = interaction_ctx.clone();
+        tokio::spawn(async move {
+            let mut request = request;
+            let _resume_cursor = take_resume_cursor(&mut request);
+            let mut response = match super::http::acp_bridge::dispatch_with_interaction(
+                &router,
+                &runtime,
+                &tenant_id,
+                request.clone(),
+                Some(&interaction_ctx),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => super::http::bridge_json_rpc_error(&request, error),
+            };
+            // The first lazy-bound prompt cannot be subscribed before it
+            // binds, so Router buffers any early backend updates in its
+            // native `_acpx.updates` extension. Flush those as normal ACP
+            // frames before the final response; bridge clients must never
+            // need to understand ACPX-only response extensions.
+            if let Some(updates) = response
+                .get_mut("_acpx")
+                .and_then(|value| value.get_mut("updates"))
+                .and_then(|value| value.as_array_mut())
+            {
+                let mut flushed_updates = false;
+                for mut update in std::mem::take(updates) {
+                    let Some(native_session_id) = update
+                        .pointer("/params/sessionId")
+                        .and_then(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    if runtime
+                        .bound_gateway_session_id(&tenant_id, native_session_id)
+                        .is_none()
+                    {
+                        let Some(virtual_id) =
+                            runtime.virtual_session_id(&tenant_id, native_session_id)
+                        else {
+                            continue;
+                        };
+                        update["params"]["sessionId"] = serde_json::Value::String(virtual_id);
+                    }
+                    let Ok(frame) = serde_json::to_string(&update) else {
+                        continue;
+                    };
+                    if sink.lock().await.send(Message::Text(frame)).await.is_err() {
+                        return;
+                    }
+                    flushed_updates = true;
+                }
+                if flushed_updates {
+                    // Some ACP clients dispatch notifications on separate
+                    // tasks. Give them one scheduling slice before the
+                    // prompt response completes the turn and they snapshot
+                    // accumulated text.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+            if response
+                .get("_acpx")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|extension| {
+                    extension
+                        .get("updates")
+                        .is_some_and(|value| value.as_array().is_some_and(Vec::is_empty))
+                })
+            {
+                response
+                    .get_mut("_acpx")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("checked extension object")
+                    .remove("updates");
+                if response
+                    .get("_acpx")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+                {
+                    response
+                        .as_object_mut()
+                        .expect("JSON-RPC object")
+                        .remove("_acpx");
+                }
+            }
+            let method = request
+                .get("method")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if let Some(public_id) = bridge_session_id_to_forget(&request, &response, method) {
+                if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
+                    if watched.lock().await.remove(&native_id) {
+                        hub.remove_stream(&tenant_id, &native_id).await;
+                    }
+                }
+            } else if let Some(public_id) = bridge_session_id_to_watch(&request, &response, method)
+            {
+                if let Some(native_id) = runtime.bound_gateway_session_id(&tenant_id, &public_id) {
+                    if watched.lock().await.insert(native_id.clone()) {
+                        match hub
+                            .subscribe_resuming(
+                                &tenant_id,
+                                native_id.clone(),
+                                None,
+                                StreamResumeState::default(),
+                            )
+                            .await
+                        {
+                            Ok(mut rx) => {
+                                let forwarder_sink = Arc::clone(&sink);
+                                let forwarder_runtime = Arc::clone(&runtime);
+                                let forwarder_tenant = tenant_id.clone();
+                                tokio::spawn(async move {
+                                    loop {
+                                        let mut update = match rx.recv().await {
+                                            Ok(update) => update.into_value(),
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Lagged(
+                                                    skipped,
+                                                ),
+                                            ) => {
+                                                tracing::warn!(%skipped, "ACPX bridge notification subscriber lagged");
+                                                continue;
+                                            }
+                                            Err(
+                                                tokio::sync::broadcast::error::RecvError::Closed,
+                                            ) => break,
+                                        };
+                                        let Some(native_session_id) = update
+                                            .pointer("/params/sessionId")
+                                            .and_then(|value| value.as_str())
+                                        else {
+                                            continue;
+                                        };
+                                        let Some(virtual_id) = forwarder_runtime
+                                            .virtual_session_id(
+                                                &forwarder_tenant,
+                                                native_session_id,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+                                        update["params"]["sessionId"] =
+                                            serde_json::Value::String(virtual_id);
+                                        let Ok(frame) = serde_json::to_string(&update) else {
+                                            continue;
+                                        };
+                                        if forwarder_sink
+                                            .lock()
+                                            .await
+                                            .send(Message::Text(frame))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                });
+                            }
+                            Err(error) => {
+                                watched.lock().await.remove(&native_id);
+                                response = super::http::json_rpc_subscribe_error(&request, error);
+                            }
+                        }
+                    }
+                }
+            }
+            let Ok(frame) = serde_json::to_string(&response) else {
+                return;
+            };
+            // A backend update published during this dispatch is already
+            // queued for the per-session forwarder. Yield before writing
+            // the terminal response so an ACP client observes streamed
+            // updates first.
+            tokio::task::yield_now().await;
+            let _ = sink.lock().await.send(Message::Text(frame)).await;
+        });
+    }
+    drop(watched);
+    // Disconnects must release every interaction binding this connection
+    // holds, or a future prompt on the same native session would forward
+    // its interactive requests to a channel nobody is reading from
+    // anymore, hanging until `DEFAULT_INTERACTION_TIMEOUT` instead of
+    // failing over to the policy fallback right away.
+    for binding in interaction_bindings.lock().await.values() {
+        interaction_hub.unbind(binding).await;
+    }
+}
+
+fn bridge_session_id_to_watch(
+    request: &serde_json::Value,
+    response: &serde_json::Value,
+    method: &str,
+) -> Option<String> {
+    if response.get("error").is_some() {
+        return None;
+    }
+    if method == "session/new" || method == "session/fork" {
+        return response
+            .pointer("/result/sessionId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+    }
+    request
+        .pointer("/params/sessionId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn bridge_session_id_to_forget(
+    request: &serde_json::Value,
+    response: &serde_json::Value,
+    method: &str,
+) -> Option<String> {
+    if response.get("error").is_some() || !matches!(method, "session/close" | "session/delete") {
+        return None;
+    }
+    request
+        .pointer("/params/sessionId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// One WS connection's request/response loop. `acpx/agent_response` relay
+/// answers and method-less `InteractionHub` answers are resolved inline,
+/// never entering `Router` dispatch. Any other frame naming a
+/// `params.sessionId` is treated as prompt-like: this connection is bound
+/// to that session on both `NotificationHub` (resumable, per
+/// `resume_cursor`/`deferred_watches`) and `AgentRequestHub` (relay) before
+/// the backend round trip runs in its own spawned task, so a slow dispatch
+/// -- in particular one blocked on a relayed agent-initiated request --
+/// never stalls this read loop, which is exactly what would otherwise
+/// prevent the answering `acpx/agent_response`/`InteractionHub` frames
+/// above from ever being read at all (see this module's "per-request
+/// concurrency" doc comment). Session-less frames dispatch and respond
+/// synchronously. Malformed frames are logged and dropped rather than
 /// closing the connection, so one bad frame doesn't take down an
 /// otherwise-healthy client session. Also subscribes/unsubscribes this
 /// connection to/from `NotificationHub`/`AgentRequestHub` per
-/// `transport::live::{session_id_to_watch, session_id_to_forget}` and
-/// [`subscribe_if_new`].
+/// `transport::live::{session_id_to_watch, session_id_to_forget}` for the
+/// session-less dispatch path.
 async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: TenantId) {
     let (sink, mut stream) = socket.split();
     let sink = Arc::new(AsyncMutex::new(sink));
     let hub = { router.lock().await.notification_hub() };
     let agent_relay = { router.lock().await.agent_request_hub() };
-    let watched: Arc<AsyncMutex<HashSet<String>>> = Arc::new(AsyncMutex::new(HashSet::new()));
+    let interaction_hub = { router.lock().await.interaction_hub() };
+    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let interaction_sink = Arc::clone(&sink);
+    tokio::spawn(async move {
+        while let Some(request) = interaction_rx.recv().await {
+            let Ok(payload) = serde_json::to_string(&request) else {
+                continue;
+            };
+            if interaction_sink
+                .lock()
+                .await
+                .send(Message::Text(payload))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut watched: HashSet<String> = HashSet::new();
+    let interaction_bindings =
+        Arc::new(AsyncMutex::new(HashMap::<String, InteractionBinding>::new()));
+    let deferred_watches = Arc::new(AsyncMutex::new(HashSet::<String>::new()));
+
+    macro_rules! send_frame {
+        ($value:expr) => {{
+            let payload = match serde_json::to_string(&$value) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    tracing::error!(?err, "failed to serialize JSON-RPC frame");
+                    continue;
+                }
+            };
+            if sink
+                .lock()
+                .await
+                .send(Message::Text(payload))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }};
+    }
 
     while let Some(msg) = stream.next().await {
         let msg = match msg {
@@ -207,33 +560,29 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             Message::Ping(_) | Message::Pong(_) => continue,
         };
 
-        let request: serde_json::Value = match serde_json::from_str(&text) {
+        let mut request: serde_json::Value = match serde_json::from_str(&text) {
             Ok(value) => value,
             Err(err) => {
                 tracing::warn!(?err, "ws frame is not valid JSON, dropping");
                 continue;
             }
         };
-        let method = request
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or_default()
-            .to_string();
 
         // **Interactive relay addition.** The client's answer to a
         // relayed agent-initiated request arrives as its own inbound
         // frame, correlated by `relayId` rather than this connection's
-        // usual JSON-RPC id space -- handled here, before the session
-        // watch/dispatch logic below, since it never targets `Router::
-        // dispatch` at all, and stays inline (not spawned) since it's
-        // always fast and non-blocking (no backend round trip) -- it must
-        // never queue up behind a slow in-flight dispatch, since a slow
-        // in-flight dispatch may be the very thing waiting on it. Always
-        // acknowledged with `{"delivered": ..}` so a panel can distinguish
-        // "the backend got your answer" from "this relay already expired"
-        // (a late click after the 15-minute `PERMISSION_RELAY_TIMEOUT`,
-        // or a stale/unknown `relayId`).
-        if method == "acpx/agent_response" {
+        // usual JSON-RPC id space -- handled here, before the
+        // interaction-hub/session-watch/dispatch logic below, since it
+        // never targets `Router::dispatch` at all, and stays inline (not
+        // spawned) since it's always fast and non-blocking (no backend
+        // round trip) -- it must never queue up behind a slow in-flight
+        // dispatch, since a slow in-flight dispatch may be the very thing
+        // waiting on it. Always acknowledged with `{"delivered": ..}` so
+        // a panel can distinguish "the backend got your answer" from
+        // "this relay already expired" (a late click after the
+        // 15-minute `PERMISSION_RELAY_TIMEOUT`, or a stale/unknown
+        // `relayId`).
+        if request.get("method").and_then(|m| m.as_str()) == Some("acpx/agent_response") {
             let relay_id = request
                 .get("params")
                 .and_then(|p| p.get("relayId"))
@@ -255,74 +604,292 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             continue;
         }
 
-        // Reattachment can emit `session/update` before the RPC response
-        // (a real adapter's own `loadSession`/history replay can start
-        // streaming immediately). Claim the session before dispatch so
-        // those notifications reach this reattaching connection instead
-        // of whatever stale connection (if any) subscribed to it before
-        // this one reconnected. Deliberately scoped to `session/load`/
-        // `session/resume` only -- NOT every `Proxied` method with a
-        // `sessionId` (a `session/prompt` against a session this
-        // connection never touched before is not reattachment; claiming
-        // it pre-dispatch would incorrectly steal live delivery away
-        // from whichever *other* connection is that session's actual
-        // current owner mid-turn -- caught by `multitenant_concurrency_
-        // e2e_test.rs`'s `the_newest_same_tenant_connection_to_touch_a_
-        // session_becomes_its_live_subscriber`, which pins down exactly
-        // that multi-connection scenario). Every other Proxied method,
-        // `session/prompt` included, still only ever subscribes in the
-        // post-dispatch step below, per `session_id_to_watch`. Stays
-        // inline (fast, no backend I/O) so subscription is always
-        // registered strictly before the spawned dispatch task below ever
-        // sends anything to the backend.
-        if matches!(method.as_str(), "session/load" | "session/resume") {
-            if let Some(session_id) = request
-                .get("params")
-                .and_then(|params| params.get("sessionId"))
-                .and_then(|session_id| session_id.as_str())
-                .map(str::to_owned)
+        let resume_cursor = take_resume_cursor(&mut request);
+
+        // A response with no method can only be the client's answer to an
+        // agent-initiated request sent by InteractionHub. It must not enter
+        // Router dispatch: it is correlated directly back to the backend
+        // request that is still awaiting it.
+        if request.get("method").is_none() && request.get("id").is_some() {
+            interaction_hub.resolve(request).await;
+            continue;
+        }
+
+        // Prompt-like calls can block on an agent-initiated request. Bind
+        // this connection before dispatch, then run the backend round trip
+        // independently so this read loop remains available for the
+        // correlated response above (and for the `acpx/agent_response`
+        // relay-answer frames handled above it).
+        if let Some(session_id) = request
+            .pointer("/params/sessionId")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        {
+            // A reconnect cursor changes the ordering requirement: install
+            // the receiver before the potentially slow backend call. This
+            // preserves live records that arrive while `session/resume` or
+            // `session/load` is in flight even if they later roll out of
+            // the bounded replay ring.
+            let resumed_before_dispatch = if resume_cursor.is_some()
+                && deferred_watches.lock().await.insert(session_id.clone())
             {
-                subscribe_if_new(&watched, &hub, &agent_relay, &sink, session_id).await;
+                let state = stream_resume_state_shared(&router, &tenant_id, &session_id).await;
+                match hub
+                    .subscribe_resuming(
+                        &tenant_id,
+                        session_id.clone(),
+                        resume_cursor.clone(),
+                        StreamResumeState {
+                            backend_session_id: state.backend_session_id,
+                            durable_state_changed: state.durable_state_changed,
+                        },
+                    )
+                    .await
+                {
+                    Ok(mut rx) => {
+                        let forwarder_sink = Arc::clone(&sink);
+                        tokio::spawn(async move {
+                            loop {
+                                let update = match rx.recv().await {
+                                    Ok(update) => update.into_value(),
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        skipped,
+                                    )) => {
+                                        tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                };
+                                let Ok(payload) = serde_json::to_string(&update) else {
+                                    continue;
+                                };
+                                if forwarder_sink
+                                    .lock()
+                                    .await
+                                    .send(Message::Text(payload))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        true
+                    }
+                    Err(error) => {
+                        deferred_watches.lock().await.remove(&session_id);
+                        send_frame!(json_rpc_subscribe_error(&request, error));
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
+            // **Interactive relay addition.** Subscribe this connection to
+            // the session's `AgentRequestHub` stream too, same lifetime as
+            // the notification-hub subscription above, so an
+            // agent-initiated `session/request_permission` relay reaches
+            // this connection for the duration it owns this session.
+            let mut relay_rx = agent_relay.subscribe(session_id.clone()).await;
+            let relay_sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                while let Some(envelope) = relay_rx.recv().await {
+                    let frame = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "acpx/agent_request",
+                        "params": {
+                            "relayId": envelope.relay_id,
+                            "sessionId": envelope.gateway_session_id,
+                            "request": envelope.request,
+                        }
+                    });
+                    write_frame(&relay_sink, &frame).await;
+                }
+            });
+            let binding = interaction_hub
+                .bind(
+                    tenant_id.clone(),
+                    session_id.clone(),
+                    interaction_tx.clone(),
+                )
+                .await;
+            let previous = interaction_bindings
+                .lock()
+                .await
+                .insert(session_id.clone(), binding);
+            if let Some(previous) = previous {
+                interaction_hub.unbind(&previous).await;
+            }
+            let subscribe_after_response = !resumed_before_dispatch
+                && deferred_watches.lock().await.insert(session_id.clone());
+
+            let router = Arc::clone(&router);
+            let tenant_id = tenant_id.clone();
+            let sink = Arc::clone(&sink);
+            let hub = hub.clone();
+            let deferred_watches = Arc::clone(&deferred_watches);
+            tokio::spawn(async move {
+                let mut response =
+                    match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
+                        Ok(response) => response,
+                        Err(error) => json_rpc_error(&request, error),
+                    };
+                if subscribe_after_response && response.get("error").is_none() {
+                    let state = stream_resume_state_shared(&router, &tenant_id, &session_id).await;
+                    match hub
+                        .subscribe_resuming(
+                            &tenant_id,
+                            session_id.clone(),
+                            resume_cursor.clone(),
+                            StreamResumeState {
+                                backend_session_id: state.backend_session_id,
+                                durable_state_changed: state.durable_state_changed,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(mut rx) => {
+                            let forwarder_sink = Arc::clone(&sink);
+                            tokio::spawn(async move {
+                                loop {
+                                    let update = match rx.recv().await {
+                                        Ok(update) => update.into_value(),
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            skipped,
+                                        )) => {
+                                            tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                            continue;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break
+                                        }
+                                    };
+                                    let Ok(payload) = serde_json::to_string(&update) else {
+                                        continue;
+                                    };
+                                    if forwarder_sink
+                                        .lock()
+                                        .await
+                                        .send(Message::Text(payload))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
+                        Err(error) => {
+                            deferred_watches.lock().await.remove(&session_id);
+                            response = json_rpc_subscribe_error(&request, error);
+                        }
+                    }
+                } else if subscribe_after_response {
+                    deferred_watches.lock().await.remove(&session_id);
+                }
+                let Ok(payload) = serde_json::to_string(&response) else {
+                    return;
+                };
+                let _ = sink.lock().await.send(Message::Text(payload)).await;
+            });
+            continue;
+        }
+
+        let mut response = {
+            match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
+                Ok(response) => response,
+                Err(err) => json_rpc_error(&request, err),
+            }
+        };
+
+        let method = request
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default();
+        if let Some(forget) = session_id_to_forget(&request, &response, method) {
+            if watched.remove(&forget) {
+                hub.remove_stream(&tenant_id, &forget).await;
+                agent_relay.unsubscribe(&forget).await;
+            }
+            deferred_watches.lock().await.remove(&forget);
+        } else if let Some(watch) = session_id_to_watch(&request, &response, method) {
+            if watched.insert(watch.clone()) {
+                let state = stream_resume_state_shared(&router, &tenant_id, &watch).await;
+                match hub
+                    .subscribe_resuming(
+                        &tenant_id,
+                        watch.clone(),
+                        resume_cursor.clone(),
+                        StreamResumeState {
+                            backend_session_id: state.backend_session_id,
+                            durable_state_changed: state.durable_state_changed,
+                        },
+                    )
+                    .await
+                {
+                    Ok(mut rx) => {
+                        deferred_watches.lock().await.insert(watch.clone());
+                        let forwarder_sink = Arc::clone(&sink);
+                        tokio::spawn(async move {
+                            loop {
+                                let update = match rx.recv().await {
+                                    Ok(update) => update.into_value(),
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        skipped,
+                                    )) => {
+                                        tracing::warn!(%skipped, "ACPX notification subscriber lagged");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                };
+                                let Ok(payload) = serde_json::to_string(&update) else {
+                                    continue;
+                                };
+                                if forwarder_sink
+                                    .lock()
+                                    .await
+                                    .send(Message::Text(payload))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        let mut relay_rx = agent_relay.subscribe(watch.clone()).await;
+                        let relay_sink = Arc::clone(&sink);
+                        tokio::spawn(async move {
+                            while let Some(envelope) = relay_rx.recv().await {
+                                let frame = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "acpx/agent_request",
+                                    "params": {
+                                        "relayId": envelope.relay_id,
+                                        "sessionId": envelope.gateway_session_id,
+                                        "request": envelope.request,
+                                    }
+                                });
+                                write_frame(&relay_sink, &frame).await;
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        watched.remove(&watch);
+                        response = json_rpc_subscribe_error(&request, error);
+                    }
+                }
             }
         }
 
-        // **Interactive relay addition.** Spawned, not awaited -- see
-        // this module's "per-request concurrency" doc comment for why a
-        // slow dispatch (in particular, one blocked on a relayed
-        // agent-initiated request) must not stall this connection's own
-        // read loop, which is exactly what would otherwise prevent the
-        // answering `acpx/agent_response` frame above from ever being
-        // read at all.
-        let router = Arc::clone(&router);
-        let tenant_id = tenant_id.clone();
-        let hub = hub.clone();
-        let agent_relay = agent_relay.clone();
-        let sink = Arc::clone(&sink);
-        let watched = Arc::clone(&watched);
-        tokio::spawn(async move {
-            let response = match dispatch_shared_for_tenant(&router, &tenant_id, request.clone())
-                .await
-            {
-                Ok(response) => response,
-                Err(err) => json_rpc_error(&request, err),
-            };
-
-            if let Some(forget) = session_id_to_forget(&request, &response, &method) {
-                let removed = watched.lock().await.remove(&forget);
-                if removed {
-                    hub.unsubscribe(&forget).await;
-                    agent_relay.unsubscribe(&forget).await;
-                }
-            } else if let Some(watch) = session_id_to_watch(&request, &response, &method) {
-                subscribe_if_new(&watched, &hub, &agent_relay, &sink, watch).await;
-            }
-
-            write_frame(&sink, &response).await;
-        });
+        send_frame!(response);
     }
 
-    for session_id in watched.lock().await.iter() {
-        hub.unsubscribe(&session_id).await;
-        agent_relay.unsubscribe(&session_id).await;
+    for session_id in watched.iter() {
+        hub.remove_stream(&tenant_id, session_id).await;
+        agent_relay.unsubscribe(session_id).await;
+    }
+    drop(watched);
+    for (_, binding) in interaction_bindings.lock().await.drain() {
+        interaction_hub.unbind(&binding).await;
     }
 }

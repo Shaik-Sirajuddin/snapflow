@@ -5,15 +5,22 @@
 //! Phase 2/3.
 
 use crate::keystore::Keystore;
+use crate::lifecycle::LifecycleConfig;
 use crate::mcp_servers::McpServerStore;
 use crate::notify::NotificationHub;
 use crate::agent_relay::AgentRequestHub;
-use crate::persistence::{Direction, PersistenceStore};
+use crate::persistence::{
+    sessions::{RecoveryMetadata, RecoveryMethod, RecoveryStatus},
+    Direction, PersistenceStore,
+};
 use crate::profile::{PermissionPolicy, Profile, ProfileStore};
 use crate::provider::ProviderStore;
 use crate::session_registry::{BackendSessionId, SessionRegistry, TenantId};
+use crate::{AgentEnablement, CustomAgentStore, InteractionHub, DEFAULT_INTERACTION_TIMEOUT};
+use acpx_proto::agent::{AgentSource, AgentStatus};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Which bucket a given JSON-RPC method falls into. See the classification
 /// table in `02-architecture.md`.
@@ -26,6 +33,41 @@ pub enum MethodClass {
     /// One-time gateway logic (profile/agent resolution + spawn), then
     /// delegates to the backend.
     Hybrid,
+    /// **ACP compatibility gap closed post-review.** `session/fork` is a
+    /// real v1 ACP method (`ForkSessionRequest`/`ForkSessionResponse`,
+    /// `x-side: agent`) that was entirely unclassified before this fix --
+    /// found by cross-checking every method the real
+    /// `agent-client-protocol` 1.2.0 crate's own `impl_jsonrpc_request!`
+    /// macro invocations define
+    /// (`src/schema/client_to_agent/requests.rs`) against `classify`'s
+    /// match arms; every other one was covered, this one fell straight
+    /// through to `MethodClass::Unknown`.
+    ///
+    /// **Not yet stabilized upstream** -- gated behind
+    /// `agent-client-protocol-schema`'s own `unstable_session_fork`
+    /// Cargo feature (see this workspace's root `Cargo.toml`, which now
+    /// enables it), i.e. the ACP project itself still considers this an
+    /// opt-in draft extension, not a baseline-spec method every agent
+    /// must implement. acpx supports it anyway because a real backend
+    /// can and does advertise fork support (`claude-agent-acp` 0.58.1's
+    /// own `session/new` response includes `sessionCapabilities.fork:
+    /// {}}`, verified against the real npx-installed adapter), so any
+    /// client that checked that capability before calling `session/fork`
+    /// would get a spurious "unknown method" from acpx even though the
+    /// backend it's actually talking to genuinely supports it.
+    ///
+    /// Neither `Proxied` (its response mints a *new* session id, unlike
+    /// every other proxied method) nor `Hybrid` (it forwards against an
+    /// *existing* session's already-running backend process, not a
+    /// freshly resolved profile/spawn like `session/new`) fits, so this
+    /// is its own bucket: resolve the *source* session's agent/backend
+    /// (like `Proxied`), forward with the gateway `sessionId` rewritten
+    /// to the backend-native one (like `Proxied`), then register the
+    /// backend's newly-minted forked session id under a *new* gateway
+    /// session id and rewrite the response the same way `session/new`
+    /// does. See `Router::dispatch_session_fork`/
+    /// `dispatch_session_fork_shared`.
+    SessionFork,
     /// Not a recognized ACP or acpx method.
     Unknown,
 }
@@ -99,6 +141,9 @@ pub fn classify(method: &str) -> MethodClass {
         // *previous* acpx process lifetime is exactly as legitimate a use
         // case as loading/resuming one.
         | "session/delete" => MethodClass::Proxied,
+        // See `MethodClass::SessionFork`'s doc comment for why this is
+        // neither `Proxied` nor `Hybrid`.
+        "session/fork" => MethodClass::SessionFork,
         "agents/list" | "agents/install" | "agents/status" | "session/list" => {
             MethodClass::GatewayNative
         }
@@ -108,6 +153,21 @@ pub fn classify(method: &str) -> MethodClass {
         "mcp_servers/create" | "mcp_servers/list" | "mcp_servers/update" | "mcp_servers/delete" => {
             MethodClass::GatewayNative
         }
+        // `retention_administration` (`acpx-session-lifecycle`). Not a
+        // real ACP method -- an acpx-only extension namespace, same
+        // category as `profiles/*`/`mcp_servers/*` above. Tenant-scoped
+        // (see `dispatch_native`'s arms): each resolves/mutates only a
+        // session already owned by the authenticated tenant issuing the
+        // request, via `SessionRegistry`'s existing tenant-nested map --
+        // exactly the same ownership check `Router::set_session_pinned`
+        // already enforced as an in-process-only seam before this;
+        // these give it a real, authenticated, gateway-native JSON-RPC
+        // surface.
+        "session/retention/get"
+        | "session/retention/list"
+        | "session/retention/pin"
+        | "session/retention/unpin"
+        | "session/retention/set_ttl" => MethodClass::GatewayNative,
         _ => MethodClass::Unknown,
     }
 }
@@ -176,11 +236,22 @@ fn session_list_selector(params: &serde_json::Value) -> Option<SessionListSelect
 pub struct Router {
     supervisor: acpx_conductor::Supervisor,
     sessions: SessionRegistry,
+    /// Native gateway-wide limits, checked before `session/new` consumes
+    /// a connector/backend session.
+    lifecycle: LifecycleConfig,
+    /// Live and in-flight session admissions. This is independent of the
+    /// router lock so permits can safely span backend I/O without leaking
+    /// capacity when their owning task is cancelled.
+    admission: Arc<Mutex<AdmissionState>>,
     /// Fallback agent id used when `session/new` carries no `_acpx.profile`
     /// (native/unmanaged mode, see `02-architecture.md`) -- Phase 3 adds
     /// real profile -> agent resolution; until then every session goes to
     /// this one configured agent.
     default_agent_id: String,
+    /// Explicit backend authentication method for native/unmanaged sessions.
+    /// Unset preserves the safe default: ACPX never guesses a backend auth
+    /// method when a caller did not select a managed profile.
+    native_auth_method_id: Option<String>,
     /// HTTP client for `acpx-registry`'s live registry fetch. Reused across
     /// calls rather than constructed per-request.
     http: reqwest::Client,
@@ -190,6 +261,10 @@ pub struct Router {
     /// every call. No TTL/invalidation yet; a later phase can add one if
     /// the registry needs to be re-polled for changes mid-run.
     registry_cache: Option<acpx_registry::Registry>,
+    /// Cached results from disposable backend capability probes. Unlike the
+    /// registry cache this stores adapter-runtime data (`configOptions`,
+    /// permission modes, and auth methods), not launch metadata.
+    capability_cache: acpx_registry::CapabilityCache,
     /// Optional sqlite-backed persistence (Phase 2 step 10, see
     /// `crate::persistence`). `None` by default -- a `Router` used purely
     /// in-memory (e.g. most of this crate's own tests) never touches
@@ -199,6 +274,14 @@ pub struct Router {
     /// "written asynchronously" design goal -- a slow/failed persistence
     /// write never delays or fails the client's actual request.
     persistence: Option<PersistenceStore>,
+    /// Durable admin-plane read stores. They remain absent for
+    /// in-memory-only routers, preserving the legacy default behavior.
+    agent_enablement: Option<AgentEnablement>,
+    custom_agents: Option<CustomAgentStore>,
+    /// Custom definitions that have been materialized into the supervisor.
+    /// Keeping this local lets a long-lived router reject a deleted custom
+    /// id instead of falling back to its stale supervisor specification.
+    materialized_custom_agents: HashSet<String>,
     /// Phase 3 stores: provider config, secret material, and
     /// {agent, provider, key-ref, launch overrides, mcp servers} profiles.
     /// All in-memory only (see `crate::provider`/`crate::profile`'s doc
@@ -209,6 +292,17 @@ pub struct Router {
     providers: ProviderStore,
     keystore: Keystore,
     profiles: ProfileStore,
+    /// **`durable_secret_and_configuration_store`.** Set only via
+    /// [`Router::enable_durable_config`] (never by [`Router::new`] or
+    /// [`Router::with_persistence`] alone) -- encrypts every secret
+    /// `Keystore::store`s from that point on before it reaches
+    /// `persistence`. `None` keeps `keystore` exactly as in-memory-only
+    /// as it always was, so a `Router` that never opts in behaves
+    /// byte-for-byte like before this field existed.
+    secret_keyring: Option<Arc<Mutex<crate::keystore::MasterKeyring>>>,
+    /// Where [`Self::rotate_master_key`] writes the keyring back to disk
+    /// after minting a new version. Set alongside `secret_keyring`.
+    keyring_path: Option<std::path::PathBuf>,
     /// Centrally-registered MCP servers (Phase 3 step 17a), merged by
     /// name into a resolved profile's `mcpServers` at `session/new` --
     /// client entries always win on collision, see
@@ -231,6 +325,9 @@ pub struct Router {
     /// `NotificationHub` because it's bidirectional (request-out,
     /// reply-in) where `NotificationHub` is publish-only.
     agent_request_hub: AgentRequestHub,
+    /// Correlates backend-initiated requests with responses from the
+    /// persistent ACP client that currently owns the session.
+    interaction_hub: InteractionHub,
     /// **Phase 15 addition.** Identity (`Arc::as_ptr` cast to `usize`) of
     /// every physical backend process instance that already has an idle
     /// scavenger task (see [`spawn_idle_scavenger`]/[`backend_idle_
@@ -245,6 +342,217 @@ pub struct Router {
     /// notices its process has exited (`BackendProcess::has_exited`) and
     /// returns on its own next tick, see that function's doc comment.
     scavenged_backends: HashSet<usize>,
+    /// Opt-in isolation for managed profile processes. Disabled by default
+    /// so existing deployments continue sharing one process per profile.
+    tenant_process_isolation: bool,
+    /// Opt-in *session*-level isolation for managed profile processes,
+    /// orthogonal to (and composable with) `tenant_process_isolation`
+    /// (`backend_process_model` hardening item, `acp-gateway-daemon`
+    /// plan). Disabled by default -- every managed profile still shares
+    /// one process per (profile[, tenant]) key across every session
+    /// using it, unchanged. When enabled, every *new* managed session
+    /// gets its own dedicated backend process (keyed by folding that
+    /// session's own gateway id into the supervisor key -- see
+    /// `dispatch_session_new`'s use of this flag), trading process count
+    /// for full request/response isolation instead of two concurrent
+    /// sessions on one profile serializing behind that profile's single
+    /// process mutex. Native/unmanaged sessions (no `_acpx.profile`) are
+    /// unaffected regardless of this setting -- see `dispatch_session_new`.
+    session_process_isolation: bool,
+    /// **`connector_reference_lifecycle`.** Supervisor keys currently
+    /// observed to have zero referencing live sessions, mapped to when
+    /// that was first observed. Only populated/consulted when
+    /// `LifecycleConfig::connector_idle_shutdown_ttl` is `Some` --
+    /// `mark_unreferenced_if_idle`/`reap_unreferenced_backends` are the
+    /// only readers/writers. A key is removed the moment any session
+    /// references it again (see `dispatch_session_new`'s bookkeeping),
+    /// so re-use before the TTL elapses cancels a pending shutdown
+    /// cleanly rather than racing it.
+    unreferenced_backends: HashMap<String, std::time::Instant>,
+}
+
+/// Outcome of proactively restoring durable sessions during startup.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StartupRecoveryReport {
+    /// Rows restored into the live [`SessionRegistry`].
+    pub restored: usize,
+    /// Rows whose backend recovery RPC failed.
+    pub failed: usize,
+    /// Rows already registered in this router, so no recovery was needed.
+    pub skipped: usize,
+}
+
+/// Startup scheduling policy for durable session recovery. The scheduler
+/// allows different backend processes to recover concurrently; each
+/// individual backend remains serialized by its own stdio process mutex.
+#[derive(Debug, Clone)]
+pub struct StartupRecoveryPolicy {
+    pub timeout: Duration,
+    pub concurrency: usize,
+    pub fail_fast: bool,
+}
+
+impl Default for StartupRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            concurrency: 2,
+            fail_fast: false,
+        }
+    }
+}
+
+impl StartupRecoveryPolicy {
+    pub fn validate(&self) -> Result<(), RouterError> {
+        if self.timeout.is_zero() {
+            return Err(RouterError::InvalidRecoveryPolicy(
+                "timeout must be greater than zero".to_string(),
+            ));
+        }
+        if self.concurrency == 0 {
+            return Err(RouterError::InvalidRecoveryPolicy(
+                "concurrency must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct PreparedRecoveryJob {
+    tenant_id: TenantId,
+    entry: crate::session_registry::SessionEntry,
+    admission: SessionAdmissionPermit,
+    backend: acpx_conductor::supervisor::SharedBackendProcess,
+    call_policy: BackendCallPolicy,
+    request: serde_json::Value,
+    request_id: serde_json::Value,
+}
+
+/// Result of one lifecycle reaper pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleReapReport {
+    pub closed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+#[derive(Debug, Default)]
+struct AdmissionState {
+    live_total: usize,
+    live_by_tenant: HashMap<TenantId, usize>,
+    reserved_total: usize,
+    reserved_by_tenant: HashMap<TenantId, usize>,
+}
+
+impl AdmissionState {
+    fn reserve(
+        &mut self,
+        tenant_id: &TenantId,
+        lifecycle: &LifecycleConfig,
+    ) -> Result<(), RouterError> {
+        let total = self.live_total + self.reserved_total;
+        if total >= lifecycle.max_sessions_total {
+            return Err(RouterError::GlobalSessionCapacity {
+                current: total,
+                limit: lifecycle.max_sessions_total,
+            });
+        }
+        let tenant_count = self
+            .live_by_tenant
+            .get(tenant_id)
+            .copied()
+            .unwrap_or_default()
+            + self
+                .reserved_by_tenant
+                .get(tenant_id)
+                .copied()
+                .unwrap_or_default();
+        if tenant_count >= lifecycle.max_sessions_per_tenant {
+            return Err(RouterError::TenantSessionCapacity {
+                tenant: tenant_id.0.clone(),
+                current: tenant_count,
+                limit: lifecycle.max_sessions_per_tenant,
+            });
+        }
+        self.reserved_total += 1;
+        *self
+            .reserved_by_tenant
+            .entry(tenant_id.clone())
+            .or_default() += 1;
+        Ok(())
+    }
+
+    fn release_reservation(&mut self, tenant_id: &TenantId) {
+        debug_assert!(self.reserved_total > 0);
+        self.reserved_total -= 1;
+        let remove_tenant = {
+            let reserved = self
+                .reserved_by_tenant
+                .get_mut(tenant_id)
+                .expect("session admission tenant must exist");
+            debug_assert!(*reserved > 0);
+            *reserved -= 1;
+            *reserved == 0
+        };
+        if remove_tenant {
+            self.reserved_by_tenant.remove(tenant_id);
+        }
+    }
+
+    fn commit(&mut self, tenant_id: &TenantId) {
+        self.release_reservation(tenant_id);
+        self.live_total += 1;
+        *self.live_by_tenant.entry(tenant_id.clone()).or_default() += 1;
+    }
+
+    fn release_live(&mut self, tenant_id: &TenantId) {
+        debug_assert!(self.live_total > 0);
+        self.live_total -= 1;
+        let remove_tenant = {
+            let live = self
+                .live_by_tenant
+                .get_mut(tenant_id)
+                .expect("registered session tenant must exist");
+            debug_assert!(*live > 0);
+            *live -= 1;
+            *live == 0
+        };
+        if remove_tenant {
+            self.live_by_tenant.remove(tenant_id);
+        }
+    }
+}
+
+/// Reserves one future registry insertion. Dropping an uncommitted permit
+/// returns the reservation, including when Tokio cancels the request task.
+struct SessionAdmissionPermit {
+    state: Arc<Mutex<AdmissionState>>,
+    tenant_id: TenantId,
+    committed: bool,
+}
+
+impl SessionAdmissionPermit {
+    fn commit(mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.commit(&self.tenant_id);
+        self.committed = true;
+    }
+}
+
+impl Drop for SessionAdmissionPermit {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.release_reservation(&self.tenant_id);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -261,6 +569,16 @@ pub enum RouterError {
     MissingSessionId,
     #[error("no session registered for gateway session id {0}")]
     UnknownSession(String),
+    #[error(
+        "session capacity reached for tenant {tenant}: {current}/{limit} live gateway sessions"
+    )]
+    TenantSessionCapacity {
+        tenant: String,
+        current: usize,
+        limit: usize,
+    },
+    #[error("global session capacity reached: {current}/{limit} live gateway sessions")]
+    GlobalSessionCapacity { current: usize, limit: usize },
     #[error("backend response to session/new has no result.sessionId")]
     MissingBackendSessionId,
     #[error("backend rejected session/new: {0}")]
@@ -273,6 +591,10 @@ pub enum RouterError {
     Framing(#[from] acpx_conductor::framing::FramingError),
     #[error("agents/status: unknown agent id {0}")]
     UnknownAgentId(String),
+    #[error("session/new: agent {0} is disabled")]
+    AgentDisabled(String),
+    #[error("custom agent id {0} conflicts with an existing registered backend")]
+    CustomAgentIdConflict(String),
     #[error(transparent)]
     Install(#[from] acpx_registry::InstallError),
     #[error("agents/install: missing or non-string params.id")]
@@ -283,10 +605,14 @@ pub enum RouterError {
     Provider(#[from] crate::provider::ProviderStoreError),
     #[error("mcp server store: {0}")]
     McpServer(#[from] crate::mcp_servers::McpServerStoreError),
+    #[error("custom agent store: {0}")]
+    CustomAgent(#[from] crate::CustomAgentStoreError),
     #[error("keystore: {0}")]
     Keystore(#[from] crate::keystore::KeystoreError),
     #[error("session/new: no profile named {0}")]
     UnknownProfile(String),
+    #[error("session/new cannot select both _acpx.profile and _acpx.agentId")]
+    ConflictingSessionSelection,
     #[error("profile {profile} references unknown provider {provider}")]
     UnknownProviderRef { profile: String, provider: String },
     #[error("profile {profile}'s agent id {agent_id} has no npx/uvx distribution in the registry")]
@@ -308,6 +634,10 @@ pub enum RouterError {
     )]
     SessionRehydrationFailed(String, crate::persistence::PersistenceError),
     #[error(
+        "session/load: gateway session {0} is still restoring; retry this request after recovery completes"
+    )]
+    SessionRestoring(String),
+    #[error(
         "logout: acpx's own initialize response advertises no agentCapabilities.auth.logout \
          (gateway-level auth is transport-level, not ACP-level -- see acpx-server's own \
          HTTP/WS auth); acpx also has no single unambiguous backend a bare, session-less \
@@ -316,7 +646,61 @@ pub enum RouterError {
     LogoutNotSupported,
     #[error("backend rejected session/list: {0}")]
     BackendSessionListError(serde_json::Value),
+    #[error("startup recovery for gateway session {0} has non-object recovery params")]
+    InvalidRecoveryParams(String),
+    #[error("startup recovery timed out for gateway session {0}")]
+    RecoveryTimeout(String),
+    #[error("startup recovery stopped after a failed session: {0}")]
+    RecoveryFailFast(String),
+    #[error("invalid startup recovery policy: {0}")]
+    InvalidRecoveryPolicy(String),
+    #[error("persistence: {0}")]
+    Persistence(#[from] crate::persistence::PersistenceError),
+    #[error("durable config requires Router::with_persistence to be configured first")]
+    DurableConfigRequiresPersistence,
+    #[error("secret rotation requires Router::enable_durable_config to be configured first")]
+    RotationRequiresDurableConfig,
+    #[error("master keyring I/O error: {0}")]
+    KeyringIo(String),
+    #[error(
+        "session/retention/pin: tenant {tenant_id} already has {current} of at most {limit} \
+         pinned sessions"
+    )]
+    PinQuotaExceeded {
+        tenant_id: String,
+        current: usize,
+        limit: usize,
+    },
+    #[error(
+        "lifecycle reaper: backend session/close for gateway session {0} did not respond \
+         within {1:?}; leaving this session in place for a later reap pass instead of \
+         holding the whole gateway's lock indefinitely"
+    )]
+    ReapBackendCallTimeout(String, Duration),
 }
+
+/// Hard ceiling on the per-candidate backend `session/close` round trip
+/// inside [`Router::reap_expired_sessions`].
+///
+/// **Real incident this guards against, not a hypothetical.** The lifecycle
+/// reaper (`acpx-server/src/main.rs`'s periodic tick, default every 60s)
+/// calls this function while the caller already holds the single global
+/// [`SharedRouter`] mutex for the *entire* pass across every idle-expired
+/// session -- exactly the same lock `acp_bridge::BridgeRuntime::
+/// refresh_models` guards with `MODEL_PROBE_TIMEOUT` for the same reason.
+/// This function's own `ensure_backend_initialized`/`read_matching_response`
+/// round trip (sending a `session/close` to the session's backend) had no
+/// timeout of its own -- confirmed live: after acpx ran for a while with a
+/// real Zed client attached, one idle session's backend (`codex-acp`)
+/// stopped answering, the very next lifecycle-reaper tick's `session/close`
+/// blocked forever inside this loop, and every other tenant/session on the
+/// server hung behind the same held mutex from that point on -- matching a
+/// real "works right after restart, wedges again later" report exactly.
+/// Timing out here drops the inner future (and the per-process
+/// `BackendProcess` lock acquired inside it), so a single stuck backend
+/// only skips *this* session's reap this pass (it stays live, tried again
+/// on the next tick) instead of freezing the whole gateway.
+const REAP_BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Router {
     pub fn default_agent_id(&self) -> &str {
@@ -327,17 +711,30 @@ impl Router {
         Self {
             supervisor: acpx_conductor::Supervisor::new(),
             sessions: SessionRegistry::new(),
+            lifecycle: LifecycleConfig::default(),
+            admission: Arc::new(Mutex::new(AdmissionState::default())),
             default_agent_id: default_agent_id.into(),
+            native_auth_method_id: None,
             http: reqwest::Client::new(),
             registry_cache: None,
+            capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,
+            agent_enablement: None,
+            custom_agents: None,
+            materialized_custom_agents: HashSet::new(),
             providers: ProviderStore::new(),
             keystore: Keystore::new(),
             profiles: ProfileStore::new(),
             mcp_servers: McpServerStore::new(),
+            secret_keyring: None,
+            keyring_path: None,
             notification_hub: NotificationHub::new(),
             agent_request_hub: AgentRequestHub::new(),
+            interaction_hub: InteractionHub::new(),
             scavenged_backends: HashSet::new(),
+            tenant_process_isolation: false,
+            session_process_isolation: false,
+            unreferenced_backends: HashMap::new(),
         }
     }
 
@@ -355,6 +752,12 @@ impl Router {
     /// this hub is for.
     pub fn agent_request_hub(&self) -> AgentRequestHub {
         self.agent_request_hub.clone()
+    }
+
+    /// A clone of the persistent client interaction bridge. Transports bind
+    /// sessions they own and resolve client responses through this hub.
+    pub fn interaction_hub(&self) -> InteractionHub {
+        self.interaction_hub.clone()
     }
 
     /// **Phase 15.** Ensure exactly one idle scavenger task
@@ -394,8 +797,475 @@ impl Router {
     /// are recorded from that point on. Builder-style so callers can write
     /// `Router::new(id).with_persistence(store)`.
     pub fn with_persistence(mut self, store: PersistenceStore) -> Self {
+        self.agent_enablement = Some(AgentEnablement::new(store.clone()));
+        self.custom_agents = Some(CustomAgentStore::new(store.clone()));
         self.persistence = Some(store);
         self
+    }
+
+    /// **`durable_secret_and_configuration_store`.** Load an on-disk (or
+    /// freshly-created) [`crate::keystore::MasterKeyring`] at
+    /// `keyring_path`, then repopulate `providers`/`profiles`/
+    /// `mcp_servers`/`keystore` from whatever was persisted by a prior
+    /// process's runtime CRUD -- and, from this call forward, every
+    /// `profiles/create|update|delete`, `mcp_servers/create|update|
+    /// delete`, and secret store also writes through to `persistence`.
+    /// Requires [`Self::with_persistence`] to have been called first
+    /// (there is nowhere durable to load from or write through to
+    /// otherwise). Intended call site: `acpx-server`'s `main.rs`, once,
+    /// right after `with_persistence`, before either transport starts
+    /// accepting requests -- exactly like `warm_default_profiles`.
+    pub async fn enable_durable_config(
+        &mut self,
+        keyring_path: std::path::PathBuf,
+    ) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.clone() else {
+            return Err(RouterError::DurableConfigRequiresPersistence);
+        };
+        let keyring = crate::keystore::MasterKeyring::load_or_create(&keyring_path)
+            .map_err(|error| RouterError::KeyringIo(error.to_string()))?;
+
+        for (key_ref, ciphertext, nonce, key_version) in persistence.load_all_secrets().await? {
+            let plaintext = keyring
+                .decrypt(key_version, &nonce, &ciphertext)
+                .map_err(RouterError::Keystore)?;
+            let secret = String::from_utf8(plaintext).map_err(|error| {
+                RouterError::KeyringIo(format!("decrypted secret was not valid UTF-8: {error}"))
+            })?;
+            self.keystore
+                .insert_known(crate::keystore::KeyRef(key_ref), secret);
+        }
+
+        for raw in persistence.load_providers().await? {
+            if let Ok(provider) = serde_json::from_value::<crate::provider::ProviderConfig>(raw) {
+                self.register_provider(provider);
+            }
+        }
+
+        for raw in persistence.load_mcp_servers().await? {
+            self.mcp_servers.create(raw)?;
+        }
+
+        for raw in persistence.load_profiles().await? {
+            if let Ok(profile) = serde_json::from_value::<Profile>(raw) {
+                self.profiles.create(profile)?;
+            }
+        }
+
+        self.secret_keyring = Some(Arc::new(Mutex::new(keyring)));
+        self.keyring_path = Some(keyring_path);
+        Ok(())
+    }
+
+    /// Mint a new keyring version, re-encrypt every currently-known
+    /// secret under it, persist both the updated ciphertext rows and the
+    /// new keyring file, and return the new version number. Operator-
+    /// triggered (see `acpx-server`'s `ACPX_MASTER_KEYRING_ROTATE`) --
+    /// there is no automatic rotation schedule.
+    pub async fn rotate_master_key(&mut self) -> Result<u32, RouterError> {
+        let Some(keyring_lock) = self.secret_keyring.clone() else {
+            return Err(RouterError::RotationRequiresDurableConfig);
+        };
+        let Some(persistence) = self.persistence.clone() else {
+            return Err(RouterError::RotationRequiresDurableConfig);
+        };
+        let keyring_path = self
+            .keyring_path
+            .clone()
+            .ok_or(RouterError::RotationRequiresDurableConfig)?;
+
+        // Snapshot every (key_ref, secret) pair before touching the
+        // keyring lock -- `Keystore::iter` borrows `self.keystore`
+        // immutably, and re-encrypting doesn't need to hold that borrow
+        // across the persistence `.await`s below.
+        let secrets: Vec<(crate::keystore::KeyRef, String)> = self
+            .keystore
+            .iter()
+            .map(|(key_ref, secret)| (key_ref.clone(), secret.to_string()))
+            .collect();
+
+        let new_version = {
+            let mut keyring = keyring_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let version = keyring.rotate();
+            keyring
+                .save(&keyring_path)
+                .map_err(|error| RouterError::KeyringIo(error.to_string()))?;
+            version
+        };
+
+        let now = now_rfc3339();
+        for (key_ref, secret) in secrets {
+            let (version, nonce, ciphertext) = {
+                let keyring = keyring_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                keyring.encrypt(secret.as_bytes())
+            };
+            persistence
+                .record_secret(
+                    key_ref.0,
+                    ciphertext,
+                    nonce,
+                    version,
+                    now.clone(),
+                    Some(now.clone()),
+                )
+                .await?;
+        }
+
+        Ok(new_version)
+    }
+
+    /// Encrypt-and-persist one secret, no-op if durable config was never
+    /// enabled. Called right after `Keystore::store` at every profile
+    /// secret entry point. Errors propagate (fail-closed): once durable
+    /// config is enabled, a caller that got a successful `profiles/
+    /// create` response should never discover after a restart that the
+    /// secret silently never made it to disk.
+    async fn persist_secret_if_durable(
+        &self,
+        key_ref: &crate::keystore::KeyRef,
+        secret: &str,
+    ) -> Result<(), RouterError> {
+        let (Some(keyring_lock), Some(persistence)) =
+            (self.secret_keyring.as_ref(), self.persistence.as_ref())
+        else {
+            return Ok(());
+        };
+        let (version, nonce, ciphertext) = {
+            let keyring = keyring_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            keyring.encrypt(secret.as_bytes())
+        };
+        persistence
+            .record_secret(
+                key_ref.0.clone(),
+                ciphertext,
+                nonce,
+                version,
+                now_rfc3339(),
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn persist_profile_if_durable(&self, profile: &Profile) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let json = serde_json::to_value(profile).expect("Profile always serializes");
+        persistence
+            .upsert_profile(profile.name.clone(), json)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_persisted_profile_if_durable(&self, name: &str) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence.delete_profile(name).await?;
+        Ok(())
+    }
+
+    async fn persist_mcp_server_if_durable(
+        &self,
+        name: &str,
+        entry: &serde_json::Value,
+    ) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence.upsert_mcp_server(name, entry.clone()).await?;
+        Ok(())
+    }
+
+    async fn delete_persisted_mcp_server_if_durable(&self, name: &str) -> Result<(), RouterError> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence.delete_mcp_server(name).await?;
+        Ok(())
+    }
+
+    async fn ensure_agent_enabled(&self, agent_id: &str) -> Result<(), RouterError> {
+        if let Some(enablement) = &self.agent_enablement {
+            if !enablement.is_enabled(agent_id).await? {
+                return Err(RouterError::AgentDisabled(agent_id.to_owned()));
+            }
+        }
+        Ok(())
+    }
+
+    async fn custom_spawn_spec(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<acpx_conductor::SpawnSpec>, RouterError> {
+        let Some(custom_agents) = &self.custom_agents else {
+            return Ok(None);
+        };
+        let Some(agent) = custom_agents.get(agent_id).await? else {
+            return Ok(None);
+        };
+        let mut spec = acpx_conductor::SpawnSpec::new(agent.command, agent.args);
+        spec.env.extend(agent.env);
+        if let Some(cwd) = agent.cwd {
+            spec = spec.with_cwd(cwd);
+        }
+        Ok(Some(spec))
+    }
+
+    async fn ensure_custom_agent_registered(
+        &mut self,
+        agent_id: &str,
+    ) -> Result<bool, RouterError> {
+        let Some(spec) = self.custom_spawn_spec(agent_id).await? else {
+            if self.materialized_custom_agents.contains(agent_id) {
+                return Err(RouterError::UnknownAgentId(agent_id.to_owned()));
+            }
+            return Ok(false);
+        };
+        if self.supervisor.spec(agent_id).is_some()
+            && !self.materialized_custom_agents.contains(agent_id)
+        {
+            return Err(RouterError::CustomAgentIdConflict(agent_id.to_owned()));
+        }
+        self.supervisor.register(agent_id.to_owned(), spec);
+        self.materialized_custom_agents.insert(agent_id.to_owned());
+        Ok(true)
+    }
+
+    /// Clone the optional durable store for server-owned features that need
+    /// to persist metadata adjacent to a native gateway session.
+    pub fn persistence_store(&self) -> Option<PersistenceStore> {
+        self.persistence.clone()
+    }
+
+    /// Override native session limits. Server configuration should validate
+    /// the values before constructing a router; this builder preserves the
+    /// low-friction in-process test API.
+    pub fn with_lifecycle_config(mut self, config: LifecycleConfig) -> Self {
+        self.lifecycle = config;
+        self
+    }
+
+    /// **`virtual_and_pinned_resource_limits`.** Read-only accessor so a
+    /// caller outside this module (`acpx-server`'s strict `/acp` bridge
+    /// reaper task, which owns its own separate `BridgeSessionStore` not
+    /// tracked by this `Router`) can reuse the same deployment-configured
+    /// `unbound_bridge_session_ttl` rather than needing a second,
+    /// independently-configured copy of it.
+    pub fn lifecycle_config(&self) -> &LifecycleConfig {
+        &self.lifecycle
+    }
+
+    /// Replace the live notification hub before transports are attached.
+    /// The server uses this to apply deployment-level subscriber limits.
+    pub fn with_notification_hub(mut self, notification_hub: NotificationHub) -> Self {
+        self.notification_hub = notification_hub;
+        self
+    }
+
+    /// Configure whether a managed profile's backend process is shared
+    /// across tenants (default) or isolated per tenant.
+    pub fn with_tenant_process_isolation(mut self, enabled: bool) -> Self {
+        self.tenant_process_isolation = enabled;
+        self
+    }
+
+    /// Configure whether every new managed session gets its own dedicated
+    /// backend process (see `session_process_isolation`'s field doc
+    /// comment). Composable with [`Self::with_tenant_process_isolation`]:
+    /// both may be enabled together, in which case the per-session key is
+    /// layered on top of the per-tenant key.
+    pub fn with_session_process_isolation(mut self, enabled: bool) -> Self {
+        self.session_process_isolation = enabled;
+        self
+    }
+
+    /// Configure the backend auth method ACPX uses for a native/unmanaged
+    /// session. Managed profiles retain their own `auth_method_id`, and an
+    /// unset native value still refuses to guess.
+    pub fn with_native_auth_method_id(mut self, method_id: Option<String>) -> Self {
+        self.native_auth_method_id = method_id.filter(|value| !value.is_empty());
+        self
+    }
+
+    fn call_policy(&self, profile: Option<&Profile>) -> BackendCallPolicy {
+        let mut policy = BackendCallPolicy::from_profile(profile);
+        if profile.is_none() {
+            policy.auth_method_id = self.native_auth_method_id.clone();
+        }
+        policy
+    }
+
+    /// [`call_policy`], but resolves `profile_name` (a session's own
+    /// persisted/explicit profile, `None` for native/unmanaged mode) the
+    /// same way `dispatch_session_new`/`dispatch_session_new_shared` now
+    /// do: an explicit profile name wins as before, but a `None` (every
+    /// native-mode session, which is what the `/acp` bridge always creates)
+    /// still picks up whatever profile [`Router::ensure_default_profiles_seeded`]
+    /// auto-seeded under this exact `agent_id`, instead of always falling
+    /// through to `BackendCallPolicy::default()`'s `false`/`false`. Without
+    /// this, a session's *first* backend round trip (`session/new`) could
+    /// declare `fs`/`terminal` capability `true` at `initialize` time (per
+    /// that same fallback) while every later `session/prompt`/`cancel`/...
+    /// against the very same session recomputed a call policy that denies
+    /// them anyway -- a declared-vs-enforced contradiction, not just an
+    /// inconsistency, since a well-behaved backend that trusted the
+    /// `initialize` declaration and asked would get a false "disabled for
+    /// this profile" error back.
+    async fn call_policy_for(
+        &mut self,
+        profile_name: Option<&str>,
+        agent_id: &str,
+    ) -> BackendCallPolicy {
+        if let Some(name) = profile_name {
+            return self.call_policy(self.profiles.get(name));
+        }
+        self.call_policy(self.profiles.get(agent_id))
+    }
+
+    /// Warm [`ensure_default_profiles_seeded`] once, outside any per-request
+    /// critical section -- call this right after constructing/registering
+    /// agents on a `Router`, before it ever serves a real request. Real
+    /// registry-agent auto-seeding (see that function's doc comment) can
+    /// do genuine network I/O the first time (`ensure_registry_loaded`'s
+    /// registry fetch) plus a `crate::detect::detect` subprocess check per
+    /// candidate agent; every `_shared` dispatch function in this file
+    /// exists specifically to never hold `router`'s lock across I/O like
+    /// that, so none of them call this themselves (confirmed as a real,
+    /// concurrency-test-caught regression, not a hypothetical one, when
+    /// this was tried inline in `call_policy_for` -- see git history).
+    /// `call_policy_for`'s own fallback lookup is a plain, cheap
+    /// `HashMap::get` either way; it just returns nothing to elevate on
+    /// until this has actually run once.
+    pub async fn warm_default_profiles(&mut self) {
+        self.ensure_default_profiles_seeded().await;
+    }
+
+    /// Lifecycle-management seam used by the server's future authenticated
+    /// retention controls. Pinning never bypasses explicit `session/close`.
+    pub async fn set_session_pinned(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        pinned: bool,
+    ) -> Result<(), RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        if self.sessions.resolve(tenant_id, &gateway_id).is_none() {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+        }
+        if let Some(store) = self.persistence.clone() {
+            store
+                .update_session_pinned(gateway_session_id.to_string(), pinned, now_unix_nanos())
+                .await?;
+        }
+        self.sessions.set_pinned(tenant_id, &gateway_id, pinned);
+        Ok(())
+    }
+
+    /// **`retention_administration`.** `session/retention/pin`'s actual
+    /// handler: [`Self::set_session_pinned`] plus the per-tenant pin
+    /// quota (`LifecycleConfig::max_pinned_sessions_per_tenant`). A
+    /// no-op re-pin of an already-pinned session never itself trips the
+    /// quota it is already counted toward -- only a session transitioning
+    /// from unpinned to pinned can exceed it.
+    async fn set_session_pinned_administered(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        pinned: bool,
+    ) -> Result<(), RouterError> {
+        if pinned {
+            if let Some(limit) = self.lifecycle.max_pinned_sessions_per_tenant {
+                let gateway_id =
+                    acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+                let already_pinned = self
+                    .sessions
+                    .resolve(tenant_id, &gateway_id)
+                    .is_some_and(|entry| entry.pinned);
+                let current = self.sessions.pinned_count(tenant_id);
+                if !already_pinned && current >= limit {
+                    return Err(RouterError::PinQuotaExceeded {
+                        tenant_id: tenant_id.0.clone(),
+                        current,
+                        limit,
+                    });
+                }
+            }
+        }
+        self.set_session_pinned(tenant_id, gateway_session_id, pinned)
+            .await
+    }
+
+    /// **`retention_administration`.** `session/retention/set_ttl`'s
+    /// handler. Mirrors [`Self::set_session_pinned`]'s ownership check
+    /// and persistence write-through shape.
+    async fn set_session_custom_ttl(
+        &mut self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        if self.sessions.resolve(tenant_id, &gateway_id).is_none() {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+        }
+        if let Some(store) = self.persistence.clone() {
+            store
+                .update_session_custom_ttl(
+                    gateway_session_id.to_string(),
+                    ttl.map(|duration| duration.as_secs() as i64),
+                )
+                .await?;
+        }
+        self.sessions.set_custom_ttl(tenant_id, &gateway_id, ttl);
+        Ok(())
+    }
+
+    /// **`retention_administration`.** `session/retention/get`'s handler
+    /// (and every other retention arm's response shape) -- resolves and
+    /// formats one tenant-owned session's retention state. Errors
+    /// `UnknownSession` for a session that either never existed or
+    /// belongs to a different tenant (never distinguishable, matching
+    /// every other tenant-ownership check in this file).
+    fn retention_info_json(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Result<serde_json::Value, RouterError> {
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        let entry = self
+            .sessions
+            .resolve(tenant_id, &gateway_id)
+            .ok_or_else(|| RouterError::UnknownSession(gateway_session_id.to_string()))?;
+        Ok(retention_entry_json(gateway_session_id, entry))
+    }
+
+    fn admit_session(&self, tenant_id: &TenantId) -> Result<SessionAdmissionPermit, RouterError> {
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.reserve(tenant_id, &self.lifecycle)?;
+        Ok(SessionAdmissionPermit {
+            state: Arc::clone(&self.admission),
+            tenant_id: tenant_id.clone(),
+            committed: false,
+        })
+    }
+
+    fn release_live_session(&self, tenant_id: &TenantId) {
+        let mut state = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.release_live(tenant_id);
     }
 
     /// Register how to spawn a given agent id. Mirrors
@@ -403,6 +1273,165 @@ impl Router {
     /// just owns the `Supervisor` instance.
     pub fn register_agent(&mut self, agent_id: impl Into<String>, spec: acpx_conductor::SpawnSpec) {
         self.supervisor.register(agent_id, spec);
+    }
+
+    /// Diagnostic/test-only seam: `ProfileStore` has no CRUD wiring exposed
+    /// over any transport yet (no admin endpoint, no config-file loader --
+    /// `_acpx.profile` can currently only ever name a profile registered
+    /// this way, in-process, before the first request that references it).
+    /// Exists so integration tests can register one directly against
+    /// `Router` without needing that wiring to exist first.
+    pub fn register_profile(
+        &mut self,
+        profile: crate::profile::Profile,
+    ) -> Result<(), crate::profile::ProfileStoreError> {
+        self.profiles.create(profile)
+    }
+
+    /// Revoke a custom definition from the live process manager after the
+    /// admin plane deletes it. Existing sessions using that definition are
+    /// intentionally terminated rather than left attached to a command an
+    /// operator has explicitly removed.
+    pub async fn revoke_custom_agent(&mut self, agent_id: &str) -> Result<(), RouterError> {
+        self.supervisor.stop(agent_id).await?;
+        for profile in self
+            .profiles
+            .list()
+            .filter(|profile| profile.agent_id == agent_id)
+        {
+            let key = format!("profile:{}", profile.name);
+            self.supervisor.stop(&key).await?;
+            self.supervisor
+                .stop_prefix(&format!("{key}:tenant:"))
+                .await?;
+        }
+        // Keep the id marked as materialized: without the durable custom
+        // record, a stale direct supervisor spec must never become
+        // launchable again in this daemon lifetime.
+        self.materialized_custom_agents.insert(agent_id.to_owned());
+        Ok(())
+    }
+
+    /// Ensure an official registry adapter has a launch specification
+    /// registered without starting its process. The strict ACP bridge uses
+    /// this before its first lazy-bound turn; native callers remain free to
+    /// provision explicit specs through [`Self::register_agent`].
+    pub async fn ensure_registry_agent_registered(
+        &mut self,
+        agent_id: &str,
+    ) -> Result<(), RouterError> {
+        if self.supervisor.spec(agent_id).is_some() {
+            return Ok(());
+        }
+        self.ensure_registry_loaded().await;
+        let agent = self
+            .registry_cache
+            .as_ref()
+            .expect("registry cache populated by ensure_registry_loaded")
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .cloned()
+            .ok_or_else(|| RouterError::UnknownAgentId(agent_id.to_string()))?;
+        let spec = npx_spawn_spec(&agent).ok_or_else(|| RouterError::NoLaunchableDistribution {
+            profile: "bridge".to_string(),
+            agent_id: agent_id.to_string(),
+        })?;
+        self.supervisor.register(agent_id.to_string(), spec);
+        Ok(())
+    }
+
+    /// Discover one adapter's runtime model and permission selectors without
+    /// creating an ACPX gateway session. The temporary backend session is
+    /// always closed before the result is cached.
+    pub async fn probe_adapter_capabilities(
+        &mut self,
+        agent_id: &str,
+        cwd: &str,
+    ) -> Result<acpx_registry::AdapterCapabilities, RouterError> {
+        self.ensure_agent_enabled(agent_id).await?;
+        if self.supervisor.spec(agent_id).is_none() {
+            self.ensure_registry_agent_registered(agent_id).await?;
+        }
+
+        let adapter_version = {
+            self.ensure_registry_loaded().await;
+            self.registry_cache
+                .as_ref()
+                .and_then(|registry| registry.agents.iter().find(|agent| agent.id == agent_id))
+                .map(|agent| agent.version.clone())
+        };
+        let cache_key = acpx_registry::CapabilityCacheKey::new(agent_id, adapter_version.clone());
+        if let Some(capabilities) = self.capability_cache.get(&cache_key, Instant::now()) {
+            return Ok(capabilities);
+        }
+
+        let backend = self.supervisor.ensure_running(agent_id).await?;
+        let capabilities = {
+            let mut backend = backend.lock().await;
+            // Bug fix: this previously hardcoded `BackendCallPolicy::default()`
+            // (no `auth_method_id`), so a capability probe against any
+            // backend that advertises non-empty `authMethods` at
+            // `initialize` time always failed with
+            // `BackendRequiresAuthentication`, even when the router was
+            // configured with `Router::with_native_auth_method_id` (or a
+            // profile-level `auth_method_id`) specifically to answer that.
+            // Every other `ensure_backend_initialized` call site already
+            // passes the resolved `self.call_policy(profile)` -- the probe
+            // path is native/unmanaged (no profile), so `self.call_policy
+            // (None)` is the same policy real `session/new` dispatch would
+            // use for this agent.
+            let call_policy = self.call_policy(None);
+            ensure_backend_initialized(&mut backend, call_policy).await?;
+            let initialize_result = backend.agent_capabilities.clone().unwrap_or_default();
+
+            let new_id = serde_json::json!("acpx-capability-probe-new");
+            backend
+                .writer
+                .lock()
+                .await
+                .write_value(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": new_id,
+                    "method": "session/new",
+                    "params": {"cwd": cwd, "mcpServers": []}
+                }))
+                .await?;
+            let (response, _, _) =
+                read_matching_response(&mut backend, &new_id, BackendCallPolicy::default(), None)
+                    .await?;
+            let backend_session_id = extract_backend_session_id(&response)?;
+            let capabilities = acpx_registry::AdapterCapabilities::from_acp(
+                agent_id,
+                &initialize_result,
+                &response["result"],
+            );
+
+            let close_id = serde_json::json!("acpx-capability-probe-close");
+            backend
+                .writer
+                .lock()
+                .await
+                .write_value(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": close_id,
+                    "method": "session/close",
+                    "params": {"sessionId": backend_session_id}
+                }))
+                .await?;
+            if let Err(error) =
+                read_matching_response(&mut backend, &close_id, BackendCallPolicy::default(), None)
+                    .await
+            {
+                tracing::warn!(%error, %agent_id, "capability probe could not close disposable backend session");
+            }
+            capabilities
+        };
+
+        self.capability_cache.invalidate_adapter(agent_id);
+        self.capability_cache
+            .put(cache_key, capabilities.clone(), Instant::now());
+        Ok(capabilities)
     }
 
     /// Seed a provider config, overwriting any existing entry of the same
@@ -416,9 +1445,25 @@ impl Router {
     /// tests use it directly too.
     pub fn register_provider(&mut self, provider: crate::provider::ProviderConfig) {
         let name = provider.name.clone();
+        let json = serde_json::to_value(&provider).expect("ProviderConfig always serializes");
         if self.providers.update(provider.clone()).is_err() {
             let _ = self.providers.create(provider);
-            let _ = name; // update() already logged nothing; create() covers the fresh-entry case
+        }
+        // Best-effort durability mirror -- fire-and-forget `tokio::spawn`
+        // since this method is sync (no runtime `providers/*` JSON-RPC
+        // endpoint exists to make a stronger await-and-propagate promise
+        // to, see this method's own doc comment) and providers are
+        // low-frequency, startup/provisioning-time writes. `enable_
+        // durable_config`'s own load path re-applies `ACPX_CONFIG_FILE`
+        // providers every boot regardless, so this only closes the gap
+        // for providers registered outside that file (e.g. directly by
+        // an embedding caller).
+        if let Some(persistence) = self.persistence.clone() {
+            tokio::spawn(async move {
+                if let Err(error) = persistence.upsert_provider(name.clone(), json).await {
+                    tracing::warn!(%error, provider = %name, "failed to persist provider config");
+                }
+            });
         }
     }
 
@@ -444,6 +1489,232 @@ impl Router {
         self.supervisor.status(supervisor_key)
     }
 
+    /// Test/observability seam for a live backend process id.
+    pub async fn process_id(&self, supervisor_key: &str) -> Option<u32> {
+        self.supervisor.process_id(supervisor_key).await
+    }
+
+    /// Test/observability seam: the supervisor key `gateway_session_id`
+    /// was created under. Lets a test assert on `process_status` (which
+    /// takes `&mut self`) *after* the session itself has already been
+    /// removed from the registry (e.g. post-reap), when
+    /// `process_id_for_session` can no longer resolve it.
+    pub fn supervisor_key_for_session(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Option<String> {
+        Some(
+            self.sessions
+                .resolve(
+                    tenant_id,
+                    &acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
+                )?
+                .agent_id
+                .clone(),
+        )
+    }
+
+    /// Test/observability seam: the live backend process id for whatever
+    /// supervisor key `gateway_session_id` was created under, following
+    /// the exact same lookup real proxied calls use (`entry.agent_id`).
+    /// Primarily exists so `ACPX_SESSION_PROCESS_ISOLATION` tests can
+    /// assert on a specific session's dedicated process without needing
+    /// to reconstruct its randomly-minted supervisor key by hand.
+    pub async fn process_id_for_session(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+    ) -> Option<u32> {
+        let agent_id = self
+            .sessions
+            .resolve(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
+            )?
+            .agent_id
+            .clone();
+        self.process_id(&agent_id).await
+    }
+
+    /// True if `supervisor_key` was minted by this router's
+    /// `session_process_isolation` path (see `dispatch_session_new`'s doc
+    /// comment) -- i.e. it is provably exclusive to exactly one session,
+    /// so stopping its backend process on that session's close can never
+    /// affect any other still-open session. A profile/tenant-only key
+    /// (the pre-existing shared-process default) never matches this and
+    /// is therefore never auto-stopped on ordinary session close/reap,
+    /// preserving that mode's whole point: keeping the process warm
+    /// across session churn.
+    fn is_session_scoped_supervisor_key(supervisor_key: &str) -> bool {
+        supervisor_key.contains(":session:")
+    }
+
+    /// Stops `supervisor_key`'s backend process iff it is session-scoped
+    /// (see [`Self::is_session_scoped_supervisor_key`]) -- a no-op for
+    /// every pre-existing shared-process key, so ordinary session
+    /// close/reap under the default (or tenant-isolated) process model is
+    /// completely unaffected. Errors are logged, not propagated: a
+    /// session is already being torn down by the caller regardless of
+    /// whether its now-orphaned dedicated process manages to stop
+    /// cleanly, and `Supervisor::stop` on an already-dead process is
+    /// itself a no-op, not an error.
+    async fn stop_if_session_scoped(&mut self, supervisor_key: &str) {
+        if !Self::is_session_scoped_supervisor_key(supervisor_key) {
+            return;
+        }
+        if let Err(error) = self.supervisor.stop(supervisor_key).await {
+            tracing::warn!(
+                %error,
+                %supervisor_key,
+                "failed to stop a session-isolated backend process on session close"
+            );
+        }
+    }
+
+    /// **`connector_reference_lifecycle`.** Called after any session
+    /// removal (reap, explicit `session/close`, or persistence-failure
+    /// rollback): if `supervisor_key` is no longer referenced by any
+    /// live session, and connector-idle-shutdown is enabled, records
+    /// when it first became unreferenced (a no-op if already recorded --
+    /// the timer starts once, not on every later check). A session-
+    /// scoped key (`stop_if_session_scoped` already stopped it
+    /// unconditionally, so it is never a real candidate) is skipped, and
+    /// a bare native/unmanaged agent id (never resolved through a
+    /// profile) is also skipped -- shutting down a directly-`register_
+    /// agent`-registered backend that a client may reference again at
+    /// any moment via native mode (no `session/new` failure to recover
+    /// from the way a profile-backed respawn has) is out of scope for
+    /// this opt-in feature.
+    fn mark_unreferenced_if_idle(&mut self, supervisor_key: &str) {
+        let Some(_ttl) = self.lifecycle.connector_idle_shutdown_ttl else {
+            return;
+        };
+        if Self::is_session_scoped_supervisor_key(supervisor_key)
+            || !supervisor_key.starts_with("profile:")
+        {
+            return;
+        }
+        if self.sessions.count_by_agent_id(supervisor_key) == 0 {
+            self.unreferenced_backends
+                .entry(supervisor_key.to_string())
+                .or_insert_with(std::time::Instant::now);
+        }
+    }
+
+    /// Cancels a pending idle-shutdown for `supervisor_key` -- called
+    /// whenever a session is (re-)registered under it, so a backend that
+    /// gains a new referencing session before its grace period elapses
+    /// is never stopped out from under that session.
+    fn cancel_unreferenced_shutdown(&mut self, supervisor_key: &str) {
+        self.unreferenced_backends.remove(supervisor_key);
+    }
+
+    /// **`connector_reference_lifecycle`.** Stops every supervisor key
+    /// that has been continuously unreferenced (zero live sessions) for
+    /// at least `LifecycleConfig::connector_idle_shutdown_ttl`. No-op
+    /// (returns `0` immediately) unless that config is `Some` --
+    /// intended to be polled periodically by the same caller driving
+    /// [`Self::reap_expired_sessions`] (see `acpx-server`'s `main.rs`),
+    /// but is itself independent of it: this only ever stops a process,
+    /// never touches `SessionRegistry` (there is nothing left in it
+    /// referencing an already-unreferenced key by definition).
+    /// Double-checks the reference count at stop time (not just at the
+    /// original observation) in case a new session raced in after
+    /// `mark_unreferenced_if_idle` recorded it but before this call --
+    /// that session's own `cancel_unreferenced_shutdown` call may not
+    /// yet have run if this is invoked concurrently, so this is the
+    /// final, authoritative check.
+    pub async fn reap_unreferenced_backends(&mut self, now: std::time::Instant) -> usize {
+        let Some(ttl) = self.lifecycle.connector_idle_shutdown_ttl else {
+            return 0;
+        };
+        let expired: Vec<String> = self
+            .unreferenced_backends
+            .iter()
+            .filter(|(_, since)| now.saturating_duration_since(**since) >= ttl)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut stopped = 0;
+        for key in expired {
+            self.unreferenced_backends.remove(&key);
+            if self.sessions.count_by_agent_id(&key) != 0 {
+                continue; // Raced with a new session -- leave it running.
+            }
+            if let Err(error) = self.supervisor.stop(&key).await {
+                tracing::warn!(
+                    %error,
+                    supervisor_key = %key,
+                    "failed to stop an idle, unreferenced backend process"
+                );
+                continue;
+            }
+            stopped += 1;
+        }
+        stopped
+    }
+
+    /// **`active_turn_deadline`.** Best-effort bounded recovery for a
+    /// turn that has been continuously in-flight for at least
+    /// `LifecycleConfig::active_turn_deadline` (see
+    /// `SessionRegistry::stuck_in_flight_candidates`). For each stuck
+    /// session: sends the backend the exact same `session/cancel`
+    /// notification `Router::dispatch_session_cancel` would (through
+    /// `Supervisor::cancel_writer`, independent of the per-process lock
+    /// the stuck `dispatch_proxied`/`dispatch_proxied_shared` call is
+    /// still holding -- see that method's doc comment for why that
+    /// separate writer handle is what makes delivery possible at all
+    /// while a call is still blocked reading a response), then
+    /// force-clears `in_flight` so the session is no longer
+    /// unconditionally skipped by every future `reap_expired_sessions`/
+    /// `stuck_in_flight_candidates` pass.
+    ///
+    /// Deliberately does **not** itself close, remove, or touch the
+    /// persisted session row -- the still-running backend call this is
+    /// racing may yet resolve normally (this only ever asks the backend
+    /// to *stop*, it cannot force an in-progress `read_matching_response`
+    /// await in another task to return early), and forcibly tearing down
+    /// the gateway session out from under that still-live call would
+    /// turn one stuck turn into a second, worse bug: a response the
+    /// original caller is still awaiting racing a session the registry
+    /// no longer knows about. Once cleared, the *next* reaper tick's
+    /// ordinary idle-TTL pass becomes the real backstop if the backend
+    /// never actually confirms the cancellation -- exactly the "recovery
+    /// policy" half of this report, not just "cancellation".
+    pub async fn cancel_stuck_turns(&mut self, now: std::time::Instant) -> usize {
+        let candidates = self
+            .sessions
+            .stuck_in_flight_candidates(now, &self.lifecycle);
+        let mut cancelled = 0;
+        for (tenant_id, gateway_id) in candidates {
+            let Some(entry) = self.sessions.resolve(&tenant_id, &gateway_id).cloned() else {
+                continue;
+            };
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": { "sessionId": entry.backend_session_id.0 }
+            });
+            if let Some(writer) = self.supervisor.cancel_writer(&entry.agent_id) {
+                if let Err(error) = writer.lock().await.write_value(&notification).await {
+                    tracing::warn!(
+                        %error,
+                        gateway_session_id = %gateway_id.0,
+                        "failed to deliver best-effort session/cancel for a stuck turn"
+                    );
+                }
+            }
+            self.spawn_transcript(gateway_id.0.clone(), Direction::ClientToAgent, notification);
+            self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
+            tracing::warn!(
+                gateway_session_id = %gateway_id.0,
+                "cancelled a turn that exceeded the active-turn deadline"
+            );
+            cancelled += 1;
+        }
+        cancelled
+    }
+
     /// Fire-and-forget one transcript append, if persistence is attached.
     /// Never awaited by the caller -- spawned onto the runtime so a slow
     /// sqlite write can't add latency to the client-visible request path.
@@ -461,25 +1732,43 @@ impl Router {
         );
     }
 
-    /// Fire-and-forget persistence for a freshly-registered session:
-    /// `record_session` followed by the two `session/new` transcript rows
-    /// (client request, agent response), all inside a *single* spawned
-    /// task so the writes are strictly ordered.
-    ///
-    /// This matters beyond bookkeeping: `transcripts.gateway_session_id`
-    /// has a `FOREIGN KEY` on `sessions.gateway_session_id` (see
-    /// `persistence/mod.rs`'s `SCHEMA_SQL`). Spawning `record_session` and
-    /// the transcript appends as three *independent* `tokio::spawn` tasks
-    /// (as this used to do) races them against each other -- if either
-    /// transcript insert's blocking-pool task got scheduled before
-    /// `record_session`'s, sqlite rejected it with `FOREIGN KEY constraint
-    /// failed`, and because these are fire-and-forget the error was only
-    /// ever logged via `tracing::warn!`, never surfacing to a caller. That
-    /// produced the exact flake seen in `router_persistence_test.rs`:
-    /// `list_transcripts` intermittently stuck at 0 or 1 instead of 2.
-    /// Doing all three writes sequentially inside one task preserves the
-    /// "never block the client-visible request path" property while
-    /// guaranteeing the parent `sessions` row always lands first.
+    async fn persist_session_recovery(
+        &self,
+        tenant_id: &TenantId,
+        gateway_session_id: &str,
+        entry: &crate::session_registry::SessionEntry,
+        effective_params: serde_json::Value,
+    ) -> Result<(), RouterError> {
+        let Some(store) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        store
+            .record_session_with_recovery(
+                gateway_session_id,
+                entry.agent_id.clone(),
+                entry.backend_session_id.0.clone(),
+                entry.profile_name.clone(),
+                now_rfc3339(),
+                tenant_id.0.clone(),
+                RecoveryMetadata {
+                    cwd: entry.cwd.clone(),
+                    recovery_params: Some(effective_params),
+                    status: RecoveryStatus::Active,
+                    recovery_method: RecoveryMethod::Load,
+                    last_recovery_error: None,
+                    created_at_unix_nanos: Some(now_unix_nanos()),
+                    last_activity_at_unix_nanos: Some(now_unix_nanos()),
+                    pinned: entry.pinned,
+                    bridge_session_id: None,
+                    bridge_model_alias: None,
+                    bridge_config_options: None,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn spawn_session_persistence(
         &self,
         tenant_id: &TenantId,
@@ -502,6 +1791,266 @@ impl Router {
         );
     }
 
+    /// Restore all durable, open sessions before the router begins serving
+    /// prompts. Failed rows remain durable for later inspection/retry but
+    /// are intentionally never added to the live registry.
+    pub async fn recover_open_sessions(&mut self) -> Result<StartupRecoveryReport, RouterError> {
+        let Some(store) = self.persistence.clone() else {
+            return Ok(StartupRecoveryReport::default());
+        };
+        let mut report = StartupRecoveryReport::default();
+
+        for record in store.list_recoverable_sessions().await? {
+            if record.recovery_method == RecoveryMethod::None {
+                report.skipped += 1;
+                continue;
+            }
+            let tenant_id = TenantId(record.tenant_id.clone());
+            let gateway_id =
+                acpx_proto::session::GatewaySessionId(record.gateway_session_id.clone());
+            if self.sessions.resolve(&tenant_id, &gateway_id).is_some() {
+                report.skipped += 1;
+                continue;
+            }
+
+            store
+                .update_recovery_status(
+                    record.gateway_session_id.clone(),
+                    RecoveryStatus::Restoring,
+                    None,
+                )
+                .await?;
+
+            let result = self.restore_open_session(&record).await;
+            match result {
+                Ok((tenant_id, entry, admission)) => {
+                    store
+                        .update_recovery_status(
+                            record.gateway_session_id.clone(),
+                            RecoveryStatus::Restored,
+                            None,
+                        )
+                        .await?;
+                    // See `dispatch_session_new`'s identical cancellation
+                    // -- this startup-restore path re-registers a session
+                    // against `entry.agent_id`'s supervisor key too.
+                    let supervisor_key_for_cancel = entry.agent_id.clone();
+                    self.sessions.insert(
+                        &tenant_id,
+                        acpx_proto::session::GatewaySessionId(record.gateway_session_id.clone()),
+                        entry,
+                    );
+                    self.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
+                    admission.commit();
+                    report.restored += 1;
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    store
+                        .update_recovery_status(
+                            record.gateway_session_id.clone(),
+                            RecoveryStatus::RecoveryFailed,
+                            Some(error),
+                        )
+                        .await?;
+                    report.failed += 1;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Safely closes and removes sessions whose native lifecycle retention
+    /// deadline has elapsed. Candidates are selected only when unpinned and
+    /// not already executing; each is marked in-flight before any backend
+    /// I/O so another reaper pass cannot race it.
+    pub async fn reap_expired_sessions(&mut self, now: std::time::Instant) -> LifecycleReapReport {
+        let candidates = self.sessions.reap_candidates(now, &self.lifecycle);
+        let mut report = LifecycleReapReport::default();
+
+        for (tenant_id, gateway_id) in candidates {
+            let Some(entry) = self.sessions.resolve(&tenant_id, &gateway_id).cloned() else {
+                report.skipped += 1;
+                continue;
+            };
+            if entry.pinned || entry.in_flight != 0 {
+                report.skipped += 1;
+                continue;
+            }
+            self.sessions.set_in_flight(&tenant_id, &gateway_id, 1);
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 999_998,
+                "method": "session/close",
+                "params": {"sessionId": entry.backend_session_id.0}
+            });
+            let call = async {
+                let backend = self.supervisor.ensure_running(&entry.agent_id).await?;
+                let call_policy = self
+                    .call_policy_for(entry.profile_name.as_deref(), &entry.agent_id)
+                    .await;
+                let mut backend = backend.lock().await;
+                ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
+                backend.writer.lock().await.write_value(&request).await?;
+                let (response, _, _) = read_matching_response(
+                    &mut backend,
+                    &serde_json::json!(999_998),
+                    call_policy,
+                    None,
+                )
+                .await?;
+                if let Some(error) = response.get("error") {
+                    return Err(RouterError::BackendSessionNewError(error.clone()));
+                }
+                Ok::<_, RouterError>(())
+            };
+            let result = match tokio::time::timeout(REAP_BACKEND_CALL_TIMEOUT, call).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Dropping `call` here releases the per-process
+                    // `BackendProcess` lock it may have acquired inside
+                    // `ensure_backend_initialized`/`read_matching_response`,
+                    // so a stuck backend can never hold this whole
+                    // reaper (and the global router mutex the caller
+                    // holds around it) hostage indefinitely. See
+                    // `REAP_BACKEND_CALL_TIMEOUT`'s doc comment for the
+                    // live incident this closes.
+                    tracing::warn!(
+                        gateway_session_id = %gateway_id.0,
+                        agent_id = %entry.agent_id,
+                        timeout_secs = REAP_BACKEND_CALL_TIMEOUT.as_secs(),
+                        "lifecycle reaper's session/close timed out; leaving this session \
+                         live and retrying on a later reap pass instead of blocking every \
+                         other tenant/session behind the router lock"
+                    );
+                    Err(RouterError::ReapBackendCallTimeout(
+                        gateway_id.0.clone(),
+                        REAP_BACKEND_CALL_TIMEOUT,
+                    ))
+                }
+            };
+            if result.is_err() {
+                self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
+                report.failed += 1;
+                continue;
+            }
+            if let Some(store) = self.persistence.clone() {
+                if store
+                    .close_session(gateway_id.0.clone(), now_rfc3339())
+                    .await
+                    .is_err()
+                {
+                    self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
+                    report.failed += 1;
+                    continue;
+                }
+            }
+            if let Some(removed) = self.sessions.remove(&tenant_id, &gateway_id) {
+                self.release_live_session(&tenant_id);
+                self.stop_if_session_scoped(&removed.agent_id).await;
+                self.mark_unreferenced_if_idle(&removed.agent_id);
+                report.closed += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+        report
+    }
+
+    async fn restore_open_session(
+        &mut self,
+        record: &crate::persistence::SessionRecord,
+    ) -> Result<
+        (
+            TenantId,
+            crate::session_registry::SessionEntry,
+            SessionAdmissionPermit,
+        ),
+        RouterError,
+    > {
+        let job = self.prepare_open_session_recovery(record).await?;
+        let job = execute_open_session_recovery(job).await?;
+        Ok((job.tenant_id, job.entry, job.admission))
+    }
+
+    async fn prepare_open_session_recovery(
+        &mut self,
+        record: &crate::persistence::SessionRecord,
+    ) -> Result<PreparedRecoveryJob, RouterError> {
+        let tenant_id = TenantId(record.tenant_id.clone());
+
+        let mut params = record
+            .recovery_params
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let params_object = params
+            .as_object_mut()
+            .ok_or_else(|| RouterError::InvalidRecoveryParams(record.gateway_session_id.clone()))?;
+        params_object.insert(
+            "sessionId".to_string(),
+            serde_json::Value::String(record.backend_session_id.clone()),
+        );
+        if let Some(cwd) = &record.cwd {
+            params_object.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
+        }
+
+        let agent_id = if let Some(profile_name) = record.profile_name.as_deref() {
+            self.resolve_profile(profile_name, &tenant_id).await?.0
+        } else {
+            record.agent_id.clone()
+        };
+        let admission = self.admit_session(&tenant_id)?;
+        let backend = self.supervisor.ensure_running(&agent_id).await?;
+        let call_policy = self
+            .call_policy_for(record.profile_name.as_deref(), &agent_id)
+            .await;
+        let request_id = format!("acpx-startup-recovery:{}", record.gateway_session_id);
+        let request_id_value = serde_json::Value::String(request_id.clone());
+        let recovery_method = match record.recovery_method {
+            RecoveryMethod::Load => "session/load",
+            RecoveryMethod::Resume => "session/resume",
+            RecoveryMethod::None => unreachable!("filtered before recovery"),
+        };
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id_value,
+            "method": recovery_method,
+            "params": params,
+        });
+
+        Ok(PreparedRecoveryJob {
+            tenant_id,
+            entry: crate::session_registry::SessionEntry {
+                agent_id,
+                backend_session_id: BackendSessionId(record.backend_session_id.clone()),
+                profile_name: record.profile_name.clone(),
+                cwd: record.cwd.clone(),
+                created_at: restore_lifecycle_instant(record.created_at_unix_nanos),
+                last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
+                in_flight: 0,
+                in_flight_since: None,
+                pinned: record.pinned,
+                custom_idle_ttl: record
+                    .custom_idle_ttl_seconds
+                    .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
+            },
+            admission,
+            backend,
+            call_policy,
+            request,
+            request_id: request_id_value,
+        })
+    }
+
+    fn recovery_supervisor_key(&self, record: &crate::persistence::SessionRecord) -> String {
+        let tenant_id = TenantId(record.tenant_id.clone());
+        match record.profile_name.as_deref() {
+            Some(profile_name) => self.profile_supervisor_key(profile_name, &tenant_id),
+            None => record.agent_id.clone(),
+        }
+    }
+
     /// Ensure the registry cache is populated, fetching (live, falling
     /// back to the bundled snapshot on any error) if it hasn't been yet.
     /// See `acpx_registry::fetch_registry_or_fallback` -- this never
@@ -511,6 +2060,88 @@ impl Router {
             self.registry_cache = Some(acpx_registry::fetch_registry_or_fallback(&self.http).await);
         }
         self.registry_cache.as_ref().expect("just populated")
+    }
+
+    /// Auto-seed one native (no `provider`/`key_ref`) [`Profile`] per
+    /// ACP-registry agent this host can actually launch
+    /// (`AgentStatus::Installed` per [`crate::detect::detect`]), named
+    /// after the agent's registry id (`claude-acp`, `codex-acp`,
+    /// `gemini`, ...) -- so `_acpx.profile` (and `profiles/list`) surface
+    /// every backend the host already supports with zero
+    /// `ACPX_CONFIG_FILE`/`profiles/create` setup required, instead of an
+    /// empty `ProfileStore` until an operator explicitly provisions one.
+    /// This closes the gap where `agents/list` could report `Installed`
+    /// for claude/codex/gemini while `profiles/list` -- the thing
+    /// `session/new`'s `_acpx.profile` actually resolves against --
+    /// stayed empty regardless.
+    ///
+    /// An explicitly created/provisioned profile of the same name always
+    /// wins (this only fills in names nobody has claimed yet -- see the
+    /// `self.profiles.get(&agent.id).is_some()` skip below); a synthetic
+    /// profile carries no provider/key, so it composes with an
+    /// already-completed `codex login`/`claude login` on this host via
+    /// plain ambient-env inheritance, exactly like `default_agent_id`'s
+    /// native/unmanaged mode already does (see `crate::launch`'s doc
+    /// comment).
+    ///
+    /// Idempotent and self-healing rather than a one-shot/cached flag:
+    /// re-run on every `profiles/list` call and every `_acpx.profile`
+    /// resolution. Cheap either way -- `ensure_registry_loaded` caches
+    /// the registry fetch after the first call, and detection is just a
+    /// handful of `<runtime> --version` subprocess spawns (three agents
+    /// in the bundled fallback registry as of this writing) -- so an
+    /// agent that becomes installed only after this process started
+    /// (e.g. `node` added to `PATH` later) still gets picked up without
+    /// a restart, with no separate cache-invalidation path to get wrong.
+    async fn ensure_default_profiles_seeded(&mut self) {
+        self.ensure_registry_loaded().await;
+        let agents = self
+            .registry_cache
+            .as_ref()
+            .expect("just loaded")
+            .agents
+            .clone();
+        for agent in agents {
+            if self.profiles.get(&agent.id).is_some() {
+                continue;
+            }
+            if crate::detect::detect(&agent.id, &agent.distribution) != AgentStatus::Installed {
+                continue;
+            }
+            let profile = Profile {
+                name: agent.id.clone(),
+                agent_id: agent.id.clone(),
+                // Not `Profile::default()`'s `false`/`false`: every
+                // registry-listed agent (`claude-acp`/`codex-acp`/`gemini`)
+                // is a locally-spawned subprocess that already has
+                // unrestricted host filesystem/process access on its own,
+                // with or without ACPX's client-mediated `fs`/`terminal`
+                // capability -- declaring `false` here buys these agents
+                // no real isolation, it only breaks them. Verified against
+                // real backends: a real `claude-agent-acp` process silently
+                // stops using the ACP terminal/permission round trip at all
+                // (executes Bash directly, no `session/request_permission`,
+                // no `WaitingForConfirmation` a client could ever act on)
+                // when `terminal` is declared `false`; a real `codex-acp`
+                // process outright rejects `session/new` in its default
+                // `agent` mode when the client can't back that mode's
+                // terminal use. `Profile::default()`'s opt-in security
+                // reasoning is still correct for a hand-authored profile
+                // meant to sandbox an untrusted/remote backend -- it just
+                // doesn't apply to this auto-seeded, install-detected,
+                // always-local-subprocess case.
+                allow_fs_access: true,
+                allow_terminal_access: true,
+                ..Profile::default()
+            };
+            // Best-effort: `create` only fails on a name collision, which
+            // the `get`/skip check above already rules out for any path
+            // that reaches here (single `&mut self` access, no
+            // concurrent seeding possible) -- ignored rather than
+            // `.expect()`-ed so a future concurrent-seeding change can't
+            // turn a benign race into a panic.
+            let _ = self.profiles.create(profile);
+        }
     }
 
     /// Dispatch one JSON-RPC request, returning the JSON-RPC response to
@@ -544,6 +2175,7 @@ impl Router {
         match classify(&method) {
             MethodClass::Hybrid => self.dispatch_session_new(tenant_id, request).await,
             MethodClass::Proxied => self.dispatch_proxied(tenant_id, request).await,
+            MethodClass::SessionFork => self.dispatch_session_fork(tenant_id, request).await,
             MethodClass::GatewayNative => self.dispatch_native(tenant_id, &method, request).await,
             MethodClass::Unknown => Err(RouterError::UnknownMethod(method)),
         }
@@ -582,16 +2214,80 @@ impl Router {
             .and_then(|ext| ext.get("profile"))
             .and_then(|p| p.as_str())
             .map(str::to_string);
+        let explicit_agent_id = params
+            .get("_acpx")
+            .and_then(|ext| ext.get("agentId"))
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        if profile_name.is_some() && explicit_agent_id.is_some() {
+            return Err(RouterError::ConflictingSessionSelection);
+        }
+        let selected_agent_id = match (&profile_name, explicit_agent_id.as_deref()) {
+            (Some(name), None) => {
+                self.ensure_default_profiles_seeded().await;
+                self.profiles
+                    .get(name)
+                    .map(|profile| profile.agent_id.clone())
+                    .ok_or_else(|| RouterError::UnknownProfile(name.clone()))?
+            }
+            (None, Some(agent_id)) => agent_id.to_owned(),
+            (None, None) => self.default_agent_id.clone(),
+            (Some(_), Some(_)) => unreachable!("checked above"),
+        };
+        // Policy is checked before profile/connector resolution and before
+        // capacity reservation, so a disabled definition cannot start a
+        // process or consume a session slot.
+        self.ensure_agent_enabled(&selected_agent_id).await?;
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_acpx");
         }
 
-        let (agent_id, profile) = match &profile_name {
-            Some(name) => {
-                let (supervisor_key, profile) = self.resolve_profile(name).await?;
+        let (agent_id, profile) = match (&profile_name, explicit_agent_id) {
+            (Some(name), None) => {
+                let (supervisor_key, profile) = self.resolve_profile(name, tenant_id).await?;
                 (supervisor_key, Some(profile))
             }
-            None => (self.default_agent_id.clone(), None),
+            (None, Some(agent_id)) => {
+                self.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
+            (None, None) => {
+                let agent_id = self.default_agent_id.clone();
+                self.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
+            (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
+        };
+
+        // **`backend_process_model` hardening, `acp-gateway-daemon` plan.**
+        // Opt-in per-session backend process isolation: when enabled and
+        // this is a *managed* session (a profile resolved above, native/
+        // unmanaged mode is unaffected), fold a freshly-minted gateway id
+        // into the already-resolved profile[/tenant] supervisor key so
+        // this exact session gets its own dedicated backend process
+        // instead of sharing the profile's one process with every other
+        // session using it. The id has to be minted *now*, before
+        // spawning, since it becomes part of the supervisor key itself;
+        // `self.sessions.register_with_id` (below) then reuses this same
+        // id rather than minting another one, so the gateway id the
+        // client sees is identical either way. `":session:"` is a safe,
+        // collision-free marker (a UUID's string form has no colons) --
+        // see [`is_session_scoped_supervisor_key`] for where this
+        // encoding is later decoded to know when it's safe to stop a
+        // session's backend process on close, following the same
+        // string-encoded-supervisor-key idiom `tenant_process_isolation`
+        // already established (`profile_supervisor_key`/`stop_prefix`).
+        let mut pre_minted_gateway_id: Option<String> = None;
+        let agent_id = if self.session_process_isolation && profile.is_some() {
+            let gid = uuid::Uuid::new_v4().to_string();
+            let session_scoped_key = format!("{agent_id}:session:{gid}");
+            if let Some(spec) = self.supervisor.spec(&agent_id).cloned() {
+                self.supervisor.register(session_scoped_key.clone(), spec);
+            }
+            pre_minted_gateway_id = Some(gid);
+            session_scoped_key
+        } else {
+            agent_id
         };
 
         // Merge the resolved profile's centrally-registered MCP servers
@@ -618,8 +2314,23 @@ impl Router {
             }
         }
 
+        let admission = self.admit_session(tenant_id)?;
         let backend = self.supervisor.ensure_running(&agent_id).await?;
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        // Native/unmanaged mode (no `_acpx.profile`, `profile` still `None`
+        // here) still benefits from whatever profile
+        // `ensure_default_profiles_seeded` auto-seeded under this exact
+        // `agent_id` -- see that seeding's own doc comment for why. Only
+        // borrowed for `call_policy`; `profile` itself (what gets persisted
+        // as this session's `profile_name` below, and what the `mcpServers`
+        // merge above already ran against) is untouched, so recovery/
+        // `session/list` semantics for native-mode sessions don't change.
+        // Doesn't call `ensure_default_profiles_seeded` itself -- see
+        // `Router::warm_default_profiles`'s doc comment for why that must
+        // happen once at startup, never inline here.
+        let call_policy_profile = profile
+            .clone()
+            .or_else(|| self.profiles.get(&agent_id).cloned());
+        let call_policy = self.call_policy(call_policy_profile.as_ref());
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
@@ -635,13 +2346,31 @@ impl Router {
         };
 
         let backend_session_id = extract_backend_session_id(&response)?;
-        let gateway_id = self.sessions.register(
-            tenant_id,
-            agent_id,
-            BackendSessionId(backend_session_id),
-            profile.as_ref().map(|p| p.name.clone()),
-            cwd,
-        );
+        // **`connector_reference_lifecycle`.** A freshly-registered
+        // session references `agent_id`'s supervisor key again -- cancel
+        // any pending idle-shutdown timer that started while it had zero
+        // referencing sessions (a no-op when the feature is disabled or
+        // no timer is pending). Cloned before the match below moves
+        // `agent_id` into whichever registration branch runs.
+        let supervisor_key_for_cancel = agent_id.clone();
+        let gateway_id = match pre_minted_gateway_id {
+            Some(gid) => self.sessions.register_with_id(
+                tenant_id,
+                acpx_proto::session::GatewaySessionId(gid),
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+            None => self.sessions.register(
+                tenant_id,
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+        };
+        self.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
 
         // Rewrite the backend's own session id into the gateway-issued one
         // before it ever reaches the client -- the client only ever sees
@@ -650,20 +2379,42 @@ impl Router {
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
         }
-        if let Some(entry) = self.sessions.resolve(
-            tenant_id,
-            &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
-        ) {
-            self.spawn_session_persistence(
+        let entry = self
+            .sessions
+            .resolve(
                 tenant_id,
-                gateway_session_id_str,
-                entry.agent_id.clone(),
-                entry.backend_session_id.0.clone(),
-                profile.map(|p| p.name),
-                request,
-                response.clone(),
-            );
+                &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
+            )
+            .cloned()
+            .expect("session was just registered");
+        let effective_params = request
+            .get("params")
+            .cloned()
+            .ok_or(RouterError::MissingParams)?;
+        if let Err(error) = self
+            .persist_session_recovery(tenant_id, &gateway_session_id_str, &entry, effective_params)
+            .await
+        {
+            if let Some(removed) = self.sessions.remove(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
+            ) {
+                self.stop_if_session_scoped(&removed.agent_id).await;
+                self.mark_unreferenced_if_idle(&removed.agent_id);
+            }
+            return Err(error);
         }
+        admission.commit();
+        self.spawn_transcript(
+            gateway_session_id_str.clone(),
+            Direction::ClientToAgent,
+            request,
+        );
+        self.spawn_transcript(
+            gateway_session_id_str,
+            Direction::AgentToClient,
+            response.clone(),
+        );
         Ok(response)
     }
 
@@ -694,13 +2445,17 @@ impl Router {
         }
         let (agent_id, profile) = match selector {
             SessionListSelector::Profile(name) => {
-                let (key, profile) = self.resolve_profile(&name).await?;
+                let (key, profile) = self.resolve_profile(&name, tenant_id).await?;
                 (key, Some(profile))
             }
-            SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
+            SessionListSelector::AgentId(explicit_id) => {
+                self.ensure_agent_enabled(&explicit_id).await?;
+                self.ensure_custom_agent_registered(&explicit_id).await?;
+                (explicit_id, None)
+            }
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        let call_policy = self.call_policy(profile.as_ref());
         let backend = self.supervisor.ensure_running(&agent_id).await?;
 
         let outbound = serde_json::json!({
@@ -830,17 +2585,16 @@ impl Router {
                 return None;
             }
         }
-        Some(
-            self.sessions
-                .register(
-                    tenant_id,
-                    agent_id.to_string(),
-                    BackendSessionId(backend_session_id.to_string()),
-                    profile_name,
-                    cwd,
-                )
-                .0,
-        )
+        let admission = self.admit_session(tenant_id).ok()?;
+        let gateway_id = self.sessions.register(
+            tenant_id,
+            agent_id.to_string(),
+            BackendSessionId(backend_session_id.to_string()),
+            profile_name,
+            cwd,
+        );
+        admission.commit();
+        Some(gateway_id.0)
     }
 
     /// Resolve `_acpx.profile` for `session/new`'s managed mode: look up
@@ -864,7 +2618,9 @@ impl Router {
     async fn resolve_profile(
         &mut self,
         profile_name: &str,
+        tenant_id: &TenantId,
     ) -> Result<(String, Profile), RouterError> {
+        self.ensure_default_profiles_seeded().await;
         let profile = self
             .profiles
             .get(profile_name)
@@ -896,6 +2652,9 @@ impl Router {
         // against both registry-listed agents (the common case) and
         // manually-configured/non-registry backends, without forcing a
         // registry fetch on every `session/new` for the latter.
+        self.ensure_agent_enabled(&profile.agent_id).await?;
+        self.ensure_custom_agent_registered(&profile.agent_id)
+            .await?;
         let mut spec = match self.supervisor.spec(&profile.agent_id).cloned() {
             Some(spec) => spec,
             None => {
@@ -922,9 +2681,17 @@ impl Router {
             spec.env.insert(key, value);
         }
 
-        let supervisor_key = format!("profile:{}", profile.name);
+        let supervisor_key = self.profile_supervisor_key(&profile.name, tenant_id);
         self.supervisor.register(supervisor_key.clone(), spec);
         Ok((supervisor_key, profile))
+    }
+
+    fn profile_supervisor_key(&self, profile_name: &str, tenant_id: &TenantId) -> String {
+        if self.tenant_process_isolation {
+            format!("profile:{profile_name}:tenant:{}", tenant_id.0)
+        } else {
+            format!("profile:{profile_name}")
+        }
     }
 
     /// **Phase 8 addition -- closes a real gap.** `session/load` (and its
@@ -965,7 +2732,10 @@ impl Router {
         method: &str,
         gateway_session_id: &str,
     ) -> Result<crate::session_registry::SessionEntry, RouterError> {
-        if !matches!(method, "session/load" | "session/resume" | "session/delete") {
+        if !matches!(
+            method,
+            "session/load" | "session/resume" | "session/delete" | "session/fork"
+        ) {
             return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
         let store = self
@@ -997,15 +2767,24 @@ impl Router {
                 gateway_session_id.to_string(),
             ));
         }
-        let entry = crate::session_registry::SessionEntry {
+        if record.status == RecoveryStatus::Restoring {
+            return Err(RouterError::SessionRestoring(
+                gateway_session_id.to_string(),
+            ));
+        }
+        let mut entry = crate::session_registry::SessionEntry {
             agent_id: record.agent_id,
             backend_session_id: BackendSessionId(record.backend_session_id),
             profile_name: record.profile_name,
-            // The `sessions` sqlite table doesn't carry `cwd` yet (see
-            // `SessionEntry::cwd`'s doc comment) -- honestly `None` here
-            // rather than guessing, not a regression this phase
-            // introduced.
-            cwd: None,
+            cwd: record.cwd,
+            created_at: restore_lifecycle_instant(record.created_at_unix_nanos),
+            last_activity_at: restore_lifecycle_instant(record.last_activity_at_unix_nanos),
+            in_flight: 0,
+            in_flight_since: None,
+            pinned: record.pinned,
+            custom_idle_ttl: record
+                .custom_idle_ttl_seconds
+                .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64)),
         };
         // **The real, second half of this bug.** `entry.agent_id` here is
         // actually the *supervisor key* `profile:{name}` minted by
@@ -1026,13 +2805,16 @@ impl Router {
         // process -- an in-process-only test would never have exercised
         // a `Supervisor` that legitimately never saw this profile before.
         if let Some(name) = entry.profile_name.as_deref() {
-            self.resolve_profile(name).await?;
+            entry.agent_id = self.resolve_profile(name, tenant_id).await?.0;
         }
+        let admission = self.admit_session(tenant_id)?;
         self.sessions.insert(
             tenant_id,
             acpx_proto::session::GatewaySessionId(gateway_session_id.to_string()),
             entry.clone(),
         );
+        self.cancel_unreferenced_shutdown(&entry.agent_id);
+        admission.commit();
         Ok(entry)
     }
 
@@ -1080,11 +2862,9 @@ impl Router {
         let agent_id = entry.agent_id.clone();
         let backend_session_id = entry.backend_session_id.0.clone();
         let profile_name = entry.profile_name.clone();
-        let call_policy = BackendCallPolicy::from_profile(
-            profile_name
-                .as_deref()
-                .and_then(|name| self.profiles.get(name)),
-        );
+        let call_policy = self
+            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .await;
 
         // Rewrite gateway id -> backend id in place; everything else in
         // `params` is forwarded untouched, per the proxied-method contract
@@ -1106,12 +2886,28 @@ impl Router {
                 read_matching_response(&mut backend, &id, call_policy, None).await?;
             attach_updates(response, notifications, agent_requests)
         };
+        self.sessions.touch(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        );
+        if let Some(store) = self.persistence.clone() {
+            store
+                .update_session_activity(gateway_session_id.clone(), now_unix_nanos())
+                .await?;
+        }
+        mark_successful_recovery_retry(self.persistence.clone(), &gateway_session_id, &method)
+            .await?;
         self.spawn_transcript(
             gateway_session_id.clone(),
             Direction::AgentToClient,
             response.clone(),
         );
         if method == "session/close" {
+            if let Some(store) = self.persistence.clone() {
+                store
+                    .close_session(gateway_session_id.clone(), now_rfc3339())
+                    .await?;
+            }
             // Evict the closed session from the in-memory registry --
             // **real bug fix**: this used to never happen, so every
             // session ever opened over a long-running daemon's lifetime
@@ -1120,17 +2916,140 @@ impl Router {
             // closed sessions as still live indefinitely. `remove` already
             // existed on `SessionRegistry` but was never called from
             // anywhere in this file until now.
-            self.sessions.remove(
+            // **Second real bug fix, found while auditing the
+            // `connector_reference_lifecycle` gap:** this evicted the
+            // `SessionRegistry` entry but never called
+            // `stop_if_session_scoped` -- unlike the reap path just above
+            // in this file, which does. Under `ACPX_SESSION_PROCESS_
+            // ISOLATION`, an explicit client `session/close` (the common
+            // case -- a well-behaved client closes when done, rather than
+            // waiting for the idle reaper) leaked that session's
+            // dedicated backend process forever, with no other code path
+            // ever able to stop it again (its supervisor key is unique to
+            // this one session, so no other session/reap ever revisits
+            // it). A no-op for the default shared-process model.
+            if let Some(removed) = self.sessions.remove(
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
-            );
-            if let Some(store) = self.persistence.clone() {
-                tokio::spawn(async move {
-                    if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
-                        tracing::warn!(%err, "failed to persist session close");
-                    }
-                });
+            ) {
+                self.release_live_session(tenant_id);
+                self.stop_if_session_scoped(&removed.agent_id).await;
+                self.mark_unreferenced_if_idle(&removed.agent_id);
             }
+        }
+        Ok(response)
+    }
+
+    /// Real ACP `session/fork` -- see [`MethodClass::SessionFork`]'s doc
+    /// comment for the full rationale (this method was entirely
+    /// unclassified/unimplemented before that fix). Resolves the
+    /// *source* session named by `params.sessionId` exactly like
+    /// `dispatch_proxied` does (including `rehydrate_session` fallback
+    /// for a source session that only survives in persistence), forwards
+    /// the fork request to that same backend process with the gateway id
+    /// rewritten to the backend-native one, then -- mirroring
+    /// `dispatch_session_new`'s own "mint a fresh gateway id for
+    /// whatever backend session id came back" handling -- registers the
+    /// backend's newly-forked session id under a *brand new* gateway
+    /// session id (same tenant/agent/profile as the source session,
+    /// `cwd` taken from the fork request's own `params.cwd` since a
+    /// forked session's working directory is independently specified,
+    /// not necessarily inherited) and rewrites the response's
+    /// `result.sessionId` accordingly before it ever reaches the client.
+    async fn dispatch_session_fork(
+        &mut self,
+        tenant_id: &TenantId,
+        mut request: serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
+        let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+        let params = request
+            .get_mut("params")
+            .ok_or(RouterError::MissingParams)?;
+        let gateway_session_id = params
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .ok_or(RouterError::MissingSessionId)?
+            .to_string();
+        // The *new* forked session's cwd, per `ForkSessionRequest`'s own
+        // schema -- distinct from (and not inherited from) the source
+        // session's cwd, so this is read off the fork request itself,
+        // exactly like `dispatch_session_new` reads it off `session/
+        // new`'s own params.
+        let cwd = params
+            .get("cwd")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+
+        // Reserve the fork before potentially rehydrating its persisted
+        // source. If either source or fork cannot fit, rehydration remains
+        // non-mutating rather than leaving a source-only live entry behind.
+        let admission = self.admit_session(tenant_id)?;
+        let entry = match self.sessions.resolve(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        ) {
+            Some(entry) => entry.clone(),
+            None => {
+                self.rehydrate_session(tenant_id, "session/fork", &gateway_session_id)
+                    .await?
+            }
+        };
+        let agent_id = entry.agent_id.clone();
+        let backend_session_id = entry.backend_session_id.0.clone();
+        let profile_name = entry.profile_name.clone();
+        let call_policy = self
+            .call_policy_for(profile_name.as_deref(), &agent_id)
+            .await;
+
+        params["sessionId"] = serde_json::Value::String(backend_session_id);
+
+        let backend = self.supervisor.ensure_running(&agent_id).await?;
+        let mut response = {
+            let mut backend = backend.lock().await;
+            ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
+            backend.writer.lock().await.write_value(&request).await?;
+            let (response, notifications, agent_requests) =
+                read_matching_response(&mut backend, &id, call_policy, None).await?;
+            attach_updates(response, notifications, agent_requests)
+        };
+
+        let forked_backend_session_id = extract_backend_session_id(&response)?;
+        let forked_gateway_id = self.sessions.register(
+            tenant_id,
+            agent_id,
+            BackendSessionId(forked_backend_session_id),
+            profile_name.clone(),
+            cwd,
+        );
+        admission.commit();
+        let forked_gateway_session_id_str = forked_gateway_id.0.clone();
+        if let Some(result) = response.get_mut("result") {
+            result["sessionId"] = serde_json::Value::String(forked_gateway_id.0.clone());
+        }
+
+        // Persisted as the *new* forked session's own inaugural
+        // transcript (client request that created it, agent's response
+        // minting it) -- mirrors `dispatch_session_new`'s own persistence
+        // exactly, since a fork is a fresh session from a persistence
+        // point of view, just one whose backend process happens to
+        // already be running (reused, not freshly spawned) and whose
+        // conversation history the backend itself carried over. Nothing
+        // is recorded against the *source* `gateway_session_id` here --
+        // `session/fork` doesn't add a message to the source session's
+        // own conversation.
+        if let Some(entry) = self.sessions.resolve(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(forked_gateway_session_id_str.clone()),
+        ) {
+            self.spawn_session_persistence(
+                tenant_id,
+                forked_gateway_session_id_str,
+                entry.agent_id.clone(),
+                entry.backend_session_id.0.clone(),
+                profile_name,
+                request,
+                response.clone(),
+            );
         }
         Ok(response)
     }
@@ -1324,7 +3243,21 @@ impl Router {
                         "close": {},
                         "delete": {},
                         "resume": {},
-                        "list": {}
+                        "list": {},
+                        // **ACP compatibility gap closed post-review.**
+                        // `session/fork` is now genuinely forwarded to
+                        // whatever backend a caller selects (see
+                        // `MethodClass::SessionFork`'s doc comment) --
+                        // same honesty rule as `close`/`delete`/
+                        // `resume`/`list` above -- so it belongs here
+                        // too, not left implicitly unsupported the way
+                        // it silently was before that fix. A
+                        // spec-compliant client checks this capability
+                        // before ever calling `session/fork`, so leaving
+                        // it unset would have meant no compliant client
+                        // could discover acpx supports it even though
+                        // the dispatch path itself works correctly.
+                        "fork": {}
                     }
                 },
                 "authMethods": [],
@@ -1419,18 +3352,37 @@ impl Router {
                     .expect("just loaded")
                     .agents
                     .clone();
-                let entries: Vec<serde_json::Value> = agents
-                    .into_iter()
-                    .map(|agent| {
-                        let status = crate::detect::detect(&agent.id, &agent.distribution);
-                        serde_json::json!({
+                let mut entries: Vec<serde_json::Value> = Vec::with_capacity(agents.len());
+                for agent in agents {
+                    let enabled = match &self.agent_enablement {
+                        Some(enablement) => enablement.is_enabled(&agent.id).await?,
+                        None => true,
+                    };
+                    entries.push(serde_json::json!({
+                        "id": agent.id,
+                        "name": agent.name,
+                        "version": agent.version,
+                        "status": crate::detect::detect(&agent.id, &agent.distribution),
+                        "enabled": enabled,
+                        "source": AgentSource::Registry,
+                    }));
+                }
+                if let Some(custom_agents) = &self.custom_agents {
+                    for agent in custom_agents.list().await? {
+                        let enabled = match &self.agent_enablement {
+                            Some(enablement) => enablement.is_enabled(&agent.id).await?,
+                            None => true,
+                        };
+                        entries.push(serde_json::json!({
                             "id": agent.id,
                             "name": agent.name,
-                            "version": agent.version,
-                            "status": status,
-                        })
-                    })
-                    .collect();
+                            "version": "custom",
+                            "status": AgentStatus::Configured,
+                            "enabled": enabled,
+                            "source": AgentSource::Custom,
+                        }));
+                    }
+                }
                 serde_json::json!({ "agents": entries })
             }
             "agents/status" => {
@@ -1440,6 +3392,15 @@ impl Router {
                     .and_then(|i| i.as_str())
                     .ok_or(RouterError::MissingParams)?
                     .to_string();
+                if let Some(custom_agents) = &self.custom_agents {
+                    if custom_agents.get(&agent_id).await?.is_some() {
+                        return Ok(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"id": agent_id, "status": AgentStatus::Configured}
+                        }));
+                    }
+                }
                 self.ensure_registry_loaded().await;
                 let agent = self
                     .registry_cache
@@ -1489,17 +3450,22 @@ impl Router {
                 // see `04-phased-plan.md` step 13/14).
                 if let Some(secret) = params.get("secret").and_then(|s| s.as_str()) {
                     profile.key_ref = Some(self.keystore.store(secret));
+                    if let Some(key_ref) = profile.key_ref.clone() {
+                        self.persist_secret_if_durable(&key_ref, secret).await?;
+                    }
                 }
                 if method == "profiles/create" {
                     self.profiles.create(profile.clone())?;
                 } else {
                     self.profiles.update(profile.clone())?;
                 }
+                self.persist_profile_if_durable(&profile).await?;
                 redact_launch_overrides(
                     serde_json::to_value(&profile).expect("Profile always serializes"),
                 )
             }
             "profiles/list" => {
+                self.ensure_default_profiles_seeded().await;
                 let profiles: Vec<serde_json::Value> = self
                     .profiles
                     .list()
@@ -1519,6 +3485,7 @@ impl Router {
                     .ok_or(RouterError::MissingParams)?
                     .to_string();
                 self.profiles.delete(&name)?;
+                self.delete_persisted_profile_if_durable(&name).await?;
                 // **Real bug fix**: this used to only remove the
                 // `ProfileStore` entry, leaving whatever backend process
                 // was spawned for it (under supervisor key
@@ -1534,6 +3501,10 @@ impl Router {
                 if let Err(err) = self.supervisor.stop(&supervisor_key).await {
                     tracing::warn!(%err, profile = %name, "failed to stop profile's backend process on delete");
                 }
+                let tenant_prefix = format!("{supervisor_key}:tenant:");
+                if let Err(err) = self.supervisor.stop_prefix(&tenant_prefix).await {
+                    tracing::warn!(%err, profile = %name, "failed to stop tenant-isolated profile backend processes on delete");
+                }
                 serde_json::json!({ "name": name, "deleted": true })
             }
             "mcp_servers/create" | "mcp_servers/update" => {
@@ -1545,6 +3516,9 @@ impl Router {
                     self.mcp_servers.create(entry.clone())?;
                 } else {
                     self.mcp_servers.update(entry.clone())?;
+                }
+                if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
+                    self.persist_mcp_server_if_durable(name, &entry).await?;
                 }
                 entry
             }
@@ -1559,7 +3533,85 @@ impl Router {
                     .ok_or(RouterError::MissingParams)?
                     .to_string();
                 self.mcp_servers.delete(&name)?;
+                self.delete_persisted_mcp_server_if_durable(&name).await?;
                 serde_json::json!({ "name": name, "deleted": true })
+            }
+            "session/retention/get" => {
+                let gateway_session_id = request
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                self.retention_info_json(tenant_id, &gateway_session_id)?
+            }
+            "session/retention/list" => {
+                let sessions: Vec<serde_json::Value> = self
+                    .sessions
+                    .list_for_tenant(tenant_id)
+                    .into_iter()
+                    .map(|(gateway_id, entry)| retention_entry_json(&gateway_id.0, &entry))
+                    .collect();
+                serde_json::json!({ "sessions": sessions })
+            }
+            "session/retention/pin" => {
+                let gateway_session_id = request
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                self.set_session_pinned_administered(tenant_id, &gateway_session_id, true)
+                    .await?;
+                tracing::info!(
+                    tenant_id = %tenant_id.0,
+                    gateway_session_id = %gateway_session_id,
+                    "session pinned via session/retention/pin"
+                );
+                self.retention_info_json(tenant_id, &gateway_session_id)?
+            }
+            "session/retention/unpin" => {
+                let gateway_session_id = request
+                    .get("params")
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                self.set_session_pinned_administered(tenant_id, &gateway_session_id, false)
+                    .await?;
+                tracing::info!(
+                    tenant_id = %tenant_id.0,
+                    gateway_session_id = %gateway_session_id,
+                    "session unpinned via session/retention/unpin"
+                );
+                self.retention_info_json(tenant_id, &gateway_session_id)?
+            }
+            "session/retention/set_ttl" => {
+                let params = request
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let gateway_session_id = params
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                // `null`/absent clears the override; a present number
+                // sets it -- distinguished via `Option<Option<u64>>`-
+                // shaped parsing so "field omitted" and "field explicitly
+                // null" both mean "clear", matching every other optional
+                // JSON-RPC param in this dispatcher.
+                let idle_ttl_seconds = params.get("idleTtlSeconds").and_then(|v| v.as_u64());
+                let ttl = idle_ttl_seconds.map(std::time::Duration::from_secs);
+                self.set_session_custom_ttl(tenant_id, &gateway_session_id, ttl)
+                    .await?;
+                tracing::info!(
+                    tenant_id = %tenant_id.0,
+                    gateway_session_id = %gateway_session_id,
+                    idle_ttl_seconds = ?idle_ttl_seconds,
+                    "session idle TTL override changed via session/retention/set_ttl"
+                );
+                self.retention_info_json(tenant_id, &gateway_session_id)?
             }
             other => return Err(RouterError::UnknownMethod(other.to_string())),
         };
@@ -2197,19 +4249,23 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     else {
         return false;
     };
-    let (gateway_id, hub) = {
+    let (tenant_id, gateway_id, hub) = {
         let r = ctx.router.lock().await;
-        let gateway_id = match &ctx.tenant_id {
-            Some(tenant_id) => {
-                r.sessions
-                    .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
-            }
+        let resolved = match &ctx.tenant_id {
+            Some(tenant_id) => r
+                .sessions
+                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
+                .map(|gateway_id| (tenant_id.clone(), gateway_id)),
             None => r
                 .sessions
-                .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id)
-                .map(|(_tenant, gid)| gid),
+                .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id),
         };
-        (gateway_id, r.notification_hub.clone())
+        match resolved {
+            Some((tenant_id, gateway_id)) => {
+                (tenant_id, Some(gateway_id), r.notification_hub.clone())
+            }
+            None => (TenantId::default(), None, r.notification_hub.clone()),
+        }
     };
     let Some(gateway_id) = gateway_id else {
         return false;
@@ -2221,7 +4277,54 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     {
         *session_id_field = serde_json::Value::String(gateway_id.0.clone());
     }
-    hub.publish(&gateway_id.0, translated).await
+    hub.publish(&tenant_id, &gateway_id.0, translated).await
+}
+
+/// Forward a backend-initiated request to the persistent client that owns
+/// this session. `Ok(None)` means this dispatch has no bound client and the
+/// caller must use its existing profile-policy fallback.
+async fn try_forward_interaction(
+    ctx: &LiveNotifyCtx,
+    value: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, crate::InteractionError> {
+    let Some(tenant_id) = &ctx.tenant_id else {
+        return Ok(None);
+    };
+    let Some(backend_session_id) = value
+        .get("params")
+        .and_then(|params| params.get("sessionId"))
+        .and_then(|session_id| session_id.as_str())
+    else {
+        return Ok(None);
+    };
+    let (gateway_id, interaction_hub) = {
+        let router = ctx.router.lock().await;
+        (
+            router
+                .sessions
+                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id),
+            router.interaction_hub.clone(),
+        )
+    };
+    let Some(gateway_id) = gateway_id else {
+        return Ok(None);
+    };
+
+    let mut request = value.clone();
+    if let Some(session_id) = request
+        .get_mut("params")
+        .and_then(|params| params.get_mut("sessionId"))
+    {
+        *session_id = serde_json::Value::String(gateway_id.0.clone());
+    }
+    interaction_hub
+        .request(
+            tenant_id,
+            &gateway_id.0,
+            request,
+            DEFAULT_INTERACTION_TIMEOUT,
+        )
+        .await
 }
 
 /// **Phase 15.** The idle/background-reader gap phase 14 documented and
@@ -2455,6 +4558,7 @@ const TERMINAL_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(200);
 fn spawn_terminal_output_stream(
     backend: acpx_conductor::supervisor::SharedBackendProcess,
     hub: NotificationHub,
+    tenant_id: TenantId,
     gateway_session_id: String,
     terminal_id: String,
 ) {
@@ -2490,6 +4594,7 @@ fn spawn_terminal_output_stream(
                 last_len = output.len();
                 last_truncated = truncated;
                 hub.publish(
+                    &tenant_id,
                     &gateway_session_id,
                     serde_json::json!({
                         "jsonrpc": "2.0",
@@ -2553,6 +4658,62 @@ async fn read_matching_response(
             value.get("id"),
             value.get("method").and_then(|m| m.as_str()),
         ) {
+            // A persistent transport may have a client bound to this exact
+            // tenant/session. Give that client the first chance to answer
+            // every backend-initiated request, with one carve-out:
+            // `session/request_permission`/`fs/read_text_file`/
+            // `fs/write_text_file`/`terminal/create` each have their own
+            // dedicated `AgentRequestHub` relay below (real clients, e.g.
+            // the panel's `acpx/agent_request`/`acpx/agent_response`
+            // envelope, already depend on that exact wire contract) --
+            // tried first for those four, with `InteractionHub` as the
+            // fallback *within* each of those arms (not here) for a
+            // connection that bound `InteractionHub` but never subscribed
+            // to `AgentRequestHub` for this session (e.g. a strict ACP
+            // bridge connection, per `strict_acp_ws_forwards_backend_
+            // permission_requests_to_the_bound_client`). Every other
+            // method (including the plain `terminal/output`/
+            // `wait_for_exit`/`kill`/`release` polls below, which have no
+            // relay concept of their own) keeps trying `InteractionHub`
+            // here, unconditionally, same as before this carve-out
+            // existed. Profile policy/direct handling remains the
+            // deliberate fallback once every applicable live path returns
+            // nothing.
+            let has_dedicated_relay = matches!(
+                method,
+                "session/request_permission"
+                    | "fs/read_text_file"
+                    | "fs/write_text_file"
+                    | "terminal/create"
+            );
+            if !has_dedicated_relay {
+                if let Some(live) = live {
+                    match try_forward_interaction(live, &value).await {
+                        Ok(Some(mut reply)) => {
+                            // The outer client sees ACPX's opaque interaction id;
+                            // the backend must receive the id it originally sent.
+                            reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                            backend.writer.lock().await.write_value(&reply).await?;
+                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let reply = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                                "error": {
+                                    "code": -32001,
+                                    "message": format!("acpx interactive client request failed: {error}"),
+                                }
+                            });
+                            backend.writer.lock().await.write_value(&reply).await?;
+                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
+                            continue;
+                        }
+                    }
+                }
+            }
             let reply = if method == "session/request_permission" {
                 // **Interactive relay addition.** A live client (WS,
                 // currently) that owns this gateway session gets first
@@ -2563,9 +4724,35 @@ async fn read_matching_response(
                 // HTTP-only client (`live: None`) or a WS client that
                 // never subscribed to this session always falls straight
                 // through to that same fallback, unchanged.
+                //
+                // **`InteractionHub` fallback.** A connection that bound
+                // `InteractionHub` but never subscribed to
+                // `AgentRequestHub` for this session (e.g. a strict ACP
+                // bridge connection -- see `strict_acp_ws_forwards_
+                // backend_permission_requests_to_the_bound_client`) gets
+                // a second chance here before falling back to policy,
+                // since `try_relay_agent_request` returns `None`
+                // immediately for it (no `AgentRequestHub` subscriber).
                 match try_relay_agent_request(live, &value, PERMISSION_RELAY_TIMEOUT).await {
                     Some(relayed) => relayed,
-                    None => build_permission_reply(&value, policy.permission_policy),
+                    None => match live {
+                        Some(live) => match try_forward_interaction(live, &value).await {
+                            Ok(Some(mut reply)) => {
+                                reply["id"] =
+                                    value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                                reply
+                            }
+                            Ok(None) => build_permission_reply(&value, policy.permission_policy),
+                            Err(error) => {
+                                tracing::warn!(
+                                    ?error,
+                                    "interaction-hub permission forward failed, falling back to policy"
+                                );
+                                build_permission_reply(&value, policy.permission_policy)
+                            }
+                        },
+                        None => build_permission_reply(&value, policy.permission_policy),
+                    },
                 }
             } else if (method == "fs/read_text_file" || method == "fs/write_text_file")
                 && policy.allow_fs_access
@@ -2617,10 +4804,13 @@ async fn read_matching_response(
                                 .and_then(|r| r.get("terminalId"))
                                 .and_then(|t| t.as_str()),
                         ) {
-                            if let Some(gateway_session_id) = ctx.gateway_session_id.clone() {
+                            if let (Some(gateway_session_id), Some(tenant_id)) =
+                                (ctx.gateway_session_id.clone(), ctx.tenant_id.clone())
+                            {
                                 spawn_terminal_output_stream(
                                     std::sync::Arc::clone(&ctx.backend),
                                     ctx.notification_hub.clone(),
+                                    tenant_id,
                                     gateway_session_id,
                                     terminal_id.to_string(),
                                 );
@@ -2853,11 +5043,272 @@ fn spawn_session_persistence_fn(
     });
 }
 
+/// A failed proactive restore remains durable so a client can retry it with
+/// ACP's native `session/load` or `session/resume`. Once any retry reaches
+/// the backend successfully, clear the stale failure diagnostics without
+/// changing unrelated active or closed session rows.
+async fn mark_successful_recovery_retry(
+    store: Option<PersistenceStore>,
+    gateway_session_id: &str,
+    method: &str,
+) -> Result<(), RouterError> {
+    if !matches!(method, "session/load" | "session/resume") {
+        return Ok(());
+    }
+    let Some(store) = store else {
+        return Ok(());
+    };
+    let Some(record) = store.get_session(gateway_session_id.to_string()).await? else {
+        return Ok(());
+    };
+    if record.closed_at.is_none() && record.status == RecoveryStatus::RecoveryFailed {
+        store
+            .update_recovery_status(
+                gateway_session_id.to_string(),
+                RecoveryStatus::Restored,
+                None,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// `Arc<tokio::sync::Mutex<Router>>` -- the handle type
 /// `acpx-server`'s transports hold and pass to [`dispatch_shared`].
 /// Re-exported here (rather than only living in `acpx-server`) so this
 /// module can define `dispatch_shared` against it directly.
 pub type SharedRouterHandle = std::sync::Arc<tokio::sync::Mutex<Router>>;
+
+async fn execute_open_session_recovery(
+    job: PreparedRecoveryJob,
+) -> Result<PreparedRecoveryJob, RouterError> {
+    let response = {
+        let mut backend = job.backend.lock().await;
+        ensure_backend_initialized(&mut backend, job.call_policy.clone()).await?;
+        backend
+            .writer
+            .lock()
+            .await
+            .write_value(&job.request)
+            .await?;
+        let (response, _, _) =
+            read_matching_response(&mut backend, &job.request_id, job.call_policy.clone(), None)
+                .await?;
+        response
+    };
+    if let Some(error) = response.get("error") {
+        return Err(RouterError::BackendSessionNewError(error.clone()));
+    }
+    Ok(job)
+}
+
+/// Restore durable sessions through the shared router without holding its
+/// mutex during ACP backend I/O. Different connectors can therefore make
+/// progress concurrently while each connector's own stdio remains serialized.
+pub async fn recover_open_sessions_shared(
+    router: &SharedRouterHandle,
+    policy: StartupRecoveryPolicy,
+) -> Result<StartupRecoveryReport, RouterError> {
+    policy.validate()?;
+    let store = {
+        let router = router.lock().await;
+        router.persistence.clone()
+    };
+    let Some(store) = store else {
+        return Ok(StartupRecoveryReport::default());
+    };
+
+    let mut report = StartupRecoveryReport::default();
+    let mut candidates = std::collections::VecDeque::new();
+    for record in store.list_recoverable_sessions().await? {
+        if record.recovery_method == RecoveryMethod::None {
+            report.skipped += 1;
+            continue;
+        }
+        let is_live = {
+            let router = router.lock().await;
+            let tenant_id = TenantId(record.tenant_id.clone());
+            let gateway_id =
+                acpx_proto::session::GatewaySessionId(record.gateway_session_id.clone());
+            router.sessions.resolve(&tenant_id, &gateway_id).is_some()
+        };
+        if is_live {
+            report.skipped += 1;
+            continue;
+        }
+        store
+            .update_recovery_status(
+                record.gateway_session_id.clone(),
+                RecoveryStatus::Restoring,
+                None,
+            )
+            .await?;
+        candidates.push_back(record);
+    }
+
+    if policy.fail_fast {
+        while let Some(record) = candidates.pop_front() {
+            let restored = run_recovery_candidate(
+                router.clone(),
+                store.clone(),
+                record.clone(),
+                policy.timeout,
+            )
+            .await?;
+            if restored {
+                report.restored += 1;
+            } else {
+                return Err(RouterError::RecoveryFailFast(record.gateway_session_id));
+            }
+        }
+        return Ok(report);
+    }
+
+    let mut running = tokio::task::JoinSet::new();
+    while running.len() < policy.concurrency {
+        let Some(record) = candidates.pop_front() else {
+            break;
+        };
+        running.spawn(run_recovery_candidate(
+            router.clone(),
+            store.clone(),
+            record,
+            policy.timeout,
+        ));
+    }
+    while let Some(result) = running.join_next().await {
+        match result.map_err(|error| RouterError::InvalidRecoveryPolicy(error.to_string()))?? {
+            true => report.restored += 1,
+            false => report.failed += 1,
+        }
+        if let Some(record) = candidates.pop_front() {
+            running.spawn(run_recovery_candidate(
+                router.clone(),
+                store.clone(),
+                record,
+                policy.timeout,
+            ));
+        }
+    }
+    Ok(report)
+}
+
+async fn run_recovery_candidate(
+    router: SharedRouterHandle,
+    store: PersistenceStore,
+    record: crate::persistence::SessionRecord,
+    timeout: Duration,
+) -> Result<bool, RouterError> {
+    let outcome = tokio::time::timeout(timeout, async {
+        let job = {
+            let mut router = router.lock().await;
+            router.prepare_open_session_recovery(&record).await?
+        };
+        execute_open_session_recovery(job).await
+    })
+    .await;
+
+    let job = match outcome {
+        Ok(Ok(job)) => job,
+        Ok(Err(error)) => {
+            store
+                .update_recovery_status(
+                    record.gateway_session_id,
+                    RecoveryStatus::RecoveryFailed,
+                    Some(error.to_string()),
+                )
+                .await?;
+            return Ok(false);
+        }
+        Err(_) => {
+            let supervisor_key = {
+                let mut router = router.lock().await;
+                let key = router.recovery_supervisor_key(&record);
+                if let Err(error) = router.supervisor.stop(&key).await {
+                    tracing::warn!(%error, gateway_session_id = %record.gateway_session_id, "failed to stop timed-out recovery backend");
+                }
+                key
+            };
+            tracing::warn!(
+                gateway_session_id = %record.gateway_session_id,
+                supervisor_key,
+                "startup recovery timed out and the backend process was stopped"
+            );
+            let error = RouterError::RecoveryTimeout(record.gateway_session_id.clone());
+            store
+                .update_recovery_status(
+                    record.gateway_session_id,
+                    RecoveryStatus::RecoveryFailed,
+                    Some(error.to_string()),
+                )
+                .await?;
+            return Ok(false);
+        }
+    };
+
+    store
+        .update_recovery_status(
+            record.gateway_session_id.clone(),
+            RecoveryStatus::Restored,
+            None,
+        )
+        .await?;
+    let mut router = router.lock().await;
+    // See `dispatch_session_new`'s identical cancellation.
+    let supervisor_key_for_cancel = job.entry.agent_id.clone();
+    router.sessions.insert(
+        &job.tenant_id,
+        acpx_proto::session::GatewaySessionId(record.gateway_session_id),
+        job.entry,
+    );
+    router.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
+    job.admission.commit();
+    Ok(true)
+}
+
+/// Durable identity and drift state needed by a persistent transport before
+/// it attaches a resumable session-update subscription.
+#[derive(Debug, Clone, Default)]
+pub struct StreamResumeState {
+    pub backend_session_id: Option<String>,
+    pub durable_state_changed: bool,
+}
+
+/// Inspect the session registry and optional persistence store without
+/// holding the router mutex across SQLite I/O. A transcript count mismatch
+/// means a non-ACPX writer changed durable history since the last observed
+/// state and must invalidate any resume cursor.
+pub async fn stream_resume_state_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    gateway_session_id: &str,
+) -> StreamResumeState {
+    let (backend_session_id, persistence) = {
+        let router = router.lock().await;
+        let gateway_id = acpx_proto::session::GatewaySessionId(gateway_session_id.to_string());
+        (
+            router
+                .sessions
+                .resolve(tenant_id, &gateway_id)
+                .map(|entry| entry.backend_session_id.0.clone()),
+            router.persistence.clone(),
+        )
+    };
+    let durable_state_changed = match persistence {
+        Some(store) => match store.transcript_state_changed(gateway_session_id).await {
+            Ok(changed) => changed,
+            Err(err) => {
+                tracing::warn!(%err, %gateway_session_id, "failed to inspect durable transcript state for stream resume");
+                false
+            }
+        },
+        None => false,
+    };
+    StreamResumeState {
+        backend_session_id,
+        durable_state_changed,
+    }
+}
 
 /// Real multi-agent concurrency entry point (added post-Phase-6, replacing
 /// the naive "hold the whole-`Router` mutex for an entire `dispatch` call,
@@ -2930,6 +5381,7 @@ pub async fn dispatch_shared_for_tenant(
             dispatch_session_cancel_shared(router, tenant_id, request).await
         }
         MethodClass::Proxied => dispatch_proxied_shared(router, tenant_id, request).await,
+        MethodClass::SessionFork => dispatch_session_fork_shared(router, tenant_id, request).await,
         // **Phase 13.** Mirrors `dispatch_native`'s `"session/list"`
         // branching (see `session_list_selector`'s doc comment) but only
         // when a selector is actually present -- an unqualified
@@ -2954,6 +5406,26 @@ pub async fn dispatch_shared_for_tenant(
         {
             dispatch_session_list_real_shared(router, tenant_id, request).await
         }
+        // **`client_and_installer_contract` hardening, `acp-gateway-daemon`
+        // plan.** `agents/install` is a genuine (potentially many-second,
+        // real network/filesystem) download+extract, not the cheap/local
+        // registry-cache read every other `GatewayNative` method actually
+        // is -- routing it through the generic
+        // `router.lock().await.dispatch_for_tenant(...)` arm below would
+        // hold the *entire* router mutex for that whole duration,
+        // freezing every other concurrent client (every tenant, every
+        // session, every unrelated backend) until the install finishes.
+        // Found during this hardening pass, not a pre-existing documented
+        // risk -- fixed the same way `session/list`'s real-backend arm
+        // just above already established: resolve what's needed under a
+        // brief lock, release it, then do the slow part unlocked. The
+        // wire contract (`{id, outcome}`) is unchanged -- see
+        // `dispatch_agents_install_shared`'s doc comment for why a
+        // fuller async job/progress model remains a deliberately
+        // deferred, separate enhancement.
+        MethodClass::GatewayNative if method == "agents/install" => {
+            dispatch_agents_install_shared(router, request).await
+        }
         MethodClass::GatewayNative | MethodClass::Unknown => {
             router
                 .lock()
@@ -2962,6 +5434,57 @@ pub async fn dispatch_shared_for_tenant(
                 .await
         }
     }
+}
+
+/// [`dispatch_shared_for_tenant`]'s `agents/install` path -- resolves the
+/// requested [`acpx_registry::Agent`] under a brief router lock (mirrors
+/// `Router::dispatch_native`'s `"agents/install"` arm exactly, including
+/// its `{id, outcome}` response shape and every error case), then
+/// releases that lock *before* the actual `acpx_registry::install` call,
+/// which is the one that can genuinely take seconds (npm/pip resolution,
+/// or a full binary download+extract).
+///
+/// **Not a polling/streamed job**, deliberately: this still blocks the
+/// *calling* HTTP/WS/stdio request until the install finishes, same as
+/// before this fix -- only the *router-wide* blocking (every other
+/// concurrent client on this whole daemon) is what this function
+/// resolves. A durable job id + `agents/install/status` progress-polling
+/// API remains the documented, still-open, separate enhancement (see
+/// `acpx-client::ext::registry::install`'s doc comment) -- deliberately
+/// out of scope here to avoid a breaking wire-contract change across
+/// `acpx-proto`'s `AgentInstallResult` type and every existing caller/
+/// test that depends on today's synchronous shape, for what would be a
+/// pure UX improvement (progress feedback) rather than a correctness fix
+/// like the mutex-holding bug this function *does* resolve.
+async fn dispatch_agents_install_shared(
+    router: &SharedRouterHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+    let agent = {
+        let mut r = router.lock().await;
+        let agent_id = request
+            .get("params")
+            .and_then(|p| p.get("id"))
+            .and_then(|i| i.as_str())
+            .ok_or(RouterError::MissingAgentId)?
+            .to_string();
+        r.ensure_registry_loaded().await;
+        r.registry_cache
+            .as_ref()
+            .expect("just loaded")
+            .agents
+            .iter()
+            .find(|a| a.id == agent_id)
+            .cloned()
+            .ok_or(RouterError::UnknownAgentId(agent_id))?
+    };
+    let outcome = acpx_registry::install(&agent).await?;
+    Ok(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": { "id": agent.id, "outcome": format!("{outcome:?}") },
+    }))
 }
 
 /// [`dispatch_shared`]'s `session/cancel` path -- mirrors
@@ -3056,15 +5579,19 @@ async fn dispatch_session_list_real_shared(
         let mut r = router.lock().await;
         let (agent_id, profile) = match selector {
             SessionListSelector::Profile(name) => {
-                let (key, profile) = r.resolve_profile(&name).await?;
+                let (key, profile) = r.resolve_profile(&name, tenant_id).await?;
                 (key, Some(profile))
             }
-            SessionListSelector::AgentId(explicit_id) => (explicit_id, None),
+            SessionListSelector::AgentId(explicit_id) => {
+                r.ensure_agent_enabled(&explicit_id).await?;
+                r.ensure_custom_agent_registered(&explicit_id).await?;
+                (explicit_id, None)
+            }
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
+        let call_policy = r.call_policy(profile.as_ref());
         (agent_id, profile_name, backend, call_policy)
     };
 
@@ -3184,11 +5711,12 @@ async fn dispatch_proxied_shared(
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        let call_policy = BackendCallPolicy::from_profile(
-            profile_name
-                .as_deref()
-                .and_then(|name| r.profiles.get(name)),
+        r.sessions.set_in_flight(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            1,
         );
+        let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
         (
             backend,
             r.persistence.clone(),
@@ -3206,7 +5734,7 @@ async fn dispatch_proxied_shared(
         request.clone(),
     );
 
-    let response = {
+    let response_result = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&request).await?;
@@ -3221,8 +5749,24 @@ async fn dispatch_proxied_shared(
         };
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, Some(&live)).await?;
-        attach_updates(response, notifications, agent_requests)
-    };
+        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+    }
+    .await;
+    {
+        let mut r = router.lock().await;
+        r.sessions.set_in_flight(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            0,
+        );
+    }
+    if let Some(store) = persistence.clone() {
+        store
+            .update_session_activity(gateway_session_id.clone(), now_unix_nanos())
+            .await?;
+    }
+    let response = response_result?;
+    mark_successful_recovery_retry(persistence.clone(), &gateway_session_id, &method).await?;
 
     spawn_transcript_fn(
         persistence.clone(),
@@ -3232,23 +5776,140 @@ async fn dispatch_proxied_shared(
     );
 
     if method == "session/close" {
+        if let Some(store) = persistence.clone() {
+            store
+                .close_session(gateway_session_id.clone(), now_rfc3339())
+                .await?;
+        }
         // Same leak/correctness fix as `Router::dispatch_proxied` above --
         // see that call site's comment. Re-acquire the router lock
         // briefly (bookkeeping only, no backend I/O held) to evict the
         // closed session from the shared `SessionRegistry` too, so the
         // two dispatch paths never drift apart on this behavior.
-        router.lock().await.sessions.remove(
+        let mut r = router.lock().await;
+        if let Some(removed) = r.sessions.remove(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
-        );
-        if let Some(store) = persistence {
-            tokio::spawn(async move {
-                if let Err(err) = store.close_session(gateway_session_id, now_rfc3339()).await {
-                    tracing::warn!(%err, "failed to persist session close");
-                }
-            });
+        ) {
+            r.release_live_session(tenant_id);
+            r.stop_if_session_scoped(&removed.agent_id).await;
+            r.mark_unreferenced_if_idle(&removed.agent_id);
         }
     }
+    Ok(response)
+}
+
+/// [`dispatch_shared`]'s `session/fork` path. Mirrors
+/// `Router::dispatch_session_fork` exactly (see that method's doc
+/// comment for the full rationale) but restructured -- release
+/// `router`'s own lock before the backend round trip -- the same way
+/// every other `_shared` function in this file is, per this function's
+/// own module-level pattern.
+async fn dispatch_session_fork_shared(
+    router: &SharedRouterHandle,
+    tenant_id: &TenantId,
+    mut request: serde_json::Value,
+) -> Result<serde_json::Value, RouterError> {
+    let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+    let gateway_session_id = request
+        .get("params")
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .ok_or(RouterError::MissingSessionId)?
+        .to_string();
+    let cwd = request
+        .get("params")
+        .and_then(|p| p.get("cwd"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+
+    let (backend, persistence, call_policy, agent_id, profile_name, admission) = {
+        let mut r = router.lock().await;
+        // Reserve the fork before potentially rehydrating its persisted
+        // source so a rejected fork cannot leave the source registered.
+        let admission = r.admit_session(tenant_id)?;
+        let entry = match r.sessions.resolve(
+            tenant_id,
+            &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+        ) {
+            Some(entry) => entry.clone(),
+            None => {
+                r.rehydrate_session(tenant_id, "session/fork", &gateway_session_id)
+                    .await?
+            }
+        };
+        let agent_id = entry.agent_id.clone();
+        let backend_session_id = entry.backend_session_id.0.clone();
+        let profile_name = entry.profile_name.clone();
+        if let Some(params) = request.get_mut("params") {
+            params["sessionId"] = serde_json::Value::String(backend_session_id);
+        }
+        let backend = r.supervisor.ensure_running(&agent_id).await?;
+        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
+        (
+            backend,
+            r.persistence.clone(),
+            call_policy,
+            agent_id,
+            profile_name,
+            admission,
+        )
+    };
+
+    let mut response = async {
+        let mut proc = backend.lock().await;
+        ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
+        proc.writer.lock().await.write_value(&request).await?;
+        // No `LiveNotifyCtx` here, deliberately -- same reasoning as
+        // `dispatch_session_new_shared`'s own doc comment on this exact
+        // point: this call is what *creates* the new forked gateway
+        // session (`sessions.register` below), so no transport
+        // connection could possibly have subscribed to it yet.
+        let (response, notifications, agent_requests) =
+            read_matching_response(&mut proc, &id, call_policy, None).await?;
+        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+    }
+    .await?;
+
+    let forked_backend_session_id = extract_backend_session_id(&response)?;
+    let (forked_gateway_session_id_str, persist_args) = {
+        let mut r = router.lock().await;
+        let forked_gateway_id = r.sessions.register(
+            tenant_id,
+            agent_id,
+            BackendSessionId(forked_backend_session_id),
+            profile_name.clone(),
+            cwd,
+        );
+        admission.commit();
+        let forked_gateway_session_id_str = forked_gateway_id.0.clone();
+        if let Some(result) = response.get_mut("result") {
+            result["sessionId"] = serde_json::Value::String(forked_gateway_id.0);
+        }
+        let persist_args = r
+            .sessions
+            .resolve(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(forked_gateway_session_id_str.clone()),
+            )
+            .map(|entry| (entry.agent_id.clone(), entry.backend_session_id.0.clone()));
+        (forked_gateway_session_id_str, persist_args)
+    };
+
+    if let Some((persisted_agent_id, persisted_backend_session_id)) = persist_args {
+        spawn_session_persistence_fn(
+            persistence,
+            tenant_id.0.clone(),
+            forked_gateway_session_id_str,
+            persisted_agent_id,
+            persisted_backend_session_id,
+            profile_name,
+            request,
+            response.clone(),
+        );
+    }
+
     Ok(response)
 }
 
@@ -3264,7 +5925,16 @@ async fn dispatch_session_new_shared(
 ) -> Result<serde_json::Value, RouterError> {
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
 
-    let (agent_id, profile, backend, persistence, cwd) = {
+    let (
+        agent_id,
+        profile,
+        backend,
+        persistence,
+        cwd,
+        admission,
+        call_policy,
+        pre_minted_gateway_id,
+    ) = {
         let mut r = router.lock().await;
         let params = request
             .get_mut("params")
@@ -3278,16 +5948,64 @@ async fn dispatch_session_new_shared(
             .and_then(|ext| ext.get("profile"))
             .and_then(|p| p.as_str())
             .map(str::to_string);
+        let explicit_agent_id = params
+            .get("_acpx")
+            .and_then(|ext| ext.get("agentId"))
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        if profile_name.is_some() && explicit_agent_id.is_some() {
+            return Err(RouterError::ConflictingSessionSelection);
+        }
+        let selected_agent_id = match (&profile_name, explicit_agent_id.as_deref()) {
+            (Some(name), None) => {
+                r.ensure_default_profiles_seeded().await;
+                r.profiles
+                    .get(name)
+                    .map(|profile| profile.agent_id.clone())
+                    .ok_or_else(|| RouterError::UnknownProfile(name.clone()))?
+            }
+            (None, Some(agent_id)) => agent_id.to_owned(),
+            (None, None) => r.default_agent_id.clone(),
+            (Some(_), Some(_)) => unreachable!("checked above"),
+        };
+        r.ensure_agent_enabled(&selected_agent_id).await?;
         if let Some(obj) = params.as_object_mut() {
             obj.remove("_acpx");
         }
 
-        let (agent_id, profile) = match &profile_name {
-            Some(name) => {
-                let (supervisor_key, profile) = r.resolve_profile(name).await?;
+        let (agent_id, profile) = match (&profile_name, explicit_agent_id) {
+            (Some(name), None) => {
+                let (supervisor_key, profile) = r.resolve_profile(name, tenant_id).await?;
                 (supervisor_key, Some(profile))
             }
-            None => (r.default_agent_id.clone(), None),
+            (None, Some(agent_id)) => {
+                r.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
+            (None, None) => {
+                let agent_id = r.default_agent_id.clone();
+                r.ensure_custom_agent_registered(&agent_id).await?;
+                (agent_id, None)
+            }
+            (Some(_), Some(_)) => unreachable!("checked before _acpx stripping"),
+        };
+
+        // See `dispatch_session_new`'s identical block for the full
+        // rationale -- this is the shared (`Arc<Mutex<Router>>`-based)
+        // dispatch path's mirror of that same per-session backend
+        // process isolation logic, kept in lockstep since production
+        // transports call this function, not `Router::dispatch` directly.
+        let mut pre_minted_gateway_id: Option<String> = None;
+        let agent_id = if r.session_process_isolation && profile.is_some() {
+            let gid = uuid::Uuid::new_v4().to_string();
+            let session_scoped_key = format!("{agent_id}:session:{gid}");
+            if let Some(spec) = r.supervisor.spec(&agent_id).cloned() {
+                r.supervisor.register(session_scoped_key.clone(), spec);
+            }
+            pre_minted_gateway_id = Some(gid);
+            session_scoped_key
+        } else {
+            agent_id
         };
 
         if let Some(profile) = &profile {
@@ -3308,14 +6026,32 @@ async fn dispatch_session_new_shared(
             }
         }
 
+        let admission = r.admit_session(tenant_id)?;
         let backend = r.supervisor.ensure_running(&agent_id).await?;
         r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
-        (agent_id, profile, backend, r.persistence.clone(), cwd)
+        // See `dispatch_session_new`'s identical fallback for why: native/
+        // unmanaged mode still picks up whatever profile
+        // `ensure_default_profiles_seeded` auto-seeded under this
+        // `agent_id`, for `call_policy` purposes only. Doesn't trigger the
+        // seeding itself -- see `Router::warm_default_profiles`.
+        let call_policy_profile = profile
+            .clone()
+            .or_else(|| r.profiles.get(&agent_id).cloned());
+        let call_policy = r.call_policy(call_policy_profile.as_ref());
+        (
+            agent_id,
+            profile,
+            backend,
+            r.persistence.clone(),
+            cwd,
+            admission,
+            call_policy,
+            pre_minted_gateway_id,
+        )
     };
 
-    let mut response = {
+    let mut response = async {
         let mut proc = backend.lock().await;
-        let call_policy = BackendCallPolicy::from_profile(profile.as_ref());
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
         proc.writer.lock().await.write_value(&request).await?;
         // No `LiveNotifyCtx` here, deliberately: this exact call is what
@@ -3333,55 +6069,107 @@ async fn dispatch_session_new_shared(
         // session.
         let (response, notifications, agent_requests) =
             read_matching_response(&mut proc, &id, call_policy, None).await?;
-        attach_session_new_extras(
+        Ok::<_, RouterError>(attach_session_new_extras(
             response,
             notifications,
             agent_requests,
             proc.agent_capabilities.clone(),
-        )
-    };
+        ))
+    }
+    .await?;
 
     let backend_session_id = extract_backend_session_id(&response)?;
 
-    let (gateway_session_id_str, persist_args) = {
+    let (gateway_session_id_str, entry) = {
         let mut r = router.lock().await;
-        let gateway_id = r.sessions.register(
-            tenant_id,
-            agent_id,
-            BackendSessionId(backend_session_id),
-            profile.as_ref().map(|p| p.name.clone()),
-            cwd,
-        );
+        // See `dispatch_session_new`'s identical cancellation for why.
+        let supervisor_key_for_cancel = agent_id.clone();
+        let gateway_id = match pre_minted_gateway_id.clone() {
+            Some(gid) => r.sessions.register_with_id(
+                tenant_id,
+                acpx_proto::session::GatewaySessionId(gid),
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+            None => r.sessions.register(
+                tenant_id,
+                agent_id,
+                BackendSessionId(backend_session_id),
+                profile.as_ref().map(|p| p.name.clone()),
+                cwd,
+            ),
+        };
+        r.cancel_unreferenced_shutdown(&supervisor_key_for_cancel);
         let gateway_session_id_str = gateway_id.0.clone();
         if let Some(result) = response.get_mut("result") {
             result["sessionId"] = serde_json::Value::String(gateway_id.0);
         }
-        // Re-resolve (mirrors `Router::dispatch_session_new`'s own
-        // approach) rather than threading `agent_id`/`backend_session_id`
-        // back out through the closure -- `agent_id` was just moved into
-        // `register` above, and this is the same lock acquisition anyway.
-        let persist_args = r
+        let entry = r
             .sessions
             .resolve(
                 tenant_id,
                 &acpx_proto::session::GatewaySessionId(gateway_session_id_str.clone()),
             )
-            .map(|entry| (entry.agent_id.clone(), entry.backend_session_id.0.clone()));
-        (gateway_session_id_str, persist_args)
+            .cloned()
+            .expect("session was just registered");
+        (gateway_session_id_str, entry)
     };
 
-    if let Some((persisted_agent_id, persisted_backend_session_id)) = persist_args {
-        spawn_session_persistence_fn(
-            persistence,
-            tenant_id.0.clone(),
-            gateway_session_id_str,
-            persisted_agent_id,
-            persisted_backend_session_id,
-            profile.map(|p| p.name),
-            request,
-            response.clone(),
-        );
+    let effective_params = request
+        .get("params")
+        .cloned()
+        .ok_or(RouterError::MissingParams)?;
+    if let Some(store) = persistence.clone() {
+        if let Err(error) = store
+            .record_session_with_recovery(
+                gateway_session_id_str.clone(),
+                entry.agent_id.clone(),
+                entry.backend_session_id.0.clone(),
+                entry.profile_name.clone(),
+                now_rfc3339(),
+                tenant_id.0.clone(),
+                RecoveryMetadata {
+                    cwd: entry.cwd.clone(),
+                    recovery_params: Some(effective_params),
+                    status: RecoveryStatus::Active,
+                    recovery_method: RecoveryMethod::Load,
+                    last_recovery_error: None,
+                    created_at_unix_nanos: Some(now_unix_nanos()),
+                    last_activity_at_unix_nanos: Some(now_unix_nanos()),
+                    pinned: entry.pinned,
+                    bridge_session_id: None,
+                    bridge_model_alias: None,
+                    bridge_config_options: None,
+                },
+            )
+            .await
+        {
+            let mut r = router.lock().await;
+            if let Some(removed) = r.sessions.remove(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id_str),
+            ) {
+                r.stop_if_session_scoped(&removed.agent_id).await;
+                r.mark_unreferenced_if_idle(&removed.agent_id);
+            }
+            return Err(error.into());
+        }
     }
+    admission.commit();
+    spawn_transcript_fn(
+        persistence.clone(),
+        gateway_session_id_str.clone(),
+        Direction::ClientToAgent,
+        request,
+    );
+    spawn_transcript_fn(
+        persistence,
+        gateway_session_id_str,
+        Direction::AgentToClient,
+        response.clone(),
+    );
 
     Ok(response)
 }
@@ -3395,6 +6183,47 @@ fn now_rfc3339() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}.{:09}Z", now.as_secs(), now.subsec_nanos())
+}
+
+fn now_unix_nanos() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(now.as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// **`retention_administration`.** Response shape shared by every
+/// `session/retention/*` method -- `session/retention/list` builds an
+/// array of these, the single-session arms return one directly. Ages are
+/// whole seconds (this is a coarse operator-facing view, not a precision
+/// timer).
+fn retention_entry_json(
+    gateway_session_id: &str,
+    entry: &crate::session_registry::SessionEntry,
+) -> serde_json::Value {
+    let now = std::time::Instant::now();
+    serde_json::json!({
+        "sessionId": gateway_session_id,
+        "pinned": entry.pinned,
+        "customIdleTtlSeconds": entry.custom_idle_ttl.map(|ttl| ttl.as_secs()),
+        "idleForSeconds": now.saturating_duration_since(entry.last_activity_at).as_secs(),
+        "ageSeconds": now.saturating_duration_since(entry.created_at).as_secs(),
+        "inFlight": entry.in_flight,
+    })
+}
+
+/// Rebuild a monotonic lifecycle deadline from durable wall time. A missing
+/// timestamp comes from a database predating lifecycle persistence, so it
+/// deliberately restarts at `now` instead of expiring the session on boot.
+fn restore_lifecycle_instant(stored_unix_nanos: Option<i64>) -> std::time::Instant {
+    let Some(stored_unix_nanos) = stored_unix_nanos.filter(|value| *value > 0) else {
+        return std::time::Instant::now();
+    };
+    let elapsed_nanos = now_unix_nanos().saturating_sub(stored_unix_nanos);
+    let elapsed_nanos = u64::try_from(elapsed_nanos).unwrap_or(u64::MAX);
+    std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_nanos(elapsed_nanos))
+        .unwrap_or_else(std::time::Instant::now)
 }
 
 /// Mask every value in a serialized `Profile`'s `launch_overrides` map

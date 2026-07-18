@@ -5,6 +5,7 @@ members = [
     "acpx-registry",
     "acpx-conductor",
     "acpx-core",
+    "acpx-bridge",
     "acpx-server",
     "acpx-client",
 ]
@@ -19,11 +20,22 @@ repository = "https://github.com/acpx-dev/acpx"
 # acpx-client never drift onto different wire-type versions. See
 # memory/acpx/gen/plans/acp-gateway-daemon/03-crate-and-folder-layout.md.
 [workspace.dependencies]
-agent-client-protocol = "1"
+# `unstable_session_fork`: enables `ForkSessionRequest`/`ForkSessionResponse`
+# (`session/fork`) -- per upstream's own feature name, this is a real but
+# not-yet-stabilized v1 ACP extension (opt-in on their side too), not a
+# baseline-spec method. acpx supports it anyway because real, published
+# adapters (`claude-agent-acp` 0.58.1, verified against the actual npx
+# package) already advertise `sessionCapabilities.fork` and implement it --
+# see `acpx-core/src/router.rs`'s `MethodClass::SessionFork` doc comment
+# for the full compatibility-gap story. If upstream ever renames/removes
+# this feature on stabilization, the compile error here is the signal to
+# revisit this pin, not a silent behavior change.
+agent-client-protocol = { version = "1", features = ["unstable_session_fork"] }
 acpx-proto = { path = "acpx-proto" }
 acpx-registry = { path = "acpx-registry" }
 acpx-conductor = { path = "acpx-conductor" }
 acpx-core = { path = "acpx-core" }
+acpx-bridge = { path = "acpx-bridge" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

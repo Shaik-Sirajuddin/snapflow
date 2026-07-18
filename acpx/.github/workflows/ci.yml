@@ -8,6 +8,16 @@ on:
   pull_request:
     paths:
       - "acpx/**"
+  # `release_validation` hardening item (`acp-gateway-daemon` plan): live
+  # registry reachability and Gemini/registry drift are not exercised by
+  # the default push/PR gate above (deliberately -- `cargo test
+  # --workspace` must stay hermetic, see `acpx-registry/tests/
+  # live_registry.rs`'s doc comment). A daily schedule gives that
+  # `#[ignore]`d coverage a real, recurring run without slowing down or
+  # adding network flakiness to every ordinary push/PR.
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
 
 defaults:
   run:
@@ -16,6 +26,7 @@ defaults:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,6 +36,7 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,7 +46,48 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
+
+  # **`release_validation` hardening item.** Cross-platform coverage for
+  # the `binary` adapter-distribution install path -- previously verified
+  # on Linux only (like every other job above). `install_into_downloads_
+  # and_extracts_a_real_tar_gz_archive` (`acpx-registry/tests/
+  # binary_install_real_download_test.rs`) is a real download+extract
+  # against a same-machine loopback HTTP server, not a mock, so it
+  # genuinely exercises `reqwest`'s TLS/networking stack and the `tar`/
+  # `flate2`/`zip` extraction crates per-platform -- meaningful signal
+  # for whether the *code*, not just Linux's toolchain, is actually
+  # cross-platform. Runs on every push/PR (not schedule-only) since it's
+  # fast and has no external network dependency; also included in the
+  # nightly schedule run below for macOS/Windows runner flakiness
+  # visibility independent of push/PR cadence.
+  cross_platform_binary_install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p acpx-registry --test binary_install_real_download_test
+
+  # **`release_validation` hardening item.** Live registry endpoint check
+  # (`acpx-registry/tests/live_registry.rs`, normally `#[ignore]`d) --
+  # catches upstream schema drift or endpoint changes in
+  # `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`
+  # before it silently falls back to the bundled snapshot in production.
+  # Schedule-only: this is the one job in this file that touches a real
+  # external network resource outside this repo's control, so it
+  # deliberately stays off the push/PR critical path.
+  live_registry_check:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p acpx-registry --test live_registry -- --ignored

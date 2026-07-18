@@ -1,0 +1,59 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+
+// Settings page chrome -- the `[Project | Global]` scope switcher from the
+// settings-pane-redesign plan's "Component layout" section. Project is the
+// default-selected scope (owned by the caller, `SettingsPage`, not this
+// component -- this is a dumb controlled tab strip, same division of
+// ownership `left_tabs.slint`/`search_bar.slint` follow).
+export component SettingsTopTabs inherits Rectangle {
+    in property <string> scope: "project"; // "project" | "global"
+    callback scope-selected(string);
+
+    height: 32px;
+
+    HorizontalLayout {
+        spacing: Metrics.space-2;
+
+        Rectangle {
+            horizontal-stretch: 1;
+            border-radius: Theme.radius-sm;
+            background: root.scope == "project" ? Theme.bg-primary : Theme.bg-sidebar;
+            project-tab := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Show project settings";
+                accessible-action-default => { root.scope-selected("project"); }
+                clicked => { root.scope-selected("project"); }
+            }
+            Text {
+                text: "Project";
+                color: root.scope == "project" ? Theme.text-on-primary : Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            border-radius: Theme.radius-sm;
+            background: root.scope == "global" ? Theme.bg-primary : Theme.bg-sidebar;
+            global-tab := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Show global settings";
+                accessible-action-default => { root.scope-selected("global"); }
+                clicked => { root.scope-selected("global"); }
+            }
+            Text {
+                text: "Global";
+                color: root.scope == "global" ? Theme.text-on-primary : Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

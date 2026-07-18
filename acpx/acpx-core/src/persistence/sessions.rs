@@ -4,6 +4,154 @@
 //! index; the two are populated independently (see [`crate::persistence`]
 //! module docs on the async write path).
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
+use serde_json::Value;
+use std::fmt;
+
+/// Durable recovery lifecycle state for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryStatus {
+    Active,
+    Restoring,
+    Restored,
+    RecoveryFailed,
+    Closed,
+}
+
+/// Aggregate durable recovery state for operator diagnostics. Counts do not
+/// expose tenant, session, backend, prompt, or credential information.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryStatusCounts {
+    pub active: usize,
+    pub restoring: usize,
+    pub restored: usize,
+    pub recovery_failed: usize,
+    pub closed: usize,
+}
+
+impl RecoveryStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Restoring => "restoring",
+            Self::Restored => "restored",
+            Self::RecoveryFailed => "recovery_failed",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl fmt::Display for RecoveryStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ToSql for RecoveryStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for RecoveryStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "active" => Ok(Self::Active),
+            "restoring" => Ok(Self::Restoring),
+            "restored" => Ok(Self::Restored),
+            "recovery_failed" => Ok(Self::RecoveryFailed),
+            "closed" => Ok(Self::Closed),
+            value => Err(FromSqlError::Other(
+                format!("unknown recovery status {value:?}").into(),
+            )),
+        }
+    }
+}
+
+/// Backend mechanism to use when restoring a durable session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryMethod {
+    Load,
+    Resume,
+    None,
+}
+
+impl RecoveryMethod {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Resume => "resume",
+            Self::None => "none",
+        }
+    }
+}
+
+impl fmt::Display for RecoveryMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ToSql for RecoveryMethod {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::from(self.as_str()))
+    }
+}
+
+impl FromSql for RecoveryMethod {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        match value.as_str()? {
+            "load" => Ok(Self::Load),
+            "resume" => Ok(Self::Resume),
+            "none" => Ok(Self::None),
+            value => Err(FromSqlError::Other(
+                format!("unknown recovery method {value:?}").into(),
+            )),
+        }
+    }
+}
+
+/// Optional metadata supplied when creating a session that can be restored.
+///
+/// A missing `recovery_params` is stored as SQL `NULL`, avoiding an unsafe
+/// assumption about a backend's parameter shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryMetadata {
+    pub cwd: Option<String>,
+    pub recovery_params: Option<Value>,
+    pub status: RecoveryStatus,
+    pub recovery_method: RecoveryMethod,
+    pub last_recovery_error: Option<String>,
+    /// Durable wall-clock lifecycle values. They are optional so a database
+    /// created before lifecycle continuity shipped can be migrated without
+    /// making old rows immediately eligible for TTL reaping on restart.
+    pub created_at_unix_nanos: Option<i64>,
+    pub last_activity_at_unix_nanos: Option<i64>,
+    pub pinned: bool,
+    /// Strict-ACP bridge state. Native transports leave these fields empty.
+    pub bridge_session_id: Option<String>,
+    pub bridge_model_alias: Option<String>,
+    pub bridge_config_options: Option<Value>,
+}
+
+impl Default for RecoveryMetadata {
+    fn default() -> Self {
+        Self {
+            cwd: None,
+            recovery_params: None,
+            status: RecoveryStatus::Active,
+            recovery_method: RecoveryMethod::None,
+            last_recovery_error: None,
+            created_at_unix_nanos: None,
+            last_activity_at_unix_nanos: None,
+            pinned: false,
+            bridge_session_id: None,
+            bridge_model_alias: None,
+            bridge_config_options: None,
+        }
+    }
+}
+
 /// One row of the `sessions` table. `created_at`/`closed_at` are opaque
 /// caller-supplied timestamp strings (the router owns timestamp formatting,
 /// e.g. RFC3339) -- persistence itself stays free of a time-formatting
@@ -25,4 +173,29 @@ pub struct SessionRecord {
     /// `"default"` by `store.rs`'s migration, matching every other
     /// tenant-unaware caller's implicit tenant.
     pub tenant_id: String,
+    pub cwd: Option<String>,
+    pub recovery_params: Option<Value>,
+    pub status: RecoveryStatus,
+    pub recovery_method: RecoveryMethod,
+    pub last_recovery_error: Option<String>,
+    /// Explicit lifecycle retention override. `false` is the safe migration
+    /// default: old rows retain their existing TTL behavior.
+    pub pinned: bool,
+    /// Wall-clock creation time used to reconstruct a conservative monotonic
+    /// lifetime after a daemon restart. `None` denotes a pre-lifecycle row.
+    pub created_at_unix_nanos: Option<i64>,
+    /// Wall-clock last activity used to reconstruct the idle deadline after
+    /// a daemon restart. `None` denotes a pre-lifecycle row.
+    pub last_activity_at_unix_nanos: Option<i64>,
+    /// Virtual `/acp` session identity, retained separately from the native
+    /// gateway id so a bridge client can resume after a daemon restart.
+    pub bridge_session_id: Option<String>,
+    pub bridge_model_alias: Option<String>,
+    pub bridge_config_options: Option<Value>,
+    /// **`retention_administration`.** Per-session idle-TTL override in
+    /// whole seconds, set via `session/retention/set_ttl` and mirrored
+    /// into `crate::session_registry::SessionEntry::custom_idle_ttl` on
+    /// startup recovery. `None` means "no override, use the deployment
+    /// default" -- the migration default for every pre-existing row.
+    pub custom_idle_ttl_seconds: Option<i64>,
 }

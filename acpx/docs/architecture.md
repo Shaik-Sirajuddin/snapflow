@@ -158,20 +158,64 @@ to; `POST /rpc` has no such push channel and is unaffected (see
 
 `SessionRegistry` ([`session_registry.rs`](../acpx-core/src/session_registry.rs))
 maps an opaque `GatewaySessionId` (minted by acpx at `session/new`) to a
-`SessionEntry { agent_id, backend_session_id, profile_name, cwd }`. This
-mapping, and the `Supervisor`'s `HashMap<agent_id, SharedBackendProcess>`
-of running child processes, are both **in-memory only, owned by the
-daemon process, not by any client transport connection**:
+`SessionEntry { agent_id, backend_session_id, profile_name, cwd,
+created_at, last_activity_at, in_flight, in_flight_since, pinned,
+custom_idle_ttl }`. This mapping, and the `Supervisor`'s
+`HashMap<agent_id, SharedBackendProcess>` of running child processes, are
+both **in-memory only, owned by the daemon process, not by any client
+transport connection**:
 
 - A WS/stdio disconnect only unsubscribes that connection's
   `NotificationHub` watches (`transport/ws.rs`'s `handle_socket` cleanup
   loop). It never touches `Supervisor` or `SessionRegistry`. A backend
-  process is only ever killed by an explicit `profiles/delete` call
-  (`Supervisor::stop`) or the whole daemon process exiting.
+  process is never killed just because a transport connection dropped.
 - This means reconnecting a transport (new WS connection, a fresh
   `POST /rpc`) and reusing the same `GatewaySessionId` resumes
   instantly: `Supervisor::ensure_running` returns the already-running
   `Arc` with no respawn, and the session mapping is already present.
+
+### Retention, idle expiry, and the lifecycle reaper
+
+`acpx-session-lifecycle` plan
+([`lifecycle.rs`](../acpx-core/src/lifecycle.rs)): a session left idle
+(no in-flight turn) too long is safely closed and evicted, but an
+in-flight turn is never interrupted by TTL alone. Controlled by
+`LifecycleConfig`, all of it overridable via env (see
+[`setup.md`](./setup.md)'s environment variable table):
+
+| Policy | Field | Effect |
+| --- | --- | --- |
+| Idle session TTL | `idle_session_ttl` (default 30m) | An unpinned, not-in-flight session with no activity for this long becomes a reap candidate. |
+| Absolute session TTL | `absolute_session_ttl` (default off) | Optional hard ceiling on session age, regardless of activity -- still never interrupts an in-flight turn. |
+| Pinning | `SessionEntry::pinned` | Exempts a session from idle/absolute reaping entirely, subject to `max_pinned_sessions_per_tenant`. |
+| Per-session TTL override | `SessionEntry::custom_idle_ttl` | Replaces the deployment-wide idle TTL for one session. |
+| Capacity | `max_sessions_total` / `max_sessions_per_tenant` | Admission limits enforced before a backend session is even created. |
+| Active-turn deadline | `active_turn_deadline` (default off) | Bounds how long a turn may stay in-flight (`SessionEntry::in_flight_since`) before `Router::cancel_stuck_turns` sends the backend a best-effort `session/cancel` and clears in-flight bookkeeping, so a turn that never completes stops being unconditionally reap-exempt. Does not itself close the session -- a later idle-TTL pass is the real backstop. |
+| Connector idle shutdown | `connector_idle_shutdown_ttl` (default off) | Once a shared backend process (a supervisor key) has zero referencing live sessions for this long, `Router::reap_unreferenced_backends` stops it. Independent of session TTLs: a session can close while its process is still referenced by a sibling session under the same key. |
+
+A daemon-owned reaper task (`ACPX_LIFECYCLE_REAPER_ENABLED`, ticking
+every `ACPX_LIFECYCLE_REAPER_INTERVAL_SECONDS`, wired in
+[`main.rs`](../acpx-server/src/main.rs)) drives all three passes each
+tick: `Router::reap_expired_sessions` (idle/absolute TTL), `Router::
+reap_unreferenced_backends` (connector idle shutdown), and `Router::
+cancel_stuck_turns` (active-turn deadline).
+
+### Retention administration (gateway-native, tenant-scoped)
+
+Not ACP methods -- acpx-native JSON-RPC methods under the
+`session/retention/*` namespace, dispatched the same way as
+`agents/*`/`profiles/*`. Every call is scoped to the caller's own tenant
+(`X-Acpx-Tenant`/native tenant identity) and emits a sanitized
+`tracing::info!` audit event (tenant id + gateway session id only, never
+prompt/transcript content):
+
+| Method | Effect |
+| --- | --- |
+| `session/retention/get` | Returns one session's pin state, custom TTL, idle/age seconds, and in-flight count. |
+| `session/retention/list` | Same, for every session the caller's tenant owns. |
+| `session/retention/pin` | Pins a session (exempt from idle/absolute reaping), subject to `max_pinned_sessions_per_tenant`. |
+| `session/retention/unpin` | Restores default TTL behavior. |
+| `session/retention/set_ttl` | Sets (or clears) a per-session idle-TTL override. |
 
 ## Persistence and restart recovery
 
@@ -212,6 +256,68 @@ after a restart is therefore narrower than a live reconnect:
   `acpx-server` process, real `claude-agent-acp`) by
   `ambient_claude_session_load_survives_a_real_gateway_restart` in
   [`real_ambient_multi_agent_test.rs`](../acpx-server/tests/real_ambient_multi_agent_test.rs).
+- When the strict `/acp` bridge is enabled, its virtual session id,
+  selected public model, and accepted adapter configuration are persisted
+  alongside the native gateway session. After native startup recovery has
+  restored that gateway session, the HTTP bridge rebuilds the tenant-scoped
+  virtual mapping before serving `/acp` requests. Bridge model changes,
+  adapter option changes, and forks update the same durable binding. If
+  the initial binding cannot be persisted, ACPX closes the newly-created
+  native session rather than leaving an untracked orphan.
+- `GET /health` is an authenticated (when `ACPX_AUTH_TOKEN` is set),
+  secret-free readiness endpoint. It reports only aggregate durable
+  recovery counts and returns `recovering` while any persisted session is
+  in the `restoring` state. Individual session ids and recovery errors are
+  deliberately excluded. Recovery errors are flattened and capped before
+  persistence; a client attempting explicit `session/load` or
+  `session/resume` for a still-restoring row receives a retryable error
+  rather than starting duplicate backend recovery.
+
+### Durable secret and configuration store
+
+`ACPX_DB_PATH` also enables `Router::enable_durable_config`
+(`acpx-server`'s `main.rs`, right after `with_persistence` and before
+either transport starts): profiles, centrally-registered MCP servers,
+provider config, and every key a profile references now survive a
+restart, closing what used to be an in-memory-only gap. Behavior:
+
+- **Encryption at rest.** Secrets are AES-256-GCM encrypted
+  (`acpx_core::keystore::MasterKeyring`) before ever reaching sqlite --
+  the `secrets` table only ever holds `(key_ref, ciphertext, nonce,
+  key_version)`, never plaintext. The keyring itself is a local file
+  (default `<ACPX_DB_PATH>.keyring`, override with
+  `ACPX_MASTER_KEYRING_PATH`), created with `0600` permissions on first
+  use. This is explicitly a local-file key-management tier, not a real
+  OS-keychain/KMS integration -- structured so a KMS-backed
+  `MasterKeyring` could replace it later without changing any caller
+  (every consumer only ever sees an opaque `KeyRef`).
+- **Rotation.** `ACPX_MASTER_KEYRING_ROTATE=1` on a given startup mints a
+  new keyring version and re-encrypts every persisted secret under it in
+  a one-shot pass (`Router::rotate_master_key`); older versions stay in
+  the keyring so mid-rotation ciphertext (if a row hasn't been
+  re-encrypted yet) still decrypts. Not a schedule -- unset (the
+  default) never rotates.
+- **Load ordering matters.** `warm_default_profiles` (auto-seeds a
+  profile per installed registry agent) runs *after* `enable_durable_
+  config`, not before -- it only fills in a profile name that isn't
+  already present, so persisted profiles must load first or a restart
+  would silently reseed and shadow an operator's customization of one of
+  those default-named profiles (e.g. `codex-acp`) every time.
+- **Providers stay provisioning-file-first.** There is deliberately no
+  `providers/*` JSON-RPC method (see `Router::register_provider`'s doc
+  comment), so `ACPX_CONFIG_FILE` remains the primary way to declare
+  providers; `enable_durable_config` mirrors whatever `register_provider`
+  registers as a best-effort (fire-and-forget) durability backstop on
+  top of that, not a replacement for it. `provisioning.rs`'s `apply` is
+  correspondingly idempotent across restarts: a `profiles/create`/
+  `mcp_servers/create` that collides with something already loaded from
+  a *prior* run retries as an update rather than failing, while a true
+  duplicate name *within the same file* still fails startup outright.
+- Verified end-to-end (real second `acpx-server` process, same
+  `ACPX_DB_PATH`) by
+  [`durable_secret_store_binary_test.rs`](../acpx-server/tests/durable_secret_store_binary_test.rs);
+  the encryption/rotation/load-ordering details are covered in-process by
+  [`durable_secret_store_test.rs`](../acpx-core/tests/durable_secret_store_test.rs).
 
 ## Transports
 
@@ -240,6 +346,53 @@ Auth (`ACPX_AUTH_TOKEN`, constant-time bearer-token compare) applies to
 both `POST /rpc` and the WS upgrade; unset means no auth on that
 transport (pair with a TLS-terminating reverse proxy for any
 non-loopback bind -- acpx itself never terminates TLS).
+
+### The `/acp` compatibility bridge
+
+Opt-in (`ACPX_ACP_BRIDGE_ENABLED=1` + `ACPX_ACP_BRIDGE_CONFIG_FILE`),
+mounted on the same HTTP/WS listener at `/acp/rpc` and `/acp/ws`
+([`transport/acp_bridge.rs`](../acpx-server/src/transport/acp_bridge.rs)).
+Exists for strict ACP clients that expect a plain agent endpoint with a
+small, fixed model list rather than acpx's own profile/provider
+machinery -- notably **Zed** and **OpenHands**, both of which support ACP
+model discovery (`GET /acp/models`, secret-free: id/name/agent id/
+availability only). A bridge session:
+
+- Selects a model from `ACPX_ACP_BRIDGE_CONFIG_FILE`'s `models` list
+  (`{"id", "agent_id", "model_id", "name"?}`) via `session/set_config_
+  option`, or uses `default_model` if the client never picks one --
+  *lazily* bound to a real native gateway session on first
+  `session/prompt`, not at `session/new`, so a client that only ever
+  lists models never spawns a backend process.
+- Is a **virtual session**: the client-visible id never equals the real
+  gateway session id underneath it (see `bridge_sessions.rs`). An
+  unbound virtual session (picked a model, or not, but never prompted)
+  is reaped after `unbound_bridge_session_ttl` (default 5m) without ever
+  spawning a backend.
+- Forwards backend-initiated interactive requests
+  (`session/request_permission`, `fs/*`, `terminal/*`) to the bound `/acp`
+  client with session-id translation in both directions -- proven live
+  against a real Zed checkout, see
+  `memory/acpx/gen/plans/acpx-acp-compatibility/reports/zed-e2e-verification.md`.
+- Is capped per tenant by `max_virtual_sessions_per_tenant` (bridge
+  config file field, default unlimited).
+
+`acpx-acp-bridge` ([`acpx-bridge/`](../acpx-bridge/)) is a small separate
+binary a client spawns as its own ACP stdio subprocess; it does nothing
+but forward stdio <-> the shared daemon's `/acp/ws`. See
+`scripts/openhands-acpx-bridge.sh` for the OpenHands wiring and
+`setup.md`'s "ACP compatibility bridge" section for a full worked
+example (config file, daemon invocation, Zed/OpenHands client config).
+
+### Admin surface
+
+Optional, separate listener (`ACPX_ADMIN_BIND`, off by default),
+authenticated by a *different* token (`ACPX_ADMIN_TOKEN`) than the
+client-facing `ACPX_AUTH_TOKEN` -- deliberately not interchangeable, so a
+leaked client token can never reach admin routes. Covers custom-agent
+CRUD and other operator-only concerns that are not part of the ACP
+surface at all; see
+[`acpx-server/src/transport/admin.rs`](../acpx-server/src/transport/admin.rs).
 
 ## Agent detection and managed vs. native mode
 
