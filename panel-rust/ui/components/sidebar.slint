@@ -2,6 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
+import { HoverSurface } from "../base/hover.slint";
 import { ThreadItem } from "../types.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
@@ -105,8 +106,15 @@ export component Sidebar inherits Rectangle {
                         color: Theme.text-muted;
                     }
                 }
-                if expanded : Rectangle {
-                    horizontal-stretch: 1;
+                // Always mounted (not `if expanded`) so Ctrl+K /
+                // `focus-search()` can target it after the panel expands
+                // the rail. Collapsed: invisible, no stretch.
+                Rectangle {
+                    horizontal-stretch: expanded ? 1 : 0;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    visible: expanded;
+                    clip: true;
                     // TextInput has no built-in placeholder support
                     // (that's std-widgets' LineEdit, which pulls in a
                     // heavier widget style dependency this crate doesn't
@@ -144,19 +152,13 @@ export component Sidebar inherits Rectangle {
             viewport-height: thread-list-col.preferred-height;
             thread-list-col := VerticalLayout {
                 spacing: Metrics.space-1;
-                for thread[i] in threads : Rectangle {
+                for thread[i] in threads : HoverSurface {
                     height: expanded && thread.model != "" ? 66px : 56px;
-                    background: i == selected-thread ? Theme.bg-chat
-                        : thread-select.has-hover ? Theme.bg-primary-container
-                        : Theme.bg-sidebar;
-                    animate background { duration: 100ms; }
-                    thread-select := TouchArea {
-                        mouse-cursor: pointer;
-                        accessible-role: button;
-                        accessible-label: thread.name;
-                        accessible-action-default => { thread-selected(i); }
-                        clicked => { thread-selected(i); }
-                    }
+                    idle-bg: Theme.bg-sidebar;
+                    selected-bg: Theme.bg-chat;
+                    selected: i == selected-thread;
+                    button-accessible-label: thread.name;
+                    clicked => { thread-selected(i); }
                     HorizontalLayout {
                         Rectangle {
                             width: 3px;
@@ -364,18 +366,14 @@ export component Sidebar inherits Rectangle {
         // glyph (which was placement-only, no click behavior) so it's a
         // real, always-reachable control regardless of collapse state,
         // matching the rest of this footer row's "always visible" role.
-        Rectangle {
+        HoverSurface {
             height: compact ? 28px : 40px;
-            background: settings-bar-touch.has-hover ? Theme.bg-primary-container : Theme.bg-card;
+            idle-bg: Theme.bg-card;
+            selected: false;
+            button-accessible-label: "Open settings";
+            clicked => { root.settings-requested(); }
             border-color: Theme.border-default;
             border-width: 1px;
-            settings-bar-touch := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Open settings";
-                accessible-action-default => { root.settings-requested(); }
-                clicked => { root.settings-requested(); }
-            }
             HorizontalLayout {
                 padding: compact ? Metrics.space-2 : Metrics.space-4;
                 spacing: Metrics.space-3;
@@ -397,5 +395,11 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
+    }
+
+    // Ctrl+K target -- focus the thread search box (expanded) so the
+    // panel-level keybinding can jump here without re-finding the input.
+    public function focus-search() {
+        search-input.focus();
     }
 }

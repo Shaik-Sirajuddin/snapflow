@@ -1,0 +1,38 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Layer 3 (base) -- shared hover/cursor convention for clickable surfaces.
+// IconButton and Button already bake this in; HoverSurface is for free-form
+// rows/tiles (thread list, cards) that still need the same pointer + tint
+// without re-hand-rolling TouchArea + has-hover + animate each time.
+//
+// Fill uses Theme.bg-primary-container on hover (and optional selected-bg
+// when selected), matching IconButton/sidebar rows. Animation duration is
+// fixed at 100ms so hover feedback stays consistent panel-wide.
+export component HoverSurface inherits Rectangle {
+    in property <color> idle-bg: transparent;
+    in property <color> selected-bg: Theme.bg-chat;
+    in property <bool> selected: false;
+    // Named button-accessible-label (not accessible-label) -- Rectangle
+    // already owns the latter as a built-in a11y property.
+    in property <string> button-accessible-label: "";
+    // When false the surface still shows hover, but is not clickable
+    // (e.g. a decorative preview). Default true.
+    in property <bool> interactive: true;
+    callback clicked();
+    out property <bool> has-hover: touch.has-hover;
+
+    background: selected ? selected-bg
+        : touch.has-hover ? Theme.bg-primary-container
+        : idle-bg;
+    animate background { duration: 100ms; }
+
+    touch := TouchArea {
+        enabled: root.interactive;
+        mouse-cursor: root.interactive ? pointer : default;
+        accessible-role: button;
+        accessible-label: root.button-accessible-label;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+    }
+    @children
+}

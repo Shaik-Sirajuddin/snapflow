@@ -1,0 +1,47 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Layer 3 (base) -- href-styled text for markdown `link-clicked` targets
+// and any other explicit URL/label affordance. Pointer cursor + primary
+// color so links read as interactive even before a full StyledText
+// markdown view lands (chat-items-redesign.md). Callers wire `clicked`
+// to open the URL / navigate.
+export component LinkText inherits Rectangle {
+    in property <string> text;
+    in property <length> font-size: 12px;
+    in property <bool> mono: false;
+    callback clicked();
+
+    height: label.preferred-height;
+    // Grow with the label; parent layouts can still stretch/elide via
+    // preferred-width / horizontal-stretch on this root if needed.
+    min-width: 0px;
+    preferred-width: label.preferred-width;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: root.text;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+    }
+    label := Text {
+        text: root.text;
+        color: touch.has-hover ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary;
+        animate color { duration: 100ms; }
+        font-family: root.mono ? Theme.font-mono : Theme.font-sans;
+        font-size: root.font-size * Theme.font-scale;
+        // Underline-like affordance via a 1px rule under the glyphs --
+        // Slint Text has no text-decoration, so a thin bar stands in.
+        overflow: elide;
+        width: parent.width;
+        height: parent.height;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        width: parent.width;
+        background: touch.has-hover ? Theme.bg-primary.with-alpha(0.85) : Theme.bg-primary;
+        animate background { duration: 100ms; }
+    }
+}
