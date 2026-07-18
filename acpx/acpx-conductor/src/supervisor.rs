@@ -93,6 +93,30 @@ pub struct Supervisor {
     stable_after: Duration,
 }
 
+/// Hard ceiling on how long [`Supervisor::stop`] will wait to acquire the
+/// to-be-killed process's own per-process lock before giving up on doing
+/// the kill inline and detaching that wait into a background task instead.
+///
+/// **Why this exists, not hypothetical.** `stop` is called from two
+/// `acpx-core::Router` call sites that themselves run while their own
+/// caller is holding the single global router mutex for the whole call:
+/// `acpx-server`'s periodic lifecycle-reaper tick (`reap_unreferenced_
+/// backends`, gated behind `connector_idle_shutdown_ttl`) and
+/// `dispatch_proxied_shared`'s `session/close` handling (`stop_if_
+/// session_scoped`, gated behind `ACPX_SESSION_PROCESS_ISOLATION=1`).
+/// If the agent id being stopped currently has a stuck in-flight request
+/// (`read_matching_response` blocked forever on a backend that stopped
+/// responding -- the exact, previously-live incident `acpx-core::
+/// router::REAP_BACKEND_CALL_TIMEOUT`'s doc comment describes), that
+/// request's task is holding this same process's lock for as long as
+/// it's stuck, so an unbounded `handle.lock().await` here would wedge
+/// the caller's global router lock right along with it -- the identical
+/// failure mode, one call site further down. Both gating features are
+/// off by default in this deployment, so this closes a real but not
+/// (yet) independently observed-live path, the same way the
+/// `REAP_BACKEND_CALL_TIMEOUT` fix closed the one that was.
+const STOP_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl Supervisor {
     pub fn new() -> Self {
         Self {
@@ -269,9 +293,37 @@ impl Supervisor {
             self.write_handles.remove(agent_id);
             // Waits for any in-flight request against this agent to finish
             // before killing it, rather than yanking the process out from
-            // under a concurrent caller mid-I/O.
-            let mut proc = handle.lock().await;
-            proc.kill().await.map_err(ProcessError::Spawn)?;
+            // under a concurrent caller mid-I/O -- but only up to
+            // `STOP_LOCK_TIMEOUT`: see that constant's doc comment for why
+            // waiting unboundedly here is a real deadlock risk for any
+            // caller holding a broader lock (e.g. the global router mutex)
+            // around this call, not just a theoretical concern.
+            match tokio::time::timeout(STOP_LOCK_TIMEOUT, handle.clone().lock_owned()).await {
+                Ok(mut proc) => {
+                    proc.kill().await.map_err(ProcessError::Spawn)?;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %agent_id,
+                        timeout_secs = STOP_LOCK_TIMEOUT.as_secs(),
+                        "stop: backend process lock is still held by a stuck in-flight \
+                         request; detaching the kill into a background task instead of \
+                         blocking this call (and whatever lock its caller holds) \
+                         indefinitely -- the process will still be killed once that \
+                         stuck request eventually releases the lock"
+                    );
+                    tokio::spawn(async move {
+                        let mut proc = handle.lock().await;
+                        if let Err(error) = proc.kill().await {
+                            tracing::warn!(
+                                %error,
+                                "detached background kill (after a stop() lock timeout) \
+                                 also failed"
+                            );
+                        }
+                    });
+                }
+            }
         }
         // An intentional stop isn't a crash -- clear backoff bookkeeping so
         // a subsequent `ensure_running` spawns immediately.

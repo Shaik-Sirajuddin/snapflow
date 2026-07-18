@@ -661,7 +661,36 @@ pub enum RouterError {
         current: usize,
         limit: usize,
     },
+    #[error(
+        "lifecycle reaper: backend session/close for gateway session {0} did not respond \
+         within {1:?}; leaving this session in place for a later reap pass instead of \
+         holding the whole gateway's lock indefinitely"
+    )]
+    ReapBackendCallTimeout(String, Duration),
 }
+
+/// Hard ceiling on the per-candidate backend `session/close` round trip
+/// inside [`Router::reap_expired_sessions`].
+///
+/// **Real incident this guards against, not a hypothetical.** The lifecycle
+/// reaper (`acpx-server/src/main.rs`'s periodic tick, default every 60s)
+/// calls this function while the caller already holds the single global
+/// [`SharedRouter`] mutex for the *entire* pass across every idle-expired
+/// session -- exactly the same lock `acp_bridge::BridgeRuntime::
+/// refresh_models` guards with `MODEL_PROBE_TIMEOUT` for the same reason.
+/// This function's own `ensure_backend_initialized`/`read_matching_response`
+/// round trip (sending a `session/close` to the session's backend) had no
+/// timeout of its own -- confirmed live: after acpx ran for a while with a
+/// real Zed client attached, one idle session's backend (`codex-acp`)
+/// stopped answering, the very next lifecycle-reaper tick's `session/close`
+/// blocked forever inside this loop, and every other tenant/session on the
+/// server hung behind the same held mutex from that point on -- matching a
+/// real "works right after restart, wedges again later" report exactly.
+/// Timing out here drops the inner future (and the per-process
+/// `BackendProcess` lock acquired inside it), so a single stuck backend
+/// only skips *this* session's reap this pass (it stays live, tried again
+/// on the next tick) instead of freezing the whole gateway.
+const REAP_BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Router {
     pub fn new(default_agent_id: impl Into<String>) -> Self {
@@ -1313,7 +1342,20 @@ impl Router {
         let backend = self.supervisor.ensure_running(agent_id).await?;
         let capabilities = {
             let mut backend = backend.lock().await;
-            ensure_backend_initialized(&mut backend, BackendCallPolicy::default()).await?;
+            // Bug fix: this previously hardcoded `BackendCallPolicy::default()`
+            // (no `auth_method_id`), so a capability probe against any
+            // backend that advertises non-empty `authMethods` at
+            // `initialize` time always failed with
+            // `BackendRequiresAuthentication`, even when the router was
+            // configured with `Router::with_native_auth_method_id` (or a
+            // profile-level `auth_method_id`) specifically to answer that.
+            // Every other `ensure_backend_initialized` call site already
+            // passes the resolved `self.call_policy(profile)` -- the probe
+            // path is native/unmanaged (no profile), so `self.call_policy
+            // (None)` is the same policy real `session/new` dispatch would
+            // use for this agent.
+            let call_policy = self.call_policy(None);
+            ensure_backend_initialized(&mut backend, call_policy).await?;
             let initialize_result = backend.agent_capabilities.clone().unwrap_or_default();
 
             let new_id = serde_json::json!("acpx-capability-probe-new");
@@ -1816,7 +1858,7 @@ impl Router {
                 "method": "session/close",
                 "params": {"sessionId": entry.backend_session_id.0}
             });
-            let result = async {
+            let call = async {
                 let backend = self.supervisor.ensure_running(&entry.agent_id).await?;
                 let call_policy = self
                     .call_policy_for(entry.profile_name.as_deref(), &entry.agent_id)
@@ -1835,8 +1877,32 @@ impl Router {
                     return Err(RouterError::BackendSessionNewError(error.clone()));
                 }
                 Ok::<_, RouterError>(())
-            }
-            .await;
+            };
+            let result = match tokio::time::timeout(REAP_BACKEND_CALL_TIMEOUT, call).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Dropping `call` here releases the per-process
+                    // `BackendProcess` lock it may have acquired inside
+                    // `ensure_backend_initialized`/`read_matching_response`,
+                    // so a stuck backend can never hold this whole
+                    // reaper (and the global router mutex the caller
+                    // holds around it) hostage indefinitely. See
+                    // `REAP_BACKEND_CALL_TIMEOUT`'s doc comment for the
+                    // live incident this closes.
+                    tracing::warn!(
+                        gateway_session_id = %gateway_id.0,
+                        agent_id = %entry.agent_id,
+                        timeout_secs = REAP_BACKEND_CALL_TIMEOUT.as_secs(),
+                        "lifecycle reaper's session/close timed out; leaving this session \
+                         live and retrying on a later reap pass instead of blocking every \
+                         other tenant/session behind the router lock"
+                    );
+                    Err(RouterError::ReapBackendCallTimeout(
+                        gateway_id.0.clone(),
+                        REAP_BACKEND_CALL_TIMEOUT,
+                    ))
+                }
+            };
             if result.is_err() {
                 self.sessions.set_in_flight(&tenant_id, &gateway_id, 0);
                 report.failed += 1;

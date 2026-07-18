@@ -20,6 +20,7 @@ use acpx_core::{
 use acpx_proto::session::NewSessionParams;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
+use tokio::time::Duration;
 
 use super::SharedRouter;
 
@@ -106,6 +107,24 @@ pub struct BridgeRuntime {
     config_options: Arc<RwLock<Vec<Value>>>,
 }
 
+/// Hard ceiling on one adapter's capability probe inside [`BridgeRuntime::refresh_models`].
+///
+/// **Real incident this guards against, not a hypothetical:** `probe_adapter_capabilities`
+/// runs while holding the single global [`SharedRouter`] mutex (see the lock scope below),
+/// and its `initialize`/`authenticate`/`session/new` reads against the backend's stdio have
+/// no timeout of their own (`BackendCallPolicy::timeout` is a real field but is never wired
+/// into `ensure_backend_initialized`/`read_matching_response` -- a separate, deeper gap left
+/// for a future fix). Before this constant existed, one backend that stopped answering --
+/// observed live against `codex-acp` -- wedged the router mutex forever, which froze *every*
+/// tenant/session on the server, not just `/acp/models`: this matched a real "Zed stuck at
+/// loading" report end to end, with `session/new` calls from Zed's own client queued behind
+/// the same lock and never returning either (confirmed live via CLOSE-WAIT sockets piling up
+/// on the HTTP listener while every authenticated endpoint, not only `/acp/models`, hung).
+/// Bounding this one call lets a stuck backend fail *this* refresh cleanly -- existing
+/// static/previously-discovered models stay available -- instead of taking the whole server
+/// down with it.
+const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
 impl BridgeRuntime {
     pub fn new(config: Arc<BridgeConfig>) -> Self {
         Self {
@@ -129,9 +148,27 @@ impl BridgeRuntime {
         let mut discovered = Vec::new();
         let mut discovered_options = Vec::new();
         for agent_id in agent_ids {
-            let capabilities = {
+            let probe = async {
                 let mut router = router.lock().await;
                 router.probe_adapter_capabilities(&agent_id, "/tmp").await
+            };
+            let capabilities = match tokio::time::timeout(MODEL_PROBE_TIMEOUT, probe).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Timing out here drops `probe` -- and with it the router
+                    // `MutexGuard` acquired inside -- so a wedged backend
+                    // releases the global lock for every other tenant/session
+                    // instead of holding it forever. See `MODEL_PROBE_TIMEOUT`'s
+                    // doc comment for the live incident this fixes.
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        timeout_secs = MODEL_PROBE_TIMEOUT.as_secs(),
+                        "capability probe timed out; skipping model discovery for \
+                         this adapter this refresh (static/previously-discovered \
+                         models remain available)"
+                    );
+                    continue;
+                }
             };
             let Ok(capabilities) = capabilities else {
                 continue;

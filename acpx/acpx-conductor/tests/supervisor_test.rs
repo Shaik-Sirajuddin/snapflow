@@ -1,6 +1,46 @@
 use acpx_conductor::{ProcessStatus, SpawnSpec, Supervisor, SupervisorError};
 use std::time::Duration;
 
+/// Regression test for the `STOP_LOCK_TIMEOUT` fix in
+/// `Supervisor::stop` -- mirrors `acpx-core`'s
+/// `stuck_backend_session_close_does_not_wedge_the_router` test for the
+/// identical failure shape one layer down: a stuck in-flight request
+/// holds the per-process lock `stop` used to wait on unboundedly, which
+/// previously meant `stop` (and therefore any caller holding a broader
+/// lock around it, e.g. `acpx-core::Router`'s global mutex) blocked
+/// forever too.
+#[tokio::test]
+async fn stop_does_not_block_forever_when_process_lock_is_held() {
+    let mut sup = Supervisor::new();
+    sup.register("echo-agent", SpawnSpec::new("cat", vec![]));
+    let handle = sup.ensure_running("echo-agent").await.unwrap();
+
+    // Simulate a stuck in-flight request (e.g. `read_matching_response`
+    // blocked reading a reply that never comes) by holding the process's
+    // own lock indefinitely from another task.
+    let held = handle.clone();
+    let hold_task = tokio::spawn(async move {
+        let _guard = held.lock().await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    // Give the holder task a moment to actually acquire the lock first.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let stop_result = tokio::time::timeout(Duration::from_secs(20), sup.stop("echo-agent")).await;
+    assert!(
+        stop_result.is_ok(),
+        "stop() should return within STOP_LOCK_TIMEOUT instead of blocking forever \
+         behind a stuck holder of the process lock"
+    );
+    stop_result.unwrap().unwrap();
+
+    // `stop` must have detached bookkeeping immediately, not left the
+    // agent looking like it is still running.
+    assert_eq!(sup.status("echo-agent"), ProcessStatus::NotStarted);
+
+    hold_task.abort();
+}
+
 #[tokio::test]
 async fn ensure_running_spawns_and_reuses_process() {
     let mut sup = Supervisor::new();
