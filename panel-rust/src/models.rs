@@ -355,9 +355,26 @@ pub fn build_thread_items<N: AsRef<str>>(
                     .unwrap_or_default()
                     .into(),
                 closed: closed.get(real_index).copied().unwrap_or(false),
+                // Provider/model are not part of the name/state slices this
+                // filter operates on -- `lib.rs` post-populates them by
+                // `real_index` after filtering, so they default empty here.
+                provider: String::new().into(),
+                model: String::new().into(),
             },
         })
         .collect()
+}
+
+/// The current value of a thread's `"model"` config option, or "" when the
+/// backend advertises no such option (or no current value) -- the sidebar's
+/// Phase 8 model label. Reads the same `configOptions[]` feed the compose
+/// bar's model selector uses.
+pub fn model_name_from_config(options: &[ConfigOptionInfo]) -> String {
+    options
+        .iter()
+        .find(|o| o.id == "model")
+        .and_then(|o| o.current_value.clone())
+        .unwrap_or_default()
 }
 
 /// Builds the terminal-card row model for the active thread --

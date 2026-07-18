@@ -141,11 +141,11 @@ export component Sidebar inherits Rectangle {
             vertical-stretch: 1;
             preferred-height: 0px;
             min-height: 0px;
-            viewport-height: threads.length * 58px;
-            VerticalLayout {
+            viewport-height: thread-list-col.preferred-height;
+            thread-list-col := VerticalLayout {
                 spacing: Metrics.space-1;
                 for thread[i] in threads : Rectangle {
-                    height: 56px;
+                    height: expanded && thread.model != "" ? 66px : 56px;
                     background: i == selected-thread ? Theme.bg-chat
                         : thread-select.has-hover ? Theme.bg-primary-container
                         : Theme.bg-sidebar;
@@ -333,6 +333,19 @@ export component Sidebar inherits Rectangle {
                                 color: Theme.text-secondary;
                                 font-size: 10px * Theme.font-scale;
                                 font-family: Theme.font-sans;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                preferred-width: 0px;
+                                min-width: 0px;
+                            }
+                            // Phase 8: the thread's active model (prefixed with
+                            // its provider when known) -- shown only where a
+                            // model is actually advertised.
+                            if expanded && thread.model != "" : Text {
+                                text: thread.provider != "" ? thread.provider + " \u{00B7} " + thread.model : thread.model;
+                                color: Theme.text-muted;
+                                font-size: 9px * Theme.font-scale;
+                                font-family: Theme.font-mono;
                                 overflow: elide;
                                 horizontal-stretch: 1;
                                 preferred-width: 0px;

@@ -324,6 +324,26 @@ impl PanelSingleton {
                     .unwrap_or(false)
             })
             .collect();
+        let providers: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                self.bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_provider(idx))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let thread_models: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                self.bridge
+                    .as_ref()
+                    .map(|bridge| models::model_name_from_config(&bridge.config_options(idx)))
+                    .unwrap_or_default()
+            })
+            .collect();
         let items = build_thread_items(
             &*names,
             &state,
@@ -333,7 +353,15 @@ impl PanelSingleton {
             &query,
         );
         *self.visible_indices.borrow_mut() = items.iter().map(|i| i.real_index).collect();
-        let items: Vec<ThreadItem> = items.into_iter().map(|i| i.item).collect();
+        let items: Vec<ThreadItem> = items
+            .into_iter()
+            .map(|i| {
+                let mut item = i.item;
+                item.provider = providers.get(i.real_index).cloned().unwrap_or_default().into();
+                item.model = thread_models.get(i.real_index).cloned().unwrap_or_default().into();
+                item
+            })
+            .collect();
         self.component
             .set_threads(ModelRc::new(VecModel::from(items)));
     }
