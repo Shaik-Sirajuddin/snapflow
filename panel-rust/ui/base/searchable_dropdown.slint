@@ -38,6 +38,10 @@ export component SearchableDropdown inherits Rectangle {
 
     height: 24px;
     min-width: 72px;
+    // Fixed cap so a long mode/model label never grows the trigger past a
+    // reasonable width inside the compose bar's row 2 -- the label's own
+    // `overflow: elide` (below) takes over once content exceeds this.
+    max-width: 140px;
     background: trigger-touch.has-hover || open ? Theme.bg-primary-container : Theme.bg-canvas;
     animate background { duration: 100ms; }
     border-color: Theme.border-default;

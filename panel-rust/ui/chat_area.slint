@@ -455,16 +455,18 @@ export component ChatArea inherits Rectangle {
         compose-shell := Rectangle {
             background: Theme.bg-chat;
             VerticalLayout {
-                padding-left: Metrics.space-5;
-                padding-right: Metrics.space-5;
-                padding-top: Metrics.space-4;
-                padding-bottom: Metrics.space-4;
+                // Outer/layout-level padding around the whole compose
+                // surface -- the "md" tier (Metrics.space-6). Distinct from
+                // the smaller "sm" tier (Metrics.space-3) used below for
+                // spacing/padding *within* the surface (between its two
+                // rows, inside the input box, inside dropdown rows).
+                padding: Metrics.space-6;
                 spacing: Metrics.space-3;
                 // Row 1 -- auto-growing input (capped, internal scroll once
                 // capped) with the Send/Stop button right-aligned and
                 // vertically centered to the row.
                 HorizontalLayout {
-                    spacing: Metrics.space-4;
+                    spacing: Metrics.space-3;
                     input-box := Rectangle {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
@@ -473,7 +475,7 @@ export component ChatArea inherits Rectangle {
                         // the inner Flickable scrolls -- `compose.preferred-
                         // height` is driven by width (set by the layout), not
                         // by this height, so there is no sizing cycle.
-                        height: Math.clamp(compose.preferred-height + 2 * Metrics.space-4, 34px, 120px);
+                        height: Math.clamp(compose.preferred-height + 2 * Metrics.space-3, 34px, 120px);
                         background: Theme.bg-sidebar;
                         border-color: Theme.border-default;
                         border-width: 1px;
@@ -485,15 +487,15 @@ export component ChatArea inherits Rectangle {
                             font-family: Theme.font-sans;
                             wrap: word-wrap;
                             visible: compose.text == "";
-                            x: Metrics.space-5;
-                            y: Metrics.space-4;
-                            width: parent.width - 2 * Metrics.space-5;
+                            x: Metrics.space-3;
+                            y: Metrics.space-3;
+                            width: parent.width - 2 * Metrics.space-3;
                         }
                         Flickable {
-                            x: Metrics.space-5;
-                            y: Metrics.space-4;
-                            width: parent.width - 2 * Metrics.space-5;
-                            height: parent.height - 2 * Metrics.space-4;
+                            x: Metrics.space-3;
+                            y: Metrics.space-3;
+                            width: parent.width - 2 * Metrics.space-3;
+                            height: parent.height - 2 * Metrics.space-3;
                             viewport-height: compose.preferred-height;
                             compose := TextInput {
                                 accessible-label: "Compose message";
@@ -531,7 +533,7 @@ export component ChatArea inherits Rectangle {
                     VerticalLayout {
                         alignment: center;
                         Rectangle {
-                            width: compact ? 44px : 116px;
+                            width: 32px;
                             height: 26px;
                             background: sending ? Theme.border-default
                                 : !(sending || compose.text != "") ? Theme.border-default
@@ -554,21 +556,16 @@ export component ChatArea inherits Rectangle {
                                     else { send-requested(); }
                                 }
                             }
-                            HorizontalLayout {
-                                padding-left: compact ? 8px : 14px;
-                                padding-right: compact ? 8px : 14px;
-                                padding-top: Metrics.space-2;
-                                padding-bottom: Metrics.space-2;
+                            VerticalLayout {
                                 alignment: center;
-                                Text {
-                                    text: sending ? "Stop" : compact ? "\u{27A4}" : "Send Command";
-                                    color: sending ? Theme.text-secondary
-                                        : (compose.text != "" ? Theme.text-on-primary : Theme.text-muted);
-                                    font-family: Theme.font-sans;
-                                    font-size: 10px * Theme.font-scale;
-                                    font-weight: 700;
-                                    vertical-alignment: center;
-                                    horizontal-alignment: center;
+                                HorizontalLayout {
+                                    alignment: center;
+                                    Icon {
+                                        source: sending ? @image-url("./assets/icons/square.svg") : @image-url("./assets/icons/send.svg");
+                                        size: Metrics.icon-sm;
+                                        color: sending ? Theme.text-secondary
+                                            : (compose.text != "" ? Theme.text-on-primary : Theme.text-muted);
+                                    }
                                 }
                             }
                         }
