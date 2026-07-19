@@ -207,6 +207,27 @@ pub fn scaffold_new_skill(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     Ok(skill_dir)
 }
 
+/// `dev-mode` task's "ship a default global skill". Per
+/// `03-open-risks.md`'s `bundled_skill_content_scope` finding: this is
+/// intentionally a minimal placeholder, not real skill content -- get
+/// the real content from `memory/designa/skills/` conventions before
+/// expanding it.
+const BUNDLED_SKILL_NAME: &str = "getting-started";
+const BUNDLED_SKILL_FRONT_MATTER: &str = "---\nname: getting-started\ndescription: >-\n  Placeholder default skill shipped with dev mode. Replace with real\n  content before relying on it for anything.\n---\n\n# Getting Started\n\nThis is a placeholder skill bundled with dev mode. It exists so\nenabling dev mode always leaves at least one global skill in place to\nverify the skill-manager UI/discovery pipeline end-to-end; write real\ninstructions here (or delete this skill and add real ones) before\nshipping dev mode for actual use.\n";
+
+/// Copies the bundled default global skill into `global_dir` on first
+/// dev-mode enable. Idempotent -- a no-op (not an error) if a skill by
+/// that name already exists, so re-enabling dev mode after the user
+/// edited or deleted it doesn't clobber their changes.
+pub fn ensure_bundled_global_skill(global_dir: &Path) -> std::io::Result<()> {
+    let skill_dir = global_dir.join(BUNDLED_SKILL_NAME);
+    if skill_dir.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(&skill_dir)?;
+    fs::write(skill_dir.join("SKILL.md"), BUNDLED_SKILL_FRONT_MATTER)
+}
+
 /// Moves a project-local skill directory into the global skills
 /// directory (`skills-management`'s "make global" action). Errors if
 /// `skill_dir` doesn't exist, or a same-named skill already exists at
@@ -395,5 +416,28 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         // Original must be left in place on failure.
         assert!(skill_dir.exists());
+    }
+
+    #[test]
+    fn ensure_bundled_global_skill_creates_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_bundled_global_skill(dir.path()).unwrap();
+        let entries = scan_skills_dir(dir.path(), SkillScope::Global);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "getting-started");
+    }
+
+    #[test]
+    fn ensure_bundled_global_skill_does_not_clobber_user_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_bundled_global_skill(dir.path()).unwrap();
+        let skill_md = dir.path().join(BUNDLED_SKILL_NAME).join("SKILL.md");
+        fs::write(&skill_md, "---\nname: getting-started\ndescription: edited\n---\n").unwrap();
+
+        // Re-running (simulating dev mode disabled then re-enabled) must
+        // not overwrite the user's edit.
+        ensure_bundled_global_skill(dir.path()).unwrap();
+        let contents = fs::read_to_string(&skill_md).unwrap();
+        assert!(contents.contains("edited"));
     }
 }

@@ -44,6 +44,7 @@ export component SettingsPage inherits Rectangle {
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
     in property <[SkillOption]> available-skills: [];
+    in property <bool> dev-mode: false;
 
     callback save();
     callback close();
@@ -54,6 +55,7 @@ export component SettingsPage inherits Rectangle {
     callback agent-install-requested(string);
     callback recover-session-attach(string, string, string);
     callback skill-promote-to-global(string);
+    callback dev-mode-toggled(bool);
 
     background: Theme.bg-card;
     border-color: Theme.border-strong;
@@ -172,7 +174,9 @@ export component SettingsPage inherits Rectangle {
                         if root.active-section == "skills" : SkillsView {
                             width: parent.width;
                             skills: root.available-skills;
+                            dev-mode: root.dev-mode;
                             skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
+                            dev-mode-toggled(enabled) => { root.dev-mode-toggled(enabled); }
                         }
                     }
                 }

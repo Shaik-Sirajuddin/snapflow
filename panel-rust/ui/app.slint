@@ -86,6 +86,7 @@ export component ChatPanel inherits Window {
     // skills_management_settings phases), same "property exists before
     // its consuming UI" precedent as `available-mcp-servers` originally.
     in property <[SkillOption]> available-skills: [];
+    in property <bool> dev-mode: false;
     // Mode/config selector addition -- see chat_area.slint's own doc
     // comment on these properties; passed straight through to `ChatArea`
     // below (this root component owns no mode/config state of its own,
@@ -104,6 +105,7 @@ export component ChatPanel inherits Window {
     callback new-thread-requested();
     callback new-skill-requested(string);
     callback skill-promote-to-global(string);
+    callback dev-mode-toggled(bool);
     callback thread-close-requested(int);
     callback thread-delete-requested(int);
     callback thread-archive-requested(int);
@@ -347,6 +349,7 @@ export component ChatPanel inherits Window {
                 agent-catalog: agent-catalog;
                 recoverable-sessions: recoverable-sessions;
                 available-skills: available-skills;
+                dev-mode: dev-mode;
                 save => { settings-save(); }
                 close => {
                     settings-open = false;
@@ -362,6 +365,7 @@ export component ChatPanel inherits Window {
                 agent-install-requested(id) => { agent-install-requested(id); }
                 recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
                 skill-promote-to-global(path) => { skill-promote-to-global(path); }
+                dev-mode-toggled(enabled) => { dev-mode-toggled(enabled); }
             }
         }
     }

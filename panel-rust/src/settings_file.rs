@@ -55,6 +55,15 @@ pub struct SettingsDocument {
     pub default_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<HarnessSettings>,
+    // `dev_mode` -- `dev-mode` task's "Dev mode option for the system".
+    // Deliberately Global tier only: read/written directly against
+    // `SettingsPaths::global` by `SettingsPaths::dev_mode()`/
+    // `set_dev_mode()` below, bypassing `merge_documents`'s generic
+    // Project-overrides-Global layering entirely -- a project-scoped
+    // settings.json setting this key has no effect, since dev mode is a
+    // system-level toggle, not a per-project one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_mode: Option<bool>,
 }
 
 fn schema_version_default() -> u32 {
@@ -246,6 +255,28 @@ impl SettingsPaths {
         let refs: Vec<&SettingsDocument> = layers.iter().collect();
         Ok(merge_documents(&refs))
     }
+
+    /// Reads `dev_mode` from the Global document only -- see
+    /// `SettingsDocument::dev_mode`'s doc comment for why this
+    /// deliberately does not go through `load_resolved`'s generic
+    /// Project-overrides-Global merge.
+    pub fn dev_mode(&self) -> bool {
+        load_document(&self.global)
+            .ok()
+            .and_then(|doc| doc.dev_mode)
+            .unwrap_or(false)
+    }
+
+    /// Writes `dev_mode` into the Global document, preserving every
+    /// other field already on disk (same read-modify-write shape
+    /// `lib.rs::save_panel_prefs_to_json` already uses for the other
+    /// Global-tier fields).
+    pub fn set_dev_mode(&self, enabled: bool) -> Result<(), SettingsFileError> {
+        let mut doc = load_document(&self.global)?;
+        doc.schema_version = 1;
+        doc.dev_mode = Some(enabled);
+        save_document(&self.global, &doc)
+    }
 }
 
 fn dirs_fallback_config() -> PathBuf {
@@ -357,6 +388,7 @@ mod tests {
             background_session_default: Some(false),
             default_agent_id: None,
             harness: None,
+            dev_mode: None,
         };
         let global = SettingsDocument {
             schema_version: 1,
@@ -365,6 +397,7 @@ mod tests {
             background_session_default: Some(true),
             default_agent_id: Some("codex".into()),
             harness: None,
+            dev_mode: None,
         };
         let project = SettingsDocument {
             schema_version: 1,
@@ -377,6 +410,7 @@ mod tests {
                 notify_on_input_required: true,
                 auto_resume_on_rate_limit_reset: true,
             }),
+            dev_mode: None,
         };
         let r = merge_documents(&[&bundled, &global, &project]);
         assert_eq!(r.default_profile.as_deref(), Some("project-prof"));
@@ -398,12 +432,65 @@ mod tests {
             background_session_default: Some(true),
             default_agent_id: None,
             harness: Some(HarnessSettings::default()),
+            dev_mode: None,
         };
         save_document(&path, &doc).unwrap();
         let loaded = load_document(&path).unwrap();
         assert_eq!(loaded.default_profile.as_deref(), Some("default"));
         assert_eq!(loaded.permission_profile.as_deref(), Some("full"));
         assert_eq!(loaded.background_session_default, Some(true));
+    }
+
+    #[test]
+    fn dev_mode_defaults_to_false_and_round_trips_through_global_only() {
+        let dir = tempdir().unwrap();
+        let paths = SettingsPaths {
+            global: dir.path().join("settings.global.json"),
+            project: Some(dir.path().join("settings.project.json")),
+            bundled_default: None,
+        };
+        assert!(!paths.dev_mode());
+
+        paths.set_dev_mode(true).unwrap();
+        assert!(paths.dev_mode());
+
+        // A project-tier document setting dev_mode has no effect --
+        // dev_mode() only ever reads the Global document.
+        save_document(
+            paths.project.as_ref().unwrap(),
+            &SettingsDocument {
+                dev_mode: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(paths.dev_mode());
+
+        paths.set_dev_mode(false).unwrap();
+        assert!(!paths.dev_mode());
+    }
+
+    #[test]
+    fn set_dev_mode_preserves_other_global_fields() {
+        let dir = tempdir().unwrap();
+        let global = dir.path().join("settings.global.json");
+        save_document(
+            &global,
+            &SettingsDocument {
+                default_profile: Some("kept".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let paths = SettingsPaths {
+            global: global.clone(),
+            project: None,
+            bundled_default: None,
+        };
+        paths.set_dev_mode(true).unwrap();
+        let reloaded = load_document(&global).unwrap();
+        assert_eq!(reloaded.default_profile.as_deref(), Some("kept"));
+        assert_eq!(reloaded.dev_mode, Some(true));
     }
 
     #[test]

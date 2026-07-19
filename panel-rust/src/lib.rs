@@ -136,6 +136,7 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore) {
         background_session_default: Some(defaults.background_session),
         default_agent_id: None,
         harness: None,
+        dev_mode: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
         eprintln!("panel-rust: failed to migrate panel defaults to JSON: {error}");
@@ -1133,6 +1134,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         panel
             .component
             .set_background_default(defaults.background_session);
+        panel
+            .component
+            .set_dev_mode(settings_file::SettingsPaths::from_env().dev_mode());
         if let Some(selected_thread_id) = defaults.selected_thread_id {
             if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
                 (0..panel.thread_names.borrow().len()).find(|idx| {
@@ -1719,6 +1723,27 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     Err(error) => {
                         eprintln!("panel-rust: failed to promote skill {path:?} to global: {error}");
                     }
+                }
+            });
+        });
+
+        panel.component.on_dev_mode_toggled(move |enabled| {
+            let paths = settings_file::SettingsPaths::from_env();
+            if let Err(error) = paths.set_dev_mode(enabled) {
+                eprintln!("panel-rust: failed to persist dev mode: {error}");
+            }
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                panel.component.set_dev_mode(enabled);
+                if enabled {
+                    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                    if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
+                        eprintln!("panel-rust: failed to install bundled global skill: {error}");
+                    }
+                    panel.refresh_skills_model();
                 }
             });
         });

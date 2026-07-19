@@ -22,6 +22,12 @@ export component SkillsView inherits Rectangle {
     // pure client-side list filter.
     property <bool> show-global-skills: true;
     callback skill-promote-to-global(string /* path */);
+    // `dev-mode` task's "Dev mode option for the system" -- Global-tier
+    // only (see `settings_file::SettingsDocument::dev_mode`'s doc
+    // comment). Enabling it copies in one bundled placeholder global
+    // skill (`skills_state::ensure_bundled_global_skill`), idempotently.
+    in property <bool> dev-mode: false;
+    callback dev-mode-toggled(bool);
 
     background: transparent;
 
@@ -42,7 +48,23 @@ export component SkillsView inherits Rectangle {
             Toggle {
                 checked: root.show-global-skills;
                 toggle-accessible-label: "Toggle global skills visibility";
-                toggled => { root.show-global-skills = !root.show-global-skills; }
+                toggled(new-checked) => { root.show-global-skills = new-checked; }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Metrics.gap-sm;
+            Text {
+                text: "Dev mode";
+                color: Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Toggle {
+                checked: root.dev-mode;
+                toggle-accessible-label: "Toggle dev mode";
+                toggled(new-checked) => { root.dev-mode-toggled(new-checked); }
             }
         }
 
