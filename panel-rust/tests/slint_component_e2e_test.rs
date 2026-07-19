@@ -198,8 +198,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
         kind: "agent".into(),
         text: "streamed response".into(),
-        body_styled: Default::default(),
-        has_body_styled: false,
+        markdown_lines: Default::default(),
         status: "streaming".into(),
         expanded: false,
         index: 0,
@@ -523,6 +522,13 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     panel.set_available_mcp_servers(ModelRc::new(VecModel::from(vec![McpServerOption {
         name: "media-fs".into(),
         command: "node server.js".into(),
+        transport: "".into(),
+        url: "".into(),
+        enabled: true,
+        status: "".into(),
+        needs_auth: false,
+        auth_status: "".into(),
+        tools: Default::default(),
     }])));
     panel.set_agent_catalog(ModelRc::new(VecModel::from(vec![AgentCatalogEntry {
         id: "claude".into(),
@@ -751,6 +757,8 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         closed: false,
         provider: "".into(),
         model: "".into(),
+        project_name: "".into(),
+        project_path: "".into(),
     }])));
 
     let closed_index = Rc::new(Cell::new(-1i32));
@@ -833,6 +841,8 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         closed: true,
         provider: "".into(),
         model: "".into(),
+        project_name: "".into(),
+        project_path: "".into(),
     }])));
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")

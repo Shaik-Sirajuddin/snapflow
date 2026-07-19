@@ -27,7 +27,10 @@ mod permission;
 pub mod protocol_types;
 mod send_queue;
 mod settings_file;
-mod skills_state;
+// `pub` (not just `mod`) so the new `skills-mcp-server` bin target can
+// reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
+// of duplicating the SKILL.md front-matter parsing logic.
+pub mod skills_state;
 mod state_store;
 mod theme;
 

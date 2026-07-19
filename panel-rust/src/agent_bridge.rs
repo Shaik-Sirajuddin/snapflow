@@ -310,11 +310,9 @@ async fn open_session_maybe_profiled(
     handle: &AcpxThreadHandle,
     cwd: PathBuf,
     profile: Option<&str>,
+    mcp_servers: Vec<serde_json::Value>,
 ) -> Result<String, crate::gateway_actor::AcpxThreadError> {
-    match profile {
-        Some(profile) => handle.open_session_with_profile(cwd, profile).await,
-        None => handle.open_session(cwd).await,
-    }
+    handle.open_session_with(cwd, profile.map(str::to_string), mcp_servers).await
 }
 
 /// Recomputes `slot.transcript` from `slot.history`'s current full
@@ -609,6 +607,62 @@ fn resolve_acpx_server_bin() -> PathBuf {
         std::env::current_exe().ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
+}
+
+/// Resolves the `skills-mcp-server` binary path (`skill_injection_
+/// verification` phase): `RUI_SKILLS_MCP_SERVER_BIN` env override, else a
+/// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
+/// convention as [`resolve_acpx_server_bin`].
+fn resolve_skills_mcp_server_bin_from(
+    override_bin: Option<&str>,
+    current_exe: Option<&Path>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
+        return PathBuf::from(bin);
+    }
+    if let Some(parent) = current_exe.and_then(Path::parent) {
+        let candidate = parent.join("skills-mcp-server");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    manifest_dir.join("target/debug/skills-mcp-server")
+}
+
+fn resolve_skills_mcp_server_bin() -> PathBuf {
+    resolve_skills_mcp_server_bin_from(
+        std::env::var("RUI_SKILLS_MCP_SERVER_BIN").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+/// Builds the `mcpServers` array `session/new`/`session/load` now send
+/// (previously always `[]`, see `gateway_actor::thread_actor`'s doc
+/// comments on `Command::OpenSession`/`Command::ResumeSession`) -- one
+/// entry pointing at `skills-mcp-server`, always present regardless of
+/// which ACPX profile (if any) the session uses. `project_path` is the
+/// active MLT project's *file* path (`PanelSingleton::active_project_path`
+/// as threaded through `AgentBridge::session_cwd_override`) -- passed
+/// through as-is; `skills-mcp-server` itself derives the project's
+/// `.skills/` directory from its parent, same as `refresh_skills_model`
+/// (lib.rs) already does.
+fn skills_mcp_servers_entry(project_path: Option<&std::path::Path>) -> Vec<serde_json::Value> {
+    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+    let mut args = vec![
+        "--global-dir".to_string(),
+        global_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(project_path) = project_path.and_then(|p| p.parent()) {
+        args.push("--project-dir".to_string());
+        args.push(project_path.to_string_lossy().into_owned());
+    }
+    vec![serde_json::json!({
+        "name": "skills",
+        "command": resolve_skills_mcp_server_bin().to_string_lossy(),
+        "args": args,
+    })]
 }
 
 /// Resolves the mock backend agent binary the locally-spawned gateway
@@ -1141,6 +1195,12 @@ fn spawn_background_attachment(
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
         let cwd = cwd_for_session(&session_cwd_override);
+        let mcp_servers = skills_mcp_servers_entry(
+            session_cwd_override
+                .lock()
+                .expect("session cwd override mutex poisoned")
+                .as_deref(),
+        );
         let result = if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
@@ -1160,11 +1220,11 @@ fn spawn_background_attachment(
                             "panel-rust: session/resume unavailable for cached thread {:?} ({reattach_error}); falling back to session/load",
                             slot.thread_id
                         );
-                        handle.resume_session(session_id.clone(), cwd.clone()).await
+                        handle.resume_session(session_id.clone(), cwd.clone(), mcp_servers.clone()).await
                     }
                 }
             } else {
-                handle.resume_session(session_id.clone(), cwd.clone()).await
+                handle.resume_session(session_id.clone(), cwd.clone(), mcp_servers.clone()).await
             };
             match resume_result {
                 Ok(()) => Ok(session_id),
@@ -1173,11 +1233,11 @@ fn spawn_background_attachment(
                         "panel-rust: cached acpx session resume failed for thread {:?} ({resume_error}); opening a fresh session",
                         slot.thread_id
                     );
-                    open_session_maybe_profiled(&handle, cwd, profile_name.as_deref()).await
+                    open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
                 }
             }
         } else {
-            open_session_maybe_profiled(&handle, cwd, profile_name.as_deref()).await
+            open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
         };
 
         match result {
@@ -1832,8 +1892,14 @@ impl AgentBridge {
         });
 
         let cwd = cwd_for_session(&self.session_cwd_override);
+        let mcp_servers = skills_mcp_servers_entry(
+            self.session_cwd_override
+                .lock()
+                .expect("session cwd override mutex poisoned")
+                .as_deref(),
+        );
         self.runtime
-            .block_on(handle.resume_session(session_id.to_string(), cwd))
+            .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
         *slot
             .acp_session_id
@@ -4703,6 +4769,45 @@ done
         // `load_older_page` actually refreshed `transcript`, not just
         // `history`.
         assert_eq!(bridge.transcript(0).len(), total_messages);
+    }
+
+    /// `skill_injection_verification` phase: `skills_mcp_servers_entry`'s
+    /// output shape -- the actual client-supplied `mcpServers` entry every
+    /// `session/new`/`session/load` now sends (see `Command::OpenSession`/
+    /// `Command::ResumeSession`'s doc comments), verified directly rather
+    /// than through a real acpx-server round trip (this sandbox's
+    /// acpx-server makes a real network call to cdn.agentclientprotocol.com
+    /// at startup before binding its port -- confirmed directly by
+    /// inspecting its own startup log -- making real round-trip tests here
+    /// flaky on network latency, unrelated to this logic itself).
+    #[test]
+    fn skills_mcp_servers_entry_always_includes_the_skills_server() {
+        let entries = skills_mcp_servers_entry(None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "skills");
+        assert!(entries[0]["command"].as_str().unwrap().contains("skills-mcp-server"));
+        let args = entries[0]["args"].as_array().expect("args is an array");
+        assert!(args.contains(&serde_json::Value::String("--global-dir".to_string())));
+        assert!(
+            !args.contains(&serde_json::Value::String("--project-dir".to_string())),
+            "no project open -- args must not claim a --project-dir"
+        );
+    }
+
+    #[test]
+    fn skills_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
+        let project_file = std::path::Path::new("/tmp/my-project/timeline.mlt");
+        let entries = skills_mcp_servers_entry(Some(project_file));
+        let args = entries[0]["args"].as_array().expect("args is an array");
+        let project_dir_idx = args
+            .iter()
+            .position(|a| a == "--project-dir")
+            .expect("--project-dir must be present when a project is open");
+        assert_eq!(
+            args[project_dir_idx + 1],
+            serde_json::Value::String("/tmp/my-project".to_string()),
+            "--project-dir must be the project FILE's parent directory, not the file itself"
+        );
     }
 }
 /// Refreshes `slot`'s trailer (`acp_session_id`/`updated_at`), taking

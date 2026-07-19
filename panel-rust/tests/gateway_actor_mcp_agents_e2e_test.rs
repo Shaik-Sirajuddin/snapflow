@@ -236,7 +236,7 @@ async fn profile_referencing_a_central_mcp_server_reaches_the_real_backend_sessi
     let mut handle = handle;
     let mut events = handle.take_events();
     handle
-        .open_session_with_profile(std::env::current_dir().unwrap(), "mcp-linked")
+        .open_session_with_profile(std::env::current_dir().unwrap(), "mcp-linked", Vec::new())
         .await
         .expect("open_session_with_profile");
     handle

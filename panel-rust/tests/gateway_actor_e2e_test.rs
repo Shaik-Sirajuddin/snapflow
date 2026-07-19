@@ -222,7 +222,7 @@ async fn resume_session_replays_history_via_session_load() {
     let mut resumer = spawn_acpx_thread(gateway.base_url.clone());
     let mut events_rx = resumer.take_events();
     resumer
-        .resume_session(session_id, std::env::current_dir().unwrap())
+        .resume_session(session_id, std::env::current_dir().unwrap(), Vec::new())
         .await
         .expect("resume_session");
 
@@ -345,7 +345,7 @@ async fn resume_session_retries_after_transient_gateway_errors() {
 
     let handle = spawn_acpx_thread(format!("http://127.0.0.1:{port}"));
     handle
-        .resume_session("persisted-session", std::env::current_dir().unwrap())
+        .resume_session("persisted-session", std::env::current_dir().unwrap(), Vec::new())
         .await
         .expect("resume_session should retry transient gateway errors");
     handle

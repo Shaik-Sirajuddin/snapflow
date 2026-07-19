@@ -59,5 +59,14 @@ crate-type = ["staticlib", "rlib"]
 name = "rui-mock-agent"
 path = "src/bin/mock_agent.rs"
 
+# `skill_injection_verification` phase: a minimal, real MCP (Model Context
+# Protocol, distinct from ACP) server exposing discovered skills as
+# list_skills/read_skill tools -- what agent_bridge.rs points every
+# session's client-supplied `mcpServers` array at. See the binary's own
+# module doc comment for the full mechanism.
+[[bin]]
+name = "skills-mcp-server"
+path = "src/bin/skills_mcp_server.rs"
+
 [dependencies.agent-client-protocol]
 version = "1.2"

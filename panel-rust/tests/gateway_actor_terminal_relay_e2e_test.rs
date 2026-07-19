@@ -150,7 +150,7 @@ async fn terminal_create_relay_and_live_output_reach_the_thread_actor() {
     let mut handle = spawn_acpx_thread(gateway.base_url.clone());
     let mut events = handle.take_events();
     handle
-        .open_session_with_profile(std::env::current_dir().unwrap(), "terminal-enabled")
+        .open_session_with_profile(std::env::current_dir().unwrap(), "terminal-enabled", Vec::new())
         .await
         .expect("open_session_with_profile");
 

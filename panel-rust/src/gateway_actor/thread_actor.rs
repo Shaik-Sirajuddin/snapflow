@@ -54,6 +54,10 @@ enum Command {
         /// for-byte the same request this crate always sent before
         /// profile selection existed.
         profile: Option<String>,
+        /// `skill_injection_verification` phase: the `mcpServers` array
+        /// `session/new` sends -- previously always `[]`. See
+        /// [`AcpxThreadHandle::open_session`]'s doc comment.
+        mcp_servers: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<String, AcpxThreadError>>,
     },
     /// `session/load` against an already-known gateway session id --
@@ -66,6 +70,9 @@ enum Command {
     ResumeSession {
         session_id: String,
         cwd: PathBuf,
+        /// Same `mcpServers` addition as `OpenSession` above -- ACP's
+        /// `LoadSessionRequest` requires this field too.
+        mcp_servers: Vec<serde_json::Value>,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// ACP's lighter `session/resume` reattachment path. Unlike
@@ -248,10 +255,24 @@ impl AcpxThreadHandle {
     /// per acpx's own design, only the gateway id is ever meaningful to
     /// a client).
     pub async fn open_session(&self, cwd: impl Into<PathBuf>) -> Result<String, AcpxThreadError> {
+        self.open_session_with(cwd, None, Vec::new()).await
+    }
+
+    /// Same as [`Self::open_session`], but with an explicit `mcpServers`
+    /// array (`skill_injection_verification` phase) -- the shared
+    /// implementation both [`Self::open_session`] and [`Self::
+    /// open_session_with_profile`] delegate to.
+    pub async fn open_session_with(
+        &self,
+        cwd: impl Into<PathBuf>,
+        profile: Option<String>,
+        mcp_servers: Vec<serde_json::Value>,
+    ) -> Result<String, AcpxThreadError> {
         let cwd = cwd.into();
         self.call(|resp| Command::OpenSession {
             cwd,
-            profile: None,
+            profile,
+            mcp_servers,
             resp,
         })
         .await
@@ -267,10 +288,9 @@ impl AcpxThreadHandle {
         &self,
         cwd: impl Into<PathBuf>,
         profile: impl Into<String>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<String, AcpxThreadError> {
-        let cwd = cwd.into();
-        let profile = Some(profile.into());
-        self.call(|resp| Command::OpenSession { cwd, profile, resp })
+        self.open_session_with(cwd, Some(profile.into()), mcp_servers)
             .await
     }
 
@@ -280,12 +300,14 @@ impl AcpxThreadHandle {
         &self,
         session_id: impl Into<String>,
         cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<serde_json::Value>,
     ) -> Result<(), AcpxThreadError> {
         let session_id = session_id.into();
         let cwd = cwd.into();
         self.call(|resp| Command::ResumeSession {
             session_id,
             cwd,
+            mcp_servers,
             resp,
         })
         .await
@@ -994,10 +1016,10 @@ async fn run_thread_actor(
             },
         };
         match cmd {
-            Command::OpenSession { cwd, profile, resp } => {
+            Command::OpenSession { cwd, profile, mcp_servers, resp } => {
                 let params = serde_json::json!({
                     "cwd": cwd.to_string_lossy(),
-                    "mcpServers": [],
+                    "mcpServers": mcp_servers,
                 });
                 let mut result = Err(AcpxThreadError::ActorGone);
                 for attempt in 0..5 {
@@ -1026,6 +1048,7 @@ async fn run_thread_actor(
             Command::ResumeSession {
                 session_id: sid,
                 cwd,
+                mcp_servers,
                 resp,
             } => {
                 // `session/load`'s `cwd`/`mcpServers` are required fields
@@ -1038,7 +1061,7 @@ async fn run_thread_actor(
                 let params = serde_json::json!({
                     "sessionId": sid,
                     "cwd": cwd.to_string_lossy(),
-                    "mcpServers": [],
+                    "mcpServers": mcp_servers,
                 });
                 // Match session/new's bounded retry. A relaunched panel can
                 // race an acpx-server that is still accepting its socket but
