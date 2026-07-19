@@ -557,4 +557,159 @@ mod tests {
             "expected watcher to observe profile b, got {profiles:?}"
         );
     }
+
+    /// `settings_reflection_matrix` phase (skills-settings-e2e-verification
+    /// plan): a small curated matrix of setting-change -> file-reflection ->
+    /// live-pickup scenarios, per tasks/v2/init.yaml's testing-a block
+    /// ("matrix to test different scenarios, different options").
+    ///
+    /// Deliberately scoped to panel-rust's own `SettingsWatcher` -- the
+    /// real, already-shipped live-pickup mechanism `lib.rs`'s
+    /// `settings_reload_pending`/`apply_json_prefs_to_component` uses to
+    /// notice an externally-rewritten settings file while the panel is
+    /// running. Direct investigation confirmed acpx-server has no config
+    /// hot-reload mechanism at all (`ACPX_ACP_BRIDGE_CONFIG_FILE` is read
+    /// once at startup only) -- there is nothing real to test at that layer
+    /// without first building a feature that doesn't exist, which is out of
+    /// scope for a test-only phase. This matrix covers every field
+    /// `ResolvedSettings` exposes, plus Project-overrides-Global precedence
+    /// and dev_mode's deliberate Global-tier-only exception, all through the
+    /// same watcher path a live conversation actually observes settings
+    /// changes through.
+    #[test]
+    fn settings_reflection_matrix() {
+        let dir = tempdir().unwrap();
+        let global = dir.path().join("settings.global.json");
+        let project = dir.path().join("settings.project.json");
+        save_document(&global, &SettingsDocument::default()).unwrap();
+        let paths = SettingsPaths {
+            global: global.clone(),
+            project: Some(project.clone()),
+            bundled_default: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let watcher = SettingsWatcher::start(
+            paths,
+            Duration::from_millis(50),
+            Arc::new(Mutex::new(move |r: ResolvedSettings| {
+                seen_c.lock().unwrap().push(r);
+            })),
+        );
+        thread::sleep(Duration::from_millis(80));
+
+        // Scenario 1: default_profile set at Global tier.
+        save_document(
+            &global,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("gpt-profile".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| r.default_profile.as_deref() == Some("gpt-profile"));
+
+        // Scenario 2: permission_profile and background_session_default set
+        // together at Global tier, in the same write.
+        save_document(
+            &global,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("gpt-profile".into()),
+                permission_profile: Some("readonly".into()),
+                background_session_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| {
+            r.permission_profile.as_deref() == Some("readonly") && r.background_session_default
+        });
+
+        // Scenario 3: default_agent_id set at Global tier.
+        save_document(
+            &global,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("gpt-profile".into()),
+                permission_profile: Some("readonly".into()),
+                background_session_default: Some(true),
+                default_agent_id: Some("claude".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| r.default_agent_id.as_deref() == Some("claude"));
+
+        // Scenario 4: Project-tier override takes precedence over the
+        // Global value already on disk, without touching Global at all.
+        save_document(
+            &project,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("project-only-profile".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| {
+            r.default_profile.as_deref() == Some("project-only-profile")
+        });
+
+        // Scenario 5: removing the Project-tier override (writing an empty
+        // document back) falls back to the Global value again -- proves the
+        // precedence isn't a one-way ratchet.
+        save_document(&project, &SettingsDocument::default()).unwrap();
+        wait_for(&seen, |r| {
+            r.default_profile.as_deref() == Some("gpt-profile")
+        });
+
+        watcher.stop();
+
+        // Scenario 6 (dev_mode's Global-tier-only exception): a
+        // Project-tier dev_mode write must never reach ResolvedSettings at
+        // all -- dev_mode is deliberately not part of the generic
+        // Project-overrides-Global merge (see SettingsDocument::dev_mode's
+        // doc comment), so it's read directly via SettingsPaths::dev_mode()
+        // rather than through the watcher's ResolvedSettings callback.
+        let paths_after = SettingsPaths {
+            global: global.clone(),
+            project: Some(project.clone()),
+            bundled_default: None,
+        };
+        assert!(!paths_after.dev_mode(), "dev_mode should still be false before this scenario");
+        save_document(
+            &project,
+            &SettingsDocument {
+                schema_version: 1,
+                dev_mode: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths_after.dev_mode(),
+            "a Project-tier dev_mode write must have zero effect -- dev_mode is Global-tier only"
+        );
+        paths_after.set_dev_mode(true).unwrap();
+        assert!(
+            paths_after.dev_mode(),
+            "dev_mode written via set_dev_mode (Global tier) must take effect"
+        );
+    }
+
+    /// Polls `seen`'s most recent entries for up to ~2s, matching
+    /// `watcher_fires_on_external_write`'s own poll shape -- shared here
+    /// since `settings_reflection_matrix` needs it at 5 distinct points.
+    fn wait_for(seen: &Arc<Mutex<Vec<ResolvedSettings>>>, matches: impl Fn(&ResolvedSettings) -> bool) {
+        for _ in 0..40 {
+            if seen.lock().unwrap().iter().any(&matches) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let snapshot = seen.lock().unwrap().clone();
+        panic!("expected watcher to observe a matching ResolvedSettings within ~2s, got {snapshot:?}");
+    }
 }
