@@ -359,6 +359,17 @@ pub struct Router {
     /// process mutex. Native/unmanaged sessions (no `_acpx.profile`) are
     /// unaffected regardless of this setting -- see `dispatch_session_new`.
     session_process_isolation: bool,
+    /// **`ACPX_STARTUP_SESSION_RECOVERY_ENABLED` gate, threaded through
+    /// to on-demand rehydration too.** Defaults `true` (matches every
+    /// pre-existing deployment/test that never sets the env var, and
+    /// matches `rehydrate_session`'s original always-on behavior before
+    /// this flag existed). When an operator explicitly disables startup
+    /// session recovery, that must mean "recovery is off," full stop --
+    /// not just "don't proactively batch-recover at boot, but still
+    /// silently resurrect any persisted session the instant any client
+    /// happens to touch its gateway id." `rehydrate_session` checks this
+    /// before even querying the persistence store.
+    on_demand_recovery_enabled: bool,
     /// **`connector_reference_lifecycle`.** Supervisor keys currently
     /// observed to have zero referencing live sessions, mapped to when
     /// that was first observed. Only populated/consulted when
@@ -863,6 +874,7 @@ impl Router {
             scavenged_backends: HashSet::new(),
             tenant_process_isolation: false,
             session_process_isolation: false,
+            on_demand_recovery_enabled: true,
             unreferenced_backends: HashMap::new(),
         }
     }
@@ -1213,6 +1225,16 @@ impl Router {
     /// layered on top of the per-tenant key.
     pub fn with_session_process_isolation(mut self, enabled: bool) -> Self {
         self.session_process_isolation = enabled;
+        self
+    }
+
+    /// Wire `ACPX_STARTUP_SESSION_RECOVERY_ENABLED` into on-demand
+    /// rehydration too -- see `on_demand_recovery_enabled`'s field doc
+    /// comment. `main.rs` passes the same `config.
+    /// startup_session_recovery_enabled` value used to gate the eager
+    /// batch job at boot; this is one operator-facing toggle, not two.
+    pub fn with_on_demand_recovery_enabled(mut self, enabled: bool) -> Self {
+        self.on_demand_recovery_enabled = enabled;
         self
     }
 
@@ -2954,10 +2976,36 @@ impl Router {
         if !matches!(classify(method), MethodClass::Proxied | MethodClass::SessionFork) {
             return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
-        let store = self
-            .persistence
-            .clone()
-            .ok_or_else(|| RouterError::SessionNotPersisted(gateway_session_id.to_string()))?;
+        if !self.on_demand_recovery_enabled {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+        }
+        let store = match self.persistence.clone() {
+            Some(store) => store,
+            None => {
+                // Same implicit-vs-explicit distinction as the
+                // `RecoveryFailed` gate below: only `session/load`/
+                // `session/resume` get the specific, actionable
+                // `SessionNotPersisted` diagnostic ("configure
+                // ACPX_DB_PATH") -- that message only makes sense as a
+                // reply to an explicit reload attempt. Every other
+                // `Proxied`/`SessionFork` method (`session/prompt`,
+                // `session/cancel`, ...) must fail with the same plain
+                // `UnknownSession` a deployment with no persistence at
+                // all has always returned for these methods, matching
+                // this widening's own doc comment ("a gateway session id
+                // that is merely unknown ... still fails exactly as
+                // before"). Without this, a cross-tenant id guess against
+                // a persistence-less deployment leaked a distinguishable
+                // "not persisted" error instead of the generic "no
+                // session registered" every other unknown-id case gets.
+                if method == "session/load" || method == "session/resume" {
+                    return Err(RouterError::SessionNotPersisted(
+                        gateway_session_id.to_string(),
+                    ));
+                }
+                return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+            }
+        };
         let record = store
             .get_session(gateway_session_id.to_string())
             .await
@@ -2987,6 +3035,30 @@ impl Router {
             return Err(RouterError::SessionRestoring(
                 gateway_session_id.to_string(),
             ));
+        }
+        // **Recovery-outage gate.** A record startup recovery (or a
+        // previous on-demand attempt) already gave up on stays
+        // unavailable to every *implicit* touch (`session/prompt`,
+        // `session/cancel`, ...) -- those never carried an explicit
+        // "please bring this back" intent, so they must fail exactly
+        // like a genuinely-unknown session id would (`UnknownSession`,
+        // "no session registered"), without retrying the connector at
+        // all. Only `session/load`/`session/resume` -- the two methods
+        // whose entire purpose is an explicit reload request -- are
+        // allowed to retry a `RecoveryFailed` record here, so a caller
+        // polling `session/load` after a connector outage clears can
+        // still recover it (see `real_binary_survives_a_recovery_
+        // connector_outage`). Without this gate, an ordinary
+        // `session/prompt` right after a failed startup recovery would
+        // silently attempt a fresh backend spawn and surface whatever
+        // low-level connector error that spawn attempt produces (e.g. a
+        // `Supervisor` crash-backoff message) instead of the same clean,
+        // stable `UnknownSession` a client can already recognize.
+        if record.status == RecoveryStatus::RecoveryFailed
+            && method != "session/load"
+            && method != "session/resume"
+        {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
         let mut entry = crate::session_registry::SessionEntry {
             agent_id: record.agent_id,
