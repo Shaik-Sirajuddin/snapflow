@@ -499,6 +499,18 @@ impl PanelSingleton {
             .set_threads(ModelRc::new(VecModel::from(items)));
     }
 
+    /// Rebuilds the `skills` sidebar model from the global skills
+    /// directory (`skill_discovery_backend` phase). Project-local
+    /// scanning is deliberately not wired here yet -- it needs
+    /// `active_project_binding`'s active-project state, which doesn't
+    /// exist yet -- so this only ever reports global skills for now.
+    fn refresh_skills_model(&self) {
+        let dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        let entries = crate::skills_state::scan_skills_dir(&dir, crate::skills_state::SkillScope::Global);
+        self.component
+            .set_available_skills(crate::models::to_skill_options(entries));
+    }
+
     /// Translates a Slint-side filtered-list index (what `thread-selected`
     /// callbacks and `get_selected_thread()` hand back) into the real
     /// index the agent bridge/`thread_state` use. `None` if out of range
@@ -1097,6 +1109,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             _settings_watcher: settings_watcher,
         };
         panel.refresh_threads_model();
+        panel.refresh_skills_model();
         // Multi-process prefs live in JSON; selected thread stays in SQLite.
         if let Some(store) = panel.panel_state.as_ref() {
             maybe_migrate_sqlite_defaults_to_json(store);
@@ -1667,6 +1680,25 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     }
                     // Fresh empty transcript for the new session row.
                     panel.refresh_messages_for(real_idx);
+                }
+            });
+        });
+
+        panel.component.on_new_skill_requested(move |name| {
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                let dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                match crate::skills_state::scaffold_new_skill(&dir, name.as_str()) {
+                    Ok(skill_dir) => {
+                        trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
+                        panel.refresh_skills_model();
+                    }
+                    Err(error) => {
+                        eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
+                    }
                 }
             });
         });

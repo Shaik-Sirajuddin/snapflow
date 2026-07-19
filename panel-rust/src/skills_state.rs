@@ -149,6 +149,64 @@ pub fn project_skills_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".skills")
 }
 
+/// Global skills directory: a `skills` sibling of the per-thread JSONL
+/// transcript cache, inside the same cache dir `agent_bridge::
+/// resolve_cache_dir()` already resolves -- no new env var needed.
+pub fn global_skills_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("skills")
+}
+
+/// Filesystem-safe directory name for a new skill: lowercase, spaces and
+/// anything non-alphanumeric collapsed to a single `-`, matching how
+/// skill directory names look in practice (e.g. `voice-embedding`).
+pub fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = true; // suppress a leading dash
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+/// Scaffolds `<dir>/<slugify(name)>/SKILL.md` with prefilled front
+/// matter (`assistant-sidebar refine`'s "new-skill with logo button ...
+/// initiate a skill with prefil name, desc, skill.MD"). Errors if the
+/// slugified name is empty or a skill with that name already exists --
+/// both real user-facing conditions the caller should report, not panic
+/// on.
+pub fn scaffold_new_skill(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let slug = slugify(name);
+    if slug.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "skill name must contain at least one letter or digit",
+        ));
+    }
+    let skill_dir = dir.join(&slug);
+    if skill_dir.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("a skill named {slug:?} already exists"),
+        ));
+    }
+    fs::create_dir_all(&skill_dir)?;
+    let front_matter = format!(
+        "---\nname: {name}\ndescription: >-\n  TODO: describe what this skill does and when to use it.\n---\n\n# {name}\n\nTODO: write the skill's instructions here.\n",
+        name = name.trim(),
+    );
+    fs::write(skill_dir.join("SKILL.md"), front_matter)?;
+    Ok(skill_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,5 +305,41 @@ mod tests {
             project_skills_dir(project_dir),
             Path::new("/tmp/example-project/.skills")
         );
+    }
+
+    #[test]
+    fn slugify_lowercases_and_collapses_non_alphanumerics() {
+        assert_eq!(slugify("Voice Embedding"), "voice-embedding");
+        assert_eq!(slugify("  My   Skill!! "), "my-skill");
+        assert_eq!(slugify("multi___word---name"), "multi-word-name");
+        assert_eq!(slugify(""), "");
+        assert_eq!(slugify("---"), "");
+    }
+
+    #[test]
+    fn scaffold_new_skill_writes_prefilled_front_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = scaffold_new_skill(dir.path(), "Voice Embedding").unwrap();
+        assert_eq!(skill_dir, dir.path().join("voice-embedding"));
+        let contents = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        let (name, description, started_from) = parse_front_matter(&contents);
+        assert_eq!(name, "Voice Embedding");
+        assert!(description.contains("TODO"));
+        assert_eq!(started_from, None);
+    }
+
+    #[test]
+    fn scaffold_new_skill_rejects_a_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        scaffold_new_skill(dir.path(), "dup").unwrap();
+        let err = scaffold_new_skill(dir.path(), "dup").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn scaffold_new_skill_rejects_an_empty_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = scaffold_new_skill(dir.path(), "!!!").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

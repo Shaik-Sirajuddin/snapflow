@@ -102,6 +102,7 @@ export component ChatPanel inherits Window {
 
     callback thread-selected(int);
     callback new-thread-requested();
+    callback new-skill-requested(string);
     callback thread-close-requested(int);
     callback thread-delete-requested(int);
     callback thread-archive-requested(int);
@@ -229,11 +230,13 @@ export component ChatPanel inherits Window {
                 selected-thread: selected-thread;
                 compact: compact;
                 expanded: root.narrow ? false : sidebar-expanded;
+                skills: available-skills;
                 thread-selected(i) => {
                     selected-thread = i;
                     thread-selected(i);
                 }
                 new-thread-requested => { new-thread-requested(); }
+                new-skill-requested(name) => { new-skill-requested(name); }
                 thread-close-requested(i) => { thread-close-requested(i); }
                 thread-delete-requested(i) => { thread-delete-requested(i); }
                 thread-archive-requested(i) => { thread-archive-requested(i); }

@@ -3,7 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
-import { ThreadItem } from "../types.slint";
+import { ThreadItem, SkillOption } from "../types.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
 // extend this with a real search box + filtered model and a footer
@@ -21,6 +21,17 @@ export component Sidebar inherits Rectangle {
     callback thread-delete-requested(int);
     callback thread-archive-requested(int);
     callback settings-requested();
+
+    // Skill-manager sidebar mode -- `sidebar_skill_tree_and_new_skill_flow`
+    // phase. `skill-mode` sibling-swaps the thread list for a skill list
+    // in this same column, rather than a separate panel, matching
+    // `assistant-sidebar refine`'s "thread view + skill-manager" ask.
+    in-out property <bool> skill-mode: false;
+    in property <[SkillOption]> skills: [];
+    // Fired with the user-entered name once the new-skill dialog is
+    // confirmed; Rust creates the scaffolded SKILL.md and re-scans.
+    callback new-skill-requested(string);
+    property <bool> new-skill-dialog-open: false;
 
     // Two-step arm/confirm state for the sidebar row close/delete
     // controls -- same pattern as `settings_sheet.slint`'s
@@ -85,7 +96,7 @@ export component Sidebar inherits Rectangle {
                     }
                 }
                 if expanded : Text {
-                    text: "Chats";
+                    text: skill-mode ? "Skills" : "Chats";
                     color: Theme.text-primary;
                     font-size: 14px * Theme.font-scale;
                     font-family: Theme.font-sans;
@@ -101,13 +112,59 @@ export component Sidebar inherits Rectangle {
                     height: 0px;
                     preferred-height: 0px;
                 }
-                if expanded : IconButton {
+                if expanded && !skill-mode : IconButton {
                     button-accessible-label: "New thread";
                     clicked => { new-thread-requested(); }
                     Icon {
                         source: @image-url("../assets/icons/plus.svg");
                         size: 16px;
                         color: Theme.bg-primary;
+                    }
+                }
+                if expanded && skill-mode : IconButton {
+                    button-accessible-label: "New skill";
+                    clicked => { new-skill-dialog-open = true; }
+                    Icon {
+                        source: @image-url("../assets/icons/plus.svg");
+                        size: 16px;
+                        color: Theme.bg-primary;
+                    }
+                }
+            }
+        }
+        // Threads / Skills tab row -- `assistant-sidebar refine`'s
+        // "thread view + skill-manager" sibling-mode switch.
+        if expanded : Rectangle {
+            height: 28px;
+            background: Theme.bg-canvas;
+            HorizontalLayout {
+                padding-left: Metrics.space-3;
+                padding-right: Metrics.space-3;
+                spacing: Metrics.space-3;
+                threads-tab := TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: "Show threads";
+                    clicked => { skill-mode = false; }
+                    Text {
+                        text: "Threads";
+                        color: !skill-mode ? Theme.bg-primary : Theme.text-muted;
+                        font-size: 11px * Theme.font-scale;
+                        font-weight: !skill-mode ? 700 : 400;
+                        vertical-alignment: center;
+                    }
+                }
+                skills-tab := TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: button;
+                    accessible-label: "Show skills";
+                    clicked => { skill-mode = true; }
+                    Text {
+                        text: "Skills";
+                        color: skill-mode ? Theme.bg-primary : Theme.text-muted;
+                        font-size: 11px * Theme.font-scale;
+                        font-weight: skill-mode ? 700 : 400;
+                        vertical-alignment: center;
                     }
                 }
             }
@@ -161,8 +218,72 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
+        // Skill list -- file-tree-flat row per discovered skill (name,
+        // description, scope badge, started-from provenance). No
+        // selection/open wiring yet (`active_pane_and_editor_view`
+        // phase's job); this phase is discovery + the new-skill flow.
+        if skill-mode : Flickable {
+            vertical-stretch: 1;
+            preferred-height: 0px;
+            min-height: 0px;
+            viewport-height: skill-list-col.preferred-height;
+            skill-list-col := VerticalLayout {
+                spacing: Metrics.space-1;
+                for skill in skills : Rectangle {
+                    height: expanded ? 48px : 32px;
+                    background: Theme.bg-sidebar;
+                    VerticalLayout {
+                        padding-left: compact ? Metrics.space-6 : Metrics.space-8;
+                        padding-right: compact ? Metrics.space-6 : Metrics.space-8;
+                        padding-top: Metrics.space-3;
+                        padding-bottom: Metrics.space-3;
+                        alignment: center;
+                        HorizontalLayout {
+                            spacing: Metrics.space-3;
+                            Text {
+                                text: skill.name;
+                                color: Theme.text-primary;
+                                font-size: 11px * Theme.font-scale;
+                                font-family: Theme.font-sans;
+                                font-weight: 600;
+                                horizontal-stretch: 1;
+                                preferred-width: 0px;
+                                min-width: 0px;
+                                overflow: elide;
+                            }
+                            if skill.scope == "project" && skill.started-from != "" : Text {
+                                text: "\u{2192} " + skill.started-from;
+                                color: Theme.text-tertiary;
+                                font-size: 9px * Theme.font-scale;
+                                font-family: Theme.font-mono;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                            }
+                            Text {
+                                text: skill.scope;
+                                color: Theme.text-muted;
+                                font-size: 9px * Theme.font-scale;
+                                font-family: Theme.font-mono;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                            }
+                        }
+                        if expanded && skill.description != "" : Text {
+                            text: skill.description;
+                            color: Theme.text-muted;
+                            font-size: 10px * Theme.font-scale;
+                            font-family: Theme.font-sans;
+                            horizontal-stretch: 1;
+                            preferred-width: 0px;
+                            min-width: 0px;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
         // Thread card: title row (+ optional model). No description line.
-        Flickable {
+        if !skill-mode : Flickable {
             vertical-stretch: 1;
             preferred-height: 0px;
             min-height: 0px;
@@ -421,5 +542,107 @@ export component Sidebar inherits Rectangle {
     // panel-level keybinding can jump here without re-finding the input.
     public function focus-search() {
         search-input.focus();
+    }
+
+    // New-skill dialog -- name input, prefilled scaffold created by
+    // Rust on confirm (`new-skill-requested`). Simple in-tree overlay,
+    // same "drawn over everything else in this component" approach
+    // `searchable_dropdown.slint`'s popup already uses, rather than a
+    // new modal-overlay primitive for one call site.
+    if new-skill-dialog-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: Theme.bg-canvas.with-alpha(0.85);
+        TouchArea {
+            // Backdrop click dismisses without creating a skill.
+            clicked => { new-skill-dialog-open = false; }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: Math.min(220px, parent.width - 2 * Metrics.space-6);
+            height: 110px;
+            background: Theme.bg-card;
+            border-color: Theme.border-strong;
+            border-width: 1px;
+            border-radius: Theme.radius-md;
+            // Swallow clicks so they don't reach the backdrop TouchArea.
+            TouchArea {}
+            VerticalLayout {
+                padding: Metrics.space-4;
+                spacing: Metrics.space-3;
+                Text {
+                    text: "New skill";
+                    color: Theme.text-primary;
+                    font-size: 11px * Theme.font-scale;
+                    font-weight: 600;
+                    font-family: Theme.font-sans;
+                }
+                Rectangle {
+                    height: 28px;
+                    background: Theme.bg-sidebar;
+                    border-color: Theme.border-default;
+                    border-width: 1px;
+                    border-radius: Theme.radius-sm;
+                    new-skill-name-input := TextInput {
+                        x: Metrics.space-3;
+                        y: 0px;
+                        width: parent.width - 2 * Metrics.space-3;
+                        height: parent.height;
+                        accessible-label: "New skill name";
+                        color: Theme.text-primary;
+                        font-family: Theme.font-sans;
+                        font-size: 11px * Theme.font-scale;
+                        vertical-alignment: center;
+                        single-line: true;
+                        key-pressed(event) => {
+                            if (event.text == Key.Return && self.text != "") {
+                                root.new-skill-requested(self.text);
+                                self.text = "";
+                                new-skill-dialog-open = false;
+                                return EventResult.accept;
+                            }
+                            return EventResult.reject;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Metrics.space-3;
+                    alignment: end;
+                    cancel-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Cancel";
+                        clicked => { new-skill-dialog-open = false; }
+                        Text {
+                            text: "Cancel";
+                            color: Theme.text-secondary;
+                            font-size: 10px * Theme.font-scale;
+                            vertical-alignment: center;
+                        }
+                    }
+                    create-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Create skill";
+                        enabled: new-skill-name-input.text != "";
+                        clicked => {
+                            root.new-skill-requested(new-skill-name-input.text);
+                            new-skill-name-input.text = "";
+                            new-skill-dialog-open = false;
+                        }
+                        Text {
+                            text: "Create";
+                            color: new-skill-name-input.text != "" ? Theme.bg-primary : Theme.text-muted;
+                            font-size: 10px * Theme.font-scale;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
