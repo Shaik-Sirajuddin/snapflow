@@ -5108,67 +5108,129 @@ async fn read_matching_response_with_idle_timeout(
         // sends some other agent-initiated request acpx doesn't yet
         // support still gets *a* reply and can decide how to proceed
         // (e.g. treat it as declined) rather than hanging indefinitely.
-        if let (Some(_), Some(method)) = (
-            value.get("id"),
-            value.get("method").and_then(|m| m.as_str()),
-        ) {
-            // A persistent transport may have a client bound to this exact
-            // tenant/session. Give that client the first chance to answer
-            // every backend-initiated request, with one carve-out:
-            // `session/request_permission`/`fs/read_text_file`/
-            // `fs/write_text_file`/`terminal/create` each have their own
-            // dedicated `AgentRequestHub` relay below (real clients, e.g.
-            // the panel's `acpx/agent_request`/`acpx/agent_response`
-            // envelope, already depend on that exact wire contract) --
-            // tried first for those four, with `InteractionHub` as the
-            // fallback *within* each of those arms (not here) for a
-            // connection that bound `InteractionHub` but never subscribed
-            // to `AgentRequestHub` for this session (e.g. a strict ACP
-            // bridge connection, per `strict_acp_ws_forwards_backend_
-            // permission_requests_to_the_bound_client`). Every other
-            // method (including the plain `terminal/output`/
-            // `wait_for_exit`/`kill`/`release` polls below, which have no
-            // relay concept of their own) keeps trying `InteractionHub`
-            // here, unconditionally, same as before this carve-out
-            // existed. Profile policy/direct handling remains the
-            // deliberate fallback once every applicable live path returns
-            // nothing.
-            let has_dedicated_relay = matches!(
-                method,
-                "session/request_permission"
-                    | "fs/read_text_file"
-                    | "fs/write_text_file"
-                    | "terminal/create"
-            );
-            if !has_dedicated_relay {
-                if let Some(live) = live {
-                    match try_forward_interaction(live, &value).await {
-                        Ok(Some(mut reply)) => {
-                            // The outer client sees ACPX's opaque interaction id;
-                            // the backend must receive the id it originally sent.
-                            reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                            backend.writer.lock().await.write_value(&reply).await?;
-                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            let reply = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                                "error": {
-                                    "code": -32001,
-                                    "message": format!("acpx interactive client request failed: {error}"),
-                                }
-                            });
-                            backend.writer.lock().await.write_value(&reply).await?;
-                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-                            continue;
-                        }
+        match handle_unmatched_frame(backend, value, &policy, live).await? {
+            UnmatchedOutcome::AgentRequestAnswered(entry) => {
+                agent_requests.push(entry);
+                continue;
+            }
+            UnmatchedOutcome::Delivered => continue,
+            UnmatchedOutcome::Notification(value) => {
+                notifications.push(value);
+            }
+        }
+    }
+}
+
+/// Outcome of routing one frame [`read_matching_response_with_idle_timeout`]'s
+/// read loop (or the process-reader-demux consumer,
+/// `spawn_demux_consumer_if_new`) observed that did not match the
+/// response id its caller is waiting on.
+enum UnmatchedOutcome {
+    /// An agent-initiated request (`id` + `method`) was answered and the
+    /// reply already written to `backend.writer`; record it for
+    /// `_acpx.agentRequests`.
+    AgentRequestAnswered(serde_json::Value),
+    /// A `session/update` notification was delivered to a live subscriber;
+    /// nothing further to do.
+    Delivered,
+    /// No live delivery happened (no `live` ctx, no subscriber, or not a
+    /// `session/update`) -- caller should buffer it into `_acpx.updates`.
+    Notification(serde_json::Value),
+}
+
+/// Answer or route one frame that didn't match the response id a caller
+/// of `read_matching_response*` is waiting on. Pulled out of that
+/// function's read loop into its own function -- byte-for-byte identical
+/// logic, just given a call boundary -- so the process-reader-demux
+/// consumer (phase 1, `memory/acpx/gen/acpx-concurrency-config-execution.
+/// meta.json`) can reuse the exact same agent-request-answering and
+/// live-notification-delivery behavior for frames it observes outside of
+/// any in-flight caller's own read loop, instead of a second,
+/// divergence-prone copy of this security-sensitive (permission/approval)
+/// logic.
+async fn handle_unmatched_frame(
+    backend: &mut acpx_conductor::BackendProcess,
+    value: serde_json::Value,
+    policy: &BackendCallPolicy,
+    live: Option<&LiveNotifyCtx>,
+) -> Result<UnmatchedOutcome, RouterError> {
+    // An agent-initiated *request* (has both its own `id` and a
+    // `method`) is not a notification -- pre-fix, this loop treated
+    // it as one, pushing it into `notifications` and never replying,
+    // which left the backend deadlocked forever waiting for an
+    // answer that would never come (verified as a real hang, not a
+    // hypothetical, against `session/request_permission`: every real
+    // adapter that asks permission mid-turn blocks its own response
+    // to the *outer* call on getting one). `session/request_permission`
+    // is the only such method acpx knows how to answer today (see
+    // `build_permission_reply`); anything else gets a proper JSON-RPC
+    // method-not-found error instead of silence, so a backend that
+    // sends some other agent-initiated request acpx doesn't yet
+    // support still gets *a* reply and can decide how to proceed
+    // (e.g. treat it as declined) rather than hanging indefinitely.
+    if let (Some(_), Some(method)) = (
+        value.get("id"),
+        value.get("method").and_then(|m| m.as_str()),
+    ) {
+        // A persistent transport may have a client bound to this exact
+        // tenant/session. Give that client the first chance to answer
+        // every backend-initiated request, with one carve-out:
+        // `session/request_permission`/`fs/read_text_file`/
+        // `fs/write_text_file`/`terminal/create` each have their own
+        // dedicated `AgentRequestHub` relay below (real clients, e.g.
+        // the panel's `acpx/agent_request`/`acpx/agent_response`
+        // envelope, already depend on that exact wire contract) --
+        // tried first for those four, with `InteractionHub` as the
+        // fallback *within* each of those arms (not here) for a
+        // connection that bound `InteractionHub` but never subscribed
+        // to `AgentRequestHub` for this session (e.g. a strict ACP
+        // bridge connection, per `strict_acp_ws_forwards_backend_
+        // permission_requests_to_the_bound_client`). Every other
+        // method (including the plain `terminal/output`/
+        // `wait_for_exit`/`kill`/`release` polls below, which have no
+        // relay concept of their own) keeps trying `InteractionHub`
+        // here, unconditionally, same as before this carve-out
+        // existed. Profile policy/direct handling remains the
+        // deliberate fallback once every applicable live path returns
+        // nothing.
+        let has_dedicated_relay = matches!(
+            method,
+            "session/request_permission"
+                | "fs/read_text_file"
+                | "fs/write_text_file"
+                | "terminal/create"
+        );
+        if !has_dedicated_relay {
+            if let Some(live) = live {
+                match try_forward_interaction(live, &value).await {
+                    Ok(Some(mut reply)) => {
+                        // The outer client sees ACPX's opaque interaction id;
+                        // the backend must receive the id it originally sent.
+                        reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+                            serde_json::json!({"request": value, "reply": reply}),
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                            "error": {
+                                "code": -32001,
+                                "message": format!("acpx interactive client request failed: {error}"),
+                            }
+                        });
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+                            serde_json::json!({"request": value, "reply": reply}),
+                        ));
                     }
                 }
             }
-            let reply = if method == "session/request_permission" {
+        }
+        let reply = if method == "session/request_permission" {
                 // **Interactive relay addition.** A live client (WS,
                 // currently) that owns this gateway session gets first
                 // say: it may take real user interaction to answer, so
@@ -5308,30 +5370,30 @@ async fn read_matching_response_with_idle_timeout(
                     }
                 })
             };
-            backend.writer.lock().await.write_value(&reply).await?;
-            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-            continue;
-        }
-        // **Phase 14.** A real notification (`method`, no `id`) -- try
-        // live delivery first when a subscribed transport connection is
-        // known (`live.is_some()`) and this is the one notification type
-        // that's actually session-scoped and worth streaming live,
-        // `session/update`. Anything not delivered live (no `live` ctx at
-        // all, e.g. the plain `&mut self` dispatch path; no live
-        // subscriber currently registered for this session, e.g. an
-        // HTTP-only client; or a notification method other than
-        // `session/update`) falls through to the pre-existing buffering
-        // behavior unchanged, so `_acpx.updates` keeps working exactly as
-        // before for every case this phase doesn't newly handle.
-        if let Some(ctx) = live {
-            if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
-                && try_deliver_live(ctx, &value).await
-            {
-                continue;
-            }
-        }
-        notifications.push(value);
+        backend.writer.lock().await.write_value(&reply).await?;
+        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+            serde_json::json!({"request": value, "reply": reply}),
+        ));
     }
+    // **Phase 14.** A real notification (`method`, no `id`) -- try
+    // live delivery first when a subscribed transport connection is
+    // known (`live.is_some()`) and this is the one notification type
+    // that's actually session-scoped and worth streaming live,
+    // `session/update`. Anything not delivered live (no `live` ctx at
+    // all, e.g. the plain `&mut self` dispatch path; no live
+    // subscriber currently registered for this session, e.g. an
+    // HTTP-only client; or a notification method other than
+    // `session/update`) falls through to the pre-existing buffering
+    // behavior unchanged, so `_acpx.updates` keeps working exactly as
+    // before for every case this phase doesn't newly handle.
+    if let Some(ctx) = live {
+        if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
+            && try_deliver_live(ctx, &value).await
+        {
+            return Ok(UnmatchedOutcome::Delivered);
+        }
+    }
+    Ok(UnmatchedOutcome::Notification(value))
 }
 
 /// Fold `notifications` and `agent_requests` (both as collected by
