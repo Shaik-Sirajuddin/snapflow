@@ -52,7 +52,6 @@ export component ChatPanel inherits Window {
     in-out property <bool> background-default: false;
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
-    in-out property <string> agent-badge: "agent . ask";
     in property <string> connection-status: "Connecting...";
     in property <bool> compact: true;
     in-out property <bool> narrow: false;
@@ -288,7 +287,19 @@ export component ChatPanel inherits Window {
                 has-older-messages: has-older-messages;
                 loading-older-messages <=> loading-older-messages;
                 load-older-requested => { load-older-requested(); }
-                agent-badge: agent-badge;
+                // `default_variables_display` phase: `agent-badge` used to
+                // be a static "agent . ask" default that nothing ever set
+                // from Rust, so it never reflected the active thread's real
+                // provider/model or updated on model selection. Derived
+                // here instead, the same way `active-thread-name`/
+                // `active-thread-description` already are, from the same
+                // live per-thread `provider`/`model` fields the sidebar row
+                // already shows -- always current, no separate Rust-side
+                // property push needed.
+                agent-badge: threads.length > 0 && threads[selected-thread].provider != ""
+                    ? threads[selected-thread].provider
+                        + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
+                    : "agent . ask";
                 connection-status: connection-status;
                 sending: threads.length > 0
                     ? threads[selected-thread].status == "loading"

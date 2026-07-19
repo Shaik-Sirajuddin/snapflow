@@ -28,6 +28,10 @@ export component SettingsSearchBar inherits Rectangle {
         color: Theme.text-primary;
         font-size: 11px * Theme.font-scale;
         x: Metrics.space-4;
+        // See text_field.slint's identical fix for why y/height are
+        // pinned explicitly here.
+        y: 0px;
+        height: parent.height;
         width: parent.width - 2 * Metrics.space-4;
         vertical-alignment: center;
     }
