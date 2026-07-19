@@ -2158,6 +2158,7 @@ async fn handle_request(
         Err(e) => return respond(Err(e)),
     };
 
+    let params_for_remap = req.params.clone();
     let op = match build_op(&req.method, req.params.clone(), project_id.clone()) {
         Ok(op) => op,
         Err(_) => match build_op_ext(&req.method, req.params, project_id.clone(), audio_enabled) {
@@ -2175,8 +2176,88 @@ async fn handle_request(
             // has nothing to fan out to yet, which is not a failure.
             let _ = sender.send(notification.clone());
         }
+        // `selection_remap_on_mutation` phase: keep the session's current
+        // selection following the same logical item after a mutation that
+        // could shift/invalidate the index it was pointing at, rather than
+        // silently going stale.
+        remap_selection_after_mutation(&req.method, &params_for_remap, &mut session.current);
     }
     respond(outcome.result)
+}
+
+/// `selection_remap_on_mutation` phase: audited every `edit.*`/`filter.*`
+/// method that can shift or remove a track/clip index a live selection
+/// could be pointing at (the ag-note's own removeTrack question mark, plus
+/// reorderTrack, removeClip):
+///
+/// - `edit.removeTrack`: `apply_selection_lock` already forces this
+///   method's `trackIndex` to equal `current.track_index` (it's in
+///   `TRACK_INDEX_METHODS`) -- so a successful call always means the
+///   currently-selected track was the one just removed. Clears the
+///   selection entirely (cascading clip/filter, same as `track.exit`),
+///   the same "the selected item is just gone" case `clip.exit`/
+///   `track.exit` already handle -- there is no "shift" to apply, unlike
+///   the array-reindex case below, since the selected track itself no
+///   longer exists.
+/// - `edit.reorderTrack`: standard array-move semantics -- if the
+///   selected track was the one moved, follow it to its new index; if it
+///   was merely inside the shifted range, adjust by one slot.
+/// - `edit.removeClip`: `clipId` is a persistent identity, not a
+///   position, so removing some OTHER clip never invalidates an
+///   already-selected `clip_id`. Only clears the selection if the
+///   backend's own response names the removed clip as the one currently
+///   selected (a defensive check that's currently unreachable in
+///   practice, since `edit.removeClip` is a positional trackIndex+
+///   clipIndex operation, deliberately excluded from `apply_selection_lock`
+///   per that function's own doc comment -- kept for whenever a future
+///   phase gives `edit.removeClip` a `clipId`-based form instead).
+///
+/// `edit.moveClip`/`edit.splitClip`/`filter.remove`/`filter.reorder` were
+/// also audited and found NOT to need remapping: `moveClip` relocates a
+/// clip between tracks without changing its `clipId` identity (the
+/// session's `track_index`/`clip_id` selections are independent, not a
+/// "clip must belong to selected track" invariant); `splitClip` only ever
+/// grows the clip list, never shifts an existing clip's identity out from
+/// under a selection; `filter.remove`/`filter.reorder` shift
+/// `filterIndex`, which nothing enters/exits yet (`CurrentSelection::
+/// filter_index` is never set by any tool today -- see
+/// `apply_selection_lock`'s doc comment on why `filterIndex` isn't locked
+/// either), so there is nothing live to remap there yet.
+fn remap_selection_after_mutation(method: &str, params: &Value, current: &mut CurrentSelection) {
+    match method {
+        "edit.removeTrack" => {
+            current.track_index = None;
+            current.clip_id = None;
+            current.filter_index = None;
+        }
+        "edit.reorderTrack" => {
+            let Some(selected) = current.track_index else {
+                return;
+            };
+            let from = params.get("fromIndex").and_then(|v| v.as_u64());
+            let to = params.get("toIndex").and_then(|v| v.as_u64());
+            let (Some(from), Some(to)) = (from, to) else {
+                return;
+            };
+            let (from, to, selected_u64) = (from as usize, to as usize, selected as u64);
+            if selected as usize == from {
+                current.track_index = Some(to);
+            } else if from < to && selected_u64 > from as u64 && selected_u64 <= to as u64 {
+                current.track_index = Some(selected - 1);
+            } else if to < from && selected_u64 >= to as u64 && selected_u64 < from as u64 {
+                current.track_index = Some(selected + 1);
+            }
+        }
+        "edit.removeClip" => {
+            if let Some(removed_clip_id) = params.get("clipId").and_then(|v| v.as_str()) {
+                if current.clip_id.as_deref() == Some(removed_clip_id) {
+                    current.clip_id = None;
+                    current.filter_index = None;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Pulls the next fanned-out notification for this connection, if it's

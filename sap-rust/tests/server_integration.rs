@@ -819,6 +819,62 @@ async fn reorder_track_and_set_track_height_never_needed_a_selection_in_the_firs
     assert!(reordered.error.is_none(), "edit.reorderTrack should never require track.enter: {:?}", reordered.error);
 }
 
+// `selection_remap_on_mutation` phase: the current selection must follow
+// the same logical item through a mutation that shifts/removes its index,
+// not silently point at whatever ends up in that slot.
+
+#[tokio::test]
+async fn removing_the_selected_track_clears_the_selection_entirely() {
+    let path = start_server("remap-remove-track", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-remap-a"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+
+    client.call("track.enter", json!({"trackIndex": 1})).await;
+    let removed = client.call("edit.removeTrack", json!({})).await;
+    assert!(removed.error.is_none(), "edit.removeTrack should succeed: {:?}", removed.error);
+
+    let view = client.call("currentView", json!({})).await;
+    assert!(
+        view.result.unwrap()["trackIndex"].is_null(),
+        "the removed track's selection must be cleared, not silently point at whatever is now at that slot"
+    );
+}
+
+#[tokio::test]
+async fn reordering_tracks_follows_the_selected_track_to_its_new_index() {
+    let path = start_server("remap-reorder-track", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-remap-b"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+
+    // Select track 0, then move it to index 2 -- the selection must
+    // follow the same logical track, not stay pinned to slot 0 (which
+    // now holds a different track) or to slot 2 by coincidence.
+    client.call("track.enter", json!({"trackIndex": 0})).await;
+    let reordered = client
+        .call("edit.reorderTrack", json!({"fromIndex": 0, "toIndex": 2}))
+        .await;
+    assert!(reordered.error.is_none(), "edit.reorderTrack should succeed: {:?}", reordered.error);
+    let view = client.call("currentView", json!({})).await;
+    assert_eq!(view.result.unwrap()["trackIndex"], 2, "selection should follow the moved track to its new index");
+
+    // A track between the moved range shifts down by one slot when it
+    // wasn't the one being moved.
+    client.call("track.enter", json!({"trackIndex": 1})).await;
+    let reordered2 = client
+        .call("edit.reorderTrack", json!({"fromIndex": 0, "toIndex": 1}))
+        .await;
+    assert!(reordered2.error.is_none());
+    let view2 = client.call("currentView", json!({})).await;
+    assert_eq!(view2.result.unwrap()["trackIndex"], 0, "a track inside the shifted range should move down by one slot");
+}
+
 #[tokio::test]
 async fn filter_method_without_a_selected_clip_is_rejected_with_an_actionable_error() {
     let path = start_server("no-clip-selected", TOKEN).await;
