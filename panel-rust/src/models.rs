@@ -616,6 +616,10 @@ pub fn build_thread_items<N: AsRef<str>>(
                 // `real_index` after filtering, so they default empty here.
                 provider: String::new().into(),
                 model: String::new().into(),
+                // Post-populated by `real_index` in lib.rs, same reason
+                // as provider/model above.
+                project_path: String::new().into(),
+                project_name: String::new().into(),
             },
         })
         .collect()

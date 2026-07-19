@@ -214,6 +214,13 @@ struct ThreadSlot {
     /// of every thread until a caller explicitly closes it (never set
     /// implicitly by window/process teardown).
     closed: Mutex<bool>,
+    /// `thread_item_project_context` phase: the project directory this
+    /// thread's session was actually opened/resumed/reattached against
+    /// (the `cwd` passed to ACP at creation time -- see `cwd_for_session`),
+    /// captured once and never updated afterward, since ACP has no way to
+    /// move an existing session to a new cwd. `None` when no project was
+    /// active at creation time (the pre-`active_project_binding` default).
+    project_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -263,6 +270,15 @@ pub struct AgentBridge {
     // (`refresh_terminals_for` and friends) rely on being able to call
     // without needing `&mut self.bridge` threaded through.
     local_terminals: std::cell::RefCell<std::collections::HashMap<usize, crate::local_terminal::LocalTerminal>>,
+    // `chat_sessions_project_path` phase: the active MLT project's path
+    // (set from `PanelSingleton::active_project_path` via
+    // `set_active_project_path`), consulted by `cwd_for_session` at every
+    // new-session call site instead of the process's own cwd, once one is
+    // known. `Arc<Mutex<..>>`, not a plain field, so the background
+    // attachment task spawned in the constructor's loop (which runs on a
+    // tokio worker thread, well past this struct's own lifetime scope at
+    // spawn time) can observe updates made after construction.
+    session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// A point-in-time read of a client-local terminal's VT100 screen state
@@ -975,13 +991,18 @@ fn now_token() -> String {
     format!("unix:{secs}")
 }
 
-/// The `cwd` argument ACP's `session/new` wants -- this crate has no
-/// concept of a project directory of its own (the chat panel isn't
-/// editing files directly), so the process's own working directory is
-/// as reasonable a default as any, with `.` as a last-resort fallback if
-/// that's somehow unavailable.
-fn cwd_for_session() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+/// The `cwd` argument ACP's `session/new` wants. `chat_sessions_project_path`
+/// phase: prefers the active MLT project's path (see
+/// `AgentBridge::set_active_project_path`) when one is known, since that's
+/// the directory a skill/session should actually be scoped to; falls back
+/// to the process's own working directory (with `.` as a last resort) when
+/// no project is open, matching this function's pre-existing behavior.
+fn cwd_for_session(session_cwd_override: &Mutex<Option<PathBuf>>) -> PathBuf {
+    session_cwd_override
+        .lock()
+        .expect("session cwd override mutex poisoned")
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 fn replay_matches_cached_position(
@@ -1115,10 +1136,11 @@ fn spawn_background_attachment(
     has_cached_transcript: bool,
     profile_name: Option<String>,
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
+    session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
 ) {
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
-        let cwd = cwd_for_session();
+        let cwd = cwd_for_session(&session_cwd_override);
         let result = if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
@@ -1341,6 +1363,7 @@ impl AgentBridge {
         let gateways = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut gateway_setters: HashMap<String, Vec<AcpxThreadGatewaySetter>> = HashMap::new();
         let mut attachment_gates: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
+        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
 
         // `spawn_acpx_thread_with_gateway` calls the free-function `tokio::spawn` internally,
         // which needs an active runtime context on this (calling) thread --
@@ -1433,6 +1456,9 @@ impl AgentBridge {
                attachment: Mutex::new(AttachmentState::default()),
                attachment_ready: tokio::sync::Notify::new(),
                closed: Mutex::new(false),
+               // No project can be active yet at construction time --
+               // `session_cwd_override` was just created above, unset.
+               project_path: None,
             });
             slots.push(slot.clone());
 
@@ -1448,6 +1474,7 @@ impl AgentBridge {
                 has_cached_transcript,
                 spec.profile_name.clone(),
                 attachment_gate,
+                session_cwd_override.clone(),
             );
         }
         drop(_guard);
@@ -1474,7 +1501,21 @@ impl AgentBridge {
             gateways,
             store,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
+            session_cwd_override,
         })
+    }
+
+    /// `chat_sessions_project_path` phase: called from the FFI-driven
+    /// `panel_rust_set_project_path` path whenever the active MLT project
+    /// changes, so every subsequently-opened/resumed/reattached session
+    /// picks up the new project directory as its `cwd`. Deliberately does
+    /// NOT retroactively move already-open sessions -- ACP has no
+    /// "change an existing session's cwd" operation.
+    pub fn set_active_project_path(&self, path: Option<PathBuf>) {
+        *self
+            .session_cwd_override
+            .lock()
+            .expect("session cwd override mutex poisoned") = path;
     }
 
    /// Adds one open thread using the already-provisioned provider gateway.
@@ -1553,6 +1594,11 @@ impl AgentBridge {
         };
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
+        let project_path_for_slot = self
+            .session_cwd_override
+            .lock()
+            .expect("session cwd override mutex poisoned")
+            .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
             provider: provider.to_string(),
@@ -1596,8 +1642,9 @@ impl AgentBridge {
             }),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            project_path: project_path_for_slot,
         });
-       let cwd = cwd_for_session();
+       let cwd = cwd_for_session(&self.session_cwd_override);
        let session_id = if let Some(session_id) = cached_session_id.clone() {
            let resume_result = if has_cached_transcript {
                match self
@@ -1829,6 +1876,11 @@ impl AgentBridge {
         };
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
+        let project_path_for_slot = self
+            .session_cwd_override
+            .lock()
+            .expect("session cwd override mutex poisoned")
+            .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
             provider: provider.to_string(),
@@ -1851,9 +1903,10 @@ impl AgentBridge {
             }),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            project_path: project_path_for_slot,
         });
 
-        let cwd = cwd_for_session();
+        let cwd = cwd_for_session(&self.session_cwd_override);
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
@@ -1967,6 +2020,18 @@ impl AgentBridge {
     /// because a preceding thread was deleted.
     pub fn thread_provider(&self, idx: usize) -> Option<String> {
         self.slots.get(idx).map(|slot| slot.provider.clone())
+    }
+
+    /// `thread_item_project_context` phase: the project directory this
+    /// thread's session was opened against (see `ThreadSlot::project_path`'s
+    /// doc comment) -- `None` when no project was active at creation time,
+    /// distinct from `Some("")`, which never occurs here.
+    pub fn thread_project_path(&self, idx: usize) -> Option<String> {
+        self.slots.get(idx).and_then(|slot| {
+            slot.project_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
     }
 
     /// Snapshot of a thread's currently-pending interactive requests

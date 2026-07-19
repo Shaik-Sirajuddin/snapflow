@@ -27,6 +27,17 @@ export struct ThreadItem {
     // the sidebar row shows the model label only when non-empty.
     provider: string,
     model: string,
+    // active_project_binding/thread_item_project_context phase: the
+    // project directory this thread's session was opened against (see
+    // AgentBridge::thread_project_path). Empty string when unknown/no
+    // project was active at creation time -- the sidebar row shows a
+    // project-context badge only when this differs from the panel's
+    // current active-project-path AND is non-empty.
+    project-path: string,
+    // Display-only basename of project-path (Slint has no string-split
+    // primitive to derive this itself), e.g. "/a/b/foo.mlt" -> "foo.mlt".
+    // Empty exactly when project-path is empty.
+    project-name: string,
 }
 
 

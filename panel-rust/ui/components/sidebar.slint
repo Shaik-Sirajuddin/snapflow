@@ -11,6 +11,10 @@ import { ThreadItem, SkillOption } from "../types.slint";
 export component Sidebar inherits Rectangle {
     in property <[ThreadItem]> threads: [];
     in property <int> selected-thread: 0;
+    // `thread_item_project_context` phase: the panel's current active
+    // project, forwarded straight from ChatPanel -- compared per-row
+    // against each thread's own project-path to decide badge visibility.
+    in property <string> active-project-path: "";
     in property <bool> compact: true;
     in property <bool> expanded: false;
     callback thread-selected(int);
@@ -368,6 +372,23 @@ export component Sidebar inherits Rectangle {
                                     source: @image-url("../assets/icons/moon.svg");
                                     size: Metrics.icon-sm;
                                     color: Theme.text-tertiary;
+                                }
+                                // `thread_item_project_context` phase: no
+                                // dedicated folder/project icon exists in
+                                // assets/icons (checked the directory
+                                // listing), so this uses a small text
+                                // badge of the project's basename instead
+                                // of a "logo" image, matching the
+                                // established text-label-for-missing-icon
+                                // precedent from active_pane_and_editor_view.
+                                if expanded && thread.project-path != "" && thread.project-path != root.active-project-path : Text {
+                                    text: thread.project-name;
+                                    color: Theme.text-tertiary;
+                                    font-size: 8px * Theme.font-scale;
+                                    font-family: Theme.font-mono;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    max-width: 64px;
                                 }
                                 if expanded && !thread.background && i == selected-thread : Text {
                                     text: "ACTIVE";

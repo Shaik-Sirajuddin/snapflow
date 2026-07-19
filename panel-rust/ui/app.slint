@@ -96,6 +96,12 @@ export component ChatPanel inherits Window {
     in property <string> active-skill-path: "";
     in-out property <string> active-skill-content: "";
     in property <[string]> detected-editors: [];
+    // `thread_item_project_context` phase: the currently-open MLT
+    // project's path (mirrors PanelSingleton::active_project_path),
+    // pushed from Rust on every `panel_rust_set_project_path` FFI call.
+    // Empty string means no project is open. Sidebar rows use this to
+    // decide whether a thread's own project-path differs from "here".
+    in property <string> active-project-path: "";
     callback skill-content-edited(string, string /* path, new content */);
     callback skill-copy-path-requested(string);
     callback skill-open-in-editor-requested(string, string /* editor name, path */);
@@ -248,6 +254,7 @@ export component ChatPanel inherits Window {
                 compact: compact;
                 expanded: root.narrow ? false : sidebar-expanded;
                 skills: available-skills;
+                active-project-path: root.active-project-path;
                 thread-selected(i) => {
                     selected-thread = i;
                     thread-selected(i);

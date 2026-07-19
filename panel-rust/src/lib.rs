@@ -498,6 +498,16 @@ impl PanelSingleton {
                     .unwrap_or_default()
             })
             .collect();
+        let thread_project_paths: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                self.bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_project_path(idx))
+                    .unwrap_or_default()
+            })
+            .collect();
         let items = build_thread_items(
             &*names,
             &state,
@@ -513,6 +523,16 @@ impl PanelSingleton {
                 let mut item = i.item;
                 item.provider = providers.get(i.real_index).cloned().unwrap_or_default().into();
                 item.model = thread_models.get(i.real_index).cloned().unwrap_or_default().into();
+                let project_path = thread_project_paths
+                    .get(i.real_index)
+                    .cloned()
+                    .unwrap_or_default();
+                item.project_name = std::path::Path::new(&project_path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .into();
+                item.project_path = project_path.into();
                 item
             })
             .collect();
@@ -2541,6 +2561,16 @@ pub extern "C" fn panel_rust_set_project_path(
             let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
             std::str::from_utf8(bytes).ok().map(str::to_string)
         };
+        // `chat_sessions_project_path` phase: also propagate to the
+        // bridge, whose `cwd_for_session` reads this to scope every
+        // subsequently-opened ACP session to the active project instead
+        // of the process's own working directory.
+        if let Some(bridge) = panel.bridge.as_ref() {
+            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
+        }
+        panel
+            .component
+            .set_active_project_path(path.clone().unwrap_or_default().into());
         *panel.active_project_path.borrow_mut() = path;
         true
     })
