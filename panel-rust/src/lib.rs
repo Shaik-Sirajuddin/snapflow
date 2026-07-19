@@ -220,6 +220,16 @@ struct PanelSingleton {
     traced_attachment_threads: RefCell<HashSet<String>>,
     thread_state: RefCell<Vec<ThreadState>>,
     thread_errors: RefCell<Vec<String>>,
+    /// `queued_send_queue_behavior` phase: one `SendQueue` per thread,
+    /// parallel to `thread_state`/`thread_names` (same real_index
+    /// convention, grown at exactly the two thread-creation call sites
+    /// that also grow those). In-memory only for now -- restart
+    /// persistence (`SendQueue::load`/JSONL) needs a real per-thread
+    /// identity available at construction time, which isn't wired up
+    /// yet; this still gets the core behavior (always-typeable input,
+    /// correct enqueue/drain) without gambling on that extra plumbing
+    /// in the same pass.
+    send_queues: RefCell<Vec<crate::send_queue::SendQueue>>,
     /// Phase 2 (chat-panel-ui-theme-parity.md): current sidebar search
     /// filter, empty means "show all".
     search_query: RefCell<String>,
@@ -831,6 +841,39 @@ impl PanelSingleton {
                             if let Some(error) = self.thread_errors.borrow_mut().get_mut(idx) {
                                 error.clear();
                             }
+                            // queued_send_queue_behavior: auto-advance
+                            // this thread's send queue now that its turn
+                            // has genuinely ended. `is_compose_focused`
+                            // is always passed false here (a simplification
+                            // vs. Zed's precedent, which suppresses
+                            // auto-send while the user is actively
+                            // editing the *next* message) -- this
+                            // integration pass doesn't thread per-thread
+                            // compose-focus state down to this event
+                            // loop; documented, not silently dropped.
+                            let popped = self
+                                .send_queues
+                                .borrow_mut()
+                                .get_mut(idx)
+                                .and_then(|q| q.on_generation_stopped(false).ok().flatten());
+                            if let Some(entry) = popped {
+                                bridge.push_local(
+                                    idx,
+                                    ChatMessage {
+                                        kind: MessageKind::User,
+                                        text: entry.text.clone(),
+                                        status: None,
+                                        id: None,
+                                        raw_input: None,
+                                        raw_output: None,
+                                    },
+                                );
+                                *slot = ThreadState::Loading;
+                                bridge.send_prompt(idx, entry.text);
+                                trace_host_input(format_args!(
+                                    "queued message auto-sent real_thread={idx}"
+                                ));
+                            }
                         }
                         AgentEvent::Error(error) => {
                             trace_host_input(format_args!(
@@ -1055,6 +1098,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .chain(std::iter::repeat(None))
             .take(initial_names.len())
             .collect();
+        let initial_thread_count = initial_names.len();
         let (bridge, initial_state) = match AgentBridge::new_with_thread_specs(&initial_specs) {
             Ok(b) => (Some(b), vec![ThreadState::Idle; initial_names.len()]),
             Err(e) => {
@@ -1099,6 +1143,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             traced_attachment_threads: RefCell::new(HashSet::new()),
             thread_state: RefCell::new(initial_state),
             thread_errors: RefCell::new(Vec::new()),
+            send_queues: RefCell::new(
+                (0..initial_thread_count)
+                    .map(|_| crate::send_queue::SendQueue::new())
+                    .collect(),
+            ),
             search_query: RefCell::new(String::new()),
             visible_indices: RefCell::new(Vec::new()),
             expanded: RefCell::new(Vec::new()),
@@ -1552,6 +1601,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     panel.thread_permission_profiles.borrow_mut().push(None);
                     panel.thread_state.borrow_mut().push(ThreadState::Idle);
                     panel.thread_errors.borrow_mut().push(String::new());
+                    panel
+                        .send_queues
+                        .borrow_mut()
+                        .push(crate::send_queue::SendQueue::new());
                     panel.search_query.borrow_mut().clear();
                     panel.refresh_threads_model();
                     // The recovered session is now bound locally --
@@ -1665,6 +1718,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     .push(non_empty(component.get_permission_profile().to_string()));
                 panel.thread_state.borrow_mut().push(ThreadState::Idle);
                 panel.thread_errors.borrow_mut().push(String::new());
+                panel
+                    .send_queues
+                    .borrow_mut()
+                    .push(crate::send_queue::SendQueue::new());
                 panel.search_query.borrow_mut().clear();
                 // New session: clear compose so it never carries over.
                 component.set_compose_text("".into());
@@ -1776,9 +1833,23 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         .get(idx)
                         .is_some_and(|state| *state == ThreadState::Loading)
                     {
-                        trace_host_input(format_args!(
-                            "send ignored real_thread={idx} because it is already loading"
-                        ));
+                        // queued_send_queue_behavior: a turn is already
+                        // in flight, so this message goes on the queue
+                        // instead of being silently dropped (compose is
+                        // no longer disabled while sending -- see
+                        // chat_input_layout.slint's `enabled: true` --
+                        // so this branch is reachable for real now,
+                        // unlike before this phase).
+                        if let Some(queue) = panel.send_queues.borrow_mut().get_mut(idx) {
+                            match queue.enqueue(text.to_string(), false) {
+                                Ok(_) => trace_host_input(format_args!(
+                                    "send queued real_thread={idx} (turn in flight)"
+                                )),
+                                Err(error) => eprintln!(
+                                    "panel-rust: failed to enqueue message for thread {idx}: {error}"
+                                ),
+                            }
+                        }
                         return;
                     }
                     if bridge.thread_closed(idx) {

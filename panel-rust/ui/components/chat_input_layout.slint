@@ -80,7 +80,19 @@ export component ChatInputLayout inherits Rectangle {
                     compose := TextInput {
                         accessible-label: "Compose message";
                         text <=> root.compose-text;
-                        enabled: !root.sending;
+                        // queued_send_queue_behavior: always typeable,
+                        // even mid-turn -- `send-requested` now enqueues
+                        // instead of dispatching immediately when a turn
+                        // is in flight (lib.rs's on_send_requested),
+                        // matching Zed's own "always allow typing"
+                        // precedent. Was `enabled: !root.sending`, which
+                        // this phase's own investigation found masked a
+                        // real bug: the old handler cleared the compose
+                        // text unconditionally before its loading guard,
+                        // so a message submitted mid-turn would have
+                        // been silently destroyed had this ever been
+                        // reachable -- fixed together with this flip.
+                        enabled: true;
                         color: Theme.text-primary;
                         font-family: Theme.font-sans;
                         font-size: 11px * Theme.font-scale;
