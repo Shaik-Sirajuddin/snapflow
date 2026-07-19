@@ -268,6 +268,27 @@ export struct McpServerOption {
     tools: [McpToolOption],
 }
 
+// Skill-manager sidebar/settings row -- `skill_discovery_backend` phase of
+// `memory/designa/gen/plans/skill-manager-workspace/`. Filesystem-derived
+// (no backend RPC), built from `skills_state::SkillEntry` via
+// `models::to_skill_options`.
+export struct SkillOption {
+    name: string,
+    description: string,
+    // "global" | "project" -- which skills directory this was discovered
+    // in (memory/designa/gen/plans/skill-manager-workspace/
+    // 01-architecture.md's resolved storage split).
+    scope: string,
+    // Absolute path to the skill's directory, for the editor-view /
+    // "open in <editor>" flow (active_pane_and_editor_view phase).
+    path: string,
+    // Global skill id this project-local skill was instantiated from, or
+    // "" when not applicable (global skills, or a project skill created
+    // from scratch) -- `skills-management`'s "show project_start skills
+    // include global `started_from`".
+    started-from: string,
+}
+
 // Recovery/import sheet addition (Coverage Matrix `session/list` row):
 // one entry from `AgentBridge::recoverable_sessions` -- a real remote
 // gateway session not currently bound to any local thread row.

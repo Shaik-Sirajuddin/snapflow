@@ -26,6 +26,7 @@ mod permission;
 pub mod protocol_types;
 mod send_queue;
 mod settings_file;
+mod skills_state;
 mod state_store;
 mod theme;
 

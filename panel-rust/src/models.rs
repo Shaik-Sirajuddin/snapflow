@@ -11,8 +11,9 @@ use crate::agent_bridge::TerminalBuffer;
 use crate::markdown::{self, LineKind};
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
-    McpServerOption, MessageItem, ProfileOption, TerminalItem, ThreadItem,
+    McpServerOption, MessageItem, ProfileOption, SkillOption, TerminalItem, ThreadItem,
 };
+use crate::skills_state::SkillEntry;
 use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -706,6 +707,23 @@ pub fn to_mcp_server_options(
             // a real `mcp_servers/update`, a `tools/list` round trip, and a
             // status/auth feed are a later phase.
             ..Default::default()
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Builds the skill-manager sidebar/settings row model from discovered
+/// `skills_state::SkillEntry` values (both global and project-local
+/// scans, already merged/sorted by the caller).
+pub fn to_skill_options(entries: Vec<SkillEntry>) -> ModelRc<SkillOption> {
+    let items: Vec<SkillOption> = entries
+        .into_iter()
+        .map(|entry| SkillOption {
+            name: entry.name.into(),
+            description: entry.description.into(),
+            scope: entry.scope.as_str().into(),
+            path: entry.path.to_string_lossy().into_owned().into(),
+            started_from: entry.started_from.unwrap_or_default().into(),
         })
         .collect();
     ModelRc::new(VecModel::from(items))
