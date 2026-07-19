@@ -92,6 +92,17 @@ pub struct ServerConfig {
     /// `tenant_process_isolation`. Defaults to the legacy shared-process
     /// behavior; native/unmanaged sessions are unaffected either way.
     pub session_process_isolation: bool,
+    /// **`process_reader_demux`, phase 1 of
+    /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
+    /// Opt-in (`ACPX_PROCESS_READER_DEMUX=1`, default off). When on,
+    /// `session/prompt`/`session/new` register-then-await a backend
+    /// response via a per-process reader task instead of holding that
+    /// process's own lock across the entire write + blocking-read-loop
+    /// of a turn -- so two sessions sharing one backend process (the
+    /// live default when both isolation flags above are also off) can
+    /// actually overlap in wall time. See `Router::process_reader_demux`'s
+    /// field doc comment for the current scope and known tradeoffs.
+    pub process_reader_demux: bool,
 }
 
 impl ServerConfig {
@@ -331,6 +342,9 @@ impl ServerConfig {
         let session_process_isolation = std::env::var("ACPX_SESSION_PROCESS_ISOLATION")
             .map(|value| value == "1")
             .unwrap_or(false);
+        let process_reader_demux = std::env::var("ACPX_PROCESS_READER_DEMUX")
+            .map(|value| value == "1")
+            .unwrap_or(false);
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {
@@ -356,6 +370,7 @@ impl ServerConfig {
             stream_idle_retention,
             tenant_process_isolation,
             session_process_isolation,
+            process_reader_demux,
         }
     }
 }
