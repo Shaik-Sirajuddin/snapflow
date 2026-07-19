@@ -172,6 +172,13 @@ export component ChatInputLayout inherits Rectangle {
                 options: root.config-dropdown-entries;
                 placeholder: "Search models...";
                 popup-width: 220px;
+                // Right-side call site in this row -- searchable_dropdown.
+                // slint's own doc comment calls this exact case out as
+                // needing popup-align-end, otherwise the 220px popup opens
+                // left-aligned from this trigger's x and runs off the row's
+                // right edge at narrow/tablet widths (the mode selector to
+                // its left has more room and doesn't need this).
+                popup-align-end: true;
                 entry-selected(id, value) => { root.config-option-selected(id, value); }
             }
         }
