@@ -9,6 +9,7 @@
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::Router;
+use acpx_core::LifecycleConfig;
 use serde_json::json;
 
 /// Reads newline-delimited JSON-RPC requests, replies with a canned
@@ -390,5 +391,178 @@ async fn launch_overrides_values_are_redacted_in_every_profile_response() {
     assert!(
         session.is_ok(),
         "profile must remain fully usable after redaction-on-echo: {session:?}"
+    );
+}
+
+/// **`background_mode` (bg-mode `session/close` override).** With
+/// `LifecycleConfig::background_mode` on, an explicit `session/close`
+/// must not actually tear the session down: it should answer success
+/// but leave the gateway session id fully promptable afterward, exactly
+/// as if the client had merely disconnected instead of closing.
+#[tokio::test]
+async fn background_mode_suppresses_session_close_and_the_session_stays_promptable() {
+    let mut router = Router::new("stand-in-agent").with_lifecycle_config(LifecycleConfig {
+        background_mode: true,
+        ..LifecycleConfig::default()
+    });
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+
+    let new_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}
+        }))
+        .await
+        .expect("session/new");
+    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let close_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/close",
+            "params": {"sessionId": gateway_id}
+        }))
+        .await
+        .expect("background-mode session/close must still answer success");
+    assert_eq!(close_response["result"], json!({}));
+
+    let prompt_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": gateway_id, "prompt": []}
+        }))
+        .await;
+    assert!(
+        prompt_response.is_ok(),
+        "session must still be live and promptable after a suppressed close: {prompt_response:?}"
+    );
+}
+
+/// The per-call `_acpx.bg: "off"` override forces a real close even
+/// while `background_mode` is on deployment-wide -- the suppressed-close
+/// default is not an unconditional trap door.
+#[tokio::test]
+async fn background_mode_bg_off_override_forces_a_real_close() {
+    let mut router = Router::new("stand-in-agent").with_lifecycle_config(LifecycleConfig {
+        background_mode: true,
+        ..LifecycleConfig::default()
+    });
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+
+    let new_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}
+        }))
+        .await
+        .expect("session/new");
+    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let close_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/close",
+            "params": {"sessionId": gateway_id, "_acpx": {"bg": "off"}}
+        }))
+        .await
+        .expect("overridden session/close must still answer success");
+    // Unlike the suppressed case, this one is genuinely forwarded to the
+    // stand-in backend, which echoes its own generic `{"ok": true}`
+    // result for any non-`session/new` method -- not an empty `{}`.
+    assert_eq!(close_response["result"], json!({"ok": true}));
+
+    let prompt_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": gateway_id, "prompt": []}
+        }))
+        .await;
+    assert!(
+        prompt_response.is_err(),
+        "an overridden, real close must not leave the session promptable: {prompt_response:?}"
+    );
+}
+
+/// Deployment default (`background_mode: false`, i.e. every pre-existing
+/// deployment that never sets `ACPX_BACKGROUND_MODE`) keeps the
+/// unconditional real-close behavior this crate had before this feature
+/// existed -- explicit regression guard, not just an absence of the
+/// override.
+#[tokio::test]
+async fn background_mode_off_by_default_keeps_a_real_close() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+
+    let new_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}
+        }))
+        .await
+        .expect("session/new");
+    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+
+    router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/close",
+            "params": {"sessionId": gateway_id}
+        }))
+        .await
+        .expect("session/close");
+
+    let prompt_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": gateway_id, "prompt": []}
+        }))
+        .await;
+    assert!(
+        prompt_response.is_err(),
+        "default behavior must remain a real close: {prompt_response:?}"
+    );
+}
+
+/// Same feature, exercised through `dispatch_shared`/`dispatch_proxied_
+/// shared` -- the actual path every live transport (`transport::ws`,
+/// `transport::stdio`, `transport::http`, and the strict `/acp` bridge)
+/// uses in production, not just `Router::dispatch`'s owned-router test
+/// convenience used by the three tests above.
+#[tokio::test]
+async fn background_mode_suppresses_session_close_via_dispatch_shared_too() {
+    use acpx_core::router::dispatch_shared;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let mut router = Router::new("stand-in-agent").with_lifecycle_config(LifecycleConfig {
+        background_mode: true,
+        ..LifecycleConfig::default()
+    });
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let router = Arc::new(Mutex::new(router));
+
+    let new_response = dispatch_shared(
+        &router,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+    )
+    .await
+    .expect("session/new");
+    let gateway_id = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+
+    let close_response = dispatch_shared(
+        &router,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/close",
+            "params": {"sessionId": gateway_id}
+        }),
+    )
+    .await
+    .expect("background-mode session/close via dispatch_shared must still answer success");
+    assert_eq!(close_response["result"], json!({}));
+
+    let list_after = dispatch_shared(
+        &router,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "session/list", "params": {}}),
+    )
+    .await
+    .expect("session/list");
+    assert_eq!(
+        list_after["result"]["sessions"].as_array().unwrap().len(),
+        1,
+        "a suppressed close must leave the session listed as still live via dispatch_shared too"
     );
 }

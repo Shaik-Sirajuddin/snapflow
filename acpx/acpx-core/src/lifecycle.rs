@@ -56,6 +56,32 @@ pub struct LifecycleConfig {
     /// never be selected by `SessionRegistry::reap_candidates` no matter
     /// how long the idle TTL is.
     pub active_turn_deadline: Option<std::time::Duration>,
+    /// **`background_mode` (bg-mode `session/close` override).** When
+    /// `true`, an explicit client `session/close` is deliberately *not*
+    /// forwarded to the backend and does not evict the session from
+    /// `SessionRegistry`/persistence -- the session, and whatever
+    /// backend process is running it, stays fully alive so a later
+    /// `session/resume`/`session/load`/`session/prompt` against the
+    /// same gateway session id keeps working exactly as if the client
+    /// had merely disconnected rather than explicitly closed. This
+    /// mirrors `acpx-acp-bridge`'s existing "EOF never sends session/
+    /// close" transport-level behavior one level up, at the JSON-RPC
+    /// method itself, for callers (e.g. an editor closing a
+    /// conversation tab) that call `session/close` explicitly rather
+    /// than just dropping the connection. `false` (the default) keeps
+    /// every pre-existing deployment's `session/close` semantics
+    /// unchanged: a real, immediate close. A caller can override this
+    /// per call regardless of the deployment-wide default via the
+    /// additive, ACP-schema-external `_acpx.bg` extension field on the
+    /// `session/close` request itself (`false`/`"off"` forces a real
+    /// close even in background mode; `true`/`"on"` forces a
+    /// background no-op even when this flag is `false`) -- see
+    /// `router::take_background_override`. `session/delete` is
+    /// deliberately unaffected either way: unlike `close`, `delete` is
+    /// an unambiguous, explicit destroy-this-session's-data signal, and
+    /// silently keeping a session alive under that call would be
+    /// surprising for a caller that just asked to delete it.
+    pub background_mode: bool,
 }
 
 impl Default for LifecycleConfig {
@@ -69,6 +95,7 @@ impl Default for LifecycleConfig {
             max_pinned_sessions_per_tenant: None,
             connector_idle_shutdown_ttl: None,
             active_turn_deadline: None,
+            background_mode: false,
         }
     }
 }

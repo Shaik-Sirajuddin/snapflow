@@ -313,6 +313,9 @@ impl ServerConfig {
             )),
             Err(_) => lifecycle.active_turn_deadline,
         };
+        lifecycle.background_mode = std::env::var("ACPX_BACKGROUND_MODE")
+            .map(|value| value == "1")
+            .unwrap_or(lifecycle.background_mode);
         lifecycle
             .validate()
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));
