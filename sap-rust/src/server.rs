@@ -52,6 +52,30 @@ pub struct ServerConfig {
 struct Session {
     authenticated: bool,
     project_id: Option<String>,
+    /// `mcp-selection-state` plan's `selection_state` phase: the session's
+    /// current track/clip/filter selection cursor, per the ag-note in
+    /// `snapshotd-mcp-tool-report.md` Table 2 -- resolved there as
+    /// session-scoped (not shared across other sessions bound to the same
+    /// project), so this lives on `Session` itself rather than anywhere
+    /// keyed by `project_id`. Cleared on `project.exit` (a selection from
+    /// one project is meaningless once unbound) and on a fresh
+    /// `project.select` to the same project (re-entering a project starts
+    /// with nothing selected, matching a fresh connection's own default).
+    current: CurrentSelection,
+}
+
+/// `mcp-selection-state` plan: `current { trackIndex, clipId, filterIndex }`
+/// per the ag-note. `filter_index` is only meaningful once a clip is also
+/// selected (a filter belongs to a clip), but is not itself validated
+/// against `clip_id` here -- callers are expected to exit/re-enter in the
+/// right order (`clip.exit` before selecting a different clip's filter),
+/// matching how the ag-note describes enter/exit as the only mutation path.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentSelection {
+    track_index: Option<usize>,
+    clip_id: Option<String>,
+    filter_index: Option<usize>,
 }
 
 /// Outcome of running one op against the backend: the RPC result to send
@@ -1890,6 +1914,7 @@ async fn handle_request(
     if req.method == "project.exit" {
         return match session.project_id.take() {
             Some(_project_id) => {
+                session.current = CurrentSelection::default();
                 let outcome = dispatch(
                     dispatch_tx,
                     Box::new(move |b| match b.project_exit() {
@@ -1961,6 +1986,7 @@ async fn handle_request(
             let sender = channel_for_project(channels, &project_id);
             *notif_rx = Some(sender.subscribe());
             session.project_id = Some(project_id);
+            session.current = CurrentSelection::default();
         }
         return respond(outcome.result);
     }
@@ -1971,6 +1997,66 @@ async fn handle_request(
         Some(p) => p,
         None => return respond(Err(rpc_error(error_codes::NO_PROJECT_BOUND))),
     };
+
+    // `mcp-selection-state` plan: `track.enter`/`track.exit`/`clip.enter`/
+    // `clip.exit`/`currentView`. Namespaced (`track.*`/`clip.*`) chosen over
+    // the top-level `enterTrack`/`exitTrack` alternative the ag-note also
+    // named, since it matches the rest of this dot-namespaced surface
+    // (`edit.*`, `filter.*`, `playlist.*`) -- pure session bookkeeping, no
+    // backend dispatch, so these are handled directly here rather than
+    // through `build_op`/`build_op_ext` like every project-mutating method.
+    // Deliberately does NOT validate that `trackIndex`/`clipId` actually
+    // exist in the backend at entry time -- existence validation would need
+    // a dispatch round trip this minimal first pass doesn't add yet; a
+    // stale/nonexistent selection is caught the same way an out-of-range
+    // index always was, whenever a tool that actually reads the backend
+    // acts on it.
+    if req.method == "track.enter" {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P {
+            track_index: usize,
+        }
+        return match serde_json::from_value::<P>(req.params) {
+            Ok(p) => {
+                session.current.track_index = Some(p.track_index);
+                respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")))
+            }
+            Err(e) => respond(Err(invalid_params(&e))),
+        };
+    }
+    if req.method == "track.exit" {
+        session.current.track_index = None;
+        // A clip only makes sense within an entered track -- exiting the
+        // track also exits any clip/filter selection nested under it,
+        // rather than leaving a clip-id selection dangling with no track.
+        session.current.clip_id = None;
+        session.current.filter_index = None;
+        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+    }
+    if req.method == "clip.enter" {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P {
+            clip_id: String,
+        }
+        return match serde_json::from_value::<P>(req.params) {
+            Ok(p) => {
+                session.current.clip_id = Some(p.clip_id);
+                respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")))
+            }
+            Err(e) => respond(Err(invalid_params(&e))),
+        };
+    }
+    if req.method == "clip.exit" {
+        session.current.clip_id = None;
+        // A filter only makes sense within an entered clip.
+        session.current.filter_index = None;
+        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+    }
+    if req.method == "currentView" {
+        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+    }
 
     let op = match build_op(&req.method, req.params.clone(), project_id.clone()) {
         Ok(op) => op,

@@ -615,3 +615,117 @@ async fn project_undo_from_one_session_can_undo_a_different_sessions_most_recent
     let too_many = agent1.call("project.undo", json!({})).await;
     assert!(too_many.error.is_some(), "undo past the bottom of the shared stack must fail, not silently succeed");
 }
+
+// `mcp-selection-state` plan's `selection_state`/`enter_exit_tools`/
+// `current_view_tool` phases: the session-scoped `current` selection cursor
+// and its `track.enter`/`track.exit`/`clip.enter`/`clip.exit`/`currentView`
+// methods. `lock_tools_to_selection`/`selection_remap_on_mutation` are NOT
+// covered here -- the plan's own Notes flag an unresolved escape-hatch
+// policy question ("keep an explicit-index override or remove it entirely")
+// that needs a human decision before those phases can be implemented, not
+// guessed.
+
+#[tokio::test]
+async fn current_view_defaults_to_an_empty_selection() {
+    let path = start_server("current-view-default", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-sel-a"})).await;
+
+    let view = client.call("currentView", json!({})).await;
+    assert!(view.error.is_none(), "currentView should succeed: {:?}", view.error);
+    let current = view.result.expect("currentView returns the selection struct");
+    assert!(current["trackIndex"].is_null());
+    assert!(current["clipId"].is_null());
+    assert!(current["filterIndex"].is_null());
+}
+
+#[tokio::test]
+async fn track_enter_and_exit_round_trip_through_current_view() {
+    let path = start_server("track-enter-exit", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-sel-b"})).await;
+
+    let entered = client.call("track.enter", json!({"trackIndex": 2})).await;
+    assert!(entered.error.is_none(), "track.enter should succeed: {:?}", entered.error);
+    assert_eq!(entered.result.as_ref().unwrap()["trackIndex"], 2);
+
+    let view = client.call("currentView", json!({})).await;
+    assert_eq!(view.result.as_ref().unwrap()["trackIndex"], 2);
+
+    let exited = client.call("track.exit", json!({})).await;
+    assert!(exited.error.is_none(), "track.exit should succeed: {:?}", exited.error);
+    assert!(exited.result.as_ref().unwrap()["trackIndex"].is_null());
+
+    let view_after_exit = client.call("currentView", json!({})).await;
+    assert!(view_after_exit.result.as_ref().unwrap()["trackIndex"].is_null());
+}
+
+#[tokio::test]
+async fn clip_enter_and_exit_round_trip_through_current_view() {
+    let path = start_server("clip-enter-exit", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-sel-c"})).await;
+
+    client.call("track.enter", json!({"trackIndex": 0})).await;
+    let entered = client.call("clip.enter", json!({"clipId": "clip-42"})).await;
+    assert!(entered.error.is_none(), "clip.enter should succeed: {:?}", entered.error);
+    assert_eq!(entered.result.as_ref().unwrap()["clipId"], "clip-42");
+    // Entering a clip must not clobber the already-entered track.
+    assert_eq!(entered.result.as_ref().unwrap()["trackIndex"], 0);
+
+    let exited = client.call("clip.exit", json!({})).await;
+    assert!(exited.error.is_none(), "clip.exit should succeed: {:?}", exited.error);
+    assert!(exited.result.as_ref().unwrap()["clipId"].is_null());
+    // Exiting the clip must not clobber the still-entered track.
+    assert_eq!(exited.result.as_ref().unwrap()["trackIndex"], 0);
+}
+
+#[tokio::test]
+async fn exiting_a_track_also_exits_its_nested_clip_selection() {
+    let path = start_server("track-exit-cascades", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-sel-d"})).await;
+
+    client.call("track.enter", json!({"trackIndex": 1})).await;
+    client.call("clip.enter", json!({"clipId": "clip-nested"})).await;
+
+    let exited = client.call("track.exit", json!({})).await;
+    assert!(exited.error.is_none());
+    // A clip only makes sense within an entered track -- exiting the track
+    // must also clear the clip selection nested under it, not leave a
+    // dangling clip-id selection with no track.
+    assert!(exited.result.as_ref().unwrap()["clipId"].is_null(), "track.exit should cascade-clear the nested clip selection");
+}
+
+#[tokio::test]
+async fn selection_is_cleared_on_project_exit_and_reselect() {
+    let path = start_server("selection-cleared-on-exit", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-sel-e"})).await;
+    client.call("track.enter", json!({"trackIndex": 3})).await;
+
+    client.call("project.exit", json!({})).await;
+    client.call("project.select", json!({"projectId": "proj-sel-e"})).await;
+
+    let view = client.call("currentView", json!({})).await;
+    assert!(
+        view.result.as_ref().unwrap()["trackIndex"].is_null(),
+        "re-entering a project after project.exit must start with no selection, not the previous session's stale trackIndex"
+    );
+}
+
+#[tokio::test]
+async fn selection_methods_require_a_bound_project_like_every_other_method() {
+    let path = start_server("selection-needs-project", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+
+    let entered = client.call("track.enter", json!({"trackIndex": 0})).await;
+    let err = entered.error.expect("track.enter without project.select must be rejected");
+    assert_eq!(err.code, error_codes::NO_PROJECT_BOUND);
+}
