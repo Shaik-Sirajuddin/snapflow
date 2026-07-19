@@ -34,18 +34,24 @@ export component AgentLogo {
         width: root.size;
         height: root.size;
         image-fit: contain;
+        source-clip-width: 24;
+        source-clip-height: 24;
         source: @image-url("../../../assets/logos/claude-code.svg");
     }
     if root.agent-id == "gemini-cli" : Image {
         width: root.size;
         height: root.size;
         image-fit: contain;
+        source-clip-width: 24;
+        source-clip-height: 24;
         source: @image-url("../../../assets/logos/gemini-cli.svg");
     }
     if root.agent-id == "codex" : Image {
         width: root.size;
         height: root.size;
         image-fit: contain;
+        source-clip-width: 14;
+        source-clip-height: 14;
         colorize: root.color;
         source: @image-url("../../../assets/logos/codex.svg");
     }
@@ -53,6 +59,8 @@ export component AgentLogo {
         width: root.size;
         height: root.size;
         image-fit: contain;
+        source-clip-width: 21;
+        source-clip-height: 21;
         colorize: root.color;
         source: @image-url("../../../assets/logos/amp.svg");
     }

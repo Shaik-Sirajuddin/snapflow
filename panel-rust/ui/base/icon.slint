@@ -13,4 +13,9 @@ export component Icon inherits Image {
     height: size;
     colorize: color;
     image-fit: contain;
+    // Slint 1.17.1 lowers Image to ClippedImage but does not materialize
+    // its documented default full-source clip. All shared Lucide assets
+    // are 24x24, so provide it explicitly to prevent fit() dividing by 0.
+    source-clip-width: 24;
+    source-clip-height: 24;
 }

@@ -2785,6 +2785,10 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
 
 #[no_mangle]
 pub extern "C" fn panel_rust_render(_handle: *mut PanelHandle) -> bool {
+    panel_rust_render_impl()
+}
+
+fn panel_rust_render_impl() -> bool {
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
@@ -2861,7 +2865,7 @@ mod lifecycle_tests {
         assert!(!first.is_null());
         assert_eq!(panel_rust_width(first), 96);
         assert_eq!(panel_rust_height(first), 64);
-        assert!(panel_rust_render(first));
+        assert!(panel_rust_render_impl());
         assert!(panel_rust_input_scroll(first, 48.0, 32.0, 0.0, -40.0));
         PANEL.with(|cell| {
             let panel = cell.borrow();
