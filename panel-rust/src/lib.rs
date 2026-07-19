@@ -546,8 +546,30 @@ impl PanelSingleton {
     /// `active_project_binding`'s active-project state, which doesn't
     /// exist yet -- so this only ever reports global skills for now.
     fn refresh_skills_model(&self) {
-        let dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-        let entries = crate::skills_state::scan_skills_dir(&dir, crate::skills_state::SkillScope::Global);
+        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        let mut entries = crate::skills_state::scan_skills_dir(
+            &global_dir,
+            crate::skills_state::SkillScope::Global,
+        );
+        // `project_scoped_skill_isolation`: now that `active_project_binding`
+        // is real, also scan the active project's own `.skills/` directory
+        // -- entirely additive to the always-scanned global directory, and
+        // naturally empty (not an error) when no project is open or it has
+        // no `.skills/` yet, since `scan_skills_dir` already treats a
+        // missing directory as an empty result.
+        if let Some(project_path) = self.active_project_path.borrow().as_ref() {
+            // `active_project_path` is the open MLT *file*'s path
+            // (`MainWindow::fileName()`), not its containing directory --
+            // `.skills/` lives alongside the project file, so this needs
+            // the parent directory.
+            if let Some(project_dir) = std::path::Path::new(project_path).parent() {
+                let skills_dir = crate::skills_state::project_skills_dir(project_dir);
+                entries.extend(crate::skills_state::scan_skills_dir(
+                    &skills_dir,
+                    crate::skills_state::SkillScope::Project,
+                ));
+            }
+        }
         self.component
             .set_available_skills(crate::models::to_skill_options(entries));
     }
@@ -2572,6 +2594,9 @@ pub extern "C" fn panel_rust_set_project_path(
             .component
             .set_active_project_path(path.clone().unwrap_or_default().into());
         *panel.active_project_path.borrow_mut() = path;
+        // `project_scoped_skill_isolation`: re-scan now that the active
+        // project (and therefore its `.skills/` directory) changed.
+        panel.refresh_skills_model();
         true
     })
 }

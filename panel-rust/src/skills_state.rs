@@ -356,6 +356,42 @@ mod tests {
         );
     }
 
+    /// `project_scoped_skill_isolation` phase: proves two distinct
+    /// projects' skill lists never leak into each other -- the same
+    /// isolation property `phase_c_isolation_test.go` proves for
+    /// snapshotd's real MLT processes, but at the layer this actually
+    /// lives at. Skills are never exposed through any MCP tool (grepped
+    /// snapshotd/internal/mcpadapter for "skill": zero hits) -- they are
+    /// scanned directly off disk by panel-rust itself via
+    /// `project_skills_dir(project_dir)`, so isolation is a property of
+    /// that scan being scoped to one project directory at a time, not of
+    /// any daemon/process boundary.
+    #[test]
+    fn scanning_two_distinct_project_directories_never_mixes_their_skills() {
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        write_skill(
+            &project_skills_dir(project_a.path()),
+            "alpha-only",
+            "---\nname: alpha-only\ndescription: only in project A\n---\n",
+        );
+        write_skill(
+            &project_skills_dir(project_b.path()),
+            "beta-only",
+            "---\nname: beta-only\ndescription: only in project B\n---\n",
+        );
+
+        let entries_a = scan_skills_dir(&project_skills_dir(project_a.path()), SkillScope::Project);
+        let entries_b = scan_skills_dir(&project_skills_dir(project_b.path()), SkillScope::Project);
+
+        assert_eq!(entries_a.len(), 1);
+        assert_eq!(entries_a[0].name, "alpha-only");
+        assert_eq!(entries_b.len(), 1);
+        assert_eq!(entries_b[0].name, "beta-only");
+        assert!(entries_a.iter().all(|e| e.name != "beta-only"));
+        assert!(entries_b.iter().all(|e| e.name != "alpha-only"));
+    }
+
     #[test]
     fn slugify_lowercases_and_collapses_non_alphanumerics() {
         assert_eq!(slugify("Voice Embedding"), "voice-embedding");
