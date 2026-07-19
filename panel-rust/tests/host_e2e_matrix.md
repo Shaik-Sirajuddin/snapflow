@@ -7,6 +7,7 @@ test gate.
 | Scenario | Parallelism | Event evidence | Status |
 | --- | --- | --- | --- |
 | Composer prompt | One focused compose field | `session/prompt` contains the exact typed text | Proven (`PANEL_HOST_E2E_DRIVE=1`) |
+| Input event matrix (designa v2 `input` task) | Full a-z alphabet, several backspaces in a row, then a multi-word sequence, all in one compose | `session/prompt` contains the deterministic post-edit text (alphabet minus the backspaced tail, plus the words) | Driver scenario added (`--exercise-input-matrix` / `PANEL_HOST_E2E_INPUT_MATRIX=1`); not yet run against a live Xvfb/Shotcut instance in this pass |
 | New thread | Two threads, one provider | Two distinct `session/new` records followed by correctly bound prompts | Proven (`PANEL_HOST_E2E_NEW_THREAD=1`) |
 | Provider isolation | Codex and Claude concurrently | Each backend log has only its provider's prompt marker | Proven (`PANEL_HOST_E2E_PROVIDER_ISOLATION=1`) -- uses the fixture's own default thread 1 (Claude), not a freshly clicked thread |
 | Parallel turns | Two sessions concurrently | Both expected prompt markers arrive; neither blocks or crosses sessions | Pending |
