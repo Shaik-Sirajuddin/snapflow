@@ -210,6 +210,15 @@ struct PanelSingleton {
     bridge: Option<AgentBridge>,
     panel_state: Option<PanelStateStore>,
     appearance: RefCell<AppearanceState>,
+    /// `active_project_binding` phase: the currently-open Shotcut MLT
+    /// project's path, pushed in from the C++ host via
+    /// `panel_rust_set_project_path` (mirroring `panel_rust_set_theme`'s
+    /// byte-buffer FFI shape) whenever `MainWindow::producerOpened`
+    /// fires. `None` before the first project opens, or if Shotcut has
+    /// no project open. This is deliberately just storage for now --
+    /// `thread_item_project_context`/`chat_sessions_project_path`
+    /// consume it.
+    active_project_path: RefCell<Option<String>>,
     thread_names: RefCell<Vec<String>>,
     /// Immutable ACPX profile bindings, held alongside the display names so
     /// a background session attachment can persist a complete `ThreadRecord`
@@ -1138,6 +1147,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             bridge,
             panel_state,
             appearance: RefCell::new(AppearanceState::default()),
+            active_project_path: RefCell::new(None),
             thread_names: RefCell::new(initial_names),
             thread_profiles: RefCell::new(initial_profiles),
             thread_permission_profiles: RefCell::new(initial_permission_profiles),
@@ -2501,6 +2511,37 @@ pub extern "C" fn panel_rust_set_theme(
             std::str::from_utf8(bytes).unwrap_or("dark")
         };
         Theme::get(&panel.component).set_theme(text.into());
+        true
+    })
+}
+
+/// `active_project_binding` phase's FFI crossing point -- mirrors
+/// `panel_rust_set_theme`'s byte-buffer shape exactly.
+/// `ChatRustDock::updateProjectPath` calls this whenever `MainWindow::
+/// producerOpened` fires, passing `MainWindow::fileName()`. An empty
+/// buffer (zero length, not necessarily a null pointer) means "no
+/// project open" and clears the stored path -- Shotcut's own
+/// `producerOpened(false)` firing on project close is expected to pass
+/// an empty string, not skip the call, so panel-rust's state can't go
+/// stale after a close.
+#[no_mangle]
+pub extern "C" fn panel_rust_set_project_path(
+    _handle: *mut PanelHandle,
+    path_ptr: *const c_uchar,
+    path_len: usize,
+) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        let path = if path_ptr.is_null() || path_len == 0 {
+            None
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+            std::str::from_utf8(bytes).ok().map(str::to_string)
+        };
+        *panel.active_project_path.borrow_mut() = path;
         true
     })
 }
