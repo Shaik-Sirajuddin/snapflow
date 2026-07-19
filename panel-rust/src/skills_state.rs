@@ -329,6 +329,37 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    /// `runtime_and_edge_pass` phase's llm-edge subset: a malformed
+    /// SKILL.md (garbage content, no `---` front-matter delimiters at
+    /// all, not even the folded-block-scalar or missing-name shapes the
+    /// other tests already cover) must degrade to a directory-name
+    /// fallback with an empty description, never panic or abort the scan
+    /// of every other skill in the directory.
+    #[test]
+    fn malformed_skill_md_with_no_front_matter_delimiters_degrades_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(
+            dir.path(),
+            "totally-garbled",
+            "this is not yaml front matter at all\njust some random text\n\u{0}\u{fffd} garbled-ish garbage too",
+        );
+        // A well-formed sibling must still scan correctly even though the
+        // malformed one is right next to it -- one bad SKILL.md must never
+        // break the whole directory's scan.
+        write_skill(
+            dir.path(),
+            "well-formed",
+            "---\nname: well-formed\ndescription: still works\n---\n",
+        );
+        let entries = scan_skills_dir(dir.path(), SkillScope::Global);
+        assert_eq!(entries.len(), 2);
+        let garbled = entries.iter().find(|e| e.name == "totally-garbled");
+        assert!(garbled.is_some(), "malformed skill should still appear, name-only fallback");
+        assert_eq!(garbled.unwrap().description, "");
+        let well_formed = entries.iter().find(|e| e.name == "well-formed").unwrap();
+        assert_eq!(well_formed.description, "still works");
+    }
+
     #[test]
     fn missing_directory_is_empty_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
