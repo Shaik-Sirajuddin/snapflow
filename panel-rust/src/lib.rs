@@ -24,6 +24,7 @@ mod markdown;
 mod models;
 mod permission;
 pub mod protocol_types;
+mod send_queue;
 mod settings_file;
 mod state_store;
 mod theme;
