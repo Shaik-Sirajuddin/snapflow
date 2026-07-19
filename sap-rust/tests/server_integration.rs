@@ -161,10 +161,11 @@ async fn track_reorder_properties_and_clip_remove_move_dispatch() {
     client.call("edit.addTrack", json!({"kind": "video"})).await;
     client.call("edit.addTrack", json!({"kind": "video"})).await;
 
+    client.call("track.enter", json!({"trackIndex": 1})).await;
     let props = client
         .call(
             "edit.setTrackProperties",
-            json!({"trackIndex": 1, "muted": true, "blendMode": "14"}),
+            json!({"muted": true, "blendMode": "14"}),
         )
         .await;
     assert!(props.error.is_none(), "edit.setTrackProperties should succeed: {:?}", props.error);
@@ -183,15 +184,20 @@ async fn track_reorder_properties_and_clip_remove_move_dispatch() {
     assert_eq!(tracks[0]["muted"], true);
     assert_eq!(tracks[0]["blendMode"], "14");
 
+    client.call("track.enter", json!({"trackIndex": 0})).await;
     let clip_a = client
-        .call("edit.appendClip", json!({"trackIndex": 0, "source": {"path": "/tmp/a.mp4"}}))
+        .call("edit.appendClip", json!({"source": {"path": "/tmp/a.mp4"}}))
         .await
         .result
         .expect("appendClip a");
     client
-        .call("edit.appendClip", json!({"trackIndex": 0, "source": {"path": "/tmp/b.mp4"}}))
+        .call("edit.appendClip", json!({"source": {"path": "/tmp/b.mp4"}}))
         .await;
 
+    // moveClip/removeClip/reorderTrack reference two tracks (or a
+    // positional clipIndex, not a persistent clipId) -- out of
+    // lock_tools_to_selection's scope (see apply_selection_lock's doc
+    // comment), so these still take explicit trackIndex/clipIndex params.
     let moved = client
         .call(
             "edit.moveClip",
@@ -202,12 +208,14 @@ async fn track_reorder_properties_and_clip_remove_move_dispatch() {
     let moved_clip = moved.result.expect("edit.moveClip returns the moved clip");
     assert_eq!(moved_clip["clipId"], clip_a["clipId"]);
 
-    let track1_clips = client.call("edit.listClips", json!({"trackIndex": 1})).await.result.unwrap();
+    client.call("track.enter", json!({"trackIndex": 1})).await;
+    let track1_clips = client.call("edit.listClips", json!({})).await.result.unwrap();
     assert_eq!(track1_clips.as_array().unwrap().len(), 1);
 
     let removed = client.call("edit.removeClip", json!({"trackIndex": 0, "clipIndex": 0})).await;
     assert!(removed.error.is_none(), "edit.removeClip should succeed: {:?}", removed.error);
-    let track0_clips = client.call("edit.listClips", json!({"trackIndex": 0})).await.result.unwrap();
+    client.call("track.enter", json!({"trackIndex": 0})).await;
+    let track0_clips = client.call("edit.listClips", json!({})).await.result.unwrap();
     assert_eq!(track0_clips.as_array().unwrap().len(), 0);
 
     let bad = client.call("edit.reorderTrack", json!({"fromIndex": 9, "toIndex": 0})).await;
@@ -315,10 +323,12 @@ async fn filter_set_property_dispatches_and_last_write_succeeds() {
     client.call("sap.hello", json!({"token": TOKEN})).await;
     client.call("project.select", json!({"projectId": "filter-project"})).await;
     client.call("edit.addTrack", json!({"kind": "video"})).await;
-    let clip = client.call("edit.appendClip", json!({"trackIndex": 0, "source": {"path": "/tmp/source.mp4"}})).await;
+    client.call("track.enter", json!({"trackIndex": 0})).await;
+    let clip = client.call("edit.appendClip", json!({"source": {"path": "/tmp/source.mp4"}})).await;
     let clip_id = clip.result.unwrap()["clipId"].as_str().unwrap().to_string();
+    client.call("clip.enter", json!({"clipId": clip_id})).await;
     let filter = client
-        .call("filter.add", json!({"clipId": clip_id, "mltService": "brightness", "properties": {}}))
+        .call("filter.add", json!({"mltService": "brightness", "properties": {}}))
         .await;
     let filter_index = filter.result.unwrap()["filterIndex"].clone();
 
@@ -326,7 +336,7 @@ async fn filter_set_property_dispatches_and_last_write_succeeds() {
         let response = client
             .call(
                 "filter.setProperty",
-                json!({"clipId": clip_id, "filterIndex": filter_index, "property": "level", "value": value}),
+                json!({"filterIndex": filter_index, "property": "level", "value": value}),
             )
             .await;
         assert!(response.error.is_none(), "filter.setProperty should succeed: {:?}", response.error);
@@ -342,10 +352,11 @@ async fn audio_set_gain_is_not_callable_when_audio_is_disabled() {
         .call("project.select", json!({"projectId": "audio-project"}))
         .await;
     client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("track.enter", json!({"trackIndex": 0})).await;
     let clip = client
         .call(
             "edit.appendClip",
-            json!({"trackIndex": 0, "source": {"path": "/tmp/source.mp4"}}),
+            json!({"source": {"path": "/tmp/source.mp4"}}),
         )
         .await;
     let clip_id = clip.result.unwrap()["clipId"].as_str().unwrap().to_string();
@@ -410,13 +421,18 @@ async fn edit_split_clip_and_filter_lifecycle_dispatch() {
         .call("project.select", json!({"projectId": "split-filter-project"}))
         .await;
     client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("track.enter", json!({"trackIndex": 0})).await;
     let clip = client
         .call(
             "edit.appendClip",
-            json!({"trackIndex": 0, "source": {"path": "/tmp/source.mp4"}}),
+            json!({"source": {"path": "/tmp/source.mp4"}}),
         )
         .await;
     let clip_id = clip.result.unwrap()["clipId"].as_str().unwrap().to_string();
+    // trimClipIn/trimClipOut/splitClip use a positional trackIndex+
+    // clipIndex pair, not a persistent clipId -- out of
+    // lock_tools_to_selection's scope (see apply_selection_lock's doc
+    // comment), so these still take explicit params.
     client
         .call(
             "edit.trimClipIn",
@@ -443,36 +459,33 @@ async fn edit_split_clip_and_filter_lifecycle_dispatch() {
     assert_eq!(split_result["rightIndex"], 1);
     assert!(split_result["rightClipId"].as_str().unwrap().len() > 0);
 
-    let listed = client
-        .call("edit.listClips", json!({"trackIndex": 0}))
-        .await;
+    // track.enter(0) is still in effect from above (no track.exit yet).
+    let listed = client.call("edit.listClips", json!({})).await;
     let clips = listed.result.unwrap();
     assert_eq!(clips.as_array().unwrap().len(), 2);
     assert_eq!(clips[0]["outFrame"], 39);
     assert_eq!(clips[1]["inFrame"], 40);
 
     let left_id = split_result["leftClipId"].as_str().unwrap().to_string();
+    client.call("clip.enter", json!({"clipId": left_id})).await;
     client
         .call(
             "filter.add",
-            json!({"clipId": left_id, "mltService": "qtcrop", "properties": {"rect": "0 0 10 10"}}),
+            json!({"mltService": "qtcrop", "properties": {"rect": "0 0 10 10"}}),
         )
         .await;
     client
         .call(
             "filter.add",
-            json!({"clipId": left_id, "mltService": "brightness", "properties": {"level": 0.5}}),
+            json!({"mltService": "brightness", "properties": {"level": 0.5}}),
         )
         .await;
-    let filters = client.call("filter.list", json!({"clipId": left_id})).await;
+    let filters = client.call("filter.list", json!({})).await;
     assert!(filters.error.is_none(), "filter.list: {:?}", filters.error);
     assert_eq!(filters.result.as_ref().unwrap().as_array().unwrap().len(), 2);
 
     let reorder = client
-        .call(
-            "filter.reorder",
-            json!({"clipId": left_id, "filterIndex": 0, "newIndex": 1}),
-        )
+        .call("filter.reorder", json!({"filterIndex": 0, "newIndex": 1}))
         .await;
     assert!(reorder.error.is_none(), "filter.reorder: {:?}", reorder.error);
 
@@ -480,7 +493,6 @@ async fn edit_split_clip_and_filter_lifecycle_dispatch() {
         .call(
             "filter.addKeyframe",
             json!({
-                "clipId": left_id,
                 "filterIndex": 0,
                 "property": "level",
                 "position": 10,
@@ -492,7 +504,7 @@ async fn edit_split_clip_and_filter_lifecycle_dispatch() {
     let kfs = client
         .call(
             "filter.listKeyframes",
-            json!({"clipId": left_id, "filterIndex": 0, "property": "level"}),
+            json!({"filterIndex": 0, "property": "level"}),
         )
         .await;
     assert!(kfs.error.is_none(), "filter.listKeyframes: {:?}", kfs.error);
@@ -503,16 +515,16 @@ async fn edit_split_clip_and_filter_lifecycle_dispatch() {
     let rm_kf = client
         .call(
             "filter.removeKeyframe",
-            json!({"clipId": left_id, "filterIndex": 0, "property": "level", "position": 10}),
+            json!({"filterIndex": 0, "property": "level", "position": 10}),
         )
         .await;
     assert!(rm_kf.error.is_none(), "filter.removeKeyframe: {:?}", rm_kf.error);
 
     let rm = client
-        .call("filter.remove", json!({"clipId": left_id, "filterIndex": 0}))
+        .call("filter.remove", json!({"filterIndex": 0}))
         .await;
     assert!(rm.error.is_none(), "filter.remove: {:?}", rm.error);
-    let filters = client.call("filter.list", json!({"clipId": left_id})).await;
+    let filters = client.call("filter.list", json!({})).await;
     assert_eq!(filters.result.unwrap().as_array().unwrap().len(), 1);
 }
 
@@ -728,4 +740,86 @@ async fn selection_methods_require_a_bound_project_like_every_other_method() {
     let entered = client.call("track.enter", json!({"trackIndex": 0})).await;
     let err = entered.error.expect("track.enter without project.select must be rejected");
     assert_eq!(err.code, error_codes::NO_PROJECT_BOUND);
+}
+
+// `lock_tools_to_selection` phase: the user's explicit decision on the
+// plan's open escape-hatch question was to drop it entirely -- no
+// exception for scripted/batch callers. These tests prove that decision
+// actually holds: an explicit trackIndex/clipId is never honored (not
+// even as a fallback when no selection is active), and a selection-scoped
+// method without a matching enter is rejected with a clear, actionable
+// error rather than silently succeeding against nothing or a stale index.
+
+#[tokio::test]
+async fn explicit_track_index_is_ignored_in_favor_of_the_real_selection() {
+    let path = start_server("explicit-track-index-ignored", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-lock-a"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+
+    client.call("track.enter", json!({"trackIndex": 1})).await;
+    // Explicitly claims trackIndex 0 -- must be ignored in favor of the
+    // real selection (track 1), not honored as an override.
+    let props = client
+        .call(
+            "edit.setTrackProperties",
+            json!({"trackIndex": 0, "muted": true}),
+        )
+        .await;
+    assert!(props.error.is_none(), "edit.setTrackProperties should succeed: {:?}", props.error);
+
+    let tracks = client.call("edit.listTracks", json!({})).await.result.unwrap();
+    let tracks = tracks.as_array().unwrap();
+    assert_eq!(tracks[1]["muted"], true, "track 1 (the real selection) should be muted");
+    assert_eq!(tracks[0]["muted"], false, "track 0 (the ignored explicit index) must be untouched");
+}
+
+#[tokio::test]
+async fn edit_method_without_a_selected_track_is_rejected_with_an_actionable_error() {
+    let path = start_server("no-track-selected", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-lock-b"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+
+    let response = client
+        .call("edit.setTrackProperties", json!({"trackIndex": 0, "muted": true}))
+        .await;
+    let err = response.error.expect("edit.setTrackProperties without track.enter must be rejected");
+    assert_eq!(err.code, error_codes::INVALID_PARAMS);
+    assert!(
+        err.message.contains("track.enter"),
+        "error should name the correct tool to use, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn filter_method_without_a_selected_clip_is_rejected_with_an_actionable_error() {
+    let path = start_server("no-clip-selected", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-lock-c"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("track.enter", json!({"trackIndex": 0})).await;
+    let clip = client
+        .call("edit.appendClip", json!({"source": {"path": "/tmp/x.mp4"}}))
+        .await;
+    let clip_id = clip.result.unwrap()["clipId"].as_str().unwrap().to_string();
+
+    let response = client
+        .call(
+            "filter.add",
+            json!({"clipId": clip_id, "mltService": "brightness", "properties": {}}),
+        )
+        .await;
+    let err = response.error.expect("filter.add without clip.enter must be rejected");
+    assert_eq!(err.code, error_codes::INVALID_PARAMS);
+    assert!(
+        err.message.contains("clip.enter"),
+        "error should name the correct tool to use, got: {}",
+        err.message
+    );
 }

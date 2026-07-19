@@ -78,6 +78,89 @@ struct CurrentSelection {
     filter_index: Option<usize>,
 }
 
+/// `lock_tools_to_selection` phase: every `edit.*` method scoped to an
+/// *existing* track (not `edit.addTrack`, which creates a brand new one --
+/// there is nothing to select yet).
+const TRACK_INDEX_METHODS: &[&str] = &[
+    "edit.removeTrack",
+    "edit.reorderTrack",
+    "edit.setTrackHeight",
+    "edit.setTrackProperties",
+    "edit.appendClip",
+    "edit.insertClip",
+    "edit.overwriteClip",
+    "edit.listClips",
+];
+
+/// Every `filter.*` method, all of which are scoped to a specific clip by
+/// `clipId` per the source ag-note's own Table 2 categorization.
+const CLIP_ID_METHODS: &[&str] = &[
+    "filter.add",
+    "filter.addKeyframe",
+    "filter.list",
+    "filter.listKeyframes",
+    "filter.remove",
+    "filter.removeKeyframe",
+    "filter.reorder",
+    "filter.setProperty",
+];
+
+/// Overwrites (never merely supplements) `trackIndex`/`clipId` on every
+/// method in [`TRACK_INDEX_METHODS`]/[`CLIP_ID_METHODS`] with this
+/// session's own `current` selection, dropping the client's ability to
+/// pass either explicitly -- the user's explicit decision on the plan's
+/// open escape-hatch question ("keep an override for scripted/batch
+/// callers, or drop it entirely"): drop it entirely, no exception.
+/// `filterIndex` is deliberately NOT locked here -- no `filter.enter`/
+/// `filter.exit` tool exists to set `CurrentSelection::filter_index` at
+/// all (only `track.enter`/`exit` and `clip.enter`/`exit` do), so locking
+/// it would make every `filter.*` method needing a specific filter
+/// permanently uncallable. Out of scope for this phase; a future
+/// `filter.enter`/`exit` pair would need to land first.
+fn apply_selection_lock(
+    method: &str,
+    mut params: Value,
+    current: &CurrentSelection,
+) -> Result<Value, RpcError> {
+    if TRACK_INDEX_METHODS.contains(&method) {
+        let Some(track_index) = current.track_index else {
+            return Err(RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: format!(
+                    "{method} needs a selected track -- call track.enter first"
+                ),
+                data: None,
+            });
+        };
+        match params.as_object_mut() {
+            Some(obj) => {
+                obj.insert("trackIndex".to_string(), json!(track_index));
+            }
+            None => {
+                params = json!({ "trackIndex": track_index });
+            }
+        }
+    }
+    if CLIP_ID_METHODS.contains(&method) {
+        let Some(clip_id) = current.clip_id.clone() else {
+            return Err(RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: format!("{method} needs a selected clip -- call clip.enter first"),
+                data: None,
+            });
+        };
+        match params.as_object_mut() {
+            Some(obj) => {
+                obj.insert("clipId".to_string(), json!(clip_id));
+            }
+            None => {
+                params = json!({ "clipId": clip_id });
+            }
+        }
+    }
+    Ok(params)
+}
+
 /// Outcome of running one op against the backend: the RPC result to send
 /// back to the requester, plus an optional notification to fan out to every
 /// connection bound to the same project (only published when `result` is
@@ -1871,7 +1954,7 @@ fn build_op_ext(
 /// 2.0 notification semantics — SAP clients are expected to always send an
 /// `id`, but nothing here assumes it.
 async fn handle_request(
-    req: RpcRequest,
+    mut req: RpcRequest,
     session: &mut Session,
     token: &str,
     dispatch_tx: &DispatchSender,
@@ -2057,6 +2140,19 @@ async fn handle_request(
     if req.method == "currentView" {
         return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
     }
+
+    // `lock_tools_to_selection` phase: the user decided to drop the
+    // explicit-index escape hatch entirely (not keep it for scripted/batch
+    // callers) -- edit.*/filter.* methods scoped to an existing track/clip
+    // no longer accept a client-supplied trackIndex/clipId at all; both are
+    // always overwritten from this session's own `current` selection
+    // (track.enter/clip.enter), and a method needing a selection component
+    // the session hasn't entered yet is rejected before ever reaching the
+    // backend.
+    req.params = match apply_selection_lock(&req.method, req.params, &session.current) {
+        Ok(params) => params,
+        Err(e) => return respond(Err(e)),
+    };
 
     let op = match build_op(&req.method, req.params.clone(), project_id.clone()) {
         Ok(op) => op,
