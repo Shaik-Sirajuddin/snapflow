@@ -797,6 +797,29 @@ async fn edit_method_without_a_selected_track_is_rejected_with_an_actionable_err
 }
 
 #[tokio::test]
+async fn reorder_track_and_set_track_height_never_needed_a_selection_in_the_first_place() {
+    // Regression test: an earlier pass of apply_selection_lock's method
+    // list mistakenly included edit.reorderTrack (fromIndex/toIndex, no
+    // trackIndex field at all) and edit.setTrackHeight (a global height
+    // setting, no trackIndex field either) -- both would have incorrectly
+    // required track.enter first despite never reading trackIndex at all.
+    let path = start_server("reorder-height-no-selection-needed", TOKEN).await;
+    let mut client = Client::connect(&path).await;
+    client.call("sap.hello", json!({"token": TOKEN})).await;
+    client.call("project.select", json!({"projectId": "proj-lock-d"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+    client.call("edit.addTrack", json!({"kind": "video"})).await;
+
+    let height = client.call("edit.setTrackHeight", json!({"height": 90})).await;
+    assert!(height.error.is_none(), "edit.setTrackHeight should never require track.enter: {:?}", height.error);
+
+    let reordered = client
+        .call("edit.reorderTrack", json!({"fromIndex": 0, "toIndex": 1}))
+        .await;
+    assert!(reordered.error.is_none(), "edit.reorderTrack should never require track.enter: {:?}", reordered.error);
+}
+
+#[tokio::test]
 async fn filter_method_without_a_selected_clip_is_rejected_with_an_actionable_error() {
     let path = start_server("no-clip-selected", TOKEN).await;
     let mut client = Client::connect(&path).await;

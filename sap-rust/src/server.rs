@@ -78,13 +78,17 @@ struct CurrentSelection {
     filter_index: Option<usize>,
 }
 
-/// `lock_tools_to_selection` phase: every `edit.*` method scoped to an
-/// *existing* track (not `edit.addTrack`, which creates a brand new one --
-/// there is nothing to select yet).
+/// `lock_tools_to_selection` phase: every `edit.*` method whose own params
+/// actually include `trackIndex` -- checked directly against each match
+/// arm's `struct P` in `build_op` before including it here.
+/// `edit.addTrack` is excluded (creates a brand new track -- nothing to
+/// select yet). `edit.reorderTrack` (`fromIndex`/`toIndex`) and
+/// `edit.setTrackHeight` (no track index at all, a global height setting)
+/// are also excluded: neither has a `trackIndex` field to lock in the
+/// first place, so including them would incorrectly gate a method that
+/// never needed a selection behind `track.enter`.
 const TRACK_INDEX_METHODS: &[&str] = &[
     "edit.removeTrack",
-    "edit.reorderTrack",
-    "edit.setTrackHeight",
     "edit.setTrackProperties",
     "edit.appendClip",
     "edit.insertClip",
