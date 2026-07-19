@@ -1,0 +1,100 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+import { Button } from "../../../base/button.slint";
+import { Toggle } from "../../../base/toggle.slint";
+import { SettingsRow } from "../../../base/settings_row.slint";
+import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
+import { SkillOption } from "../../../types.slint";
+
+// Skills settings left-tab view -- `skills_management_settings` phase.
+// Same layout convention as `mcp_servers_view.slint`: a `SettingsRow`
+// per entry, a page-level toggle, and one promotion action. Global
+// skills always list; project-local ones additionally show their
+// `started_from` provenance and a "Make Global" action
+// (`skills-management`'s "make global button", "show project_start
+// skills include global started_from").
+export component SkillsView inherits Rectangle {
+    in property <[SkillOption]> skills: [];
+    // Page-level toggle: hide the global-scope rows so a long list of
+    // shared global skills doesn't drown out a project's own few local
+    // ones (`skills-management`'s "a toggle to show Global Skills or
+    // not"). UI-only local state -- no round trip needed, this is a
+    // pure client-side list filter.
+    property <bool> show-global-skills: true;
+    callback skill-promote-to-global(string /* path */);
+
+    background: transparent;
+
+    SettingsSection {
+        width: parent.width;
+
+        SettingsSectionHeader { text: "Skills"; }
+
+        HorizontalLayout {
+            spacing: Metrics.gap-sm;
+            Text {
+                text: "Show global skills";
+                color: Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Toggle {
+                checked: root.show-global-skills;
+                toggle-accessible-label: "Toggle global skills visibility";
+                toggled => { root.show-global-skills = !root.show-global-skills; }
+            }
+        }
+
+        SettingsRowGroup {
+            width: parent.width;
+
+            for skill in root.skills : SettingsRow {
+                property <bool> row-visible: skill.scope != "global" || root.show-global-skills;
+                width: parent.width;
+                // No conditional-instantiation of a `for` template item in
+                // Slint (`if` can't follow `:` after a `for` binding) --
+                // collapse to zero height + invisible instead of a nested
+                // `if`, same effect as not rendering the row at all.
+                height: row-visible ? self.row-height + (self.hint == "" ? 0px : 12px) : 0px;
+                visible: row-visible;
+                clip: true;
+                label: skill.name;
+                label-font-family: Theme.font-mono;
+                hint: skill.description;
+
+                // Provenance -- only meaningful for a project-local skill
+                // instantiated from a global one.
+                if skill.scope == "project" && skill.started-from != "" : Text {
+                    text: "from " + skill.started-from;
+                    color: Theme.text-muted;
+                    font-size: 9px * Theme.font-scale;
+                    vertical-alignment: center;
+                    max-width: 120px;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: skill.scope;
+                    color: Theme.text-muted;
+                    font-size: 9px * Theme.font-scale;
+                    font-family: Theme.font-mono;
+                    vertical-alignment: center;
+                }
+
+                // Promote a project-local skill to global -- moves its
+                // directory into the global skills folder. Global skills
+                // have no promotion target of their own.
+                if skill.scope == "project" : Button {
+                    label: "Make Global";
+                    button-accessible-label: "Make skill " + skill.name + " global";
+                    btn-width: 80px;
+                    btn-height: 22px;
+                    font-size: 9px;
+                    font-weight: 400;
+                    clicked => { root.skill-promote-to-global(skill.path); }
+                }
+            }
+        }
+    }
+}

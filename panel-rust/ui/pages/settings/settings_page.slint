@@ -23,12 +23,13 @@ import { SettingsSearchBar } from "components/search_bar.slint";
 import { McpServersView } from "views/mcp_servers_view.slint";
 import { AgentsView } from "views/agents_view.slint";
 import { HarnessView } from "views/harness_view.slint";
-import { ProfileOption, McpServerOption, AgentCatalogEntry, RemoteSessionOption } from "../../types.slint";
+import { SkillsView } from "views/skills_view.slint";
+import { ProfileOption, McpServerOption, AgentCatalogEntry, RemoteSessionOption, SkillOption } from "../../types.slint";
 
 export component SettingsPage inherits Rectangle {
     // New shell-only state (settings-pane-redesign plan, phase 1).
     in-out property <string> scope: "project"; // "project" | "global"
-    in-out property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness"
+    in-out property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
     in-out property <string> search-query: "";
 
     // Same public API `SettingsSheet` exposed -- unchanged so `app.slint`'s
@@ -42,6 +43,7 @@ export component SettingsPage inherits Rectangle {
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
+    in property <[SkillOption]> available-skills: [];
 
     callback save();
     callback close();
@@ -51,6 +53,7 @@ export component SettingsPage inherits Rectangle {
     callback profile-delete(string);
     callback agent-install-requested(string);
     callback recover-session-attach(string, string, string);
+    callback skill-promote-to-global(string);
 
     background: Theme.bg-card;
     border-color: Theme.border-strong;
@@ -165,6 +168,11 @@ export component SettingsPage inherits Rectangle {
                             background-default <=> root.background-default;
                             background-override-set <=> root.background-override-set;
                             background-override <=> root.background-override;
+                        }
+                        if root.active-section == "skills" : SkillsView {
+                            width: parent.width;
+                            skills: root.available-skills;
+                            skill-promote-to-global(path) => { root.skill-promote-to-global(path); }
                         }
                     }
                 }

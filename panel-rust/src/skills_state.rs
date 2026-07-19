@@ -207,6 +207,34 @@ pub fn scaffold_new_skill(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     Ok(skill_dir)
 }
 
+/// Moves a project-local skill directory into the global skills
+/// directory (`skills-management`'s "make global" action). Errors if
+/// `skill_dir` doesn't exist, or a same-named skill already exists at
+/// the destination -- both real conditions to report, not overwrite
+/// silently. Uses `fs::rename`, so this only works when both
+/// directories are on the same filesystem (true for the common case:
+/// project and global skills dirs both live under the user's home);
+/// a cross-filesystem copy-then-delete fallback is not implemented --
+/// out of scope until a real cross-filesystem setup is reported.
+pub fn promote_skill_to_global(skill_dir: &Path, global_dir: &Path) -> std::io::Result<PathBuf> {
+    let Some(skill_name) = skill_dir.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "skill path has no directory name",
+        ));
+    };
+    fs::create_dir_all(global_dir)?;
+    let destination = global_dir.join(skill_name);
+    if destination.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("a global skill named {skill_name:?} already exists"),
+        ));
+    }
+    fs::rename(skill_dir, &destination)?;
+    Ok(destination)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +369,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = scaffold_new_skill(dir.path(), "!!!").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn promote_skill_to_global_moves_the_directory() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let skill_dir = scaffold_new_skill(project_dir.path(), "my-skill").unwrap();
+
+        let promoted = promote_skill_to_global(&skill_dir, global_dir.path()).unwrap();
+
+        assert_eq!(promoted, global_dir.path().join("my-skill"));
+        assert!(!skill_dir.exists());
+        assert!(promoted.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn promote_skill_to_global_rejects_a_name_collision() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let global_dir = tempfile::tempdir().unwrap();
+        let skill_dir = scaffold_new_skill(project_dir.path(), "dup").unwrap();
+        scaffold_new_skill(global_dir.path(), "dup").unwrap();
+
+        let err = promote_skill_to_global(&skill_dir, global_dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Original must be left in place on failure.
+        assert!(skill_dir.exists());
     }
 }

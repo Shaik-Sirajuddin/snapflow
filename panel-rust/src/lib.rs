@@ -1703,6 +1703,26 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        panel.component.on_skill_promote_to_global(move |path| {
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                let skill_dir = std::path::PathBuf::from(path.as_str());
+                let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                match crate::skills_state::promote_skill_to_global(&skill_dir, &global_dir) {
+                    Ok(destination) => {
+                        trace_host_input(format_args!("skill promoted to global at {destination:?}"));
+                        panel.refresh_skills_model();
+                    }
+                    Err(error) => {
+                        eprintln!("panel-rust: failed to promote skill {path:?} to global: {error}");
+                    }
+                }
+            });
+        });
+
         let component_weak = panel.component.as_weak();
         panel.component.on_send_requested(move || {
             let Some(component) = component_weak.upgrade() else {

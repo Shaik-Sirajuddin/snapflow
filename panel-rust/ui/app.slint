@@ -103,6 +103,7 @@ export component ChatPanel inherits Window {
     callback thread-selected(int);
     callback new-thread-requested();
     callback new-skill-requested(string);
+    callback skill-promote-to-global(string);
     callback thread-close-requested(int);
     callback thread-delete-requested(int);
     callback thread-archive-requested(int);
@@ -345,6 +346,7 @@ export component ChatPanel inherits Window {
                 available-mcp-servers: available-mcp-servers;
                 agent-catalog: agent-catalog;
                 recoverable-sessions: recoverable-sessions;
+                available-skills: available-skills;
                 save => { settings-save(); }
                 close => {
                     settings-open = false;
@@ -359,6 +361,7 @@ export component ChatPanel inherits Window {
                 profile-delete(name) => { profile-delete(name); }
                 agent-install-requested(id) => { agent-install-requested(id); }
                 recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
+                skill-promote-to-global(path) => { skill-promote-to-global(path); }
             }
         }
     }
