@@ -1558,26 +1558,6 @@ impl AgentBridge {
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
-        let gateways = self.gateways.clone();
-        let gateway = self.runtime.block_on(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                if let Some(gateway) = gateways
-                    .lock()
-                    .expect("gateways mutex poisoned")
-                    .get(&base_url)
-                    .cloned()
-                {
-                    return Ok(gateway);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(BridgeError::Gateway(format!(
-                        "gateway connection missing for {base_url}"
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })?;
         let (
             seeded,
             cached_session_id,
@@ -1588,11 +1568,59 @@ impl AgentBridge {
             seed_thread_from_cache(self.store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
         let has_cached_transcript = !seeded.is_empty();
 
-        let mut handle = {
+        // `thread_new_loading_state` phase: `session/new`/`session/resume`
+        // is a real network round trip that must never block the calling
+        // (single-threaded Slint UI) thread -- this used to `self.runtime.
+        // block_on` it inline, which froze the whole UI for the call's
+        // duration. Mirrors the constructor's own async-attachment pattern
+        // instead: hand the gateway over through the same delayed-setter
+        // `spawn_acpx_thread_with_delayed_gateway` uses (so creating the
+        // handle itself never waits on the gateway either), then delegate
+        // the actual session resolution to `spawn_background_attachment`
+        // (the exact function the constructor's own per-thread loop already
+        // uses for this), which sets `attachment`/notifies waiters and
+        // persists the thread record once the session id is known --
+        // `sync_thread_records` (lib.rs) already polls for that and was
+        // written specifically to support creation returning before
+        // attachment finishes.
+        let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
-            spawn_acpx_thread_with_gateway(gateway)
+            spawn_acpx_thread_with_delayed_gateway()
         };
-        let mut events_rx = handle.take_events();
+        match self
+            .gateways
+            .lock()
+            .expect("gateways mutex poisoned")
+            .get(&base_url)
+            .cloned()
+        {
+            Some(gateway) => gateway_setter.set_gateway(gateway),
+            None => {
+                // Only reachable in the narrow window right after
+                // construction, before the background `Gateway::connect`
+                // task (spawned in the constructor) has resolved yet.
+                let gateways = self.gateways.clone();
+                self.runtime.spawn(async move {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if let Some(gateway) = gateways
+                            .lock()
+                            .expect("gateways mutex poisoned")
+                            .get(&base_url)
+                            .cloned()
+                        {
+                            gateway_setter.set_gateway(gateway);
+                            return;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+            }
+        }
+        let events_rx = handle.take_events();
         let handle = Arc::new(handle);
         let project_path_for_slot = self
             .session_cwd_override
@@ -1636,133 +1664,30 @@ impl AgentBridge {
             ),
             session_modes: Mutex::new(runtime_snapshot.session_modes),
             config_options: Mutex::new(runtime_snapshot.config_options),
-            attachment: Mutex::new(AttachmentState {
-                complete: true,
-                error: None,
-            }),
+            attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             project_path: project_path_for_slot,
         });
-       let cwd = cwd_for_session(&self.session_cwd_override);
-       let session_id = if let Some(session_id) = cached_session_id.clone() {
-           let resume_result = if has_cached_transcript {
-               match self
-                   .runtime
-                   .block_on(handle.reattach_session(session_id.clone(), cwd.clone()))
-               {
-                   Ok(()) => Ok(()),
-                   Err(reattach_error) => {
-                       eprintln!(
-                           "panel-rust: session/resume unavailable for cached thread {thread_id:?} ({reattach_error}); falling back to session/load"
-                       );
-                       self.runtime
-                           .block_on(handle.resume_session(session_id.clone(), cwd.clone()))
-                   }
-               }
-           } else {
-               self.runtime
-                   .block_on(handle.resume_session(session_id.clone(), cwd.clone()))
-           };
-           match resume_result {
-               Ok(()) => session_id,
-                Err(_) => self
-                    .runtime
-                    .block_on(open_session_maybe_profiled(&handle, cwd, profile))
-                    .map_err(|error| BridgeError::Gateway(error.to_string()))?,
-            }
-        } else {
-            self.runtime
-                .block_on(open_session_maybe_profiled(&handle, cwd, profile))
-                .map_err(|error| BridgeError::Gateway(error.to_string()))?
-        };
-        *slot
-            .acp_session_id
-            .lock()
-            .expect("acp_session_id mutex poisoned") = Some(session_id);
-        persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
+        self.slots.push(slot.clone());
 
-        if cached_session_id.is_some() && !has_cached_transcript {
-            let mut cached_index = 0usize;
-            let mut replayed_any = false;
-            while let Ok(event) = events_rx.try_recv() {
-                if let AgentEvent::Message(message) = event {
-                    let mut history = slot.history.lock().expect("history mutex poisoned");
-                    if !replay_matches_cached_position(&history, &mut cached_index, &message) {
-                        history.push(message.clone());
-                        replayed_any = true;
-                        if let Some(store) = &self.store {
-                            let _ = store.append(&slot.thread_id, &message);
-                        }
-                    }
-                }
-            }
-            if replayed_any {
-                refresh_transcript(&slot);
-            }
-        }
+        spawn_background_attachment(
+            &self.runtime,
+            slot,
+            handle,
+            events_rx,
+            self.events.clone(),
+            self.store.clone(),
+            idx,
+            cached_session_id,
+            has_cached_transcript,
+            profile.map(str::to_string),
+            Arc::new(tokio::sync::Mutex::new(())),
+            self.session_cwd_override.clone(),
+        );
 
-        let events_out = self.events.clone();
-        let store_for_task = self.store.clone();
-        let slot_for_task = slot.clone();
-        self.runtime.spawn(async move {
-            while let Some(event) = events_rx.recv().await {
-                match &event {
-                    AgentEvent::Message(message) => {
-                        slot_for_task
-                            .history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .push(message.clone());
-                        refresh_transcript(&slot_for_task);
-                        if let Some(store) = &store_for_task {
-                            let _ = store.append(&slot_for_task.thread_id, message);
-                        }
-                    }
-                    AgentEvent::TurnEnded(_) => {
-                        persist_thread_snapshot(
-                            store_for_task.as_ref(),
-                            &slot_for_task,
-                            now_token(),
-                        );
-                        slot_for_task
-                            .transcript
-                            .lock()
-                            .expect("transcript mutex poisoned")
-                            .mark_all_streaming_completed();
-                    }
-                    AgentEvent::Error(_) => {}
-                    AgentEvent::PermissionRequest(req) => {
-                        slot_for_task
-                            .pending_requests
-                            .lock()
-                            .expect("pending_requests mutex poisoned")
-                            .push(req.clone());
-                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
-                    }
-                    AgentEvent::TerminalOutput(term_ev) => {
-                        store_terminal_output(&slot_for_task, term_ev);
-                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
-                    }
-                    AgentEvent::SessionModes(_)
-                    | AgentEvent::CurrentModeChanged(_)
-                    | AgentEvent::ConfigOptions(_) => {
-                        store_capability_event(&slot_for_task, &event);
-                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
-                    }
-                }
-                events_out
-                    .lock()
-                    .expect("event queue mutex poisoned")
-                    .push_back(BridgeEvent {
-                        thread_index: idx,
-                        event,
-                    });
-            }
-        });
-       self.slots.push(slot);
-       Ok(idx)
-   }
+        Ok(idx)
+    }
 
     /// `session/list` scoped to thread `idx`'s own provider -- what a
     /// recovery/import sheet populates its choices from. Blocking, same

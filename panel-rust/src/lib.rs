@@ -375,13 +375,20 @@ impl PanelSingleton {
     /// before that attachment finishes so cached UI can render immediately;
     /// attempting this work only during creation silently skipped every
     /// initial record and made the next host process unable to reattach.
-    fn sync_thread_records(&self) {
+    ///
+    /// Returns whether any thread's attachment newly resolved this tick
+    /// (`thread_new_loading_state` phase) -- `panel_rust_poll` uses this to
+    /// know when to call `refresh_threads_model` so a thread's sidebar row
+    /// flips from its "loading" placeholder to its real state even when no
+    /// other `AgentEvent` happens to arrive in the same tick.
+    fn sync_thread_records(&self) -> bool {
         let (Some(store), Some(bridge)) = (&self.panel_state, &self.bridge) else {
-            return;
+            return false;
         };
         let names = self.thread_names.borrow();
         let profiles = self.thread_profiles.borrow();
         let permission_profiles = self.thread_permission_profiles.borrow();
+        let mut newly_attached = false;
         for idx in 0..names.len() {
             let Some(binding) = bridge.thread_binding(idx) else {
                 continue;
@@ -405,6 +412,7 @@ impl PanelSingleton {
                         .borrow_mut()
                         .insert(record.thread_id.clone())
                     {
+                        newly_attached = true;
                         trace_host_input(format_args!(
                             "attachment ready thread={idx} session={:?}",
                             record.session_id
@@ -419,6 +427,7 @@ impl PanelSingleton {
                 }
             }
         }
+        newly_attached
     }
 
     /// Rebuilds and pushes the `threads` model from the dynamic thread list +
@@ -533,6 +542,23 @@ impl PanelSingleton {
                     .unwrap_or_default()
                     .into();
                 item.project_path = project_path.into();
+                // `thread_new_loading_state` phase: a thread whose ACP
+                // session hasn't resolved yet (`thread_binding` is only
+                // `None` before `spawn_background_attachment` completes --
+                // see `add_thread_with_profile`'s doc comment) shows as
+                // loading/busy instead of a misleadingly-idle empty chat
+                // view, from the moment "+" is clicked until attachment
+                // finishes. Closed threads are excluded since a closed
+                // session legitimately has no binding either.
+                if !item.closed
+                    && self
+                        .bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.thread_binding(i.real_index).is_none())
+                {
+                    item.status = "loading".into();
+                    item.busy = true;
+                }
                 item
             })
             .collect();
@@ -2703,7 +2729,15 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
             return false;
         };
         let bridge_changed = panel.apply_bridge_events();
-        panel.sync_thread_records();
+        // `thread_new_loading_state` phase: a newly-created thread's
+        // attachment can resolve with no other AgentEvent arriving in the
+        // same tick -- refresh the sidebar so its row flips out of the
+        // "loading" placeholder as soon as that happens, not only on the
+        // next unrelated bridge event.
+        let attachment_changed = panel.sync_thread_records();
+        if attachment_changed {
+            panel.refresh_threads_model();
+        }
         // Multi-process settings watch: reload prefs when another process
         // rewrote the global/project JSON (skip during our own save window).
         let mut settings_changed = false;
@@ -2738,7 +2772,11 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let connection_changed = selected
             .map(|idx| panel.refresh_connection_status_for(idx))
             .unwrap_or(false);
-        bridge_changed || local_terminal_changed || connection_changed || settings_changed
+        bridge_changed
+            || local_terminal_changed
+            || connection_changed
+            || settings_changed
+            || attachment_changed
     })
 }
 
