@@ -4114,7 +4114,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
         // answers `initialize`.
         let handshake = async {
             loop {
-                let value = proc.reader.read_value().await?;
+                let value = proc.reader_mut().read_value().await?;
                 if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
                     return Ok::<_, RouterError>(value);
                 }
@@ -4194,7 +4194,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
             // same unbounded-hang gap.
             let handshake = async {
                 loop {
-                    let value = proc.reader.read_value().await?;
+                    let value = proc.reader_mut().read_value().await?;
                     if value.get("id").and_then(|v| v.as_i64()) == Some(AUTHENTICATE_REQUEST_ID) {
                         return Ok::<_, RouterError>(value);
                     }
@@ -4804,7 +4804,7 @@ async fn backend_idle_scavenger(
         // holding) waiting for it.
         loop {
             let attempt =
-                tokio::time::timeout(Duration::from_millis(0), proc.reader.read_value()).await;
+                tokio::time::timeout(Duration::from_millis(0), proc.reader_mut().read_value()).await;
             let value = match attempt {
                 Ok(Ok(value)) => value,
                 Ok(Err(err)) => {
@@ -5073,7 +5073,7 @@ async fn read_matching_response_with_idle_timeout(
         // notification in some unrelated call's own read loop.
         let value = match tokio::time::timeout(
             idle_read_timeout,
-            backend.reader.read_value(),
+            backend.reader_mut().read_value(),
         )
         .await
         {

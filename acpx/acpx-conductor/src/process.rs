@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
@@ -51,7 +51,6 @@ impl SpawnSpec {
 /// A supervised backend agent process with framed stdio JSON-RPC access.
 pub struct BackendProcess {
     child: Child,
-    pub reader: FramedReader,
     /// Shared, independently-lockable -- **not** covered by whatever lock
     /// a caller holds on the surrounding `Arc<Mutex<BackendProcess>>`
     /// itself (`acpx_conductor::supervisor::SharedBackendProcess`). This
@@ -72,6 +71,25 @@ pub struct BackendProcess {
     /// without ever touching the outer per-process lock at all -- see
     /// `acpx_conductor::supervisor::Supervisor::cancel_writer`.
     pub writer: Arc<Mutex<FramedWriter>>,
+    /// `None` once [`Self::start_demux`] has taken it to hand to the
+    /// process's background reader task -- see that method's doc comment.
+    /// `Some` for the entire handshake/authenticate phase (those still
+    /// read directly off it, unchanged) and for the whole lifetime of a
+    /// process that never enables process-reader-demux at all (the
+    /// opt-in default: `ACPX_PROCESS_READER_DEMUX` unset).
+    reader: Option<FramedReader>,
+    /// `Some` once [`Self::start_demux`] has spawned this process's
+    /// background reader task -- the pending-request table callers
+    /// register a response id against instead of holding this
+    /// `BackendProcess`'s own outer lock across a full write+read turn.
+    /// `None` for the entire lifetime of a process that never enables
+    /// process-reader-demux (`ACPX_PROCESS_READER_DEMUX` unset, the
+    /// default) -- every dispatch path keeps reading directly off
+    /// `reader` via [`Self::reader_mut`] exactly as before this field
+    /// existed. See `memory/acpx/tasks/zed_integration.yaml` task 7 and
+    /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`
+    /// phase 1.
+    pub pending: Option<Arc<crate::demux::PendingRequests>>,
     /// Whether the ACP `initialize` handshake has already been performed
     /// against this process instance. Deliberately just a generic done/not
     /// flag owned here (not ACP-specific logic -- this crate stays
@@ -141,8 +159,9 @@ impl BackendProcess {
 
         Ok(Self {
             child,
-            reader: FramedReader::new(stdout),
+            reader: Some(FramedReader::new(stdout)),
             writer: Arc::new(Mutex::new(FramedWriter::new(stdin))),
+            pending: None,
             handshake_done: false,
             agent_capabilities: None,
             terminals: HashMap::new(),
@@ -155,6 +174,45 @@ impl BackendProcess {
     /// meant to call it (`Supervisor`, once, at spawn time).
     pub fn writer_handle(&self) -> Arc<Mutex<FramedWriter>> {
         Arc::clone(&self.writer)
+    }
+
+    /// Mutable access to the raw reader for direct, single-shot reads
+    /// (the `initialize`/`authenticate` handshake, and the idle
+    /// scavenger's non-blocking drain) that happen before -- or entirely
+    /// without -- process-reader-demux ever starting for this process.
+    /// Panics if called after [`Self::start_demux`] has taken the reader;
+    /// every call site that could run after demux starts must go through
+    /// the pending-request table (`self.pending`) instead.
+    pub fn reader_mut(&mut self) -> &mut FramedReader {
+        self.reader.as_mut().expect(
+            "BackendProcess::reader_mut called after start_demux() took the reader; \
+             use self.pending's registered oneshot instead",
+        )
+    }
+
+    /// Move the raw reader out to a new background task that owns it for
+    /// the rest of this process's lifetime, matching backend responses to
+    /// callers via a pending-request table (`self.pending`) instead of
+    /// requiring the caller to hold this `BackendProcess`'s own outer
+    /// lock across an entire write+read turn -- see
+    /// `memory/acpx/tasks/zed_integration.yaml` task 7. Idempotent is
+    /// *not* guaranteed: call only when `self.pending.is_none()` (callers
+    /// check that themselves so they can skip re-spawning a consumer for
+    /// an already-demuxed process, mirroring the existing idle-scavenger
+    /// dedup pattern in `acpx-core::router::spawn_idle_scavenger_if_new`).
+    /// Must only be called once the `initialize`/`authenticate` handshake
+    /// has already completed via [`Self::reader_mut`] -- the handshake's
+    /// own fixed-id reads are not routed through the pending table.
+    pub fn start_demux(&mut self) -> mpsc::UnboundedReceiver<crate::demux::UnmatchedFrame> {
+        let reader = self
+            .reader
+            .take()
+            .expect("start_demux called twice, or before the reader was ever set");
+        let pending = Arc::new(crate::demux::PendingRequests::new());
+        let (unmatched_tx, unmatched_rx) = mpsc::unbounded_channel();
+        crate::demux::spawn_reader_task(reader, Arc::clone(&pending), unmatched_tx);
+        self.pending = Some(pending);
+        unmatched_rx
     }
 
     /// Returns the process's exit status if it has already exited
