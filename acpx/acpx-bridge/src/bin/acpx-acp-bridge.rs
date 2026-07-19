@@ -3,60 +3,146 @@
 //! This process owns only its local stdio connection. EOF or a broken
 //! WebSocket never sends `session/close` to ACPX, so retained daemon
 //! sessions survive an editor/OpenHands subprocess restart.
+//!
+//! **Mid-stream WebSocket reconnect.** A dropped WebSocket (a network
+//! blip, `acpx-server` restarting, ...) used to be fatal: the whole
+//! process exited, forcing the editor to notice a crashed agent and
+//! spawn a brand-new bridge process with no memory of anything. That new
+//! process, plus the fact that nothing here ever populated ACPX's
+//! `_acpx.resume` reconnect cursor, meant any `session/update`
+//! notification published while the socket was down (routinely the
+//! start of whatever the backend agent was mid-way through streaming)
+//! was gone for good, even though `acpx-server`'s `NotificationHub` had
+//! it buffered the whole time -- see `acpx_bridge::resume`'s module doc
+//! comment for the full mechanics. This `main` instead reconnects in
+//! place (bounded exponential backoff) and, via [`ResumeTracker`],
+//! injects that cursor into the next outgoing frame for every session it
+//! was mid-way through when the drop happened, so `acpx-server` replays
+//! exactly what was missed. Only stdin EOF -- the editor actually
+//! killing this child -- still ends the process.
 
+use acpx_bridge::ResumeTracker;
 use futures_util::{SinkExt, StreamExt};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 
+const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let url = bridge_url()?;
-    let request = bridge_request(&url)?;
-    let (socket, _) = tokio_tungstenite::connect_async(request).await?;
-    let (mut write, mut read) = socket.split();
     let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
+    let mut tracker = ResumeTracker::new();
+    let mut backoff = INITIAL_RECONNECT_BACKOFF;
+    // Only true from the *second* successful connect onward -- the first
+    // one has no prior session to resume anything against.
+    let mut is_reconnect = false;
 
-    loop {
-        tokio::select! {
-            line = stdin.next_line() => {
-                match line? {
-                    Some(line) if !line.trim().is_empty() => {
-                        // Validate locally so an accidental non-JSON log line
-                        // cannot corrupt the ACP wire connection.
-                        let _: serde_json::Value = serde_json::from_str(&line)?;
-                        write.send(Message::Text(line)).await?;
-                    }
-                    Some(_) => {}
-                    None => {
-                        let _ = write.send(Message::Close(None)).await;
-                        return Ok(());
+    'connection: loop {
+        let request = bridge_request(&url)?;
+        eprintln!("acpx-acp-bridge: connecting to {url} (is_reconnect={is_reconnect})");
+        let socket = match tokio_tungstenite::connect_async(request).await {
+            Ok((socket, _)) => socket,
+            Err(err) => {
+                eprintln!(
+                    "acpx-acp-bridge: connect to {url} failed ({err}); retrying in {backoff:?}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                continue 'connection;
+            }
+        };
+        backoff = INITIAL_RECONNECT_BACKOFF;
+        if is_reconnect {
+            tracker.mark_all_for_resync();
+            eprintln!(
+                "acpx-acp-bridge: reconnected to {url}; resuming {} tracked session(s)",
+                tracker.len()
+            );
+        }
+        is_reconnect = true;
+        let (mut write, mut read) = socket.split();
+
+        loop {
+            tokio::select! {
+                line = stdin.next_line() => {
+                    match line? {
+                        Some(line) if !line.trim().is_empty() => {
+                            let mut value: serde_json::Value = match serde_json::from_str(&line) {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    // An accidental non-JSON log line must not
+                                    // corrupt the ACP wire connection.
+                                    eprintln!("acpx-acp-bridge: ignoring non-JSON stdin line: {err}");
+                                    continue;
+                                }
+                            };
+                            tracker.observe_outgoing(&value);
+                            // Only re-serialize (which, without serde_json's
+                            // `preserve_order` feature, reorders keys) when a
+                            // cursor was actually injected -- every ordinary
+                            // frame is forwarded byte-for-byte untouched.
+                            let text = if tracker.prepare_outgoing(&mut value) {
+                                value.to_string()
+                            } else {
+                                line
+                            };
+                            if let Err(err) = write.send(Message::Text(text)).await {
+                                eprintln!("acpx-acp-bridge: send failed ({err}); reconnecting");
+                                continue 'connection;
+                            }
+                        }
+                        Some(_) => {}
+                        None => {
+                            let _ = write.send(Message::Close(None)).await;
+                            return Ok(());
+                        }
                     }
                 }
-            }
-            frame = read.next() => {
-                let Some(frame) = frame else {
-                    return Ok(());
-                };
-                match frame? {
-                    Message::Text(text) => {
-                        let _: serde_json::Value = serde_json::from_str(&text)?;
-                        stdout.write_all(text.as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
-                        stdout.flush().await?;
-                    }
-                    Message::Binary(bytes) => {
-                        let text = String::from_utf8(bytes)?;
-                        let _: serde_json::Value = serde_json::from_str(&text)?;
-                        stdout.write_all(text.as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
-                        stdout.flush().await?;
-                    }
-                    Message::Close(_) => return Ok(()),
-                    Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
-                    Message::Pong(_) | Message::Frame(_) => {}
+                frame = read.next() => {
+                    let Some(frame) = frame else {
+                        eprintln!("acpx-acp-bridge: server closed the connection; reconnecting");
+                        continue 'connection;
+                    };
+                    let text = match frame {
+                        Ok(Message::Text(text)) => text,
+                        Ok(Message::Binary(bytes)) => match String::from_utf8(bytes) {
+                            Ok(text) => text,
+                            Err(err) => {
+                                eprintln!("acpx-acp-bridge: ignoring non-UTF8 binary frame: {err}");
+                                continue;
+                            }
+                        },
+                        Ok(Message::Close(_)) => {
+                            eprintln!("acpx-acp-bridge: server sent Close; reconnecting");
+                            continue 'connection;
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            let _ = write.send(Message::Pong(payload)).await;
+                            continue;
+                        }
+                        Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
+                        Err(err) => {
+                            eprintln!("acpx-acp-bridge: read error ({err}); reconnecting");
+                            continue 'connection;
+                        }
+                    };
+                    let value: serde_json::Value = match serde_json::from_str(&text) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            eprintln!("acpx-acp-bridge: ignoring non-JSON server frame: {err}");
+                            continue;
+                        }
+                    };
+                    tracker.observe_incoming(&value);
+                    stdout.write_all(text.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
                 }
             }
         }
