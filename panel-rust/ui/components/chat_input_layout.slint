@@ -65,7 +65,13 @@ export component ChatInputLayout inherits Rectangle {
                     color: Theme.text-muted;
                     font-size: 11px * Theme.font-scale;
                     font-family: Theme.font-sans;
-                    wrap: word-wrap;
+                    // Single line + elide, not word-wrap: at the box's
+                    // collapsed min-height (34px, one text row) a wrapped
+                    // two-line placeholder overflowed its own row and
+                    // visually spilled past the field -- an ellipsis on a
+                    // single line stays inside the field at any width.
+                    wrap: no-wrap;
+                    overflow: elide;
                     visible: compose.text == "";
                     x: Metrics.pad-lg;
                     y: Metrics.pad-lg / 2;
@@ -85,6 +91,17 @@ export component ChatInputLayout inherits Rectangle {
                         font-family: Theme.font-sans;
                         font-size: 11px * Theme.font-scale;
                         width: parent.width;
+                        // Without an explicit height, TextInput sizes to its
+                        // own content (one line's worth when empty/short) --
+                        // far smaller than the visible, padded input-box
+                        // behind it. A click anywhere below that first
+                        // line's actual hit region (most of the box's
+                        // clamp(..., 34px, 120px) height) missed the
+                        // TextInput entirely and never focused it, the root
+                        // cause of the composer's "click does nothing"
+                        // focus bug reproduced via a real click at the
+                        // input box's visual center.
+                        height: max(self.preferred-height, parent.height);
                         single-line: false;
                         wrap: word-wrap;
                         key-pressed(event) => {

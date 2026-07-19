@@ -57,6 +57,9 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 		return nil, fmt.Errorf("daemon: open registry: %w", err)
 	}
 	pm := procmgr.New(reg, cfg.SnapshotBinPath, cfg.RunDir, cfg.LogDir)
+	if cfg.LaunchConnectTimeout > 0 {
+		pm.ConnectTimeout = cfg.LaunchConnectTimeout
+	}
 	d := &Daemon{
 		Cfg:      cfg,
 		Reg:      reg,

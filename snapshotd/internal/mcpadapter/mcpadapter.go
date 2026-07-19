@@ -323,6 +323,47 @@ func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
 	}
 }
 
+// sapTool builds one typed MCP tool for a single fixed sap-rust method,
+// used by the tools_*.go files (audio/filter/generator/subtitles/...) for
+// the typed-tool-surface pass this package's own doc comment describes as
+// a future possibility beyond the generic sap.call passthrough above.
+// Forwarding logic mirrors sapCallTool exactly (same project.select-bound
+// ForwardSAP path, same mcpSink notification relay) except the SAP method
+// is fixed at registration time instead of read from the call's own
+// arguments, and the call's arguments are marshaled verbatim as that
+// method's params (every params object here already matches its sap-rust
+// method's expected shape 1:1, same convention `tool` above documents for
+// daemon.* methods). mcpName and sapMethod are passed separately (even
+// though every current call site sets them equal) so this stays usable if
+// a tool's public MCP name and its underlying SAP method name ever diverge.
+func sapTool(s *server.MCPServer, h Handler, mcpName, sapMethod, description string, opts ...mcp.ToolOption) server.ServerTool {
+	toolOpts := append([]mcp.ToolOption{mcp.WithDescription(description)}, opts...)
+	return server.ServerTool{
+		Tool: mcp.NewTool(mcpName, toolOpts...),
+		Handler: func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			paramsRaw, err := json.Marshal(req.GetArguments())
+			if err != nil {
+				return mcp.NewToolResultErrorFromErr("marshaling arguments", err), nil
+			}
+
+			cs := server.ClientSessionFromContext(ctx)
+			if cs == nil {
+				return mcp.NewToolResultError(mcpName + ": no MCP client session in context"), nil
+			}
+			sink := &mcpSink{server: s, sessionID: cs.SessionID()}
+
+			result, err := h.ForwardSAP(ctx, cs.SessionID(), sink, sapMethod, paramsRaw)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if len(result) == 0 {
+				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", mcpName)), nil
+			}
+			return mcp.NewToolResultJSON(wrapArrayResult(result))
+		},
+	}
+}
+
 // mcpSink relays a project's fanned-out SAP notifications (edit.changed,
 // project.dirty, etc -- opaque to this package, see internal/sapproxy) to
 // one MCP client session over its existing transport (SSE by default), via

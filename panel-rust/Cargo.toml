@@ -54,5 +54,27 @@ crate-type = ["staticlib", "rlib"]
 name = "rui-mock-agent"
 path = "src/bin/mock_agent.rs"
 
+# Minimal daemon-side ACPX chat verification tool -- see that file's own
+# doc comment. Not part of this crate's public library API.
+[[bin]]
+name = "chat-init-verify"
+path = "src/bin/chat_init_verify.rs"
+
 [dependencies.agent-client-protocol]
 version = "1.2"
+
+# Vendored workaround for a real upstream i-slint-renderer-software 1.17.1
+# bug: `draw_image_impl`'s SVG-image path divides by the image's reported
+# intrinsic size with no zero-guard, producing Infinity/NaN (then a fatal
+# euclid::Size2D cast panic) whenever that size is momentarily 0 -- a real,
+# reproduced crash in the Qt-hosted real_ffi build (confirmed via a manual
+# repro with RUST_BACKTRACE=full: RustPanelItem::paint -> panel_rust_render
+# -> ... -> draw_image_impl -> Size2D::cast().unwrap() on None). Because
+# this crate builds as a `staticlib` (panic=abort is implicit for that
+# crate-type), the panic cannot be caught at the FFI boundary either -- it
+# takes down the whole host process. See vendor/i-slint-renderer-software-
+# 1.17.1/lib.rs's own comment at the two patched call sites for the exact
+# fix (skip drawing that frame instead of dividing by zero). Remove this
+# patch once upstream Slint ships an equivalent guard.
+[patch.crates-io]
+i-slint-renderer-software = { path = "vendor/i-slint-renderer-software-1.17.1" }

@@ -645,8 +645,7 @@ fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
-    let request = if let Some(expected_agent) = expected_agent {
-        let _ = expected_agent;
+    let request = if expected_agent.is_some() {
         format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
     } else {
         let body = r#"{"jsonrpc":"2.0","id":0,"method":"session/list","params":{}}"#;
@@ -684,9 +683,17 @@ fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
             return false;
         }
     }
-    if let Some(expected_agent) = expected_agent {
-        envelope.get("status").and_then(|s| s.as_str()) == Some("ok")
-            && envelope.get("agentId").and_then(|id| id.as_str()) == Some(expected_agent)
+    if expected_agent.is_some() {
+        // acpx-server's real `/health` handler (acpx-server/src/transport/
+        // http.rs's health_handler) reports readiness as
+        // `"status": "ready"` (or "degraded"/absent on failure) and never
+        // includes an `agentId` field at all -- there is no per-agent
+        // identity signal on this endpoint, only "is a real acpx-server
+        // listening and healthy here". A single shared daemon-owned
+        // gateway (snapshotd's bundled acpx-server) serves one default
+        // backend for all providers, so "healthy" is the right bar for
+        // reuse regardless of which provider name was requested.
+        envelope.get("status").and_then(|s| s.as_str()) == Some("ready")
     } else {
         envelope
             .get("result")

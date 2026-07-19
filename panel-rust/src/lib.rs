@@ -68,7 +68,7 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
 /// work by the time `text()` is populated). Returns `None` for pure
 /// modifier presses (empty text, no special mapping) which Slint doesn't
 /// need forwarded as a `KeyPressed`/`KeyReleased` text event.
-fn map_qt_key(qt_key: c_int, text: &str) -> Option<SharedString> {
+fn map_qt_key(qt_key: c_int, text: &str, shift: bool) -> Option<SharedString> {
     let special = match qt_key {
         0x0100_0000 => Some(Key::Escape),
         0x0100_0001 => Some(Key::Tab),
@@ -92,12 +92,25 @@ fn map_qt_key(qt_key: c_int, text: &str) -> Option<SharedString> {
         // provides the ASCII `Qt::Key_*` code, so recover that character for
         // a focused composer instead of letting host shortcuts eat the input.
         // Shifted/non-ASCII input continues to use Qt's non-empty text path.
+        //
+        // `Qt::Key_A`..`Key_Z` are case-*insensitive* constants (always
+        // 0x41-0x5A/uppercase, regardless of whether Shift was actually
+        // held -- Qt only conveys case via `text()`, never via `key()`).
+        // Every other printable `Qt::Key_*` in the 0x20-0x7E range (digits,
+        // punctuation) already resolves to the shift-corrected character on
+        // X11 (a keysym's shift level is baked into which keysym the
+        // keycode maps to), so only the letter-case decision below needs
+        // the caller's own `shift` (real modifier state, passed through
+        // from `QKeyEvent::modifiers()`) rather than being guessable from
+        // `qt_key` alone -- unconditionally lower-casing here (the
+        // previous behavior) silently dropped every actually-uppercase
+        // letter typed while it collided with a host shortcut.
         match u32::try_from(qt_key)
             .ok()
             .and_then(char::from_u32)
             .filter(|ch| ch.is_ascii_graphic() || *ch == ' ')
         {
-            Some(ch) if ch.is_ascii_uppercase() => Some(ch.to_ascii_lowercase().into()),
+            Some(ch) if ch.is_ascii_uppercase() && !shift => Some(ch.to_ascii_lowercase().into()),
             Some(ch) => Some(ch.into()),
             None => None,
         }
@@ -2199,6 +2212,14 @@ pub extern "C" fn panel_rust_input_key(
     text_ptr: *const c_uchar,
     text_len: usize,
     pressed: bool,
+    // Raw `Qt::KeyboardModifiers` bitmask (`QKeyEvent::modifiers()`,
+    // forwarded verbatim by the caller) -- only bit 0x02000000
+    // (`Qt::ShiftModifier`) is currently consulted, by `map_qt_key`'s
+    // empty-text fallback for deciding a letter's case (`Qt::Key_A`..
+    // `Key_Z` are case-insensitive constants, so that decision is
+    // otherwise unrecoverable from `qt_key` alone -- see that function's
+    // own doc comment).
+    modifiers: c_int,
 ) -> bool {
     let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
     let Some(window) = window else {
@@ -2240,7 +2261,9 @@ pub extern "C" fn panel_rust_input_key(
         ));
         return true;
     }
-    let Some(key_text) = map_qt_key(qt_key, text) else {
+    const QT_SHIFT_MODIFIER: c_int = 0x0200_0000;
+    let shift = (modifiers & QT_SHIFT_MODIFIER) != 0;
+    let Some(key_text) = map_qt_key(qt_key, text, shift) else {
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed=true text={text:?} \
              compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
@@ -2381,6 +2404,19 @@ pub extern "C" fn panel_rust_apply_host_appearance(
 /// `panel_rust_render` + trigger a Qt repaint).
 #[no_mangle]
 pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
+    // Slint `animate` blocks (hover fades, entrance/exit transitions, the
+    // loading spinner, ...) only progress when something calls this --
+    // under a real windowing backend the platform event loop does it
+    // automatically, but this crate's `SpikePlatform`/`MinimalSoftwareWindow`
+    // has no event loop of its own, only this 80ms QTimer poll
+    // (rustpanelitem.cpp's RustPanelItem::poll). Without this call every
+    // `animate` was simply frozen -- properties jumped straight to their
+    // end value with no interpolation, since nothing ever advanced
+    // Slint's animation clock. Called unconditionally, every tick,
+    // regardless of `apply_bridge_events`/etc. below finding anything
+    // "changed" -- an in-flight animation is itself a reason to redraw
+    // even with zero application-state change this tick.
+    slint::platform::update_timers_and_animations();
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
@@ -2422,9 +2458,38 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let connection_changed = selected
             .map(|idx| panel.refresh_connection_status_for(idx))
             .unwrap_or(false);
-        bridge_changed || local_terminal_changed || connection_changed || settings_changed
+        // Always true, not just `bridge_changed || ... || settings_changed`:
+        // this crate has no cheap way to ask Slint "is an `animate` block
+        // still mid-transition right now" from a custom platform, and an
+        // in-flight animation needs a repaint every tick even when every
+        // other signal above is false. 80ms (this function's own caller,
+        // rustpanelitem.cpp's QTimer) was already budgeted as "nowhere
+        // near a hot loop" for a chat panel this size, so redrawing
+        // unconditionally at that cadence costs nothing that mattered
+        // before this fix wasn't already the norm during real activity.
+        let _ = (bridge_changed, local_terminal_changed, connection_changed, settings_changed);
+        true
     })
 }
+
+// Below this, a real layout pass squeezing this component's full nested
+// item tree (sidebar + chat area, many icons/rows deep) into a
+// near-zero canvas can produce a degenerate (effectively-zero or
+// precision-lost) destination size for some nested `Image` item --
+// `i_slint_renderer_software`'s `draw_image_impl` then fails an internal
+// `euclid::Size2D` numeric cast and, since this crate builds with
+// `panic = "abort"`, that panic takes down the whole host process
+// instead of unwinding (confirmed via a real crash: `RustPanelItem::
+// paint` -> `panel_rust_render` -> deep `visit_children_item` recursion
+// -> `draw_image_impl` -> `Size2D::cast().unwrap()` on `None`, on the
+// very first paint of a freshly-created dock before Qt's own layout has
+// given it its real ~20%-of-window size). The host (`rustpanelitem.cpp`)
+// only floors width/height at `qMax(1.0, ...)`, so a literal 1x1 first
+// paint is possible and was in fact what triggered this. Skipping the
+// render entirely below this floor is harmless: Qt repaints again as
+// soon as the item's real geometry lands, typically within the same
+// event-loop tick.
+const MIN_RENDERABLE_SIZE: u32 = 16;
 
 #[no_mangle]
 pub extern "C" fn panel_rust_render(_handle: *mut PanelHandle) -> bool {
@@ -2434,6 +2499,9 @@ pub extern "C" fn panel_rust_render(_handle: *mut PanelHandle) -> bool {
             return false;
         };
         let width = panel.width;
+        if width < MIN_RENDERABLE_SIZE || panel.height < MIN_RENDERABLE_SIZE {
+            return false;
+        }
         panel.window.draw_if_needed(|renderer| {
             let mut buffer = panel.buffer.borrow_mut();
             renderer.render(&mut buffer, width as usize);

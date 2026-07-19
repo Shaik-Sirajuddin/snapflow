@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -201,22 +202,44 @@ func (s *Server) handle(ctx context.Context, sessionID string, sink sapproxy.Sin
 		return errorResponse(req.ID, CodeInvalidRequest, "missing method")
 	}
 
+	log := s.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Debug("sdp request", "session", sessionID, "method", req.Method, "params", string(req.Params))
+
 	if strings.HasPrefix(req.Method, "daemon.") {
 		result, err := s.Handler.Dispatch(ctx, req.Method, req.Params)
 		if err != nil {
+			log.Debug("sdp response", "session", sessionID, "method", req.Method, "err", err.Error())
 			return errorResponse(req.ID, CodeInternalError, err.Error())
 		}
-		return resultResponse(req.ID, result)
+		resp := resultResponse(req.ID, result)
+		log.Debug("sdp response", "session", sessionID, "method", req.Method, "result", debugJSON(resp.Result))
+		return resp
 	}
 
 	// Every other method is the generic, opaque SAP proxy path (06's
 	// project.*/edit.*/playlist.*/... surface), forwarded verbatim.
 	result, err := s.Handler.ForwardSAP(ctx, sessionID, sink, req.Method, req.Params)
 	if err != nil {
+		log.Debug("sdp response", "session", sessionID, "method", req.Method, "err", err.Error())
 		if rpcErr, ok := err.(*sapproxy.RPCError); ok {
 			return Response{JSONRPC: "2.0", ID: req.ID, Error: &Error{Code: int(rpcErr.Code), Message: rpcErr.Message}}
 		}
 		return errorResponse(req.ID, CodeInternalError, err.Error())
 	}
+	log.Debug("sdp response", "session", sessionID, "method", req.Method, "result", string(result))
 	return Response{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+// debugJSON best-effort-marshals v for a Debug log field; only used on the
+// (rare, Debug-gated) daemon.* dispatch path where result is `any`, not
+// already a json.RawMessage like the ForwardSAP path's result.
+func debugJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("%v", v)
+	}
+	return string(b)
 }
