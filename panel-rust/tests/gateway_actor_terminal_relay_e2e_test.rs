@@ -47,7 +47,7 @@ fn spawn_acpx_server_with_retry(configure: impl Fn(&mut Command, u16)) -> (Child
             .stderr(Stdio::null());
         let mut child = command.spawn().expect("spawn real acpx-server binary for test");
 
-        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
         let mut reachable = false;
         while std::time::Instant::now() < deadline {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {

@@ -2774,7 +2774,17 @@ mod tests {
                 .spawn()
                 .expect("spawn real acpx-server binary for test");
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            // acpx-server's own startup (before it even binds its listen
+            // socket) does a real network fetch of the ACP registry
+            // (acpx-core's ensure_registry_loaded, called from
+            // warm_default_profiles at the top of main.rs), falling back
+            // to a bundled snapshot on any error. That client used to have
+            // no timeout at all -- fixed (acpx-core/src/router.rs) to a
+            // bounded 5s -- but even the bounded case can take a bit over
+            // 1.5s to fail-and-fall-back in this sandbox's network
+            // conditions (measured ~1.6s directly). 3s gives real headroom
+            // without materially slowing down the common fast-startup case.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
             let mut reachable = false;
             while std::time::Instant::now() < deadline {
                 if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
