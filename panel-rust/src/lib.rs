@@ -17,6 +17,7 @@
 mod agent_bridge;
 mod appearance;
 mod conversation;
+mod editor_detect;
 pub mod gateway_actor;
 pub mod jsonl_store;
 mod local_terminal;
@@ -1803,6 +1804,75 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     panel.refresh_skills_model();
                 }
             });
+        });
+
+        panel.component.on_skill_editor_open_requested(move |path| {
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                let path = std::path::PathBuf::from(path.as_str());
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let content =
+                    std::fs::read_to_string(path.join("SKILL.md")).unwrap_or_default();
+                panel.component.set_active_skill_name(name.into());
+                panel
+                    .component
+                    .set_active_skill_path(path.to_string_lossy().into_owned().into());
+                panel.component.set_active_skill_content(content.into());
+                let detected: Vec<slint::SharedString> = crate::editor_detect::detect_installed_editors()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                panel
+                    .component
+                    .set_detected_editors(ModelRc::new(VecModel::from(detected)));
+            });
+        });
+
+        panel.component.on_skill_content_edited(move |path, content| {
+            let skill_md = std::path::Path::new(path.as_str()).join("SKILL.md");
+            if let Err(error) = std::fs::write(&skill_md, content.as_str()) {
+                eprintln!("panel-rust: failed to save skill {path:?}: {error}");
+            }
+        });
+
+        panel.component.on_skill_copy_path_requested(move |path| {
+            trace_host_input(format_args!("skill copy-path requested for {path:?}"));
+            // No system clipboard dependency in this crate today -- see
+            // panel-rust/Cargo.lock check in skill-manager-workspace's
+            // 03-open-risks.md for the same "no new dependency without a
+            // concrete need" stance applied to the opener crate. Logged
+            // for now; a real clipboard write is a small, separate
+            // addition once a clipboard crate is actually needed
+            // elsewhere too.
+        });
+
+        panel.component.on_skill_open_in_editor_requested(move |editor_name, path| {
+            let Some((bin, _)) = crate::editor_detect::EDITOR_CANDIDATES
+                .iter()
+                .find(|(_, name)| *name == editor_name.as_str())
+            else {
+                eprintln!("panel-rust: unknown editor {editor_name:?}");
+                return;
+            };
+            if let Err(error) =
+                crate::editor_detect::open_in_editor(bin, std::path::Path::new(path.as_str()))
+            {
+                eprintln!("panel-rust: failed to open skill in {editor_name:?}: {error}");
+            }
+        });
+
+        panel.component.on_skill_open_with_os_default_requested(move |path| {
+            if let Err(error) =
+                crate::editor_detect::open_with_os_default(std::path::Path::new(path.as_str()))
+            {
+                eprintln!("panel-rust: failed to open skill with OS default: {error}");
+            }
         });
 
         let component_weak = panel.component.as_weak();

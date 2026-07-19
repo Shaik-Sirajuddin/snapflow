@@ -1,0 +1,141 @@
+import { Theme } from "../../tokens/theme.slint";
+import { Metrics } from "../../tokens/metrics.slint";
+import { Icon } from "../../base/icon.slint";
+import { IconButton } from "../../base/icon_button.slint";
+
+// Skill editor -- `active_pane_and_editor_view` phase. Replaces
+// `ChatArea` in the main content area (see `app.slint`'s `active-pane`
+// switch) while a skill is selected in the sidebar's skill list. Top
+// bar mirrors `chat_area.slint`'s header shell (icon glyph + title,
+// same row height/padding), plus copy-path and detected-editor icons;
+// body is a plain live-edit TextInput over the skill's `SKILL.md`
+// contents (writes through on every edit -- `assistant-sidebar
+// refine`'s "opens editor to edit the skills in live").
+export component SkillEditorView inherits Rectangle {
+    in property <string> skill-name;
+    in property <string> skill-path;
+    in-out property <string> skill-content;
+    // Display names of CLI-launchable editors actually found on PATH
+    // (editor_detect::detect_installed_editors), capped to a small
+    // static candidate list per 03-open-risks.md's editor-detection
+    // scope decision -- not exhaustive detection.
+    in property <[string]> detected-editors: [];
+    callback copy-path-requested();
+    callback open-in-editor-requested(string /* editor display name */);
+    callback open-with-os-default-requested();
+    callback content-edited(string);
+    callback close-requested();
+
+    background: Theme.bg-chat;
+
+    VerticalLayout {
+        width: parent.width;
+        height: parent.height;
+
+        Rectangle {
+            height: 44px;
+            background: Theme.bg-chat;
+            HorizontalLayout {
+                padding-left: Metrics.space-4;
+                padding-right: Metrics.space-4;
+                spacing: Metrics.space-3;
+                Rectangle {
+                    width: 22px;
+                    height: 22px;
+                    background: Theme.bg-primary-container;
+                    border-color: Theme.border-default;
+                    border-width: 1px;
+                    border-radius: Theme.radius-sm;
+                    Icon {
+                        source: @image-url("../../assets/icons/book-open.svg");
+                        size: Metrics.icon-md;
+                        color: Theme.bg-primary;
+                    }
+                }
+                Text {
+                    text: root.skill-name;
+                    color: Theme.text-primary;
+                    font-size: 12px * Theme.font-scale;
+                    font-weight: 600;
+                    font-family: Theme.font-mono;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    overflow: elide;
+                }
+                copy-path-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    width: copy-path-label.preferred-width + 2 * Metrics.space-2;
+                    accessible-role: button;
+                    accessible-label: "Copy skill path";
+                    clicked => { root.copy-path-requested(); }
+                    copy-path-label := Text {
+                        text: "Copy path";
+                        color: Theme.text-secondary;
+                        font-size: 9px * Theme.font-scale;
+                        vertical-alignment: center;
+                    }
+                }
+                // Up to a few detected-CLI-editor icons -- text labels
+                // rather than per-editor glyphs, since there is no
+                // per-editor icon asset set in this crate and adding one
+                // is out of scope for this phase.
+                for editor-name in root.detected-editors : TouchArea {
+                    mouse-cursor: pointer;
+                    width: open-label.preferred-width + 2 * Metrics.space-2;
+                    accessible-role: button;
+                    accessible-label: "Open in " + editor-name;
+                    clicked => { root.open-in-editor-requested(editor-name); }
+                    open-label := Text {
+                        text: "Open in " + editor-name;
+                        color: Theme.text-secondary;
+                        font-size: 9px * Theme.font-scale;
+                        vertical-alignment: center;
+                    }
+                }
+                open-default-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    width: open-default-label.preferred-width + 2 * Metrics.space-2;
+                    accessible-role: button;
+                    accessible-label: "Open with OS default application";
+                    clicked => { root.open-with-os-default-requested(); }
+                    open-default-label := Text {
+                        text: "Open";
+                        color: Theme.text-secondary;
+                        font-size: 9px * Theme.font-scale;
+                        vertical-alignment: center;
+                    }
+                }
+                IconButton {
+                    button-accessible-label: "Close skill editor";
+                    clicked => { root.close-requested(); }
+                    Icon {
+                        source: @image-url("../../assets/icons/x.svg");
+                        size: Metrics.icon-sm;
+                        color: Theme.text-secondary;
+                    }
+                }
+            }
+        }
+
+        Flickable {
+            vertical-stretch: 1;
+            preferred-height: 0px;
+            min-height: 0px;
+            viewport-height: max(self.height, editor-input.preferred-height + 2 * Metrics.space-6);
+            editor-input := TextInput {
+                x: Metrics.space-6;
+                y: Metrics.space-4;
+                width: parent.width - 2 * Metrics.space-6;
+                color: Theme.text-primary;
+                font-family: Theme.font-mono;
+                font-size: 11px * Theme.font-scale;
+                wrap: word-wrap;
+                single-line: false;
+                text <=> root.skill-content;
+                edited => { root.content-edited(self.text); }
+            }
+        }
+    }
+}

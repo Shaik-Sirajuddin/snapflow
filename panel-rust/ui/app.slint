@@ -5,6 +5,7 @@ import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
 import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
 import { SettingsPage } from "pages/settings/settings_page.slint";
+import { SkillEditorView } from "pages/skills/skill_view.slint";
 import { TextUtil } from "base/text_util.slint";
 
 export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme }
@@ -87,6 +88,19 @@ export component ChatPanel inherits Window {
     // its consuming UI" precedent as `available-mcp-servers` originally.
     in property <[SkillOption]> available-skills: [];
     in property <bool> dev-mode: false;
+    // `active_pane_and_editor_view` phase: which surface the main content
+    // area shows -- "chat" (ChatArea, the default) or "skill" (a live
+    // SkillEditorView for the sidebar's currently-selected skill).
+    in-out property <string> active-pane: "chat";
+    in property <string> active-skill-name: "";
+    in property <string> active-skill-path: "";
+    in-out property <string> active-skill-content: "";
+    in property <[string]> detected-editors: [];
+    callback skill-content-edited(string, string /* path, new content */);
+    callback skill-copy-path-requested(string);
+    callback skill-open-in-editor-requested(string, string /* editor name, path */);
+    callback skill-open-with-os-default-requested(string);
+    callback skill-editor-open-requested(string /* path */);
     // Mode/config selector addition -- see chat_area.slint's own doc
     // comment on these properties; passed straight through to `ChatArea`
     // below (this root component owns no mode/config state of its own,
@@ -240,6 +254,10 @@ export component ChatPanel inherits Window {
                 }
                 new-thread-requested => { new-thread-requested(); }
                 new-skill-requested(name) => { new-skill-requested(name); }
+                skill-selected(path) => {
+                    root.active-pane = "skill";
+                    root.skill-editor-open-requested(path);
+                }
                 thread-close-requested(i) => { thread-close-requested(i); }
                 thread-delete-requested(i) => { thread-delete-requested(i); }
                 thread-archive-requested(i) => { thread-archive-requested(i); }
@@ -248,6 +266,7 @@ export component ChatPanel inherits Window {
                 toggle-expanded => { sidebar-expanded = !sidebar-expanded; }
             }
             chat-area := ChatArea {
+                visible: root.active-pane == "chat";
                 x: sidebar.width;
                 y: 0px;
                 width: root.width - self.x;
@@ -294,6 +313,27 @@ export component ChatPanel inherits Window {
                 panel-shortcut(event) => {
                     return root.handle-panel-shortcut(event);
                 }
+            }
+            if root.active-pane == "skill" : SkillEditorView {
+                x: sidebar.width;
+                y: 0px;
+                width: root.width - self.x;
+                height: parent.height;
+                skill-name: root.active-skill-name;
+                skill-path: root.active-skill-path;
+                skill-content <=> root.active-skill-content;
+                detected-editors: root.detected-editors;
+                copy-path-requested => { root.skill-copy-path-requested(root.active-skill-path); }
+                open-in-editor-requested(editor-name) => {
+                    root.skill-open-in-editor-requested(editor-name, root.active-skill-path);
+                }
+                open-with-os-default-requested => {
+                    root.skill-open-with-os-default-requested(root.active-skill-path);
+                }
+                content-edited(new-content) => {
+                    root.skill-content-edited(root.active-skill-path, new-content);
+                }
+                close-requested => { root.active-pane = "chat"; }
             }
         }
         if expanded-terminal.terminal-id != "" : TerminalOverlay {

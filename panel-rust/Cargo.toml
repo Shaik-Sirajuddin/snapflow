@@ -22,6 +22,11 @@ serde_json = "1"
 rusqlite = "0.31"
 portable-pty = "0.9"
 vt100 = "0.15"
+# active_pane_and_editor_view phase: "open with OS default handler"
+# fallback for the skill editor's top bar -- checked for an existing
+# default-app-opener dependency first (none present), so this is the
+# one new dependency rather than hand-rolling per-OS Command branching.
+opener = "0.7"
 
 [dev-dependencies]
 tempfile = "3"

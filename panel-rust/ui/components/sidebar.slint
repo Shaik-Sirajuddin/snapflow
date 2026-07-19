@@ -32,6 +32,10 @@ export component Sidebar inherits Rectangle {
     // confirmed; Rust creates the scaffolded SKILL.md and re-scans.
     callback new-skill-requested(string);
     property <bool> new-skill-dialog-open: false;
+    // `active_pane_and_editor_view` phase: fired with a skill's path
+    // when its row is clicked, so the host can switch the main content
+    // area to the skill editor.
+    callback skill-selected(string);
 
     // Two-step arm/confirm state for the sidebar row close/delete
     // controls -- same pattern as `settings_sheet.slint`'s
@@ -229,9 +233,13 @@ export component Sidebar inherits Rectangle {
             viewport-height: skill-list-col.preferred-height;
             skill-list-col := VerticalLayout {
                 spacing: Metrics.space-1;
-                for skill in skills : Rectangle {
+                for skill in skills : HoverSurface {
                     height: expanded ? 48px : 32px;
-                    background: Theme.bg-sidebar;
+                    idle-bg: Theme.bg-sidebar;
+                    selected-bg: Theme.bg-chat;
+                    selected: false;
+                    button-accessible-label: "Open skill " + skill.name;
+                    clicked => { root.skill-selected(skill.path); }
                     VerticalLayout {
                         padding-left: compact ? Metrics.space-6 : Metrics.space-8;
                         padding-right: compact ? Metrics.space-6 : Metrics.space-8;
