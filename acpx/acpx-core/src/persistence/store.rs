@@ -234,6 +234,25 @@ impl PersistenceStore {
 
     /// List sessions that are still open and have an explicit recovery
     /// mechanism. These rows are candidates for startup recovery.
+    ///
+    /// Excludes rows already marked [`RecoveryStatus::RecoveryFailed`] by a
+    /// *previous* pass of this same eager, startup-time batch. Without this,
+    /// a session whose backend permanently rejects `session/load`/
+    /// `session/resume` (for example codex-acp's "no rollout found for
+    /// thread id" when the underlying agent process never actually
+    /// persisted anything for that thread -- confirmed live, 3 orphaned
+    /// rows from sessions that were created but never completed a turn,
+    /// retried and failed identically on every one of several consecutive
+    /// restarts) gets re-attempted, and re-fails, forever: one doomed
+    /// backend spawn + rejection round trip added to every single startup,
+    /// permanently, plus `last_recovery_error`/the `/health` `failed`
+    /// counter staying polluted with the same stale failure. A row that
+    /// already failed once here stays durable (`last_recovery_error`
+    /// remains inspectable) and is still eligible for a *client-triggered*
+    /// retry through the on-demand path (`find_session_by_bridge_session_id`
+    /// / `rehydrate_session`, which deliberately applies no such filter --
+    /// see that method's own doc comment) -- it just never gets
+    /// automatically retried again by the unattended eager batch.
     pub async fn list_recoverable_sessions(&self) -> Result<Vec<SessionRecord>, PersistenceError> {
         let conn = self.conn.clone();
         run_blocking(move || {
@@ -247,6 +266,7 @@ impl PersistenceStore {
                  FROM sessions \
                  WHERE closed_at IS NULL \
                    AND status != 'closed' \
+                   AND status != 'recovery_failed' \
                    AND recovery_method IN ('load', 'resume') \
                  ORDER BY created_at ASC",
             )?;

@@ -15,6 +15,26 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 pub const DEFAULT_INTERACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Capacity of a bound client connection's agent-request delivery
+/// channel.
+///
+/// **Why bounded, not unbounded, and why `try_send` not `send().await`.**
+/// [`InteractionHub::request`] calls `binding.sender.send(..)` while
+/// still holding `self.state`'s lock -- the single mutex every `bind`/
+/// `unbind`/`resolve`/`request` call for *every* tenant/session this hub
+/// serves contends on. A blocking bounded `send().await` here would
+/// therefore stall every other session's interaction traffic the moment
+/// one client's channel filled up, trading an unbounded-memory-growth
+/// risk for a cross-session lock-contention one -- strictly worse.
+/// `try_send` keeps the non-blocking contract this call site already
+/// has (it previously used `UnboundedSender::send`, itself always
+/// non-blocking) while still capping how much can queue per connection:
+/// a full channel is treated exactly like the pre-existing "disconnected"
+/// path below (unbind and fail this one request), which is the correct
+/// outcome anyway for a client too far behind to plausibly answer a
+/// fresh interactive prompt in time.
+pub const INTERACTION_QUEUE_CAPACITY: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct InteractionKey {
     tenant_id: TenantId,
@@ -49,7 +69,7 @@ struct InteractionState {
 #[derive(Clone)]
 struct Binding {
     id: String,
-    sender: mpsc::UnboundedSender<serde_json::Value>,
+    sender: mpsc::Sender<serde_json::Value>,
 }
 
 struct PendingInteraction {
@@ -69,7 +89,7 @@ impl InteractionHub {
         &self,
         tenant_id: TenantId,
         gateway_session_id: impl Into<String>,
-        sender: mpsc::UnboundedSender<serde_json::Value>,
+        sender: mpsc::Sender<serde_json::Value>,
     ) -> InteractionBinding {
         let key = InteractionKey {
             tenant_id,
@@ -139,7 +159,7 @@ impl InteractionHub {
                     sender: tx,
                 },
             );
-            if binding.sender.send(request).is_err() {
+            if binding.sender.try_send(request).is_err() {
                 state.pending.remove(&public_id);
                 if state
                     .bindings
@@ -182,7 +202,7 @@ mod tests {
     async fn request_uses_an_opaque_id_and_restores_the_client_response() {
         let hub = InteractionHub::new();
         let tenant = TenantId::from("tenant-a");
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
         hub.bind(tenant.clone(), "session-a", tx).await;
 
         let hub_for_request = hub.clone();
@@ -233,9 +253,9 @@ mod tests {
     async fn an_old_binding_cannot_remove_a_new_owner() {
         let hub = InteractionHub::new();
         let tenant = TenantId::from("tenant-a");
-        let (old_tx, _old_rx) = mpsc::unbounded_channel();
+        let (old_tx, _old_rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
         let old = hub.bind(tenant.clone(), "session-a", old_tx).await;
-        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        let (new_tx, mut new_rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
         hub.bind(tenant.clone(), "session-a", new_tx).await;
         hub.unbind(&old).await;
 

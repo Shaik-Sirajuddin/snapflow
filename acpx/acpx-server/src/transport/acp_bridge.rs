@@ -41,7 +41,7 @@ use super::SharedRouter;
 #[derive(Clone)]
 pub(crate) struct BridgeInteractionCtx {
     pub hub: InteractionHub,
-    pub sender: mpsc::UnboundedSender<Value>,
+    pub sender: mpsc::Sender<Value>,
     /// Keyed by native/gateway session id (not the bridge's virtual id) so
     /// a reconnect or a second bridge session sharing an agent process
     /// never collide; owned by the WS connection so it can unbind every
@@ -247,7 +247,12 @@ impl BridgeRuntime {
             let mut last_attempt = self
                 .last_refresh_attempt
                 .lock()
-                .expect("last_refresh_attempt mutex poisoned");
+                // Self-heals on poison rather than permanently wedging
+                // every future model refresh attempt this process ever
+                // makes -- see `bridge_sessions::lock_sessions`'s doc
+                // comment for the identical reasoning against a plain
+                // `Option<Instant>` guard.
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let now = Instant::now();
             if let Some(previous) = *last_attempt {
                 if now.duration_since(previous) < cooldown {
