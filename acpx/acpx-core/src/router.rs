@@ -370,6 +370,31 @@ pub struct Router {
     /// happens to touch its gateway id." `rehydrate_session` checks this
     /// before even querying the persistence store.
     on_demand_recovery_enabled: bool,
+    /// **`process_reader_demux`, phase 1 of
+    /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
+    /// Opt-in (disabled by default -- `ACPX_PROCESS_READER_DEMUX` unset).
+    /// When enabled, [`dispatch_proxied_shared`] and
+    /// [`dispatch_session_new_shared`] register-then-await a response via
+    /// `BackendProcess::pending` instead of holding the per-process lock
+    /// across the entire write + blocking-read-loop of a turn -- see
+    /// `memory/acpx/tasks/zed_integration.yaml` task 7. This is what lets
+    /// two sessions sharing one backend process actually overlap in wall
+    /// time instead of fully serializing behind each other's whole turn.
+    /// Deliberately scoped to just these two hot dispatch paths for now;
+    /// the legacy non-`_shared` `Router::dispatch*` methods and the
+    /// session-fork/session-list paths are unaffected either way.
+    ///
+    /// **Known tradeoff while enabled**: unmatched frames (bare
+    /// notifications and agent-initiated requests) are handled entirely
+    /// by an independent per-process consumer task
+    /// ([`spawn_demux_consumer`]) rather than by whichever call
+    /// happened to be in the read loop -- so a response's own
+    /// `_acpx.updates`/`_acpx.agentRequests` are always empty when this
+    /// is on; that data still reaches a live-subscribed client via
+    /// `NotificationHub`, it just never gets attached inline to this
+    /// particular call's response the way the legacy path's best-effort
+    /// buffering fallback does.
+    process_reader_demux: bool,
     /// **`connector_reference_lifecycle`.** Supervisor keys currently
     /// observed to have zero referencing live sessions, mapped to when
     /// that was first observed. Only populated/consulted when
@@ -698,6 +723,11 @@ pub enum RouterError {
          was killed and this call failed rather than holding its per-process lock forever"
     )]
     BackendHandshakeTimeout(&'static str, Duration),
+    #[error(
+        "backend process's reader task ended (process exited or a read error occurred) before \
+         this call's response arrived"
+    )]
+    BackendDemuxReaderClosed,
 }
 
 /// Hard ceiling on the per-candidate backend `session/close` round trip
@@ -878,6 +908,7 @@ impl Router {
             tenant_process_isolation: false,
             session_process_isolation: false,
             on_demand_recovery_enabled: true,
+            process_reader_demux: false,
             unreferenced_backends: HashMap::new(),
         }
     }
@@ -1238,6 +1269,13 @@ impl Router {
     /// batch job at boot; this is one operator-facing toggle, not two.
     pub fn with_on_demand_recovery_enabled(mut self, enabled: bool) -> Self {
         self.on_demand_recovery_enabled = enabled;
+        self
+    }
+
+    /// Opt-in per-process reader-task demultiplexing -- see
+    /// `process_reader_demux`'s field doc comment. Disabled by default.
+    pub fn with_process_reader_demux(mut self, enabled: bool) -> Self {
+        self.process_reader_demux = enabled;
         self
     }
 
@@ -4189,7 +4227,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
         // answers `initialize`.
         let handshake = async {
             loop {
-                let value = proc.reader.read_value().await?;
+                let value = proc.reader_mut().read_value().await?;
                 if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
                     return Ok::<_, RouterError>(value);
                 }
@@ -4269,7 +4307,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
             // same unbounded-hang gap.
             let handshake = async {
                 loop {
-                    let value = proc.reader.read_value().await?;
+                    let value = proc.reader_mut().read_value().await?;
                     if value.get("id").and_then(|v| v.as_i64()) == Some(AUTHENTICATE_REQUEST_ID) {
                         return Ok::<_, RouterError>(value);
                     }
@@ -4879,7 +4917,7 @@ async fn backend_idle_scavenger(
         // holding) waiting for it.
         loop {
             let attempt =
-                tokio::time::timeout(Duration::from_millis(0), proc.reader.read_value()).await;
+                tokio::time::timeout(Duration::from_millis(0), proc.reader_mut().read_value()).await;
             let value = match attempt {
                 Ok(Ok(value)) => value,
                 Ok(Err(err)) => {
@@ -4912,6 +4950,62 @@ async fn backend_idle_scavenger(
             );
         }
     }
+}
+
+/// **`process_reader_demux`, phase 1.** Background consumer for one
+/// physical backend process's stream of unmatched frames (bare
+/// notifications and agent-initiated requests), fed by that process's
+/// reader task (`BackendProcess::start_demux`) via `unmatched_rx`. Unlike
+/// [`backend_idle_scavenger`], this runs continuously for the whole
+/// process lifetime, not only during idle windows between calls -- it's
+/// the fix for the race noted in `memory/acpx/tasks/zed_integration.yaml`
+/// task 7 ("only forwards live updates while some caller happens to be
+/// in the read loop"). Reuses [`handle_unmatched_frame`], the exact same
+/// agent-request-answering/live-delivery logic the legacy read loop
+/// uses, briefly re-locking `backend` per frame (never held across a
+/// blocking read -- the reader task already owns that).
+///
+/// `policy` is fixed for this consumer's whole lifetime, captured from
+/// whichever call first activated demux for this process. In practice
+/// every session sharing one physical process already shares one
+/// profile (`Supervisor` keys processes by agent id, optionally folded
+/// with tenant/session id -- never by profile alone with differing call
+/// policies on one key), so this matches what the legacy per-call read
+/// loop effectively assumed too.
+fn spawn_demux_consumer(
+    router: SharedRouterHandle,
+    agent_id: String,
+    agent_relay: AgentRequestHub,
+    notification_hub: NotificationHub,
+    backend: acpx_conductor::supervisor::SharedBackendProcess,
+    policy: BackendCallPolicy,
+    mut unmatched_rx: tokio::sync::mpsc::UnboundedReceiver<acpx_conductor::UnmatchedFrame>,
+) {
+    let ctx = LiveNotifyCtx {
+        router,
+        agent_id: agent_id.clone(),
+        tenant_id: None,
+        agent_relay,
+        gateway_session_id: None,
+        notification_hub,
+        backend: std::sync::Arc::clone(&backend),
+    };
+    tokio::spawn(async move {
+        while let Some(value) = unmatched_rx.recv().await {
+            let mut proc = backend.lock().await;
+            if let Err(err) = handle_unmatched_frame(&mut proc, value, &policy, Some(&ctx)).await {
+                tracing::warn!(
+                    agent_id = %ctx.agent_id,
+                    %err,
+                    "acpx process-reader-demux consumer failed to handle an unmatched frame"
+                );
+            }
+        }
+        // `unmatched_rx` closed -- the reader task ended (process exited
+        // or hit a read error). Nothing left to consume; this consumer's
+        // job ends with the process it belongs to, matching
+        // `backend_idle_scavenger`'s own `has_exited` early return.
+    });
 }
 
 /// How long a relayed `session/request_permission` is allowed to wait
@@ -5148,7 +5242,7 @@ async fn read_matching_response_with_idle_timeout(
         // notification in some unrelated call's own read loop.
         let value = match tokio::time::timeout(
             idle_read_timeout,
-            backend.reader.read_value(),
+            backend.reader_mut().read_value(),
         )
         .await
         {
@@ -5183,67 +5277,129 @@ async fn read_matching_response_with_idle_timeout(
         // sends some other agent-initiated request acpx doesn't yet
         // support still gets *a* reply and can decide how to proceed
         // (e.g. treat it as declined) rather than hanging indefinitely.
-        if let (Some(_), Some(method)) = (
-            value.get("id"),
-            value.get("method").and_then(|m| m.as_str()),
-        ) {
-            // A persistent transport may have a client bound to this exact
-            // tenant/session. Give that client the first chance to answer
-            // every backend-initiated request, with one carve-out:
-            // `session/request_permission`/`fs/read_text_file`/
-            // `fs/write_text_file`/`terminal/create` each have their own
-            // dedicated `AgentRequestHub` relay below (real clients, e.g.
-            // the panel's `acpx/agent_request`/`acpx/agent_response`
-            // envelope, already depend on that exact wire contract) --
-            // tried first for those four, with `InteractionHub` as the
-            // fallback *within* each of those arms (not here) for a
-            // connection that bound `InteractionHub` but never subscribed
-            // to `AgentRequestHub` for this session (e.g. a strict ACP
-            // bridge connection, per `strict_acp_ws_forwards_backend_
-            // permission_requests_to_the_bound_client`). Every other
-            // method (including the plain `terminal/output`/
-            // `wait_for_exit`/`kill`/`release` polls below, which have no
-            // relay concept of their own) keeps trying `InteractionHub`
-            // here, unconditionally, same as before this carve-out
-            // existed. Profile policy/direct handling remains the
-            // deliberate fallback once every applicable live path returns
-            // nothing.
-            let has_dedicated_relay = matches!(
-                method,
-                "session/request_permission"
-                    | "fs/read_text_file"
-                    | "fs/write_text_file"
-                    | "terminal/create"
-            );
-            if !has_dedicated_relay {
-                if let Some(live) = live {
-                    match try_forward_interaction(live, &value).await {
-                        Ok(Some(mut reply)) => {
-                            // The outer client sees ACPX's opaque interaction id;
-                            // the backend must receive the id it originally sent.
-                            reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                            backend.writer.lock().await.write_value(&reply).await?;
-                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            let reply = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                                "error": {
-                                    "code": -32001,
-                                    "message": format!("acpx interactive client request failed: {error}"),
-                                }
-                            });
-                            backend.writer.lock().await.write_value(&reply).await?;
-                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-                            continue;
-                        }
+        match handle_unmatched_frame(backend, value, &policy, live).await? {
+            UnmatchedOutcome::AgentRequestAnswered(entry) => {
+                agent_requests.push(entry);
+                continue;
+            }
+            UnmatchedOutcome::Delivered => continue,
+            UnmatchedOutcome::Notification(value) => {
+                notifications.push(value);
+            }
+        }
+    }
+}
+
+/// Outcome of routing one frame [`read_matching_response_with_idle_timeout`]'s
+/// read loop (or the process-reader-demux consumer,
+/// `spawn_demux_consumer`) observed that did not match the
+/// response id its caller is waiting on.
+enum UnmatchedOutcome {
+    /// An agent-initiated request (`id` + `method`) was answered and the
+    /// reply already written to `backend.writer`; record it for
+    /// `_acpx.agentRequests`.
+    AgentRequestAnswered(serde_json::Value),
+    /// A `session/update` notification was delivered to a live subscriber;
+    /// nothing further to do.
+    Delivered,
+    /// No live delivery happened (no `live` ctx, no subscriber, or not a
+    /// `session/update`) -- caller should buffer it into `_acpx.updates`.
+    Notification(serde_json::Value),
+}
+
+/// Answer or route one frame that didn't match the response id a caller
+/// of `read_matching_response*` is waiting on. Pulled out of that
+/// function's read loop into its own function -- byte-for-byte identical
+/// logic, just given a call boundary -- so the process-reader-demux
+/// consumer (phase 1, `memory/acpx/gen/acpx-concurrency-config-execution.
+/// meta.json`) can reuse the exact same agent-request-answering and
+/// live-notification-delivery behavior for frames it observes outside of
+/// any in-flight caller's own read loop, instead of a second,
+/// divergence-prone copy of this security-sensitive (permission/approval)
+/// logic.
+async fn handle_unmatched_frame(
+    backend: &mut acpx_conductor::BackendProcess,
+    value: serde_json::Value,
+    policy: &BackendCallPolicy,
+    live: Option<&LiveNotifyCtx>,
+) -> Result<UnmatchedOutcome, RouterError> {
+    // An agent-initiated *request* (has both its own `id` and a
+    // `method`) is not a notification -- pre-fix, this loop treated
+    // it as one, pushing it into `notifications` and never replying,
+    // which left the backend deadlocked forever waiting for an
+    // answer that would never come (verified as a real hang, not a
+    // hypothetical, against `session/request_permission`: every real
+    // adapter that asks permission mid-turn blocks its own response
+    // to the *outer* call on getting one). `session/request_permission`
+    // is the only such method acpx knows how to answer today (see
+    // `build_permission_reply`); anything else gets a proper JSON-RPC
+    // method-not-found error instead of silence, so a backend that
+    // sends some other agent-initiated request acpx doesn't yet
+    // support still gets *a* reply and can decide how to proceed
+    // (e.g. treat it as declined) rather than hanging indefinitely.
+    if let (Some(_), Some(method)) = (
+        value.get("id"),
+        value.get("method").and_then(|m| m.as_str()),
+    ) {
+        // A persistent transport may have a client bound to this exact
+        // tenant/session. Give that client the first chance to answer
+        // every backend-initiated request, with one carve-out:
+        // `session/request_permission`/`fs/read_text_file`/
+        // `fs/write_text_file`/`terminal/create` each have their own
+        // dedicated `AgentRequestHub` relay below (real clients, e.g.
+        // the panel's `acpx/agent_request`/`acpx/agent_response`
+        // envelope, already depend on that exact wire contract) --
+        // tried first for those four, with `InteractionHub` as the
+        // fallback *within* each of those arms (not here) for a
+        // connection that bound `InteractionHub` but never subscribed
+        // to `AgentRequestHub` for this session (e.g. a strict ACP
+        // bridge connection, per `strict_acp_ws_forwards_backend_
+        // permission_requests_to_the_bound_client`). Every other
+        // method (including the plain `terminal/output`/
+        // `wait_for_exit`/`kill`/`release` polls below, which have no
+        // relay concept of their own) keeps trying `InteractionHub`
+        // here, unconditionally, same as before this carve-out
+        // existed. Profile policy/direct handling remains the
+        // deliberate fallback once every applicable live path returns
+        // nothing.
+        let has_dedicated_relay = matches!(
+            method,
+            "session/request_permission"
+                | "fs/read_text_file"
+                | "fs/write_text_file"
+                | "terminal/create"
+        );
+        if !has_dedicated_relay {
+            if let Some(live) = live {
+                match try_forward_interaction(live, &value).await {
+                    Ok(Some(mut reply)) => {
+                        // The outer client sees ACPX's opaque interaction id;
+                        // the backend must receive the id it originally sent.
+                        reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+                            serde_json::json!({"request": value, "reply": reply}),
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                            "error": {
+                                "code": -32001,
+                                "message": format!("acpx interactive client request failed: {error}"),
+                            }
+                        });
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+                            serde_json::json!({"request": value, "reply": reply}),
+                        ));
                     }
                 }
             }
-            let reply = if method == "session/request_permission" {
+        }
+        let reply = if method == "session/request_permission" {
                 // **Interactive relay addition.** A live client (WS,
                 // currently) that owns this gateway session gets first
                 // say: it may take real user interaction to answer, so
@@ -5383,30 +5539,30 @@ async fn read_matching_response_with_idle_timeout(
                     }
                 })
             };
-            backend.writer.lock().await.write_value(&reply).await?;
-            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-            continue;
-        }
-        // **Phase 14.** A real notification (`method`, no `id`) -- try
-        // live delivery first when a subscribed transport connection is
-        // known (`live.is_some()`) and this is the one notification type
-        // that's actually session-scoped and worth streaming live,
-        // `session/update`. Anything not delivered live (no `live` ctx at
-        // all, e.g. the plain `&mut self` dispatch path; no live
-        // subscriber currently registered for this session, e.g. an
-        // HTTP-only client; or a notification method other than
-        // `session/update`) falls through to the pre-existing buffering
-        // behavior unchanged, so `_acpx.updates` keeps working exactly as
-        // before for every case this phase doesn't newly handle.
-        if let Some(ctx) = live {
-            if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
-                && try_deliver_live(ctx, &value).await
-            {
-                continue;
-            }
-        }
-        notifications.push(value);
+        backend.writer.lock().await.write_value(&reply).await?;
+        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+            serde_json::json!({"request": value, "reply": reply}),
+        ));
     }
+    // **Phase 14.** A real notification (`method`, no `id`) -- try
+    // live delivery first when a subscribed transport connection is
+    // known (`live.is_some()`) and this is the one notification type
+    // that's actually session-scoped and worth streaming live,
+    // `session/update`. Anything not delivered live (no `live` ctx at
+    // all, e.g. the plain `&mut self` dispatch path; no live
+    // subscriber currently registered for this session, e.g. an
+    // HTTP-only client; or a notification method other than
+    // `session/update`) falls through to the pre-existing buffering
+    // behavior unchanged, so `_acpx.updates` keeps working exactly as
+    // before for every case this phase doesn't newly handle.
+    if let Some(ctx) = live {
+        if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
+            && try_deliver_live(ctx, &value).await
+        {
+            return Ok(UnmatchedOutcome::Delivered);
+        }
+    }
+    Ok(UnmatchedOutcome::Notification(value))
 }
 
 /// Fold `notifications` and `agent_requests` (both as collected by
@@ -6260,7 +6416,7 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence, call_policy, agent_id, agent_relay, notification_hub) = {
+    let (backend, persistence, call_policy, agent_id, agent_relay, notification_hub, process_reader_demux) = {
         let mut r = router.lock().await;
         let entry = match r.sessions.resolve(
             tenant_id,
@@ -6279,13 +6435,20 @@ async fn dispatch_proxied_shared(
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // The demux consumer (spawned below, once handshake completes)
+        // subsumes the idle scavenger's job for this process -- spawning
+        // both would leave two tasks competing for the same lock to do
+        // overlapping work.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         r.sessions.set_in_flight(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             1,
         );
         let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
+        let process_reader_demux = r.process_reader_demux;
         (
             backend,
             r.persistence.clone(),
@@ -6293,6 +6456,7 @@ async fn dispatch_proxied_shared(
             agent_id,
             r.agent_request_hub.clone(),
             r.notification_hub.clone(),
+            process_reader_demux,
         )
     };
 
@@ -6306,26 +6470,79 @@ async fn dispatch_proxied_shared(
     let response_result = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&request).await?;
-        let live = LiveNotifyCtx {
-            router: std::sync::Arc::clone(router),
-            agent_id,
-            tenant_id: Some(tenant_id.clone()),
-            agent_relay,
-            gateway_session_id: Some(gateway_session_id.clone()),
-            notification_hub,
-            backend: std::sync::Arc::clone(&backend),
-        };
-        let (response, notifications, agent_requests) =
-            read_matching_response_with_idle_timeout(
-                &mut proc,
-                &id,
-                call_policy,
-                Some(&live),
-                session_establish_or_default_idle_timeout(&method),
-            )
-            .await?;
-        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        if process_reader_demux {
+            // **Phase 1, `process_reader_demux`.** Register-then-await
+            // instead of holding `proc` (the per-process lock) across the
+            // write and the entire blocking read loop -- see
+            // `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.
+            // This is the change that lets two sessions sharing this
+            // backend process actually overlap in wall time.
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let idle_timeout = session_establish_or_default_idle_timeout(&method);
+            let rx = pending.register(&id).await;
+            writer.lock().await.write_value(&request).await?;
+            let response = match tokio::time::timeout(idle_timeout, acpx_conductor::demux::recv(rx)).await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = idle_timeout.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path); killing the wedged process so every \
+                         other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(idle_timeout));
+                }
+            };
+            // Unmatched frames (notifications/agent-requests) are handled
+            // entirely by the independent demux consumer task, not
+            // observed by this call at all -- see `process_reader_demux`'s
+            // field doc comment for the tradeoff this implies.
+            Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
+        } else {
+            proc.writer.lock().await.write_value(&request).await?;
+            let live = LiveNotifyCtx {
+                router: std::sync::Arc::clone(router),
+                agent_id,
+                tenant_id: Some(tenant_id.clone()),
+                agent_relay,
+                gateway_session_id: Some(gateway_session_id.clone()),
+                notification_hub,
+                backend: std::sync::Arc::clone(&backend),
+            };
+            let (response, notifications, agent_requests) =
+                read_matching_response_with_idle_timeout(
+                    &mut proc,
+                    &id,
+                    call_policy,
+                    Some(&live),
+                    session_establish_or_default_idle_timeout(&method),
+                )
+                .await?;
+            Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        }
     }
     .await;
     {
@@ -6510,6 +6727,9 @@ async fn dispatch_session_new_shared(
         admission,
         call_policy,
         pre_minted_gateway_id,
+        agent_relay,
+        notification_hub,
+        process_reader_demux,
     ) = {
         let mut r = router.lock().await;
         let params = request
@@ -6604,7 +6824,12 @@ async fn dispatch_session_new_shared(
 
         let admission = r.admit_session(tenant_id)?;
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // The demux consumer (spawned below, once handshake completes)
+        // subsumes the idle scavenger's job for this process -- see
+        // `dispatch_proxied_shared`'s identical branch.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         // See `dispatch_session_new`'s identical fallback for why: native/
         // unmanaged mode still picks up whatever profile
         // `ensure_default_profiles_seeded` auto-seeded under this
@@ -6614,6 +6839,7 @@ async fn dispatch_session_new_shared(
             .clone()
             .or_else(|| r.profiles.get(&agent_id).cloned());
         let call_policy = r.call_policy(call_policy_profile.as_ref());
+        let process_reader_demux = r.process_reader_demux;
         (
             agent_id,
             profile,
@@ -6623,41 +6849,104 @@ async fn dispatch_session_new_shared(
             admission,
             call_policy,
             pre_minted_gateway_id,
+            r.agent_request_hub.clone(),
+            r.notification_hub.clone(),
+            process_reader_demux,
         )
     };
 
     let mut response = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&request).await?;
-        // No `LiveNotifyCtx` here, deliberately: this exact call is what
-        // *creates* the gateway session (`self.sessions.register` below,
-        // after this block returns) -- until that registration happens, no
-        // gateway session id exists yet for `try_deliver_live`'s
-        // `find_by_backend` lookup to ever find, and no transport
-        // connection could possibly have subscribed to it yet either (a
-        // connection only learns the gateway session id from *this*
-        // call's own response). Passing a live ctx here would be dead
-        // code that always falls back to buffering -- `session/prompt`/
-        // `session/resume`/`session/load` (`dispatch_proxied_shared`,
-        // which *does* pass one) are where live delivery actually
-        // matters, since those always target an already-registered
-        // session.
-        let (response, notifications, agent_requests) =
-            read_matching_response_with_idle_timeout(
-                &mut proc,
-                &id,
-                call_policy,
-                None,
+        // No `LiveNotifyCtx` on the non-demux path below, deliberately:
+        // this exact call is what *creates* the gateway session
+        // (`self.sessions.register` below, after this block returns) --
+        // until that registration happens, no gateway session id exists
+        // yet for `try_deliver_live`'s `find_by_backend` lookup to ever
+        // find, and no transport connection could possibly have
+        // subscribed to it yet either (a connection only learns the
+        // gateway session id from *this* call's own response). Passing a
+        // live ctx here would be dead code that always falls back to
+        // buffering -- `session/prompt`/`session/resume`/`session/load`
+        // (`dispatch_proxied_shared`, which *does* pass one) are where
+        // live delivery actually matters, since those always target an
+        // already-registered session. The demux consumer below has the
+        // same `tenant_id: None`/`gateway_session_id: None` shape for the
+        // same reason -- it's process-scoped, not call-scoped, so it
+        // never had a live ctx to pass here in the first place.
+        if process_reader_demux {
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let rx = pending.register(&id).await;
+            writer.lock().await.write_value(&request).await?;
+            let response = match tokio::time::timeout(
                 SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
+                acpx_conductor::demux::recv(rx),
             )
-            .await?;
-        Ok::<_, RouterError>(attach_session_new_extras(
-            response,
-            notifications,
-            agent_requests,
-            proc.agent_capabilities.clone(),
-        ))
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = SESSION_ESTABLISH_IDLE_READ_TIMEOUT.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path, session/new); killing the wedged \
+                         process so every other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(
+                        SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
+                    ));
+                }
+            };
+            let agent_capabilities = {
+                let proc = backend.lock().await;
+                proc.agent_capabilities.clone()
+            };
+            Ok::<_, RouterError>(attach_session_new_extras(
+                response,
+                Vec::new(),
+                Vec::new(),
+                agent_capabilities,
+            ))
+        } else {
+            proc.writer.lock().await.write_value(&request).await?;
+            let (response, notifications, agent_requests) =
+                read_matching_response_with_idle_timeout(
+                    &mut proc,
+                    &id,
+                    call_policy,
+                    None,
+                    SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
+                )
+                .await?;
+            Ok::<_, RouterError>(attach_session_new_extras(
+                response,
+                notifications,
+                agent_requests,
+                proc.agent_capabilities.clone(),
+            ))
+        }
     }
     .await?;
 

@@ -432,6 +432,14 @@ pub async fn serve_on_with_bridge_and_tenant_tokens(
         ..state
     };
     if let Some(runtime) = &state.bridge_runtime {
+        // **`config_hot_reload` (phase 2).** Only when the bridge is
+        // actually enabled -- `BridgeConfig::from_env` requires
+        // `ACPX_ACP_BRIDGE_CONFIG_FILE` whenever `bridge_runtime` is
+        // `Some` at all (see that function's doc comment), so this env
+        // var is guaranteed set here.
+        if let Ok(path) = std::env::var("ACPX_ACP_BRIDGE_CONFIG_FILE") {
+            acp_bridge::spawn_config_watcher(Arc::clone(runtime), std::path::PathBuf::from(path));
+        }
         if let Some(store) = state.router.lock().await.persistence_store() {
             let restored = runtime
                 .restore_recovered_sessions(&store)
@@ -667,7 +675,7 @@ async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -
     let agents_result = response.get("result").cloned().unwrap_or_default();
     runtime.refresh_models(&state.router).await;
     Json(serde_json::json!({
-        "defaultModel": runtime.config.default_model,
+        "defaultModel": runtime.config().default_model,
         "models": runtime.public_models(&agents_result).await,
     }))
     .into_response()

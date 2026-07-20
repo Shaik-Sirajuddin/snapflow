@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         .with_tenant_process_isolation(config.tenant_process_isolation)
         .with_session_process_isolation(config.session_process_isolation)
         .with_on_demand_recovery_enabled(config.startup_session_recovery_enabled)
+        .with_process_reader_demux(config.process_reader_demux)
         .with_notification_hub(NotificationHub::with_stream_retention(
             256,
             config.max_subscribers_per_session,
