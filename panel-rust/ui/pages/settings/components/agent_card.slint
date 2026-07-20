@@ -3,7 +3,6 @@ import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { AgentLogo } from "../components/agent_logo.slint";
 import { Button } from "../../../base/button.slint";
-import { LabeledSelect } from "../../../base/labeled_select.slint";
 import { Toggle } from "../../../base/toggle.slint";
 
 // Grid tile for the Agents view -- one per catalog entry (auto-discovered
@@ -43,10 +42,9 @@ export component AgentCard inherits Rectangle {
     // status->presentation mapping in one place.
     in property <string> status: "";
     in property <bool> is-default: false;
-    in-out property <string> default-model: "";
-    in property <[string]> model-options: [];
-    in-out property <string> permission-profile: "";
-    in property <[string]> profile-options: [];
+    // Set by AgentsView so narrow settings panes can use a full-width
+    // single-column card instead of overflowing the two-column grid.
+    in property <length> card-width: 260px;
     callback set-default(bool);
     callback install-requested();
     callback connect-requested();
@@ -59,8 +57,8 @@ export component AgentCard inherits Rectangle {
     property <bool> is-connected: root.status == "installed";
     property <bool> is-present: root.status == "installed" || root.status == "installed_no_session";
 
-    width: 260px;
-    height: 226px;
+    width: card-width;
+    height: 136px;
     // Same tertiary tone the search box uses so cards read as one
     // consistent surface with the rest of this page's chrome; the default
     // card gets the primary-container tint to stand out. No hover tint on
@@ -163,51 +161,9 @@ export component AgentCard inherits Rectangle {
             }
         }
 
-        // Rows 3-4: Model + Profile pickers (only meaningful once present).
-        // Both are the same "label + Select" shape -- `LabeledSelect`
-        // (base/labeled_select.slint) -- rather than each hand-rolling its
-        // own `Text` + `Select` pair.
-        // No explicit `width:` here -- this is a *direct* managed child of
-        // the padded outer VerticalLayout above (`padding:
-        // Metrics.space-6`), so its default `alignment: stretch` already
-        // sizes it correctly within the padding automatically. Binding
-        // `width: parent.width` here (as this used to) reads the padded
-        // layout's own *raw* box width, bypassing the padding inset the
-        // layout would otherwise apply -- that's why the Model/Profile
-        // pickers rendered flush to the card's outer edge instead of
-        // respecting the card's padding. The `width: parent.width`
-        // pattern used throughout this session is for cases where an
-        // element is *not* a direct layout child (nested deeper, or
-        // outside any layout at all) and genuinely doesn't get sized
-        // automatically -- it's the wrong fix for a direct child of a
-        // padded layout, which already gets sized correctly by default.
-        if root.is-present : VerticalLayout {
-            spacing: Metrics.space-2;
-            LabeledSelect {
-                width: parent.width;
-                label: "Model";
-                value <=> root.default-model;
-                options: root.model-options;
-                placeholder: "Default model";
-                searchable: root.model-options.length >= 5;
-                select-accessible-label: "Default model for " + root.agent-name;
-            }
-            LabeledSelect {
-                width: parent.width;
-                label: "Profile";
-                value <=> root.permission-profile;
-                options: root.profile-options;
-                placeholder: "Permission mode";
-                select-accessible-label: "Permission profile for " + root.agent-name;
-            }
-        }
-
-        // Row 5: primary action per status. All three are UI-only for now,
-        // same posture as `mcp_servers_view.slint`'s "Connect" button:
-        // there is no per-agent connect/disconnect RPC in
-        // `src/agent_bridge.rs` today (only `agents/install`), so Connect/
-        // Disconnect are placeholders wired up through the view; Install is
-        // the one real callback (`agents/install`).
+        // Only expose actions backed by the agent registry. There is no
+        // per-agent model/profile/connect API in ACPX, so those controls
+        // must not masquerade as persisted runtime settings.
         Rectangle {
             vertical-stretch: 1;
             HorizontalLayout {
@@ -222,27 +178,6 @@ export component AgentCard inherits Rectangle {
                     font-size: 10px;
                     font-weight: 400;
                     clicked => { root.install-requested(); }
-                }
-                if root.is-present && !root.is-connected : Button {
-                    label: "Connect";
-                    button-accessible-label: "Connect agent " + root.agent-name;
-                    btn-width: 72px;
-                    btn-height: 24px;
-                    font-size: 10px;
-                    font-weight: 400;
-                    // UI-only: no per-agent connect RPC exists yet (see
-                    // this row's doc comment).
-                    clicked => { root.connect-requested(); }
-                }
-                if root.is-connected : Button {
-                    label: "Disconnect";
-                    button-accessible-label: "Disconnect agent " + root.agent-name;
-                    btn-width: 84px;
-                    btn-height: 24px;
-                    font-size: 10px;
-                    font-weight: 400;
-                    // UI-only: no per-agent disconnect RPC exists yet.
-                    clicked => { root.disconnect-requested(); }
                 }
             }
         }

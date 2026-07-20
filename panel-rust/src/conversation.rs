@@ -373,7 +373,10 @@ pub fn rebuild_from_chat_messages(
         match msg.kind {
             ChatKind::User => {
                 open_run = None;
-                let message_id = msg.id.clone().unwrap_or_else(|| next_synthetic(&mut synthetic_counter));
+                let message_id = msg
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| next_synthetic(&mut synthetic_counter));
                 state.apply(ConversationEvent::UserMessage {
                     thread_id: thread_id.to_string(),
                     message_id,
@@ -421,7 +424,10 @@ pub fn rebuild_from_chat_messages(
             }
             ChatKind::ToolCall => {
                 open_run = None;
-                let tool_call_id = msg.id.clone().unwrap_or_else(|| next_synthetic(&mut synthetic_counter));
+                let tool_call_id = msg
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| next_synthetic(&mut synthetic_counter));
                 state.apply(ConversationEvent::ToolCall {
                     thread_id: thread_id.to_string(),
                     tool_call_id,

@@ -22,7 +22,7 @@ pub mod gateway_actor;
 pub mod jsonl_store;
 mod local_terminal;
 mod markdown;
-mod models;
+pub mod models;
 mod permission;
 pub mod protocol_types;
 mod send_queue;
@@ -165,9 +165,7 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore) {
 fn load_panel_prefs(selected_thread_id: Option<String>) -> PanelDefaults {
     let paths = settings_file::SettingsPaths::from_env();
     match paths.load_resolved() {
-        Ok(resolved) => {
-            settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id)
-        }
+        Ok(resolved) => settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
         Err(error) => {
             eprintln!("panel-rust: settings file load failed: {error}");
             PanelDefaults {
@@ -178,16 +176,99 @@ fn load_panel_prefs(selected_thread_id: Option<String>) -> PanelDefaults {
     }
 }
 
-/// Persist profile / permission / background-default into the global JSON
-/// file (atomic write). Preserves other keys already on disk (harness, …).
-fn save_panel_prefs_to_json(defaults: &PanelDefaults) -> Result<(), settings_file::SettingsFileError> {
+/// Settings values displayed for one editable tier. The Project view reads
+/// Project → Global → bundled defaults, while Global reads Global → bundled
+/// defaults. Saving the view writes only the selected tier's document.
+struct ScopedPanelPrefs {
+    defaults: PanelDefaults,
+    default_agent_id: Option<String>,
+}
+
+fn scoped_settings_path<'a>(
+    paths: &'a settings_file::SettingsPaths,
+    scope: &str,
+) -> Option<&'a std::path::Path> {
+    match scope {
+        "global" => Some(paths.global.as_path()),
+        "project" => paths.project.as_deref(),
+        _ => None,
+    }
+}
+
+fn load_scoped_panel_prefs(
+    scope: &str,
+    selected_thread_id: Option<String>,
+) -> Option<ScopedPanelPrefs> {
     let paths = settings_file::SettingsPaths::from_env();
-    let mut doc = settings_file::load_document(&paths.global).unwrap_or_default();
+    if scoped_settings_path(&paths, scope).is_none() {
+        eprintln!("panel-rust: unavailable settings scope {scope:?}");
+        return None;
+    }
+
+    let mut documents = Vec::new();
+    if let Some(path) = paths.bundled_default.as_deref() {
+        match settings_file::load_document(path) {
+            Ok(document) => documents.push(document),
+            Err(error) => {
+                eprintln!("panel-rust: bundled settings load failed: {error}");
+                return None;
+            }
+        }
+    }
+    match settings_file::load_document(&paths.global) {
+        Ok(document) => documents.push(document),
+        Err(error) => {
+            eprintln!("panel-rust: global settings load failed: {error}");
+            return None;
+        }
+    }
+    if scope == "project" {
+        let Some(path) = paths.project.as_deref() else {
+            return None;
+        };
+        match settings_file::load_document(path) {
+            Ok(document) => documents.push(document),
+            Err(error) => {
+                eprintln!("panel-rust: project settings load failed: {error}");
+                return None;
+            }
+        }
+    }
+
+    let refs: Vec<&settings_file::SettingsDocument> = documents.iter().collect();
+    let resolved = settings_file::merge_documents(&refs);
+    Some(ScopedPanelPrefs {
+        defaults: settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
+        default_agent_id: resolved.default_agent_id,
+    })
+}
+
+/// Persist profile / permission / background-default / default-agent into the
+/// selected JSON tier. Existing unrelated fields (harness, dev mode, ...) are
+/// retained by the read-modify-write operation.
+fn save_panel_prefs_to_json(
+    scope: &str,
+    defaults: &PanelDefaults,
+    default_agent_id: Option<String>,
+) -> Result<(), String> {
+    let paths = settings_file::SettingsPaths::from_env();
+    let path = scoped_settings_path(&paths, scope)
+        .ok_or_else(|| format!("settings scope {scope:?} is unavailable"))?;
+    let mut doc = settings_file::load_document(path).map_err(|error| error.to_string())?;
     doc.schema_version = 1;
     doc.default_profile = defaults.profile_name.clone();
     doc.permission_profile = defaults.permission_profile.clone();
     doc.background_session_default = Some(defaults.background_session);
-    settings_file::save_document(&paths.global, &doc)
+    doc.default_agent_id = default_agent_id;
+    settings_file::save_document(path, &doc).map_err(|error| error.to_string())
+}
+
+fn provider_for_default_agent(agent_id: &str) -> Option<&str> {
+    match agent_id {
+        "codex" => Some("codex"),
+        "claude" | "claude-code" => Some("claude"),
+        _ => None,
+    }
 }
 
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
@@ -343,27 +424,55 @@ impl PanelSingleton {
         let gw = self.settings_gateway_index();
         self.component
             .set_available_profiles(models::to_profile_options(bridge.list_profiles(gw)));
-        self.component.set_available_mcp_servers(models::to_mcp_server_options(
-            bridge.list_mcp_servers(gw),
-        ));
+        self.component
+            .set_available_mcp_servers(models::to_mcp_server_options(bridge.list_mcp_servers(gw)));
         self.component
             .set_agent_catalog(models::to_agent_catalog_entries(bridge.list_agents(gw)));
         let recovery_provider = bridge.thread_provider(gw).unwrap_or_default();
-        self.component.set_recoverable_sessions(models::to_remote_session_options(
-            bridge.recoverable_sessions(gw),
-            &recovery_provider,
-        ));
+        self.component
+            .set_recoverable_sessions(models::to_remote_session_options(
+                bridge.recoverable_sessions(gw),
+                &recovery_provider,
+            ));
     }
 
     fn apply_json_prefs_to_component(&self) {
-        let defaults = load_panel_prefs(None);
+        let scope = self.component.get_settings_scope().to_string();
+        let Some(prefs) = load_scoped_panel_prefs(&scope, None) else {
+            return;
+        };
+        let defaults = prefs.defaults;
         self.component
             .set_default_profile(defaults.profile_name.unwrap_or_default().into());
-        self.component.set_permission_profile(
-            defaults.permission_profile.unwrap_or_default().into(),
-        );
+        self.component
+            .set_permission_profile(defaults.permission_profile.unwrap_or_default().into());
         self.component
             .set_background_default(defaults.background_session);
+        self.component
+            .set_default_agent_id(prefs.default_agent_id.unwrap_or_default().into());
+        // Thread presentation still resolves its per-thread override through
+        // the local store. Mirror the effective JSON default so an external
+        // settings write updates the active sidebar without a restart.
+        self.sync_runtime_defaults(&load_panel_prefs(None));
+    }
+
+    fn sync_runtime_defaults(&self, effective: &PanelDefaults) {
+        let Some(store) = self.panel_state.as_ref() else {
+            return;
+        };
+        let selected_thread_id = store
+            .defaults()
+            .ok()
+            .and_then(|defaults| defaults.selected_thread_id);
+        let runtime_defaults = PanelDefaults {
+            profile_name: effective.profile_name.clone(),
+            permission_profile: effective.permission_profile.clone(),
+            background_session: effective.background_session,
+            selected_thread_id,
+        };
+        if let Err(error) = store.save_defaults(&runtime_defaults) {
+            eprintln!("panel-rust: failed to synchronize runtime panel defaults: {error}");
+        }
     }
 
     /// Derives a conservative PTY grid from the actual dock viewport.
@@ -490,7 +599,9 @@ impl PanelSingleton {
                 else {
                     return false;
                 };
-                store.effective_background_session(&thread_id).unwrap_or(false)
+                store
+                    .effective_background_session(&thread_id)
+                    .unwrap_or(false)
             })
             .collect();
         let closed: Vec<bool> = names
@@ -546,8 +657,16 @@ impl PanelSingleton {
             .into_iter()
             .map(|i| {
                 let mut item = i.item;
-                item.provider = providers.get(i.real_index).cloned().unwrap_or_default().into();
-                item.model = thread_models.get(i.real_index).cloned().unwrap_or_default().into();
+                item.provider = providers
+                    .get(i.real_index)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into();
+                item.model = thread_models
+                    .get(i.real_index)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into();
                 let project_path = thread_project_paths
                     .get(i.real_index)
                     .cloned()
@@ -614,6 +733,28 @@ impl PanelSingleton {
         }
         self.component
             .set_available_skills(crate::models::to_skill_options(entries));
+    }
+
+    /// Loads a discovered skill directory into the editor surface. New skill
+    /// creation and list-row selection share this so a successful scaffold
+    /// always opens the exact file that was written.
+    fn open_skill_editor(&self, skill_dir: &std::path::Path) {
+        let name = skill_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
+        self.component.set_active_skill_name(name.into());
+        self.component
+            .set_active_skill_path(skill_dir.to_string_lossy().into_owned().into());
+        self.component.set_active_skill_content(content.into());
+        let detected: Vec<slint::SharedString> = crate::editor_detect::detect_installed_editors()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        self.component
+            .set_detected_editors(ModelRc::new(VecModel::from(detected)));
+        self.component.set_active_pane("skill".into());
     }
 
     /// Translates a Slint-side filtered-list index (what `thread-selected`
@@ -741,10 +882,11 @@ impl PanelSingleton {
             .set_mode_trigger_label(models::current_mode_name(&modes).into());
         self.component
             .set_mode_dropdown_entries(models::to_mode_dropdown_entries(modes));
+        let config_opts = bridge.config_options(real_idx);
         self.component
-            .set_config_dropdown_entries(models::to_config_dropdown_entries(
-                bridge.config_options(real_idx),
-            ));
+            .set_config_trigger_label(models::current_config_trigger_label(&config_opts).into());
+        self.component
+            .set_config_dropdown_entries(models::to_config_dropdown_entries(config_opts));
     }
 
     /// Rebuilds the `pending-request` property for `real_idx` from the
@@ -778,6 +920,7 @@ impl PanelSingleton {
                     title: view.title.into(),
                     summary: view.summary.into(),
                     supported: permission::is_supported_method(&event.method),
+                    options: permission::to_permission_option_model(view.options),
                 }
             }
             None => PendingRequestItem {
@@ -787,6 +930,7 @@ impl PanelSingleton {
                 title: SharedString::default(),
                 summary: SharedString::default(),
                 supported: false,
+                options: permission::to_permission_option_model(Vec::new()),
             },
         };
         self.component.set_pending_request(item);
@@ -844,7 +988,9 @@ impl PanelSingleton {
     /// into an idle shell's prompt should not force a redraw every
     /// tick).
     fn refresh_local_terminal_for(&self, real_idx: usize) -> bool {
-        let Some(bridge) = &self.bridge else { return false };
+        let Some(bridge) = &self.bridge else {
+            return false;
+        };
         let snapshot = bridge.local_terminal_snapshot(real_idx);
         let new_text = snapshot
             .as_ref()
@@ -879,22 +1025,47 @@ impl PanelSingleton {
     }
 
     /// Answers the currently-displayed thread's first pending request
-    /// with `approved`, then immediately re-renders the request card
-    /// (which will hide it, since `AgentBridge::respond_to_request`
-    /// removes the entry synchronously -- see that method's doc
-    /// comment) so the UI reflects the decision without waiting for the
-    /// next `apply_bridge_events` poll tick.
-    fn answer_pending_request(&self, component: &ChatPanel, approved: bool) {
+    /// with a concrete one-of option id (Zed flat permission model), then
+    /// immediately re-renders the request card (which will hide it, since
+    /// `AgentBridge::respond_to_request` removes the entry synchronously).
+    fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
         let Some(bridge) = &self.bridge else { return };
         let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
             return;
         };
         let pending = bridge.pending_requests(real_idx);
         trace_host_input(format_args!(
-            "answer pending request invoked thread={real_idx} approved={approved} pending_count={}",
+            "answer pending request option thread={real_idx} option_id={option_id} pending_count={}",
             pending.len()
         ));
         let Some(event) = pending.first() else { return };
+        let response = permission::build_response_for_option(event, option_id);
+        bridge.respond_to_request(real_idx, &event.relay_id, response);
+        self.refresh_pending_request_for(real_idx);
+    }
+
+    /// Keyboard convenience: approve/reject maps to the first allow_* /
+    /// reject_* option on the live request (same fallback as
+    /// [`permission::build_response`]).
+    fn answer_pending_request(&self, component: &ChatPanel, approved: bool) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+            return;
+        };
+        let pending = bridge.pending_requests(real_idx);
+        let Some(event) = pending.first() else { return };
+        let options = permission::extract_options(event);
+        let option_id = if approved {
+            permission::default_allow_option_id(&options)
+        } else {
+            permission::default_reject_option_id(&options)
+        };
+        if let Some(id) = option_id {
+            self.answer_pending_request_option(component, id);
+            return;
+        }
+        // No matching option (e.g. reject with only allow offered) —
+        // fall through to build_response's cancel policy.
         let response = permission::build_response(event, approved);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
         self.refresh_pending_request_for(real_idx);
@@ -1264,7 +1435,20 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .as_ref()
             .and_then(|store| store.defaults().ok())
             .and_then(|d| d.selected_thread_id);
-        let defaults = load_panel_prefs(selected_from_sqlite);
+        let settings_scope = if settings_file::SettingsPaths::from_env()
+            .project
+            .is_some()
+        {
+            "project"
+        } else {
+            "global"
+        };
+        panel.component.set_settings_scope(settings_scope.into());
+        let scoped_prefs = load_scoped_panel_prefs(settings_scope, selected_from_sqlite.clone());
+        let defaults = scoped_prefs
+            .as_ref()
+            .map(|prefs| prefs.defaults.clone())
+            .unwrap_or_else(|| load_panel_prefs(selected_from_sqlite));
         panel.component.set_default_profile(
             defaults.profile_name.clone().unwrap_or_default().into(),
         );
@@ -1278,6 +1462,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         panel
             .component
             .set_background_default(defaults.background_session);
+        panel.component.set_default_agent_id(
+            scoped_prefs
+                .and_then(|prefs| prefs.default_agent_id)
+                .unwrap_or_default()
+                .into(),
+        );
+        panel.sync_runtime_defaults(&defaults);
         let dev_mode_at_startup = settings_file::SettingsPaths::from_env().dev_mode();
         panel.component.set_dev_mode(dev_mode_at_startup);
         if dev_mode_at_startup {
@@ -1358,14 +1549,16 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     // Open immediately so a slow/failed gateway list cannot
                     // leave the user thinking Settings is dead.
                     component.set_settings_open(true);
-                    let defaults = load_panel_prefs(None);
-                    component.set_default_profile(
-                        defaults.profile_name.unwrap_or_default().into(),
-                    );
-                    component.set_permission_profile(
-                        defaults.permission_profile.unwrap_or_default().into(),
-                    );
-                    component.set_background_default(defaults.background_session);
+                    let scope = if settings_file::SettingsPaths::from_env()
+                        .project
+                        .is_some()
+                    {
+                        "project"
+                    } else {
+                        "global"
+                    };
+                    component.set_settings_scope(scope.into());
+                    panel.apply_json_prefs_to_component();
                     if let Some(store) = panel.panel_state.as_ref() {
                         let selected_override = panel
                             .real_index(component.get_selected_thread() as usize)
@@ -1388,6 +1581,23 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     }
                     panel.refresh_settings_gateway_lists();
                 }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_settings_scope_changed(move |scope| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                if load_scoped_panel_prefs(scope.as_str(), None).is_none() {
+                    component.set_settings_scope("global".into());
+                }
+                panel.apply_json_prefs_to_component();
             });
         });
 
@@ -1415,10 +1625,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                             }),
                     };
                     // JSON is the multi-process source of truth for prefs.
-                    if let Err(error) = save_panel_prefs_to_json(&defaults) {
+                    if let Err(error) = save_panel_prefs_to_json(
+                        component.get_settings_scope().as_str(),
+                        &defaults,
+                        non_empty(component.get_default_agent_id().to_string()),
+                    ) {
                         eprintln!("panel-rust: failed to save panel settings JSON: {error}");
                         return;
                     }
+                    // JSON remains the cross-process source of truth. The
+                    // SQLite mirror exists solely for immediate thread-level
+                    // background-session resolution in this panel process.
+                    panel.sync_runtime_defaults(&load_panel_prefs(None));
                     // Mark self-write so the file watcher does not bounce UI.
                     panel.settings_ignore_watch_until.set(Some(
                         std::time::Instant::now() + std::time::Duration::from_millis(500),
@@ -1540,6 +1758,51 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
             });
         });
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_mcp_server_enabled_changed(move |name, enabled| {
+                let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                    let slot = cell.borrow();
+                    let Some(panel) = slot.as_ref() else {
+                        return;
+                    };
+                    let Some(bridge) = &panel.bridge else {
+                        return;
+                    };
+                    let gw = panel.settings_gateway_index();
+                    let Some(mut entry) = bridge
+                        .list_mcp_servers(gw)
+                        .into_iter()
+                        .find(|entry| entry.name == name.as_str())
+                    else {
+                        eprintln!(
+                            "panel-rust: MCP server {:?} disappeared before its enabled state could update",
+                            name
+                        );
+                        component.set_available_mcp_servers(models::to_mcp_server_options(
+                            bridge.list_mcp_servers(gw),
+                        ));
+                        return;
+                    };
+                    entry.extra["enabled"] = serde_json::Value::Bool(enabled);
+                    if !bridge.update_mcp_server(gw, entry.extra) {
+                        eprintln!(
+                            "panel-rust: failed to update enabled state for MCP server {:?}",
+                            name
+                        );
+                    }
+                    // The gateway is authoritative. Re-list after either
+                    // outcome rather than leaving an optimistic UI value.
+                    component.set_available_mcp_servers(models::to_mcp_server_options(
+                        bridge.list_mcp_servers(gw),
+                    ));
+                });
+            });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -1765,6 +2028,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 let prefs = load_panel_prefs(None);
                 let default_profile = non_empty(component.get_default_profile().to_string())
                     .or(prefs.profile_name);
+                let default_agent_id = non_empty(component.get_default_agent_id().to_string())
+                    .or_else(|| {
+                        settings_file::SettingsPaths::from_env()
+                            .load_resolved()
+                            .ok()
+                            .and_then(|resolved| resolved.default_agent_id)
+                    });
                 let mut profile = default_profile;
                 // Resolve gateway index before mutably borrowing the bridge.
                 let gw = panel.settings_gateway_index();
@@ -1786,7 +2056,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                             profile = None;
                         }
                     }
-                    let Ok(real_idx) = bridge.add_thread_with_profile(&name, profile.as_deref())
+                    let preferred_provider = default_agent_id
+                        .as_deref()
+                        .and_then(provider_for_default_agent);
+                    let Ok(real_idx) = bridge.add_thread_with_profile_and_provider(
+                        &name,
+                        profile.as_deref(),
+                        preferred_provider,
+                    )
                     else {
                         return;
                     };
@@ -1851,17 +2128,92 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
-        panel.component.on_new_skill_requested(move |name| {
+        panel.component.on_thread_rename_requested(move |filtered_idx, name| {
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                return;
+            }
+            PANEL.with(|cell| {
+                let panel_slot = cell.borrow();
+                let Some(panel) = panel_slot.as_ref() else {
+                    return;
+                };
+                let Some(real_idx) = panel.real_index(filtered_idx as usize) else {
+                    return;
+                };
+                let thread_id = panel
+                    .bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_binding(real_idx))
+                    .map(|binding| binding.thread_id);
+
+                let Some(current_name) = panel.thread_names.borrow().get(real_idx).cloned() else {
+                    return;
+                };
+                if current_name == name {
+                    return;
+                }
+                if let Some(slot) = panel.thread_names.borrow_mut().get_mut(real_idx) {
+                    *slot = name.clone();
+                }
+                if let (Some(store), Some(thread_id)) = (panel.panel_state.as_ref(), thread_id) {
+                    if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
+                        eprintln!("panel-rust: failed to persist renamed chat thread: {error}");
+                    }
+                }
+
+                panel.refresh_threads_model();
+                let updated_filtered_idx = {
+                    panel
+                        .visible_indices
+                        .borrow()
+                        .iter()
+                        .position(|idx| *idx == real_idx)
+                };
+                let has_visible_threads = !panel.visible_indices.borrow().is_empty();
+                if let Some(updated_filtered_idx) = updated_filtered_idx {
+                    panel.component.set_selected_thread(updated_filtered_idx as i32);
+                    panel.refresh_messages_for(real_idx);
+                } else if has_visible_threads {
+                    panel.component.set_selected_thread(0);
+                }
+            });
+        });
+
+        panel.component.on_new_skill_requested(move |name, scope| {
             PANEL.with(|cell| {
                 let slot = cell.borrow();
                 let Some(panel) = slot.as_ref() else {
                     return;
                 };
-                let dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                let skill_scope = match scope.as_str() {
+                    "global" => crate::skills_state::SkillScope::Global,
+                    "project" => crate::skills_state::SkillScope::Project,
+                    other => {
+                        eprintln!("panel-rust: invalid new skill scope {other:?}");
+                        return;
+                    }
+                };
+                let active_project_path = panel.active_project_path.borrow().clone();
+                let active_project_file = active_project_path.as_deref().map(std::path::Path::new);
+                let dir = match crate::skills_state::skill_creation_dir(
+                    skill_scope,
+                    &resolve_cache_dir(),
+                    active_project_file,
+                ) {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        eprintln!(
+                            "panel-rust: failed to resolve {scope} skill storage for {name:?}: {error}"
+                        );
+                        return;
+                    }
+                };
                 match crate::skills_state::scaffold_new_skill(&dir, name.as_str()) {
                     Ok(skill_dir) => {
                         trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
                         panel.refresh_skills_model();
+                        panel.open_skill_editor(&skill_dir);
                     }
                     Err(error) => {
                         eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
@@ -1917,25 +2269,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 let Some(panel) = slot.as_ref() else {
                     return;
                 };
-                let path = std::path::PathBuf::from(path.as_str());
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let content =
-                    std::fs::read_to_string(path.join("SKILL.md")).unwrap_or_default();
-                panel.component.set_active_skill_name(name.into());
-                panel
-                    .component
-                    .set_active_skill_path(path.to_string_lossy().into_owned().into());
-                panel.component.set_active_skill_content(content.into());
-                let detected: Vec<slint::SharedString> = crate::editor_detect::detect_installed_editors()
-                    .into_iter()
-                    .map(Into::into)
-                    .collect();
-                panel
-                    .component
-                    .set_detected_editors(ModelRc::new(VecModel::from(detected)));
+                panel.open_skill_editor(std::path::Path::new(path.as_str()));
             });
         });
 
@@ -2184,6 +2518,22 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        // One-of select: each option row on the permission card sends its
+        // optionId (ACP or synthetic approve/reject).
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_permission_option_selected(move |option_id| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        panel.answer_pending_request_option(&component, option_id.as_str());
+                    }
+                });
+            });
+
         // Terminal-view addition: expand a card into the floating
         // overlay, and close it. `refresh_terminals_for` (called from
         // every `refresh_messages_for`) keeps whichever terminal is
@@ -2374,6 +2724,80 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         });
 
         let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_search_submitted(move |query, search_skills, show_global| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    let slot = cell.borrow();
+                    let Some(panel) = slot.as_ref() else {
+                        return;
+                    };
+                    if search_skills {
+                        let needle = query.trim().to_lowercase();
+                        let global_dir =
+                            crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                        let mut entries = if show_global {
+                            crate::skills_state::scan_skills_dir(
+                                &global_dir,
+                                crate::skills_state::SkillScope::Global,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        if let Some(project_path) = panel.active_project_path.borrow().as_ref() {
+                            if let Some(project_dir) =
+                                std::path::Path::new(project_path).parent()
+                            {
+                                entries.extend(crate::skills_state::scan_skills_dir(
+                                    &crate::skills_state::project_skills_dir(project_dir),
+                                    crate::skills_state::SkillScope::Project,
+                                ));
+                            }
+                        }
+                        entries.sort_by(|a, b| a.name.cmp(&b.name));
+                        if let Some(entry) = entries.into_iter().find(|entry| {
+                            needle.is_empty()
+                                || entry.name.to_lowercase().contains(&needle)
+                                || entry.description.to_lowercase().contains(&needle)
+                        }) {
+                            panel.open_skill_editor(&entry.path);
+                        }
+                        return;
+                    }
+
+                    // Reapply the host-side filter immediately before
+                    // activation so Enter always opens the first current
+                    // result, even when the key arrives with the final edit
+                    // event still queued by the platform.
+                    *panel.search_query.borrow_mut() = query.to_string();
+                    panel.refresh_threads_model();
+                    let Some(real_idx) = panel.real_index(0) else {
+                        component
+                            .set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
+                        return;
+                    };
+                    component.set_selected_thread(0);
+                    if let (Some(store), Some(binding)) = (
+                        panel.panel_state.as_ref(),
+                        panel
+                            .bridge
+                            .as_ref()
+                            .and_then(|bridge| bridge.thread_binding(real_idx)),
+                    ) {
+                        if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
+                            eprintln!(
+                                "panel-rust: failed to persist search-selected chat thread: {error}"
+                            );
+                        }
+                    }
+                    panel.refresh_messages_for(real_idx);
+                });
+            });
+
+        let component_weak = panel.component.as_weak();
         panel.component.on_toggle_expanded(move |index| {
             let Some(_component) = component_weak.upgrade() else {
                 return;
@@ -2503,11 +2927,13 @@ pub extern "C" fn panel_rust_input_scroll(
     let Some(window) = window else {
         return false;
     };
-    window.window().dispatch_event(WindowEvent::PointerScrolled {
-        position: slint::LogicalPosition::new(x, y),
-        delta_x,
-        delta_y,
-    });
+    window
+        .window()
+        .dispatch_event(WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(x, y),
+            delta_x,
+            delta_y,
+        });
     true
 }
 
@@ -2954,7 +3380,9 @@ mod lifecycle_tests {
         PANEL.with(|cell| {
             let panel = cell.borrow();
             let panel = panel.as_ref().expect("panel exists");
-            panel.component.set_compose_text("preserve this draft".into());
+            panel
+                .component
+                .set_compose_text("preserve this draft".into());
         });
         assert!(panel_rust_apply_host_appearance(
             first,

@@ -1,46 +1,12 @@
 import { Theme } from "../../../tokens/theme.slint";
-import { Metrics } from "../../../tokens/metrics.slint";
+import { FilterSearchBar } from "../../../base/filter_search_bar.slint";
 
-// Settings page chrome -- the search bar from the settings-pane-redesign
-// plan's "Component layout" section, sitting above the active section's
-// content and filtering its rows by label (client-side substring filter,
-// per the plan -- no new Rust plumbing). This phase only wires the text
-// input itself up to `query`; per-row filtering against it is left to a
-// later pass once the real per-section views (mcp_servers_view.slint's
-// list, agents_view.slint's grid) exist to filter -- Slint's `string` type
-// has no `contains`/`index-of` builtin (confirmed against the bundled
-// compiler grammar while building this), so real substring filtering will
-// need either a small helper on the Rust side or a manual scan, deferred
-// until a section actually needs it.
-export component SettingsSearchBar inherits Rectangle {
-    in-out property <string> query: "";
-
-    height: 28px;
-    background: Theme.bg-tertiary;
-    border-width: 1px;
-    border-color: Theme.border-default;
-    border-radius: Theme.radius-sm;
-
-    TextInput {
-        accessible-label: "Search settings";
-        accessible-action-default => { self.focus(); }
-        text <=> root.query;
-        color: Theme.text-primary;
-        font-size: 11px * Theme.font-scale;
-        x: Metrics.space-4;
-        // See text_field.slint's identical fix for why y/height are
-        // pinned explicitly here.
-        y: 0px;
-        height: parent.height;
-        width: parent.width - 2 * Metrics.space-4;
-        vertical-alignment: center;
-    }
-    if root.query == "" : Text {
-        text: "Search settings...";
-        color: Theme.text-muted;
-        font-size: 11px * Theme.font-scale;
-        x: Metrics.space-4;
-        height: parent.height;
-        vertical-alignment: center;
-    }
+// Settings page — thin wrap of shared FilterSearchBar with settings defaults.
+// All settings search sites should use this (or FilterSearchBar directly).
+export component SettingsSearchBar inherits FilterSearchBar {
+    show-icon: false;
+    icon-trailing: false;
+    bar-bg: Theme.bg-tertiary;
+    placeholder: "Search settings...";
+    bar-accessible-label: "Search settings";
 }

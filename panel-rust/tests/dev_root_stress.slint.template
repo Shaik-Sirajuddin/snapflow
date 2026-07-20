@@ -18,7 +18,6 @@ export component DevRoot inherits ChatPanel {
     compact: false;
     sidebar-expanded: true;
     narrow: false;
-    agent-badge: "codex . ask";
     has-older-messages: true;
     loading-older-messages: false;
     threads: [

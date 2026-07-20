@@ -285,6 +285,21 @@ impl PanelStateStore {
         Ok(())
     }
 
+    /// Updates only the local display name. The stable thread id and ACP
+    /// session binding remain untouched, so renaming never creates a session.
+    pub fn update_thread_display_name(
+        &self,
+        thread_id: &str,
+        display_name: &str,
+    ) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        connection.execute(
+            "UPDATE thread_settings SET display_name = ?2 WHERE thread_id = ?1",
+            params![thread_id, display_name],
+        )?;
+        Ok(())
+    }
+
     /// Profile and permission bindings become immutable once `session/new`
     /// succeeds. Changing either must create a new thread/session instead of
     /// silently migrating a populated transcript.
@@ -427,6 +442,32 @@ mod tests {
         store.save_thread_record(&second).unwrap();
 
         assert_eq!(store.thread_records().unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn update_thread_display_name_preserves_durable_binding() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let record = ThreadRecord {
+            thread_id: "timeline".to_owned(),
+            display_name: "Fix timeline".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-1".to_owned(),
+            profile_name: Some("review".to_owned()),
+            permission_profile: None,
+            background_session: None,
+        };
+        store.save_thread_record(&record).unwrap();
+        store
+            .update_thread_display_name(&record.thread_id, "Repair timeline")
+            .unwrap();
+
+        assert_eq!(
+            store.thread_records().unwrap(),
+            vec![ThreadRecord {
+                display_name: "Repair timeline".to_owned(),
+                ..record
+            }]
+        );
     }
 
     #[test]

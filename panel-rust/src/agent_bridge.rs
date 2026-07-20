@@ -57,17 +57,17 @@
 //!   with durable server-side session storage exists to validate
 //!   against.
 
-use crate::jsonl_store::{
-    JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
-};
 use crate::conversation::ConversationState;
-use crate::protocol_types::{
-    AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
-    TerminalOutputEvent,
-};
 use crate::gateway_actor::{
     spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_gateway,
     AcpxThreadGatewaySetter, AcpxThreadHandle,
+};
+use crate::jsonl_store::{
+    JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
+};
+use crate::protocol_types::{
+    AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
+    TerminalOutputEvent,
 };
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -168,9 +168,9 @@ struct ThreadSlot {
     /// `terminal_id` -- populated from `AgentEvent::TerminalOutput`
     /// (the gateway's `acpx/terminal_output` push, see
     /// `acpx_core::router::spawn_terminal_output_stream`'s doc comment).
-   /// Always the current whole-buffer snapshot, never appended-to --
-   /// matches that event's own "replace, don't append" contract.
-   terminal_buffers: Mutex<HashMap<String, TerminalBuffer>>,
+    /// Always the current whole-buffer snapshot, never appended-to --
+    /// matches that event's own "replace, don't append" contract.
+    terminal_buffers: Mutex<HashMap<String, TerminalBuffer>>,
     /// Insertion-ordered list of every terminal id ever seen on this
     /// thread (first-seen order) -- `HashMap` iteration order is
     /// unspecified, but the UI needs a stable order to render terminal
@@ -206,7 +206,7 @@ struct ThreadSlot {
     /// transcript restoration. Commands wait for this completion signal so
     /// they cannot reach the actor before `session/new`/`session/load`.
     attachment: Mutex<AttachmentState>,
-   attachment_ready: tokio::sync::Notify,
+    attachment_ready: tokio::sync::Notify,
     /// Set once [`AgentBridge::close_thread`] has sent a real
     /// `session/close` for this thread. Purely a presentation flag --
     /// see that method's doc comment and this plan's Coverage Matrix
@@ -269,7 +269,8 @@ pub struct AgentBridge {
     // which `PanelSingleton`'s own `&self` refresh methods
     // (`refresh_terminals_for` and friends) rely on being able to call
     // without needing `&mut self.bridge` threaded through.
-    local_terminals: std::cell::RefCell<std::collections::HashMap<usize, crate::local_terminal::LocalTerminal>>,
+    local_terminals:
+        std::cell::RefCell<std::collections::HashMap<usize, crate::local_terminal::LocalTerminal>>,
     // `chat_sessions_project_path` phase: the active MLT project's path
     // (set from `PanelSingleton::active_project_path` via
     // `set_active_project_path`), consulted by `cwd_for_session` at every
@@ -312,7 +313,9 @@ async fn open_session_maybe_profiled(
     profile: Option<&str>,
     mcp_servers: Vec<serde_json::Value>,
 ) -> Result<String, crate::gateway_actor::AcpxThreadError> {
-    handle.open_session_with(cwd, profile.map(str::to_string), mcp_servers).await
+    handle
+        .open_session_with(cwd, profile.map(str::to_string), mcp_servers)
+        .await
 }
 
 /// Recomputes `slot.transcript` from `slot.history`'s current full
@@ -358,8 +361,10 @@ fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
 fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
     match ev {
         AgentEvent::SessionModes(modes) => {
-            *slot.session_modes.lock().expect("session_modes mutex poisoned") =
-                Some(modes.clone());
+            *slot
+                .session_modes
+                .lock()
+                .expect("session_modes mutex poisoned") = Some(modes.clone());
         }
         AgentEvent::CurrentModeChanged(mode_id) => {
             if let Some(modes) = slot
@@ -409,12 +414,14 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
         terminals: terminal_order
             .into_iter()
             .filter_map(|terminal_id| {
-                terminal_buffers.get(&terminal_id).map(|buffer| TerminalRuntimeSnapshot {
-                    terminal_id,
-                    output: buffer.output.clone(),
-                    truncated: buffer.truncated,
-                    exit_status: buffer.exit_status,
-                })
+                terminal_buffers
+                    .get(&terminal_id)
+                    .map(|buffer| TerminalRuntimeSnapshot {
+                        terminal_id,
+                        output: buffer.output.clone(),
+                        truncated: buffer.truncated,
+                        exit_status: buffer.exit_status,
+                    })
             })
             .collect(),
         session_modes: slot
@@ -1456,13 +1463,7 @@ impl AgentBridge {
             // able to disable the whole chat panel -- it degrades to an
             // empty scrollback for *that thread only*, same as any other
             // cache miss.
-            let (
-                seeded,
-                cached_session_id,
-                older_available,
-                oldest_loaded_index,
-                runtime_snapshot,
-            ) =
+            let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
                 seed_thread_from_cache(store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
             let has_cached_transcript = !seeded.is_empty();
 
@@ -1519,12 +1520,12 @@ impl AgentBridge {
                 ),
                 session_modes: Mutex::new(runtime_snapshot.session_modes),
                 config_options: Mutex::new(runtime_snapshot.config_options),
-               attachment: Mutex::new(AttachmentState::default()),
-               attachment_ready: tokio::sync::Notify::new(),
-               closed: Mutex::new(false),
-               // No project can be active yet at construction time --
-               // `session_cwd_override` was just created above, unset.
-               project_path: None,
+                attachment: Mutex::new(AttachmentState::default()),
+                attachment_ready: tokio::sync::Notify::new(),
+                closed: Mutex::new(false),
+                // No project can be active yet at construction time --
+                // `session_cwd_override` was just created above, unset.
+                project_path: None,
             });
             slots.push(slot.clone());
 
@@ -1584,11 +1585,11 @@ impl AgentBridge {
             .expect("session cwd override mutex poisoned") = path;
     }
 
-   /// Adds one open thread using the already-provisioned provider gateway.
-   /// The session is opened synchronously before the new slot is exposed to
-   /// the UI, so selecting the row and sending immediately cannot race
-   /// `session/new`.
-   pub fn add_thread(&mut self, name: &str) -> Result<usize, BridgeError> {
+    /// Adds one open thread using the already-provisioned provider gateway.
+    /// The session is opened synchronously before the new slot is exposed to
+    /// the UI, so selecting the row and sending immediately cannot race
+    /// `session/new`.
+    pub fn add_thread(&mut self, name: &str) -> Result<usize, BridgeError> {
         self.add_thread_with_profile(name, None)
     }
 
@@ -1607,6 +1608,18 @@ impl AgentBridge {
         name: &str,
         profile: Option<&str>,
     ) -> Result<usize, BridgeError> {
+        self.add_thread_with_profile_and_provider(name, profile, None)
+    }
+
+    /// Creates a thread using a configured provider when the caller has a
+    /// compatible default-agent preference; otherwise preserves the normal
+    /// stable provider rotation.
+    pub fn add_thread_with_profile_and_provider(
+        &mut self,
+        name: &str,
+        profile: Option<&str>,
+        preferred_provider: Option<&str>,
+    ) -> Result<usize, BridgeError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(BridgeError::Gateway("thread name cannot be empty".into()));
@@ -1619,18 +1632,14 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        let provider = provider_for_index(idx);
+        let provider = preferred_provider
+            .filter(|provider| self.gateway_urls.contains_key(*provider))
+            .unwrap_or_else(|| provider_for_index(idx));
         let base_url =
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
-        let (
-            seeded,
-            cached_session_id,
-            older_available,
-            oldest_loaded_index,
-            runtime_snapshot,
-        ) =
+        let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
             seed_thread_from_cache(self.store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
         let has_cached_transcript = !seeded.is_empty();
 
@@ -1761,16 +1770,16 @@ impl AgentBridge {
     /// (an empty list, not a propagated error, on failure -- there is no
     /// toast/error-surface mechanism for this read-only listing call
     /// yet).
-   pub fn list_remote_sessions(&self, idx: usize) -> Vec<crate::gateway_actor::RemoteThreadInfo> {
-       let Some(slot) = self.slots.get(idx) else {
-           return Vec::new();
-       };
-       let handle = slot.handle.clone();
-       let provider = slot.provider.clone();
+    pub fn list_remote_sessions(&self, idx: usize) -> Vec<crate::gateway_actor::RemoteThreadInfo> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        let handle = slot.handle.clone();
+        let provider = slot.provider.clone();
         self.runtime
             .block_on(handle.list_sessions_for_agent(provider))
             .unwrap_or_default()
-   }
+    }
 
     /// Same as [`Self::list_remote_sessions`], narrowed to sessions not
     /// already bound to a local thread row -- the actual recovery/import
@@ -1832,9 +1841,10 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        let base_url = self.gateway_urls.get(provider).cloned().ok_or_else(|| {
-            BridgeError::Gateway(format!("gateway URL missing for {provider}"))
-        })?;
+        let base_url =
+            self.gateway_urls.get(provider).cloned().ok_or_else(|| {
+                BridgeError::Gateway(format!("gateway URL missing for {provider}"))
+            })?;
         let gateways = self.gateways.clone();
         let gateway = self.runtime.block_on(async move {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1877,7 +1887,8 @@ impl AgentBridge {
             provider: provider.to_string(),
             handle: handle.clone(),
             transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
-                &thread_id, &[],
+                &thread_id,
+                &[],
             )),
             history: Mutex::new(Vec::new()),
             acp_session_id: Mutex::new(None),
@@ -1978,9 +1989,7 @@ impl AgentBridge {
         };
         let gateways = self.gateways.lock().expect("gateways mutex poisoned");
         match gateways.get(url).map(|gateway| gateway.mode()) {
-            Some(acpx_client::TransportMode::WebSocketInteractive) => {
-                "Live connection".to_owned()
-            }
+            Some(acpx_client::TransportMode::WebSocketInteractive) => "Live connection".to_owned(),
             Some(acpx_client::TransportMode::HttpDegraded) => {
                 "HTTP fallback - approvals unavailable".to_owned()
             }
@@ -2061,21 +2070,21 @@ impl AgentBridge {
         })
     }
 
-   /// Every terminal id known on thread `idx` so far, first-seen order
-   /// -- what a terminal-view component iterates to render one card per
-   /// live/finished terminal. Paired with [`Self::terminal_buffer`] for
-   /// each id's current output/exit state.
-   pub fn active_terminals(&self, idx: usize) -> Vec<String> {
-       self.slots
-           .get(idx)
-           .map(|s| {
-               s.terminal_order
-                   .lock()
-                   .expect("terminal_order mutex poisoned")
-                   .clone()
-           })
-           .unwrap_or_default()
-   }
+    /// Every terminal id known on thread `idx` so far, first-seen order
+    /// -- what a terminal-view component iterates to render one card per
+    /// live/finished terminal. Paired with [`Self::terminal_buffer`] for
+    /// each id's current output/exit state.
+    pub fn active_terminals(&self, idx: usize) -> Vec<String> {
+        self.slots
+            .get(idx)
+            .map(|s| {
+                s.terminal_order
+                    .lock()
+                    .expect("terminal_order mutex poisoned")
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
 
     /// `profiles/list` against thread `idx`'s bound gateway -- what the
     /// settings sheet's profile picker populates its choices from.
@@ -2088,15 +2097,15 @@ impl AgentBridge {
     /// mechanism yet) if the call fails -- the picker then just shows
     /// no choices, same degrade-gracefully posture already used for the
     /// existing free-text profile fields.
-   pub fn list_profiles(&self, idx: usize) -> Vec<crate::gateway_actor::ProfileSummary> {
-       let Some(slot) = self.slots.get(idx) else {
-           return Vec::new();
-       };
-       let handle = slot.handle.clone();
-       self.runtime
-           .block_on(handle.list_profiles())
-           .unwrap_or_default()
-   }
+    pub fn list_profiles(&self, idx: usize) -> Vec<crate::gateway_actor::ProfileSummary> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.list_profiles())
+            .unwrap_or_default()
+    }
 
     /// `profiles/create` against thread `idx`'s bound gateway. Returns
     /// `true` on success -- the caller (`lib.rs`'s settings-sheet
@@ -2121,16 +2130,16 @@ impl AgentBridge {
         self.runtime.block_on(handle.update_profile(entry)).is_ok()
     }
 
-   /// `profiles/delete`.
-   pub fn delete_profile(&self, idx: usize, name: &str) -> bool {
-       let Some(slot) = self.slots.get(idx) else {
-           return false;
-       };
-       let handle = slot.handle.clone();
-       self.runtime
-           .block_on(handle.delete_profile(name.to_string()))
-           .is_ok()
-   }
+    /// `profiles/delete`.
+    pub fn delete_profile(&self, idx: usize, name: &str) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        let handle = slot.handle.clone();
+        self.runtime
+            .block_on(handle.delete_profile(name.to_string()))
+            .is_ok()
+    }
 
     /// Explicit, opt-in-only `session/close` on thread `idx` -- see
     /// `AcpxThreadHandle::close_session`'s doc comment: this is never
@@ -2209,7 +2218,9 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime.block_on(handle.create_mcp_server(entry)).is_ok()
+        self.runtime
+            .block_on(handle.create_mcp_server(entry))
+            .is_ok()
     }
 
     /// `mcp_servers/update` -- same payload shape as [`Self::
@@ -2219,7 +2230,9 @@ impl AgentBridge {
             return false;
         };
         let handle = slot.handle.clone();
-        self.runtime.block_on(handle.update_mcp_server(entry)).is_ok()
+        self.runtime
+            .block_on(handle.update_mcp_server(entry))
+            .is_ok()
     }
 
     /// `mcp_servers/delete`.
@@ -2243,7 +2256,9 @@ impl AgentBridge {
             return Vec::new();
         };
         let handle = slot.handle.clone();
-        self.runtime.block_on(handle.list_agents()).unwrap_or_default()
+        self.runtime
+            .block_on(handle.list_agents())
+            .unwrap_or_default()
     }
 
     /// `agents/install` -- client-initiated installer trigger. Returns
@@ -2325,7 +2340,9 @@ impl AgentBridge {
     pub fn write_local_terminal_input(&self, idx: usize, bytes: &[u8]) {
         if let Some(term) = self.local_terminals.borrow_mut().get_mut(&idx) {
             if let Err(error) = term.write_input(bytes) {
-                eprintln!("panel-rust: local terminal write_input failed for thread {idx}: {error}");
+                eprintln!(
+                    "panel-rust: local terminal write_input failed for thread {idx}: {error}"
+                );
             }
         }
     }
@@ -2436,7 +2453,11 @@ impl AgentBridge {
     pub fn has_older_page(&self, idx: usize) -> bool {
         self.slots
             .get(idx)
-            .map(|s| *s.older_available.lock().expect("older_available mutex poisoned"))
+            .map(|s| {
+                *s.older_available
+                    .lock()
+                    .expect("older_available mutex poisoned")
+            })
             .unwrap_or(false)
     }
 
@@ -2459,7 +2480,11 @@ impl AgentBridge {
         let Some(store) = &self.store else {
             return false;
         };
-        if !*slot.older_available.lock().expect("older_available mutex poisoned") {
+        if !*slot
+            .older_available
+            .lock()
+            .expect("older_available mutex poisoned")
+        {
             return false;
         }
         let before_index = *slot
@@ -2481,7 +2506,10 @@ impl AgentBridge {
             // out from under this index somehow) -- treat as exhausted
             // rather than looping forever on a caller that keeps
             // retrying.
-            *slot.older_available.lock().expect("older_available mutex poisoned") = false;
+            *slot
+                .older_available
+                .lock()
+                .expect("older_available mutex poisoned") = false;
             return false;
         }
         {
@@ -2490,7 +2518,10 @@ impl AgentBridge {
             prepended.extend(history.drain(..));
             *history = prepended;
         }
-        *slot.older_available.lock().expect("older_available mutex poisoned") = page.older_available;
+        *slot
+            .older_available
+            .lock()
+            .expect("older_available mutex poisoned") = page.older_available;
         *slot
             .oldest_loaded_index
             .lock()
@@ -2667,9 +2698,7 @@ impl AgentBridge {
                     .expect("event queue mutex poisoned")
                     .push_back(BridgeEvent {
                         thread_index: idx,
-                        event: AgentEvent::Error(format!(
-                            "session/set_config_option failed: {e}"
-                        )),
+                        event: AgentEvent::Error(format!("session/set_config_option failed: {e}")),
                     });
             }
         });
@@ -2705,8 +2734,7 @@ mod tests {
     }
 
     fn mock_agent_bin() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/debug/rui-mock-agent")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent")
     }
 
     fn wait_for_thread_ready(bridge: &AgentBridge, idx: usize) {
@@ -2845,11 +2873,7 @@ mod tests {
         }
 
         fn spawn_with_persona_and_db(persona: &str, db_path: Option<&std::path::Path>) -> Self {
-            Self::spawn_with_backend_cmd(
-                &mock_agent_bin().to_string_lossy(),
-                persona,
-                db_path,
-            )
+            Self::spawn_with_backend_cmd(&mock_agent_bin().to_string_lossy(), persona, db_path)
         }
 
         /// Same as [`Self::spawn_with_persona_and_db`], but with an
@@ -2946,8 +2970,8 @@ mod tests {
             .history(index)
             .iter()
             .any(|message| { message.text.contains("HELLO FROM A NEW THREAD") }));
-       assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
-   }
+        assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
+    }
 
     /// Coverage Matrix `session/list` row: recoverable-session listing
     /// and attach-without-`session/new` -- real gateway, two genuinely
@@ -3135,7 +3159,10 @@ mod tests {
             "restored output\n"
         );
         assert_eq!(
-            bridge.session_modes(0).expect("restored modes").current_mode_id,
+            bridge
+                .session_modes(0)
+                .expect("restored modes")
+                .current_mode_id,
             "ask"
         );
         assert_eq!(
@@ -4045,20 +4072,23 @@ done
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        assert!(ended, "prompt turn did not finish after answering the relay");
+        assert!(
+            ended,
+            "prompt turn did not finish after answering the relay"
+        );
 
         let history = bridge.history(0);
-       assert!(
-           history.iter().any(|m| m.text.contains("CHOSE: allow-once")),
-           "expected the backend's own echo to reflect the live-relayed \
+        assert!(
+            history.iter().any(|m| m.text.contains("CHOSE: allow-once")),
+            "expected the backend's own echo to reflect the live-relayed \
            allow-once answer, not the profile's AutoReject default \
           (which would have picked reject-once): got {history:?}"
-     );
-  }
+        );
+    }
 
-   /// Coverage Matrix `initialize`/connection-state row: proves
-   /// `transport_status` reports the live-WS state against a real
-   /// gateway, not merely that the constructor call returns `Ok`.
+    /// Coverage Matrix `initialize`/connection-state row: proves
+    /// `transport_status` reports the live-WS state against a real
+    /// gateway, not merely that the constructor call returns `Ok`.
     /// `new_with_gateway_resolver_and_cache_dir` does **not** block on
     /// the shared per-provider `Gateway::connect()` task (only later
     /// command calls do, via `wait_for_attachment` -- see `AgentBridge`'s
@@ -4108,8 +4138,7 @@ done
             status = bridge.transport_status(0);
         }
         assert_eq!(
-            status,
-            "Live connection",
+            status, "Live connection",
             "a freshly attached thread against a real, reachable acpx-server \
              must report the live WebSocket state, not Connecting/HTTP fallback"
         );
@@ -4130,12 +4159,12 @@ done
     /// resolves) -- it only replies once it sees `session/cancel` arrive on
     /// the same stdio stream, using the prompt's own captured `id`. If
     /// `cancel_prompt` failed to reach the backend at all, this test would
-   /// hang until its own deadline and fail with `ended == false`, so a
-   /// pass is proof the cancel notification, not a coincidental timeout,
-   /// is what unblocked the turn.
-   #[test]
-   fn cancel_prompt_ends_a_slow_turn_with_cancelled_stop_reason() {
-       let script_dir = tempfile::tempdir().expect("script tempdir");
+    /// hang until its own deadline and fail with `ended == false`, so a
+    /// pass is proof the cancel notification, not a coincidental timeout,
+    /// is what unblocked the turn.
+    #[test]
+    fn cancel_prompt_ends_a_slow_turn_with_cancelled_stop_reason() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
         let script_path = script_dir.path().join("stand_in_backend.sh");
         let prompt_id_path = script_dir.path().join("prompt_id");
         std::fs::write(
@@ -4211,11 +4240,11 @@ done
         );
     }
 
-   /// Real end-to-end proof of the profile-picker path this crate
-   /// exposes to `lib.rs`'s settings sheet: `AgentBridge::list_profiles`
-   /// sees a real profile registered on the gateway (including its
-   /// capability flags), and `AgentBridge::add_thread_with_profile`
-   /// actually threads `_acpx.profile` through to a real `session/new`
+    /// Real end-to-end proof of the profile-picker path this crate
+    /// exposes to `lib.rs`'s settings sheet: `AgentBridge::list_profiles`
+    /// sees a real profile registered on the gateway (including its
+    /// capability flags), and `AgentBridge::add_thread_with_profile`
+    /// actually threads `_acpx.profile` through to a real `session/new`
     /// call -- proven by the new thread's own terminal/create relay
     /// succeeding, which only happens when `allow_terminal_access` is
     /// true for the session's resolved profile (the default/no-profile
@@ -4428,7 +4457,11 @@ done
         let modes = modes.expect("session/new's modes should have been captured by now");
         assert_eq!(modes.current_mode_id, "ask");
         assert_eq!(
-            modes.available.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            modes
+                .available
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["ask", "code"]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4450,8 +4483,7 @@ done
         while std::time::Instant::now() < deadline && !set_mode_marker.is_file() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let observed_mode_id =
-            std::fs::read_to_string(&set_mode_marker).unwrap_or_default();
+        let observed_mode_id = std::fs::read_to_string(&set_mode_marker).unwrap_or_default();
         assert_eq!(
             observed_mode_id.trim(),
             "code",
@@ -4583,7 +4615,10 @@ done
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        assert!(seen, "expected the real shell's own echoed output through the bridge");
+        assert!(
+            seen,
+            "expected the real shell's own echoed output through the bridge"
+        );
 
         bridge.resize_local_terminal(0, 100, 40);
         let resized = bridge
@@ -4665,7 +4700,10 @@ done
 
         let raw_history = bridge.history(0);
         assert_eq!(
-            raw_history.iter().filter(|m| m.text.contains("Hello") || m.text == ", " || m.text == "world").count(),
+            raw_history
+                .iter()
+                .filter(|m| m.text.contains("Hello") || m.text == ", " || m.text == "world")
+                .count(),
             3,
             "expected 3 separate raw chunks in history, got {raw_history:?}"
         );
@@ -4674,11 +4712,9 @@ done
         let merged = transcript
             .iter()
             .find_map(|item| match item {
-                crate::conversation::TranscriptItem::Assistant { text, message_id, .. }
-                    if message_id == "reply-1" =>
-                {
-                    Some(text.clone())
-                }
+                crate::conversation::TranscriptItem::Assistant {
+                    text, message_id, ..
+                } if message_id == "reply-1" => Some(text.clone()),
                 _ => None,
             })
             .expect("expected exactly one merged Assistant transcript item for reply-1");
@@ -4726,7 +4762,11 @@ done
                 // below is meaningful rather than incidentally
                 // exercising the merge behavior a different, dedicated
                 // test already covers.
-                kind: if i % 2 == 0 { MessageKind::User } else { MessageKind::Agent },
+                kind: if i % 2 == 0 {
+                    MessageKind::User
+                } else {
+                    MessageKind::Agent
+                },
                 text: format!("message-{i}"),
                 status: None,
                 id: None,
@@ -4759,15 +4799,24 @@ done
             HISTORY_PAGE_SIZE,
             "cold start should load exactly one page, not the full cached history"
         );
-        assert_eq!(initial[0].text, format!("message-{}", total_messages - HISTORY_PAGE_SIZE));
-        assert_eq!(initial[HISTORY_PAGE_SIZE - 1].text, format!("message-{}", total_messages - 1));
+        assert_eq!(
+            initial[0].text,
+            format!("message-{}", total_messages - HISTORY_PAGE_SIZE)
+        );
+        assert_eq!(
+            initial[HISTORY_PAGE_SIZE - 1].text,
+            format!("message-{}", total_messages - 1)
+        );
         assert!(bridge.has_older_page(0));
 
         // First load_older_page call adds the next page back.
         assert!(bridge.load_older_page(0));
         let after_one = bridge.history(0);
         assert_eq!(after_one.len(), HISTORY_PAGE_SIZE * 2);
-        assert_eq!(after_one[0].text, format!("message-{}", total_messages - HISTORY_PAGE_SIZE * 2));
+        assert_eq!(
+            after_one[0].text,
+            format!("message-{}", total_messages - HISTORY_PAGE_SIZE * 2)
+        );
         assert!(bridge.has_older_page(0));
 
         // Second call reaches the real start (37 remaining messages).
@@ -4801,7 +4850,10 @@ done
         let entries = skills_mcp_servers_entry(None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["name"], "skills");
-        assert!(entries[0]["command"].as_str().unwrap().contains("skills-mcp-server"));
+        assert!(entries[0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("skills-mcp-server"));
         let args = entries[0]["args"].as_array().expect("args is an array");
         assert!(args.contains(&serde_json::Value::String("--global-dir".to_string())));
         assert!(

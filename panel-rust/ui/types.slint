@@ -112,6 +112,20 @@ export struct MessageItem {
     first-use: bool,
 }
 
+// One choice in a pending approval — ACP `PermissionOption` shape
+// (`optionId` / `name` / `kind`) projected for Slint. Kinds match the
+// protocol: allow_once, allow_always, reject_once, reject_always.
+// For non-permission methods (fs/*, terminal/create) the host synthesizes
+// Approve/Reject rows with the same shape so the card is always a one-of
+// select (Zed's PermissionOptions::Flat model).
+export struct PermissionOptionItem {
+    option-id: string,
+    name: string,
+    kind: string,
+    // True for allow_* (and synthetic Approve) — drives primary styling.
+    is-allow: bool,
+}
+
 // Interactive-relay addition: one pending agent-initiated request
 // awaiting a user decision (`session/request_permission`, `fs/*`,
 // `terminal/create`) -- see `panel-rust/src/permission.rs`'s
@@ -119,6 +133,10 @@ export struct MessageItem {
 // distinguishes "no pending request" (an all-empty/default struct,
 // since Slint has no `Option<T>`) from a real one with an empty
 // `relay-id` -- callers must check `active` first.
+//
+// `options` is the one-of select list rendered above the compose bar
+// (Zed flat permission buttons). Empty when unsupported; selection
+// fires `permission-option-selected(option-id)`.
 export struct PendingRequestItem {
     active: bool,
     relay-id: string,
@@ -126,6 +144,7 @@ export struct PendingRequestItem {
     title: string,
     summary: string,
     supported: bool,
+    options: [PermissionOptionItem],
 }
 
 // Terminal-view addition: one live agent-created terminal known to the

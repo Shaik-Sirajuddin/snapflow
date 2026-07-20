@@ -274,7 +274,11 @@ impl SendQueue {
     /// Removes an entry for an explicit "send now" / steer. If a
     /// generation is in flight, the caller must cancel it; the resulting
     /// Stopped event needs absorbing so the queue doesn't double-send.
-    pub fn send_now(&mut self, id: QueueEntryId, is_generating: bool) -> io::Result<Option<QueueEntry>> {
+    pub fn send_now(
+        &mut self,
+        id: QueueEntryId,
+        is_generating: bool,
+    ) -> io::Result<Option<QueueEntry>> {
         let index = self.entries.iter().position(|entry| entry.id == id);
         let entry = index.and_then(|i| self.entries.remove(i));
         if entry.is_some() && is_generating {

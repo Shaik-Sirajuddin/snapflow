@@ -8,12 +8,12 @@
 
 use crate::gateway_actor::classify_raw_update;
 use crate::protocol_types::AgentEvent;
-use acpx_client::raw::ClientError;
-use acpx_client::{AgentRequest, Gateway};
 use crate::protocol_types::{
     AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
     TerminalOutputEvent,
 };
+use acpx_client::raw::ClientError;
+use acpx_client::{AgentRequest, Gateway};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -86,10 +86,10 @@ enum Command {
         text: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
-   ListSessions {
-       agent_id: Option<String>,
-       resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
-   },
+    ListSessions {
+        agent_id: Option<String>,
+        resp: oneshot::Sender<Result<Vec<RemoteThreadInfo>, AcpxThreadError>>,
+    },
     /// `profiles/list` -- every profile the bound gateway currently has
     /// registered, for a profile-picker UI. Read-only, no session
     /// binding involved -- safe to call before `OpenSession` has ever
@@ -103,9 +103,9 @@ enum Command {
     /// imply session close by default, only an explicit caller
     /// (a future per-thread "close on exit" setting) should ever send
     /// this.
-   CloseSession {
-       resp: oneshot::Sender<Result<(), AcpxThreadError>>,
-   },
+    CloseSession {
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     /// Real, stable v1 ACP `session/delete` -- permanently removes a
     /// session (backend-forwarded `Proxied` method, see `acpx-core::
     /// router`'s own doc comment on this method's classification).
@@ -150,11 +150,11 @@ enum Command {
         entry: serde_json::Value,
         resp: oneshot::Sender<Result<serde_json::Value, AcpxThreadError>>,
     },
-   /// `mcp_servers/delete`.
-   DeleteMcpServer {
-       name: String,
-       resp: oneshot::Sender<Result<(), AcpxThreadError>>,
-   },
+    /// `mcp_servers/delete`.
+    DeleteMcpServer {
+        name: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     /// `profiles/create`. `entry` must include a `"name"` field (the
     /// merge key `acpx-core::profile::ProfileStore` uses). See
     /// `acpx_client::ext::profiles::create`'s doc comment for the
@@ -179,7 +179,8 @@ enum Command {
     /// gateway's live detection status per entry, for an agent-catalog
     /// UI (installed/not-installed/runtime-missing chips). Read-only.
     ListAgents {
-        resp: oneshot::Sender<Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError>>,
+        resp:
+            oneshot::Sender<Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError>>,
     },
     /// `agents/status` for one agent id.
     AgentStatus {
@@ -342,13 +343,13 @@ impl AcpxThreadHandle {
     /// Gateway-aggregated `session/list` -- every session across every
     /// backend *this gateway* currently supervises, not just this
     /// thread's own.
-   pub async fn list_sessions(&self) -> Result<Vec<RemoteThreadInfo>, AcpxThreadError> {
-       self.call(|resp| Command::ListSessions {
-           agent_id: None,
-           resp,
-       })
-       .await
-   }
+    pub async fn list_sessions(&self) -> Result<Vec<RemoteThreadInfo>, AcpxThreadError> {
+        self.call(|resp| Command::ListSessions {
+            agent_id: None,
+            resp,
+        })
+        .await
+    }
 
     /// Typed, per-backend `session/list`, preserving ACP `title` and
     /// `updatedAt` metadata for cache reconciliation.
@@ -357,8 +358,9 @@ impl AcpxThreadHandle {
         agent_id: impl Into<String>,
     ) -> Result<Vec<RemoteThreadInfo>, AcpxThreadError> {
         let agent_id = Some(agent_id.into());
-        self.call(|resp| Command::ListSessions { agent_id, resp }).await
-   }
+        self.call(|resp| Command::ListSessions { agent_id, resp })
+            .await
+    }
 
     /// `profiles/list` against this thread's bound gateway -- what a
     /// profile-picker UI populates its choices from. Safe to call before
@@ -368,10 +370,10 @@ impl AcpxThreadHandle {
         self.call(|resp| Command::ListProfiles { resp }).await
     }
 
-   /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
-   pub async fn close_session(&self) -> Result<(), AcpxThreadError> {
-       self.call(|resp| Command::CloseSession { resp }).await
-   }
+    /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
+    pub async fn close_session(&self) -> Result<(), AcpxThreadError> {
+        self.call(|resp| Command::CloseSession { resp }).await
+    }
 
     /// Real `session/delete` -- opt-in only, see [`Command::
     /// DeleteSession`]'s doc comment on ordering vs. `close_session`.
@@ -438,7 +440,8 @@ impl AcpxThreadHandle {
         &self,
         entry: serde_json::Value,
     ) -> Result<serde_json::Value, AcpxThreadError> {
-        self.call(|resp| Command::CreateMcpServer { entry, resp }).await
+        self.call(|resp| Command::CreateMcpServer { entry, resp })
+            .await
     }
 
     /// `mcp_servers/update` -- same payload shape as `create_mcp_server`.
@@ -446,14 +449,16 @@ impl AcpxThreadHandle {
         &self,
         entry: serde_json::Value,
     ) -> Result<serde_json::Value, AcpxThreadError> {
-        self.call(|resp| Command::UpdateMcpServer { entry, resp }).await
+        self.call(|resp| Command::UpdateMcpServer { entry, resp })
+            .await
     }
 
-   /// `mcp_servers/delete`.
-   pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
-       let name = name.into();
-       self.call(|resp| Command::DeleteMcpServer { name, resp }).await
-   }
+    /// `mcp_servers/delete`.
+    pub async fn delete_mcp_server(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
+        let name = name.into();
+        self.call(|resp| Command::DeleteMcpServer { name, resp })
+            .await
+    }
 
     /// `profiles/create`. `entry` must include a `"name"` field, same
     /// shape `AcpxThreadHandle::list_profiles`'s `ProfileSummary`
@@ -464,7 +469,8 @@ impl AcpxThreadHandle {
         &self,
         entry: serde_json::Value,
     ) -> Result<serde_json::Value, AcpxThreadError> {
-        self.call(|resp| Command::CreateProfile { entry, resp }).await
+        self.call(|resp| Command::CreateProfile { entry, resp })
+            .await
     }
 
     /// `profiles/update` -- same payload shape as [`Self::create_profile`].
@@ -472,13 +478,15 @@ impl AcpxThreadHandle {
         &self,
         entry: serde_json::Value,
     ) -> Result<serde_json::Value, AcpxThreadError> {
-        self.call(|resp| Command::UpdateProfile { entry, resp }).await
+        self.call(|resp| Command::UpdateProfile { entry, resp })
+            .await
     }
 
     /// `profiles/delete`.
     pub async fn delete_profile(&self, name: impl Into<String>) -> Result<(), AcpxThreadError> {
         let name = name.into();
-        self.call(|resp| Command::DeleteProfile { name, resp }).await
+        self.call(|resp| Command::DeleteProfile { name, resp })
+            .await
     }
 
     /// `agents/list` -- the registry's agent catalogue with this
@@ -498,7 +506,8 @@ impl AcpxThreadHandle {
         agent_id: impl Into<String>,
     ) -> Result<crate::protocol_types::AgentCatalogEntry, AcpxThreadError> {
         let agent_id = agent_id.into();
-        self.call(|resp| Command::AgentStatus { agent_id, resp }).await
+        self.call(|resp| Command::AgentStatus { agent_id, resp })
+            .await
     }
 
     /// `agents/install` -- client-initiated installer trigger. Blocks
@@ -509,7 +518,8 @@ impl AcpxThreadHandle {
         agent_id: impl Into<String>,
     ) -> Result<serde_json::Value, AcpxThreadError> {
         let agent_id = agent_id.into();
-        self.call(|resp| Command::InstallAgent { agent_id, resp }).await
+        self.call(|resp| Command::InstallAgent { agent_id, resp })
+            .await
     }
 
     /// Sends `session/cancel` through an independent gateway connection, so
@@ -683,7 +693,7 @@ async fn await_gateway(gateway_rx: &mut watch::Receiver<Option<Arc<Gateway>>>) -
 /// (unlike [`run_cancel_worker`], this never needs the bound session id
 /// -- `acpx/agent_response` is addressed purely by `relay_id`, which the
 /// server resolves against its own process-wide relay hub regardless of
- /// which connection sends it).
+/// which connection sends it).
 ///
 /// Connects **lazily**, on the first actual `RespondCommand`, unlike
 /// [`run_thread_actor`]/[`run_cancel_worker`]'s eager `Gateway::connect`
@@ -746,7 +756,10 @@ fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
         return None;
     }
     let session_update = update.get("params")?.get("update")?;
-    match session_update.get("sessionUpdate").and_then(|k| k.as_str())? {
+    match session_update
+        .get("sessionUpdate")
+        .and_then(|k| k.as_str())?
+    {
         "current_mode_update" => {
             let mode_id = session_update.get("currentModeId")?.as_str()?.to_string();
             Some(AgentEvent::CurrentModeChanged(mode_id))
@@ -883,10 +896,7 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
     if let Some(modes) = value.get("modes").and_then(parse_session_modes) {
         let _ = event_tx.send(AgentEvent::SessionModes(modes));
     }
-    if let Some(options) = value
-        .get("configOptions")
-        .and_then(parse_config_options)
-    {
+    if let Some(options) = value.get("configOptions").and_then(parse_config_options) {
         let _ = event_tx.send(AgentEvent::ConfigOptions(options));
     }
 }
@@ -967,13 +977,25 @@ fn parse_terminal_output(value: &serde_json::Value) -> Option<TerminalOutputEven
     let params = value.get("params")?;
     let terminal_id = params.get("terminalId")?.as_str()?.to_string();
     let output = params.get("output")?.as_str()?.to_string();
-    let truncated = params.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false);
-    let exit_status = params.get("exitStatus").filter(|v| !v.is_null()).map(|status| {
-        (
-            status.get("exitCode").and_then(|c| c.as_i64()).map(|c| c as i32),
-            status.get("signal").and_then(|s| s.as_i64()).map(|s| s as i32),
-        )
-    });
+    let truncated = params
+        .get("truncated")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    let exit_status = params
+        .get("exitStatus")
+        .filter(|v| !v.is_null())
+        .map(|status| {
+            (
+                status
+                    .get("exitCode")
+                    .and_then(|c| c.as_i64())
+                    .map(|c| c as i32),
+                status
+                    .get("signal")
+                    .and_then(|s| s.as_i64())
+                    .map(|s| s as i32),
+            )
+        });
     Some(TerminalOutputEvent {
         terminal_id,
         output,
@@ -1016,7 +1038,12 @@ async fn run_thread_actor(
             },
         };
         match cmd {
-            Command::OpenSession { cwd, profile, mcp_servers, resp } => {
+            Command::OpenSession {
+                cwd,
+                profile,
+                mcp_servers,
+                resp,
+            } => {
                 let params = serde_json::json!({
                     "cwd": cwd.to_string_lossy(),
                     "mcpServers": mcp_servers,
@@ -1215,7 +1242,7 @@ async fn run_thread_actor(
                         .collect()
                 });
                 let _ = resp.send(result.map_err(Into::into));
-           }
+            }
             Command::ListProfiles { resp } => {
                 let result = client
                     .call("profiles/list", serde_json::json!({}), None)
@@ -1248,18 +1275,18 @@ async fn run_thread_actor(
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
-           Command::CloseSession { resp } => {
-               let Some(sid) = session_id.clone() else {
-                   // Never opened -- closing a session that was never
-                   // opened on this handle is a no-op success, not an
-                   // error (nothing gateway-side to close).
-                   let _ = resp.send(Ok(()));
-                   continue;
-               };
-               let params = serde_json::json!({ "sessionId": sid });
-               let result = client.call("session/close", params, None).await;
-               let _ = resp.send(result.map(|_| ()).map_err(Into::into));
-           }
+            Command::CloseSession { resp } => {
+                let Some(sid) = session_id.clone() else {
+                    // Never opened -- closing a session that was never
+                    // opened on this handle is a no-op success, not an
+                    // error (nothing gateway-side to close).
+                    let _ = resp.send(Ok(()));
+                    continue;
+                };
+                let params = serde_json::json!({ "sessionId": sid });
+                let result = client.call("session/close", params, None).await;
+                let _ = resp.send(result.map(|_| ()).map_err(Into::into));
+            }
             Command::DeleteSession { resp } => {
                 let Some(sid) = session_id.clone() else {
                     // Never opened -- nothing gateway-side to delete.
@@ -1343,13 +1370,17 @@ async fn run_thread_actor(
                 let result = client.call("mcp_servers/update", entry, None).await;
                 let _ = resp.send(result.map_err(Into::into));
             }
-           Command::DeleteMcpServer { name, resp } => {
-               let result = client
-                   .call("mcp_servers/delete", serde_json::json!({ "name": name }), None)
-                   .await
-                   .map(|_| ());
-               let _ = resp.send(result.map_err(Into::into));
-           }
+            Command::DeleteMcpServer { name, resp } => {
+                let result = client
+                    .call(
+                        "mcp_servers/delete",
+                        serde_json::json!({ "name": name }),
+                        None,
+                    )
+                    .await
+                    .map(|_| ());
+                let _ = resp.send(result.map_err(Into::into));
+            }
             Command::CreateProfile { entry, resp } => {
                 let result = client.call("profiles/create", entry, None).await;
                 let _ = resp.send(result.map_err(Into::into));
@@ -1388,15 +1419,18 @@ async fn run_thread_actor(
                     .call("agents/status", serde_json::json!({ "id": agent_id }), None)
                     .await
                     .and_then(|value| {
-                        crate::protocol_types::AgentCatalogEntry::from_json(&value).ok_or_else(
-                            || acpx_client::raw::ClientError::MalformedResponse,
-                        )
+                        crate::protocol_types::AgentCatalogEntry::from_json(&value)
+                            .ok_or_else(|| acpx_client::raw::ClientError::MalformedResponse)
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::InstallAgent { agent_id, resp } => {
                 let result = client
-                    .call("agents/install", serde_json::json!({ "id": agent_id }), None)
+                    .call(
+                        "agents/install",
+                        serde_json::json!({ "id": agent_id }),
+                        None,
+                    )
                     .await;
                 let _ = resp.send(result.map_err(Into::into));
             }
@@ -1460,7 +1494,10 @@ mod capability_parsing_tests {
         assert_eq!(parsed.current_mode_id, "ask");
         assert_eq!(parsed.available.len(), 2);
         assert_eq!(parsed.available[1].id, "code");
-        assert_eq!(parsed.available[1].description.as_deref(), Some("Autonomous coding"));
+        assert_eq!(
+            parsed.available[1].description.as_deref(),
+            Some("Autonomous coding")
+        );
     }
 
     #[test]

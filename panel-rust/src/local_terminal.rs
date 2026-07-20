@@ -226,7 +226,10 @@ mod tests {
         // Let the shell's prompt render before resizing, so the
         // subsequent `stty size` command doesn't race the shell's own
         // startup.
-        wait_for(|| !term.screen_text().trim().is_empty(), Duration::from_secs(5));
+        wait_for(
+            || !term.screen_text().trim().is_empty(),
+            Duration::from_secs(5),
+        );
         term.resize(100, 40).expect("resize");
         assert_eq!(term.cols(), 100);
         assert_eq!(term.rows(), 40);
@@ -245,9 +248,15 @@ mod tests {
     #[test]
     fn has_exited_reflects_a_real_process_exit() {
         let mut term = LocalTerminal::spawn(80, 24).expect("spawn local terminal");
-        assert!(!term.has_exited(), "freshly spawned shell should not have exited yet");
+        assert!(
+            !term.has_exited(),
+            "freshly spawned shell should not have exited yet"
+        );
         term.write_input(b"exit\r").expect("write_input");
         let exited = wait_for(|| term.has_exited(), Duration::from_secs(10));
-        assert!(exited, "expected the real shell process to have exited after `exit`");
+        assert!(
+            exited,
+            "expected the real shell process to have exited after `exit`"
+        );
     }
 }

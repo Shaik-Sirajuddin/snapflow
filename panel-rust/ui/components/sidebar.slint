@@ -3,6 +3,9 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
+import { FilterSearchBar } from "../base/filter_search_bar.slint";
+import { NamePromptDialog } from "../base/name_prompt_dialog.slint";
+import { TextUtil } from "../base/text_util.slint";
 import { ThreadItem, SkillOption } from "../types.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
@@ -16,15 +19,25 @@ export component Sidebar inherits Rectangle {
     // against each thread's own project-path to decide badge visibility.
     in property <string> active-project-path: "";
     in property <bool> compact: true;
+    in property <bool> narrow: false;
     in property <bool> expanded: false;
     callback thread-selected(int);
     callback new-thread-requested();
     callback search-changed(string);
     callback toggle-expanded();
+    callback collapse-requested();
+    // Force the rail open (no-op if already expanded). Used by the
+    // search-icon click and by callers that must not toggle-close.
+    callback expand-requested();
     callback thread-close-requested(int);
     callback thread-delete-requested(int);
     callback thread-archive-requested(int);
+    callback thread-rename-started(int);
+    callback thread-rename-cancelled();
+    callback thread-rename-confirmed(int, string);
+    callback search-submitted(string, bool, bool);
     callback settings-requested();
+    callback skills-settings-requested();
 
     // Skill-manager sidebar mode -- `sidebar_skill_tree_and_new_skill_flow`
     // phase. `skill-mode` sibling-swaps the thread list for a skill list
@@ -32,9 +45,14 @@ export component Sidebar inherits Rectangle {
     // `assistant-sidebar refine`'s "thread view + skill-manager" ask.
     in-out property <bool> skill-mode: false;
     in property <[SkillOption]> skills: [];
-    // Fired with the user-entered name once the new-skill dialog is
-    // confirmed; Rust creates the scaffolded SKILL.md and re-scans.
-    callback new-skill-requested(string);
+    // Project skills are the primary list. This control adds global skills
+    // to the current project view; it is not a mutually-exclusive scope tab.
+    property <bool> show-global-skills: false;
+    in-out property <string> search-query: "";
+    // Fired with the user-entered name and selected scope once the
+    // dialog is confirmed; Rust creates the scaffolded SKILL.md and
+    // re-scans the matching storage directory.
+    callback new-skill-requested(string, string);
     property <bool> new-skill-dialog-open: false;
     // `active_pane_and_editor_view` phase: fired with a skill's path
     // when its row is clicked, so the host can switch the main content
@@ -49,6 +67,34 @@ export component Sidebar inherits Rectangle {
     // drive or observe.
     property <int> pending-close-index: -1;
     property <int> pending-delete-index: -1;
+    in-out property <int> rename-thread-index: -1;
+    in property <string> rename-focus-target: "";
+    property <int> rename-focus-index: -1;
+    in-out property <string> rename-thread-draft: "";
+
+    function begin-thread-rename(index: int) {
+        if (index < 0 || index >= root.threads.length) {
+            return;
+        }
+        root.thread-rename-started(index);
+    }
+
+    function cancel-thread-rename() {
+        root.rename-focus-index = -1;
+        root.thread-rename-cancelled();
+    }
+
+    function confirm-thread-rename(index: int) {
+        if (root.rename-thread-draft != "") {
+            root.thread-rename-confirmed(index, root.rename-thread-draft);
+        }
+    }
+
+    changed rename-thread-index => {
+        if (root.rename-thread-index >= 0 && root.rename-focus-target == "sidebar") {
+            root.rename-focus-index = root.rename-thread-index;
+        }
+    }
 
     // Per-thread identity accent -- deliberately the one departure from
     // this project's usual monochrome status language (see theme.slint's
@@ -72,18 +118,29 @@ export component Sidebar inherits Rectangle {
     animate width { duration: 180ms; easing: ease-in-out; }
     background: Theme.bg-sidebar;
 
-    // Settings footer: outer margin + box height. Main column ends above it
-    // so the control always snaps to the bottom of the thread bar.
-    property <length> settings-margin: Metrics.pad-sm;
+    // Settings footer: inset + box height. The inset positions its icon
+    // center on ChatInputLayout's second-row center line (36px above the
+    // panel bottom) in both compact and regular layouts.
+    property <length> settings-margin: compact
+        ? Metrics.pad-lg + Metrics.space-2
+        : Metrics.pad-lg + Metrics.space-1;
     property <length> settings-box-h: compact ? 32px : 36px;
-    property <length> settings-footer-h: settings-box-h + 2 * settings-margin;
+    property <length> skills-config-h: skill-mode && expanded ? 32px : 0px;
+    // When Skills config is present, use the same inset above it, between
+    // it and Settings, and below Settings.
+    property <length> settings-footer-h: skills-config-h > 0px
+        ? skills-config-h + settings-box-h + 3 * settings-margin
+        : settings-box-h + 2 * settings-margin;
 
     // Header + search + thread list only (fills space above settings).
     VerticalLayout {
         width: parent.width;
         height: parent.height - settings-footer-h;
         y: 0px;
-        spacing: Metrics.space-5;
+        // In collapsed mode, a small tokenized gap plus centered glyph
+        // aligns its top edge with ChatArea's 48px header divider. The
+        // expanded search field keeps the roomier separation.
+        spacing: expanded ? Metrics.space-5 : Metrics.space-1;
         Rectangle {
             height: 36px;
             background: Theme.bg-card;
@@ -94,23 +151,49 @@ export component Sidebar inherits Rectangle {
                 padding-left: compact ? Metrics.space-2 : Metrics.space-4;
                 padding-right: compact ? Metrics.space-2 : Metrics.space-4;
                 spacing: compact ? 2px : 6px;
-                IconButton {
-                    button-accessible-label: expanded ? "Collapse thread sidebar" : "Expand thread sidebar";
-                    clicked => { toggle-expanded(); }
-                    Icon {
-                        source: @image-url("../assets/icons/panel-left.svg");
-                        size: 16px;
-                        color: Theme.text-secondary;
+                if !expanded : VerticalLayout {
+                    width: 100%;
+                    height: parent.height;
+                    alignment: center;
+                    HorizontalLayout {
+                        alignment: center;
+                        IconButton {
+                            button-accessible-label: "Expand thread sidebar";
+                            clicked => { toggle-expanded(); }
+                            Icon {
+                                source: @image-url("../assets/icons/panel-left.svg");
+                                size: 16px;
+                                color: Theme.text-secondary;
+                            }
+                        }
                     }
                 }
-                if expanded : Text {
-                    text: skill-mode ? "Skills" : "Chats";
-                    color: Theme.text-primary;
-                    font-size: 14px * Theme.font-scale;
-                    font-family: Theme.font-sans;
-                    font-weight: 600;
-                    vertical-alignment: center;
+                if expanded : VerticalLayout {
                     horizontal-stretch: 0;
+                    height: parent.height;
+                    alignment: center;
+                    IconButton {
+                        button-accessible-label: "Collapse thread sidebar";
+                        clicked => { toggle-expanded(); }
+                        Icon {
+                            source: @image-url("../assets/icons/panel-left.svg");
+                            size: 16px;
+                            color: Theme.text-secondary;
+                        }
+                    }
+                }
+                if expanded : VerticalLayout {
+                    horizontal-stretch: 0;
+                    height: parent.height;
+                    alignment: center;
+                    Text {
+                        text: skill-mode ? "Skills" : "Chats";
+                        color: Theme.text-primary;
+                        font-size: 14px * Theme.font-scale;
+                        font-family: Theme.font-sans;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
                 }
                 Rectangle {
                     horizontal-stretch: 1;
@@ -120,22 +203,32 @@ export component Sidebar inherits Rectangle {
                     height: 0px;
                     preferred-height: 0px;
                 }
-                if expanded && !skill-mode : IconButton {
-                    button-accessible-label: "New thread";
-                    clicked => { new-thread-requested(); }
-                    Icon {
-                        source: @image-url("../assets/icons/plus.svg");
-                        size: 16px;
-                        color: Theme.bg-primary;
+                if expanded && !skill-mode : VerticalLayout {
+                    horizontal-stretch: 0;
+                    height: parent.height;
+                    alignment: center;
+                    IconButton {
+                        button-accessible-label: "New thread";
+                        clicked => { new-thread-requested(); }
+                        Icon {
+                            source: @image-url("../assets/icons/plus.svg");
+                            size: 16px;
+                            color: Theme.bg-primary;
+                        }
                     }
                 }
-                if expanded && skill-mode : IconButton {
-                    button-accessible-label: "New skill";
-                    clicked => { new-skill-dialog-open = true; }
-                    Icon {
-                        source: @image-url("../assets/icons/plus.svg");
-                        size: 16px;
-                        color: Theme.bg-primary;
+                if expanded && skill-mode : VerticalLayout {
+                    horizontal-stretch: 0;
+                    height: parent.height;
+                    alignment: center;
+                    IconButton {
+                        button-accessible-label: "New skill";
+                        clicked => { new-skill-dialog-open = true; }
+                        Icon {
+                            source: @image-url("../assets/icons/plus.svg");
+                            size: 16px;
+                            color: Theme.bg-primary;
+                        }
                     }
                 }
             }
@@ -177,52 +270,109 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
-        Rectangle {
-            height: 32px;
+        // Project skills stay visible by default. Global skills can be
+        // included in the list without replacing the current project view.
+        if expanded && skill-mode : Rectangle {
+            height: 28px;
             background: Theme.bg-canvas;
             HorizontalLayout {
-                padding: Metrics.space-3;
+                padding-left: Metrics.space-3;
+                padding-right: Metrics.space-3;
                 spacing: Metrics.space-2;
-                alignment: expanded ? stretch : center;
-                VerticalLayout {
+                show-global-skills-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    horizontal-stretch: 0;
+                    accessible-role: button;
+                    accessible-label: root.show-global-skills
+                        ? "Hide global skills"
+                        : "Show global skills";
+                    clicked => { root.show-global-skills = !root.show-global-skills; }
+                    Rectangle {
+                        height: 24px;
+                        background: root.show-global-skills || show-global-skills-touch.has-hover
+                            ? Theme.bg-primary-container
+                            : transparent;
+                        animate background { duration: 100ms; }
+                        border-radius: Theme.radius-sm;
+                        HorizontalLayout {
+                            padding-left: Metrics.space-2;
+                            padding-right: Metrics.space-2;
+                            spacing: Metrics.space-1;
+                            Text {
+                                text: "Show global skills";
+                                color: root.show-global-skills || show-global-skills-touch.has-hover
+                                    ? Theme.text-primary
+                                    : Theme.text-secondary;
+                                font-size: 10px * Theme.font-scale;
+                                font-weight: root.show-global-skills ? 700 : 400;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 32px;
+            // Collapsed rail: whole row is hit target (ui.yaml thread-view).
+            background: !expanded && search-rail-hit.has-hover
+                ? Theme.bg-primary-container
+                : Theme.bg-canvas;
+            animate background { duration: 100ms; }
+
+            search-rail-hit := TouchArea {
+                width: expanded ? 0px : parent.width;
+                height: expanded ? 0px : parent.height;
+                enabled: !expanded;
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Expand sidebar and search threads";
+                accessible-action-default => { root.open-search(); }
+                clicked => { root.open-search(); }
+            }
+            // Collapsed: centered search glyph in the rail.
+            if !expanded : VerticalLayout {
+                width: 100%;
+                height: 100%;
+                alignment: center;
+                HorizontalLayout {
                     alignment: center;
                     Icon {
                         source: @image-url("../assets/icons/search.svg");
-                        size: 13px;
-                        color: Theme.text-muted;
+                        size: Metrics.icon-sm;
+                        color: search-rail-hit.has-hover ? Theme.text-primary : Theme.text-muted;
                     }
                 }
-                // Always mounted (not `if expanded`) so Ctrl+K /
-                // `focus-search()` can target it after the panel expands
-                // the rail. Collapsed: invisible, no stretch.
-                Rectangle {
-                    horizontal-stretch: expanded ? 1 : 0;
-                    preferred-width: 0px;
-                    min-width: 0px;
-                    visible: expanded;
-                    clip: true;
-                    // TextInput has no built-in placeholder support
-                    // (that's std-widgets' LineEdit, which pulls in a
-                    // heavier widget style dependency this crate doesn't
-                    // otherwise use) -- a manually-overlaid Text shown
-                    // only while empty reproduces the HTML's "Search
-                    // active threads..." placeholder with no new deps.
-                    Text {
-                        text: "Search active threads...";
-                        color: Theme.text-muted;
-                        font-family: Theme.font-sans;
-                        font-size: 11px * Theme.font-scale;
-                        vertical-alignment: center;
-                        visible: search-input.text == "";
+            }
+
+            // Expanded: shared FilterSearchBar (same base as settings /
+            // mention / dropdown). Always mounted so focus-search() works
+            // after expand; hidden when collapsed.
+            thread-search := FilterSearchBar {
+                x: Metrics.space-3;
+                y: (parent.height - self.height) / 2;
+                width: parent.width - 2 * Metrics.space-3;
+                visible: expanded;
+                // Keep mounted for focus-search even when not visible.
+                placeholder: skill-mode ? "Search skills..." : "Search active threads...";
+                bar-accessible-label: skill-mode ? "Search skills" : "Search threads";
+                show-icon: true;
+                icon-trailing: true;
+                bar-height: 28px;
+                bar-bg: Theme.bg-sidebar;
+                query <=> root.search-query;
+                edited => { search-changed(self.query); }
+                icon-clicked => { root.open-search(); }
+                key-pressed(event) => {
+                    if (event.text == Key.Return) {
+                        root.search-submitted(
+                            root.search-query,
+                            root.skill-mode,
+                            root.show-global-skills,
+                        );
+                        return EventResult.accept;
                     }
-                    search-input := TextInput {
-                        accessible-label: "Search threads";
-                        color: Theme.text-primary;
-                        font-family: Theme.font-sans;
-                        font-size: 11px * Theme.font-scale;
-                        vertical-alignment: center;
-                        edited => { search-changed(self.text); }
-                    }
+                    return EventResult.reject;
                 }
             }
         }
@@ -238,40 +388,69 @@ export component Sidebar inherits Rectangle {
             skill-list-col := VerticalLayout {
                 spacing: Metrics.space-1;
                 for skill in skills : HoverSurface {
-                    height: expanded ? 48px : 32px;
+                    property <bool> row-visible: (skill.scope == "project"
+                        || root.show-global-skills)
+                        && TextUtil.matches-filter(
+                            skill.name + "\n" + skill.description,
+                            root.search-query,
+                        );
+                    height: row-visible ? (expanded ? 48px : 32px) : 0px;
+                    width: 100%;
+                    visible: row-visible;
+                    clip: true;
                     idle-bg: Theme.bg-sidebar;
                     selected-bg: Theme.bg-chat;
                     selected: false;
                     button-accessible-label: "Open skill " + skill.name;
                     clicked => { root.skill-selected(skill.path); }
+                    double-clicked => {
+                        if (root.expanded) {
+                            root.collapse-requested();
+                        }
+                    }
+                    // Collapsed rail: name only, elide overflow (no scope
+                    // chips — they force the row past 48px and kill elide).
                     VerticalLayout {
-                        padding-left: compact ? Metrics.space-6 : Metrics.space-8;
-                        padding-right: compact ? Metrics.space-6 : Metrics.space-8;
-                        padding-top: Metrics.space-3;
-                        padding-bottom: Metrics.space-3;
+                        width: 100%;
+                        height: 100%;
+                        padding-left: expanded
+                            ? (compact ? Metrics.space-6 : Metrics.space-8)
+                            : Metrics.space-2;
+                        padding-right: expanded
+                            ? (compact ? Metrics.space-6 : Metrics.space-8)
+                            : Metrics.space-2;
+                        padding-top: expanded ? Metrics.space-3 : 0px;
+                        padding-bottom: expanded ? Metrics.space-3 : 0px;
                         alignment: center;
                         HorizontalLayout {
+                            width: 100%;
                             spacing: Metrics.space-3;
+                            alignment: expanded ? stretch : center;
+                            cross-axis-alignment: center;
                             Text {
                                 text: skill.name;
                                 color: Theme.text-primary;
-                                font-size: 11px * Theme.font-scale;
+                                font-size: (expanded ? 11px : 9px) * Theme.font-scale;
                                 font-family: Theme.font-sans;
                                 font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-alignment: expanded ? left : center;
                                 horizontal-stretch: 1;
                                 preferred-width: 0px;
                                 min-width: 0px;
                                 overflow: elide;
                             }
-                            if skill.scope == "project" && skill.started-from != "" : Text {
+                            if expanded && skill.scope == "project" && skill.started-from != "" : Text {
                                 text: "\u{2192} " + skill.started-from;
                                 color: Theme.text-tertiary;
                                 font-size: 9px * Theme.font-scale;
                                 font-family: Theme.font-mono;
                                 vertical-alignment: center;
                                 horizontal-stretch: 0;
+                                overflow: elide;
+                                max-width: 72px;
                             }
-                            Text {
+                            if expanded : Text {
                                 text: skill.scope;
                                 color: Theme.text-muted;
                                 font-size: 9px * Theme.font-scale;
@@ -305,50 +484,90 @@ export component Sidebar inherits Rectangle {
                 for thread[i] in threads : HoverSurface {
                     // Taller only when the model line is shown under the name.
                     height: expanded && thread.model != "" ? 52px : 44px;
+                    // Fill the rail width so the left stick can pin to x=0
+                    // (content-sized rows left a gap beside a centered group).
+                    width: 100%;
                     idle-bg: Theme.bg-sidebar;
                     selected-bg: Theme.bg-chat;
                     selected: i == selected-thread;
                     button-accessible-label: thread.name;
                     clicked => { thread-selected(i); }
+                    double-clicked => {
+                        if (root.expanded) {
+                            root.collapse-requested();
+                        }
+                    }
+                    // Collapsed: color-coded stick flush LEFT + status glyph
+                    // centered in the remaining width. Expanded: white
+                    // selection stick on the LEFT (Theme.bg-primary — white
+                    // in dark theme) for the active row only.
+                    //
+                    // COLOR CODING (multi-hue accent) ONLY WHEN COLLAPSED.
                     HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        // Always stretch so the stick is not centered with
+                        // the icon group (alignment:center was the gap).
+                        alignment: stretch;
+                        spacing: 0px;
                         Rectangle {
                             width: 3px;
-                            background: i == selected-thread ? Theme.bg-primary : transparent;
+                            horizontal-stretch: 0;
+                            // Full row height, flush to the rail's left end.
+                            height: 100%;
+                            // Collapsed: per-thread accent (rose/orange/…).
+                            // Expanded: white selection bar (bg-primary) on
+                            // the selected row only; transparent otherwise.
+                            background: expanded
+                                ? (i == selected-thread ? Theme.bg-primary : transparent)
+                                : root.thread-accent(i);
                         }
                         VerticalLayout {
                             horizontal-stretch: 1;
                             preferred-width: 0px;
                             min-width: 0px;
-                            padding-left: compact ? Metrics.space-6 : Metrics.space-8;
-                            padding-right: compact ? Metrics.space-6 : Metrics.space-8;
-                            padding-top: Metrics.space-5;
-                            padding-bottom: Metrics.space-5;
+                            padding-left: expanded ? (compact ? Metrics.space-6 : Metrics.space-8) : 0px;
+                            padding-right: expanded ? (compact ? Metrics.space-6 : Metrics.space-8) : 0px;
+                            // Single-line rows need the content group centered
+                            // in the fixed row height. The model-detail variant
+                            // keeps its intentional vertical breathing room.
+                            padding-top: expanded && thread.model != "" ? Metrics.space-3 : 0px;
+                            padding-bottom: expanded && thread.model != "" ? Metrics.space-3 : 0px;
                             spacing: Metrics.space-3;
                             alignment: center;
                             HorizontalLayout {
-                                spacing: Metrics.space-4;
-                                // Left-end state icon: a spinner glyph while the thread
-                                // is actively fetching (blink disabled for now -- static
-                                // icon only), a raised-hand glyph when it needs user
-                                // attention (error/awaiting input), otherwise the plain
-                                // status dot this replaced.
-                                state-icon-blink := Timer {
-                                    interval: 500ms;
-                                    running: false;
-                                    triggered => { state-icon-lit = !state-icon-lit; }
+                                // Expanded: row content L→R. Collapsed:
+                                // center status icon in space after the stick.
+                                alignment: expanded ? stretch : center;
+                                // Keep titles readable before eliding in the
+                                // compact expanded rail; row actions already
+                                // provide their own button hit targets.
+                                spacing: expanded ? Metrics.space-2 : 0px;
+                                // Left-end state icon: spinning circular progress while
+                                // the thread is actively fetching, a filled hand only
+                                // when an error requires user attention, otherwise a
+                                // plain status dot. Centered in the rail when collapsed.
+                                property <angle> load-spin: 0deg;
+                                load-spin-timer := Timer {
+                                    interval: 80ms;
+                                    running: thread.status == "loading";
+                                    triggered => { load-spin += 30deg; }
                                 }
-                                property <bool> state-icon-lit: true;
-                                if thread.status == "loading" : Icon {
-                                    source: @image-url("../assets/icons/loader-circle.svg");
-                                    size: 14px;
-                                    color: Theme.bg-primary;
-                                    opacity: state-icon-lit ? 1.0 : 0.3;
-                                    animate opacity { duration: 200ms; }
+                                if thread.status == "loading" : Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    Icon {
+                                        source: @image-url("../assets/icons/loader-circle.svg");
+                                        size: 14px;
+                                        color: Theme.bg-primary;
+                                        transform-rotation: load-spin;
+                                        transform-origin: { x: 7px, y: 7px };
+                                    }
                                 }
                                 if thread.status == "error" : Icon {
                                     source: @image-url("../assets/icons/hand.svg");
                                     size: 14px;
-                                    color: Theme.text-secondary;
+                                    color: Theme.bg-primary;
                                 }
                                 if thread.status != "loading" && thread.status != "error" : Rectangle {
                                     width: 6px;
@@ -356,7 +575,7 @@ export component Sidebar inherits Rectangle {
                                     border-radius: 3px;
                                     background: Theme.text-muted;
                                 }
-                                if expanded : Text {
+                                if expanded && root.rename-thread-index != i : Text {
                                     text: thread.name;
                                     color: i == selected-thread ? Theme.bg-primary : Theme.text-primary;
                                     font-size: 11px * Theme.font-scale;
@@ -368,7 +587,54 @@ export component Sidebar inherits Rectangle {
                                     preferred-width: 0px;
                                     min-width: 0px;
                                 }
-                                if expanded && thread.background : Icon {
+                                rename-editor := Rectangle {
+                                    visible: expanded && root.rename-thread-index == i;
+                                    height: 24px;
+                                    // TextInput selection/caret painting may
+                                    // extend past its visual box otherwise.
+                                    clip: true;
+                                    background: Theme.bg-card;
+                                    border-width: 1px;
+                                    border-color: Theme.border-default;
+                                    border-radius: Theme.radius-sm;
+                                    horizontal-stretch: 1;
+                                    preferred-width: 0px;
+                                    min-width: root.rename-thread-index == i ? 56px : 0px;
+                                    max-width: root.rename-thread-index == i ? 10000px : 0px;
+                                    rename-input := TextInput {
+                                        x: Metrics.space-2;
+                                        y: 0px;
+                                        width: parent.width - 2 * Metrics.space-2;
+                                        height: parent.height;
+                                        accessible-label: "Thread name";
+                                        text <=> root.rename-thread-draft;
+                                        color: Theme.text-primary;
+                                        font-family: Theme.font-sans;
+                                        font-size: 10px * Theme.font-scale;
+                                        vertical-alignment: center;
+                                        single-line: true;
+                                        key-pressed(event) => {
+                                            if (event.text == Key.Return) {
+                                                root.confirm-thread-rename(i);
+                                                return EventResult.accept;
+                                            }
+                                            if (event.text == Key.Escape) {
+                                                root.cancel-thread-rename();
+                                                return EventResult.accept;
+                                            }
+                                            return EventResult.reject;
+                                        }
+                                    }
+                                }
+                                rename-focus-delay := Timer {
+                                    interval: 1ms;
+                                    running: root.rename-focus-index == i;
+                                    triggered => {
+                                        root.rename-focus-index = -1;
+                                        rename-input.focus();
+                                    }
+                                }
+                                if expanded && root.rename-thread-index != i && thread.background : Icon {
                                     source: @image-url("../assets/icons/moon.svg");
                                     size: Metrics.icon-sm;
                                     color: Theme.text-tertiary;
@@ -381,7 +647,8 @@ export component Sidebar inherits Rectangle {
                                 // of a "logo" image, matching the
                                 // established text-label-for-missing-icon
                                 // precedent from active_pane_and_editor_view.
-                                if expanded && thread.project-path != "" && thread.project-path != root.active-project-path : Text {
+                                if expanded && root.rename-thread-index != i
+                                    && thread.project-path != "" && thread.project-path != root.active-project-path : Text {
                                     text: thread.project-name;
                                     color: Theme.text-tertiary;
                                     font-size: 8px * Theme.font-scale;
@@ -390,12 +657,46 @@ export component Sidebar inherits Rectangle {
                                     overflow: elide;
                                     max-width: 64px;
                                 }
-                                if expanded && !thread.background && i == selected-thread : Text {
+                                if expanded && root.rename-thread-index != i
+                                    && !thread.background && i == selected-thread : Text {
                                     text: "ACTIVE";
                                     color: Theme.text-muted;
                                     font-size: 8px * Theme.font-scale;
                                     font-family: Theme.font-mono;
                                     vertical-alignment: center;
+                                }
+                                if expanded && root.rename-thread-index == -1 : IconButton {
+                                    btn-width: 18px;
+                                    btn-height: 18px;
+                                    button-accessible-label: "Rename thread " + thread.name;
+                                    clicked => { root.begin-thread-rename(i); }
+                                    Icon {
+                                        source: @image-url("../assets/icons/pencil.svg");
+                                        size: 13px;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+                                if expanded && root.rename-thread-index == i : IconButton {
+                                    btn-width: 18px;
+                                    btn-height: 18px;
+                                    button-accessible-label: "Save thread name";
+                                    clicked => { root.confirm-thread-rename(i); }
+                                    Icon {
+                                        source: @image-url("../assets/icons/check.svg");
+                                        size: 13px;
+                                        color: Theme.bg-primary;
+                                    }
+                                }
+                                if expanded && root.rename-thread-index == i : IconButton {
+                                    btn-width: 18px;
+                                    btn-height: 18px;
+                                    button-accessible-label: "Cancel thread rename";
+                                    clicked => { root.cancel-thread-rename(); }
+                                    Icon {
+                                        source: @image-url("../assets/icons/x.svg");
+                                        size: 13px;
+                                        color: Theme.text-muted;
+                                    }
                                 }
                                 // Coverage Matrix `session/close`/
                                 // `session/delete` row: explicit,
@@ -408,7 +709,8 @@ export component Sidebar inherits Rectangle {
                                 // confirm -- same two-step pattern as
                                 // `settings_sheet.slint`'s profile
                                 // delete control.
-                                if expanded && !thread.closed && root.pending-close-index != i : IconButton {
+                                if expanded && root.rename-thread-index != i
+                                    && !thread.closed && root.pending-close-index != i : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Close thread " + thread.name;
@@ -419,7 +721,8 @@ export component Sidebar inherits Rectangle {
                                         color: Theme.text-muted;
                                     }
                                 }
-                                if expanded && !thread.closed && root.pending-close-index == i : HorizontalLayout {
+                                if expanded && root.rename-thread-index != i
+                                    && !thread.closed && root.pending-close-index == i : HorizontalLayout {
                                     spacing: Metrics.space-1;
                                     IconButton {
                                         btn-width: 18px;
@@ -447,7 +750,8 @@ export component Sidebar inherits Rectangle {
                                         }
                                     }
                                 }
-                                if expanded && thread.closed && root.pending-delete-index != i : IconButton {
+                                if expanded && root.rename-thread-index != i
+                                    && thread.closed && root.pending-delete-index != i : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Delete thread " + thread.name;
@@ -458,7 +762,8 @@ export component Sidebar inherits Rectangle {
                                         color: Theme.text-muted;
                                     }
                                 }
-                                if expanded && thread.closed && root.pending-delete-index == i : HorizontalLayout {
+                                if expanded && root.rename-thread-index != i
+                                    && thread.closed && root.pending-delete-index == i : HorizontalLayout {
                                     spacing: Metrics.space-1;
                                     IconButton {
                                         btn-width: 18px;
@@ -486,7 +791,7 @@ export component Sidebar inherits Rectangle {
                                         }
                                     }
                                 }
-                                if expanded : IconButton {
+                                if expanded && root.rename-thread-index != i : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Archive thread " + thread.name;
@@ -510,27 +815,57 @@ export component Sidebar inherits Rectangle {
                                 min-width: 0px;
                             }
                         }
-                        Rectangle {
-                            width: 3px;
-                            background: expanded ? transparent : root.thread-accent(i);
-                        }
                     }
                 }
             }
         }
     }
 
-    // Settings — absolute bottom of the thread bar: margined box, bg + radius, no border.
+    // Skills config sits directly above Settings in the Skills sidebar.
     settings-footer := Rectangle {
         x: 0px;
         y: parent.height - self.height;
         width: parent.width;
         height: root.settings-footer-h;
         background: Theme.bg-sidebar;
-        // Inset margin around the settings chip.
-        settings-box := HoverSurface {
+        if root.skills-config-h > 0px : skills-config := HoverSurface {
             x: root.settings-margin;
             y: root.settings-margin;
+            width: parent.width - 2 * root.settings-margin;
+            height: root.skills-config-h;
+            idle-bg: transparent;
+            selected: false;
+            button-accessible-label: "Open Skills settings";
+            clicked => { root.skills-settings-requested(); }
+            border-width: 0px;
+            border-radius: Theme.radius-md;
+            HorizontalLayout {
+                width: 100%;
+                height: 100%;
+                padding-left: Metrics.pad-sm;
+                padding-right: Metrics.pad-sm;
+                spacing: Metrics.gap-sm;
+                cross-axis-alignment: center;
+                Text {
+                    text: "Skills config";
+                    color: Theme.text-secondary;
+                    font-size: 10px * Theme.font-scale;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                Icon {
+                    source: @image-url("../assets/icons/chevron-right.svg");
+                    size: Metrics.icon-sm;
+                    color: Theme.text-muted;
+                }
+            }
+        }
+        // Expanded: full-width settings row with the normal hover surface.
+        if expanded : settings-box := HoverSurface {
+            x: root.settings-margin;
+            y: root.skills-config-h > 0px
+                ? root.skills-config-h + 2 * root.settings-margin
+                : root.settings-margin;
             width: parent.width - 2 * root.settings-margin;
             height: root.settings-box-h;
             idle-bg: Theme.bg-tertiary;
@@ -545,7 +880,7 @@ export component Sidebar inherits Rectangle {
                 padding-left: Metrics.pad-sm;
                 padding-right: Metrics.pad-sm;
                 spacing: Metrics.gap-sm;
-                alignment: expanded ? start : center;
+                alignment: start;
                 VerticalLayout {
                     alignment: center;
                     horizontal-stretch: 0;
@@ -555,7 +890,7 @@ export component Sidebar inherits Rectangle {
                         color: Theme.text-secondary;
                     }
                 }
-                if expanded : Text {
+                Text {
                     text: "Settings";
                     color: Theme.text-secondary;
                     font-size: 11px * Theme.font-scale;
@@ -565,113 +900,66 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
+        // Collapsed: use the same icon-button primitive as the header.
+        // The expanded row's horizontal padding cannot fit a 48px rail,
+        // which made both its background and hover hit area look broken.
+        if !expanded : IconButton {
+            x: (parent.width - self.width) / 2;
+            y: root.skills-config-h > 0px
+                ? root.skills-config-h + 2 * root.settings-margin
+                    + (root.settings-box-h - self.height) / 2
+                : (parent.height - self.height) / 2;
+            btn-width: 28px;
+            btn-height: 28px;
+            button-accessible-label: "Open settings";
+            clicked => { root.settings-requested(); }
+            Icon {
+                source: @image-url("../assets/icons/settings.svg");
+                size: Metrics.icon-md;
+                color: Theme.text-secondary;
+            }
+        }
     }
 
-    // Ctrl+K target -- focus the thread search box (expanded) so the
-    // panel-level keybinding can jump here without re-finding the input.
+    // Ctrl+K / search-icon target -- focus the thread search box so the
+    // panel-level keybinding and the collapsed-rail search button can
+    // jump here without re-finding the input.
     public function focus-search() {
-        search-input.focus();
+        thread-search.focus-input();
     }
 
-    // New-skill dialog -- name input, prefilled scaffold created by
-    // Rust on confirm (`new-skill-requested`). Simple in-tree overlay,
-    // same "drawn over everything else in this component" approach
-    // `searchable_dropdown.slint`'s popup already uses, rather than a
-    // new modal-overlay primitive for one call site.
-    if new-skill-dialog-open : Rectangle {
+    // Expand the rail if needed, then put keyboard focus in the filter.
+    // Uses `expand-requested` (not toggle) so an already-open sidebar
+    // never bounces closed. Focus runs after a short delay so the width
+    // animation + `visible: expanded` on the TextInput have applied
+    // (same-frame focus on a still-hidden input is a no-op).
+    property <bool> pending-search-focus: false;
+    search-focus-delay := Timer {
+        interval: 200ms;
+        running: pending-search-focus;
+        triggered => {
+            pending-search-focus = false;
+            thread-search.focus-input();
+        }
+    }
+    public function open-search() {
+        if (!expanded) {
+            pending-search-focus = true;
+            expand-requested();
+        } else {
+            thread-search.focus-input();
+        }
+    }
+
+    NamePromptDialog {
         x: 0px;
         y: 0px;
         width: root.width;
         height: root.height;
-        background: Theme.bg-canvas.with-alpha(0.85);
-        TouchArea {
-            // Backdrop click dismisses without creating a skill.
-            clicked => { new-skill-dialog-open = false; }
-        }
-        Rectangle {
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            width: Math.min(220px, parent.width - 2 * Metrics.space-6);
-            height: 110px;
-            background: Theme.bg-card;
-            border-color: Theme.border-strong;
-            border-width: 1px;
-            border-radius: Theme.radius-md;
-            // Swallow clicks so they don't reach the backdrop TouchArea.
-            TouchArea {}
-            VerticalLayout {
-                padding: Metrics.space-4;
-                spacing: Metrics.space-3;
-                Text {
-                    text: "New skill";
-                    color: Theme.text-primary;
-                    font-size: 11px * Theme.font-scale;
-                    font-weight: 600;
-                    font-family: Theme.font-sans;
-                }
-                Rectangle {
-                    height: 28px;
-                    background: Theme.bg-sidebar;
-                    border-color: Theme.border-default;
-                    border-width: 1px;
-                    border-radius: Theme.radius-sm;
-                    new-skill-name-input := TextInput {
-                        x: Metrics.space-3;
-                        y: 0px;
-                        width: parent.width - 2 * Metrics.space-3;
-                        height: parent.height;
-                        accessible-label: "New skill name";
-                        color: Theme.text-primary;
-                        font-family: Theme.font-sans;
-                        font-size: 11px * Theme.font-scale;
-                        vertical-alignment: center;
-                        single-line: true;
-                        key-pressed(event) => {
-                            if (event.text == Key.Return && self.text != "") {
-                                root.new-skill-requested(self.text);
-                                self.text = "";
-                                new-skill-dialog-open = false;
-                                return EventResult.accept;
-                            }
-                            return EventResult.reject;
-                        }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: Metrics.space-3;
-                    alignment: end;
-                    cancel-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        accessible-role: button;
-                        accessible-label: "Cancel";
-                        clicked => { new-skill-dialog-open = false; }
-                        Text {
-                            text: "Cancel";
-                            color: Theme.text-secondary;
-                            font-size: 10px * Theme.font-scale;
-                            vertical-alignment: center;
-                        }
-                    }
-                    create-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        accessible-role: button;
-                        accessible-label: "Create skill";
-                        enabled: new-skill-name-input.text != "";
-                        clicked => {
-                            root.new-skill-requested(new-skill-name-input.text);
-                            new-skill-name-input.text = "";
-                            new-skill-dialog-open = false;
-                        }
-                        Text {
-                            text: "Create";
-                            color: new-skill-name-input.text != "" ? Theme.bg-primary : Theme.text-muted;
-                            font-size: 10px * Theme.font-scale;
-                            font-weight: 600;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-            }
-        }
+        open <=> root.new-skill-dialog-open;
+        title: "New skill";
+        field-accessible-label: "New skill name";
+        confirm-label: "Create";
+        confirmed(name) => { root.new-skill-requested(name, "project"); }
     }
 }
