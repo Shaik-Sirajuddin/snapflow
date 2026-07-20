@@ -6,20 +6,23 @@ import { CursorHost } from "../../tokens/cursor_host.slint";
 
 // Skill editor -- `active_pane_and_editor_view` phase. Replaces
 // `ChatArea` in the main content area (see `app.slint`'s `active-pane`
-// switch) while a skill is selected in the sidebar's skill list. Top
-// bar mirrors `chat_area.slint`'s header shell (icon glyph + title,
-// same row height/padding), plus copy-path and detected-editor icons;
-// body is a plain live-edit TextInput over the skill's `SKILL.md`
-// contents (writes through on every edit -- `assistant-sidebar
-// refine`'s "opens editor to edit the skills in live").
+// switch) while a skill is selected in the sidebar's skill list.
+//
+// Design tokens (aligned with chat_area / DESIGN_SYSTEM):
+//   Surface     Theme.bg-chat
+//   Header      44px band, Metrics.space-6 H padding, space-3 gaps,
+//               cross-axis-alignment: center (same shell as chat-view-top)
+//   Title       Theme.text-primary, font-sans, 12px * font-scale
+//   Secondary   Theme.text-secondary, 9px actions
+//   Divider     Theme.border-default 1px
+//   Editor body Theme.font-mono, Theme.text-primary, Metrics.pad-md insets
+//
+// Closing: X button fires close-requested; selecting a thread in the
+// sidebar sets active-pane back to "chat" in app.slint (thread-selected).
 export component SkillEditorView inherits Rectangle {
     in property <string> skill-name;
     in property <string> skill-path;
     in-out property <string> skill-content;
-    // Display names of CLI-launchable editors actually found on PATH
-    // (editor_detect::detect_installed_editors), capped to a small
-    // static candidate list per 03-open-risks.md's editor-detection
-    // scope decision -- not exhaustive detection.
     in property <[string]> detected-editors: [];
     callback copy-path-requested();
     callback open-in-editor-requested(string /* editor display name */);
@@ -37,101 +40,185 @@ export component SkillEditorView inherits Rectangle {
             height: 44px;
             background: Theme.bg-chat;
             HorizontalLayout {
-                padding-left: Metrics.space-4;
-                padding-right: Metrics.space-4;
+                width: 100%;
+                height: 100%;
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
                 spacing: Metrics.space-3;
-                Rectangle {
-                    width: 22px;
-                    height: 22px;
-                    background: Theme.bg-primary-container;
-                    border-color: Theme.border-default;
-                    border-width: 1px;
-                    border-radius: Theme.radius-sm;
-                    Icon {
-                        source: @image-url("../../assets/icons/book-open.svg");
-                        size: Metrics.icon-md;
-                        color: Theme.bg-primary;
-                    }
-                }
-                Text {
-                    text: root.skill-name;
-                    color: Theme.text-primary;
-                    font-size: 12px * Theme.font-scale;
-                    font-weight: 600;
-                    font-family: Theme.font-mono;
-                    vertical-alignment: center;
+                alignment: stretch;
+                cross-axis-alignment: center;
+
+                // Left: glyph + title (left-aligned), matches chat-view-top.
+                HorizontalLayout {
+                    spacing: Metrics.space-3;
                     horizontal-stretch: 1;
                     preferred-width: 0px;
                     min-width: 0px;
-                    overflow: elide;
-                }
-                copy-path-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    width: copy-path-label.preferred-width + 2 * Metrics.space-2;
-                    accessible-role: button;
-                    accessible-label: "Copy skill path";
-                    clicked => { root.copy-path-requested(); }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    copy-path-label := Text {
-                        text: "Copy path";
-                        color: Theme.text-secondary;
-                        font-size: 9px * Theme.font-scale;
+                    alignment: start;
+                    cross-axis-alignment: center;
+                    Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        horizontal-stretch: 0;
+                        background: Theme.bg-primary-container;
+                        border-color: Theme.border-default;
+                        border-width: 1px;
+                        border-radius: Theme.radius-sm;
+                        VerticalLayout {
+                            width: 100%;
+                            height: 100%;
+                            alignment: center;
+                            HorizontalLayout {
+                                alignment: center;
+                                Icon {
+                                    source: @image-url("../../assets/icons/book-open.svg");
+                                    size: Metrics.icon-md;
+                                    color: Theme.bg-primary;
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.skill-name;
+                        color: Theme.text-primary;
+                        font-size: 12px * Theme.font-scale;
+                        font-weight: 600;
+                        font-family: Theme.font-sans;
                         vertical-alignment: center;
+                        horizontal-alignment: left;
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        overflow: elide;
                     }
                 }
-                // Up to a few detected-CLI-editor icons -- text labels
-                // rather than per-editor glyphs, since there is no
-                // per-editor icon asset set in this crate and adding one
-                // is out of scope for this phase.
-                for editor-name in root.detected-editors : TouchArea {
-                    mouse-cursor: pointer;
-                    width: open-label.preferred-width + 2 * Metrics.space-2;
-                    accessible-role: button;
-                    accessible-label: "Open in " + editor-name;
-                    clicked => { root.open-in-editor-requested(editor-name); }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    open-label := Text {
-                        text: "Open in " + editor-name;
-                        color: Theme.text-secondary;
-                        font-size: 9px * Theme.font-scale;
-                        vertical-alignment: center;
+
+                // Right: text actions + close (end-aligned).
+                HorizontalLayout {
+                    spacing: Metrics.space-2;
+                    horizontal-stretch: 0;
+                    alignment: end;
+                    cross-axis-alignment: center;
+
+                    // Variable-width text actions — token-colored pills
+                    // (Button is fixed-width; long "Open in …" labels need flex).
+                    copy-path-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        horizontal-stretch: 0;
+                        accessible-role: button;
+                        accessible-label: "Copy skill path";
+                        clicked => { root.copy-path-requested(); }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                        Rectangle {
+                            background: copy-path-touch.has-hover
+                                ? Theme.bg-primary-container
+                                : Theme.bg-primary-container.with-alpha(0.6);
+                            border-width: 1px;
+                            border-color: Theme.border-default;
+                            border-radius: Theme.radius-sm;
+                            HorizontalLayout {
+                                padding-left: Metrics.space-2;
+                                padding-right: Metrics.space-2;
+                                padding-top: Metrics.space-1;
+                                padding-bottom: Metrics.space-1;
+                                Text {
+                                    text: "Copy path";
+                                    color: Theme.text-secondary;
+                                    font-size: 9px * Theme.font-scale;
+                                    font-family: Theme.font-sans;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
-                }
-                open-default-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    width: open-default-label.preferred-width + 2 * Metrics.space-2;
-                    accessible-role: button;
-                    accessible-label: "Open with OS default application";
-                    clicked => { root.open-with-os-default-requested(); }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    open-default-label := Text {
-                        text: "Open";
-                        color: Theme.text-secondary;
-                        font-size: 9px * Theme.font-scale;
-                        vertical-alignment: center;
+                    for editor-name in root.detected-editors : ed-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        horizontal-stretch: 0;
+                        accessible-role: button;
+                        accessible-label: "Open in " + editor-name;
+                        clicked => { root.open-in-editor-requested(editor-name); }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                        Rectangle {
+                            background: ed-touch.has-hover
+                                ? Theme.bg-primary-container
+                                : Theme.bg-primary-container.with-alpha(0.6);
+                            border-width: 1px;
+                            border-color: Theme.border-default;
+                            border-radius: Theme.radius-sm;
+                            HorizontalLayout {
+                                padding-left: Metrics.space-2;
+                                padding-right: Metrics.space-2;
+                                padding-top: Metrics.space-1;
+                                padding-bottom: Metrics.space-1;
+                                Text {
+                                    text: "Open in " + editor-name;
+                                    color: Theme.text-secondary;
+                                    font-size: 9px * Theme.font-scale;
+                                    font-family: Theme.font-sans;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
-                }
-                IconButton {
-                    button-accessible-label: "Close skill editor";
-                    clicked => { root.close-requested(); }
-                    Icon {
-                        source: @image-url("../../assets/icons/x.svg");
-                        size: Metrics.icon-sm;
-                        color: Theme.text-secondary;
+                    open-default-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        horizontal-stretch: 0;
+                        accessible-role: button;
+                        accessible-label: "Open with OS default application";
+                        clicked => { root.open-with-os-default-requested(); }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                        Rectangle {
+                            background: open-default-touch.has-hover
+                                ? Theme.bg-primary-container
+                                : Theme.bg-primary-container.with-alpha(0.6);
+                            border-width: 1px;
+                            border-color: Theme.border-default;
+                            border-radius: Theme.radius-sm;
+                            HorizontalLayout {
+                                padding-left: Metrics.space-2;
+                                padding-right: Metrics.space-2;
+                                padding-top: Metrics.space-1;
+                                padding-bottom: Metrics.space-1;
+                                Text {
+                                    text: "Open";
+                                    color: Theme.text-secondary;
+                                    font-size: 9px * Theme.font-scale;
+                                    font-family: Theme.font-sans;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                    IconButton {
+                        button-accessible-label: "Close skill editor";
+                        clicked => { root.close-requested(); }
+                        Icon {
+                            source: @image-url("../../assets/icons/x.svg");
+                            size: Metrics.icon-sm;
+                            color: Theme.text-secondary;
+                        }
                     }
                 }
             }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: Theme.border-default;
         }
 
         Flickable {
             vertical-stretch: 1;
             preferred-height: 0px;
             min-height: 0px;
-            viewport-height: max(self.height, editor-input.preferred-height + 2 * Metrics.space-6);
+            viewport-height: max(self.height, editor-input.preferred-height + 2 * Metrics.pad-md);
             editor-input := TextInput {
-                x: Metrics.space-6;
-                y: Metrics.space-4;
-                width: parent.width - 2 * Metrics.space-6;
+                x: Metrics.pad-md;
+                y: Metrics.pad-sm;
+                width: parent.width - 2 * Metrics.pad-md;
                 // Explicit height -- without one, this multi-line
                 // TextInput's focusable/clickable hit-region collapsed to
                 // its own single-line preferred height at y:0, leaving

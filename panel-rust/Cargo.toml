@@ -4,8 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "Real chat-panel crate. Renders a Slint UI (software renderer, CPU pixel buffer) driven by live ACPX gateway session data (via acpx-client directly, see src/gateway_actor.rs), exposed via a C ABI for a Qt QQuickItem to composite. See src/agent_bridge.rs for how the async agent connections are bridged onto panel-rust's single required OS thread, and its module docs for the jsonl cache / live-reload contract."
 
+[features]
+default = []
+# Optional: cargo run --features ui-dev-viewer --bin ui-dev-viewer
+ui-dev-viewer = ["dep:slint-interpreter", "dep:spin_on", "dep:notify"]
+
 [dependencies]
 slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
+slint-interpreter = { version = "1.17.1", optional = true, default-features = true, features = ["compat-1-2", "display-diagnostics", "backend-winit", "renderer-femtovg"] }
+spin_on = { version = "0.1", optional = true }
+notify = { version = "6", optional = true }
 # Streaming markdown for agent bodies (src/markdown.rs).
 pulldown-cmark = "0.12"
 textwrap = "0.16"
@@ -73,6 +81,12 @@ path = "src/bin/chat_init_verify.rs"
 [[bin]]
 name = "skills-mcp-server"
 path = "src/bin/skills_mcp_server.rs"
+
+# Dev UI viewer with TextUtil installed (live / @ # filter). Not shipped.
+[[bin]]
+name = "ui-dev-viewer"
+path = "src/bin/ui_dev_viewer.rs"
+required-features = ["ui-dev-viewer"]
 
 [dependencies.agent-client-protocol]
 version = "1.2"

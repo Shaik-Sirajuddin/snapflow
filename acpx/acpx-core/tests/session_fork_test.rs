@@ -208,3 +208,49 @@ done
         json!("agent_message_chunk")
     );
 }
+
+/// **Regression: `process_reader_demux` fork-panic gap.** Before the fix,
+/// `dispatch_session_fork_shared` always read its response via
+/// `read_matching_response`'s `backend.reader_mut()`, unconditionally --
+/// but once any earlier call against the *same* shared backend process
+/// had already enabled process-reader-demux (`BackendProcess::
+/// start_demux`, which takes the raw reader), `reader_mut()` panics
+/// outright. With `process_reader_demux` now on by default, the first
+/// `session/new` on this router already activates demux for this process
+/// (see `dispatch_session_new_shared`'s own demux branch) -- so forking a
+/// session against that same process is exactly the crash scenario this
+/// test pins. Must complete normally, no panic.
+#[tokio::test]
+async fn dispatch_shared_session_fork_works_after_demux_is_already_active_on_the_process() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let router = router.with_process_reader_demux(true);
+    let router = Arc::new(Mutex::new(router));
+
+    let new_response = dispatch_shared(
+        &router,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+    )
+    .await
+    .expect("session/new activates process-reader-demux for this shared process");
+    let source_gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let fork_response = dispatch_shared(
+        &router,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/fork",
+            "params": {"sessionId": source_gateway_id, "cwd": "/tmp/forked"}
+        }),
+    )
+    .await
+    .expect("session/fork must not panic on a process demux already activated");
+    let forked_gateway_id = fork_response["result"]["sessionId"]
+        .as_str()
+        .expect("session/fork result carries a sessionId")
+        .to_string();
+    assert_ne!(forked_gateway_id, source_gateway_id);
+    assert_ne!(forked_gateway_id, "forked-xyz");
+}

@@ -203,13 +203,13 @@ impl BackendProcess {
     /// Must only be called once the `initialize`/`authenticate` handshake
     /// has already completed via [`Self::reader_mut`] -- the handshake's
     /// own fixed-id reads are not routed through the pending table.
-    pub fn start_demux(&mut self) -> mpsc::UnboundedReceiver<crate::demux::UnmatchedFrame> {
+    pub fn start_demux(&mut self) -> mpsc::Receiver<crate::demux::UnmatchedFrame> {
         let reader = self
             .reader
             .take()
             .expect("start_demux called twice, or before the reader was ever set");
         let pending = Arc::new(crate::demux::PendingRequests::new());
-        let (unmatched_tx, unmatched_rx) = mpsc::unbounded_channel();
+        let (unmatched_tx, unmatched_rx) = mpsc::channel(crate::demux::UNMATCHED_FRAME_QUEUE_CAPACITY);
         crate::demux::spawn_reader_task(reader, Arc::clone(&pending), unmatched_tx);
         self.pending = Some(pending);
         unmatched_rx

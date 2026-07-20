@@ -4,43 +4,49 @@
 //! wiring glue), per this crate's established modularity convention
 //! (see `models.rs`'s doc comment).
 //!
-//! v1 scope: a single approve/reject decision per request, not a full
-//! N-option picker. For `session/request_permission` (which offers a
-//! real ACP `options: Vec<PermissionOption>` list), "Approve" picks the
-//! first `allow_once`/`allow_always`-kinded option (matching acpx's own
-//! `build_permission_reply`'s `AutoAllow` fallback-to-first-option
-//! behavior when no exact-kind match exists) and "Reject" picks the
-//! first `reject_once`/`reject_always`-kinded option, falling back to
-//! `{"outcome": "cancelled"}` if the backend offered no reject-kinded
-//! option at all (mirrors `AutoReject`'s own fallback). For
-//! `fs/read_text_file`/`fs/write_text_file`/`terminal/create`, both
-//! buttons send the lightweight `{"approved": bool}` decision envelope
-//! `acpx_core::router::try_relay_approval` expects (see that function's
-//! doc comment) -- the real disk/process I/O always happens gateway-side
-//! either way.
+//! ## Approval model (Zed-aligned one-of select)
+//!
+//! Zed's `PermissionOptions::Flat` renders every ACP `PermissionOption`
+//! as its own button; clicking one sends
+//! `RequestPermissionOutcome::Selected { optionId, kind }` immediately.
+//! That is a **one-of select**: the choice *is* the action, not a two-step
+//! "pick then confirm".
+//!
+//! This module projects the same model for our panel:
+//! - `session/request_permission` → real `params.options[]` rows
+//! - `fs/*` / `terminal/create` → synthetic Approve / Reject rows
+//! - unknown methods → empty options (card still shows title/summary)
+//!
+//! Keyboard conveniences map onto the same list: Ctrl+Enter ≈ first
+//! `allow_*` option, Escape ≈ first `reject_*` (or cancel).
 
 use crate::protocol_types::AgentRequestEvent;
 use serde_json::Value;
+use slint::{ModelRc, VecModel};
+
+/// One selectable approval choice for the Slint card (mirrors
+/// [`crate::PermissionOptionItem`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOptionView {
+    pub option_id: String,
+    pub name: String,
+    pub kind: String,
+    pub is_allow: bool,
+}
 
 /// What a request card actually shows: a short title (method-derived),
 /// a human-readable one-line summary of the specific action being
-/// requested, and whether this method is even answerable by this v1 UI
-/// (unknown/future agent-initiated methods still render, so the request
-/// is never silently invisible, but only offer a "Dismiss" affordance
-/// -- see [`is_supported_method`]).
+/// requested, and the one-of option list.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingRequestView {
     pub relay_id: String,
     pub method: String,
     pub title: String,
     pub summary: String,
+    pub options: Vec<PermissionOptionView>,
 }
 
-/// Whether this v1 UI knows how to build a real approve/reject response
-/// for `method` -- see [`build_response`]. An unrecognized method still
-/// gets a visible card (never silently dropped, per the Coverage
-/// Matrix's "Unknown ACP update/request shapes... shown as safe generic
-/// notices" contract), just without working action buttons.
+/// Whether this UI knows how to build a real response for `method`.
 pub fn is_supported_method(method: &str) -> bool {
     matches!(
         method,
@@ -49,6 +55,76 @@ pub fn is_supported_method(method: &str) -> bool {
             | "fs/write_text_file"
             | "terminal/create"
     )
+}
+
+fn kind_is_allow(kind: &str) -> bool {
+    kind.starts_with("allow_") || kind == "approve"
+}
+
+fn kind_is_reject(kind: &str) -> bool {
+    kind.starts_with("reject_") || kind == "reject"
+}
+
+/// Projects ACP `params.options` (or synthetic fs/terminal pairs) into
+/// the one-of list the permission card renders.
+pub fn extract_options(event: &AgentRequestEvent) -> Vec<PermissionOptionView> {
+    match event.method.as_str() {
+        "session/request_permission" => {
+            let options = event
+                .raw_request
+                .get("params")
+                .and_then(|p| p.get("options"))
+                .and_then(|o| o.as_array())
+                .cloned()
+                .unwrap_or_default();
+            options
+                .iter()
+                .filter_map(|opt| {
+                    let option_id = opt
+                        .get("optionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if option_id.is_empty() {
+                        return None;
+                    }
+                    let name = opt
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(option_id.as_str())
+                        .to_string();
+                    let kind = opt
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(PermissionOptionView {
+                        is_allow: kind_is_allow(&kind),
+                        option_id,
+                        name,
+                        kind,
+                    })
+                })
+                .collect()
+        }
+        // Lightweight relay methods: synthesize a binary one-of so the
+        // same card UX covers every supported request kind.
+        "fs/read_text_file" | "fs/write_text_file" | "terminal/create" => vec![
+            PermissionOptionView {
+                option_id: "approve".into(),
+                name: "Approve".into(),
+                kind: "allow_once".into(),
+                is_allow: true,
+            },
+            PermissionOptionView {
+                option_id: "reject".into(),
+                name: "Reject".into(),
+                kind: "reject_once".into(),
+                is_allow: false,
+            },
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// Projects a raw [`AgentRequestEvent`] into what the Slint request-card
@@ -104,7 +180,9 @@ pub fn to_pending_request_view(event: &AgentRequestEvent) -> PendingRequestView 
                 .unwrap_or_default();
             (
                 "Terminal command requested".to_string(),
-                format!("The agent wants to run: {command} {args}").trim_end().to_string(),
+                format!("The agent wants to run: {command} {args}")
+                    .trim_end()
+                    .to_string(),
             )
         }
         other => (
@@ -117,17 +195,53 @@ pub fn to_pending_request_view(event: &AgentRequestEvent) -> PendingRequestView 
         method: event.method.clone(),
         title,
         summary,
+        options: extract_options(event),
     }
 }
 
-/// Builds the response payload [`rui_acpx_client::AcpxThreadHandle::
-/// respond_agent_request`] expects for `event`'s method, given the
-/// user's `approved` decision -- see this module's doc comment for the
-/// per-method shape contract.
-pub fn build_response(event: &AgentRequestEvent, approved: bool) -> Value {
+/// Convert option views into the Slint model.
+pub fn to_permission_option_model(
+    options: Vec<PermissionOptionView>,
+) -> ModelRc<crate::PermissionOptionItem> {
+    let items: Vec<crate::PermissionOptionItem> = options
+        .into_iter()
+        .map(|o| crate::PermissionOptionItem {
+            option_id: o.option_id.into(),
+            name: o.name.into(),
+            kind: o.kind.into(),
+            is_allow: o.is_allow,
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
+}
+
+/// First allow_* (or synthetic approve) option id — used by Ctrl+Enter.
+pub fn default_allow_option_id(options: &[PermissionOptionView]) -> Option<&str> {
+    options
+        .iter()
+        .find(|o| o.is_allow)
+        .map(|o| o.option_id.as_str())
+}
+
+/// First reject_* (or synthetic reject) option id — used by Escape.
+pub fn default_reject_option_id(options: &[PermissionOptionView]) -> Option<&str> {
+    options
+        .iter()
+        .find(|o| kind_is_reject(&o.kind))
+        .map(|o| o.option_id.as_str())
+}
+
+/// Builds the response payload for a concrete option pick (one-of select).
+///
+/// - `session/request_permission` → full JSON-RPC result with
+///   `{ outcome: { outcome: "selected", optionId } }` (or cancelled)
+/// - fs/terminal → `{ "approved": bool }` for the synthetic approve/reject ids
+pub fn build_response_for_option(event: &AgentRequestEvent, option_id: &str) -> Value {
     if event.method != "session/request_permission" {
+        let approved = option_id != "reject" && !option_id.starts_with("reject");
         return serde_json::json!({ "approved": approved });
     }
+
     let options: Vec<Value> = event
         .raw_request
         .get("params")
@@ -135,42 +249,50 @@ pub fn build_response(event: &AgentRequestEvent, approved: bool) -> Value {
         .and_then(|o| o.as_array())
         .cloned()
         .unwrap_or_default();
-    let kind_prefix = if approved { "allow_" } else { "reject_" };
-    let chosen = options
-        .iter()
-        .find(|opt| {
-            opt.get("kind")
-                .and_then(|k| k.as_str())
-                .map(|k| k.starts_with(kind_prefix))
-                .unwrap_or(false)
-        })
-        .or_else(|| if approved { options.first() } else { None });
+
+    let chosen = options.iter().find(|opt| {
+        opt.get("optionId")
+            .and_then(|o| o.as_str())
+            .map(|id| id == option_id)
+            .unwrap_or(false)
+    });
+
     let outcome = match chosen.and_then(|opt| opt.get("optionId").and_then(|o| o.as_str())) {
-        Some(option_id) => serde_json::json!({"outcome": "selected", "optionId": option_id}),
+        Some(id) => serde_json::json!({"outcome": "selected", "optionId": id}),
         None => serde_json::json!({"outcome": "cancelled"}),
     };
-    // Unlike the `fs/*`/`terminal/create` decision envelope above,
-    // `session/request_permission`'s relayed response is written
-    // *verbatim* to the backend's own stdin as its reply frame (see
-    // `acpx_core::router::try_relay_agent_request`'s doc comment: the
-    // hub forwards exactly what the client sent, no server-side
-    // wrapping) -- so this must be a complete JSON-RPC response
-    // envelope with the backend's own request `id` echoed back, not
-    // just the ACP `RequestPermissionResponse` payload alone. A
-    // malformed/missing `id` on `raw_request` (shouldn't happen for a
-    // real relayed request, but not fatal) falls back to `null`, which
-    // the backend would reasonably treat as "reply I can't correlate"
-    // rather than this call panicking.
-    let backend_request_id = event
-        .raw_request
-        .get("id")
-        .cloned()
-        .unwrap_or(Value::Null);
+
+    let backend_request_id = event.raw_request.get("id").cloned().unwrap_or(Value::Null);
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": backend_request_id,
         "result": { "outcome": outcome }
     })
+}
+
+/// Legacy approve/reject helper: picks the first matching kind (same
+/// fallback policy as acpx AutoAllow / AutoReject). Prefer
+/// [`build_response_for_option`] when the UI has a concrete option id.
+pub fn build_response(event: &AgentRequestEvent, approved: bool) -> Value {
+    let options = extract_options(event);
+    let option_id = if approved {
+        default_allow_option_id(&options)
+    } else {
+        default_reject_option_id(&options)
+    };
+    match option_id {
+        Some(id) => build_response_for_option(event, id),
+        None if !approved && event.method == "session/request_permission" => {
+            // No reject option offered — cancel rather than guess.
+            let backend_request_id = event.raw_request.get("id").cloned().unwrap_or(Value::Null);
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": backend_request_id,
+                "result": { "outcome": { "outcome": "cancelled" } }
+            })
+        }
+        None => build_response_for_option(event, if approved { "approve" } else { "reject" }),
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +309,8 @@ mod tests {
                     "sessionId": "s1",
                     "toolCall": {"toolCallId": "call-1", "title": "Run rm -rf"},
                     "options": [
-                        {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "allow-always", "name": "Allow always", "kind": "allow_always"},
                         {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"}
                     ]
                 }
@@ -200,6 +323,20 @@ mod tests {
         let view = to_pending_request_view(&permission_request_event());
         assert!(view.summary.contains("Run rm -rf"));
         assert_eq!(view.relay_id, "relay-1");
+        assert_eq!(view.options.len(), 3);
+        assert_eq!(view.options[0].option_id, "allow-once");
+        assert!(view.options[0].is_allow);
+        assert!(!view.options[2].is_allow);
+    }
+
+    #[test]
+    fn one_of_select_uses_exact_option_id() {
+        let response = build_response_for_option(&permission_request_event(), "allow-always");
+        assert_eq!(
+            response["result"]["outcome"],
+            serde_json::json!({"outcome": "selected", "optionId": "allow-always"})
+        );
+        assert_eq!(response["id"], serde_json::json!(42));
     }
 
     #[test]
@@ -247,8 +384,19 @@ mod tests {
         };
         let view = to_pending_request_view(&event);
         assert!(view.summary.contains("/tmp/secret.txt"));
-        assert_eq!(build_response(&event, true), serde_json::json!({"approved": true}));
-        assert_eq!(build_response(&event, false), serde_json::json!({"approved": false}));
+        assert_eq!(view.options.len(), 2);
+        assert_eq!(
+            build_response(&event, true),
+            serde_json::json!({"approved": true})
+        );
+        assert_eq!(
+            build_response(&event, false),
+            serde_json::json!({"approved": false})
+        );
+        assert_eq!(
+            build_response_for_option(&event, "approve"),
+            serde_json::json!({"approved": true})
+        );
     }
 
     #[test]
@@ -276,5 +424,6 @@ mod tests {
         assert!(!is_supported_method(&event.method));
         let view = to_pending_request_view(&event);
         assert!(view.title.contains("some/future_method"));
+        assert!(view.options.is_empty());
     }
 }

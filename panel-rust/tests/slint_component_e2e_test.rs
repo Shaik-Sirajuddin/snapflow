@@ -21,6 +21,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     let sent_text = Rc::new(Cell::new(String::new()));
     let approval_count = Rc::new(Cell::new(0));
     let rejection_count = Rc::new(Cell::new(0));
+    let selected_permission_option = Rc::new(Cell::new(String::new()));
     let load_older_count = Rc::new(Cell::new(0));
     let expanded_terminal = Rc::new(Cell::new(String::new()));
     let terminal_overlay_close_count = Rc::new(Cell::new(0));
@@ -57,6 +58,12 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     {
         let rejection_count = rejection_count.clone();
         panel.on_reject_request(move || rejection_count.set(rejection_count.get() + 1));
+    }
+    {
+        let selected_permission_option = selected_permission_option.clone();
+        panel.on_permission_option_selected(move |id| {
+            selected_permission_option.set(id.to_string());
+        });
     }
     {
         let load_older_count = load_older_count.clone();
@@ -236,22 +243,33 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         summary: "Run a render command".into(),
         supported: true,
         title: "Terminal request".into(),
+        // One-of select options (Zed flat model); synthetic for terminal/create.
+        options: ModelRc::new(VecModel::from(vec![
+            panel_rust::PermissionOptionItem {
+                option_id: "approve".into(),
+                name: "Approve".into(),
+                kind: "allow_once".into(),
+                is_allow: true,
+            },
+            panel_rust::PermissionOptionItem {
+                option_id: "reject".into(),
+                name: "Reject".into(),
+                kind: "reject_once".into(),
+                is_allow: false,
+            },
+        ])),
     });
     let approve = ElementHandle::find_by_accessible_label(&panel, "Approve request")
         .next()
         .expect("approve control must be accessible");
-    assert_eq!(
-        approve.id().as_deref(),
-        Some("PermissionCard::approve-request-button")
-    );
     approve.invoke_accessible_default_action();
-    assert_eq!(approval_count.get(), 1);
+    assert_eq!(selected_permission_option.take(), "approve");
 
     let reject = ElementHandle::find_by_accessible_label(&panel, "Reject request")
         .next()
         .expect("reject control must be accessible");
     reject.invoke_accessible_default_action();
-    assert_eq!(rejection_count.get(), 1);
+    assert_eq!(selected_permission_option.take(), "reject");
 
     panel.set_terminals(ModelRc::new(VecModel::from(vec![TerminalItem {
         terminal_id: "build-42".into(),

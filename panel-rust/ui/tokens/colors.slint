@@ -51,6 +51,13 @@ export global ColorScale {
     out property <color> dark-user-bubble: #151518;
     out property <color> light-user-bubble: #eaeaea;
 
+    // Agent message fill — subtle step off chat surface (dark-surface-2
+    // #131313 / light-surface-2), quieter than primary-container and
+    // slightly softer than the user bubble so agent rows read as elevated
+    // chat, not chips or cards.
+    out property <color> dark-agent-bubble: #18181b;
+    out property <color> light-agent-bubble: #f2f2f6;
+
     // tertiary surface dark vs light -- chat-items-redesign.md's "tertiary
     // variant" (queued-message bar, user bubble restyle). A step up in
     // contrast from the card/sidebar surface tier, a step down from
@@ -58,4 +65,14 @@ export global ColorScale {
     // both an ordinary card and the bold primary-container chip treatment.
     out property <color> dark-tertiary: #232326;
     out property <color> light-tertiary: #dcdce2;
+
+    // Approval / permission-request band — sits between chat surface and
+    // tertiary so the decision card reads as "needs action" without a
+    // chromatic status color (panel stays monochrome). Slightly lifted
+    // vs bg-card, cooler than tertiary's neutral mid-grey.
+    out property <color> dark-approval: #1c1c24;
+    out property <color> light-approval: #e8e8f0;
+    // Soft wash behind the dock (full-width strip above compose).
+    out property <color> dark-approval-band: #16161c;
+    out property <color> light-approval-band: #ececf4;
 }

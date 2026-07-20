@@ -29,6 +29,29 @@ use tokio::task::JoinHandle;
 /// [`crate::framing::FramedWriter`] handle.
 pub type UnmatchedFrame = Value;
 
+/// Capacity of the unmatched-frame channel `spawn_reader_task` feeds and
+/// its consumer drains.
+///
+/// **Why bounded, not unbounded.** A prior version used
+/// `mpsc::unbounded_channel()` here: a backend emitting notifications (or
+/// agent-initiated requests) faster than its consumer can process them
+/// (`acpx_core::router::spawn_demux_consumer`, whose per-frame handling
+/// can itself wait on a live client via `PERMISSION_RELAY_TIMEOUT`/
+/// `DEFAULT_INTERACTION_TIMEOUT`) had no ceiling on how much unprocessed
+/// JSON could pile up in this process's memory. Bounding it gives the
+/// reader task natural backpressure instead: once full, [`spawn_reader_
+/// task`]'s `send(value).await` simply waits for the consumer to drain
+/// one, which only delays this one backend process's own frame delivery
+/// (matched-response resolution still happens on every frame observed
+/// before the queue filled, and the consumer's own operations are all
+/// bounded by now -- see `write_backend_value_locked`/`*_TIMEOUT`
+/// constants in `acpx-core::router` -- so this can't wait forever
+/// either). Sized generously above any burst a well-behaved ACP session
+/// should ever produce (a turn's `session/update` stream, or a handful of
+/// concurrent permission requests) so it never engages in the common
+/// case.
+pub(crate) const UNMATCHED_FRAME_QUEUE_CAPACITY: usize = 1024;
+
 /// Why a registered response never arrived.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DemuxRecvError {
@@ -121,7 +144,7 @@ pub async fn recv(rx: oneshot::Receiver<Value>) -> Result<Value, DemuxRecvError>
 pub fn spawn_reader_task(
     mut reader: FramedReader,
     pending: Arc<PendingRequests>,
-    unmatched_tx: mpsc::UnboundedSender<UnmatchedFrame>,
+    unmatched_tx: mpsc::Sender<UnmatchedFrame>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -132,7 +155,12 @@ pub fn spawn_reader_task(
                             continue;
                         }
                     }
-                    let _ = unmatched_tx.send(value);
+                    // Bounded send -- see `UNMATCHED_FRAME_QUEUE_CAPACITY`'s
+                    // doc comment for why this is deliberate backpressure,
+                    // not an oversight. A closed receiver (no consumer left) still
+                    // fails immediately rather than blocking, same as the
+                    // old unbounded `send`'s "not fatal" behavior.
+                    let _ = unmatched_tx.send(value).await;
                 }
                 Err(FramingError::Eof) => break,
                 Err(_read_err) => break,
@@ -176,7 +204,7 @@ mod tests {
     async fn matched_response_resolves_the_registered_waiter() {
         let (reader, mut stdin, mut child) = reader_over_pipe().await;
         let pending = Arc::new(PendingRequests::new());
-        let (unmatched_tx, mut unmatched_rx) = mpsc::unbounded_channel();
+        let (unmatched_tx, mut unmatched_rx) = mpsc::channel(UNMATCHED_FRAME_QUEUE_CAPACITY);
         let _task = spawn_reader_task(reader, Arc::clone(&pending), unmatched_tx);
 
         let id = json!(1);
@@ -194,7 +222,7 @@ mod tests {
     async fn unmatched_frames_route_to_the_unmatched_channel() {
         let (reader, mut stdin, mut child) = reader_over_pipe().await;
         let pending = Arc::new(PendingRequests::new());
-        let (unmatched_tx, mut unmatched_rx) = mpsc::unbounded_channel();
+        let (unmatched_tx, mut unmatched_rx) = mpsc::channel(UNMATCHED_FRAME_QUEUE_CAPACITY);
         let _task = spawn_reader_task(reader, pending, unmatched_tx);
 
         write_line(
@@ -213,7 +241,7 @@ mod tests {
     async fn id_bearing_frame_with_no_live_registration_is_unmatched() {
         let (reader, mut stdin, mut child) = reader_over_pipe().await;
         let pending = Arc::new(PendingRequests::new());
-        let (unmatched_tx, mut unmatched_rx) = mpsc::unbounded_channel();
+        let (unmatched_tx, mut unmatched_rx) = mpsc::channel(UNMATCHED_FRAME_QUEUE_CAPACITY);
         let _task = spawn_reader_task(reader, pending, unmatched_tx);
 
         // e.g. an agent-initiated request: has both id and method, but no
@@ -234,7 +262,7 @@ mod tests {
     async fn two_concurrent_registrations_each_resolve_independently() {
         let (reader, mut stdin, mut child) = reader_over_pipe().await;
         let pending = Arc::new(PendingRequests::new());
-        let (unmatched_tx, _unmatched_rx) = mpsc::unbounded_channel();
+        let (unmatched_tx, _unmatched_rx) = mpsc::channel(UNMATCHED_FRAME_QUEUE_CAPACITY);
         let _task = spawn_reader_task(reader, Arc::clone(&pending), unmatched_tx);
 
         let rx_a = pending.register(&json!("a")).await;
@@ -258,7 +286,7 @@ mod tests {
     async fn reader_task_exit_fails_every_pending_waiter() {
         let (reader, stdin, mut child) = reader_over_pipe().await;
         let pending = Arc::new(PendingRequests::new());
-        let (unmatched_tx, _unmatched_rx) = mpsc::unbounded_channel();
+        let (unmatched_tx, _unmatched_rx) = mpsc::channel(UNMATCHED_FRAME_QUEUE_CAPACITY);
         let task = spawn_reader_task(reader, Arc::clone(&pending), unmatched_tx);
 
         let rx_a = pending.register(&json!("a")).await;
@@ -279,7 +307,7 @@ mod tests {
     async fn cancel_drops_a_registration_without_failing_others() {
         let (reader, mut stdin, mut child) = reader_over_pipe().await;
         let pending = Arc::new(PendingRequests::new());
-        let (unmatched_tx, _unmatched_rx) = mpsc::unbounded_channel();
+        let (unmatched_tx, _unmatched_rx) = mpsc::channel(UNMATCHED_FRAME_QUEUE_CAPACITY);
         let _task = spawn_reader_task(reader, Arc::clone(&pending), unmatched_tx);
 
         let _rx_a = pending.register(&json!("a")).await;

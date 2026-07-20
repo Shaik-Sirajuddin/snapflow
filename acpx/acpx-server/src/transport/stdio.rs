@@ -35,7 +35,7 @@
 use crate::transport::http::SharedRouter;
 use crate::transport::live::{session_id_to_forget, session_id_to_watch, take_resume_cursor};
 use acpx_core::router::{dispatch_shared_for_tenant, stream_resume_state_shared};
-use acpx_core::{InteractionBinding, StreamResumeState, TenantId};
+use acpx_core::{InteractionBinding, StreamResumeState, TenantId, INTERACTION_QUEUE_CAPACITY};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -48,7 +48,7 @@ pub async fn run(router: SharedRouter) -> anyhow::Result<()> {
     let mut lines = BufReader::new(stdin).lines();
     let hub = { router.lock().await.notification_hub() };
     let interaction_hub = { router.lock().await.interaction_hub() };
-    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let (interaction_tx, mut interaction_rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
     let interaction_stdout = Arc::clone(&stdout);
     tokio::spawn(async move {
         while let Some(request) = interaction_rx.recv().await {

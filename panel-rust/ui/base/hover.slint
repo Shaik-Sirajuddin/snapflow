@@ -20,6 +20,7 @@ export component HoverSurface inherits Rectangle {
     // (e.g. a decorative preview). Default true.
     in property <bool> interactive: true;
     callback clicked();
+    callback double-clicked();
     out property <bool> has-hover: touch.has-hover;
 
     background: selected ? selected-bg
@@ -34,6 +35,7 @@ export component HoverSurface inherits Rectangle {
         accessible-label: root.button-accessible-label;
         accessible-action-default => { root.clicked(); }
         clicked => { root.clicked(); }
+        double-clicked => { root.double-clicked(); }
         changed has-hover => {
             CursorHost.kind = (self.has-hover && root.interactive) ? "pointer" : "default";
         }

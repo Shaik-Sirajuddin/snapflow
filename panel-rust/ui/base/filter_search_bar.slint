@@ -1,0 +1,136 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { Icon } from "icon.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
+
+// Shared filter/search field for the whole panel UI:
+//   - thread sidebar search
+//   - settings page search (SettingsSearchBar thin wrap)
+//   - SearchableDropdown / Select popup filters
+//   - compose / @ # mention mini search
+//
+// Tokens only (Theme + Metrics). Call sites pass placeholders / leading
+// text / icon placement — no second hand-rolled search chrome.
+export component FilterSearchBar inherits Rectangle {
+    in-out property <string> query: "";
+    in property <string> placeholder: "Search...";
+    in property <string> bar-accessible-label: "Search";
+    // Leading search glyph (default on). Mutually exclusive with trailing
+    // when only one glyph is wanted — set icon-trailing to put it on the right.
+    in property <bool> show-icon: true;
+    in property <bool> icon-trailing: false;
+    // Optional mono prefix (e.g. "/" for mention filter). Empty = none.
+    in property <string> leading-text: "";
+    in property <color> bar-bg: Theme.bg-sidebar;
+    in property <length> bar-height: 28px;
+    in property <length> bar-font-size: 11px;
+    in property <length> bar-border-width: 1px;
+    in property <color> bar-border-color: Theme.border-default;
+
+    callback edited();
+    // Trailing/leading icon button action (e.g. focus / open search).
+    callback icon-clicked();
+    // Parent can intercept arrows / Enter / Esc (mention popup).
+    // Return accept to swallow; reject lets TextInput handle the key.
+    callback key-pressed(KeyEvent) -> EventResult;
+
+    height: bar-height;
+    background: bar-bg;
+    border-width: bar-border-width;
+    border-color: bar-border-color;
+    border-radius: Theme.radius-sm;
+
+    public function focus-input() {
+        search-input.focus();
+    }
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Metrics.space-4;
+        padding-right: Metrics.space-4;
+        spacing: Metrics.gap-sm;
+        alignment: stretch;
+        cross-axis-alignment: center;
+
+        // Leading icon (default for dropdown / mention).
+        if root.show-icon && !root.icon-trailing : icon-lead := TouchArea {
+            mouse-cursor: pointer;
+            horizontal-stretch: 0;
+            accessible-role: button;
+            accessible-label: root.bar-accessible-label;
+            clicked => {
+                root.icon-clicked();
+                search-input.focus();
+            }
+            changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+            Icon {
+                source: @image-url("../assets/icons/search.svg");
+                size: Metrics.icon-sm;
+                color: Theme.text-muted;
+            }
+        }
+        if root.leading-text != "" : Text {
+            text: root.leading-text;
+            color: Theme.bg-primary;
+            font-size: root.bar-font-size * Theme.font-scale;
+            font-family: Theme.font-mono;
+            font-weight: 700;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+            vertical-stretch: 0;
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            vertical-stretch: 0;
+            height: parent.height;
+            min-width: 0px;
+            preferred-width: 0px;
+            clip: true;
+            Text {
+                text: root.placeholder;
+                color: Theme.text-muted;
+                font-family: Theme.font-sans;
+                font-size: root.bar-font-size * Theme.font-scale;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+                visible: search-input.text == "";
+            }
+            search-input := TextInput {
+                accessible-label: root.bar-accessible-label;
+                accessible-action-default => { self.focus(); }
+                text <=> root.query;
+                color: Theme.text-primary;
+                font-family: Theme.font-sans;
+                font-size: root.bar-font-size * Theme.font-scale;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+                single-line: true;
+                edited => { root.edited(); }
+                key-pressed(event) => {
+                    return root.key-pressed(event);
+                }
+                changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
+            }
+        }
+        // Trailing icon (thread sidebar expanded row).
+        if root.show-icon && root.icon-trailing : icon-trail := TouchArea {
+            mouse-cursor: pointer;
+            horizontal-stretch: 0;
+            accessible-role: button;
+            accessible-label: root.bar-accessible-label;
+            clicked => {
+                root.icon-clicked();
+                search-input.focus();
+            }
+            changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+            Icon {
+                source: @image-url("../assets/icons/search.svg");
+                size: Metrics.icon-sm;
+                color: Theme.text-muted;
+            }
+        }
+    }
+}

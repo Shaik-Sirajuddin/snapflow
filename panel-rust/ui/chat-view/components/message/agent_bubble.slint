@@ -16,7 +16,9 @@ export component AgentBubble inherits Rectangle {
 
     vertical-stretch: 0;
 
-    background: is-thinking ? transparent : Theme.bg-primary-container;
+    // Subtle agent fill (Theme.bg-agent-bubble) — quieter than
+    // primary-container so messages sit softly on bg-chat.
+    background: is-thinking ? transparent : Theme.bg-agent-bubble;
     border-width: 0px;
     border-top-left-radius: is-thinking ? 0px : Theme.radius-lg;
     border-top-right-radius: is-thinking ? 0px : Theme.radius-lg;

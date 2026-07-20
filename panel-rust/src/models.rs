@@ -9,12 +9,12 @@
 
 use crate::agent_bridge::TerminalBuffer;
 use crate::markdown::{self, LineKind};
+use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
+use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
     McpServerOption, MessageItem, ProfileOption, SkillOption, TerminalItem, ThreadItem,
 };
-use crate::skills_state::SkillEntry;
-use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionModesEvent};
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
 
@@ -69,10 +69,7 @@ fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
     if kind != "agent" {
         return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
     }
-    lines_to_slint_model(markdown::render_document(
-        text,
-        markdown::DEFAULT_WRAP_COLS,
-    ))
+    lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
 }
 
 /// Incremental render for an in-flight agent message.
@@ -193,14 +190,10 @@ mod classify_tool_call_kind_tests {
     fn skill_title_and_raw_input_classify_as_skill_use() {
         assert_eq!(classify_tool_call_kind("Skill", None), "skill_use");
         assert_eq!(
-            classify_tool_call_kind(
-                "some tool",
-                Some(&json!({"skill": "trailer-writer"}))
-            ),
+            classify_tool_call_kind("some tool", Some(&json!({"skill": "trailer-writer"}))),
             "skill_use"
         );
     }
-
 
     #[test]
     fn skill_load_title_classifies_as_skill_load() {
@@ -234,39 +227,39 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                 false
             };
             MessageItem {
-            kind: kind.into(),
-            // Slint side uppercases nothing itself -- source HTML always
-            // renders `item.status.toUpperCase()`, so this crate does the
-            // same once here rather than duplicating casing logic in
-            // `.slint` markup.
-            status: m
-                .status
-                .map(|s| s.to_uppercase())
-                .unwrap_or_default()
-                .into(),
-            expanded: expanded.get(i).copied().unwrap_or(false),
-            index: i as i32,
-            raw_input: m
-                .raw_input
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-                .into(),
-            raw_output: m
-                .raw_output
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default()
-                .into(),
-            text: m.text.clone().into(),
-            markdown_lines: markdown_lines_for(kind, &m.text),
-            // Send-queue state is not modelled by the raw `ChatMessage`
-            // feed -- a message reaching here has already been dispatched.
-            queued: false,
-            can_edit: false,
-            sending: false,
-            first_use,
-        }
+                kind: kind.into(),
+                // Slint side uppercases nothing itself -- source HTML always
+                // renders `item.status.toUpperCase()`, so this crate does the
+                // same once here rather than duplicating casing logic in
+                // `.slint` markup.
+                status: m
+                    .status
+                    .map(|s| s.to_uppercase())
+                    .unwrap_or_default()
+                    .into(),
+                expanded: expanded.get(i).copied().unwrap_or(false),
+                index: i as i32,
+                raw_input: m
+                    .raw_input
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
+                    .into(),
+                raw_output: m
+                    .raw_output
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
+                    .into(),
+                text: m.text.clone().into(),
+                markdown_lines: markdown_lines_for(kind, &m.text),
+                // Send-queue state is not modelled by the raw `ChatMessage`
+                // feed -- a message reaching here has already been dispatched.
+                queued: false,
+                can_edit: false,
+                sending: false,
+                first_use,
+            }
         })
         .collect();
     ModelRc::new(VecModel::from(items))
@@ -318,9 +311,13 @@ pub fn to_message_model_from_transcript(
                 TranscriptItem::Assistant { text, .. } => {
                     ("agent", text, String::new(), String::new(), String::new())
                 }
-                TranscriptItem::Thought { text, .. } => {
-                    ("thinking", text, String::new(), String::new(), String::new())
-                }
+                TranscriptItem::Thought { text, .. } => (
+                    "thinking",
+                    text,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
                 TranscriptItem::Tool {
                     title,
                     status,
@@ -604,7 +601,10 @@ pub fn build_thread_items<N: AsRef<str>>(
                 .into(),
                 busy: matches!(st, ThreadState::Loading),
                 open: true,
-                background: background_sessions.get(real_index).copied().unwrap_or(false),
+                background: background_sessions
+                    .get(real_index)
+                    .copied()
+                    .unwrap_or(false),
                 description: descriptions
                     .get(real_index)
                     .cloned()
@@ -635,6 +635,23 @@ pub fn model_name_from_config(options: &[ConfigOptionInfo]) -> String {
         .find(|o| o.id == "model")
         .and_then(|o| o.current_value.clone())
         .unwrap_or_default()
+}
+
+/// Display label for the compose-bar model/config trigger — prefers the
+/// human-readable option `name` for the current value, falls back to the
+/// raw `currentValue`. Empty when nothing is advertised (Slint falls back
+/// to a generic "Model" label).
+pub fn current_config_trigger_label(options: &[ConfigOptionInfo]) -> String {
+    for option in options {
+        let Some(cur) = option.current_value.as_ref() else {
+            continue;
+        };
+        if let Some(v) = option.options.iter().find(|v| &v.value == cur) {
+            return v.name.clone();
+        }
+        return cur.clone();
+    }
+    String::new()
 }
 
 /// Builds the terminal-card row model for the active thread --
@@ -674,7 +691,9 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
 
 /// Builds the settings sheet's profile-picker row model from a real
 /// `profiles/list` result (`AgentBridge::list_profiles`).
-pub fn to_profile_options(profiles: Vec<crate::gateway_actor::ProfileSummary>) -> ModelRc<ProfileOption> {
+pub fn to_profile_options(
+    profiles: Vec<crate::gateway_actor::ProfileSummary>,
+) -> ModelRc<ProfileOption> {
     let items: Vec<ProfileOption> = profiles
         .into_iter()
         .map(|p| ProfileOption {
@@ -703,13 +722,14 @@ pub fn to_mcp_server_options(
         .map(|entry| McpServerOption {
             name: entry.name.into(),
             command: entry.command.unwrap_or_default().into(),
-            // UI-only fields (see `McpServerOption`'s doc in ui/types.slint):
-            // the backend only supplies name+command today, so transport/
-            // url/enabled/status/needs-auth/auth-status take their Slint-struct
-            // defaults (`""`/`false`) and `tools` an empty model. `enabled`
-            // defaulting to `false` is fine for now -- no runtime reads it yet;
-            // a real `mcp_servers/update`, a `tools/list` round trip, and a
-            // status/auth feed are a later phase.
+            // `enabled` is a registry-backed field and round-trips through
+            // `mcp_servers/update`; missing means enabled for compatibility
+            // with existing server records.
+            enabled: entry
+                .extra
+                .get("enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
             ..Default::default()
         })
         .collect();
@@ -862,7 +882,8 @@ mod tests {
 
     #[test]
     fn substring_match_is_case_insensitive() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "FADE");
+        let items =
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "FADE");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
         // Real index must survive filtering -- "Add fade transition" is
@@ -870,7 +891,8 @@ mod tests {
         // list. This is exactly the mismatch `real_index` exists to fix.
         assert_eq!(items[0].real_index, 1);
 
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
+        let items =
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
     }
@@ -951,7 +973,8 @@ mod tests {
 
     #[test]
     fn background_policy_is_preserved_after_filtering() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
+        let items =
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
         assert!(items[0].item.background);
     }
 
@@ -1039,13 +1062,16 @@ mod tests {
 
     #[test]
     fn to_agent_catalog_entries_forwards_registry_fields_verbatim() {
-        let agents = vec![crate::protocol_types::AgentCatalogEntry::from_json(&serde_json::json!({
-            "id": "codex-acp",
-            "name": "Codex Agent",
-            "version": "1.0.0",
-            "status": "installed"
-        }))
-        .unwrap()];
+        let agents =
+            vec![
+                crate::protocol_types::AgentCatalogEntry::from_json(&serde_json::json!({
+                    "id": "codex-acp",
+                    "name": "Codex Agent",
+                    "version": "1.0.0",
+                    "status": "installed"
+                }))
+                .unwrap(),
+            ];
         let model = to_agent_catalog_entries(agents);
         assert_eq!(model.row_count(), 1);
         let entry = model.row_data(0).unwrap();
@@ -1126,11 +1152,11 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod transcript_model_tests {
     use super::*;
     use crate::conversation::{ConversationEvent, ConversationState};
+    use crate::protocol_types::ConfigOptionValue;
     use slint::Model;
 
     #[test]
@@ -1157,8 +1183,7 @@ mod transcript_model_tests {
     fn streaming_markdown_matches_one_shot_for_agent() {
         let full = "Hello **world**\n\n- one\n- two\n";
         let one_shot = markdown_lines_for("agent", full);
-        let mut renderer =
-            markdown::StreamingMarkdownRenderer::new(markdown::DEFAULT_WRAP_COLS);
+        let mut renderer = markdown::StreamingMarkdownRenderer::new(markdown::DEFAULT_WRAP_COLS);
         for ch in full.chars() {
             renderer.push(&ch.to_string());
         }
@@ -1171,5 +1196,39 @@ mod transcript_model_tests {
     fn non_agent_rows_skip_markdown_parse() {
         assert_eq!(markdown_lines_for("user", "# not parsed").row_count(), 0);
         assert!(markdown_lines_for("agent", "# Title").row_count() > 0);
+    }
+
+    #[test]
+    fn current_config_trigger_label_prefers_option_display_name() {
+        let options = vec![ConfigOptionInfo {
+            id: "model".into(),
+            name: "Model".into(),
+            description: None,
+            category: None,
+            kind: "select".into(),
+            current_value: Some("gpt-5-mini".into()),
+            options: vec![
+                ConfigOptionValue {
+                    value: "gpt-5".into(),
+                    name: "GPT-5".into(),
+                    description: None,
+                },
+                ConfigOptionValue {
+                    value: "gpt-5-mini".into(),
+                    name: "GPT-5 mini".into(),
+                    description: None,
+                },
+            ],
+        }];
+        assert_eq!(current_config_trigger_label(&options), "GPT-5 mini");
+        assert_eq!(model_name_from_config(&options), "gpt-5-mini");
+
+        let entries = to_config_dropdown_entries(options);
+        assert_eq!(entries.row_count(), 3); // header + 2 values
+        let cur = entries.row_data(2).expect("mini row");
+        assert!(!cur.is_header);
+        assert!(cur.is_current);
+        assert_eq!(cur.value.as_str(), "gpt-5-mini");
+        assert_eq!(cur.id.as_str(), "model");
     }
 }

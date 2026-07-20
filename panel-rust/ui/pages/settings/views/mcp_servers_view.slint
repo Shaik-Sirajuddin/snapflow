@@ -42,6 +42,7 @@ export component McpServersView inherits Rectangle {
     in property <[McpServerOption]> servers: [];
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
+    callback mcp-server-enabled-changed(string, bool);
 
     property <string> new-mcp-name: "";
     property <string> new-mcp-command: "";
@@ -111,44 +112,13 @@ export component McpServersView inherits Rectangle {
                         overflow: elide;
                     }
 
-                    // OAuth "Connect" -- only for remote servers advertising an auth
-                    // flow (opencode remote `oauth`). UI-only placeholder for now.
-                    if server.transport == "http" && server.needs-auth : Button {
-                        label: "Connect";
-                        button-accessible-label: "Connect (authenticate) MCP server " + server.name;
-                        btn-width: 52px;
-                        btn-height: 20px;
-                        font-size: 9px;
-                        font-weight: 400;
-                        // UI-only: no `mcp_servers/authenticate` RPC exists yet.
-                        clicked => { }
-                    }
-
-                    // Expand/collapse the per-tool list, with a tool count so
-                    // it's meaningful at a glance without expanding (only when
-                    // the server advertises tools -- always empty today, see
-                    // doc comment).
-                    if server.tools.length > 0 : Button {
-                        label: (server-block.tools-expanded ? "Hide tools" : "Tools")
-                            + " (" + server.tools.length + ")";
-                        button-accessible-label: (server-block.tools-expanded ? "Hide" : "Show")
-                            + " " + server.tools.length + " tools for MCP server " + server.name;
-                        btn-width: 76px;
-                        btn-height: 20px;
-                        font-size: 9px;
-                        font-weight: 400;
-                        clicked => { server-block.tools-expanded = !server-block.tools-expanded; }
-                    }
-
                     // Enable/disable without removing the entry (opencode/Codex
-                    // per-server `enabled`) -- always the second-to-last item,
-                    // right before Remove, with real spacing (`SettingsRow`'s
-                    // own trailing-group spacing, `Metrics.space-2`, plus this
-                    // row now has far fewer neighbors competing for room) so it
-                    // reads clearly at the row's right end.
+                    // per-server `enabled`) is registry-backed and immediately
+                    // re-listed by the Rust host after update.
                     Toggle {
                         checked: server.enabled;
                         toggle-accessible-label: "Toggle MCP server " + server.name;
+                        toggled(enabled) => { root.mcp-server-enabled-changed(server.name, enabled); }
                     }
 
                     Button {
@@ -163,88 +133,6 @@ export component McpServersView inherits Rectangle {
                         font-size: 9px;
                         font-weight: 400;
                         clicked => { root.mcp-server-delete(server.name); }
-                    }
-                }
-
-                // Nested per-tool list (MCP `tools/list`) -- each tool individually
-                // enable/disable-able, with a "deferred" tag for lazy-loaded ones
-                // (opencode `mcp_lazy` / Claude Code ToolSearch). UI-only.
-                if server-block.tools-expanded && server.tools.length > 0 : Rectangle {
-                    width: parent.width;
-                    background: Theme.bg-sidebar;
-                    border-radius: Theme.radius-sm;
-                    border-width: 1px;
-                    border-color: Theme.border-default;
-
-                    VerticalLayout {
-                        width: parent.width;
-                        // `pad-md` (12px) -- matches `agent_card.slint`'s
-                        // own panel padding, was `space-4` (8px, an odd
-                        // value matching no semantic tier and
-                        // inconsistent with every other "boxed panel" on
-                        // this page). `padding-left` stays a deliberate,
-                        // larger override (`pad-lg`, 16px) so the tool
-                        // list visually indents under its server.
-                        padding: Metrics.pad-md;
-                        padding-left: Metrics.pad-lg;
-                        // `gap-sm` (6px) -- list-item gap between tool rows.
-                        spacing: Metrics.gap-sm;
-
-                        // No explicit `width:` -- this is a *direct*
-                        // managed child of the padded VerticalLayout
-                        // above (`padding-left: Metrics.space-7`, meant
-                        // to indent the tool list under its server); an
-                        // explicit `width: parent.width` here (as this
-                        // used to be) reads that layout's raw box width,
-                        // bypassing the padding inset entirely -- same
-                        // bug class fixed in `agent_card.slint`'s Model/
-                        // Profile rows. Default `alignment: stretch`
-                        // already sizes a direct child correctly within
-                        // its parent's padding automatically.
-                        for tool in server.tools : HorizontalLayout {
-                            // `gap-md` (8px) -- gap between a tool row's
-                            // own inner items (name, token-usage tag,
-                            // deferred tag, enable Toggle).
-                            spacing: Metrics.gap-md;
-
-                            Text {
-                                text: tool.name;
-                                color: Theme.text-primary;
-                                font-family: Theme.font-mono;
-                                font-size: 10px * Theme.font-scale;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                            }
-
-                            // Approximate context cost of this tool's schema --
-                            // UI-only reference figure, see `McpToolOption.
-                            // token-usage`'s own doc comment (no real per-tool
-                            // token accounting exists anywhere in this codebase).
-                            if tool.token-usage > 0 : Text {
-                                text: tool.token-usage + " tok";
-                                color: Theme.text-muted;
-                                font-family: Theme.font-mono;
-                                font-size: 9px * Theme.font-scale;
-                                vertical-alignment: center;
-                                horizontal-stretch: 0;
-                            }
-
-                            // Lazy-loaded marker -- monochrome text tag only.
-                            if tool.deferred : Text {
-                                text: "deferred";
-                                color: Theme.text-muted;
-                                font-family: Theme.font-mono;
-                                font-size: 9px * Theme.font-scale;
-                                vertical-alignment: center;
-                                horizontal-stretch: 0;
-                            }
-
-                            Toggle {
-                                checked: tool.enabled;
-                                toggle-accessible-label: "Toggle tool " + tool.name + " on MCP server " + server.name;
-                            }
-                        }
                     }
                 }
             }

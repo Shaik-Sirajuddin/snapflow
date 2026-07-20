@@ -30,8 +30,10 @@ export component SkillsView inherits Rectangle {
     callback dev-mode-toggled(bool);
 
     background: transparent;
+    vertical-stretch: 0;
+    preferred-height: content.preferred-height;
 
-    SettingsSection {
+    content := SettingsSection {
         width: parent.width;
 
         SettingsSectionHeader { text: "Skills"; }

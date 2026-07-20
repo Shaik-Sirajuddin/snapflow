@@ -2,18 +2,15 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { DropdownEntry } from "../types.slint";
 import { TextUtil } from "text_util.slint";
-import { Icon } from "icon.slint";
+import { FilterSearchBar } from "filter_search_bar.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
-// Layer 3 (base) -- a trigger button that opens a list of `DropdownEntry`
-// rows, with an optional filter box. The filter box only appears once the
-// list is long enough to warrant it (>= 4 rows) and can be suppressed
-// entirely via `searchable: false` ("disable search" mode). Domain-neutral:
-// it depends only on `DropdownEntry`, so the compose bar's mode/model
-// selectors and (later) the slash-command popup all share it. The list
-// opens upward (anchored above the trigger, drawn as an in-tree overlay so
-// it renders over the message stream) since every current call site lives
-// in the bottom compose bar.
+// Layer 3 (base) -- trigger + upward popup list of `DropdownEntry` rows.
+// Search UX mirrors the compose `/` skills popup:
+//   - shared FilterSearchBar (when `searchable`)
+//   - TextUtil.matches-filter live filter (label / id / value)
+//   - keyboard highlight + Up/Down/Enter/Esc
+// Domain-neutral: mode + model (config) selectors both use this.
 export component SearchableDropdown inherits Rectangle {
     in property <string> trigger-label;
     in property <[DropdownEntry]> options: [];
@@ -21,18 +18,174 @@ export component SearchableDropdown inherits Rectangle {
     in property <string> placeholder: "Search...";
     in property <length> popup-width: 200px;
     in property <length> popup-max-height: 220px;
-    // When true, the popup's right edge lines up with the trigger's right
-    // edge (opens leftward). Needed for right-side call sites like the
-    // compose-bar Config selector, where the default left-align would push
-    // a wider popup past the window/panel edge.
+    // When true, popup right edge lines up with the trigger (opens leftward).
     in property <bool> popup-align-end: false;
-    callback entry-selected(string /* id */, string /* value */);
+    // Optimistic selection so the chosen row stays highlighted before the
+    // host rewrites options[].is-current. Config/model matches `value`;
+    // mode matches `id` when value is empty.
+    in property <string> selected-id: "";
+    in property <string> selected-value: "";
+    // id, value, label — label lets callers update the trigger without
+    // re-scanning the model.
+    callback entry-selected(string /* id */, string /* value */, string /* label */);
 
     property <bool> open: false;
     property <string> filter: "";
-    property <bool> show-search: searchable && options.length >= 4;
-    // Option-row size: taller than the trigger so horizontal padding
-    // (space-5 below) has room without crowding the label.
+    // Same always-on search affordance as the / skills mini bar (when
+    // searchable). Short lists still benefit from type-to-filter.
+    property <bool> show-search: searchable;
+    // Keyboard highlight index into `options` (skips headers + filtered-out).
+    property <int> kb-sel: -1;
+
+    pure function row-current(entry: DropdownEntry) -> bool {
+        if (entry.is-header) {
+            return false;
+        }
+        // Config/model: match the chosen value exclusively.
+        if (root.selected-value != "") {
+            return entry.value == root.selected-value;
+        }
+        // Mode (no value payload on host rows): match chosen id.
+        if (root.selected-id != "") {
+            return entry.id == root.selected-id;
+        }
+        return entry.is-current;
+    }
+
+    // Hide non-header rows that fail the live filter. Headers stay visible
+    // (section labels). Uses matches-filter so pure slint-viewer without
+    // TextUtil does not blank the whole list.
+    pure function entry-hidden(entry: DropdownEntry) -> bool {
+        if (entry.is-header) {
+            return false;
+        }
+        // Single matches-filter call — avoid double contains-ci on the
+        // same SharedString (known generator quirk).
+        return !TextUtil.matches-filter(
+            entry.label + "\n" + entry.id + "\n" + entry.value,
+            root.filter);
+    }
+
+    pure function entry-hidden-at(i: int) -> bool {
+        if (i < 0 || i >= root.options.length) {
+            return true;
+        }
+        return root.entry-hidden(root.options[i]);
+    }
+
+    pure function is-selectable(i: int) -> bool {
+        if (i < 0 || i >= root.options.length) {
+            return false;
+        }
+        if (root.options[i].is-header) {
+            return false;
+        }
+        return !root.entry-hidden-at(i);
+    }
+
+    // Walk from `from` in `dir` (+1 / -1), skip headers + hidden, wrap.
+    // Unrolled (no recursion — recursive helpers trip binding loops).
+    function next-visible(from: int, dir: int) -> int {
+        if (root.options.length <= 0) {
+            return -1;
+        }
+        if (root.is-selectable(Math.mod(from + 1 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 1 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 2 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 2 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 3 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 3 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 4 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 4 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 5 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 5 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 6 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 6 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 7 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 7 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 8 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 8 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 9 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 9 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 10 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 10 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 12 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 12 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 16 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 16 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 20 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 20 * dir + root.options.length * 64, root.options.length);
+        }
+        if (root.is-selectable(Math.mod(from + 24 * dir + root.options.length * 64, root.options.length))) {
+            return Math.mod(from + 24 * dir + root.options.length * 64, root.options.length);
+        }
+        return -1;
+    }
+
+    function reselect-closest() {
+        root.kb-sel = root.next-visible(-1, 1);
+    }
+
+    function kb-move(dir: int) {
+        if (root.options.length == 0) {
+            return;
+        }
+        if (root.kb-sel < 0 || !root.is-selectable(root.kb-sel)) {
+            root.kb-sel = root.next-visible(-1, 1);
+            return;
+        }
+        root.kb-sel = root.next-visible(root.kb-sel, dir);
+    }
+
+    function apply-kb-sel() {
+        if (!root.is-selectable(root.kb-sel)) {
+            return;
+        }
+        root.entry-selected(
+            root.options[root.kb-sel].id,
+            root.options[root.kb-sel].value,
+            root.options[root.kb-sel].label);
+        root.close();
+    }
+
+    function dd-key(event: KeyEvent) -> EventResult {
+        if (event.text == Key.Escape) {
+            root.close();
+            return EventResult.accept;
+        }
+        if (event.text == Key.DownArrow) {
+            root.kb-move(1);
+            return EventResult.accept;
+        }
+        if (event.text == Key.UpArrow) {
+            root.kb-move(-1);
+            return EventResult.accept;
+        }
+        if (event.text == Key.LeftArrow || event.text == Key.RightArrow
+            || event.text == Key.Home || event.text == Key.End
+            || event.text == Key.PageUp || event.text == Key.PageDown
+            || event.text == Key.Delete) {
+            return EventResult.reject;
+        }
+        if (event.text == Key.Return && !event.modifiers.shift && !event.modifiers.control) {
+            root.apply-kb-sel();
+            return EventResult.accept;
+        }
+        return EventResult.reject;
+    }
+
     property <length> row-h: 30px;
     property <length> search-block-h: show-search ? 36px : 0px;
     property <length> content-h: Math.min(
@@ -42,13 +195,34 @@ export component SearchableDropdown inherits Rectangle {
     public function close() {
         open = false;
         filter = "";
+        kb-sel = -1;
     }
 
+    function open-popup() {
+        filter = "";
+        open = true;
+        reselect-closest();
+    }
+
+    function toggle-popup() {
+        if (open) {
+            close();
+        } else {
+            open-popup();
+        }
+    }
+
+    changed filter => {
+        if (open) {
+            reselect-closest();
+        }
+    }
+
+    // Fixed 24px trigger — compose-row peers (ContextRing).
     height: 24px;
+    preferred-height: 24px;
+    vertical-stretch: 0;
     min-width: 72px;
-    // Fixed cap so a long mode/model label never grows the trigger past a
-    // reasonable width inside the compose bar's row 2 -- the label's own
-    // `overflow: elide` (below) takes over once content exceeds this.
     max-width: 140px;
     background: trigger-touch.has-hover || open ? Theme.bg-primary-container : Theme.bg-canvas;
     animate background { duration: 100ms; }
@@ -60,14 +234,18 @@ export component SearchableDropdown inherits Rectangle {
         mouse-cursor: pointer;
         accessible-role: button;
         accessible-label: root.trigger-label;
-        accessible-action-default => { root.filter = ""; root.open = !root.open; }
-        clicked => { root.filter = ""; root.open = !root.open; }
+        accessible-action-default => { root.toggle-popup(); }
+        clicked => { root.toggle-popup(); }
         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
     HorizontalLayout {
+        width: 100%;
+        height: 100%;
         padding-left: Metrics.space-3;
         padding-right: Metrics.space-3;
         spacing: Metrics.space-2;
+        alignment: stretch;
+        cross-axis-alignment: center;
         Text {
             text: root.trigger-label;
             color: Theme.text-primary;
@@ -82,6 +260,7 @@ export component SearchableDropdown inherits Rectangle {
             color: Theme.text-muted;
             font-size: 9px * Theme.font-scale;
             vertical-alignment: center;
+            horizontal-stretch: 0;
         }
     }
 
@@ -90,56 +269,38 @@ export component SearchableDropdown inherits Rectangle {
         y: -root.content-h - Metrics.space-2;
         width: root.popup-width;
         height: root.content-h;
+        z: 9000;
         background: Theme.bg-card;
         border-color: Theme.border-strong;
         border-width: 1px;
         border-radius: Theme.radius-md;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #000000.with-alpha(0.4);
+        drop-shadow-offset-y: 2px;
+
+        // Default keyboard highlight to the first selectable row.
+        init => {
+            root.reselect-closest();
+        }
+
         VerticalLayout {
             padding: Metrics.space-3;
             spacing: Metrics.space-1;
-            if root.show-search : Rectangle {
-                height: 28px;
-                background: Theme.bg-sidebar;
-                border-color: Theme.border-default;
-                border-width: 1px;
-                border-radius: Theme.radius-sm;
-                HorizontalLayout {
-                    padding-left: Metrics.space-5;
-                    padding-right: Metrics.space-5;
-                    spacing: Metrics.space-2;
-                    VerticalLayout {
-                        alignment: center;
-                        Icon {
-                            source: @image-url("../assets/icons/search.svg");
-                            size: Metrics.icon-sm;
-                            color: Theme.text-muted;
-                        }
-                    }
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        Text {
-                            text: root.placeholder;
-                            color: Theme.text-muted;
-                            font-family: Theme.font-sans;
-                            font-size: 11px * Theme.font-scale;
-                            vertical-alignment: center;
-                            x: 0px;
-                            width: parent.width;
-                            height: parent.height;
-                            visible: search-input.text == "";
-                        }
-                        search-input := TextInput {
-                            accessible-label: "Filter options";
-                            color: Theme.text-primary;
-                            font-family: Theme.font-sans;
-                            font-size: 11px * Theme.font-scale;
-                            vertical-alignment: center;
-                            width: parent.width;
-                            height: parent.height;
-                            edited => { root.filter = self.text; }
-                            changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
-                        }
-                    }
+            // Always-on FilterSearchBar (when searchable) — same chrome as
+            // / skills. Focus on open so type-to-filter works immediately.
+            // Cursor-kind reporting (pointer/text) lives inside
+            // FilterSearchBar itself, so every call site inherits it.
+            if root.show-search : FilterSearchBar {
+                query <=> root.filter;
+                placeholder: root.placeholder;
+                bar-accessible-label: "Filter options";
+                show-icon: true;
+                edited => { }
+                key-pressed(event) => {
+                    return root.dd-key(event);
+                }
+                init => {
+                    self.focus-input();
                 }
             }
             Flickable {
@@ -147,14 +308,15 @@ export component SearchableDropdown inherits Rectangle {
                 viewport-height: options-col.preferred-height;
                 options-col := VerticalLayout {
                     alignment: start;
-                    for entry in root.options : Rectangle {
-                        property <bool> hidden: !entry.is-header
-                            && root.filter != ""
-                            && !TextUtil.contains-ci(entry.label, root.filter);
+                    for entry[i] in root.options : Rectangle {
+                        property <bool> hidden: root.entry-hidden(entry);
+                        property <bool> current: root.row-current(entry);
+                        property <bool> hi: !hidden && i == root.kb-sel;
                         height: hidden ? 0px : root.row-h;
                         clip: true;
                         background: entry.is-header ? transparent
-                            : entry.is-current ? Theme.bg-primary
+                            : hi ? Theme.bg-primary
+                            : current ? Theme.bg-primary-container
                             : row-touch.has-hover ? Theme.bg-primary-container
                             : transparent;
                         animate background { duration: 100ms; }
@@ -165,11 +327,13 @@ export component SearchableDropdown inherits Rectangle {
                             accessible-role: button;
                             accessible-label: entry.label;
                             accessible-action-default => {
-                                root.entry-selected(entry.id, entry.value);
+                                root.kb-sel = i;
+                                root.entry-selected(entry.id, entry.value, entry.label);
                                 root.close();
                             }
                             clicked => {
-                                root.entry-selected(entry.id, entry.value);
+                                root.kb-sel = i;
+                                root.entry-selected(entry.id, entry.value, entry.label);
                                 root.close();
                             }
                             changed has-hover => {
@@ -182,11 +346,11 @@ export component SearchableDropdown inherits Rectangle {
                             Text {
                                 text: entry.is-header ? entry.label + ":" : entry.label;
                                 color: entry.is-header ? Theme.text-secondary
-                                    : entry.is-current ? Theme.text-on-primary
+                                    : (hi || current) ? (hi ? Theme.text-on-primary : Theme.text-primary)
                                     : Theme.text-primary;
                                 font-family: Theme.font-mono;
                                 font-size: (entry.is-header ? 9px : 10px) * Theme.font-scale;
-                                font-weight: entry.is-header ? 700 : 400;
+                                font-weight: entry.is-header ? 700 : ((hi || current) ? 600 : 400);
                                 vertical-alignment: center;
                                 overflow: elide;
                             }

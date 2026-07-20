@@ -2,13 +2,16 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
+import { FilterSearchBar } from "../base/filter_search_bar.slint";
+import { ContextRing } from "../base/context_ring.slint";
 import { TextUtil } from "../base/text_util.slint";
-import { DropdownEntry } from "../types.slint";
+import { DropdownEntry, SkillOption, McpServerOption } from "../types.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
 // ChatInputLayout — bottom compose surface for ChatArea:
 //   row 1: multi-line user input + send/stop
-//   row 2: mode + config/model selectors (capability-gated, empty = hidden)
+//   row 2: context ring + mode + config/model selectors
+//   overlay: / skills · @ mcp-servers · # files popup (ui.yaml chat-view)
 //
 // Owns focus for the composer (`compose-has-focus`, `focus-compose`) so
 // ChatArea / overlays can restore keyboard focus without reaching into
@@ -19,11 +22,23 @@ export component ChatInputLayout inherits Rectangle {
     in property <[DropdownEntry]> mode-dropdown-entries: [];
     in property <[DropdownEntry]> config-dropdown-entries: [];
     in property <string> mode-trigger-label: "";
+    // Host-supplied current model/config label (ACP configOptions).
+    in property <string> config-trigger-label: "";
+    // Session context (ui.yaml chat-view-input). Host pushes real numbers
+    // when available; defaults keep the ring useful in pure viewers.
+    in property <float> context-ratio: 0.0;
+    in property <int> context-used-tokens: 0;
+    in property <int> context-limit-tokens: 0;
+    // Slash/mention catalogs for the compose popup.
+    in property <[SkillOption]> skill-options: [];
+    in property <[McpServerOption]> mcp-options: [];
+    in property <[string]> file-options: [];
 
     callback send-requested();
     callback stop-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback context-view-requested();
     // Panel chords (Ctrl+B/N/K/,, Escape, Ctrl+Enter approve) re-dispatched
     // while the composer owns focus — wired by ChatArea → ChatPanel.
     callback panel-shortcut(KeyEvent) -> EventResult;
@@ -31,22 +46,299 @@ export component ChatInputLayout inherits Rectangle {
     out property <bool> compose-has-focus: compose.has-focus;
     callback focus-compose();
 
+    // Local selection mirrors so dropdowns reflect the chosen option
+    // immediately (ui.yaml: select options linked to real state), even
+    // before the host rewrites the capability lists.
+    property <string> local-mode-id: "";
+    property <string> local-mode-label: "";
+    property <string> local-config-id: "";
+    property <string> local-config-value: "";
+    property <string> local-config-label: "";
+
+    property <string> mode-label-shown:
+        local-mode-label != "" ? local-mode-label
+        : (root.mode-trigger-label != "" ? root.mode-trigger-label : "Mode");
+    property <string> config-label-shown:
+        local-config-label != "" ? local-config-label
+        : (root.config-trigger-label != "" ? root.config-trigger-label : "Model");
+
+    // --- / @ # mention popup ---------------------------------------------
+    // TextUtil.* callbacks are installed by the Rust host (lib.rs) or
+    // ui-dev-viewer. Pure slint-viewer needs a local key-driven state
+    // machine for open/close; filter uses TextUtil.matches-filter.
+    property <bool> textutil-ready: TextUtil.filter-ready();
+    property <int> cursor-off: compose.cursor-position-byte-offset;
+    property <string> util-prefix:
+        textutil-ready ? TextUtil.active-token-prefix(compose-text, cursor-off) : "";
+    property <string> util-query:
+        textutil-ready ? TextUtil.active-token-query(compose-text, cursor-off) : "";
+
+    // Local fallback (viewer / before host wires callbacks).
+    property <bool> local-mention-active: false;
+    property <string> local-prefix: "";
+    property <string> local-query: "";
+    // Text before the mention token was opened (for replace without TextUtil).
+    property <string> pre-mention-text: "";
+    // Live filter for the mini search bar + list (synced from compose
+    // token and editable in the popup search field).
+    in-out property <string> mention-filter: "";
+    // Keyboard highlight index into the active catalog (skills/mcp/files).
+    // Closest/first match is selected by default; Up/Down move; Enter applies.
+    property <int> mention-sel: 0;
+
+    property <string> token-prefix:
+        util-prefix != "" ? util-prefix
+        : (local-mention-active ? local-prefix : "");
+    property <string> token-query:
+        util-prefix != "" ? util-query
+        : local-query;
+    property <bool> mention-open:
+        compose.has-focus
+        && (token-prefix == "/" || token-prefix == "@" || token-prefix == "#");
+    property <length> mention-popup-h: 220px;
+
+    // Keep mini-search + list filter in lockstep with the active token.
+    changed token-query => {
+        mention-filter = token-query;
+        root.reselect-closest();
+    }
+    changed token-prefix => {
+        if (token-prefix == "") {
+            mention-filter = "";
+            mention-sel = 0;
+        } else {
+            root.reselect-closest();
+        }
+    }
+    changed mention-filter => {
+        root.reselect-closest();
+    }
+
+    function open-local-mention(prefix: string) {
+        // Capture text *before* the trigger char is inserted (key-pressed
+        // runs prior to insertion when we return reject).
+        pre-mention-text = compose-text;
+        local-prefix = prefix;
+        local-query = "";
+        mention-filter = "";
+        local-mention-active = true;
+        root.reselect-closest();
+    }
+    function close-local-mention() {
+        local-mention-active = false;
+        local-prefix = "";
+        local-query = "";
+        mention-filter = "";
+        mention-sel = 0;
+        pre-mention-text = "";
+    }
+    function apply-mention-pick(insert: string) {
+        // insert includes the trigger, e.g. "/skill-name "
+        if (root.textutil-ready) {
+            root.compose-text = TextUtil.replace-active-token(
+                root.compose-text, root.cursor-off, insert);
+        } else {
+            root.compose-text = root.pre-mention-text + insert;
+        }
+        root.close-local-mention();
+        compose.focus();
+    }
+    // Hide rows that don't match the live filter (name or secondary text).
+    // Single contains-ci call — passing mention-filter twice into helpers
+    // trips a SharedString move bug in generated Rust.
+    function row-hidden(label: string, extra: string) -> bool {
+        if (root.mention-filter == "") {
+            return false;
+        }
+        if (TextUtil.contains-ci(label + "\n" + extra, root.mention-filter)) {
+            return false;
+        }
+        // Host/viewer with TextUtil: no match → hide.
+        // Pure slint-viewer (callback uninstalled): contains-ci always
+        // false — keep rows visible so the list is not blanked.
+        return TextUtil.filter-ready();
+    }
+
+    function catalog-len() -> int {
+        if (root.token-prefix == "/") {
+            return root.skill-options.length;
+        }
+        if (root.token-prefix == "@") {
+            return root.mcp-options.length;
+        }
+        if (root.token-prefix == "#") {
+            return root.file-options.length;
+        }
+        return 0;
+    }
+    function item-hidden(i: int) -> bool {
+        if (i < 0 || i >= root.catalog-len()) {
+            return true;
+        }
+        if (root.token-prefix == "/") {
+            return root.row-hidden(root.skill-options[i].name, root.skill-options[i].description);
+        }
+        if (root.token-prefix == "@") {
+            return root.row-hidden(root.mcp-options[i].name, root.mcp-options[i].command);
+        }
+        if (root.token-prefix == "#") {
+            return root.row-hidden(root.file-options[i], "");
+        }
+        return true;
+    }
+    // Walk from `from` in `dir` (+1 / -1), skip hidden rows, wrap.
+    // Unrolled (no recursion — recursive pure/helpers trip binding loops).
+    function next-visible(from: int, dir: int) -> int {
+        if (root.catalog-len() <= 0) {
+            return -1;
+        }
+        if (!root.item-hidden(Math.mod(from + 1 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 1 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 2 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 2 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 3 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 3 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 4 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 4 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 5 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 5 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 6 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 6 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 7 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 7 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 8 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 8 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 9 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 9 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 10 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 10 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 12 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 12 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 16 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 16 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 20 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 20 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        if (!root.item-hidden(Math.mod(from + 24 * dir + root.catalog-len() * 64, root.catalog-len()))) {
+            return Math.mod(from + 24 * dir + root.catalog-len() * 64, root.catalog-len());
+        }
+        return -1;
+    }
+    function reselect-closest() {
+        // First visible under the current filter (default selection).
+        root.mention-sel = root.next-visible(-1, 1);
+    }
+    function mention-move(dir: int) {
+        if (root.catalog-len() == 0) {
+            return;
+        }
+        if (root.mention-sel < 0) {
+            root.mention-sel = root.next-visible(-1, 1);
+            return;
+        }
+        root.mention-sel = root.next-visible(root.mention-sel, dir);
+    }
+    function apply-mention-sel() {
+        if (root.mention-sel < 0 || root.item-hidden(root.mention-sel)) {
+            return;
+        }
+        if (root.token-prefix == "/") {
+            root.apply-mention-pick("/" + root.skill-options[root.mention-sel].name + " ");
+        } else if (root.token-prefix == "@") {
+            root.apply-mention-pick("@" + root.mcp-options[root.mention-sel].name + " ");
+        } else if (root.token-prefix == "#") {
+            root.apply-mention-pick("#" + root.file-options[root.mention-sel] + " ");
+        }
+    }
+    // Non-printable / navigation keys — never append their private
+    // unicode text to the filter (Left/Right were producing junk glyphs).
+    pure function is-nav-or-edit-key(t: string) -> bool {
+        return t == Key.LeftArrow
+            || t == Key.RightArrow
+            || t == Key.UpArrow
+            || t == Key.DownArrow
+            || t == Key.Home
+            || t == Key.End
+            || t == Key.PageUp
+            || t == Key.PageDown
+            || t == Key.Backspace
+            || t == Key.Delete
+            || t == Key.Tab
+            || t == Key.Escape
+            || t == Key.Return;
+    }
+    // Only real typing chars go into local-query / mention-filter.
+    pure function is-filter-char(t: string) -> bool {
+        return t != ""
+            && t != " "
+            && !root.is-nav-or-edit-key(t)
+            && t.character-count == 1;
+    }
+    // Shared key handler for compose + mini search while popup is open.
+    function mention-key(event: KeyEvent) -> EventResult {
+        if (event.text == Key.Escape) {
+            root.close-local-mention();
+            compose.focus();
+            return EventResult.accept;
+        }
+        if (event.text == Key.DownArrow) {
+            root.mention-move(1);
+            return EventResult.accept;
+        }
+        if (event.text == Key.UpArrow) {
+            root.mention-move(-1);
+            return EventResult.accept;
+        }
+        // Left/Right: do not accept — let TextInput move the caret.
+        // (Still must not be treated as filter chars; see is-filter-char.)
+        if (event.text == Key.LeftArrow || event.text == Key.RightArrow
+            || event.text == Key.Home || event.text == Key.End
+            || event.text == Key.PageUp || event.text == Key.PageDown
+            || event.text == Key.Delete) {
+            return EventResult.reject;
+        }
+        if (event.text == Key.Return && !event.modifiers.shift && !event.modifiers.control) {
+            root.apply-mention-sel();
+            return EventResult.accept;
+        }
+        if (event.text == " ") {
+            root.close-local-mention();
+            return EventResult.reject;
+        }
+        return EventResult.reject;
+    }
+
+    // Second-row band height — same as SearchableDropdown + ContextRing
+    // so all three share one center line.
+    property <length> row2-h: 24px;
+
     width: 100%;
     horizontal-stretch: 1;
-    // Bar chrome matches thread list (sidebar surface).
+    // Don't clip the upward mention popup.
+    clip: false;
     background: Theme.bg-sidebar;
 
-    // Full chat-column width: shell claims parent width so the input row
-    // has leftover space for horizontal-stretch (see Slint skill).
     VerticalLayout {
         width: 100%;
-        // Wrapper (ChatInputLayout shell): H = pad-2xl, V = pad-xl.
+        // Horizontal gutter matches permission-card dock (pad-2xl).
+        // Vertical: pad-md (12px) — pad-xl (24px) made the bar look over-tall.
         padding-left: Metrics.pad-2xl;
         padding-right: Metrics.pad-2xl;
-        padding-top: Metrics.pad-xl;
-        padding-bottom: Metrics.pad-xl;
-        // Vertical gap between input row and mode/model row.
-        spacing: Metrics.gap-lg;
+        padding-top: Metrics.pad-md;
+        padding-bottom: Metrics.pad-md;
+        spacing: Metrics.gap-md;
 
         // Row 1 — input fills remaining width; send fixed, bottom-aligned.
         HorizontalLayout {
@@ -56,21 +348,14 @@ export component ChatInputLayout inherits Rectangle {
                 horizontal-stretch: 1;
                 preferred-width: 0px;
                 min-width: 0px;
-                // Field insets stay pad-lg H / half V (not the wrapper).
                 height: Math.clamp(compose.preferred-height + Metrics.pad-lg, 34px, 120px);
-                // Field fill only (no border) — contrast vs bar (bg-sidebar).
                 background: Theme.bg-tertiary;
                 border-radius: Theme.radius-md;
                 Text {
-                    text: root.sending ? "Agent is working..." : "Ask the agent to execute tools or run tasks...";
+                    text: root.sending ? "Agent is working..." : "Ask the agent…  / skills  @ mcp  # files";
                     color: Theme.text-muted;
                     font-size: 11px * Theme.font-scale;
                     font-family: Theme.font-sans;
-                    // Single line + elide, not word-wrap: at the box's
-                    // collapsed min-height (34px, one text row) a wrapped
-                    // two-line placeholder overflowed its own row and
-                    // visually spilled past the field -- an ellipsis on a
-                    // single line stays inside the field at any width.
                     wrap: no-wrap;
                     overflow: elide;
                     visible: compose.text == "";
@@ -87,46 +372,59 @@ export component ChatInputLayout inherits Rectangle {
                     compose := TextInput {
                         accessible-label: "Compose message";
                         text <=> root.compose-text;
-                        // queued_send_queue_behavior: always typeable,
-                        // even mid-turn -- `send-requested` now enqueues
-                        // instead of dispatching immediately when a turn
-                        // is in flight (lib.rs's on_send_requested),
-                        // matching Zed's own "always allow typing"
-                        // precedent. Was `enabled: !root.sending`, which
-                        // this phase's own investigation found masked a
-                        // real bug: the old handler cleared the compose
-                        // text unconditionally before its loading guard,
-                        // so a message submitted mid-turn would have
-                        // been silently destroyed had this ever been
-                        // reachable -- fixed together with this flip.
                         enabled: true;
                         color: Theme.text-primary;
                         font-family: Theme.font-sans;
                         font-size: 11px * Theme.font-scale;
                         width: parent.width;
-                        // Explicit height -- without one, this TextInput's
-                        // focusable/clickable hit-region collapsed to one
-                        // line's worth instead of the full padded input box,
-                        // so clicks in the box's lower area silently missed
-                        // it and never focused the composer.
                         height: max(self.preferred-height, parent.height);
                         single-line: false;
                         wrap: word-wrap;
                         changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
                         key-pressed(event) => {
-                            // Panel chords first so they still work while composing.
                             if (root.panel-shortcut(event) == EventResult.accept) {
                                 return EventResult.accept;
                             }
-                            // Plain Enter sends; Ctrl+Enter reserved for approve.
+                            // Open / @ # popup (local state for slint-viewer;
+                            // host path also re-detects via TextUtil).
+                            if (event.text == "/" || event.text == "@" || event.text == "#") {
+                                root.open-local-mention(event.text);
+                                return EventResult.reject;
+                            }
+                            if (root.mention-open || root.local-mention-active) {
+                                // Arrows / Enter / Esc handled for selection.
+                                if (root.mention-key(event) == EventResult.accept) {
+                                    return EventResult.accept;
+                                }
+                                if (event.text == Key.Backspace) {
+                                    if (!root.textutil-ready && root.local-mention-active) {
+                                        if (root.local-query == "") {
+                                            root.close-local-mention();
+                                        } else {
+                                            root.local-query = "";
+                                            root.mention-filter = "";
+                                        }
+                                    }
+                                    return EventResult.reject;
+                                }
+                                // Printable char only → extend filter.
+                                // Never append Left/Right/etc. (private
+                                // unicode key codes looked like junk glyphs).
+                                if (root.local-mention-active && root.is-filter-char(event.text)) {
+                                    root.local-query = root.local-query + event.text;
+                                    root.mention-filter = root.local-query;
+                                }
+                            }
                             if (event.text == Key.Return && !event.modifiers.shift && !event.modifiers.control) {
                                 root.send-requested();
                                 return EventResult.accept;
                             }
                             if (event.text == Key.Backspace && event.modifiers.control) {
-                                self.set-selection-offsets(
-                                    TextUtil.word-boundary-before(self.text, self.cursor-position-byte-offset),
-                                    self.cursor-position-byte-offset);
+                                if (root.textutil-ready) {
+                                    self.set-selection-offsets(
+                                        TextUtil.word-boundary-before(self.text, self.cursor-position-byte-offset),
+                                        self.cursor-position-byte-offset);
+                                }
                                 return EventResult.reject;
                             }
                             return EventResult.reject;
@@ -181,32 +479,274 @@ export component ChatInputLayout inherits Rectangle {
             }
         }
 
-        // Row 2 — mode + model/config; left-aligned, capability-gated.
-        if root.mode-dropdown-entries.length > 0 || root.config-dropdown-entries.length > 0 : HorizontalLayout {
+        // Row 2: mode → model → context. Default for both control types:
+        // same preferred height (row2-h) + parent cross-axis-alignment:
+        // center so geometric midlines match. Do not stretch items.
+        HorizontalLayout {
             width: 100%;
+            height: root.row2-h;
+            preferred-height: root.row2-h;
             spacing: Metrics.gap-sm;
+            alignment: start;
+            // Default vertical behavior for selects + ring.
+            cross-axis-alignment: center;
+
             if root.mode-dropdown-entries.length > 0 : SearchableDropdown {
                 horizontal-stretch: 0;
-                trigger-label: root.mode-trigger-label != "" ? root.mode-trigger-label : "Mode";
+                vertical-stretch: 0;
+                height: root.row2-h;
+                preferred-height: root.row2-h;
+                trigger-label: root.mode-label-shown;
                 options: root.mode-dropdown-entries;
+                selected-id: root.local-mode-id;
                 placeholder: "Search modes...";
                 popup-width: 200px;
-                entry-selected(id, value) => { root.mode-selected(id); }
+                entry-selected(id, value, label) => {
+                    root.local-mode-id = id;
+                    root.local-mode-label = label;
+                    root.mode-selected(id);
+                }
             }
             if root.config-dropdown-entries.length > 0 : SearchableDropdown {
                 horizontal-stretch: 0;
-                trigger-label: "Model";
+                vertical-stretch: 0;
+                height: root.row2-h;
+                preferred-height: root.row2-h;
+                trigger-label: root.config-label-shown;
                 options: root.config-dropdown-entries;
+                selected-id: root.local-config-id;
+                selected-value: root.local-config-value;
                 placeholder: "Search models...";
                 popup-width: 220px;
-                // Right-side call site in this row -- searchable_dropdown.
-                // slint's own doc comment calls this exact case out as
-                // needing popup-align-end, otherwise the 220px popup opens
-                // left-aligned from this trigger's x and runs off the row's
-                // right edge at narrow/tablet widths (the mode selector to
-                // its left has more room and doesn't need this).
-                popup-align-end: true;
-                entry-selected(id, value) => { root.config-option-selected(id, value); }
+                popup-align-end: false;
+                entry-selected(id, value, label) => {
+                    root.local-config-id = id;
+                    root.local-config-value = value;
+                    root.local-config-label = label;
+                    root.config-option-selected(id, value);
+                }
+            }
+
+            ContextRing {
+                size: root.row2-h;
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                ratio: root.context-ratio;
+                used-tokens: root.context-used-tokens;
+                limit-tokens: root.context-limit-tokens;
+                context-view-requested => { root.context-view-requested(); }
+            }
+        }
+    }
+
+    // / @ # suggestion popup — sibling of the main VerticalLayout so it
+    // is not clipped by layout packing. Anchored just above this bar.
+    if root.mention-open : Rectangle {
+        x: Metrics.pad-2xl;
+        y: -root.mention-popup-h - 6px;
+        width: parent.width - 2 * Metrics.pad-2xl;
+        height: root.mention-popup-h;
+        z: 8000;
+        background: Theme.bg-card;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-md;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: #000000.with-alpha(0.45);
+        drop-shadow-offset-y: 2px;
+        clip: true;
+
+        VerticalLayout {
+            padding: Metrics.pad-sm;
+            spacing: Metrics.gap-sm;
+            // Shared FilterSearchBar (base/) — same tokens as settings /
+            // dropdown search; leading-text is the active / @ # trigger.
+            mention-search-bar := FilterSearchBar {
+                query <=> root.mention-filter;
+                placeholder: "filter…";
+                bar-accessible-label: "Filter suggestions";
+                show-icon: true;
+                leading-text: root.token-prefix != "" ? root.token-prefix : "/";
+                edited => {
+                    root.local-query = root.mention-filter;
+                }
+                key-pressed(event) => {
+                    return root.mention-key(event);
+                }
+            }
+            Flickable {
+                vertical-stretch: 1;
+                preferred-height: 0px;
+                min-height: 40px;
+                viewport-height: mention-col.preferred-height;
+                mention-col := VerticalLayout {
+                    spacing: Metrics.space-1;
+
+                    if root.token-prefix == "/" : VerticalLayout {
+                        spacing: Metrics.space-1;
+                        for skill[i] in root.skill-options : Rectangle {
+                            property <bool> hidden: root.row-hidden(skill.name, skill.description);
+                            property <bool> hi: !hidden && i == root.mention-sel;
+                            height: hidden ? 0px : 28px;
+                            clip: true;
+                            background: hi ? Theme.bg-primary
+                                : sk-touch.has-hover ? Theme.bg-primary-container
+                                : transparent;
+                            border-radius: Theme.radius-sm;
+                            sk-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.mention-sel = i;
+                                    root.apply-mention-pick("/" + skill.name + " ");
+                                }
+                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                            }
+                            HorizontalLayout {
+                                width: 100%;
+                                height: 100%;
+                                padding-left: Metrics.space-4;
+                                padding-right: Metrics.space-4;
+                                spacing: Metrics.gap-md;
+                                alignment: stretch;
+                                cross-axis-alignment: center;
+                                Icon {
+                                    source: @image-url("../assets/icons/sparkles.svg");
+                                    size: Metrics.icon-sm;
+                                    color: hi ? Theme.text-on-primary : Theme.text-secondary;
+                                    horizontal-stretch: 0;
+                                    vertical-stretch: 0;
+                                }
+                                Text {
+                                    text: skill.name;
+                                    color: hi ? Theme.text-on-primary : Theme.text-primary;
+                                    font-size: 11px * Theme.font-scale;
+                                    font-family: Theme.font-sans;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                                Text {
+                                    text: skill.description;
+                                    color: hi ? Theme.text-on-primary.with-alpha(0.85) : Theme.text-muted;
+                                    font-size: 10px * Theme.font-scale;
+                                    font-family: Theme.font-sans;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                        if root.skill-options.length == 0 : Text {
+                            text: "No skills discovered yet";
+                            color: Theme.text-muted;
+                            font-size: 11px * Theme.font-scale;
+                        }
+                    }
+
+                    if root.token-prefix == "@" : VerticalLayout {
+                        spacing: Metrics.space-1;
+                        for srv[i] in root.mcp-options : Rectangle {
+                            property <bool> hidden: root.row-hidden(srv.name, srv.command);
+                            property <bool> hi: !hidden && i == root.mention-sel;
+                            height: hidden ? 0px : 28px;
+                            clip: true;
+                            background: hi ? Theme.bg-primary
+                                : mcp-touch.has-hover ? Theme.bg-primary-container
+                                : transparent;
+                            border-radius: Theme.radius-sm;
+                            mcp-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.mention-sel = i;
+                                    root.apply-mention-pick("@" + srv.name + " ");
+                                }
+                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                            }
+                            HorizontalLayout {
+                                width: 100%;
+                                height: 100%;
+                                padding-left: Metrics.space-4;
+                                padding-right: Metrics.space-4;
+                                spacing: Metrics.gap-md;
+                                alignment: stretch;
+                                cross-axis-alignment: center;
+                                Icon {
+                                    source: @image-url("../assets/icons/server.svg");
+                                    size: Metrics.icon-sm;
+                                    color: hi ? Theme.text-on-primary : Theme.text-secondary;
+                                    horizontal-stretch: 0;
+                                    vertical-stretch: 0;
+                                }
+                                Text {
+                                    text: srv.name;
+                                    color: hi ? Theme.text-on-primary : Theme.text-primary;
+                                    font-size: 11px * Theme.font-scale;
+                                    font-family: Theme.font-sans;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                                Text {
+                                    text: srv.command;
+                                    color: hi ? Theme.text-on-primary.with-alpha(0.85) : Theme.text-muted;
+                                    font-size: 10px * Theme.font-scale;
+                                    font-family: Theme.font-sans;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                        if root.mcp-options.length == 0 : Text {
+                            text: "No MCP servers registered";
+                            color: Theme.text-muted;
+                            font-size: 11px * Theme.font-scale;
+                        }
+                    }
+
+                    if root.token-prefix == "#" : VerticalLayout {
+                        spacing: Metrics.space-1;
+                        for f[i] in root.file-options : Rectangle {
+                            property <bool> hidden: root.row-hidden(f, "");
+                            property <bool> hi: !hidden && i == root.mention-sel;
+                            height: hidden ? 0px : 28px;
+                            clip: true;
+                            background: hi ? Theme.bg-primary
+                                : file-touch.has-hover ? Theme.bg-primary-container
+                                : transparent;
+                            border-radius: Theme.radius-sm;
+                            file-touch := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.mention-sel = i;
+                                    root.apply-mention-pick("#" + f + " ");
+                                }
+                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                            }
+                            HorizontalLayout {
+                                width: 100%;
+                                height: 100%;
+                                padding-left: Metrics.space-4;
+                                padding-right: Metrics.space-4;
+                                alignment: stretch;
+                                cross-axis-alignment: center;
+                                Text {
+                                    text: f;
+                                    color: hi ? Theme.text-on-primary : Theme.text-primary;
+                                    font-size: 11px * Theme.font-scale;
+                                    font-family: Theme.font-mono;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                        if root.file-options.length == 0 : Text {
+                            text: "No files indexed yet";
+                            color: Theme.text-muted;
+                            font-size: 11px * Theme.font-scale;
+                        }
+                    }
+                }
             }
         }
     }

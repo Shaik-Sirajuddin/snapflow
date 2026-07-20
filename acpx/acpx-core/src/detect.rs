@@ -78,7 +78,13 @@ fn dirs_home() -> std::path::PathBuf {
 
 fn which(bin: &str) -> bool {
     {
-        let cache = which_cache().lock().expect("which cache poisoned");
+        // Self-heals on poison (see `bridge_sessions::lock_sessions`'s
+        // doc comment for the identical reasoning) rather than
+        // permanently breaking every future `agents/status` binary
+        // detection for this process's remaining lifetime.
+        let cache = which_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((found, since)) = cache.get(bin) {
             if since.elapsed() < WHICH_CACHE_TTL {
                 return *found;
@@ -88,7 +94,7 @@ fn which(bin: &str) -> bool {
     let found = which_uncached(bin);
     which_cache()
         .lock()
-        .expect("which cache poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(bin.to_string(), (found, Instant::now()));
     found
 }

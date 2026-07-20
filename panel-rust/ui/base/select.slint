@@ -1,6 +1,7 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "icon.slint";
+import { FilterSearchBar } from "filter_search_bar.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- generic single-select dropdown. Nothing in this
@@ -120,7 +121,7 @@ export component Select inherits Rectangle {
             // `PopupWindow`'s own child isn't stretch-managed by a
             // normal layout the same way.
             width: parent.width;
-            height: (root.searchable ? 30px : 0px) + Math.min(root.options.length, 6) * 24px;
+            height: (root.searchable ? 28px : 0px) + Math.min(root.options.length, 6) * 24px;
             background: Theme.bg-card;
             border-width: 1px;
             border-color: Theme.border-strong;
@@ -128,34 +129,18 @@ export component Select inherits Rectangle {
             clip: true;
 
             VerticalLayout {
-                if root.searchable : Rectangle {
-                    height: 30px;
-                    background: Theme.bg-tertiary;
-                    border-width: 1px;
-                    border-color: Theme.border-default;
-                    // Same monochrome search-field treatment as
-                    // `search_bar.slint` -- see this component's own doc
-                    // comment for why the field is present but does not
-                    // filter yet.
-                    search-input := TextInput {
-                        accessible-label: root.select-accessible-label + " search";
-                        accessible-action-default => { self.focus(); }
-                        text <=> root.query;
-                        color: Theme.text-primary;
-                        font-size: 11px * Theme.font-scale;
-                        x: Metrics.space-4;
-                        width: parent.width - 2 * Metrics.space-4;
-                        vertical-alignment: center;
-                        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
-                    }
-                    if root.query == "" : Text {
-                        text: "Search...";
-                        color: Theme.text-muted;
-                        font-size: 11px * Theme.font-scale;
-                        x: Metrics.space-4;
-                        height: parent.height;
-                        vertical-alignment: center;
-                    }
+                // Shared FilterSearchBar — same chrome as settings / thread /
+                // mention search. Filtering still needs TextUtil when used
+                // against long lists (see component doc above). Cursor-kind
+                // reporting (pointer/text) lives inside FilterSearchBar
+                // itself, so every call site inherits it.
+                if root.searchable : FilterSearchBar {
+                    query <=> root.query;
+                    placeholder: "Search...";
+                    bar-accessible-label: root.select-accessible-label + " search";
+                    show-icon: false;
+                    bar-bg: Theme.bg-tertiary;
+                    bar-height: 28px;
                 }
 
                 Flickable {

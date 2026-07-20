@@ -94,14 +94,19 @@ pub struct ServerConfig {
     pub session_process_isolation: bool,
     /// **`process_reader_demux`, phase 1 of
     /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
-    /// Opt-in (`ACPX_PROCESS_READER_DEMUX=1`, default off). When on,
+    /// **On by default** (`ACPX_PROCESS_READER_DEMUX=0` opts out -- see
+    /// `Router::process_reader_demux`'s field doc comment for the three
+    /// regressions that had to be closed, each with its own regression
+    /// test, before this default could safely flip). When on,
     /// `session/prompt`/`session/new` register-then-await a backend
     /// response via a per-process reader task instead of holding that
     /// process's own lock across the entire write + blocking-read-loop
     /// of a turn -- so two sessions sharing one backend process (the
     /// live default when both isolation flags above are also off) can
     /// actually overlap in wall time. See `Router::process_reader_demux`'s
-    /// field doc comment for the current scope and known tradeoffs.
+    /// field doc comment for the current scope and known tradeoffs (now
+    /// covers `session/fork` and the real `session/list` path too, not
+    /// just `session/prompt`/`session/new`).
     pub process_reader_demux: bool,
 }
 
@@ -342,9 +347,9 @@ impl ServerConfig {
         let session_process_isolation = std::env::var("ACPX_SESSION_PROCESS_ISOLATION")
             .map(|value| value == "1")
             .unwrap_or(false);
-        let process_reader_demux = std::env::var("ACPX_PROCESS_READER_DEMUX")
+    let process_reader_demux = std::env::var("ACPX_PROCESS_READER_DEMUX")
             .map(|value| value == "1")
-            .unwrap_or(false);
+            .unwrap_or(true);
         let bridge = acpx_bridge::BridgeConfig::from_env()
             .unwrap_or_else(|err| panic!("invalid ACP bridge configuration: {err}"));
         Self {

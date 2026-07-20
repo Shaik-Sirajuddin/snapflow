@@ -59,7 +59,7 @@ export component AgentsView inherits Rectangle {
     // itself now and leaving actual filtering for that later pass, same
     // posture the page-level bar already takes).
     property <string> agent-search-query: "";
-    property <string> default-agent-id: "";
+    in-out property <string> default-agent-id: "";
 
     background: transparent;
 
@@ -79,6 +79,7 @@ export component AgentsView inherits Rectangle {
         }
 
         Flickable {
+            width: parent.width;
             height: root.available-profiles.length > 0 ? 30px : 0px;
             viewport-width: profile-chip-row.preferred-width;
             profile-chip-row := HorizontalLayout {
@@ -312,30 +313,28 @@ export component AgentsView inherits Rectangle {
         // have and is deferred to a Rust-side ordering pass -- the default
         // card still reads as default via its own tint wherever it sits.
         //
-        // Default-model/permission-profile per card are local, UI-only
-        // placeholder state for now -- `AgentCatalogEntry` has no per-agent
-        // model/profile fields yet (see the plan's "Open questions": no ACP
-        // RPC returns a model list keyed by agent id today), and mapping
-        // `available-profiles` (`[ProfileOption]`) into the `[string]`
-        // `Select.options` each card needs isn't expressible in pure Slint
-        // (no array-map primitive) without a small Rust-side helper --
-        // deferred until the real per-agent settings storage exists.
         VerticalLayout {
             width: parent.width;
             spacing: Metrics.space-6;
 
             property <int> agent-count: root.agent-catalog.length;
-            // Ceiling division for row count -- exact by construction
-            // (subtract the remainder first), not the classic `(N+1)/2`
-            // truncating-int trick, since `/` doesn't truncate here.
+            // Two cards need 532px including their grid gap. Below that,
+            // use one fluid-width card per row so the tile never overflows
+            // a narrow settings pane.
+            property <int> cards-per-row: root.width >= 532px ? 2 : 1;
+            // Ceiling division for the active column count -- exact by
+            // construction, since Slint's `/` does not truncate ints.
             property <int> row-count:
-                ((agent-count + 1) - Math.mod(agent-count + 1, 2)) / 2;
+                ((agent-count + cards-per-row - 1)
+                    - Math.mod(agent-count + cards-per-row - 1, cards-per-row))
+                    / cards-per-row;
 
             for row-idx in row-count : VerticalLayout {
                 spacing: Metrics.space-6;
+                property <int> first-agent-index: row-idx * cards-per-row;
 
-                if root.agent-catalog[row-idx * 2].status != "installed"
-                    && (row-idx == 0 || root.agent-catalog[row-idx * 2 - 1].status == "installed")
+                if root.agent-catalog[first-agent-index].status != "installed"
+                    && (first-agent-index == 0 || root.agent-catalog[first-agent-index - 1].status == "installed")
                     : SettingsDivider { width: parent.width; }
 
                 HorizontalLayout {
@@ -343,35 +342,33 @@ export component AgentsView inherits Rectangle {
                     alignment: start;
 
                     AgentCard {
-                        agent-id: root.agent-catalog[row-idx * 2].id;
-                        agent-name: root.agent-catalog[row-idx * 2].name != ""
-                            ? root.agent-catalog[row-idx * 2].name : root.agent-catalog[row-idx * 2].id;
-                        status: root.agent-catalog[row-idx * 2].status;
-                        is-default: root.agent-catalog[row-idx * 2].id == root.default-agent-id;
-                        model-options: ["default", "gpt-5.2", "gpt-5.2-codex", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5", "gemini-3-pro"];
-                        profile-options: ["default", "readonly", "full-access"];
+                        agent-id: root.agent-catalog[first-agent-index].id;
+                        agent-name: root.agent-catalog[first-agent-index].name != ""
+                            ? root.agent-catalog[first-agent-index].name : root.agent-catalog[first-agent-index].id;
+                        status: root.agent-catalog[first-agent-index].status;
+                        card-width: cards-per-row == 1 ? root.width : 260px;
+                        is-default: root.agent-catalog[first-agent-index].id == root.default-agent-id;
                         set-default(new-default) => {
-                            root.default-agent-id = new-default ? root.agent-catalog[row-idx * 2].id : "";
+                            root.default-agent-id = new-default ? root.agent-catalog[first-agent-index].id : "";
                         }
-                        install-requested => { root.agent-install-requested(root.agent-catalog[row-idx * 2].id); }
-                        connect-requested => { root.agent-connect-requested(root.agent-catalog[row-idx * 2].id); }
-                        disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[row-idx * 2].id); }
+                        install-requested => { root.agent-install-requested(root.agent-catalog[first-agent-index].id); }
+                        connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index].id); }
+                        disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index].id); }
                     }
 
-                    if row-idx * 2 + 1 < root.agent-catalog.length : AgentCard {
-                        agent-id: root.agent-catalog[row-idx * 2 + 1].id;
-                        agent-name: root.agent-catalog[row-idx * 2 + 1].name != ""
-                            ? root.agent-catalog[row-idx * 2 + 1].name : root.agent-catalog[row-idx * 2 + 1].id;
-                        status: root.agent-catalog[row-idx * 2 + 1].status;
-                        is-default: root.agent-catalog[row-idx * 2 + 1].id == root.default-agent-id;
-                        model-options: ["default", "gpt-5.2", "gpt-5.2-codex", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5", "gemini-3-pro"];
-                        profile-options: ["default", "readonly", "full-access"];
+                    if cards-per-row == 2 && first-agent-index + 1 < root.agent-catalog.length : AgentCard {
+                        agent-id: root.agent-catalog[first-agent-index + 1].id;
+                        agent-name: root.agent-catalog[first-agent-index + 1].name != ""
+                            ? root.agent-catalog[first-agent-index + 1].name : root.agent-catalog[first-agent-index + 1].id;
+                        status: root.agent-catalog[first-agent-index + 1].status;
+                        card-width: 260px;
+                        is-default: root.agent-catalog[first-agent-index + 1].id == root.default-agent-id;
                         set-default(new-default) => {
-                            root.default-agent-id = new-default ? root.agent-catalog[row-idx * 2 + 1].id : "";
+                            root.default-agent-id = new-default ? root.agent-catalog[first-agent-index + 1].id : "";
                         }
-                        install-requested => { root.agent-install-requested(root.agent-catalog[row-idx * 2 + 1].id); }
-                        connect-requested => { root.agent-connect-requested(root.agent-catalog[row-idx * 2 + 1].id); }
-                        disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[row-idx * 2 + 1].id); }
+                        install-requested => { root.agent-install-requested(root.agent-catalog[first-agent-index + 1].id); }
+                        connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index + 1].id); }
+                        disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index + 1].id); }
                     }
                 }
             }

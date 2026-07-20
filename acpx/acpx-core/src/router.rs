@@ -328,6 +328,22 @@ pub struct Router {
     /// Correlates backend-initiated requests with responses from the
     /// persistent ACP client that currently owns the session.
     interaction_hub: InteractionHub,
+    /// **`process_reader_demux` HTTP-fallback buffer.** Undelivered
+    /// `session/update` notifications the demux consumer
+    /// ([`spawn_demux_consumer`]) observed for a gateway session with no
+    /// live WS/stdio subscriber right now -- queued here instead of
+    /// discarded, keyed by `(tenant_id, gateway_session_id)`, so the
+    /// *next* `POST /rpc` call against that same session can drain and
+    /// attach them to its own response's `_acpx.updates`, exactly the
+    /// data a live-subscribed transport gets pushed immediately and an
+    /// HTTP-only caller has no other way to ever see (`transport::http`
+    /// has no live-push channel at all). Closes the real "demux silently
+    /// zeroes out `_acpx.updates` for every `POST /rpc` caller" data-loss
+    /// gap `process_reader_demux`'s field doc comment used to flag as
+    /// the reason the flag's default stayed off -- see
+    /// [`PendingUpdates`]'s own doc comment for the drain-on-read/
+    /// bounded-size contract.
+    pending_updates: PendingUpdates,
     /// **Phase 15 addition.** Identity (`Arc::as_ptr` cast to `usize`) of
     /// every physical backend process instance that already has an idle
     /// scavenger task (see [`spawn_idle_scavenger`]/[`backend_idle_
@@ -372,28 +388,89 @@ pub struct Router {
     on_demand_recovery_enabled: bool,
     /// **`process_reader_demux`, phase 1 of
     /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
-    /// Opt-in (disabled by default -- `ACPX_PROCESS_READER_DEMUX` unset).
-    /// When enabled, [`dispatch_proxied_shared`] and
-    /// [`dispatch_session_new_shared`] register-then-await a response via
+    /// **On by default** (`ACPX_PROCESS_READER_DEMUX=0` opts out). When
+    /// enabled, all four backend
+    /// round-trip dispatch paths that can share a process --
+    /// [`dispatch_proxied_shared`], [`dispatch_session_new_shared`],
+    /// [`dispatch_session_fork_shared`], and
+    /// [`dispatch_session_list_real_shared`] -- register-then-await a
+    /// response via
     /// `BackendProcess::pending` instead of holding the per-process lock
     /// across the entire write + blocking-read-loop of a turn -- see
     /// `memory/acpx/tasks/zed_integration.yaml` task 7. This is what lets
     /// two sessions sharing one backend process actually overlap in wall
     /// time instead of fully serializing behind each other's whole turn.
-    /// Deliberately scoped to just these two hot dispatch paths for now;
-    /// the legacy non-`_shared` `Router::dispatch*` methods and the
-    /// session-fork/session-list paths are unaffected either way.
+    /// The legacy, non-`_shared` `Router::dispatch*` methods (used only
+    /// by direct, non-multi-tenant callers/tests, not any production
+    /// transport -- see `dispatch_shared`'s own doc comment) are still
+    /// unaffected either way; every production dispatch path is covered.
+    /// **All four must agree on this flag together for one process**:
+    /// once any one of them calls `BackendProcess::start_demux` (taking
+    /// the raw reader), every *other* call sharing that same process
+    /// must also route through the pending table instead of
+    /// `reader_mut()` -- calling `reader_mut()` after demux has started
+    /// panics outright (`BackendProcess::reader_mut`'s own doc comment).
+    /// This field is read once per call and threaded through, so a
+    /// config change only takes effect for backend processes spawned
+    /// after the change, never retroactively for an already-demuxed one.
+    ///
+    /// **Why it is now safe to default on** (previously deferred for
+    /// three separate, real regressions -- all three are now closed,
+    /// each with its own regression test):
+    ///
+    /// 1. **`session/fork`/`session/list` crash** once any other call on
+    ///    the same shared process had already activated demux (`proc.
+    ///    reader` taken, `reader_mut()` panics). Fixed: both now
+    ///    register-then-await like every other dispatch path.
+    /// 2. **`InteractionHub`/`AgentRequestHub` relay and live terminal
+    ///    streaming silently stopped working** for every session on a
+    ///    demuxed process. Root cause: [`spawn_demux_consumer`]'s single
+    ///    per-*process* `LiveNotifyCtx` has no single session's
+    ///    `tenant_id`/`gateway_session_id` to carry (it serves every
+    ///    session sharing that process), so it always built one with
+    ///    both `None` -- and [`try_forward_interaction`] (the path
+    ///    Zed's `/acp` bridge relies on for `session/request_permission`
+    ///    etc.) and [`try_relay_agent_request`] both treated `None` as
+    ///    "give up," not "resolve it per-frame" the way
+    ///    [`try_deliver_live`] already did. Fixed: all three (plus the
+    ///    `terminal/create` live-stream spawn) now resolve the gateway
+    ///    session from each frame's own `params.sessionId` via
+    ///    [`resolve_gateway_session`], same as `try_deliver_live` always
+    ///    did. Before this fix, a live Zed session behind a shared,
+    ///    demuxed backend process would never be asked to approve a
+    ///    permission request -- it silently fell straight through to
+    ///    the profile's static auto-answer instead.
+    /// 3. **`POST /rpc` data loss**: `transport::http` has no live-push
+    ///    channel at all (see that module's doc comment), so its only
+    ///    way to see a call's interleaved notifications is the legacy
+    ///    path's inline `_acpx.updates` buffering
+    ///    (`UnmatchedOutcome::Notification` -> `attach_updates`) --
+    ///    which the demux consumer bypasses entirely (see tradeoff
+    ///    below). Fixed: [`Router::pending_updates`] buffers whatever
+    ///    the demux consumer couldn't deliver live, per gateway session,
+    ///    and [`dispatch_proxied_shared`]'s demux branch drains it into
+    ///    its own response's `_acpx.updates` before returning, so a
+    ///    `POST /rpc` caller still sees the same data it always did --
+    ///    just via a bounded (`MAX_BUFFERED_UPDATES_PER_SESSION`)
+    ///    best-effort buffer instead of blocking inline delivery.
     ///
     /// **Known tradeoff while enabled**: unmatched frames (bare
     /// notifications and agent-initiated requests) are handled entirely
     /// by an independent per-process consumer task
-    /// ([`spawn_demux_consumer`]) rather than by whichever call
-    /// happened to be in the read loop -- so a response's own
-    /// `_acpx.updates`/`_acpx.agentRequests` are always empty when this
-    /// is on; that data still reaches a live-subscribed client via
-    /// `NotificationHub`, it just never gets attached inline to this
-    /// particular call's response the way the legacy path's best-effort
-    /// buffering fallback does.
+    /// ([`spawn_demux_consumer`]) rather than by whichever call happened
+    /// to be in the read loop. A response's own `_acpx.updates`/
+    /// `_acpx.agentRequests` are populated from `PendingUpdates`
+    /// (`session/update` only, notification-delivery-order preserved,
+    /// FIFO) rather than gathered inline during the read loop --
+    /// functionally equivalent for a well-behaved caller, but the
+    /// ordering relative to *this exact call's own response frame* is
+    /// no longer strictly guaranteed the way a single shared read loop
+    /// naturally guaranteed it (a notification that raced the response
+    /// frame itself could end up buffered for the *next* call instead of
+    /// this one). `_acpx.agentRequests` is not buffered at all --
+    /// agent-initiated requests always get *some* answer immediately
+    /// (relay if live, policy auto-answer otherwise), so there is
+    /// nothing left to buffer for a later call to attach.
     process_reader_demux: bool,
     /// **`connector_reference_lifecycle`.** Supervisor keys currently
     /// observed to have zero referencing live sessions, mapped to when
@@ -728,6 +805,11 @@ pub enum RouterError {
          this call's response arrived"
     )]
     BackendDemuxReaderClosed,
+    #[error(
+        "backend stdin write timed out after {0:?}; the wedged process was killed and this \
+         call failed rather than holding its per-process/writer lock forever"
+    )]
+    BackendWriteTimeout(Duration),
 }
 
 /// Hard ceiling on the per-candidate backend `session/close` round trip
@@ -904,6 +986,7 @@ impl Router {
             notification_hub: NotificationHub::new(),
             agent_request_hub: AgentRequestHub::new(),
             interaction_hub: InteractionHub::new(),
+            pending_updates: PendingUpdates::new(),
             scavenged_backends: HashSet::new(),
             tenant_process_isolation: false,
             session_process_isolation: false,
@@ -933,6 +1016,15 @@ impl Router {
     /// sessions they own and resolve client responses through this hub.
     pub fn interaction_hub(&self) -> InteractionHub {
         self.interaction_hub.clone()
+    }
+
+    /// A clone of this router's `process_reader_demux` HTTP-fallback
+    /// buffer -- see the `pending_updates` field's doc comment. Not
+    /// exposed outside this crate (no `pub`): every caller today is a
+    /// free function in this same module (`spawn_demux_consumer`,
+    /// `dispatch_proxied_shared`).
+    fn pending_updates(&self) -> PendingUpdates {
+        self.pending_updates.clone()
     }
 
     /// **Phase 15.** Ensure exactly one idle scavenger task
@@ -1273,7 +1365,8 @@ impl Router {
     }
 
     /// Opt-in per-process reader-task demultiplexing -- see
-    /// `process_reader_demux`'s field doc comment. Disabled by default.
+    /// `process_reader_demux`'s field doc comment, including why the
+    /// default is still off. Disabled by default.
     pub fn with_process_reader_demux(mut self, enabled: bool) -> Self {
         self.process_reader_demux = enabled;
         self
@@ -1606,17 +1699,16 @@ impl Router {
             let initialize_result = backend.agent_capabilities.clone().unwrap_or_default();
 
             let new_id = serde_json::json!("acpx-capability-probe-new");
-            backend
-                .writer
-                .lock()
-                .await
-                .write_value(&serde_json::json!({
+            write_backend_value_locked(
+                &mut backend,
+                &serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": new_id,
                     "method": "session/new",
                     "params": {"cwd": cwd, "mcpServers": []}
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             let (response, _, _) =
                 read_matching_response(&mut backend, &new_id, BackendCallPolicy::default(), None)
                     .await?;
@@ -1628,17 +1720,16 @@ impl Router {
             );
 
             let close_id = serde_json::json!("acpx-capability-probe-close");
-            backend
-                .writer
-                .lock()
-                .await
-                .write_value(&serde_json::json!({
+            write_backend_value_locked(
+                &mut backend,
+                &serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": close_id,
                     "method": "session/close",
                     "params": {"sessionId": backend_session_id}
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             if let Err(error) =
                 read_matching_response(&mut backend, &close_id, BackendCallPolicy::default(), None)
                     .await
@@ -2598,7 +2689,7 @@ impl Router {
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut backend, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response_with_idle_timeout(
                     &mut backend,
@@ -2739,7 +2830,7 @@ impl Router {
         let response = {
             let mut proc = backend.lock().await;
             ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-            proc.writer.lock().await.write_value(&outbound).await?;
+            write_backend_value_locked(&mut proc, &outbound).await?;
             let (response, _notifications, _agent_requests) =
                 read_matching_response(&mut proc, &id, call_policy, None).await?;
             response
@@ -3316,7 +3407,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         let response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut backend, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response_with_idle_timeout(
                     &mut backend,
@@ -3449,7 +3540,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut backend, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy, None).await?;
             attach_updates(response, notifications, agent_requests)
@@ -3593,7 +3684,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         // backend isn't even running has, definitionally, nothing left
         // to interrupt.
         if let Some(writer) = self.supervisor.cancel_writer(&agent_id) {
-            writer.lock().await.write_value(&notification).await?;
+            write_cancel_notification_best_effort(&writer, &notification).await;
         }
 
         Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
@@ -4173,6 +4264,111 @@ impl BackendCallPolicy {
 /// either guessing a method id or silently proceeding to `session/new`
 /// and letting the backend's own downstream rejection stand in for a
 /// real error message about *why*.
+/// Hard ceiling on writing one JSON-RPC line to a backend process's stdin
+/// pipe.
+///
+/// **Why this exists.** Every dispatch path either holds the per-process
+/// `BackendProcess` lock across its `write_value` call (non-demux path,
+/// and every `process_reader_demux` path's `if proc.pending.is_none()`
+/// setup block) or serializes on the shared `writer` handle alone (the
+/// demux "write-then-register" fast path). Neither was ever bounded: a
+/// backend that stops draining its own stdin (wedged, deadlocked, or
+/// swapped/suspended) leaves `ChildStdin::write_all`'s kernel-pipe-buffer
+/// wait blocking forever, and with it every other session sharing this
+/// exact process -- the same "one stuck backend freezes the whole
+/// gateway" class of incident `BACKEND_IDLE_READ_TIMEOUT`/
+/// `BACKEND_HANDSHAKE_TIMEOUT`/`CANCEL_WRITE_TIMEOUT` already close on
+/// the read side and the best-effort-cancel side. Same reasoning as
+/// `CANCEL_WRITE_TIMEOUT`'s doc comment: writing a few hundred bytes to a
+/// healthy process's stdin pipe completes in microseconds, so a multi-
+/// second bound is generous, not aggressive.
+const BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Writes one JSON-RPC value onto `proc`'s stdin, bounded by
+/// `BACKEND_WRITE_TIMEOUT`. `proc` is already exclusively held by the
+/// caller (a `BackendProcess` guard or `&mut` reference), so on timeout
+/// this kills it directly and returns `RouterError::BackendWriteTimeout`
+/// instead of leaving every other session sharing `proc`'s lock queued
+/// up behind a wedged stdin pipe forever.
+async fn write_backend_value_locked(
+    proc: &mut acpx_conductor::BackendProcess,
+    value: &serde_json::Value,
+) -> Result<(), RouterError> {
+    let writer = proc.writer_handle();
+    let write = async move { writer.lock().await.write_value(value).await };
+    match tokio::time::timeout(BACKEND_WRITE_TIMEOUT, write).await {
+        Ok(result) => result.map_err(RouterError::from),
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = BACKEND_WRITE_TIMEOUT.as_secs(),
+                "backend stdin write timed out; killing the wedged process so every other \
+                 session sharing its lock isn't blocked forever"
+            );
+            let _ = proc.kill().await;
+            Err(RouterError::BackendWriteTimeout(BACKEND_WRITE_TIMEOUT))
+        }
+    }
+}
+
+/// Same bound as [`write_backend_value_locked`], for the
+/// `process_reader_demux` fast path where the per-process lock (`proc`)
+/// was already dropped in favor of a standalone `writer` handle before
+/// this write -- exactly the shape `Router::dispatch_session_list_real`
+/// and friends use once they register a pending-response slot. Since
+/// `proc` isn't held here, killing on timeout re-acquires `backend`'s
+/// own lock first (a wedged stdin pipe means the process is already
+/// unusable, so a short re-lock to kill it is safe and cannot itself
+/// deadlock: nothing else holds `backend` for longer than one register/
+/// write/read step in this codebase).
+async fn write_backend_value_via_handle(
+    backend: &acpx_conductor::supervisor::SharedBackendProcess,
+    writer: &std::sync::Arc<tokio::sync::Mutex<acpx_conductor::framing::FramedWriter>>,
+    value: &serde_json::Value,
+) -> Result<(), RouterError> {
+    let write = async { writer.lock().await.write_value(value).await };
+    match tokio::time::timeout(BACKEND_WRITE_TIMEOUT, write).await {
+        Ok(result) => result.map_err(RouterError::from),
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = BACKEND_WRITE_TIMEOUT.as_secs(),
+                "backend stdin write timed out (process-reader-demux path); killing the \
+                 wedged process so every other session sharing it is unblocked"
+            );
+            let mut proc = backend.lock().await;
+            let _ = proc.kill().await;
+            Err(RouterError::BackendWriteTimeout(BACKEND_WRITE_TIMEOUT))
+        }
+    }
+}
+
+/// Best-effort variant for the standalone `Supervisor::cancel_writer`
+/// pipe (`session/cancel` notifications), which has no `BackendProcess`
+/// handle to kill on timeout -- mirrors `Router::cancel_stuck_turns`'s
+/// existing `CANCEL_WRITE_TIMEOUT` handling exactly: `session/cancel` is
+/// fire-and-forget with no confirmation in the ACP wire contract, so
+/// timing out here logs and moves on rather than failing the whole
+/// dispatch (a stuck cancel write shouldn't turn into a stuck cancel
+/// *request*).
+async fn write_cancel_notification_best_effort(
+    writer: &std::sync::Arc<tokio::sync::Mutex<acpx_conductor::framing::FramedWriter>>,
+    value: &serde_json::Value,
+) {
+    let write = async { writer.lock().await.write_value(value).await };
+    match tokio::time::timeout(CANCEL_WRITE_TIMEOUT, write).await {
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to deliver best-effort session/cancel");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CANCEL_WRITE_TIMEOUT.as_secs(),
+                "best-effort session/cancel write timed out; skipping rather than blocking \
+                 this dispatch on a wedged stdin pipe"
+            );
+        }
+        Ok(Ok(())) => {}
+    }
+}
+
 async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
     call_policy: BackendCallPolicy,
@@ -4226,7 +4422,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
                 }
             }
         });
-        proc.writer.lock().await.write_value(&request).await?;
+        write_backend_value_locked(proc, &request).await?;
         // Bounded by `BACKEND_HANDSHAKE_TIMEOUT` (see its own doc comment
         // for the live incident this closes): a bare, unbounded
         // `proc.reader.read_value().await` loop here left this call --
@@ -4309,7 +4505,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
                 "method": "authenticate",
                 "params": { "methodId": method_id }
             });
-            proc.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(proc, &request).await?;
             // Same `BACKEND_HANDSHAKE_TIMEOUT` bound as the `initialize`
             // handshake just above -- this read was the other half of the
             // same unbounded-hang gap.
@@ -4521,6 +4717,29 @@ async fn handle_fs_request(request: &serde_json::Value, method: &str) -> serde_j
     }
 }
 
+/// Hard ceiling on `terminal/wait_for_exit`'s blocking wait.
+///
+/// **Why this exists.** `handle_terminal_request` runs with `proc: &mut
+/// BackendProcess` -- the *same* per-process lock every other session
+/// sharing this backend depends on (every caller of `handle_unmatched_
+/// frame`, this function's own caller, holds it for the entire call --
+/// see that function's own doc comment). Real ACP `terminal/wait_for_
+/// exit` semantics are genuinely blocking-until-exit by design (unlike
+/// `terminal/output`'s non-blocking snapshot), so a client that starts a
+/// long-running command and immediately awaits its exit is not itself
+/// misbehaving -- but nothing about that call should be allowed to
+/// freeze every *other* session on this same backend agent process for
+/// however long that command happens to run. Bounding it here means a
+/// command that legitimately runs longer than this window still keeps
+/// running (this does not kill the terminal, only fails *this specific
+/// RPC call*) -- a well-behaved caller falls back to polling `terminal/
+/// output`/`terminal/kill` instead, the same pattern a non-blocking ACP
+/// client already needs for any command it isn't sure will finish
+/// quickly. Sized the same as `BACKEND_IDLE_READ_TIMEOUT` -- both exist
+/// for the identical reason (bound how long one call may hold this
+/// exact lock hostage on every other session's behalf).
+const TERMINAL_WAIT_FOR_EXIT_TIMEOUT: Duration = BACKEND_IDLE_READ_TIMEOUT;
+
 /// Answer a real `terminal/*` request against acpx's own host, backed by
 /// `acpx_conductor::TerminalHandle` (see that module's doc comment).
 /// Schema per `agentclientprotocol.com/protocol/v1/terminals`:
@@ -4631,13 +4850,42 @@ async fn handle_terminal_request(
             None => error(-32602, format!("unknown terminalId '{terminal_id}'")),
         },
         "terminal/wait_for_exit" => match proc.terminals.get_mut(&terminal_id) {
-            Some(handle) => match handle.wait_for_exit().await {
-                Ok(status) => serde_json::json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"exitStatus": {"exitCode": status.exit_code, "signal": status.signal}}
-                }),
-                Err(err) => error(-32001, format!("terminal/wait_for_exit: {err}")),
-            },
+            Some(handle) => {
+                match tokio::time::timeout(TERMINAL_WAIT_FOR_EXIT_TIMEOUT, handle.wait_for_exit())
+                    .await
+                {
+                    Ok(Ok(status)) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"exitStatus": {"exitCode": status.exit_code, "signal": status.signal}}
+                    }),
+                    Ok(Err(err)) => error(-32001, format!("terminal/wait_for_exit: {err}")),
+                    Err(_elapsed) => {
+                        // See `TERMINAL_WAIT_FOR_EXIT_TIMEOUT`'s doc
+                        // comment: the command keeps running (not
+                        // killed) -- only this call fails, freeing the
+                        // per-process lock for every other session
+                        // sharing this backend instead of holding it
+                        // hostage for the command's entire runtime.
+                        tracing::warn!(
+                            timeout_secs = TERMINAL_WAIT_FOR_EXIT_TIMEOUT.as_secs(),
+                            %terminal_id,
+                            "terminal/wait_for_exit exceeded its timeout; the command is \
+                             still running (not killed) but this call is failing so it \
+                             doesn't hold the per-process lock hostage for every other \
+                             session sharing this backend -- poll terminal/output or \
+                             terminal/kill instead"
+                        );
+                        error(
+                            -32001,
+                            format!(
+                                "terminal/wait_for_exit exceeded {TERMINAL_WAIT_FOR_EXIT_TIMEOUT:?}; \
+                                 the command is still running -- poll terminal/output or call \
+                                 terminal/kill instead of waiting again"
+                            ),
+                        )
+                    }
+                }
+            }
             None => error(-32602, format!("unknown terminalId '{terminal_id}'")),
         },
         "terminal/kill" => match proc.terminals.get_mut(&terminal_id) {
@@ -4734,6 +4982,106 @@ struct LiveNotifyCtx {
     backend: acpx_conductor::supervisor::SharedBackendProcess,
 }
 
+/// Bounded, per-`(tenant_id, gateway_session_id)` queue of
+/// `session/update` notifications the demux consumer observed but had
+/// nobody live-subscribed to hand them to -- see the `pending_updates`
+/// field doc comment on [`Router`] for the full "why this exists" story.
+/// `push` is best-effort and self-bounding (`MAX_BUFFERED_PER_SESSION`),
+/// deliberately dropping the *oldest* entry once a session's queue is
+/// full rather than growing unbounded, so a long-idle HTTP-only session
+/// behind a chatty backend can never leak memory -- a caller that never
+/// comes back to drain simply loses the oldest updates first, matching
+/// every other best-effort delivery path in this file (e.g.
+/// `NotificationHub::publish`'s own "best effort, no delivery guarantee"
+/// contract). `drain` removes and returns everything queued, leaving the
+/// entry empty (not present) behind -- the next `push` for that same
+/// session starts a fresh queue, same as if nothing had ever been
+/// buffered.
+#[derive(Clone, Default)]
+struct PendingUpdates {
+    inner: std::sync::Arc<tokio::sync::Mutex<HashMap<(TenantId, String), Vec<serde_json::Value>>>>,
+}
+
+/// Cap on how many undelivered `session/update` notifications
+/// [`PendingUpdates`] queues per gateway session before dropping the
+/// oldest -- generous enough to cover a real turn's worth of streamed
+/// chunks (a chatty backend can emit dozens per turn) without letting an
+/// HTTP client that never polls back leak memory indefinitely.
+const MAX_BUFFERED_UPDATES_PER_SESSION: usize = 256;
+
+impl PendingUpdates {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn push(&self, tenant_id: &TenantId, gateway_session_id: &str, value: serde_json::Value) {
+        let mut inner = self.inner.lock().await;
+        let queue = inner
+            .entry((tenant_id.clone(), gateway_session_id.to_string()))
+            .or_default();
+        queue.push(value);
+        while queue.len() > MAX_BUFFERED_UPDATES_PER_SESSION {
+            queue.remove(0);
+        }
+    }
+
+    async fn drain(&self, tenant_id: &TenantId, gateway_session_id: &str) -> Vec<serde_json::Value> {
+        let mut inner = self.inner.lock().await;
+        inner
+            .remove(&(tenant_id.clone(), gateway_session_id.to_string()))
+            .unwrap_or_default()
+    }
+}
+
+/// Resolve `backend_session_id` (a backend-native session id straight off
+/// an agent's own frame) back to its acpx gateway session id and owning
+/// tenant. Scoped to `ctx.tenant_id` when the caller already knows it
+/// (every per-call `LiveNotifyCtx`, e.g. `dispatch_proxied_shared`);
+/// searched across every tenant when it doesn't
+/// (`spawn_demux_consumer`'s and `spawn_idle_scavenger_if_new`'s
+/// process-wide ctx, see their own `tenant_id: None` doc comments -- a
+/// physical backend process may be shared across tenants, and neither of
+/// those two background consumers has a single call's tenant context to
+/// scope to).
+///
+/// Shared by every "answer this backend-initiated frame on behalf of a
+/// live client" path ([`try_deliver_live`], [`try_forward_interaction`],
+/// [`try_relay_agent_request`], and the `terminal/create` live-streaming
+/// spawn in [`handle_unmatched_frame`]) so all four agree on one
+/// tenant-resolution rule instead of each hand-rolling its own. Before
+/// this helper existed, only `try_deliver_live` had the any-tenant
+/// fallback; `try_forward_interaction` required `ctx.tenant_id` to
+/// already be `Some` and `try_relay_agent_request` required
+/// `ctx.gateway_session_id` to already be `Some` -- both are always
+/// `None` on `spawn_demux_consumer`'s ctx (it is built once per shared
+/// backend *process*, before any particular session's id is known), so
+/// once `process_reader_demux` activates for a process, every
+/// `InteractionHub`/`AgentRequestHub` relay and every live terminal
+/// stream for every session sharing that process silently stopped
+/// working -- `session/request_permission` (and `fs/*`/`terminal/create`
+/// approval) requests fell straight through to the profile's static
+/// auto-answer instead of ever reaching a live client such as Zed (via
+/// the `/acp` bridge's `InteractionHub` binding), and `terminal/create`
+/// never started its live output stream. This was a real, reproducible
+/// regression, not a hypothetical -- fixed by having each of those four
+/// call sites resolve the gateway session per-frame, from the frame's
+/// own `params.sessionId`, exactly like `try_deliver_live` already did.
+async fn resolve_gateway_session(
+    ctx: &LiveNotifyCtx,
+    backend_session_id: &str,
+) -> Option<(TenantId, acpx_proto::session::GatewaySessionId)> {
+    let r = ctx.router.lock().await;
+    match &ctx.tenant_id {
+        Some(tenant_id) => r
+            .sessions
+            .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
+            .map(|gateway_id| (tenant_id.clone(), gateway_id)),
+        None => r
+            .sessions
+            .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id),
+    }
+}
+
 /// Attempt to deliver a real `session/update` notification (`value`,
 /// straight off a backend's stdout, still carrying its *backend-native*
 /// `params.sessionId`) live to whichever gateway session it belongs to,
@@ -4758,25 +5106,8 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     else {
         return false;
     };
-    let (tenant_id, gateway_id, hub) = {
-        let r = ctx.router.lock().await;
-        let resolved = match &ctx.tenant_id {
-            Some(tenant_id) => r
-                .sessions
-                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
-                .map(|gateway_id| (tenant_id.clone(), gateway_id)),
-            None => r
-                .sessions
-                .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id),
-        };
-        match resolved {
-            Some((tenant_id, gateway_id)) => {
-                (tenant_id, Some(gateway_id), r.notification_hub.clone())
-            }
-            None => (TenantId::default(), None, r.notification_hub.clone()),
-        }
-    };
-    let Some(gateway_id) = gateway_id else {
+    let Some((tenant_id, gateway_id)) = resolve_gateway_session(ctx, backend_session_id).await
+    else {
         return false;
     };
     let mut translated = value.clone();
@@ -4786,7 +5117,7 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     {
         *session_id_field = serde_json::Value::String(gateway_id.0.clone());
     }
-    hub.publish(&tenant_id, &gateway_id.0, translated).await
+    ctx.notification_hub.publish(&tenant_id, &gateway_id.0, translated).await
 }
 
 /// Forward a backend-initiated request to the persistent client that owns
@@ -4796,9 +5127,6 @@ async fn try_forward_interaction(
     ctx: &LiveNotifyCtx,
     value: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>, crate::InteractionError> {
-    let Some(tenant_id) = &ctx.tenant_id else {
-        return Ok(None);
-    };
     let Some(backend_session_id) = value
         .get("params")
         .and_then(|params| params.get("sessionId"))
@@ -4806,18 +5134,11 @@ async fn try_forward_interaction(
     else {
         return Ok(None);
     };
-    let (gateway_id, interaction_hub) = {
-        let router = ctx.router.lock().await;
-        (
-            router
-                .sessions
-                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id),
-            router.interaction_hub.clone(),
-        )
-    };
-    let Some(gateway_id) = gateway_id else {
+    let Some((tenant_id, gateway_id)) = resolve_gateway_session(ctx, backend_session_id).await
+    else {
         return Ok(None);
     };
+    let interaction_hub = { ctx.router.lock().await.interaction_hub.clone() };
 
     let mut request = value.clone();
     if let Some(session_id) = request
@@ -4827,12 +5148,7 @@ async fn try_forward_interaction(
         *session_id = serde_json::Value::String(gateway_id.0.clone());
     }
     interaction_hub
-        .request(
-            tenant_id,
-            &gateway_id.0,
-            request,
-            DEFAULT_INTERACTION_TIMEOUT,
-        )
+        .request(&tenant_id, &gateway_id.0, request, DEFAULT_INTERACTION_TIMEOUT)
         .await
 }
 
@@ -4915,6 +5231,23 @@ async fn backend_idle_scavenger(
             // left to scavenge, stop the task rather than spin forever.
             return;
         }
+        if proc.pending.is_some() {
+            // `process_reader_demux` activated for this exact process
+            // instance sometime between this tick and the last (any
+            // `_shared` dispatch path can call `start_demux`, taking
+            // `proc.reader` and handing this process's frames to
+            // `spawn_demux_consumer` instead). `reader_mut()` panics
+            // once that has happened (its own doc comment) -- this was
+            // observed in production as a real panic in this exact
+            // task. `spawn_demux_consumer` already took over every
+            // duty this scavenger existed for (idle live-notification
+            // delivery included, see its own doc comment: "runs
+            // continuously for the whole process lifetime, not only
+            // during idle windows"), so stopping here is not a
+            // regression -- it's ceding a now-redundant job to the
+            // task that made it redundant.
+            return;
+        }
         // Drain every frame already sitting in the OS pipe buffer, but
         // never block waiting for one that hasn't arrived yet -- a
         // zero-duration `timeout` around one `read_value` call is this
@@ -4987,7 +5320,7 @@ fn spawn_demux_consumer(
     notification_hub: NotificationHub,
     backend: acpx_conductor::supervisor::SharedBackendProcess,
     policy: BackendCallPolicy,
-    mut unmatched_rx: tokio::sync::mpsc::UnboundedReceiver<acpx_conductor::UnmatchedFrame>,
+    mut unmatched_rx: tokio::sync::mpsc::Receiver<acpx_conductor::UnmatchedFrame>,
 ) {
     let ctx = LiveNotifyCtx {
         router,
@@ -5001,12 +5334,48 @@ fn spawn_demux_consumer(
     tokio::spawn(async move {
         while let Some(value) = unmatched_rx.recv().await {
             let mut proc = backend.lock().await;
-            if let Err(err) = handle_unmatched_frame(&mut proc, value, &policy, Some(&ctx)).await {
-                tracing::warn!(
-                    agent_id = %ctx.agent_id,
-                    %err,
-                    "acpx process-reader-demux consumer failed to handle an unmatched frame"
-                );
+            match handle_unmatched_frame(&mut proc, value, &policy, Some(&ctx)).await {
+                Ok(UnmatchedOutcome::Notification(value)) => {
+                    // No live WS/stdio subscriber delivered this
+                    // `session/update` (or it wasn't one) -- this
+                    // consumer has no in-flight call of its own to
+                    // attach it to directly, unlike the legacy read
+                    // loop's inline `_acpx.updates` fallback. Buffer it
+                    // so the next `POST /rpc` call against this exact
+                    // gateway session can still see it -- see
+                    // `Router::pending_updates`'s field doc comment.
+                    drop(proc);
+                    if let Some(backend_session_id) = value
+                        .get("params")
+                        .and_then(|p| p.get("sessionId"))
+                        .and_then(|s| s.as_str())
+                    {
+                        if let Some((tenant_id, gateway_id)) =
+                            resolve_gateway_session(&ctx, backend_session_id).await
+                        {
+                            let mut translated = value.clone();
+                            if let Some(field) = translated
+                                .get_mut("params")
+                                .and_then(|p| p.get_mut("sessionId"))
+                            {
+                                *field = serde_json::Value::String(gateway_id.0.clone());
+                            }
+                            let pending_updates =
+                                { ctx.router.lock().await.pending_updates() };
+                            pending_updates
+                                .push(&tenant_id, &gateway_id.0, translated)
+                                .await;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %ctx.agent_id,
+                        %err,
+                        "acpx process-reader-demux consumer failed to handle an unmatched frame"
+                    );
+                }
             }
         }
         // `unmatched_rx` closed -- the reader task ended (process exited
@@ -5031,15 +5400,32 @@ const PERMISSION_RELAY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// session id yet, no live subscriber, or a timeout) is the caller's cue
 /// to fall back to the existing policy-based auto-answer -- see
 /// `crate::agent_relay`'s module doc comment for the full contract.
+/// Resolves `ctx.gateway_session_id` when the caller already knows it
+/// (every per-call `LiveNotifyCtx`); falls back to resolving it from
+/// `value`'s own `params.sessionId` via [`resolve_gateway_session`] when
+/// it doesn't (`spawn_demux_consumer`'s process-wide ctx, always `None`
+/// -- see that helper's doc comment for why this fallback exists at
+/// all).
 async fn try_relay_agent_request(
     live: Option<&LiveNotifyCtx>,
     value: &serde_json::Value,
     timeout: Duration,
 ) -> Option<serde_json::Value> {
     let ctx = live?;
-    let gateway_session_id = ctx.gateway_session_id.as_deref()?;
+    let gateway_session_id = match ctx.gateway_session_id.as_deref() {
+        Some(id) => id.to_string(),
+        None => {
+            let backend_session_id = value
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|s| s.as_str())?;
+            resolve_gateway_session(ctx, backend_session_id)
+                .await
+                .map(|(_, gateway_id)| gateway_id.0)?
+        }
+    };
     ctx.agent_relay
-        .relay(gateway_session_id, value.clone(), timeout)
+        .relay(&gateway_session_id, value.clone(), timeout)
         .await
 }
 
@@ -5384,7 +5770,7 @@ async fn handle_unmatched_frame(
                         // The outer client sees ACPX's opaque interaction id;
                         // the backend must receive the id it originally sent.
                         reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                        backend.writer.lock().await.write_value(&reply).await?;
+                        write_backend_value_locked(backend, &reply).await?;
                         return Ok(UnmatchedOutcome::AgentRequestAnswered(
                             serde_json::json!({"request": value, "reply": reply}),
                         ));
@@ -5399,7 +5785,7 @@ async fn handle_unmatched_frame(
                                 "message": format!("acpx interactive client request failed: {error}"),
                             }
                         });
-                        backend.writer.lock().await.write_value(&reply).await?;
+                        write_backend_value_locked(backend, &reply).await?;
                         return Ok(UnmatchedOutcome::AgentRequestAnswered(
                             serde_json::json!({"request": value, "reply": reply}),
                         ));
@@ -5497,9 +5883,41 @@ async fn handle_unmatched_frame(
                                 .and_then(|r| r.get("terminalId"))
                                 .and_then(|t| t.as_str()),
                         ) {
-                            if let (Some(gateway_session_id), Some(tenant_id)) =
-                                (ctx.gateway_session_id.clone(), ctx.tenant_id.clone())
-                            {
+                            // Same `spawn_demux_consumer`-has-no-per-call
+                            // tenant/session context gap as
+                            // `try_relay_agent_request`/`try_forward_
+                            // interaction` -- fall back to resolving from
+                            // `value`'s own `params.sessionId` (the
+                            // original `terminal/create` request, still
+                            // in scope here) when `ctx`'s own fields are
+                            // `None`, instead of silently never starting
+                            // the live output stream. See
+                            // `resolve_gateway_session`'s doc comment.
+                            let resolved = match (
+                                ctx.tenant_id.clone(),
+                                ctx.gateway_session_id.clone(),
+                            ) {
+                                (Some(tenant_id), Some(gateway_session_id)) => {
+                                    Some((tenant_id, gateway_session_id))
+                                }
+                                _ => {
+                                    let backend_session_id = value
+                                        .get("params")
+                                        .and_then(|p| p.get("sessionId"))
+                                        .and_then(|s| s.as_str());
+                                    match backend_session_id {
+                                        Some(backend_session_id) => {
+                                            resolve_gateway_session(ctx, backend_session_id)
+                                                .await
+                                                .map(|(tenant_id, gateway_id)| {
+                                                    (tenant_id, gateway_id.0)
+                                                })
+                                        }
+                                        None => None,
+                                    }
+                                }
+                            };
+                            if let Some((tenant_id, gateway_session_id)) = resolved {
                                 spawn_terminal_output_stream(
                                     std::sync::Arc::clone(&ctx.backend),
                                     ctx.notification_hub.clone(),
@@ -5547,7 +5965,7 @@ async fn handle_unmatched_frame(
                     }
                 })
             };
-        backend.writer.lock().await.write_value(&reply).await?;
+        write_backend_value_locked(backend, &reply).await?;
         return Ok(UnmatchedOutcome::AgentRequestAnswered(
             serde_json::json!({"request": value, "reply": reply}),
         ));
@@ -5778,12 +6196,7 @@ async fn execute_open_session_recovery(
     let response = {
         let mut backend = job.backend.lock().await;
         ensure_backend_initialized(&mut backend, job.call_policy.clone()).await?;
-        backend
-            .writer
-            .lock()
-            .await
-            .write_value(&job.request)
-            .await?;
+        write_backend_value_locked(&mut backend, &job.request).await?;
         let (response, _, _) =
             read_matching_response(&mut backend, &job.request_id, job.call_policy.clone(), None)
                 .await?;
@@ -6271,7 +6684,7 @@ async fn dispatch_session_cancel_shared(
     // Same "nothing running, nothing to cancel" no-op as
     // `Router::dispatch_session_cancel` -- see that method's comment.
     if let Some(writer) = cancel_writer {
-        writer.lock().await.write_value(&notification).await?;
+        write_cancel_notification_best_effort(&writer, &notification).await;
     }
 
     Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
@@ -6301,7 +6714,7 @@ async fn dispatch_session_list_real_shared(
         obj.remove("_acpx");
     }
 
-    let (agent_id, profile_name, backend, call_policy) = {
+    let (agent_id, profile_name, backend, call_policy, agent_relay, notification_hub, process_reader_demux) = {
         let mut r = router.lock().await;
         let (agent_id, profile) = match selector {
             SessionListSelector::Profile(name) => {
@@ -6316,9 +6729,23 @@ async fn dispatch_session_list_real_shared(
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // Same demux-vs-idle-scavenger dedup as `dispatch_proxied_shared`'s
+        // identical branch -- the demux consumer subsumes this job once
+        // active for this process.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         let call_policy = r.call_policy(profile.as_ref());
-        (agent_id, profile_name, backend, call_policy)
+        let process_reader_demux = r.process_reader_demux;
+        (
+            agent_id,
+            profile_name,
+            backend,
+            call_policy,
+            r.agent_request_hub.clone(),
+            r.notification_hub.clone(),
+            process_reader_demux,
+        )
     };
 
     let outbound = serde_json::json!({
@@ -6331,10 +6758,63 @@ async fn dispatch_session_list_real_shared(
     let response = {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&outbound).await?;
-        let (response, _notifications, _agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy, None).await?;
-        response
+        if process_reader_demux {
+            // **`process_reader_demux`.** Must not fall through to
+            // `read_matching_response`'s `reader_mut()` below -- once any
+            // other call against this same shared backend process has
+            // already activated demux (`BackendProcess::start_demux`),
+            // `proc.reader` is `None` and that call panics outright. This
+            // is the real crash `process_reader_demux`'s field doc
+            // comment used to flag as a known, deliberately-deferred gap
+            // ("session-fork/session-list paths are unaffected either
+            // way") -- closed now that the flag defaults on, so every
+            // dispatch path sharing a process must agree on which regime
+            // that process is in.
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let rx = pending.register(&id).await;
+            write_backend_value_via_handle(&backend, &writer, &outbound).await?;
+            match tokio::time::timeout(BACKEND_IDLE_READ_TIMEOUT, acpx_conductor::demux::recv(rx))
+                .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = BACKEND_IDLE_READ_TIMEOUT.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path, session/list); killing the wedged \
+                         process so every other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(BACKEND_IDLE_READ_TIMEOUT));
+                }
+            }
+        } else {
+            write_backend_value_locked(&mut proc, &outbound).await?;
+            let (response, _notifications, _agent_requests) =
+                read_matching_response(&mut proc, &id, call_policy, None).await?;
+            response
+        }
     };
 
     if let Some(error) = response.get("error") {
@@ -6505,7 +6985,7 @@ async fn dispatch_proxied_shared(
             drop(proc);
             let idle_timeout = session_establish_or_default_idle_timeout(&method);
             let rx = pending.register(&id).await;
-            writer.lock().await.write_value(&request).await?;
+            write_backend_value_via_handle(&backend, &writer, &request).await?;
             let response = match tokio::time::timeout(idle_timeout, acpx_conductor::demux::recv(rx)).await
             {
                 Ok(Ok(value)) => value,
@@ -6526,11 +7006,20 @@ async fn dispatch_proxied_shared(
             };
             // Unmatched frames (notifications/agent-requests) are handled
             // entirely by the independent demux consumer task, not
-            // observed by this call at all -- see `process_reader_demux`'s
-            // field doc comment for the tradeoff this implies.
-            Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
+            // observed by this call's own read loop -- but any
+            // `session/update` the consumer couldn't deliver live gets
+            // buffered per gateway session (`Router::pending_updates`),
+            // so a `POST /rpc` caller with no live push channel still
+            // sees it here instead of it being silently discarded.
+            let buffered_updates = {
+                let r = router.lock().await;
+                r.pending_updates()
+                    .drain(tenant_id, &gateway_session_id)
+                    .await
+            };
+            Ok::<_, RouterError>(attach_updates(response, buffered_updates, Vec::new()))
         } else {
-            proc.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut proc, &request).await?;
             let live = LiveNotifyCtx {
                 router: std::sync::Arc::clone(router),
                 agent_id,
@@ -6624,7 +7113,17 @@ async fn dispatch_session_fork_shared(
         .and_then(|c| c.as_str())
         .map(str::to_string);
 
-    let (backend, persistence, call_policy, agent_id, profile_name, admission) = {
+    let (
+        backend,
+        persistence,
+        call_policy,
+        agent_id,
+        profile_name,
+        admission,
+        agent_relay,
+        notification_hub,
+        process_reader_demux,
+    ) = {
         let mut r = router.lock().await;
         // Reserve the fork before potentially rehydrating its persisted
         // source so a rejected fork cannot leave the source registered.
@@ -6646,8 +7145,14 @@ async fn dispatch_session_fork_shared(
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // Same demux-vs-idle-scavenger dedup as `dispatch_proxied_shared`'s
+        // identical branch -- the demux consumer subsumes this job once
+        // active for this process.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
+        let process_reader_demux = r.process_reader_demux;
         (
             backend,
             r.persistence.clone(),
@@ -6655,21 +7160,77 @@ async fn dispatch_session_fork_shared(
             agent_id,
             profile_name,
             admission,
+            r.agent_request_hub.clone(),
+            r.notification_hub.clone(),
+            process_reader_demux,
         )
     };
 
     let mut response = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&request).await?;
-        // No `LiveNotifyCtx` here, deliberately -- same reasoning as
-        // `dispatch_session_new_shared`'s own doc comment on this exact
-        // point: this call is what *creates* the new forked gateway
-        // session (`sessions.register` below), so no transport
-        // connection could possibly have subscribed to it yet.
-        let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy, None).await?;
-        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        if process_reader_demux {
+            // **`process_reader_demux`.** Same crash this closes in
+            // `dispatch_session_list_real_shared` -- `proc.reader` is
+            // already `None` on any process another call already
+            // demuxed, so falling through to `read_matching_response`'s
+            // `reader_mut()` below would panic instead of forking. No
+            // `LiveNotifyCtx`/inline notifications here, deliberately --
+            // same reasoning as `dispatch_session_new_shared`'s own doc
+            // comment: this call is what *creates* the new forked
+            // gateway session (`sessions.register` below), so no
+            // transport connection could possibly have subscribed to it
+            // yet; any interleaved notifications the backend emits while
+            // forking are handled by the independent demux consumer.
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let rx = pending.register(&id).await;
+            write_backend_value_via_handle(&backend, &writer, &request).await?;
+            let response = match tokio::time::timeout(
+                BACKEND_IDLE_READ_TIMEOUT,
+                acpx_conductor::demux::recv(rx),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = BACKEND_IDLE_READ_TIMEOUT.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path, session/fork); killing the wedged \
+                         process so every other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(BACKEND_IDLE_READ_TIMEOUT));
+                }
+            };
+            Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
+        } else {
+            write_backend_value_locked(&mut proc, &request).await?;
+            let (response, notifications, agent_requests) =
+                read_matching_response(&mut proc, &id, call_policy, None).await?;
+            Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        }
     }
     .await?;
 
@@ -6902,7 +7463,7 @@ async fn dispatch_session_new_shared(
             let writer = proc.writer_handle();
             drop(proc);
             let rx = pending.register(&id).await;
-            writer.lock().await.write_value(&request).await?;
+            write_backend_value_via_handle(&backend, &writer, &request).await?;
             let response = match tokio::time::timeout(
                 SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
                 acpx_conductor::demux::recv(rx),
@@ -6938,7 +7499,7 @@ async fn dispatch_session_new_shared(
                 agent_capabilities,
             ))
         } else {
-            proc.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut proc, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response_with_idle_timeout(
                     &mut proc,
@@ -7309,8 +7870,8 @@ mod tests {
     /// `tokio::time::timeout` + kill path via `ensure_backend_
     /// initialized_with_handshake_timeout`'s parameter, in milliseconds
     /// rather than the real 30-second constant.
-    #[tokio::test]
-    async fn backend_handshake_timeout_kills_a_wedged_process_and_frees_the_lock() {
+   #[tokio::test]
+   async fn backend_handshake_timeout_kills_a_wedged_process_and_frees_the_lock() {
         // A silent backend: spawns, writes nothing to stdout, ever -- so
         // `initialize` is guaranteed to never be answered.
         let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
@@ -7333,14 +7894,66 @@ mod tests {
             ),
             "expected BackendHandshakeTimeout(\"initialize\", _), got {result:?}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+       tokio::time::sleep(Duration::from_millis(200)).await;
+       assert!(
+           backend.has_exited(),
+           "wedged backend process should have been killed on handshake timeout"
+       );
+   }
+
+    /// **Regression test for a real production panic** (`BackendProcess::
+    /// reader_mut called after start_demux() took the reader; use
+    /// self.pending's registered oneshot instead`), traced from live
+    /// `acpx-server` logs: `backend_idle_scavenger` polled `proc.
+    /// reader_mut()` unconditionally on every 75ms tick, with no check
+    /// for whether some `_shared` dispatch path had meanwhile called
+    /// `start_demux()` on the exact same physical process (which is
+    /// exactly what happens under normal load now that
+    /// `process_reader_demux` defaults on -- see [`ProcessReaderDemux`]'s
+    /// doc comment). `spawn_demux_consumer` already took over every
+    /// live-notification duty this scavenger existed for once demux
+    /// activates, so the fix is for the scavenger to notice `proc.
+    /// pending.is_some()` and stop itself instead of ever calling
+    /// `reader_mut()` again. Exercises the real (non-test-shortened)
+    /// `backend_idle_scavenger` function directly against a real spawned
+    /// process with demux already active, and asserts the task finishes
+    /// (does not panic) well within its own 75ms poll interval.
+    #[tokio::test]
+    async fn idle_scavenger_stops_instead_of_panicking_once_demux_has_taken_the_reader() {
+        let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "cat".to_string()]);
+        let mut backend = acpx_conductor::BackendProcess::spawn(&spec)
+            .await
+            .expect("failed to spawn cat-echo test backend");
+        // Activate demux exactly like a real `_shared` dispatch path
+        // does (`proc.start_demux()`) -- this is what takes `proc.
+        // reader`, the precondition for `reader_mut()` to panic.
+        let _unmatched_rx = backend.start_demux();
+        let backend = std::sync::Arc::new(tokio::sync::Mutex::new(backend));
+
+        let ctx = LiveNotifyCtx {
+            router: std::sync::Arc::new(tokio::sync::Mutex::new(Router::new("idle-scavenger-demux-agent"))),
+            agent_id: "idle-scavenger-demux-agent".to_string(),
+            tenant_id: None,
+            agent_relay: AgentRequestHub::new(),
+            gateway_session_id: None,
+            notification_hub: NotificationHub::new(),
+            backend: std::sync::Arc::clone(&backend),
+        };
+        let task = tokio::spawn(backend_idle_scavenger(std::sync::Arc::clone(&backend), ctx));
+
+        let joined = tokio::time::timeout(Duration::from_millis(500), task).await;
+        let result = joined.expect(
+            "backend_idle_scavenger should stop on its very first tick once proc.pending is \
+             Some, not run forever -- if this timed out, the pending.is_some() early return \
+             regressed",
+        );
         assert!(
-            backend.has_exited(),
-            "wedged backend process should have been killed on handshake timeout"
+            result.is_ok(),
+            "backend_idle_scavenger panicked instead of stopping cleanly: {result:?}"
         );
     }
 
-    /// Regression test for the startup-recovery agent-registration bug:
+   /// Regression test for the startup-recovery agent-registration bug:
     /// confirmed live via `last_recovery_error` across 7 consecutive real
     /// `acpx-server` restarts, `no spawn spec registered for agent
     /// codex-acp`, 0 successful recoveries out of 9 accumulated bridge

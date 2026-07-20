@@ -220,9 +220,7 @@ impl SettingsPaths {
                         .join("panel-settings")
                 })
             })
-            .unwrap_or_else(|| {
-                dirs_fallback_config().join("panel-rust")
-            });
+            .unwrap_or_else(|| dirs_fallback_config().join("panel-rust"));
         let global = global_dir.join("settings.global.json");
         let project = std::env::var_os("RUI_PANEL_PROJECT_ROOT").map(|r| {
             PathBuf::from(r)
@@ -608,7 +606,9 @@ mod tests {
             },
         )
         .unwrap();
-        wait_for(&seen, |r| r.default_profile.as_deref() == Some("gpt-profile"));
+        wait_for(&seen, |r| {
+            r.default_profile.as_deref() == Some("gpt-profile")
+        });
 
         // Scenario 2: permission_profile and background_session_default set
         // together at Global tier, in the same write.
@@ -678,7 +678,10 @@ mod tests {
             project: Some(project.clone()),
             bundled_default: None,
         };
-        assert!(!paths_after.dev_mode(), "dev_mode should still be false before this scenario");
+        assert!(
+            !paths_after.dev_mode(),
+            "dev_mode should still be false before this scenario"
+        );
         save_document(
             &project,
             &SettingsDocument {
@@ -702,7 +705,10 @@ mod tests {
     /// Polls `seen`'s most recent entries for up to ~2s, matching
     /// `watcher_fires_on_external_write`'s own poll shape -- shared here
     /// since `settings_reflection_matrix` needs it at 5 distinct points.
-    fn wait_for(seen: &Arc<Mutex<Vec<ResolvedSettings>>>, matches: impl Fn(&ResolvedSettings) -> bool) {
+    fn wait_for(
+        seen: &Arc<Mutex<Vec<ResolvedSettings>>>,
+        matches: impl Fn(&ResolvedSettings) -> bool,
+    ) {
         for _ in 0..40 {
             if seen.lock().unwrap().iter().any(&matches) {
                 return;
@@ -710,6 +716,8 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         let snapshot = seen.lock().unwrap().clone();
-        panic!("expected watcher to observe a matching ResolvedSettings within ~2s, got {snapshot:?}");
+        panic!(
+            "expected watcher to observe a matching ResolvedSettings within ~2s, got {snapshot:?}"
+        );
     }
 }

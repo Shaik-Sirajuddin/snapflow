@@ -31,6 +31,7 @@ pub use bridge_sessions::{
 pub use custom_agents::{CustomAgent, CustomAgentStore, CustomAgentStoreError};
 pub use interaction::{
     InteractionBinding, InteractionError, InteractionHub, DEFAULT_INTERACTION_TIMEOUT,
+    INTERACTION_QUEUE_CAPACITY,
 };
 pub use lifecycle::LifecycleConfig;
 pub use notify::{NotificationHub, ResumeCursor, StreamResumeState, SubscribeError};

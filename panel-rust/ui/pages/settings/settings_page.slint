@@ -17,6 +17,8 @@
 import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
 import { Button } from "../../base/button.slint";
+import { Icon } from "../../base/icon.slint";
+import { IconButton } from "../../base/icon_button.slint";
 import { SettingsTopTabs } from "components/top_tabs.slint";
 import { SettingsLeftTabs } from "components/left_tabs.slint";
 import { SettingsSearchBar } from "components/search_bar.slint";
@@ -31,12 +33,14 @@ export component SettingsPage inherits Rectangle {
     in-out property <string> scope: "project"; // "project" | "global"
     in-out property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
     in-out property <string> search-query: "";
+    in-out property <bool> sections-expanded: true;
 
     // Same public API `SettingsSheet` exposed -- unchanged so `app.slint`'s
     // call site only needs its component name + import swapped.
     in-out property <string> default-profile: "";
     in-out property <string> permission-profile: "";
     in-out property <bool> background-default: false;
+    in-out property <string> default-agent-id: "";
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <[ProfileOption]> available-profiles: [];
@@ -48,8 +52,10 @@ export component SettingsPage inherits Rectangle {
 
     callback save();
     callback close();
+    callback scope-changed(string);
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
+    callback mcp-server-enabled-changed(string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -68,9 +74,42 @@ export component SettingsPage inherits Rectangle {
         padding: Metrics.space-7;
         spacing: Metrics.space-6;
 
+        header-row := HorizontalLayout {
+            height: 36px;
+            spacing: Metrics.space-3;
+
+            VerticalLayout {
+                horizontal-stretch: 0;
+                height: parent.height;
+                alignment: center;
+                IconButton {
+                    button-accessible-label: root.sections-expanded
+                        ? "Collapse settings navigation"
+                        : "Expand settings navigation";
+                    clicked => { root.sections-expanded = !root.sections-expanded; }
+                    Icon {
+                        source: @image-url("../../assets/icons/panel-left.svg");
+                        size: 16px;
+                        color: Theme.text-secondary;
+                    }
+                }
+            }
+
+            Text {
+                text: "Settings";
+                color: Theme.text-primary;
+                font-size: 13px * Theme.font-scale;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+        }
+
         top-tabs := SettingsTopTabs {
             scope: root.scope;
-            scope-selected(new-scope) => { root.scope = new-scope; }
+            scope-selected(new-scope) => {
+                root.scope = new-scope;
+                root.scope-changed(new-scope);
+            }
         }
 
         HorizontalLayout {
@@ -107,12 +146,15 @@ export component SettingsPage inherits Rectangle {
             // padding-bypass cascaded into all of them at once.
             width: parent.width - 2 * Metrics.space-7;
             height: parent.height - 2 * Metrics.space-7
-                - top-tabs.height - save-row.height - 2 * Metrics.space-6;
+                - header-row.height - top-tabs.height - save-row.height
+                - 3 * Metrics.space-6;
             spacing: Metrics.space-6;
 
             left-tabs := SettingsLeftTabs {
                 active-section: root.active-section;
+                expanded: root.sections-expanded;
                 section-selected(new-section) => { root.active-section = new-section; }
+                collapse-requested => { root.sections-expanded = false; }
             }
 
             VerticalLayout {
@@ -148,11 +190,15 @@ export component SettingsPage inherits Rectangle {
                             servers: root.available-mcp-servers;
                             mcp-server-create(name, command) => { root.mcp-server-create(name, command); }
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }
+                            mcp-server-enabled-changed(name, enabled) => {
+                                root.mcp-server-enabled-changed(name, enabled);
+                            }
                         }
                         if root.active-section == "agents" : AgentsView {
                             width: parent.width;
                             default-profile <=> root.default-profile;
                             permission-profile <=> root.permission-profile;
+                            default-agent-id <=> root.default-agent-id;
                             available-profiles: root.available-profiles;
                             agent-catalog: root.agent-catalog;
                             recoverable-sessions: root.recoverable-sessions;

@@ -7,6 +7,7 @@
 import { Theme } from "tokens/theme.slint";
 import { Metrics } from "tokens/metrics.slint";
 import { Button } from "base/button.slint";
+import { SettingsSearchBar } from "pages/settings/components/search_bar.slint";
 
 export component SettingsPanePreview inherits Window {
     preferred-width: 720px;
@@ -83,30 +84,9 @@ export component SettingsPanePreview inherits Window {
                 horizontal-stretch: 1;
                 spacing: Metrics.space-6;
 
-                Rectangle {
-                    height: 30px;
-                    border-radius: Theme.radius-sm;
-                    background: Theme.bg-sidebar;
-                    border-width: 1px;
-                    border-color: Theme.border-default;
-                    search-input := TextInput {
-                        x: Metrics.space-5;
-                        width: parent.width - Metrics.space-5 * 2;
-                        y: 0;
-                        height: parent.height;
-                        vertical-alignment: center;
-                        font-size: 12px * Theme.font-scale;
-                        color: Theme.text-primary;
-                        text <=> search-query;
-                    }
-                    if search-query == "" : Text {
-                        x: Metrics.space-5;
-                        text: "Search settings...";
-                        color: Theme.text-muted;
-                        font-size: 12px * Theme.font-scale;
-                        vertical-alignment: center;
-                        height: parent.height;
-                    }
+                SettingsSearchBar {
+                    width: 100%;
+                    query <=> search-query;
                 }
 
                 if active-section == "mcp" : VerticalLayout {

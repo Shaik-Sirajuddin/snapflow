@@ -22,10 +22,11 @@ export component MessageCard inherits Rectangle {
 
     vertical-stretch: 0;
 
-    // Agent uses primary-container so it contrasts bg-chat without a border.
+    // Agent: subtle Theme.bg-agent-bubble (not primary-container).
     background: is-thinking ? transparent
         : is-user ? Theme.bg-user-bubble
         : is-tool-call ? Theme.bg-card
+        : is-agent ? Theme.bg-agent-bubble
         : Theme.bg-primary-container;
     border-color: is-tool-call ? Theme.border-default : transparent;
     border-width: is-thinking ? 0px : is-tool-call ? 1px : 0px;

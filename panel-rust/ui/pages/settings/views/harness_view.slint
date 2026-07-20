@@ -23,8 +23,13 @@ export component HarnessView inherits Rectangle {
     in-out property <bool> background-override: false;
 
     background: transparent;
+    vertical-stretch: 0;
+    // A preferred height alone may still receive the Flickable's spare
+    // height. Pin this sparse section to its content so rows begin at y=0.
+    height: content.preferred-height;
+    preferred-height: content.preferred-height;
 
-    SettingsSection {
+    content := SettingsSection {
         width: parent.width;
 
         SettingsSectionHeader { text: "Harness"; }

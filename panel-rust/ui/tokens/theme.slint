@@ -82,7 +82,9 @@ export global Theme {
     out property <color> bg-user-bubble: is-dark ? ColorScale.dark-user-bubble : ColorScale.light-user-bubble;
     out property <color> border-user-bubble: border-default;
     out property <color> text-user-bubble: text-primary;
-    out property <color> bg-agent-bubble: bg-sidebar;
+    // Subtle lift from bg-chat (not primary-container — that reads as a
+    // chip). See ColorScale.dark/light-agent-bubble.
+    out property <color> bg-agent-bubble: is-dark ? ColorScale.dark-agent-bubble : ColorScale.light-agent-bubble;
     out property <color> border-agent-bubble: border-default;
     out property <color> text-agent-bubble: text-primary;
     out property <color> bg-terminal: bg-sidebar;
@@ -99,6 +101,14 @@ export global Theme {
     out property <color> border-tertiary: border-default;
     out property <color> text-tertiary: text-secondary;
     out property <color> text-accent-bright: text-primary;
+
+    // Permission / approval request surfaces — distinct from bg-card and
+    // bg-chat so the one-of select dock is scannable above the compose bar.
+    // Still monochrome (no red/green); emphasis via lift + strong border +
+    // primary accent rail on the card.
+    out property <color> bg-approval: is-dark ? ColorScale.dark-approval : ColorScale.light-approval;
+    out property <color> bg-approval-band: is-dark ? ColorScale.dark-approval-band : ColorScale.light-approval-band;
+    out property <color> border-approval: border-strong;
 
     // Radius "finish" presets -- verbatim from index.html's
     // `radiusPresets` object (theme.rs::RadiusPreset::scale()).
