@@ -97,6 +97,12 @@ export component ChatInputLayout inherits Rectangle {
                         font-family: Theme.font-sans;
                         font-size: 11px * Theme.font-scale;
                         width: parent.width;
+                        // Explicit height -- without one, this TextInput's
+                        // focusable/clickable hit-region collapsed to one
+                        // line's worth instead of the full padded input box,
+                        // so clicks in the box's lower area silently missed
+                        // it and never focused the composer.
+                        height: max(self.preferred-height, parent.height);
                         single-line: false;
                         wrap: word-wrap;
                         key-pressed(event) => {

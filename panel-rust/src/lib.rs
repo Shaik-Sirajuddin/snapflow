@@ -1265,9 +1265,20 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         panel
             .component
             .set_background_default(defaults.background_session);
-        panel
-            .component
-            .set_dev_mode(settings_file::SettingsPaths::from_env().dev_mode());
+        let dev_mode_at_startup = settings_file::SettingsPaths::from_env().dev_mode();
+        panel.component.set_dev_mode(dev_mode_at_startup);
+        if dev_mode_at_startup {
+            // Mirrors on_dev_mode_toggled's install-on-enable behavior --
+            // that callback only fires on the OFF->ON transition, so a
+            // fresh launch that loads dev_mode already persisted `true`
+            // never got the bundled default skill installed at all,
+            // leaving dev mode on with zero global skills to show.
+            let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+            if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
+                eprintln!("panel-rust: failed to install bundled global skill at startup: {error}");
+            }
+            panel.refresh_skills_model();
+        }
         if let Some(selected_thread_id) = defaults.selected_thread_id {
             if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
                 (0..panel.thread_names.borrow().len()).find(|idx| {
@@ -2726,6 +2737,21 @@ pub extern "C" fn panel_rust_apply_host_appearance(
 /// `panel_rust_render` + trigger a Qt repaint).
 #[no_mangle]
 pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
+    // Slint `animate` blocks (hover fades, entrance/exit transitions, the
+    // loading spinner, the sidebar rail's `animate width`, ...) -- and a
+    // `Flickable`'s own interactive flick/momentum motion -- only progress
+    // when something calls this. Under a real windowing backend the
+    // platform event loop does it automatically, but this crate's
+    // `SpikePlatform`/`MinimalSoftwareWindow` has no event loop of its own,
+    // only this 80ms QTimer poll (rustpanelitem.cpp's RustPanelItem::poll).
+    // Without this call every `animate` was simply frozen -- properties
+    // jumped straight to their end value with no interpolation, and a
+    // Flickable's drag-then-release momentum never advanced either, since
+    // nothing ever advanced Slint's animation clock. Called unconditionally,
+    // every tick, regardless of whatever else below finds "changed" -- an
+    // in-flight animation is itself a reason to redraw even with zero
+    // application-state change this tick.
+    slint::platform::update_timers_and_animations();
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
@@ -2775,11 +2801,24 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let connection_changed = selected
             .map(|idx| panel.refresh_connection_status_for(idx))
             .unwrap_or(false);
+        // An in-flight `animate` (or a Flickable's own interactive flick/
+        // momentum motion) is itself a reason to repaint even when nothing
+        // else above changed this tick -- update_timers_and_animations()
+        // above only advances the animation clock, it doesn't make the C++
+        // side (RustPanelItem::poll, which only calls update() when this
+        // function returns true) know a frame still needs painting. Without
+        // this, every animation was silently truncated to whichever single
+        // tick happened to coincide with an unrelated state change, which
+        // in practice meant "frozen" for anything driven purely by
+        // animation (the sidebar rail's `animate width`, a Flickable's
+        // drag-release momentum, hover fades, ...).
+        let animating = panel.window.window().has_active_animations();
         bridge_changed
             || local_terminal_changed
             || connection_changed
             || settings_changed
             || attachment_changed
+            || animating
     })
 }
 
