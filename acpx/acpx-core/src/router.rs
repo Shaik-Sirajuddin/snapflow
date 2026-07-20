@@ -5231,6 +5231,23 @@ async fn backend_idle_scavenger(
             // left to scavenge, stop the task rather than spin forever.
             return;
         }
+        if proc.pending.is_some() {
+            // `process_reader_demux` activated for this exact process
+            // instance sometime between this tick and the last (any
+            // `_shared` dispatch path can call `start_demux`, taking
+            // `proc.reader` and handing this process's frames to
+            // `spawn_demux_consumer` instead). `reader_mut()` panics
+            // once that has happened (its own doc comment) -- this was
+            // observed in production as a real panic in this exact
+            // task. `spawn_demux_consumer` already took over every
+            // duty this scavenger existed for (idle live-notification
+            // delivery included, see its own doc comment: "runs
+            // continuously for the whole process lifetime, not only
+            // during idle windows"), so stopping here is not a
+            // regression -- it's ceding a now-redundant job to the
+            // task that made it redundant.
+            return;
+        }
         // Drain every frame already sitting in the OS pipe buffer, but
         // never block waiting for one that hasn't arrived yet -- a
         // zero-duration `timeout` around one `read_value` call is this
@@ -7853,8 +7870,8 @@ mod tests {
     /// `tokio::time::timeout` + kill path via `ensure_backend_
     /// initialized_with_handshake_timeout`'s parameter, in milliseconds
     /// rather than the real 30-second constant.
-    #[tokio::test]
-    async fn backend_handshake_timeout_kills_a_wedged_process_and_frees_the_lock() {
+   #[tokio::test]
+   async fn backend_handshake_timeout_kills_a_wedged_process_and_frees_the_lock() {
         // A silent backend: spawns, writes nothing to stdout, ever -- so
         // `initialize` is guaranteed to never be answered.
         let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
@@ -7877,14 +7894,66 @@ mod tests {
             ),
             "expected BackendHandshakeTimeout(\"initialize\", _), got {result:?}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+       tokio::time::sleep(Duration::from_millis(200)).await;
+       assert!(
+           backend.has_exited(),
+           "wedged backend process should have been killed on handshake timeout"
+       );
+   }
+
+    /// **Regression test for a real production panic** (`BackendProcess::
+    /// reader_mut called after start_demux() took the reader; use
+    /// self.pending's registered oneshot instead`), traced from live
+    /// `acpx-server` logs: `backend_idle_scavenger` polled `proc.
+    /// reader_mut()` unconditionally on every 75ms tick, with no check
+    /// for whether some `_shared` dispatch path had meanwhile called
+    /// `start_demux()` on the exact same physical process (which is
+    /// exactly what happens under normal load now that
+    /// `process_reader_demux` defaults on -- see [`ProcessReaderDemux`]'s
+    /// doc comment). `spawn_demux_consumer` already took over every
+    /// live-notification duty this scavenger existed for once demux
+    /// activates, so the fix is for the scavenger to notice `proc.
+    /// pending.is_some()` and stop itself instead of ever calling
+    /// `reader_mut()` again. Exercises the real (non-test-shortened)
+    /// `backend_idle_scavenger` function directly against a real spawned
+    /// process with demux already active, and asserts the task finishes
+    /// (does not panic) well within its own 75ms poll interval.
+    #[tokio::test]
+    async fn idle_scavenger_stops_instead_of_panicking_once_demux_has_taken_the_reader() {
+        let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "cat".to_string()]);
+        let mut backend = acpx_conductor::BackendProcess::spawn(&spec)
+            .await
+            .expect("failed to spawn cat-echo test backend");
+        // Activate demux exactly like a real `_shared` dispatch path
+        // does (`proc.start_demux()`) -- this is what takes `proc.
+        // reader`, the precondition for `reader_mut()` to panic.
+        let _unmatched_rx = backend.start_demux();
+        let backend = std::sync::Arc::new(tokio::sync::Mutex::new(backend));
+
+        let ctx = LiveNotifyCtx {
+            router: std::sync::Arc::new(tokio::sync::Mutex::new(Router::new("idle-scavenger-demux-agent"))),
+            agent_id: "idle-scavenger-demux-agent".to_string(),
+            tenant_id: None,
+            agent_relay: AgentRequestHub::new(),
+            gateway_session_id: None,
+            notification_hub: NotificationHub::new(),
+            backend: std::sync::Arc::clone(&backend),
+        };
+        let task = tokio::spawn(backend_idle_scavenger(std::sync::Arc::clone(&backend), ctx));
+
+        let joined = tokio::time::timeout(Duration::from_millis(500), task).await;
+        let result = joined.expect(
+            "backend_idle_scavenger should stop on its very first tick once proc.pending is \
+             Some, not run forever -- if this timed out, the pending.is_some() early return \
+             regressed",
+        );
         assert!(
-            backend.has_exited(),
-            "wedged backend process should have been killed on handshake timeout"
+            result.is_ok(),
+            "backend_idle_scavenger panicked instead of stopping cleanly: {result:?}"
         );
     }
 
-    /// Regression test for the startup-recovery agent-registration bug:
+   /// Regression test for the startup-recovery agent-registration bug:
     /// confirmed live via `last_recovery_error` across 7 consecutive real
     /// `acpx-server` restarts, `no spawn spec registered for agent
     /// codex-acp`, 0 successful recoveries out of 9 accumulated bridge
