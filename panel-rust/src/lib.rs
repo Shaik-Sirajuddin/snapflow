@@ -3376,8 +3376,10 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
     // when something calls this. Under a real windowing backend the
     // platform event loop does it automatically, but this crate's
     // `SpikePlatform`/`MinimalSoftwareWindow` has no event loop of its own,
-    // only this 80ms QTimer poll (rustpanelitem.cpp's RustPanelItem::poll).
-    // Without this call every `animate` was simply frozen -- properties
+    // only this QTimer poll (rustpanelitem.cpp's RustPanelItem::poll,
+    // interval adaptive to the real display refresh rate, 60-90fps --
+    // see updatePollIntervalForRefreshRate()). Without this call every
+    // `animate` was simply frozen -- properties
     // jumped straight to their end value with no interpolation, and a
     // Flickable's drag-then-release momentum never advanced either, since
     // nothing ever advanced Slint's animation clock. Called unconditionally,
