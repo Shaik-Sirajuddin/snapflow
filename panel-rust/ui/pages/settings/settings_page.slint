@@ -34,6 +34,22 @@ export component SettingsPage inherits Rectangle {
     in-out property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
     in-out property <string> search-query: "";
     in-out property <bool> sections-expanded: true;
+    // See FilterSearchBar.input-has-focus's doc comment. The AgentsView
+    // section only exists while active-section == "agents" (a conditional
+    // element that must stay conditional -- see its own comment below), so
+    // it can't be referenced directly; agents-search-focus-mirror is kept
+    // in sync with it via a changed handler instead, and reset whenever
+    // that section isn't the active one (the element -- and its changed
+    // handler -- gets torn down on tab switch, so nothing else would ever
+    // clear a stale `true` left over from switching away mid-focus).
+    property <bool> agents-search-focus-mirror: false;
+    changed active-section => {
+        if (self.active-section != "agents") {
+            self.agents-search-focus-mirror = false;
+        }
+    }
+    out property <bool> search-has-focus:
+        top-search-bar.input-has-focus || agents-search-focus-mirror;
 
     // Same public API `SettingsSheet` exposed -- unchanged so `app.slint`'s
     // call site only needs its component name + import swapped.
@@ -165,7 +181,7 @@ export component SettingsPage inherits Rectangle {
                 vertical-stretch: 1;
                 spacing: Metrics.space-4;
 
-                SettingsSearchBar {
+                top-search-bar := SettingsSearchBar {
                     width: parent.width;
                     query <=> root.search-query;
                 }
@@ -194,6 +210,15 @@ export component SettingsPage inherits Rectangle {
                                 root.mcp-server-enabled-changed(name, enabled);
                             }
                         }
+                        // Stays `if` (unlike the other visible:-conversion
+                        // fixes elsewhere for this same issue) -- this sits
+                        // alongside 3 other mutually-exclusive sections in
+                        // a VerticalLayout, so an unconditionally-mounted
+                        // AgentsView would reserve its height even while
+                        // hidden, pushing the other sections down whenever
+                        // this tab isn't active. Mirrors its own
+                        // search-has-focus into a plain root property
+                        // instead (see agents-search-focus-mirror below).
                         if root.active-section == "agents" : AgentsView {
                             width: parent.width;
                             default-profile <=> root.default-profile;
@@ -209,6 +234,9 @@ export component SettingsPage inherits Rectangle {
                             agent-install-requested(id) => { root.agent-install-requested(id); }
                             recover-session-attach(session-id, provider, title) => {
                                 root.recover-session-attach(session-id, provider, title);
+                            }
+                            changed search-has-focus => {
+                                root.agents-search-focus-mirror = self.search-has-focus;
                             }
                         }
                         if root.active-section == "harness" : HarnessView {

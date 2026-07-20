@@ -22,6 +22,10 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
+    // Aggregates thread-search's own FilterSearchBar.input-has-focus --
+    // see that property's doc comment for why this needs re-exposing at
+    // every component boundary up to the root gate in app.slint.
+    out property <bool> search-has-focus: thread-search.input-has-focus;
     callback thread-selected(int);
     callback new-thread-requested();
     callback search-changed(string);

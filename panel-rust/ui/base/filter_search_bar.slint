@@ -33,6 +33,14 @@ export component FilterSearchBar inherits Rectangle {
     // Parent can intercept arrows / Enter / Esc (mention popup).
     // Return accept to swallow; reject lets TextInput handle the key.
     callback key-pressed(KeyEvent) -> EventResult;
+    // Real keystrokes only reach this field through the host's C++/Rust
+    // input-key bridge when *some* aggregate of "an editable Slint surface
+    // has focus" reads true there (see `compose-has-focus`'s equivalent
+    // aggregation chain up through app.slint) -- without re-exposing this
+    // per instance, every FilterSearchBar (thread/skill search, settings
+    // search, dropdown filters) silently receives clicks but no typed
+    // text at all once the caller wires this into that gate.
+    out property <bool> input-has-focus: search-input.has-focus;
 
     height: bar-height;
     background: bar-bg;

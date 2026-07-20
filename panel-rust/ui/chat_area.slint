@@ -103,6 +103,10 @@ export component ChatArea inherits Rectangle {
     out property <bool> compose-has-focus: chat-input.compose-has-focus;
     out property <bool> local-terminal-has-focus:
         local-terminal.open && local-terminal-card.has-focus;
+    // Mode/model dropdown search + mention popup filter -- see
+    // FilterSearchBar.input-has-focus's doc comment.
+    out property <bool> secondary-text-input-has-focus:
+        chat-input.secondary-text-input-has-focus;
 
     // --- Demo approval (local one-of card, no ACP round-trip) ------------
     // Type one of these in the compose box and press Send / Enter:
