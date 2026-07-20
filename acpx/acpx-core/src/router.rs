@@ -372,17 +372,54 @@ pub struct Router {
     on_demand_recovery_enabled: bool,
     /// **`process_reader_demux`, phase 1 of
     /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
-    /// Opt-in (disabled by default -- `ACPX_PROCESS_READER_DEMUX` unset).
-    /// When enabled, [`dispatch_proxied_shared`] and
-    /// [`dispatch_session_new_shared`] register-then-await a response via
+    /// Opt-in (`ACPX_PROCESS_READER_DEMUX=1`, default off). When enabled,
+    /// all four backend
+    /// round-trip dispatch paths that can share a process --
+    /// [`dispatch_proxied_shared`], [`dispatch_session_new_shared`],
+    /// [`dispatch_session_fork_shared`], and
+    /// [`dispatch_session_list_real_shared`] -- register-then-await a
+    /// response via
     /// `BackendProcess::pending` instead of holding the per-process lock
     /// across the entire write + blocking-read-loop of a turn -- see
     /// `memory/acpx/tasks/zed_integration.yaml` task 7. This is what lets
     /// two sessions sharing one backend process actually overlap in wall
     /// time instead of fully serializing behind each other's whole turn.
-    /// Deliberately scoped to just these two hot dispatch paths for now;
-    /// the legacy non-`_shared` `Router::dispatch*` methods and the
-    /// session-fork/session-list paths are unaffected either way.
+    /// The legacy, non-`_shared` `Router::dispatch*` methods (used only
+    /// by direct, non-multi-tenant callers/tests, not any production
+    /// transport -- see `dispatch_shared`'s own doc comment) are still
+    /// unaffected either way; every production dispatch path is covered.
+    /// **All four must agree on this flag together for one process**:
+    /// once any one of them calls `BackendProcess::start_demux` (taking
+    /// the raw reader), every *other* call sharing that same process
+    /// must also route through the pending table instead of
+    /// `reader_mut()` -- calling `reader_mut()` after demux has started
+    /// panics outright (`BackendProcess::reader_mut`'s own doc comment).
+    /// This field is read once per call and threaded through, so a
+    /// config change only takes effect for backend processes spawned
+    /// after the change, never retroactively for an already-demuxed one.
+    ///
+    /// **Why the default is still off, not flipped now despite the fixes
+    /// above closing the fork/list crash gap**: this flag's own
+    /// documented tradeoff below (undelivered notifications are
+    /// discarded, not buffered, when nobody is live-subscribed) is only
+    /// harmless for the two persistent, live-subscribed transports
+    /// (`transport::ws`, `transport::stdio`) -- but `transport::http`'s
+    /// `POST /rpc` is stateless with **no live-push channel at all**
+    /// (see that module's own doc comment), so its *only* way to see a
+    /// call's interleaved notifications is the legacy path's inline
+    /// `_acpx.updates` buffering fallback (`read_matching_response`'s
+    /// `handle_unmatched_frame` -> `UnmatchedOutcome::Notification` ->
+    /// `attach_updates`), exercised for real by e.g.
+    /// `multitenant_concurrency_e2e_test.rs`'s pure-`reqwest`,
+    /// no-WS-ever-opened `session/prompt` calls. Turning this on
+    /// unconditionally would silently zero out `_acpx.updates` for every
+    /// `POST /rpc` caller workspace-wide the moment any backend process
+    /// they touch gets demuxed by *any* other concurrent call against
+    /// it -- a real, silent data-loss regression, not merely a latency
+    /// one. Flipping the default requires either adding a session-scoped
+    /// buffer-and-drain fallback to `spawn_demux_consumer`/
+    /// `handle_unmatched_frame` first, or confirming `POST /rpc` no
+    /// longer needs interleaved-notification delivery at all.
     ///
     /// **Known tradeoff while enabled**: unmatched frames (bare
     /// notifications and agent-initiated requests) are handled entirely
@@ -1273,7 +1310,8 @@ impl Router {
     }
 
     /// Opt-in per-process reader-task demultiplexing -- see
-    /// `process_reader_demux`'s field doc comment. Disabled by default.
+    /// `process_reader_demux`'s field doc comment, including why the
+    /// default is still off. Disabled by default.
     pub fn with_process_reader_demux(mut self, enabled: bool) -> Self {
         self.process_reader_demux = enabled;
         self
@@ -6301,7 +6339,7 @@ async fn dispatch_session_list_real_shared(
         obj.remove("_acpx");
     }
 
-    let (agent_id, profile_name, backend, call_policy) = {
+    let (agent_id, profile_name, backend, call_policy, agent_relay, notification_hub, process_reader_demux) = {
         let mut r = router.lock().await;
         let (agent_id, profile) = match selector {
             SessionListSelector::Profile(name) => {
@@ -6316,9 +6354,23 @@ async fn dispatch_session_list_real_shared(
         };
         let profile_name = profile.as_ref().map(|p| p.name.clone());
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // Same demux-vs-idle-scavenger dedup as `dispatch_proxied_shared`'s
+        // identical branch -- the demux consumer subsumes this job once
+        // active for this process.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         let call_policy = r.call_policy(profile.as_ref());
-        (agent_id, profile_name, backend, call_policy)
+        let process_reader_demux = r.process_reader_demux;
+        (
+            agent_id,
+            profile_name,
+            backend,
+            call_policy,
+            r.agent_request_hub.clone(),
+            r.notification_hub.clone(),
+            process_reader_demux,
+        )
     };
 
     let outbound = serde_json::json!({
@@ -6331,10 +6383,63 @@ async fn dispatch_session_list_real_shared(
     let response = {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&outbound).await?;
-        let (response, _notifications, _agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy, None).await?;
-        response
+        if process_reader_demux {
+            // **`process_reader_demux`.** Must not fall through to
+            // `read_matching_response`'s `reader_mut()` below -- once any
+            // other call against this same shared backend process has
+            // already activated demux (`BackendProcess::start_demux`),
+            // `proc.reader` is `None` and that call panics outright. This
+            // is the real crash `process_reader_demux`'s field doc
+            // comment used to flag as a known, deliberately-deferred gap
+            // ("session-fork/session-list paths are unaffected either
+            // way") -- closed now that the flag defaults on, so every
+            // dispatch path sharing a process must agree on which regime
+            // that process is in.
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let rx = pending.register(&id).await;
+            writer.lock().await.write_value(&outbound).await?;
+            match tokio::time::timeout(BACKEND_IDLE_READ_TIMEOUT, acpx_conductor::demux::recv(rx))
+                .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = BACKEND_IDLE_READ_TIMEOUT.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path, session/list); killing the wedged \
+                         process so every other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(BACKEND_IDLE_READ_TIMEOUT));
+                }
+            }
+        } else {
+            proc.writer.lock().await.write_value(&outbound).await?;
+            let (response, _notifications, _agent_requests) =
+                read_matching_response(&mut proc, &id, call_policy, None).await?;
+            response
+        }
     };
 
     if let Some(error) = response.get("error") {
@@ -6624,7 +6729,17 @@ async fn dispatch_session_fork_shared(
         .and_then(|c| c.as_str())
         .map(str::to_string);
 
-    let (backend, persistence, call_policy, agent_id, profile_name, admission) = {
+    let (
+        backend,
+        persistence,
+        call_policy,
+        agent_id,
+        profile_name,
+        admission,
+        agent_relay,
+        notification_hub,
+        process_reader_demux,
+    ) = {
         let mut r = router.lock().await;
         // Reserve the fork before potentially rehydrating its persisted
         // source so a rejected fork cannot leave the source registered.
@@ -6646,8 +6761,14 @@ async fn dispatch_session_fork_shared(
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // Same demux-vs-idle-scavenger dedup as `dispatch_proxied_shared`'s
+        // identical branch -- the demux consumer subsumes this job once
+        // active for this process.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
+        let process_reader_demux = r.process_reader_demux;
         (
             backend,
             r.persistence.clone(),
@@ -6655,21 +6776,77 @@ async fn dispatch_session_fork_shared(
             agent_id,
             profile_name,
             admission,
+            r.agent_request_hub.clone(),
+            r.notification_hub.clone(),
+            process_reader_demux,
         )
     };
 
     let mut response = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&request).await?;
-        // No `LiveNotifyCtx` here, deliberately -- same reasoning as
-        // `dispatch_session_new_shared`'s own doc comment on this exact
-        // point: this call is what *creates* the new forked gateway
-        // session (`sessions.register` below), so no transport
-        // connection could possibly have subscribed to it yet.
-        let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy, None).await?;
-        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        if process_reader_demux {
+            // **`process_reader_demux`.** Same crash this closes in
+            // `dispatch_session_list_real_shared` -- `proc.reader` is
+            // already `None` on any process another call already
+            // demuxed, so falling through to `read_matching_response`'s
+            // `reader_mut()` below would panic instead of forking. No
+            // `LiveNotifyCtx`/inline notifications here, deliberately --
+            // same reasoning as `dispatch_session_new_shared`'s own doc
+            // comment: this call is what *creates* the new forked
+            // gateway session (`sessions.register` below), so no
+            // transport connection could possibly have subscribed to it
+            // yet; any interleaved notifications the backend emits while
+            // forking are handled by the independent demux consumer.
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let rx = pending.register(&id).await;
+            writer.lock().await.write_value(&request).await?;
+            let response = match tokio::time::timeout(
+                BACKEND_IDLE_READ_TIMEOUT,
+                acpx_conductor::demux::recv(rx),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = BACKEND_IDLE_READ_TIMEOUT.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path, session/fork); killing the wedged \
+                         process so every other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(BACKEND_IDLE_READ_TIMEOUT));
+                }
+            };
+            Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
+        } else {
+            proc.writer.lock().await.write_value(&request).await?;
+            let (response, notifications, agent_requests) =
+                read_matching_response(&mut proc, &id, call_policy, None).await?;
+            Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        }
     }
     .await?;
 

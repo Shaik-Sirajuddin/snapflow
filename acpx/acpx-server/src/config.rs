@@ -94,14 +94,18 @@ pub struct ServerConfig {
     pub session_process_isolation: bool,
     /// **`process_reader_demux`, phase 1 of
     /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
-    /// Opt-in (`ACPX_PROCESS_READER_DEMUX=1`, default off). When on,
+    /// Opt-in (`ACPX_PROCESS_READER_DEMUX=1`, default off -- see
+    /// `Router::process_reader_demux`'s field doc comment for why
+    /// flipping this default is deliberately not yet done). When on,
     /// `session/prompt`/`session/new` register-then-await a backend
     /// response via a per-process reader task instead of holding that
     /// process's own lock across the entire write + blocking-read-loop
     /// of a turn -- so two sessions sharing one backend process (the
     /// live default when both isolation flags above are also off) can
     /// actually overlap in wall time. See `Router::process_reader_demux`'s
-    /// field doc comment for the current scope and known tradeoffs.
+    /// field doc comment for the current scope and known tradeoffs (now
+    /// covers `session/fork` and the real `session/list` path too, not
+    /// just `session/prompt`/`session/new`).
     pub process_reader_demux: bool,
 }
 

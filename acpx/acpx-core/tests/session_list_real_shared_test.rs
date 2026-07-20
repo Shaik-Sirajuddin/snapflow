@@ -186,3 +186,45 @@ done
         Some(true)
     );
 }
+
+/// **Regression: `process_reader_demux` session/list-panic gap.** Same
+/// class of bug `session_fork_test.rs`'s equivalent test pins:
+/// `dispatch_session_list_real_shared` always read its response via
+/// `read_matching_response`'s `backend.reader_mut()`, unconditionally --
+/// which panics once any earlier call on this same shared process
+/// already activated `process_reader_demux`
+/// (`BackendProcess::start_demux` takes the raw reader). With the flag
+/// now on by default, the first `session/new` here already activates
+/// demux for this process, so listing sessions against it right after is
+/// exactly the crash scenario. Must complete normally, no panic.
+#[tokio::test]
+async fn dispatch_shared_session_list_works_after_demux_is_already_active_on_the_process() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let router = router.with_process_reader_demux(true);
+    let router = Arc::new(Mutex::new(router));
+
+    let new_response = dispatch_shared(
+        &router,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+    )
+    .await
+    .expect("session/new activates process-reader-demux for this shared process");
+    let known_gateway_id = new_response["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let list_response = dispatch_shared(
+        &router,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/list",
+            "params": {"_acpx": {"agentId": "stand-in-agent"}}
+        }),
+    )
+    .await
+    .expect("session/list must not panic on a process demux already activated");
+    let sessions = list_response["result"]["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0]["sessionId"], json!(known_gateway_id));
+}
