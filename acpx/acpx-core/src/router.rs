@@ -328,6 +328,22 @@ pub struct Router {
     /// Correlates backend-initiated requests with responses from the
     /// persistent ACP client that currently owns the session.
     interaction_hub: InteractionHub,
+    /// **`process_reader_demux` HTTP-fallback buffer.** Undelivered
+    /// `session/update` notifications the demux consumer
+    /// ([`spawn_demux_consumer`]) observed for a gateway session with no
+    /// live WS/stdio subscriber right now -- queued here instead of
+    /// discarded, keyed by `(tenant_id, gateway_session_id)`, so the
+    /// *next* `POST /rpc` call against that same session can drain and
+    /// attach them to its own response's `_acpx.updates`, exactly the
+    /// data a live-subscribed transport gets pushed immediately and an
+    /// HTTP-only caller has no other way to ever see (`transport::http`
+    /// has no live-push channel at all). Closes the real "demux silently
+    /// zeroes out `_acpx.updates` for every `POST /rpc` caller" data-loss
+    /// gap `process_reader_demux`'s field doc comment used to flag as
+    /// the reason the flag's default stayed off -- see
+    /// [`PendingUpdates`]'s own doc comment for the drain-on-read/
+    /// bounded-size contract.
+    pending_updates: PendingUpdates,
     /// **Phase 15 addition.** Identity (`Arc::as_ptr` cast to `usize`) of
     /// every physical backend process instance that already has an idle
     /// scavenger task (see [`spawn_idle_scavenger`]/[`backend_idle_
@@ -372,8 +388,8 @@ pub struct Router {
     on_demand_recovery_enabled: bool,
     /// **`process_reader_demux`, phase 1 of
     /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
-    /// Opt-in (`ACPX_PROCESS_READER_DEMUX=1`, default off). When enabled,
-    /// all four backend
+    /// **On by default** (`ACPX_PROCESS_READER_DEMUX=0` opts out). When
+    /// enabled, all four backend
     /// round-trip dispatch paths that can share a process --
     /// [`dispatch_proxied_shared`], [`dispatch_session_new_shared`],
     /// [`dispatch_session_fork_shared`], and
@@ -398,39 +414,63 @@ pub struct Router {
     /// config change only takes effect for backend processes spawned
     /// after the change, never retroactively for an already-demuxed one.
     ///
-    /// **Why the default is still off, not flipped now despite the fixes
-    /// above closing the fork/list crash gap**: this flag's own
-    /// documented tradeoff below (undelivered notifications are
-    /// discarded, not buffered, when nobody is live-subscribed) is only
-    /// harmless for the two persistent, live-subscribed transports
-    /// (`transport::ws`, `transport::stdio`) -- but `transport::http`'s
-    /// `POST /rpc` is stateless with **no live-push channel at all**
-    /// (see that module's own doc comment), so its *only* way to see a
-    /// call's interleaved notifications is the legacy path's inline
-    /// `_acpx.updates` buffering fallback (`read_matching_response`'s
-    /// `handle_unmatched_frame` -> `UnmatchedOutcome::Notification` ->
-    /// `attach_updates`), exercised for real by e.g.
-    /// `multitenant_concurrency_e2e_test.rs`'s pure-`reqwest`,
-    /// no-WS-ever-opened `session/prompt` calls. Turning this on
-    /// unconditionally would silently zero out `_acpx.updates` for every
-    /// `POST /rpc` caller workspace-wide the moment any backend process
-    /// they touch gets demuxed by *any* other concurrent call against
-    /// it -- a real, silent data-loss regression, not merely a latency
-    /// one. Flipping the default requires either adding a session-scoped
-    /// buffer-and-drain fallback to `spawn_demux_consumer`/
-    /// `handle_unmatched_frame` first, or confirming `POST /rpc` no
-    /// longer needs interleaved-notification delivery at all.
+    /// **Why it is now safe to default on** (previously deferred for
+    /// three separate, real regressions -- all three are now closed,
+    /// each with its own regression test):
+    ///
+    /// 1. **`session/fork`/`session/list` crash** once any other call on
+    ///    the same shared process had already activated demux (`proc.
+    ///    reader` taken, `reader_mut()` panics). Fixed: both now
+    ///    register-then-await like every other dispatch path.
+    /// 2. **`InteractionHub`/`AgentRequestHub` relay and live terminal
+    ///    streaming silently stopped working** for every session on a
+    ///    demuxed process. Root cause: [`spawn_demux_consumer`]'s single
+    ///    per-*process* `LiveNotifyCtx` has no single session's
+    ///    `tenant_id`/`gateway_session_id` to carry (it serves every
+    ///    session sharing that process), so it always built one with
+    ///    both `None` -- and [`try_forward_interaction`] (the path
+    ///    Zed's `/acp` bridge relies on for `session/request_permission`
+    ///    etc.) and [`try_relay_agent_request`] both treated `None` as
+    ///    "give up," not "resolve it per-frame" the way
+    ///    [`try_deliver_live`] already did. Fixed: all three (plus the
+    ///    `terminal/create` live-stream spawn) now resolve the gateway
+    ///    session from each frame's own `params.sessionId` via
+    ///    [`resolve_gateway_session`], same as `try_deliver_live` always
+    ///    did. Before this fix, a live Zed session behind a shared,
+    ///    demuxed backend process would never be asked to approve a
+    ///    permission request -- it silently fell straight through to
+    ///    the profile's static auto-answer instead.
+    /// 3. **`POST /rpc` data loss**: `transport::http` has no live-push
+    ///    channel at all (see that module's doc comment), so its only
+    ///    way to see a call's interleaved notifications is the legacy
+    ///    path's inline `_acpx.updates` buffering
+    ///    (`UnmatchedOutcome::Notification` -> `attach_updates`) --
+    ///    which the demux consumer bypasses entirely (see tradeoff
+    ///    below). Fixed: [`Router::pending_updates`] buffers whatever
+    ///    the demux consumer couldn't deliver live, per gateway session,
+    ///    and [`dispatch_proxied_shared`]'s demux branch drains it into
+    ///    its own response's `_acpx.updates` before returning, so a
+    ///    `POST /rpc` caller still sees the same data it always did --
+    ///    just via a bounded (`MAX_BUFFERED_UPDATES_PER_SESSION`)
+    ///    best-effort buffer instead of blocking inline delivery.
     ///
     /// **Known tradeoff while enabled**: unmatched frames (bare
     /// notifications and agent-initiated requests) are handled entirely
     /// by an independent per-process consumer task
-    /// ([`spawn_demux_consumer`]) rather than by whichever call
-    /// happened to be in the read loop -- so a response's own
-    /// `_acpx.updates`/`_acpx.agentRequests` are always empty when this
-    /// is on; that data still reaches a live-subscribed client via
-    /// `NotificationHub`, it just never gets attached inline to this
-    /// particular call's response the way the legacy path's best-effort
-    /// buffering fallback does.
+    /// ([`spawn_demux_consumer`]) rather than by whichever call happened
+    /// to be in the read loop. A response's own `_acpx.updates`/
+    /// `_acpx.agentRequests` are populated from `PendingUpdates`
+    /// (`session/update` only, notification-delivery-order preserved,
+    /// FIFO) rather than gathered inline during the read loop --
+    /// functionally equivalent for a well-behaved caller, but the
+    /// ordering relative to *this exact call's own response frame* is
+    /// no longer strictly guaranteed the way a single shared read loop
+    /// naturally guaranteed it (a notification that raced the response
+    /// frame itself could end up buffered for the *next* call instead of
+    /// this one). `_acpx.agentRequests` is not buffered at all --
+    /// agent-initiated requests always get *some* answer immediately
+    /// (relay if live, policy auto-answer otherwise), so there is
+    /// nothing left to buffer for a later call to attach.
     process_reader_demux: bool,
     /// **`connector_reference_lifecycle`.** Supervisor keys currently
     /// observed to have zero referencing live sessions, mapped to when
@@ -941,6 +981,7 @@ impl Router {
             notification_hub: NotificationHub::new(),
             agent_request_hub: AgentRequestHub::new(),
             interaction_hub: InteractionHub::new(),
+            pending_updates: PendingUpdates::new(),
             scavenged_backends: HashSet::new(),
             tenant_process_isolation: false,
             session_process_isolation: false,
@@ -970,6 +1011,15 @@ impl Router {
     /// sessions they own and resolve client responses through this hub.
     pub fn interaction_hub(&self) -> InteractionHub {
         self.interaction_hub.clone()
+    }
+
+    /// A clone of this router's `process_reader_demux` HTTP-fallback
+    /// buffer -- see the `pending_updates` field's doc comment. Not
+    /// exposed outside this crate (no `pub`): every caller today is a
+    /// free function in this same module (`spawn_demux_consumer`,
+    /// `dispatch_proxied_shared`).
+    fn pending_updates(&self) -> PendingUpdates {
+        self.pending_updates.clone()
     }
 
     /// **Phase 15.** Ensure exactly one idle scavenger task
@@ -4772,6 +4822,106 @@ struct LiveNotifyCtx {
     backend: acpx_conductor::supervisor::SharedBackendProcess,
 }
 
+/// Bounded, per-`(tenant_id, gateway_session_id)` queue of
+/// `session/update` notifications the demux consumer observed but had
+/// nobody live-subscribed to hand them to -- see the `pending_updates`
+/// field doc comment on [`Router`] for the full "why this exists" story.
+/// `push` is best-effort and self-bounding (`MAX_BUFFERED_PER_SESSION`),
+/// deliberately dropping the *oldest* entry once a session's queue is
+/// full rather than growing unbounded, so a long-idle HTTP-only session
+/// behind a chatty backend can never leak memory -- a caller that never
+/// comes back to drain simply loses the oldest updates first, matching
+/// every other best-effort delivery path in this file (e.g.
+/// `NotificationHub::publish`'s own "best effort, no delivery guarantee"
+/// contract). `drain` removes and returns everything queued, leaving the
+/// entry empty (not present) behind -- the next `push` for that same
+/// session starts a fresh queue, same as if nothing had ever been
+/// buffered.
+#[derive(Clone, Default)]
+struct PendingUpdates {
+    inner: std::sync::Arc<tokio::sync::Mutex<HashMap<(TenantId, String), Vec<serde_json::Value>>>>,
+}
+
+/// Cap on how many undelivered `session/update` notifications
+/// [`PendingUpdates`] queues per gateway session before dropping the
+/// oldest -- generous enough to cover a real turn's worth of streamed
+/// chunks (a chatty backend can emit dozens per turn) without letting an
+/// HTTP client that never polls back leak memory indefinitely.
+const MAX_BUFFERED_UPDATES_PER_SESSION: usize = 256;
+
+impl PendingUpdates {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn push(&self, tenant_id: &TenantId, gateway_session_id: &str, value: serde_json::Value) {
+        let mut inner = self.inner.lock().await;
+        let queue = inner
+            .entry((tenant_id.clone(), gateway_session_id.to_string()))
+            .or_default();
+        queue.push(value);
+        while queue.len() > MAX_BUFFERED_UPDATES_PER_SESSION {
+            queue.remove(0);
+        }
+    }
+
+    async fn drain(&self, tenant_id: &TenantId, gateway_session_id: &str) -> Vec<serde_json::Value> {
+        let mut inner = self.inner.lock().await;
+        inner
+            .remove(&(tenant_id.clone(), gateway_session_id.to_string()))
+            .unwrap_or_default()
+    }
+}
+
+/// Resolve `backend_session_id` (a backend-native session id straight off
+/// an agent's own frame) back to its acpx gateway session id and owning
+/// tenant. Scoped to `ctx.tenant_id` when the caller already knows it
+/// (every per-call `LiveNotifyCtx`, e.g. `dispatch_proxied_shared`);
+/// searched across every tenant when it doesn't
+/// (`spawn_demux_consumer`'s and `spawn_idle_scavenger_if_new`'s
+/// process-wide ctx, see their own `tenant_id: None` doc comments -- a
+/// physical backend process may be shared across tenants, and neither of
+/// those two background consumers has a single call's tenant context to
+/// scope to).
+///
+/// Shared by every "answer this backend-initiated frame on behalf of a
+/// live client" path ([`try_deliver_live`], [`try_forward_interaction`],
+/// [`try_relay_agent_request`], and the `terminal/create` live-streaming
+/// spawn in [`handle_unmatched_frame`]) so all four agree on one
+/// tenant-resolution rule instead of each hand-rolling its own. Before
+/// this helper existed, only `try_deliver_live` had the any-tenant
+/// fallback; `try_forward_interaction` required `ctx.tenant_id` to
+/// already be `Some` and `try_relay_agent_request` required
+/// `ctx.gateway_session_id` to already be `Some` -- both are always
+/// `None` on `spawn_demux_consumer`'s ctx (it is built once per shared
+/// backend *process*, before any particular session's id is known), so
+/// once `process_reader_demux` activates for a process, every
+/// `InteractionHub`/`AgentRequestHub` relay and every live terminal
+/// stream for every session sharing that process silently stopped
+/// working -- `session/request_permission` (and `fs/*`/`terminal/create`
+/// approval) requests fell straight through to the profile's static
+/// auto-answer instead of ever reaching a live client such as Zed (via
+/// the `/acp` bridge's `InteractionHub` binding), and `terminal/create`
+/// never started its live output stream. This was a real, reproducible
+/// regression, not a hypothetical -- fixed by having each of those four
+/// call sites resolve the gateway session per-frame, from the frame's
+/// own `params.sessionId`, exactly like `try_deliver_live` already did.
+async fn resolve_gateway_session(
+    ctx: &LiveNotifyCtx,
+    backend_session_id: &str,
+) -> Option<(TenantId, acpx_proto::session::GatewaySessionId)> {
+    let r = ctx.router.lock().await;
+    match &ctx.tenant_id {
+        Some(tenant_id) => r
+            .sessions
+            .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
+            .map(|gateway_id| (tenant_id.clone(), gateway_id)),
+        None => r
+            .sessions
+            .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id),
+    }
+}
+
 /// Attempt to deliver a real `session/update` notification (`value`,
 /// straight off a backend's stdout, still carrying its *backend-native*
 /// `params.sessionId`) live to whichever gateway session it belongs to,
@@ -4796,25 +4946,8 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     else {
         return false;
     };
-    let (tenant_id, gateway_id, hub) = {
-        let r = ctx.router.lock().await;
-        let resolved = match &ctx.tenant_id {
-            Some(tenant_id) => r
-                .sessions
-                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id)
-                .map(|gateway_id| (tenant_id.clone(), gateway_id)),
-            None => r
-                .sessions
-                .find_by_backend_any_tenant(&ctx.agent_id, backend_session_id),
-        };
-        match resolved {
-            Some((tenant_id, gateway_id)) => {
-                (tenant_id, Some(gateway_id), r.notification_hub.clone())
-            }
-            None => (TenantId::default(), None, r.notification_hub.clone()),
-        }
-    };
-    let Some(gateway_id) = gateway_id else {
+    let Some((tenant_id, gateway_id)) = resolve_gateway_session(ctx, backend_session_id).await
+    else {
         return false;
     };
     let mut translated = value.clone();
@@ -4824,7 +4957,7 @@ async fn try_deliver_live(ctx: &LiveNotifyCtx, value: &serde_json::Value) -> boo
     {
         *session_id_field = serde_json::Value::String(gateway_id.0.clone());
     }
-    hub.publish(&tenant_id, &gateway_id.0, translated).await
+    ctx.notification_hub.publish(&tenant_id, &gateway_id.0, translated).await
 }
 
 /// Forward a backend-initiated request to the persistent client that owns
@@ -4834,9 +4967,6 @@ async fn try_forward_interaction(
     ctx: &LiveNotifyCtx,
     value: &serde_json::Value,
 ) -> Result<Option<serde_json::Value>, crate::InteractionError> {
-    let Some(tenant_id) = &ctx.tenant_id else {
-        return Ok(None);
-    };
     let Some(backend_session_id) = value
         .get("params")
         .and_then(|params| params.get("sessionId"))
@@ -4844,18 +4974,11 @@ async fn try_forward_interaction(
     else {
         return Ok(None);
     };
-    let (gateway_id, interaction_hub) = {
-        let router = ctx.router.lock().await;
-        (
-            router
-                .sessions
-                .find_by_backend(tenant_id, &ctx.agent_id, backend_session_id),
-            router.interaction_hub.clone(),
-        )
-    };
-    let Some(gateway_id) = gateway_id else {
+    let Some((tenant_id, gateway_id)) = resolve_gateway_session(ctx, backend_session_id).await
+    else {
         return Ok(None);
     };
+    let interaction_hub = { ctx.router.lock().await.interaction_hub.clone() };
 
     let mut request = value.clone();
     if let Some(session_id) = request
@@ -4865,12 +4988,7 @@ async fn try_forward_interaction(
         *session_id = serde_json::Value::String(gateway_id.0.clone());
     }
     interaction_hub
-        .request(
-            tenant_id,
-            &gateway_id.0,
-            request,
-            DEFAULT_INTERACTION_TIMEOUT,
-        )
+        .request(&tenant_id, &gateway_id.0, request, DEFAULT_INTERACTION_TIMEOUT)
         .await
 }
 
@@ -5039,12 +5157,48 @@ fn spawn_demux_consumer(
     tokio::spawn(async move {
         while let Some(value) = unmatched_rx.recv().await {
             let mut proc = backend.lock().await;
-            if let Err(err) = handle_unmatched_frame(&mut proc, value, &policy, Some(&ctx)).await {
-                tracing::warn!(
-                    agent_id = %ctx.agent_id,
-                    %err,
-                    "acpx process-reader-demux consumer failed to handle an unmatched frame"
-                );
+            match handle_unmatched_frame(&mut proc, value, &policy, Some(&ctx)).await {
+                Ok(UnmatchedOutcome::Notification(value)) => {
+                    // No live WS/stdio subscriber delivered this
+                    // `session/update` (or it wasn't one) -- this
+                    // consumer has no in-flight call of its own to
+                    // attach it to directly, unlike the legacy read
+                    // loop's inline `_acpx.updates` fallback. Buffer it
+                    // so the next `POST /rpc` call against this exact
+                    // gateway session can still see it -- see
+                    // `Router::pending_updates`'s field doc comment.
+                    drop(proc);
+                    if let Some(backend_session_id) = value
+                        .get("params")
+                        .and_then(|p| p.get("sessionId"))
+                        .and_then(|s| s.as_str())
+                    {
+                        if let Some((tenant_id, gateway_id)) =
+                            resolve_gateway_session(&ctx, backend_session_id).await
+                        {
+                            let mut translated = value.clone();
+                            if let Some(field) = translated
+                                .get_mut("params")
+                                .and_then(|p| p.get_mut("sessionId"))
+                            {
+                                *field = serde_json::Value::String(gateway_id.0.clone());
+                            }
+                            let pending_updates =
+                                { ctx.router.lock().await.pending_updates() };
+                            pending_updates
+                                .push(&tenant_id, &gateway_id.0, translated)
+                                .await;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        agent_id = %ctx.agent_id,
+                        %err,
+                        "acpx process-reader-demux consumer failed to handle an unmatched frame"
+                    );
+                }
             }
         }
         // `unmatched_rx` closed -- the reader task ended (process exited
@@ -5069,15 +5223,32 @@ const PERMISSION_RELAY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// session id yet, no live subscriber, or a timeout) is the caller's cue
 /// to fall back to the existing policy-based auto-answer -- see
 /// `crate::agent_relay`'s module doc comment for the full contract.
+/// Resolves `ctx.gateway_session_id` when the caller already knows it
+/// (every per-call `LiveNotifyCtx`); falls back to resolving it from
+/// `value`'s own `params.sessionId` via [`resolve_gateway_session`] when
+/// it doesn't (`spawn_demux_consumer`'s process-wide ctx, always `None`
+/// -- see that helper's doc comment for why this fallback exists at
+/// all).
 async fn try_relay_agent_request(
     live: Option<&LiveNotifyCtx>,
     value: &serde_json::Value,
     timeout: Duration,
 ) -> Option<serde_json::Value> {
     let ctx = live?;
-    let gateway_session_id = ctx.gateway_session_id.as_deref()?;
+    let gateway_session_id = match ctx.gateway_session_id.as_deref() {
+        Some(id) => id.to_string(),
+        None => {
+            let backend_session_id = value
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|s| s.as_str())?;
+            resolve_gateway_session(ctx, backend_session_id)
+                .await
+                .map(|(_, gateway_id)| gateway_id.0)?
+        }
+    };
     ctx.agent_relay
-        .relay(gateway_session_id, value.clone(), timeout)
+        .relay(&gateway_session_id, value.clone(), timeout)
         .await
 }
 
@@ -5535,9 +5706,41 @@ async fn handle_unmatched_frame(
                                 .and_then(|r| r.get("terminalId"))
                                 .and_then(|t| t.as_str()),
                         ) {
-                            if let (Some(gateway_session_id), Some(tenant_id)) =
-                                (ctx.gateway_session_id.clone(), ctx.tenant_id.clone())
-                            {
+                            // Same `spawn_demux_consumer`-has-no-per-call
+                            // tenant/session context gap as
+                            // `try_relay_agent_request`/`try_forward_
+                            // interaction` -- fall back to resolving from
+                            // `value`'s own `params.sessionId` (the
+                            // original `terminal/create` request, still
+                            // in scope here) when `ctx`'s own fields are
+                            // `None`, instead of silently never starting
+                            // the live output stream. See
+                            // `resolve_gateway_session`'s doc comment.
+                            let resolved = match (
+                                ctx.tenant_id.clone(),
+                                ctx.gateway_session_id.clone(),
+                            ) {
+                                (Some(tenant_id), Some(gateway_session_id)) => {
+                                    Some((tenant_id, gateway_session_id))
+                                }
+                                _ => {
+                                    let backend_session_id = value
+                                        .get("params")
+                                        .and_then(|p| p.get("sessionId"))
+                                        .and_then(|s| s.as_str());
+                                    match backend_session_id {
+                                        Some(backend_session_id) => {
+                                            resolve_gateway_session(ctx, backend_session_id)
+                                                .await
+                                                .map(|(tenant_id, gateway_id)| {
+                                                    (tenant_id, gateway_id.0)
+                                                })
+                                        }
+                                        None => None,
+                                    }
+                                }
+                            };
+                            if let Some((tenant_id, gateway_session_id)) = resolved {
                                 spawn_terminal_output_stream(
                                     std::sync::Arc::clone(&ctx.backend),
                                     ctx.notification_hub.clone(),
@@ -6631,9 +6834,18 @@ async fn dispatch_proxied_shared(
             };
             // Unmatched frames (notifications/agent-requests) are handled
             // entirely by the independent demux consumer task, not
-            // observed by this call at all -- see `process_reader_demux`'s
-            // field doc comment for the tradeoff this implies.
-            Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
+            // observed by this call's own read loop -- but any
+            // `session/update` the consumer couldn't deliver live gets
+            // buffered per gateway session (`Router::pending_updates`),
+            // so a `POST /rpc` caller with no live push channel still
+            // sees it here instead of it being silently discarded.
+            let buffered_updates = {
+                let r = router.lock().await;
+                r.pending_updates()
+                    .drain(tenant_id, &gateway_session_id)
+                    .await
+            };
+            Ok::<_, RouterError>(attach_updates(response, buffered_updates, Vec::new()))
         } else {
             proc.writer.lock().await.write_value(&request).await?;
             let live = LiveNotifyCtx {

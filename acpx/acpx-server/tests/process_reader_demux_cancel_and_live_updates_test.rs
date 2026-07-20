@@ -383,8 +383,10 @@ async fn spawn_server_with_demux(demux: Option<&str>) -> (ServerGuard, SocketAdd
 
 /// **Pins the live production bug this session's user report described:**
 /// "two sessions of the same agent launched, notifications aren't
-/// delivered to Zed." `ACPX_PROCESS_READER_DEMUX` unset is the actual
-/// live default (see `acpx-server/src/config.rs`) -- session A (plain
+/// delivered to Zed." Explicitly forces `ACPX_PROCESS_READER_DEMUX=0`
+/// (the flag is now on by default -- see `acpx-server/src/config.rs` --
+/// so this legacy-serialized behavior is opt-in, not the ambient
+/// default, going forward) -- session A (plain
 /// HTTP) gets its `session/prompt` genuinely in flight first, holding the
 /// shared backend process's per-process lock for A's *entire* turn (the
 /// pre-demux legacy behavior this whole phase's doc comments describe).
@@ -398,7 +400,7 @@ async fn spawn_server_with_demux(demux: Option<&str>) -> (ServerGuard, SocketAdd
 /// stuck-in-loading behavior for a second concurrent thread on one agent.
 #[tokio::test]
 async fn demux_off_a_second_sessions_launch_and_live_updates_stall_behind_first_sessions_turn() {
-    let (guard, addr) = spawn_server_with_demux(None).await;
+    let (guard, addr) = spawn_server_with_demux(Some("0")).await;
     let http = reqwest::Client::new();
 
     let new_a = rpc(
@@ -446,12 +448,12 @@ async fn demux_off_a_second_sessions_launch_and_live_updates_stall_behind_first_
 
     assert!(
         b_new_elapsed >= Duration::from_secs_f64(TURN_DELAY_SECS - 0.5),
-        "REGRESSION CHECK (pins today's live bug, should FAIL once process_reader_demux \
-         defaults on): B's session/new resolved in {b_new_elapsed:?} while A's turn was still \
-         in flight on the shared backend process -- expected it to be blocked for close to A's \
-         full {TURN_DELAY_SECS}s turn, proving the per-process lock is held across A's entire \
-         turn and starves B of any response (session/new result, and by extension any \
-         session/update) for that whole window"
+        "with process_reader_demux explicitly forced off, B's session/new resolved in \
+         {b_new_elapsed:?} while A's turn was still in flight on the shared backend process -- \
+         expected it to be blocked for close to A's full {TURN_DELAY_SECS}s turn, proving the \
+         per-process lock is held across A's entire turn and starves B of any response \
+         (session/new result, and by extension any session/update) for that whole window \
+         when the flag is off"
     );
 
     // B is not permanently broken -- once A's lock is released, B's own
