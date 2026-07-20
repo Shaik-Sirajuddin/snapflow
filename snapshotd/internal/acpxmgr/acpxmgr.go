@@ -73,7 +73,28 @@ func WriteConfig(path, mcpURL, agentID string) error {
 		},
 		"profiles": []any{
 			map[string]any{
-				"name":        "default",
+				// Deliberately NOT named "default" (nor anything else
+				// matching `agentID`): acpx-core's Router::call_policy_for
+				// falls back to `self.profiles.get(agent_id)` when a
+				// session/new omits `_acpx.profile` (true native/unmanaged
+				// mode, which is what this daemon's own chat panel client
+				// always uses -- see agent_bridge.rs's "opening unmanaged"
+				// path). A profile whose *name* happens to equal that
+				// agent_id gets silently picked up by that fallback and
+				// wins over `Router::with_native_auth_method_id`'s
+				// ACPX_NATIVE_AUTH_METHOD_ID override (call_policy() only
+				// applies the native override when `profile.is_none()`) --
+				// this profile carries no `auth_method_id` of its own
+				// (ProfileEntry's provisioning schema doesn't even expose
+				// that field), so every native session silently lost the
+				// configured auth method and every session/new against a
+				// real backend advertising authMethods (e.g. codex-acp)
+				// failed with "backend requires authentication" even
+				// though ACPX_NATIVE_AUTH_METHOD_ID was set correctly.
+				// This profile only exists to auto-attach the snapshotd
+				// MCP server; giving it a name that can never equal a
+				// real `agentID` value keeps it out of that lookup.
+				"name":        "snapshotd-mcp-attach",
 				"agent_id":    agentID,
 				"mcp_servers": []string{"snapshotd"},
 			},

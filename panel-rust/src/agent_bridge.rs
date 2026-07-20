@@ -754,6 +754,11 @@ fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
         }
     }
     if let Some(expected_agent) = expected_agent {
+        // acpx-server's `/health` handler now reports a `defaultAgentId`
+        // field alongside `status` (see acpx-server/src/transport/http.rs),
+        // so we can actually verify provider identity instead of treating
+        // any "ready" gateway as reusable regardless of which provider was
+        // requested.
         matches!(
             envelope.get("status").and_then(|s| s.as_str()),
             Some("ready") | Some("recovering")

@@ -9,6 +9,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub mod resume;
+pub use resume::ResumeTracker;
+
 /// One public model alias mapped to an internal ACP adapter and its native
 /// model identifier. The alias is intentionally namespaced (for example
 /// `claude/sonnet`) so adapter-local names cannot collide.

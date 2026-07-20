@@ -359,6 +359,42 @@ pub struct Router {
     /// process mutex. Native/unmanaged sessions (no `_acpx.profile`) are
     /// unaffected regardless of this setting -- see `dispatch_session_new`.
     session_process_isolation: bool,
+    /// **`ACPX_STARTUP_SESSION_RECOVERY_ENABLED` gate, threaded through
+    /// to on-demand rehydration too.** Defaults `true` (matches every
+    /// pre-existing deployment/test that never sets the env var, and
+    /// matches `rehydrate_session`'s original always-on behavior before
+    /// this flag existed). When an operator explicitly disables startup
+    /// session recovery, that must mean "recovery is off," full stop --
+    /// not just "don't proactively batch-recover at boot, but still
+    /// silently resurrect any persisted session the instant any client
+    /// happens to touch its gateway id." `rehydrate_session` checks this
+    /// before even querying the persistence store.
+    on_demand_recovery_enabled: bool,
+    /// **`process_reader_demux`, phase 1 of
+    /// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.**
+    /// Opt-in (disabled by default -- `ACPX_PROCESS_READER_DEMUX` unset).
+    /// When enabled, [`dispatch_proxied_shared`] and
+    /// [`dispatch_session_new_shared`] register-then-await a response via
+    /// `BackendProcess::pending` instead of holding the per-process lock
+    /// across the entire write + blocking-read-loop of a turn -- see
+    /// `memory/acpx/tasks/zed_integration.yaml` task 7. This is what lets
+    /// two sessions sharing one backend process actually overlap in wall
+    /// time instead of fully serializing behind each other's whole turn.
+    /// Deliberately scoped to just these two hot dispatch paths for now;
+    /// the legacy non-`_shared` `Router::dispatch*` methods and the
+    /// session-fork/session-list paths are unaffected either way.
+    ///
+    /// **Known tradeoff while enabled**: unmatched frames (bare
+    /// notifications and agent-initiated requests) are handled entirely
+    /// by an independent per-process consumer task
+    /// ([`spawn_demux_consumer`]) rather than by whichever call
+    /// happened to be in the read loop -- so a response's own
+    /// `_acpx.updates`/`_acpx.agentRequests` are always empty when this
+    /// is on; that data still reaches a live-subscribed client via
+    /// `NotificationHub`, it just never gets attached inline to this
+    /// particular call's response the way the legacy path's best-effort
+    /// buffering fallback does.
+    process_reader_demux: bool,
     /// **`connector_reference_lifecycle`.** Supervisor keys currently
     /// observed to have zero referencing live sessions, mapped to when
     /// that was first observed. Only populated/consulted when
@@ -677,6 +713,21 @@ pub enum RouterError {
          holding the whole gateway's lock indefinitely"
     )]
     ReapBackendCallTimeout(String, Duration),
+    #[error(
+        "backend produced no output for {0:?}; the wedged process was killed and this call \
+         failed rather than holding its per-process lock forever"
+    )]
+    BackendIdleReadTimeout(Duration),
+    #[error(
+        "backend produced no response to its {0} handshake within {1:?}; the wedged process \
+         was killed and this call failed rather than holding its per-process lock forever"
+    )]
+    BackendHandshakeTimeout(&'static str, Duration),
+    #[error(
+        "backend process's reader task ended (process exited or a read error occurred) before \
+         this call's response arrived"
+    )]
+    BackendDemuxReaderClosed,
 }
 
 /// Hard ceiling on the per-candidate backend `session/close` round trip
@@ -701,6 +752,125 @@ pub enum RouterError {
 /// only skips *this* session's reap this pass (it stays live, tried again
 /// on the next tick) instead of freezing the whole gateway.
 const REAP_BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Hard backstop for a single `read_value` call inside
+/// [`read_matching_response`]'s read loop -- distinct from, and much
+/// larger than, `LifecycleConfig::active_turn_deadline`. That deadline is
+/// a *cooperative* nudge: once a turn has been continuously in-flight too
+/// long, the reaper best-effort-sends the backend a `session/cancel`
+/// notification and trusts it to eventually reply. This constant is the
+/// backstop for when that trust is misplaced -- a backend that ignores
+/// its own cancel notification (or has simply wedged/deadlocked
+/// internally) leaves this loop's `read_value().await` blocked forever,
+/// which holds the per-process `BackendProcess` lock forever, which
+/// queues up every other call against that same backend (every session
+/// on a shared agent) behind it indefinitely -- confirmed live: a Zed
+/// client left connected long enough to hit this, and every subsequent
+/// request to the same agent hung at "loading" with no way to recover
+/// short of restarting acpx-server entirely.
+///
+/// Deliberately much longer than `PERMISSION_RELAY_TIMEOUT` (15 minutes):
+/// that wait happens *after* `read_value` already returned a real
+/// backend-initiated request, so it is a separate, already-bounded await
+/// and never itself counts against this budget -- only genuine silence on
+/// the wire (no bytes at all) does. A well-behaved backend should produce
+/// *some* output (even just the final error/cancelled reply to its own
+/// cancel notification) well within this window for any real turn; one
+/// that doesn't is not recoverable by waiting longer.
+///
+/// On expiry the backend process is killed outright, not merely given up
+/// on: leaving it running and simply returning early would let its
+/// eventual, stale reply for the abandoned `id` arrive during some later,
+/// unrelated call's own read loop, where it has no `method` and doesn't
+/// match that call's `id` -- indistinguishable from a real notification,
+/// so it would be silently misclassified and attached to a completely
+/// unrelated response's `_acpx.updates`. Killing avoids that entirely and
+/// forces `Supervisor::ensure_running`'s next call to see
+/// `has_exited() == true` and spawn a fresh process instead.
+const BACKEND_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// **`acpx-connect-loading-feedback`.** Bound on how long a connect/resume
+/// class call (`session/new`, `session/load`, `session/resume`) may go
+/// silent on the wire before it fails, distinct from and much shorter
+/// than [`BACKEND_IDLE_READ_TIMEOUT`]'s 20-minute backstop.
+///
+/// These three methods are exactly the ones a real ACP client's
+/// connection/thread-load UI gates its "loading" indicator on (in Zed,
+/// `ConversationView::is_loading()` -- see `acp_thread`/`agent_ui`'s
+/// `ServerState::Loading`, which wraps this whole call and only clears on
+/// success or a hard error) -- unlike `session/prompt`, where a long wait
+/// is often entirely legitimate (a real, in-progress generation) and
+/// already has its own two-tier budget (`LifecycleConfig::
+/// active_turn_deadline`'s cooperative cancel nudge, then this same 20
+/// minute hard backstop), nothing legitimately keeps a *connect* call
+/// silent for anywhere close to 20 minutes: `session/new`/`session/load`/
+/// `session/resume` only ever reconstruct/initialize session state, never
+/// run a real model turn. Leaving them on the full 20-minute budget meant
+/// a genuinely wedged backend left a real client's connect/resume UI
+/// spinning with zero feedback for up to 20 minutes before this module's
+/// own kill-and-fail recovery ever kicked in -- technically "shows as
+/// loading" the whole time, but not a bound any user would tolerate
+/// waiting out, and indistinguishable from a true hang to everyone
+/// downstream. A short, deterministic failure here instead lets a real
+/// client's own error/retry path (in Zed: `ConversationView::
+/// handle_load_error` -> `ServerState::LoadError`) fire promptly.
+const SESSION_ESTABLISH_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// **Real incident fix, not a hypothetical.** Bound on how long
+/// [`ensure_backend_initialized`]'s `initialize`/`authenticate` handshake
+/// reads may go silent before this call fails and the wedged process is
+/// killed.
+///
+/// Before this constant existed, both handshake reads were bare
+/// `proc.reader.read_value().await` calls with no timeout of their own --
+/// unlike every read that follows them, which is always bounded by
+/// [`BACKEND_IDLE_READ_TIMEOUT`]/[`SESSION_ESTABLISH_IDLE_READ_TIMEOUT`]
+/// via [`read_matching_response_with_idle_timeout`]. Confirmed live: a
+/// backend that never answers `initialize` left every dispatch path that
+/// calls `ensure_backend_initialized` first -- `session/new`, and
+/// critically `session/load`/`session/resume` against a durably
+/// recovered session whose `BackendProcess` had not yet completed its
+/// handshake -- hanging forever, holding the per-process
+/// `BackendProcess` lock for the lifetime of the daemon. At the bridge
+/// layer (`acp_bridge::bind`) this manifested as a permanent
+/// `BridgeSessionState::Binding` livelock: every retry of the exact
+/// "bridge session binding is in progress; retry the request" error
+/// kept observing the same stuck state, since neither `finish_binding`
+/// nor `fail_binding` could ever run. Set shorter than
+/// `SESSION_ESTABLISH_IDLE_READ_TIMEOUT`'s already-short 45s connect
+/// budget -- a handshake that hasn't completed in this window is
+/// exactly as legitimately silent as a connect call that hasn't, so it
+/// gets an equally aggressive bound, not the 20-minute prompt-turn
+/// backstop.
+const BACKEND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound for the raw stdin write [`Router::cancel_stuck_turns`] makes to a
+/// backend's `cancel_writer` pipe. **Live incident this closes**: this
+/// call runs every lifecycle-reaper tick while the caller
+/// ([`acpx_server::main`]'s reaper task) is holding the *entire* router
+/// mutex around the whole `reap_expired_sessions` /
+/// `reap_unreferenced_backends` / `cancel_stuck_turns` sequence -- unlike
+/// [`dispatch_session_cancel_shared`], which deliberately drops the
+/// router lock *before* writing to the exact same `cancel_writer` pipe
+/// (see that function's doc comment), this one has no such luxury: it's
+/// mutating `&mut self` in place mid-reap. A backend process wedged badly
+/// enough not to be draining its own stdin (observed live: `codex-acp`
+/// past its `active_turn_deadline`, already failing capability probes)
+/// leaves `ChildStdin::write_all` blocked once the pipe's kernel buffer
+/// fills, which -- with no timeout here -- blocks this call forever,
+/// which blocks the reaper's held router mutex forever, which then wedges
+/// every other concurrent request that touches the router lock at all
+/// (plain `initialize`/`agents/list` -- neither of which ever talks to a
+/// backend -- hang indefinitely, and client sockets pile up in
+/// `CLOSE-WAIT` because their handler tasks can never return to their own
+/// read loop to notice the peer has gone away). Short timeout is
+/// deliberate: writing one small JSON line to a healthy process's stdin
+/// pipe should complete in microseconds, and this is already a
+/// best-effort notification (the reap loop's own doc comment: "this only
+/// ever asks the backend to *stop*") -- skipping one candidate on timeout
+/// and retrying next tick is strictly better than freezing the whole
+/// gateway on its behalf.
+const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Router {
     pub fn default_agent_id(&self) -> &str {
@@ -737,6 +907,8 @@ impl Router {
             scavenged_backends: HashSet::new(),
             tenant_process_isolation: false,
             session_process_isolation: false,
+            on_demand_recovery_enabled: true,
+            process_reader_demux: false,
             unreferenced_backends: HashMap::new(),
         }
     }
@@ -1090,6 +1262,23 @@ impl Router {
         self
     }
 
+    /// Wire `ACPX_STARTUP_SESSION_RECOVERY_ENABLED` into on-demand
+    /// rehydration too -- see `on_demand_recovery_enabled`'s field doc
+    /// comment. `main.rs` passes the same `config.
+    /// startup_session_recovery_enabled` value used to gate the eager
+    /// batch job at boot; this is one operator-facing toggle, not two.
+    pub fn with_on_demand_recovery_enabled(mut self, enabled: bool) -> Self {
+        self.on_demand_recovery_enabled = enabled;
+        self
+    }
+
+    /// Opt-in per-process reader-task demultiplexing -- see
+    /// `process_reader_demux`'s field doc comment. Disabled by default.
+    pub fn with_process_reader_demux(mut self, enabled: bool) -> Self {
+        self.process_reader_demux = enabled;
+        self
+    }
+
     /// Configure the backend auth method ACPX uses for a native/unmanaged
     /// session. Managed profiles retain their own `auth_method_id`, and an
     /// unset native value still refuses to guess.
@@ -1098,9 +1287,37 @@ impl Router {
         self
     }
 
+    /// **Real bug this fixes** (found chasing a startup-recovery failure
+    /// that never reproduced live, tracked down to a race): every
+    /// registry-listed agent (`codex-acp`, `claude-acp`, ...) gets an
+    /// auto-seeded [`Profile`] at startup (`ensure_default_profiles_seeded`)
+    /// specifically so native/unmanaged sessions still pick up its
+    /// `allow_fs_access`/`allow_terminal_access`/`permission_policy` --
+    /// but that seeded profile's `auth_method_id` is always `None` (never
+    /// set by auto-seeding, only by an operator's explicit
+    /// `profiles/create`). The previous `if profile.is_none()` guard here
+    /// meant *any* call site resolving through that seeded profile --
+    /// `call_policy_for`'s no-profile-name fallback (every startup
+    /// recovery of a native/bridge session) and `dispatch_session_new`'s
+    /// own `call_policy_profile` fallback alike -- silently discarded
+    /// `ACPX_NATIVE_AUTH_METHOD_ID`/`Router::with_native_auth_method_id`
+    /// entirely, even though a profile was technically found. Confirmed
+    /// live: a persisted `codex-acp` bridge session failed recovery on
+    /// every single restart with `backend requires authentication...`,
+    /// while a live client's *first* prompt against the very same fresh
+    /// backend process minutes later succeeded -- only because an
+    /// unrelated periodic model-refresh capability probe
+    /// (`probe_adapter_capabilities`, which already worked around this
+    /// exact defect locally by passing `None` instead of a resolved
+    /// profile) happened to authenticate the shared process first. Fixing
+    /// it here, not by special-casing more call sites the way the probe
+    /// did, closes it for every current and future caller uniformly:
+    /// falling back to `native_auth_method_id` whenever the *resolved
+    /// auth method specifically* is absent, regardless of whether some
+    /// other (non-auth) profile field was found.
     fn call_policy(&self, profile: Option<&Profile>) -> BackendCallPolicy {
         let mut policy = BackendCallPolicy::from_profile(profile);
-        if profile.is_none() {
+        if policy.auth_method_id.is_none() {
             policy.auth_method_id = self.native_auth_method_id.clone();
         }
         policy
@@ -1699,12 +1916,32 @@ impl Router {
                 "params": { "sessionId": entry.backend_session_id.0 }
             });
             if let Some(writer) = self.supervisor.cancel_writer(&entry.agent_id) {
-                if let Err(error) = writer.lock().await.write_value(&notification).await {
-                    tracing::warn!(
-                        %error,
-                        gateway_session_id = %gateway_id.0,
-                        "failed to deliver best-effort session/cancel for a stuck turn"
-                    );
+                let write = async { writer.lock().await.write_value(&notification).await };
+                match tokio::time::timeout(CANCEL_WRITE_TIMEOUT, write).await {
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            gateway_session_id = %gateway_id.0,
+                            "failed to deliver best-effort session/cancel for a stuck turn"
+                        );
+                    }
+                    Err(_) => {
+                        // See `CANCEL_WRITE_TIMEOUT`'s doc comment: dropping
+                        // `write` here releases the writer-pipe lock it may
+                        // have acquired -- without this bound, a backend not
+                        // draining its own stdin blocks this call (and the
+                        // global router mutex the caller holds around the
+                        // whole reaper pass) forever.
+                        tracing::warn!(
+                            gateway_session_id = %gateway_id.0,
+                            agent_id = %entry.agent_id,
+                            timeout_secs = CANCEL_WRITE_TIMEOUT.as_secs(),
+                            "best-effort session/cancel write for a stuck turn timed out; \
+                             skipping this candidate rather than blocking the router lock \
+                             every other tenant/session depends on"
+                        );
+                    }
+                    Ok(Ok(())) => {}
                 }
             }
             self.spawn_transcript(gateway_id.0.clone(), Direction::ClientToAgent, notification);
@@ -1797,6 +2034,14 @@ impl Router {
     /// Restore all durable, open sessions before the router begins serving
     /// prompts. Failed rows remain durable for later inspection/retry but
     /// are intentionally never added to the live registry.
+    ///
+    /// "Retry" here means client-triggered, on-demand retry only (an
+    /// explicit `session/load`/`session/resume` against that exact id) --
+    /// `list_recoverable_sessions` itself excludes already-`RecoveryFailed`
+    /// rows from this eager batch, so a permanently-doomed row (backend
+    /// rejects the resume every time, e.g. no underlying rollout ever
+    /// existed) is only ever attempted once here, not on every subsequent
+    /// restart forever.
     pub async fn recover_open_sessions(&mut self) -> Result<StartupRecoveryReport, RouterError> {
         let Some(store) = self.persistence.clone() else {
             return Ok(StartupRecoveryReport::default());
@@ -2004,6 +2249,22 @@ impl Router {
             record.agent_id.clone()
         };
         let admission = self.admit_session(&tenant_id)?;
+        // **Startup-recovery agent registration fix.** Registry-backed
+        // agent ids (e.g. a bridge session's concrete `codex-acp`, as
+        // opposed to the one statically registered `default_agent_id` at
+        // startup -- see `main.rs`) only ever get a `SpawnSpec` via this
+        // same lazy call from a *live* bridge session/capability-probe
+        // path (`acp_bridge.rs`'s model selection, `probe_adapter_capabilities`).
+        // Startup recovery runs before any client has connected, so
+        // without this call every persisted session whose `agent_id`
+        // isn't `default_agent_id` failed deterministically, 100% of the
+        // time, on every single restart, with
+        // `no spawn spec registered for agent <id>` -- confirmed live via
+        // `last_recovery_error` across 7 consecutive restarts, 0
+        // successful recoveries ever. Idempotent/cheap when the spec is
+        // already registered (`ensure_registry_agent_registered` itself
+        // guards on `self.supervisor.spec(agent_id).is_some()` first).
+        self.ensure_registry_agent_registered(&agent_id).await?;
         let backend = self.supervisor.ensure_running(&agent_id).await?;
         let call_policy = self
             .call_policy_for(record.profile_name.as_deref(), &agent_id)
@@ -2339,7 +2600,14 @@ impl Router {
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             backend.writer.lock().await.write_value(&request).await?;
             let (response, notifications, agent_requests) =
-                read_matching_response(&mut backend, &id, call_policy, None).await?;
+                read_matching_response_with_idle_timeout(
+                    &mut backend,
+                    &id,
+                    call_policy,
+                    None,
+                    SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
+                )
+                .await?;
             attach_session_new_extras(
                 response,
                 notifications,
@@ -2713,14 +2981,33 @@ impl Router {
     /// of the method existing separately from `session/new`.
     ///
     /// This only fires as a fallback (the in-memory registry is always
-    /// checked first, unchanged, by both call sites) and only for
-    /// `session/load`/`session/resume` specifically -- every other
-    /// `Proxied` method (`session/prompt`, `session/cancel`, etc.) still
-    /// requires a live in-process session and correctly errors
-    /// `UnknownSession` otherwise; those aren't resumption calls, so
-    /// silently reviving one from a stale durable row on, say, a typo'd
-    /// `session/prompt` call would paper over a real client bug instead
-    /// of surfacing it.
+    /// checked first, unchanged, by both call sites) and, as of the
+    /// `acpx-session-transparent-revival` fix, for *every* `Proxied`/
+    /// `SessionFork` method reachable through `dispatch_proxied`/
+    /// `dispatch_proxied_shared`/`dispatch_session_fork(_shared)` --
+    /// not just `session/load`/`session/resume`/`session/delete`/
+    /// `session/fork`. Originally this was scoped to resumption-shaped
+    /// methods only, on the theory that silently reviving a session on,
+    /// say, an ordinary `session/prompt` would paper over a real client
+    /// bug (a stale/typo'd session id) instead of surfacing it. Real
+    /// production traffic disproved that: ACPX's own idle-TTL lifecycle
+    /// reaper (`reap_expired_sessions`) evicts a session's in-memory
+    /// entry -- while leaving its durable row alone, exactly like a
+    /// restart -- the moment a client goes quiet for
+    /// `session_idle_ttl_secs`, with no ACP-spec mechanism to push that
+    /// invalidation to the client. A real, spec-only client (Zed) has no
+    /// idea this happened and has no reason to re-issue `session/load`
+    /// before its next ordinary `session/prompt` against a thread the
+    /// user never closed -- so that first post-idle prompt hit
+    /// `UnknownSession` even though the exact same durable row a
+    /// `session/load` call would have happily revived was sitting right
+    /// there. That is not a client bug being surfaced; it is a gap
+    /// between ACPX's own idle-close policy and what a compliant client
+    /// can reasonably be expected to do. A gateway session id that is
+    /// merely *unknown* (never created, or belonging to another tenant)
+    /// still fails exactly as before -- `get_session` below returns
+    /// `None` regardless of `method`, so this widening only changes
+    /// behavior for ids ACPX itself durably tracked.
     ///
     /// Requires `ACPX_DB_PATH`/`Router::with_persistence` to have been
     /// configured; without it there is nowhere durable to recover from,
@@ -2735,16 +3022,39 @@ impl Router {
         method: &str,
         gateway_session_id: &str,
     ) -> Result<crate::session_registry::SessionEntry, RouterError> {
-        if !matches!(
-            method,
-            "session/load" | "session/resume" | "session/delete" | "session/fork"
-        ) {
+        if !matches!(classify(method), MethodClass::Proxied | MethodClass::SessionFork) {
             return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
-        let store = self
-            .persistence
-            .clone()
-            .ok_or_else(|| RouterError::SessionNotPersisted(gateway_session_id.to_string()))?;
+        if !self.on_demand_recovery_enabled {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+        }
+        let store = match self.persistence.clone() {
+            Some(store) => store,
+            None => {
+                // Same implicit-vs-explicit distinction as the
+                // `RecoveryFailed` gate below: only `session/load`/
+                // `session/resume` get the specific, actionable
+                // `SessionNotPersisted` diagnostic ("configure
+                // ACPX_DB_PATH") -- that message only makes sense as a
+                // reply to an explicit reload attempt. Every other
+                // `Proxied`/`SessionFork` method (`session/prompt`,
+                // `session/cancel`, ...) must fail with the same plain
+                // `UnknownSession` a deployment with no persistence at
+                // all has always returned for these methods, matching
+                // this widening's own doc comment ("a gateway session id
+                // that is merely unknown ... still fails exactly as
+                // before"). Without this, a cross-tenant id guess against
+                // a persistence-less deployment leaked a distinguishable
+                // "not persisted" error instead of the generic "no
+                // session registered" every other unknown-id case gets.
+                if method == "session/load" || method == "session/resume" {
+                    return Err(RouterError::SessionNotPersisted(
+                        gateway_session_id.to_string(),
+                    ));
+                }
+                return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
+            }
+        };
         let record = store
             .get_session(gateway_session_id.to_string())
             .await
@@ -2774,6 +3084,30 @@ impl Router {
             return Err(RouterError::SessionRestoring(
                 gateway_session_id.to_string(),
             ));
+        }
+        // **Recovery-outage gate.** A record startup recovery (or a
+        // previous on-demand attempt) already gave up on stays
+        // unavailable to every *implicit* touch (`session/prompt`,
+        // `session/cancel`, ...) -- those never carried an explicit
+        // "please bring this back" intent, so they must fail exactly
+        // like a genuinely-unknown session id would (`UnknownSession`,
+        // "no session registered"), without retrying the connector at
+        // all. Only `session/load`/`session/resume` -- the two methods
+        // whose entire purpose is an explicit reload request -- are
+        // allowed to retry a `RecoveryFailed` record here, so a caller
+        // polling `session/load` after a connector outage clears can
+        // still recover it (see `real_binary_survives_a_recovery_
+        // connector_outage`). Without this gate, an ordinary
+        // `session/prompt` right after a failed startup recovery would
+        // silently attempt a fresh backend spawn and surface whatever
+        // low-level connector error that spawn attempt produces (e.g. a
+        // `Supervisor` crash-backoff message) instead of the same clean,
+        // stable `UnknownSession` a client can already recognize.
+        if record.status == RecoveryStatus::RecoveryFailed
+            && method != "session/load"
+            && method != "session/resume"
+        {
+            return Err(RouterError::UnknownSession(gateway_session_id.to_string()));
         }
         let mut entry = crate::session_registry::SessionEntry {
             agent_id: record.agent_id,
@@ -2821,6 +3155,99 @@ impl Router {
         Ok(entry)
     }
 
+/// Extracts and strips the optional `_acpx.bg` background-mode override
+/// from `request.params` -- see `LifecycleConfig::background_mode`'s doc
+/// comment for the full feature. Mirrors `transport::live::
+/// take_resume_cursor`'s existing convention exactly: additive,
+/// namespaced under `_acpx` (never part of the upstream ACP `session/
+/// close` schema, so forwarding it verbatim would make a strict backend
+/// choke on an unrecognized field), and surgically removed -- only the
+/// `bg` key, not the whole `_acpx` object, so any other `_acpx.*` field
+/// a caller also sent survives untouched. Accepts a JSON boolean or the
+/// strings `"on"`/`"off"` (case-insensitive); anything else is treated
+/// as absent (no override) rather than an error, matching `take_resume_
+/// cursor`'s "malformed input is fresh state, not a hard failure"
+/// precedent.
+fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
+    let params = request.get_mut("params")?.as_object_mut()?;
+    let extension = params.get_mut("_acpx")?.as_object_mut()?;
+    let override_value = extension.get("bg").and_then(|value| match value {
+        serde_json::Value::Bool(flag) => Some(*flag),
+        serde_json::Value::String(text) if text.eq_ignore_ascii_case("off") => Some(false),
+        serde_json::Value::String(text) if text.eq_ignore_ascii_case("on") => Some(true),
+        _ => None,
+    });
+    extension.remove("bg");
+    if extension.is_empty() {
+        params.remove("_acpx");
+    }
+    override_value
+}
+
+    /// **`background_mode` (bg-mode `session/close` override).** See
+    /// `LifecycleConfig::background_mode`'s doc comment for the full
+    /// feature. Returns `Ok(None)` when this call should proceed
+    /// through the normal `session/close` path unchanged (background
+    /// mode is off for this call, whether by deployment default or by
+    /// an explicit `_acpx.bg` override); returns `Ok(Some(response))`
+    /// when the caller should return that JSON-RPC success response
+    /// immediately instead, having done nothing to the session. The
+    /// session id is still validated -- including the same
+    /// restart-survival `rehydrate_session` fallback every other
+    /// `Proxied` method gets -- so closing an unknown session id is
+    /// still a real error, not a silently-swallowed success.
+    async fn maybe_suppress_close(
+        &mut self,
+        tenant_id: &TenantId,
+        request: &mut serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, RouterError> {
+        let override_bg = Router::take_background_override(request);
+        if !override_bg.unwrap_or(self.lifecycle.background_mode) {
+            return Ok(None);
+        }
+        let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
+        let gateway_session_id = request
+            .get("params")
+            .and_then(|p| p.get("sessionId"))
+            .and_then(|s| s.as_str())
+            .ok_or(RouterError::MissingSessionId)?
+            .to_string();
+        if self
+            .sessions
+            .resolve(
+                tenant_id,
+                &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+            )
+            .is_none()
+        {
+            self.rehydrate_session(tenant_id, "session/close", &gateway_session_id)
+                .await?;
+        }
+        Ok(Some(
+            // `_acpx.backgroundClose` is an additive, ignorable response
+            // marker (a real ACP client never checks it) -- but the
+            // strict `/acp` bridge's `close_or_delete` (`acpx-server`'s
+            // `transport::acp_bridge`) *does* check it, to distinguish
+            // "the underlying gateway session is still alive" (this
+            // path) from a genuinely forwarded close whose backend
+            // response happens to also be `{}`. Without this, the
+            // bridge would still unconditionally drop its own virtual
+            // session-id mapping on any successful `session/close`
+            // response, leaving a client that keeps using the same
+            // session id after a suppressed close (exactly what
+            // background mode exists to support) hitting "bridge
+            // session not found" on its very next call -- found live,
+            // not theoretical, running a real Zed-shaped WS round trip
+            // against this feature.
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {},
+                "_acpx": {"backgroundClose": true}
+            }),
+        ))
+    }
+
     async fn dispatch_proxied(
         &mut self,
         tenant_id: &TenantId,
@@ -2841,6 +3268,11 @@ impl Router {
         // extraction, not after.
         if method == "session/cancel" {
             return self.dispatch_session_cancel(tenant_id, request).await;
+        }
+        if method == "session/close" {
+            if let Some(response) = self.maybe_suppress_close(tenant_id, &mut request).await? {
+                return Ok(response);
+            }
         }
         let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
         let params = request
@@ -2886,7 +3318,14 @@ impl Router {
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
             backend.writer.lock().await.write_value(&request).await?;
             let (response, notifications, agent_requests) =
-                read_matching_response(&mut backend, &id, call_policy, None).await?;
+                read_matching_response_with_idle_timeout(
+                    &mut backend,
+                    &id,
+                    call_policy,
+                    None,
+                    session_establish_or_default_idle_timeout(&method),
+                )
+                .await?;
             attach_updates(response, notifications, agent_requests)
         };
         self.sessions.touch(
@@ -3738,6 +4177,21 @@ async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
     call_policy: BackendCallPolicy,
 ) -> Result<(), RouterError> {
+    ensure_backend_initialized_with_handshake_timeout(proc, call_policy, BACKEND_HANDSHAKE_TIMEOUT)
+        .await
+}
+
+/// [`ensure_backend_initialized`]'s real body, parameterized on the
+/// handshake timeout so a unit test can exercise the kill-on-expiry path
+/// in milliseconds instead of waiting out the real 30-second production
+/// value -- same pattern as [`read_matching_response`]/[`read_matching_
+/// response_with_idle_timeout`] and `acp_bridge::refresh_models`/
+/// `refresh_models_with_config`.
+async fn ensure_backend_initialized_with_handshake_timeout(
+    proc: &mut acpx_conductor::BackendProcess,
+    call_policy: BackendCallPolicy,
+    handshake_timeout: Duration,
+) -> Result<(), RouterError> {
     if !proc.handshake_done {
         let allow_fs_access = call_policy.allow_fs_access;
         let allow_terminal_access = call_policy.allow_terminal_access;
@@ -3773,9 +4227,28 @@ async fn ensure_backend_initialized(
             }
         });
         proc.writer.lock().await.write_value(&request).await?;
-        loop {
-            let value = proc.reader.read_value().await?;
-            if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
+        // Bounded by `BACKEND_HANDSHAKE_TIMEOUT` (see its own doc comment
+        // for the live incident this closes): a bare, unbounded
+        // `proc.reader.read_value().await` loop here left this call --
+        // and the per-process `BackendProcess` lock every caller holds
+        // around it -- hanging forever against a backend that never
+        // answers `initialize`.
+        let handshake = async {
+            loop {
+                let value = proc.reader_mut().read_value().await?;
+                if value.get("id").and_then(|v| v.as_i64()) == Some(INITIALIZE_REQUEST_ID) {
+                    return Ok::<_, RouterError>(value);
+                }
+                // A well-behaved adapter shouldn't emit anything unprompted
+                // before answering `initialize`, but stay defensive rather
+                // than assuming the very first line back is necessarily the
+                // match -- `read_value`'s own `FramingError::Eof` on a
+                // closed pipe is still the hard stop if the backend never
+                // answers at all.
+            }
+        };
+        match tokio::time::timeout(handshake_timeout, handshake).await {
+            Ok(Ok(value)) => {
                 // Capture the backend's real `initialize` result -- its
                 // actual `agentCapabilities`/`authMethods`/negotiated
                 // `protocolVersion` -- instead of discarding it. Surfaced to
@@ -3790,13 +4263,22 @@ async fn ensure_backend_initialized(
                 // supports e.g. `loadSession`, image content, or any auth
                 // method at all.
                 proc.agent_capabilities = value.get("result").cloned();
-                break;
             }
-            // A well-behaved adapter shouldn't emit anything unprompted
-            // before answering `initialize`, but stay defensive rather than
-            // assuming the very first line back is necessarily the match --
-            // `read_value`'s own `FramingError::Eof` on a closed pipe is
-            // still the hard stop if the backend never answers at all.
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = handshake_timeout.as_secs(),
+                    "backend produced no response to the initialize handshake within the \
+                     timeout window; killing the wedged process and failing this call so \
+                     the per-process lock it held is freed for every other session on this \
+                     agent"
+                );
+                let _ = proc.kill().await;
+                return Err(RouterError::BackendHandshakeTimeout(
+                    "initialize",
+                    handshake_timeout,
+                ));
+            }
         }
         proc.handshake_done = true;
     }
@@ -3828,18 +4310,42 @@ async fn ensure_backend_initialized(
                 "params": { "methodId": method_id }
             });
             proc.writer.lock().await.write_value(&request).await?;
-            loop {
-                let value = proc.reader.read_value().await?;
-                if value.get("id").and_then(|v| v.as_i64()) == Some(AUTHENTICATE_REQUEST_ID) {
+            // Same `BACKEND_HANDSHAKE_TIMEOUT` bound as the `initialize`
+            // handshake just above -- this read was the other half of the
+            // same unbounded-hang gap.
+            let handshake = async {
+                loop {
+                    let value = proc.reader_mut().read_value().await?;
+                    if value.get("id").and_then(|v| v.as_i64()) == Some(AUTHENTICATE_REQUEST_ID) {
+                        return Ok::<_, RouterError>(value);
+                    }
+                    // Same defensive stance as the `initialize` loop above --
+                    // a well-behaved adapter shouldn't emit anything
+                    // unprompted before answering `authenticate` either.
+                }
+            };
+            match tokio::time::timeout(handshake_timeout, handshake).await {
+                Ok(Ok(value)) => {
                     if let Some(error) = value.get("error") {
                         return Err(RouterError::BackendAuthenticationError(error.clone()));
                     }
                     proc.authenticated = true;
-                    break;
                 }
-                // Same defensive stance as the `initialize` loop above --
-                // a well-behaved adapter shouldn't emit anything
-                // unprompted before answering `authenticate` either.
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = handshake_timeout.as_secs(),
+                        "backend produced no response to the authenticate handshake within \
+                         the timeout window; killing the wedged process and failing this \
+                         call so the per-process lock it held is freed for every other \
+                         session on this agent"
+                    );
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendHandshakeTimeout(
+                        "authenticate",
+                        handshake_timeout,
+                    ));
+                }
             }
         } else {
             // No auth required at all -- vacuously "authenticated" so
@@ -4419,7 +4925,7 @@ async fn backend_idle_scavenger(
         // holding) waiting for it.
         loop {
             let attempt =
-                tokio::time::timeout(Duration::from_millis(0), proc.reader.read_value()).await;
+                tokio::time::timeout(Duration::from_millis(0), proc.reader_mut().read_value()).await;
             let value = match attempt {
                 Ok(Ok(value)) => value,
                 Ok(Err(err)) => {
@@ -4452,6 +4958,62 @@ async fn backend_idle_scavenger(
             );
         }
     }
+}
+
+/// **`process_reader_demux`, phase 1.** Background consumer for one
+/// physical backend process's stream of unmatched frames (bare
+/// notifications and agent-initiated requests), fed by that process's
+/// reader task (`BackendProcess::start_demux`) via `unmatched_rx`. Unlike
+/// [`backend_idle_scavenger`], this runs continuously for the whole
+/// process lifetime, not only during idle windows between calls -- it's
+/// the fix for the race noted in `memory/acpx/tasks/zed_integration.yaml`
+/// task 7 ("only forwards live updates while some caller happens to be
+/// in the read loop"). Reuses [`handle_unmatched_frame`], the exact same
+/// agent-request-answering/live-delivery logic the legacy read loop
+/// uses, briefly re-locking `backend` per frame (never held across a
+/// blocking read -- the reader task already owns that).
+///
+/// `policy` is fixed for this consumer's whole lifetime, captured from
+/// whichever call first activated demux for this process. In practice
+/// every session sharing one physical process already shares one
+/// profile (`Supervisor` keys processes by agent id, optionally folded
+/// with tenant/session id -- never by profile alone with differing call
+/// policies on one key), so this matches what the legacy per-call read
+/// loop effectively assumed too.
+fn spawn_demux_consumer(
+    router: SharedRouterHandle,
+    agent_id: String,
+    agent_relay: AgentRequestHub,
+    notification_hub: NotificationHub,
+    backend: acpx_conductor::supervisor::SharedBackendProcess,
+    policy: BackendCallPolicy,
+    mut unmatched_rx: tokio::sync::mpsc::UnboundedReceiver<acpx_conductor::UnmatchedFrame>,
+) {
+    let ctx = LiveNotifyCtx {
+        router,
+        agent_id: agent_id.clone(),
+        tenant_id: None,
+        agent_relay,
+        gateway_session_id: None,
+        notification_hub,
+        backend: std::sync::Arc::clone(&backend),
+    };
+    tokio::spawn(async move {
+        while let Some(value) = unmatched_rx.recv().await {
+            let mut proc = backend.lock().await;
+            if let Err(err) = handle_unmatched_frame(&mut proc, value, &policy, Some(&ctx)).await {
+                tracing::warn!(
+                    agent_id = %ctx.agent_id,
+                    %err,
+                    "acpx process-reader-demux consumer failed to handle an unmatched frame"
+                );
+            }
+        }
+        // `unmatched_rx` closed -- the reader task ended (process exited
+        // or hit a read error). Nothing left to consume; this consumer's
+        // job ends with the process it belongs to, matching
+        // `backend_idle_scavenger`'s own `has_exited` early return.
+    });
 }
 
 /// How long a relayed `session/request_permission` is allowed to wait
@@ -4623,6 +5185,22 @@ fn spawn_terminal_output_stream(
     });
 }
 
+/// **`acpx-connect-loading-feedback`.** [`dispatch_proxied`]/
+/// [`dispatch_proxied_shared`] both handle every `Proxied` method through
+/// one shared backend round trip -- `session/prompt` and `session/load`/
+/// `session/resume` included -- so the idle-read budget has to be picked
+/// per call, not baked into the call site. See
+/// [`SESSION_ESTABLISH_IDLE_READ_TIMEOUT`]'s doc comment for why only
+/// these two specifically (not `session/prompt`, `session/close`,
+/// `session/set_config_option`, etc.) get the short budget.
+fn session_establish_or_default_idle_timeout(method: &str) -> Duration {
+    if matches!(method, "session/load" | "session/resume") {
+        SESSION_ESTABLISH_IDLE_READ_TIMEOUT
+    } else {
+        BACKEND_IDLE_READ_TIMEOUT
+    }
+}
+
 async fn read_matching_response(
     backend: &mut acpx_conductor::BackendProcess,
     id: &serde_json::Value,
@@ -4636,10 +5214,60 @@ async fn read_matching_response(
     ),
     RouterError,
 > {
+    read_matching_response_with_idle_timeout(backend, id, policy, live, BACKEND_IDLE_READ_TIMEOUT)
+        .await
+}
+
+/// [`read_matching_response`]'s real body, parameterized on the idle-read
+/// timeout so tests can exercise the kill-on-expiry path in milliseconds
+/// instead of waiting out the real 20-minute production value -- same
+/// pattern as `acp_bridge::refresh_models`/`refresh_models_with_config`.
+async fn read_matching_response_with_idle_timeout(
+    backend: &mut acpx_conductor::BackendProcess,
+    id: &serde_json::Value,
+    policy: BackendCallPolicy,
+    live: Option<&LiveNotifyCtx>,
+    idle_read_timeout: Duration,
+) -> Result<
+    (
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    ),
+    RouterError,
+> {
     let mut notifications = Vec::new();
     let mut agent_requests = Vec::new();
     loop {
-        let value = backend.reader.read_value().await?;
+        // See `BACKEND_IDLE_READ_TIMEOUT`'s doc comment: a backend that
+        // has stopped producing any output at all (wedged/deadlocked,
+        // ignoring its own `session/cancel`) must not be allowed to hold
+        // this loop -- and the per-process `BackendProcess` lock every
+        // caller of this function holds around it -- forever. Killing on
+        // expiry (rather than merely returning an error and leaving the
+        // process running) prevents a stale late reply for this
+        // abandoned `id` from later being misclassified as a
+        // notification in some unrelated call's own read loop.
+        let value = match tokio::time::timeout(
+            idle_read_timeout,
+            backend.reader_mut().read_value(),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = idle_read_timeout.as_secs(),
+                    "backend produced no output for the entire idle-read timeout window; \
+                     killing the wedged process and failing this call so the per-process \
+                     lock it held is freed for every other session on this agent"
+                );
+                let _ = backend.kill().await;
+                return Err(RouterError::BackendIdleReadTimeout(
+                    idle_read_timeout,
+                ));
+            }
+        };
         if value.get("id") == Some(id) {
             return Ok((value, notifications, agent_requests));
         }
@@ -4657,67 +5285,129 @@ async fn read_matching_response(
         // sends some other agent-initiated request acpx doesn't yet
         // support still gets *a* reply and can decide how to proceed
         // (e.g. treat it as declined) rather than hanging indefinitely.
-        if let (Some(_), Some(method)) = (
-            value.get("id"),
-            value.get("method").and_then(|m| m.as_str()),
-        ) {
-            // A persistent transport may have a client bound to this exact
-            // tenant/session. Give that client the first chance to answer
-            // every backend-initiated request, with one carve-out:
-            // `session/request_permission`/`fs/read_text_file`/
-            // `fs/write_text_file`/`terminal/create` each have their own
-            // dedicated `AgentRequestHub` relay below (real clients, e.g.
-            // the panel's `acpx/agent_request`/`acpx/agent_response`
-            // envelope, already depend on that exact wire contract) --
-            // tried first for those four, with `InteractionHub` as the
-            // fallback *within* each of those arms (not here) for a
-            // connection that bound `InteractionHub` but never subscribed
-            // to `AgentRequestHub` for this session (e.g. a strict ACP
-            // bridge connection, per `strict_acp_ws_forwards_backend_
-            // permission_requests_to_the_bound_client`). Every other
-            // method (including the plain `terminal/output`/
-            // `wait_for_exit`/`kill`/`release` polls below, which have no
-            // relay concept of their own) keeps trying `InteractionHub`
-            // here, unconditionally, same as before this carve-out
-            // existed. Profile policy/direct handling remains the
-            // deliberate fallback once every applicable live path returns
-            // nothing.
-            let has_dedicated_relay = matches!(
-                method,
-                "session/request_permission"
-                    | "fs/read_text_file"
-                    | "fs/write_text_file"
-                    | "terminal/create"
-            );
-            if !has_dedicated_relay {
-                if let Some(live) = live {
-                    match try_forward_interaction(live, &value).await {
-                        Ok(Some(mut reply)) => {
-                            // The outer client sees ACPX's opaque interaction id;
-                            // the backend must receive the id it originally sent.
-                            reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                            backend.writer.lock().await.write_value(&reply).await?;
-                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-                            continue;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            let reply = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                                "error": {
-                                    "code": -32001,
-                                    "message": format!("acpx interactive client request failed: {error}"),
-                                }
-                            });
-                            backend.writer.lock().await.write_value(&reply).await?;
-                            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-                            continue;
-                        }
+        match handle_unmatched_frame(backend, value, &policy, live).await? {
+            UnmatchedOutcome::AgentRequestAnswered(entry) => {
+                agent_requests.push(entry);
+                continue;
+            }
+            UnmatchedOutcome::Delivered => continue,
+            UnmatchedOutcome::Notification(value) => {
+                notifications.push(value);
+            }
+        }
+    }
+}
+
+/// Outcome of routing one frame [`read_matching_response_with_idle_timeout`]'s
+/// read loop (or the process-reader-demux consumer,
+/// `spawn_demux_consumer`) observed that did not match the
+/// response id its caller is waiting on.
+enum UnmatchedOutcome {
+    /// An agent-initiated request (`id` + `method`) was answered and the
+    /// reply already written to `backend.writer`; record it for
+    /// `_acpx.agentRequests`.
+    AgentRequestAnswered(serde_json::Value),
+    /// A `session/update` notification was delivered to a live subscriber;
+    /// nothing further to do.
+    Delivered,
+    /// No live delivery happened (no `live` ctx, no subscriber, or not a
+    /// `session/update`) -- caller should buffer it into `_acpx.updates`.
+    Notification(serde_json::Value),
+}
+
+/// Answer or route one frame that didn't match the response id a caller
+/// of `read_matching_response*` is waiting on. Pulled out of that
+/// function's read loop into its own function -- byte-for-byte identical
+/// logic, just given a call boundary -- so the process-reader-demux
+/// consumer (phase 1, `memory/acpx/gen/acpx-concurrency-config-execution.
+/// meta.json`) can reuse the exact same agent-request-answering and
+/// live-notification-delivery behavior for frames it observes outside of
+/// any in-flight caller's own read loop, instead of a second,
+/// divergence-prone copy of this security-sensitive (permission/approval)
+/// logic.
+async fn handle_unmatched_frame(
+    backend: &mut acpx_conductor::BackendProcess,
+    value: serde_json::Value,
+    policy: &BackendCallPolicy,
+    live: Option<&LiveNotifyCtx>,
+) -> Result<UnmatchedOutcome, RouterError> {
+    // An agent-initiated *request* (has both its own `id` and a
+    // `method`) is not a notification -- pre-fix, this loop treated
+    // it as one, pushing it into `notifications` and never replying,
+    // which left the backend deadlocked forever waiting for an
+    // answer that would never come (verified as a real hang, not a
+    // hypothetical, against `session/request_permission`: every real
+    // adapter that asks permission mid-turn blocks its own response
+    // to the *outer* call on getting one). `session/request_permission`
+    // is the only such method acpx knows how to answer today (see
+    // `build_permission_reply`); anything else gets a proper JSON-RPC
+    // method-not-found error instead of silence, so a backend that
+    // sends some other agent-initiated request acpx doesn't yet
+    // support still gets *a* reply and can decide how to proceed
+    // (e.g. treat it as declined) rather than hanging indefinitely.
+    if let (Some(_), Some(method)) = (
+        value.get("id"),
+        value.get("method").and_then(|m| m.as_str()),
+    ) {
+        // A persistent transport may have a client bound to this exact
+        // tenant/session. Give that client the first chance to answer
+        // every backend-initiated request, with one carve-out:
+        // `session/request_permission`/`fs/read_text_file`/
+        // `fs/write_text_file`/`terminal/create` each have their own
+        // dedicated `AgentRequestHub` relay below (real clients, e.g.
+        // the panel's `acpx/agent_request`/`acpx/agent_response`
+        // envelope, already depend on that exact wire contract) --
+        // tried first for those four, with `InteractionHub` as the
+        // fallback *within* each of those arms (not here) for a
+        // connection that bound `InteractionHub` but never subscribed
+        // to `AgentRequestHub` for this session (e.g. a strict ACP
+        // bridge connection, per `strict_acp_ws_forwards_backend_
+        // permission_requests_to_the_bound_client`). Every other
+        // method (including the plain `terminal/output`/
+        // `wait_for_exit`/`kill`/`release` polls below, which have no
+        // relay concept of their own) keeps trying `InteractionHub`
+        // here, unconditionally, same as before this carve-out
+        // existed. Profile policy/direct handling remains the
+        // deliberate fallback once every applicable live path returns
+        // nothing.
+        let has_dedicated_relay = matches!(
+            method,
+            "session/request_permission"
+                | "fs/read_text_file"
+                | "fs/write_text_file"
+                | "terminal/create"
+        );
+        if !has_dedicated_relay {
+            if let Some(live) = live {
+                match try_forward_interaction(live, &value).await {
+                    Ok(Some(mut reply)) => {
+                        // The outer client sees ACPX's opaque interaction id;
+                        // the backend must receive the id it originally sent.
+                        reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+                            serde_json::json!({"request": value, "reply": reply}),
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": value.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                            "error": {
+                                "code": -32001,
+                                "message": format!("acpx interactive client request failed: {error}"),
+                            }
+                        });
+                        backend.writer.lock().await.write_value(&reply).await?;
+                        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+                            serde_json::json!({"request": value, "reply": reply}),
+                        ));
                     }
                 }
             }
-            let reply = if method == "session/request_permission" {
+        }
+        let reply = if method == "session/request_permission" {
                 // **Interactive relay addition.** A live client (WS,
                 // currently) that owns this gateway session gets first
                 // say: it may take real user interaction to answer, so
@@ -4857,30 +5547,30 @@ async fn read_matching_response(
                     }
                 })
             };
-            backend.writer.lock().await.write_value(&reply).await?;
-            agent_requests.push(serde_json::json!({"request": value, "reply": reply}));
-            continue;
-        }
-        // **Phase 14.** A real notification (`method`, no `id`) -- try
-        // live delivery first when a subscribed transport connection is
-        // known (`live.is_some()`) and this is the one notification type
-        // that's actually session-scoped and worth streaming live,
-        // `session/update`. Anything not delivered live (no `live` ctx at
-        // all, e.g. the plain `&mut self` dispatch path; no live
-        // subscriber currently registered for this session, e.g. an
-        // HTTP-only client; or a notification method other than
-        // `session/update`) falls through to the pre-existing buffering
-        // behavior unchanged, so `_acpx.updates` keeps working exactly as
-        // before for every case this phase doesn't newly handle.
-        if let Some(ctx) = live {
-            if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
-                && try_deliver_live(ctx, &value).await
-            {
-                continue;
-            }
-        }
-        notifications.push(value);
+        backend.writer.lock().await.write_value(&reply).await?;
+        return Ok(UnmatchedOutcome::AgentRequestAnswered(
+            serde_json::json!({"request": value, "reply": reply}),
+        ));
     }
+    // **Phase 14.** A real notification (`method`, no `id`) -- try
+    // live delivery first when a subscribed transport connection is
+    // known (`live.is_some()`) and this is the one notification type
+    // that's actually session-scoped and worth streaming live,
+    // `session/update`. Anything not delivered live (no `live` ctx at
+    // all, e.g. the plain `&mut self` dispatch path; no live
+    // subscriber currently registered for this session, e.g. an
+    // HTTP-only client; or a notification method other than
+    // `session/update`) falls through to the pre-existing buffering
+    // behavior unchanged, so `_acpx.updates` keeps working exactly as
+    // before for every case this phase doesn't newly handle.
+    if let Some(ctx) = live {
+        if value.get("method").and_then(|m| m.as_str()) == Some("session/update")
+            && try_deliver_live(ctx, &value).await
+        {
+            return Ok(UnmatchedOutcome::Delivered);
+        }
+    }
+    Ok(UnmatchedOutcome::Notification(value))
 }
 
 /// Fold `notifications` and `agent_requests` (both as collected by
@@ -5359,6 +6049,38 @@ pub async fn dispatch_shared(
 /// pre-existing (tenant-unaware) caller keeps working unchanged; only
 /// `acpx-server`'s transports, which extract a real `X-Acpx-Tenant`
 /// header, call this directly.
+/// Lightweight, redacted operational visibility for every request that
+/// reaches [`dispatch_shared_for_tenant`] -- the single dispatch entry
+/// point every real transport (HTTP/WS/stdio, native and ACP-bridge)
+/// funnels through. `session/prompt` gets its own distinct log line
+/// (`session_id`/`prompt_preview`) instead of the generic
+/// `method=...`/`tenant=...` shape every other method gets, since a raw
+/// prompt body is exactly the kind of thing an operator tailing
+/// production logs needs a *preview* of (to correlate a live incident
+/// with a specific user-visible turn) without the full-fidelity content
+/// (which may be arbitrarily large, and isn't itself an operational
+/// signal past its first few tokens).
+fn log_request_received(method: &str, tenant_id: &TenantId, request: &serde_json::Value) {
+    if method == "session/prompt" {
+        let session_id = request
+            .pointer("/params/sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prompt_preview = request
+            .pointer("/params/prompt")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        tracing::info!(
+            %session_id,
+            tenant = %tenant_id.0,
+            %prompt_preview,
+            "acpx received session/prompt"
+        );
+    } else {
+        tracing::info!(%method, tenant = %tenant_id.0, "acpx received request");
+    }
+}
+
 pub async fn dispatch_shared_for_tenant(
     router: &SharedRouterHandle,
     tenant_id: &TenantId,
@@ -5369,6 +6091,7 @@ pub async fn dispatch_shared_for_tenant(
         .and_then(|m| m.as_str())
         .ok_or(RouterError::MissingMethod)?
         .to_string();
+    log_request_received(&method, tenant_id, &request);
     match classify(&method) {
         MethodClass::Hybrid => dispatch_session_new_shared(router, tenant_id, request).await,
         // **Phase 7:** `session/cancel` needs `dispatch_session_cancel_shared`
@@ -5686,6 +6409,13 @@ async fn dispatch_proxied_shared(
         .and_then(|m| m.as_str())
         .ok_or(RouterError::MissingMethod)?
         .to_string();
+    if method == "session/close" {
+        let mut r = router.lock().await;
+        if let Some(response) = r.maybe_suppress_close(tenant_id, &mut request).await? {
+            return Ok(response);
+        }
+        drop(r);
+    }
     let id = request.get("id").cloned().ok_or(RouterError::MissingId)?;
     let gateway_session_id = request
         .get("params")
@@ -5694,7 +6424,7 @@ async fn dispatch_proxied_shared(
         .ok_or(RouterError::MissingSessionId)?
         .to_string();
 
-    let (backend, persistence, call_policy, agent_id, agent_relay, notification_hub) = {
+    let (backend, persistence, call_policy, agent_id, agent_relay, notification_hub, process_reader_demux) = {
         let mut r = router.lock().await;
         let entry = match r.sessions.resolve(
             tenant_id,
@@ -5713,13 +6443,20 @@ async fn dispatch_proxied_shared(
             params["sessionId"] = serde_json::Value::String(backend_session_id);
         }
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // The demux consumer (spawned below, once handshake completes)
+        // subsumes the idle scavenger's job for this process -- spawning
+        // both would leave two tasks competing for the same lock to do
+        // overlapping work.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         r.sessions.set_in_flight(
             tenant_id,
             &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
             1,
         );
         let call_policy = r.call_policy_for(profile_name.as_deref(), &agent_id).await;
+        let process_reader_demux = r.process_reader_demux;
         (
             backend,
             r.persistence.clone(),
@@ -5727,6 +6464,7 @@ async fn dispatch_proxied_shared(
             agent_id,
             r.agent_request_hub.clone(),
             r.notification_hub.clone(),
+            process_reader_demux,
         )
     };
 
@@ -5740,19 +6478,79 @@ async fn dispatch_proxied_shared(
     let response_result = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&request).await?;
-        let live = LiveNotifyCtx {
-            router: std::sync::Arc::clone(router),
-            agent_id,
-            tenant_id: Some(tenant_id.clone()),
-            agent_relay,
-            gateway_session_id: Some(gateway_session_id.clone()),
-            notification_hub,
-            backend: std::sync::Arc::clone(&backend),
-        };
-        let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy, Some(&live)).await?;
-        Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        if process_reader_demux {
+            // **Phase 1, `process_reader_demux`.** Register-then-await
+            // instead of holding `proc` (the per-process lock) across the
+            // write and the entire blocking read loop -- see
+            // `memory/acpx/gen/acpx-concurrency-config-execution.meta.json`.
+            // This is the change that lets two sessions sharing this
+            // backend process actually overlap in wall time.
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let idle_timeout = session_establish_or_default_idle_timeout(&method);
+            let rx = pending.register(&id).await;
+            writer.lock().await.write_value(&request).await?;
+            let response = match tokio::time::timeout(idle_timeout, acpx_conductor::demux::recv(rx)).await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = idle_timeout.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path); killing the wedged process so every \
+                         other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(idle_timeout));
+                }
+            };
+            // Unmatched frames (notifications/agent-requests) are handled
+            // entirely by the independent demux consumer task, not
+            // observed by this call at all -- see `process_reader_demux`'s
+            // field doc comment for the tradeoff this implies.
+            Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
+        } else {
+            proc.writer.lock().await.write_value(&request).await?;
+            let live = LiveNotifyCtx {
+                router: std::sync::Arc::clone(router),
+                agent_id,
+                tenant_id: Some(tenant_id.clone()),
+                agent_relay,
+                gateway_session_id: Some(gateway_session_id.clone()),
+                notification_hub,
+                backend: std::sync::Arc::clone(&backend),
+            };
+            let (response, notifications, agent_requests) =
+                read_matching_response_with_idle_timeout(
+                    &mut proc,
+                    &id,
+                    call_policy,
+                    Some(&live),
+                    session_establish_or_default_idle_timeout(&method),
+                )
+                .await?;
+            Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
+        }
     }
     .await;
     {
@@ -5937,6 +6735,9 @@ async fn dispatch_session_new_shared(
         admission,
         call_policy,
         pre_minted_gateway_id,
+        agent_relay,
+        notification_hub,
+        process_reader_demux,
     ) = {
         let mut r = router.lock().await;
         let params = request
@@ -6031,7 +6832,12 @@ async fn dispatch_session_new_shared(
 
         let admission = r.admit_session(tenant_id)?;
         let backend = r.supervisor.ensure_running(&agent_id).await?;
-        r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        // The demux consumer (spawned below, once handshake completes)
+        // subsumes the idle scavenger's job for this process -- see
+        // `dispatch_proxied_shared`'s identical branch.
+        if !r.process_reader_demux {
+            r.spawn_idle_scavenger_if_new(router, &agent_id, &backend);
+        }
         // See `dispatch_session_new`'s identical fallback for why: native/
         // unmanaged mode still picks up whatever profile
         // `ensure_default_profiles_seeded` auto-seeded under this
@@ -6041,6 +6847,7 @@ async fn dispatch_session_new_shared(
             .clone()
             .or_else(|| r.profiles.get(&agent_id).cloned());
         let call_policy = r.call_policy(call_policy_profile.as_ref());
+        let process_reader_demux = r.process_reader_demux;
         (
             agent_id,
             profile,
@@ -6050,34 +6857,104 @@ async fn dispatch_session_new_shared(
             admission,
             call_policy,
             pre_minted_gateway_id,
+            r.agent_request_hub.clone(),
+            r.notification_hub.clone(),
+            process_reader_demux,
         )
     };
 
     let mut response = async {
         let mut proc = backend.lock().await;
         ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-        proc.writer.lock().await.write_value(&request).await?;
-        // No `LiveNotifyCtx` here, deliberately: this exact call is what
-        // *creates* the gateway session (`self.sessions.register` below,
-        // after this block returns) -- until that registration happens, no
-        // gateway session id exists yet for `try_deliver_live`'s
-        // `find_by_backend` lookup to ever find, and no transport
-        // connection could possibly have subscribed to it yet either (a
-        // connection only learns the gateway session id from *this*
-        // call's own response). Passing a live ctx here would be dead
-        // code that always falls back to buffering -- `session/prompt`/
-        // `session/resume`/`session/load` (`dispatch_proxied_shared`,
-        // which *does* pass one) are where live delivery actually
-        // matters, since those always target an already-registered
-        // session.
-        let (response, notifications, agent_requests) =
-            read_matching_response(&mut proc, &id, call_policy, None).await?;
-        Ok::<_, RouterError>(attach_session_new_extras(
-            response,
-            notifications,
-            agent_requests,
-            proc.agent_capabilities.clone(),
-        ))
+        // No `LiveNotifyCtx` on the non-demux path below, deliberately:
+        // this exact call is what *creates* the gateway session
+        // (`self.sessions.register` below, after this block returns) --
+        // until that registration happens, no gateway session id exists
+        // yet for `try_deliver_live`'s `find_by_backend` lookup to ever
+        // find, and no transport connection could possibly have
+        // subscribed to it yet either (a connection only learns the
+        // gateway session id from *this* call's own response). Passing a
+        // live ctx here would be dead code that always falls back to
+        // buffering -- `session/prompt`/`session/resume`/`session/load`
+        // (`dispatch_proxied_shared`, which *does* pass one) are where
+        // live delivery actually matters, since those always target an
+        // already-registered session. The demux consumer below has the
+        // same `tenant_id: None`/`gateway_session_id: None` shape for the
+        // same reason -- it's process-scoped, not call-scoped, so it
+        // never had a live ctx to pass here in the first place.
+        if process_reader_demux {
+            if proc.pending.is_none() {
+                let rx = proc.start_demux();
+                spawn_demux_consumer(
+                    std::sync::Arc::clone(router),
+                    agent_id.clone(),
+                    agent_relay.clone(),
+                    notification_hub.clone(),
+                    std::sync::Arc::clone(&backend),
+                    call_policy.clone(),
+                    rx,
+                );
+            }
+            let pending = proc
+                .pending
+                .clone()
+                .expect("just activated demux above, or it was already active");
+            let writer = proc.writer_handle();
+            drop(proc);
+            let rx = pending.register(&id).await;
+            writer.lock().await.write_value(&request).await?;
+            let response = match tokio::time::timeout(
+                SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
+                acpx_conductor::demux::recv(rx),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(acpx_conductor::DemuxRecvError::ReaderClosed)) => {
+                    return Err(RouterError::BackendDemuxReaderClosed);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = SESSION_ESTABLISH_IDLE_READ_TIMEOUT.as_secs(),
+                        "backend produced no output for the entire idle-read timeout window \
+                         (process-reader-demux path, session/new); killing the wedged \
+                         process so every other session sharing it is unblocked"
+                    );
+                    let mut proc = backend.lock().await;
+                    let _ = proc.kill().await;
+                    return Err(RouterError::BackendIdleReadTimeout(
+                        SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
+                    ));
+                }
+            };
+            let agent_capabilities = {
+                let proc = backend.lock().await;
+                proc.agent_capabilities.clone()
+            };
+            Ok::<_, RouterError>(attach_session_new_extras(
+                response,
+                Vec::new(),
+                Vec::new(),
+                agent_capabilities,
+            ))
+        } else {
+            proc.writer.lock().await.write_value(&request).await?;
+            let (response, notifications, agent_requests) =
+                read_matching_response_with_idle_timeout(
+                    &mut proc,
+                    &id,
+                    call_policy,
+                    None,
+                    SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
+                )
+                .await?;
+            Ok::<_, RouterError>(attach_session_new_extras(
+                response,
+                notifications,
+                agent_requests,
+                proc.agent_capabilities.clone(),
+            ))
+        }
     }
     .await?;
 
@@ -6295,6 +7172,37 @@ mod tests {
         assert_eq!(classify("bogus/method"), MethodClass::Unknown);
     }
 
+    /// **`acpx-connect-loading-feedback`.** `session/load`/`session/resume`
+    /// -- the two `Proxied` methods a real client's connect/loading UI
+    /// gates on -- get the short `SESSION_ESTABLISH_IDLE_READ_TIMEOUT`;
+    /// every other `Proxied` method (`session/prompt` above all -- a long
+    /// wait there is often a legitimate in-progress generation) keeps the
+    /// full `BACKEND_IDLE_READ_TIMEOUT` backstop.
+    #[test]
+    fn session_establish_idle_timeout_only_applies_to_load_and_resume() {
+        assert_eq!(
+            session_establish_or_default_idle_timeout("session/load"),
+            SESSION_ESTABLISH_IDLE_READ_TIMEOUT
+        );
+        assert_eq!(
+            session_establish_or_default_idle_timeout("session/resume"),
+            SESSION_ESTABLISH_IDLE_READ_TIMEOUT
+        );
+        for other in [
+            "session/prompt",
+            "session/close",
+            "session/delete",
+            "session/set_config_option",
+            "session/set_mode",
+        ] {
+            assert_eq!(
+                session_establish_or_default_idle_timeout(other),
+                BACKEND_IDLE_READ_TIMEOUT,
+                "method {other} must keep the full idle-read backstop"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn handle_fs_request_windows_read_by_line_and_limit() {
         // Unit-level coverage for the `line`/`limit` windowing math itself
@@ -6345,5 +7253,200 @@ mod tests {
     fn classifies_phase_9_stable_methods() {
         assert_eq!(classify("session/delete"), MethodClass::Proxied);
         assert_eq!(classify("logout"), MethodClass::GatewayNative);
+    }
+
+    /// Regression test for `BACKEND_IDLE_READ_TIMEOUT`'s live incident:
+    /// a backend that produces zero bytes of output must not be allowed
+    /// to hold `read_matching_response`'s read loop (and the per-process
+    /// `BackendProcess` lock a caller holds around it) forever. Exercises
+    /// the real `tokio::time::timeout` + kill path via
+    /// `read_matching_response_with_idle_timeout`'s shortened-timeout
+    /// parameter, in milliseconds rather than the real 20-minute constant.
+    #[tokio::test]
+    async fn backend_idle_read_timeout_kills_a_wedged_process_and_frees_the_lock() {
+        // A silent backend: spawns, writes nothing to stdout, ever.
+        let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+        let mut backend = acpx_conductor::BackendProcess::spawn(&spec)
+            .await
+            .expect("failed to spawn silent test backend");
+        assert!(!backend.has_exited(), "backend should still be starting up");
+
+        let result = read_matching_response_with_idle_timeout(
+            &mut backend,
+            &serde_json::json!(1),
+            BackendCallPolicy::default(),
+            None,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(RouterError::BackendIdleReadTimeout(_))),
+            "expected BackendIdleReadTimeout, got {result:?}"
+        );
+        // Give the kill a moment to land, then confirm the wedged process
+        // was actually terminated -- not merely abandoned with the call
+        // failing but the child left running.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            backend.has_exited(),
+            "wedged backend process should have been killed on idle-read timeout"
+        );
+    }
+
+    /// **Fix regression test for the live incident traced from a real
+    /// `"bridge session binding is in progress; retry the request"`
+    /// report never clearing.** Before `BACKEND_HANDSHAKE_TIMEOUT`
+    /// existed, `ensure_backend_initialized`'s `initialize` handshake
+    /// read was a bare, unbounded `proc.reader.read_value().await` --
+    /// unlike every read that follows it, which
+    /// `read_matching_response_with_idle_timeout` already bounds. A
+    /// backend that never answers `initialize` left this call (and the
+    /// per-process `BackendProcess` lock every caller holds around it)
+    /// hanging forever. Mirrors `backend_idle_read_timeout_kills_a_
+    /// wedged_process_and_frees_the_lock` immediately above, but for the
+    /// handshake path specifically: exercises the real
+    /// `tokio::time::timeout` + kill path via `ensure_backend_
+    /// initialized_with_handshake_timeout`'s parameter, in milliseconds
+    /// rather than the real 30-second constant.
+    #[tokio::test]
+    async fn backend_handshake_timeout_kills_a_wedged_process_and_frees_the_lock() {
+        // A silent backend: spawns, writes nothing to stdout, ever -- so
+        // `initialize` is guaranteed to never be answered.
+        let spec = acpx_conductor::SpawnSpec::new("sh", vec!["-c".to_string(), "sleep 30".to_string()]);
+        let mut backend = acpx_conductor::BackendProcess::spawn(&spec)
+            .await
+            .expect("failed to spawn silent test backend");
+        assert!(!backend.has_exited(), "backend should still be starting up");
+
+        let result = ensure_backend_initialized_with_handshake_timeout(
+            &mut backend,
+            BackendCallPolicy::default(),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(RouterError::BackendHandshakeTimeout("initialize", _))
+            ),
+            "expected BackendHandshakeTimeout(\"initialize\", _), got {result:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            backend.has_exited(),
+            "wedged backend process should have been killed on handshake timeout"
+        );
+    }
+
+    /// Regression test for the startup-recovery agent-registration bug:
+    /// confirmed live via `last_recovery_error` across 7 consecutive real
+    /// `acpx-server` restarts, `no spawn spec registered for agent
+    /// codex-acp`, 0 successful recoveries out of 9 accumulated bridge
+    /// sessions, ever. Root cause -- a registry-backed agent id (any
+    /// bridge session's concrete backend, as opposed to the one
+    /// statically registered `default_agent_id`) only ever got a
+    /// `SpawnSpec` via `ensure_registry_agent_registered`, and startup
+    /// recovery called `self.supervisor.ensure_running(&agent_id)`
+    /// directly, skipping that call entirely -- so recovery ran before
+    /// any live session had a chance to lazily register the spec it
+    /// needed. Uses the bundled offline `registry.fallback.json` (via
+    /// `acpx_registry::fallback_registry()`) instead of
+    /// `ensure_registry_loaded`'s live-network attempt, so this stays
+    /// hermetic and fast; only registration is asserted here (not a full
+    /// `ensure_running` spawn), since the real registry's `codex-acp`
+    /// entry launches via real `npx`, which is deliberately out of scope
+    /// for a unit test.
+    #[tokio::test]
+    async fn ensure_registry_agent_registered_populates_a_spec_for_a_registry_only_agent_id() {
+        let mut router = Router::new("default");
+        router.registry_cache = Some(acpx_registry::fallback_registry());
+
+        assert!(
+            router.supervisor.spec("codex-acp").is_none(),
+            "codex-acp must start out unregistered, exactly like a freshly booted acpx-server \
+             that only ever statically registers `default_agent_id` (see main.rs)"
+        );
+
+        router
+            .ensure_registry_agent_registered("codex-acp")
+            .await
+            .expect("codex-acp is a real entry in the bundled fallback registry");
+
+        assert!(
+            router.supervisor.spec("codex-acp").is_some(),
+            "ensure_registry_agent_registered must have registered a SpawnSpec -- this is the \
+             exact call `prepare_open_session_recovery` now makes before \
+             `self.supervisor.ensure_running(&agent_id)`, closing the startup-recovery gap"
+        );
+
+        // Idempotent: calling it again once already registered must not
+        // error or attempt a redundant registry lookup.
+        router
+            .ensure_registry_agent_registered("codex-acp")
+            .await
+            .expect("re-registering an already-registered agent id must be a no-op");
+    }
+
+    /// Regression test for `call_policy`'s auto-seeded-profile auth
+    /// shadowing bug: confirmed live via a real recovery failure
+    /// (`backend requires authentication...`) followed minutes later by
+    /// a successful live prompt against the exact same fresh backend
+    /// process, once an unrelated background capability probe had
+    /// authenticated it first through its own workaround. A profile with
+    /// no explicit `auth_method_id` (exactly what
+    /// `ensure_default_profiles_seeded` always produces for every
+    /// registry agent) must still fall back to the router's configured
+    /// `native_auth_method_id` -- only an *explicitly* set
+    /// `Profile::auth_method_id` should ever override it.
+    #[test]
+    fn call_policy_falls_back_to_native_auth_method_when_profile_omits_one() {
+        let router = Router::new("default").with_native_auth_method_id(Some("api-key".to_string()));
+
+        let auto_seeded_profile = crate::profile::Profile {
+            name: "codex-acp".to_string(),
+            agent_id: "codex-acp".to_string(),
+            provider: None,
+            key_ref: None,
+            launch_overrides: HashMap::new(),
+            mcp_servers: vec![],
+            permission_policy: Default::default(),
+            allow_fs_access: true,
+            allow_terminal_access: true,
+            auth_method_id: None,
+        };
+        let policy = router.call_policy(Some(&auto_seeded_profile));
+        assert_eq!(
+            policy.auth_method_id.as_deref(),
+            Some("api-key"),
+            "a profile with no explicit auth_method_id must still fall back to \
+             native_auth_method_id, not silently drop it"
+        );
+        // The rest of the auto-seeded profile's fields must still win --
+        // this fix must not regress `call_policy_for`'s own documented
+        // reason for consulting the seeded profile at all.
+        assert!(policy.allow_fs_access);
+        assert!(policy.allow_terminal_access);
+
+        let explicit_profile = crate::profile::Profile {
+            auth_method_id: Some("chat-gpt".to_string()),
+            ..auto_seeded_profile
+        };
+        let policy = router.call_policy(Some(&explicit_profile));
+        assert_eq!(
+            policy.auth_method_id.as_deref(),
+            Some("chat-gpt"),
+            "an explicitly configured profile auth_method_id must still win over \
+             the router's native default"
+        );
+
+        let policy = router.call_policy(None);
+        assert_eq!(
+            policy.auth_method_id.as_deref(),
+            Some("api-key"),
+            "no profile at all must keep falling back to native_auth_method_id, \
+             same as before this fix"
+        );
     }
 }

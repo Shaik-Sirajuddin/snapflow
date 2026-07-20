@@ -156,6 +156,25 @@ async fn handle_acp_socket(
     // inbound frame is now spawned onto its own task below -- see that
     // spawn's own doc comment for why this had to stop being inline.
     let watched: Arc<AsyncMutex<HashSet<String>>> = Arc::new(AsyncMutex::new(HashSet::new()));
+    // **Disconnect socket-leak fix.** Every background forwarder task
+    // below (`interaction_rx`'s reply relay, each `subscribe_resuming`
+    // notification loop) is spawned independently and holds its own
+    // `Arc::clone(&sink)`; none of them previously had their lifetime
+    // tied to this connection's own read loop, so they kept looping --
+    // and kept `sink` alive -- until their *upstream* channel closed on
+    // its own (the session's stream getting explicitly removed, which
+    // may be much later or never for an abandoned session). Confirmed
+    // live: `ss -tnp` on a real deployment showed multiple `CLOSE-WAIT`
+    // sockets wedged for hours after their peer had already sent a FIN,
+    // because this process never dropped its last `sink` reference to
+    // send its own. Aborting every task this *specific* connection
+    // spawned -- not touching the shared per-session broadcast stream
+    // itself, which other still-connected subscribers may legitimately
+    // depend on -- guarantees `sink`'s refcount reaches zero as soon as
+    // this connection's own read loop ends, regardless of what state any
+    // other subscriber or the session itself is in.
+    let background_tasks: Arc<AsyncMutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(AsyncMutex::new(Vec::new()));
     // Live-interaction wiring (see `acp_bridge::BridgeInteractionCtx`'s doc
     // comment): without this, a backend-initiated `session/request_permission`
     // mid-turn always falls through to the static policy auto-answer -- a
@@ -176,7 +195,7 @@ async fn handle_acp_socket(
         let interaction_sink = Arc::clone(&sink);
         let forwarder_runtime = Arc::clone(&runtime);
         let forwarder_tenant = tenant_id.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(mut request) = interaction_rx.recv().await {
                 // The hub only ever knows the native/gateway session id
                 // (see `try_forward_interaction` in `router.rs`); a bridge
@@ -208,6 +227,7 @@ async fn handle_acp_socket(
                 }
             }
         });
+        background_tasks.lock().await.push(handle);
     }
     while let Some(message) = stream.next().await {
         let text = match message {
@@ -219,7 +239,7 @@ async fn handle_acp_socket(
             Ok(Message::Close(_)) | Err(_) => break,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
         };
-        let request: serde_json::Value = match serde_json::from_str(&text) {
+        let mut request: serde_json::Value = match serde_json::from_str(&text) {
             Ok(request) => request,
             Err(_) => continue,
         };
@@ -229,6 +249,124 @@ async fn handle_acp_socket(
         if request.get("method").is_none() && request.get("id").is_some() {
             interaction_hub.resolve(request).await;
             continue;
+        }
+        // **Bridge mid-turn resume fix, generalized.** Extracted *here*,
+        // synchronously, before the dispatch below is ever spawned --
+        // mirrors `transport::ws::handle_socket`'s (the native
+        // transport's) identical `resumed_before_dispatch` fix. Originally
+        // this only ran when the client supplied an explicit
+        // `_acpx.resume` cursor (a real reconnect); every ordinary
+        // steady-state `session/prompt` on an already-bound session fell
+        // through to the post-dispatch fallback below instead, which only
+        // subscribes *after* `dispatch_with_interaction` returns. Since
+        // that dispatch is exactly what reads the backend's
+        // `session/update` stream and attempts live delivery
+        // (`try_deliver_live` in `router.rs`), no subscriber was ever
+        // registered while it ran -- every notification for that call
+        // missed live delivery and fell back to the `_acpx.updates`
+        // response bundle every time, not just on reconnect. The bundle
+        // is still flushed as real frames afterwards (see the
+        // `_acpx.updates` flush below), but only as one end-of-turn
+        // batch, not incrementally -- indistinguishable, from a client's
+        // point of view, from the whole thread materializing as a single
+        // text blob right before the response, matching the reported
+        // "not picked up as a thread update, rather as text" symptom.
+        // Attempting this early subscribe unconditionally (any known,
+        // already-bound session, resume cursor or not) closes that gap:
+        // `resume_cursor` is passed through as `Option<ResumeCursor>`
+        // exactly as `subscribe_resuming` already accepts for every other
+        // ordinary (non-resuming) first subscribe elsewhere in this file.
+        let resume_cursor = take_resume_cursor(&mut request);
+        {
+            let virtual_id = request
+                .pointer("/params/sessionId")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            // `None` here covers two cases that both correctly fall back
+            // to the existing post-dispatch subscribe path below: the
+            // request carries no session id at all, or (the common
+            // reconnect-mid-bind race) the bridge session hasn't finished
+            // its lazy `bind()` yet, so no native gateway id exists to
+            // subscribe to yet -- `bridge_session_id_to_watch`'s
+            // post-response fallback still catches that case once
+            // binding completes.
+            if let Some(native_id) =
+                virtual_id.and_then(|id| runtime.bound_gateway_session_id(&tenant_id, &id))
+            {
+                // Reuses `watched` (not a separate set): it's already
+                // exactly what the post-response fallback below checks
+                // via `bridge_session_id_to_watch`, so claiming a native
+                // id here transparently prevents that later path from
+                // ever double-subscribing the same one.
+                if watched.lock().await.insert(native_id.clone()) {
+                    let state = stream_resume_state_shared(&router, &tenant_id, &native_id).await;
+                    match hub
+                        .subscribe_resuming(
+                            &tenant_id,
+                            native_id.clone(),
+                            resume_cursor.clone(),
+                            StreamResumeState {
+                                backend_session_id: state.backend_session_id,
+                                durable_state_changed: state.durable_state_changed,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(mut rx) => {
+                            let forwarder_sink = Arc::clone(&sink);
+                            let forwarder_runtime = Arc::clone(&runtime);
+                            let forwarder_tenant = tenant_id.clone();
+                            let handle = tokio::spawn(async move {
+                                loop {
+                                    let mut update = match rx.recv().await {
+                                        Ok(update) => update.into_value(),
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                            skipped,
+                                        )) => {
+                                            tracing::warn!(%skipped, "ACPX bridge notification subscriber lagged (early resume subscribe)");
+                                            continue;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break
+                                        }
+                                    };
+                                    let Some(native_session_id) = update
+                                        .pointer("/params/sessionId")
+                                        .and_then(|value| value.as_str())
+                                        .map(str::to_string)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(virtual_id) = forwarder_runtime
+                                        .virtual_session_id(&forwarder_tenant, &native_session_id)
+                                    else {
+                                        continue;
+                                    };
+                                    update["params"]["sessionId"] =
+                                        serde_json::Value::String(virtual_id);
+                                    let Ok(frame) = serde_json::to_string(&update) else {
+                                        continue;
+                                    };
+                                    if forwarder_sink
+                                        .lock()
+                                        .await
+                                        .send(Message::Text(frame))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                            background_tasks.lock().await.push(handle);
+                        }
+                        Err(error) => {
+                            watched.lock().await.remove(&native_id);
+                            tracing::warn!(%error, "bridge early resume subscribe failed; falling back to post-dispatch subscribe");
+                        }
+                    }
+                }
+            }
         }
         // Spawned, not awaited inline: a bridge-lazy-bound `session/prompt`
         // can block on a backend-initiated `session/request_permission`
@@ -248,9 +386,9 @@ async fn handle_acp_socket(
         let hub = hub.clone();
         let watched = Arc::clone(&watched);
         let interaction_ctx = interaction_ctx.clone();
-        tokio::spawn(async move {
-            let mut request = request;
-            let _resume_cursor = take_resume_cursor(&mut request);
+        let dispatch_background_tasks = Arc::clone(&background_tasks);
+        let handle = tokio::spawn(async move {
+            let request = request;
             let mut response = match super::http::acp_bridge::dispatch_with_interaction(
                 &router,
                 &runtime,
@@ -360,7 +498,7 @@ async fn handle_acp_socket(
                                 let forwarder_sink = Arc::clone(&sink);
                                 let forwarder_runtime = Arc::clone(&runtime);
                                 let forwarder_tenant = tenant_id.clone();
-                                tokio::spawn(async move {
+                                let handle = tokio::spawn(async move {
                                     loop {
                                         let mut update = match rx.recv().await {
                                             Ok(update) => update.into_value(),
@@ -406,6 +544,7 @@ async fn handle_acp_socket(
                                         }
                                     }
                                 });
+                                dispatch_background_tasks.lock().await.push(handle);
                             }
                             Err(error) => {
                                 watched.lock().await.remove(&native_id);
@@ -425,6 +564,18 @@ async fn handle_acp_socket(
             tokio::task::yield_now().await;
             let _ = sink.lock().await.send(Message::Text(frame)).await;
         });
+        background_tasks.lock().await.push(handle);
+    }
+    // See `background_tasks`'s doc comment above: aborting every task this
+    // connection spawned (not touching the shared per-session broadcast
+    // stream, which other still-connected subscribers may depend on) is
+    // what actually lets `sink`'s `Arc` refcount reach zero here, so the
+    // underlying socket's write half is dropped -- and our own FIN sent --
+    // as soon as this connection's read loop ends, instead of staying
+    // `CLOSE-WAIT` until some unrelated, possibly-never-triggered event
+    // elsewhere closes the session's notification stream.
+    for handle in background_tasks.lock().await.drain(..) {
+        handle.abort();
     }
     drop(watched);
     // Disconnects must release every interaction binding this connection
@@ -497,7 +648,19 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     let interaction_hub = { router.lock().await.interaction_hub() };
     let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
     let interaction_sink = Arc::clone(&sink);
-    tokio::spawn(async move {
+    // See `handle_acp_socket`'s identical `background_tasks` doc comment:
+    // every forwarder below is spawned independently and holds its own
+    // `Arc::clone(&sink)`, so none of them previously had their lifetime
+    // tied to this connection's own read loop -- a disconnected client's
+    // socket stayed `CLOSE-WAIT` until the *session's* stream happened to
+    // get torn down by something else entirely, which for an abandoned,
+    // still-pinned/live session may be arbitrarily long or never. Aborting
+    // only this connection's own tasks (not the shared per-session
+    // broadcast stream another still-connected subscriber may depend on)
+    // fixes the leak without weakening multi-subscriber semantics.
+    let background_tasks: Arc<AsyncMutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(AsyncMutex::new(Vec::new()));
+    let handle = tokio::spawn(async move {
         while let Some(request) = interaction_rx.recv().await {
             let Ok(payload) = serde_json::to_string(&request) else {
                 continue;
@@ -513,6 +676,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             }
         }
     });
+    background_tasks.lock().await.push(handle);
     let mut watched: HashSet<String> = HashSet::new();
     let interaction_bindings =
         Arc::new(AsyncMutex::new(HashMap::<String, InteractionBinding>::new()));
@@ -625,13 +789,28 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             .and_then(|value| value.as_str())
             .map(str::to_string)
         {
-            // A reconnect cursor changes the ordering requirement: install
-            // the receiver before the potentially slow backend call. This
-            // preserves live records that arrive while `session/resume` or
-            // `session/load` is in flight even if they later roll out of
-            // the bounded replay ring.
-            let resumed_before_dispatch = if resume_cursor.is_some()
-                && deferred_watches.lock().await.insert(session_id.clone())
+            // Subscribing before dispatch (not only on an explicit resume
+            // cursor) closes the same gap `acp_bridge`'s identical fix
+            // documents above: `dispatch_shared_for_tenant` below is what
+            // reads the backend's `session/update` stream and attempts
+            // live delivery (`try_deliver_live` in `router.rs`) for the
+            // very call this function is about to run. Deferring the
+            // subscribe until *after* that call returns (the
+            // `subscribe_after_response` fallback further down) meant no
+            // subscriber was ever registered while it ran, so every
+            // notification for every ordinary (non-reconnect)
+            // `session/prompt` fell back to the `_acpx.updates` response
+            // bundle -- delivered as real frames eventually, but only as
+            // one end-of-turn batch, not incrementally live. Also
+            // preserves the original reconnect-cursor case's ordering
+            // requirement: installing the receiver before the potentially
+            // slow backend call keeps live records that arrive while
+            // `session/resume`/`session/load` is in flight even if they
+            // later roll out of the bounded replay ring.
+            let resumed_before_dispatch = if deferred_watches
+                .lock()
+                .await
+                .insert(session_id.clone())
             {
                 let state = stream_resume_state_shared(&router, &tenant_id, &session_id).await;
                 match hub
@@ -648,7 +827,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                 {
                     Ok(mut rx) => {
                         let forwarder_sink = Arc::clone(&sink);
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             loop {
                                 let update = match rx.recv().await {
                                     Ok(update) => update.into_value(),
@@ -674,6 +853,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                 }
                             }
                         });
+                        background_tasks.lock().await.push(handle);
                         true
                     }
                     Err(error) => {
@@ -692,7 +872,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             // this connection for the duration it owns this session.
             let mut relay_rx = agent_relay.subscribe(session_id.clone()).await;
             let relay_sink = Arc::clone(&sink);
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 while let Some(envelope) = relay_rx.recv().await {
                     let frame = serde_json::json!({
                         "jsonrpc": "2.0",
@@ -706,6 +886,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                     write_frame(&relay_sink, &frame).await;
                 }
             });
+            background_tasks.lock().await.push(handle);
             let binding = interaction_hub
                 .bind(
                     tenant_id.clone(),
@@ -728,7 +909,8 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             let sink = Arc::clone(&sink);
             let hub = hub.clone();
             let deferred_watches = Arc::clone(&deferred_watches);
-            tokio::spawn(async move {
+            let dispatch_background_tasks = Arc::clone(&background_tasks);
+            let handle = tokio::spawn(async move {
                 let mut response =
                     match dispatch_shared_for_tenant(&router, &tenant_id, request.clone()).await {
                         Ok(response) => response,
@@ -750,7 +932,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                     {
                         Ok(mut rx) => {
                             let forwarder_sink = Arc::clone(&sink);
-                            tokio::spawn(async move {
+                            let handle = tokio::spawn(async move {
                                 loop {
                                     let update = match rx.recv().await {
                                         Ok(update) => update.into_value(),
@@ -778,6 +960,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                     }
                                 }
                             });
+                            dispatch_background_tasks.lock().await.push(handle);
                         }
                         Err(error) => {
                             deferred_watches.lock().await.remove(&session_id);
@@ -792,6 +975,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                 };
                 let _ = sink.lock().await.send(Message::Text(payload)).await;
             });
+            background_tasks.lock().await.push(handle);
             continue;
         }
 
@@ -830,7 +1014,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                     Ok(mut rx) => {
                         deferred_watches.lock().await.insert(watch.clone());
                         let forwarder_sink = Arc::clone(&sink);
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             loop {
                                 let update = match rx.recv().await {
                                     Ok(update) => update.into_value(),
@@ -856,9 +1040,10 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                 }
                             }
                         });
+                        background_tasks.lock().await.push(handle);
                         let mut relay_rx = agent_relay.subscribe(watch.clone()).await;
                         let relay_sink = Arc::clone(&sink);
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             while let Some(envelope) = relay_rx.recv().await {
                                 let frame = serde_json::json!({
                                     "jsonrpc": "2.0",
@@ -872,6 +1057,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                 write_frame(&relay_sink, &frame).await;
                             }
                         });
+                        background_tasks.lock().await.push(handle);
                     }
                     Err(error) => {
                         watched.remove(&watch);
@@ -889,6 +1075,15 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
         agent_relay.unsubscribe(session_id).await;
     }
     drop(watched);
+    // See `background_tasks`'s doc comment at the top of this function:
+    // abort every task this connection spawned before returning, so
+    // `sink`'s `Arc` refcount reaches zero here regardless of whether the
+    // session(s) it watched ever get their shared stream explicitly torn
+    // down -- that is what actually lets the socket's write half drop and
+    // our own FIN go out, instead of leaving it `CLOSE-WAIT` indefinitely.
+    for handle in background_tasks.lock().await.drain(..) {
+        handle.abort();
+    }
     for (_, binding) in interaction_bindings.lock().await.drain() {
         interaction_hub.unbind(&binding).await;
     }

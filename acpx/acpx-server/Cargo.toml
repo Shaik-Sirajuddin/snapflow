@@ -48,6 +48,19 @@ axum = { version = "0.7", features = ["ws"] }
 # was already a test-only WS-client dependency below) since this is now
 # real, non-test code.
 futures-util = "0.3"
+# **Phase 2 (`config_hot_reload`) addition.** Lock-free swap of the ACP
+# bridge's live `BridgeConfig` so a background file-watcher thread can
+# publish a freshly-validated config and every concurrent request-handling
+# task picks it up on its next read, with no lock contention and no
+# restart. See `acpx-core/src/router.rs`'s `process_reader_demux` field
+# doc comment for the sibling phase this follows;
+# `memory/acpx/gen/acpx-concurrency-config-execution.meta.json` tracks both.
+arc-swap = "1"
+# Real filesystem-level (inotify on Linux) watch on
+# `ACPX_ACP_BRIDGE_CONFIG_FILE` -- polling would work too, but a real
+# watch reloads within milliseconds of an operator's edit instead of one
+# polling interval's worth of staleness, and needs no tuning knob at all.
+notify = "6"
 
 [dev-dependencies]
 tokio = { workspace = true }

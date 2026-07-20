@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -79,7 +80,13 @@ func cmdServe(cfg config.Config, args []string) error {
 	noMCP := fs.Bool("no-mcp", false, "disable the SSE MCP adapter")
 	_ = fs.Parse(args)
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	logLevel := slog.LevelInfo
+	if v := os.Getenv("SNAPSHOTD_LOG_LEVEL"); v != "" {
+		_ = logLevel.UnmarshalText([]byte(v))
+	} else if debug, _ := strconv.ParseBool(os.Getenv("SNAPSHOTD_DEBUG")); debug {
+		logLevel = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 
 	lock, err := daemonlock.Acquire(cfg.HomeDir)
 	if err != nil {
@@ -139,6 +146,7 @@ func cmdServe(cfg config.Config, args []string) error {
 				DbPath:         filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
 				McpURL:         acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
 				DefaultAgentID: "default",
+				BackendCmd:     cfg.AcpxBackendCmd,
 				Log:            logger,
 			})
 			startCancel()

@@ -31,7 +31,7 @@ async fn framed_roundtrip_through_a_stand_in_backend() {
         .expect("write request");
 
     let echoed = backend
-        .reader
+        .reader_mut()
         .read_value()
         .await
         .expect("read echoed value");

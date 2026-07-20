@@ -31,3 +31,9 @@ tracing = { workspace = true }
 # `#[path]`, see this block's doc comment) now needs `futures_util::
 # {SinkExt, StreamExt}` to split the `WebSocket` for live-notification
 # forwarding.
+# **`config_hot_reload` (phase 2) addition** -- `transport/http.rs`
+# pulls in `transport/acp_bridge.rs` as its own submodule, which now
+# needs `arc-swap` (lock-free `BridgeConfig` swap) and `notify` (the
+# config file watcher) to resolve when compiled in here via `#[path]`.
+arc-swap = "1"
+notify = "6"

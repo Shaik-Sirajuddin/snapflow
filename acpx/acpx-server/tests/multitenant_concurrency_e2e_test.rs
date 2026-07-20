@@ -476,31 +476,26 @@ async fn two_ws_clients_of_the_same_tenant_share_sessions_while_a_third_tenant_s
     );
 }
 
-/// **Documents, rather than assumes, the live-notification "last touch
-/// wins" ownership rule (`acpx_core::notify`'s module doc comment) in the
-/// specific multi-client-same-tenant scenario it's actually meant for.**
+/// **Documents the live-notification broadcast fan-out rule
+/// (`acpx_core::notify`'s module doc comment) in the specific
+/// multi-client-same-tenant scenario it's actually meant for.**
 ///
-/// Two subtleties this test exists to pin down precisely (both easy to
-/// get backwards by just reading the doc comment without checking
-/// `ws.rs`'s actual subscribe ordering):
-/// 1. `handle_socket`'s loop only calls `hub.subscribe` *after*
-///    `dispatch_shared_for_tenant` has already fully returned (see
-///    `ws.rs`). So a `session/update` the backend streams *during*
-///    connection B's own `session/prompt` call is delivered to whoever
-///    was *already* the registered subscriber at that moment -- here,
-///    connection A (subscribed earlier via its own `session/new`) --
-///    not to B, even though B is the connection that triggered the
-///    backend to emit it.
-/// 2. Only *after* B's call fully completes does B itself call
-///    `hub.subscribe`, per `session_id_to_watch`'s `Proxied`-method
-///    branch -- silently replacing A's registration. A subsequent
-///    notification for this same gateway session now goes to B, not A:
-///    proven directly against `NotificationHub::publish` here (using a
-///    kept `Arc` clone of the router, exactly how a real backend's next
-///    streamed chunk would route) rather than needing a second real
-///    backend round trip.
-/// Once both clients have touched the session, later updates must fan out
-/// to both of them. This is the regression proof for session multiplexing.
+/// `ws.rs`'s `handle_socket` now subscribes *before* dispatching every
+/// `session/prompt` on an already-bound session (the "generalized
+/// subscribe-before-dispatch" fix -- see `ws.rs`'s own doc comment on
+/// that change), not only on an explicit `_acpx.resume` reconnect. So by
+/// the time connection B's own `session/prompt` call reaches the
+/// backend, B is already a registered subscriber for `gateway_id`,
+/// alongside A (subscribed earlier via its own `session/new`). A
+/// `session/update` the backend streams *during* B's call therefore
+/// broadcasts to *both* already-registered subscribers -- A and B -- not
+/// just to whichever one happened to subscribe first. This is exactly
+/// what the fix exists for: B, the connection that triggered the turn,
+/// no longer has to wait for the end-of-turn `_acpx.updates` bundle to
+/// see its own stream.
+/// Once both clients have touched the session, later updates must
+/// continue to fan out to both of them. This is the regression proof for
+/// session multiplexing.
 #[tokio::test]
 async fn same_tenant_connections_receive_the_same_later_session_updates() {
     let streaming_script = r#"
@@ -543,9 +538,10 @@ done
     // Connection A is now subscribed (session/new always watches the
     // session it just minted).
 
-    // Connection B, same tenant, now prompts the same session. The
-    // backend streams a chunk *during* this call -- delivered live to A
-    // (still the registered subscriber at that instant), not B.
+    // Connection B, same tenant, now prompts the same session. Thanks to
+    // subscribe-before-dispatch, B is already a registered subscriber by
+    // the time the backend streams a chunk *during* this call, so the
+    // chunk broadcasts live to both A and B.
     let prompt_resp = ws_rpc(
         &mut ws_b,
         json!({
@@ -561,10 +557,10 @@ done
     // the subscriber happened to be.
     assert!(prompt_resp["_acpx"].get("updates").is_none());
 
-    // A, the subscriber at the moment the chunk was emitted, receives it
-    // as its own independent next frame (not tucked inside B's response
-    // -- a genuinely separate, unsolicited JSON-RPC notification frame
-    // per the whole point of ACP compatibility phase 14).
+    // A, a subscriber at the moment the chunk was emitted, receives it as
+    // its own independent next frame (not tucked inside B's response --
+    // a genuinely separate, unsolicited JSON-RPC notification frame per
+    // the whole point of ACP compatibility phase 14).
     let live_frame = tokio::time::timeout(Duration::from_secs(2), ws_a.next())
         .await
         .expect("live frame should arrive on A promptly (A was the subscriber when it fired)")
@@ -582,13 +578,26 @@ done
     );
     assert_eq!(live_value["params"]["sessionId"], json!(gateway_id));
 
-    // B must not have received that same chunk too -- it went to A only.
-    let b_has_nothing = tokio::time::timeout(Duration::from_millis(300), ws_b.next()).await;
-    assert!(
-        b_has_nothing.is_err(),
-        "connection B should not have received the chunk that went live to A, got: \
-         {b_has_nothing:?}"
+    // B, also a subscriber by the time the chunk was emitted (subscribed
+    // before its own dispatch, per the fix), independently receives the
+    // exact same broadcast frame -- proving B no longer has to wait for
+    // `_acpx.updates` to see its own triggered turn's live stream.
+    let b_live_frame = tokio::time::timeout(Duration::from_secs(2), ws_b.next())
+        .await
+        .expect("live frame should arrive on B promptly (B is a subscriber by the time it fired)")
+        .expect("ws stream ended early")
+        .expect("ws frame error");
+    let b_live_text = match b_live_frame {
+        WsMessage::Text(text) => text,
+        other => panic!("expected text frame, got {other:?}"),
+    };
+    let b_live_value: serde_json::Value = serde_json::from_str(&b_live_text).expect("json body");
+    assert_eq!(b_live_value["method"], json!("session/update"));
+    assert_eq!(
+        b_live_value["params"]["update"]["content"]["text"],
+        json!("from-connection-b")
     );
+    assert_eq!(b_live_value["params"]["sessionId"], json!(gateway_id));
 
     // B has now subscribed after its successful call. Publish a synthetic
     // next notification exactly as a backend would and confirm fan-out to

@@ -301,8 +301,35 @@ impl NotificationHub {
 
         let (current_epoch, clear_replay) = {
             let mut epoch = stream.epoch.lock().await;
-            let backend_changed = epoch.backend_session_id != resume_state.backend_session_id
-                && resume_state.backend_session_id.is_some();
+            // A *genuine* backend-session swap (a real restart / a
+            // different physical backend now answering for this gateway
+            // session) is the only thing that should invalidate the
+            // epoch and wipe replay -- `Some(a) -> Some(b)` with `a !=
+            // b`. `None -> Some(_)` is not a change at all: it is simply
+            // the *first* time any subscriber has ever supplied durable
+            // backend identity (every session's very first subscribe,
+            // at `session/new`, goes through the WS transports'
+            // "post-response fallback" path with `StreamResumeState::
+            // default()`, which never populates `backend_session_id` --
+            // see that path's call site). The `else if` arm below exists
+            // specifically to absorb that first observation without
+            // disturbing replay, but a naive `!=` comparison here made
+            // it unreachable: `None != Some(_)` is always true, so the
+            // very first resume of *any* session's life used to take
+            // this arm instead, needlessly bumping the epoch and
+            // clearing every buffered notification a client's own
+            // `_acpx.resume` cursor was about to recover. Found via a
+            // real bridge-reconnect-mid-stream end-to-end test: replay
+            // silently produced nothing for the gap on a session's first
+            // ever resume, live delivery only, exactly the "first part
+            // of the message is lost on resume" symptom.
+            let backend_changed = matches!(
+                (
+                    epoch.backend_session_id.as_deref(),
+                    resume_state.backend_session_id.as_deref(),
+                ),
+                (Some(old), Some(new)) if old != new
+            );
             if backend_changed || resume_state.durable_state_changed {
                 epoch.generation += 1;
                 epoch.backend_session_id = resume_state.backend_session_id.clone();
@@ -315,13 +342,19 @@ impl NotificationHub {
             } else if epoch.backend_session_id.is_none()
                 && resume_state.backend_session_id.is_some()
             {
+                // Record the now-known identity for *future* drift
+                // comparisons, but deliberately leave `epoch.value`
+                // untouched: it was already handed out (inside
+                // `Envelope::into_value`) to every subscriber that has
+                // seen a notification on this stream so far, computed
+                // back when `backend_session_id` was still unknown.
+                // Recomputing it here -- even without bumping
+                // `generation` -- would invalidate every one of those
+                // already-issued cursors on the very next resume
+                // attempt, since [`Self::subscribe_resuming`]'s cursor
+                // check further down is a plain equality test against
+                // whatever `current_epoch` this block produces.
                 epoch.backend_session_id = resume_state.backend_session_id.clone();
-                epoch.value = epoch_value(
-                    &stream_key,
-                    &self.process_nonce,
-                    epoch.generation,
-                    epoch.backend_session_id.as_deref(),
-                );
             }
             (
                 epoch.value.clone(),
@@ -609,6 +642,121 @@ mod tests {
                 assert_ne!(epoch, old_epoch);
                 assert_eq!(seq, 1);
             }
+            other => panic!("expected resync error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_ever_backend_session_observation_does_not_wipe_replay() {
+        // Regression test for the real bug this fixes: a session's very
+        // first subscribe (mirroring the WS transports' `session/new`
+        // "post-response fallback" path) never supplies a
+        // `backend_session_id` -- see that call site's `StreamResumeState::
+        // default()`. The *first* resume attempt that finally learns it
+        // (mirroring `stream_resume_state_shared`, used by the
+        // pre-dispatch reconnect-cursor path) must not be treated as a
+        // genuine backend swap: doing so needlessly bumped the epoch and
+        // cleared every buffered notification a valid `_acpx.resume`
+        // cursor was about to recover.
+        let hub = NotificationHub::with_replay_limits(8, 4, 10);
+        let tenant = TenantId::from("tenant-a");
+
+        // The "session/new" subscribe: no backend identity known yet.
+        let mut first = hub
+            .subscribe_resuming(&tenant, "session-1", None, StreamResumeState::default())
+            .await
+            .unwrap();
+        assert!(
+            hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
+                .await
+        );
+        let delivered = first.recv().await.unwrap();
+        let cursor = ResumeCursor {
+            last_seq: delivered.seq,
+            epoch: delivered.epoch.clone(),
+        };
+        drop(first); // simulated mid-stream disconnect
+
+        // Published while nobody was subscribed -- exactly what a
+        // client's resume cursor exists to recover.
+        assert!(
+            !hub.publish(&tenant, "session-1", serde_json::json!({"n": 2}))
+                .await
+        );
+        assert!(
+            !hub.publish(&tenant, "session-1", serde_json::json!({"n": 3}))
+                .await
+        );
+
+        // The reconnect: this is the *first* time backend identity is
+        // ever supplied for this stream (mirrors `stream_resume_state_
+        // shared` resolving it from the session registry on a real
+        // `session/load`/`session/resume`).
+        let mut resumed = hub
+            .subscribe_resuming(
+                &tenant,
+                "session-1",
+                Some(cursor),
+                StreamResumeState {
+                    backend_session_id: Some("backend-1".to_string()),
+                    durable_state_changed: false,
+                },
+            )
+            .await
+            .expect("first-ever backend identity must not force a resync");
+
+        assert_eq!(resumed.recv().await.unwrap().seq(), 2);
+        assert_eq!(resumed.recv().await.unwrap().seq(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_genuine_backend_session_swap_still_invalidates_the_epoch() {
+        // The fix above must not blunt real drift detection: once a
+        // stream has *already* observed one backend session id, a
+        // resume that reports a *different* one is a genuine backend
+        // swap (a real restart under a fresh backend process) and must
+        // still force a resync exactly as before.
+        let hub = NotificationHub::new();
+        let tenant = TenantId::from("tenant-a");
+
+        let mut first = hub
+            .subscribe_resuming(
+                &tenant,
+                "session-1",
+                None,
+                StreamResumeState {
+                    backend_session_id: Some("backend-1".to_string()),
+                    durable_state_changed: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            hub.publish(&tenant, "session-1", serde_json::json!({"n": 1}))
+                .await
+        );
+        let delivered = first.recv().await.unwrap();
+        let old_epoch = delivered.epoch.clone();
+        let cursor = ResumeCursor {
+            last_seq: delivered.seq,
+            epoch: old_epoch.clone(),
+        };
+        drop(first);
+
+        let error = hub
+            .subscribe_resuming(
+                &tenant,
+                "session-1",
+                Some(cursor),
+                StreamResumeState {
+                    backend_session_id: Some("backend-2".to_string()),
+                    durable_state_changed: false,
+                },
+            )
+            .await
+            .expect_err("a genuinely different backend session id must still force a resync");
+        match error {
+            SubscribeError::ResyncRequired { epoch, .. } => assert_ne!(epoch, old_epoch),
             other => panic!("expected resync error, got {other:?}"),
         }
     }

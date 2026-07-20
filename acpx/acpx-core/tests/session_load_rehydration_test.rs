@@ -151,16 +151,17 @@ async fn session_delete_also_rehydrates_from_persistence() {
     assert!(delete_response.get("error").is_none());
 }
 
-/// Rehydration is deliberately scoped to `session/load`/`session/resume`/
-/// `session/delete` only -- every other `Proxied` method (`session/
-/// prompt` here) must keep erroring `UnknownSession` for a gateway id
-/// this process's in-memory registry has never held live, even with
-/// persistence configured and a matching durable row present. Silently
-/// reviving one on an arbitrary method would paper over real client bugs
-/// (e.g. a stale/typo'd session id in an ordinary prompt call) instead of
-/// surfacing them.
+/// **`acpx-session-transparent-revival`.** An ordinary `session/prompt`
+/// against a gateway id whose in-memory entry is gone (idle-reaped, or a
+/// restart) but whose durable row is still present must now rehydrate
+/// transparently, exactly like `session/load` does just above -- a real
+/// ACP client (Zed) has no reason to re-issue `session/load` before its
+/// next prompt on a thread the user never closed, and previously got a
+/// dead-end `UnknownSession` even though ACPX itself had everything on
+/// disk needed to resume the turn. See `Router::rehydrate_session`'s doc
+/// comment for the full incident this closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_prompt_does_not_rehydrate_even_with_a_matching_persisted_row() {
+async fn session_prompt_rehydrates_from_persistence_after_close() {
     let store = PersistenceStore::open_in_memory().expect("open in-memory store");
     let mut router = Router::new("stand-in-agent").with_persistence(store.clone());
     router.register_agent("stand-in-agent", stand_in_backend_spec());
@@ -186,14 +187,38 @@ async fn session_prompt_does_not_rehydrate_even_with_a_matching_persisted_row() 
         .await
         .expect("session/close");
 
-    let err = router
+    let prompt_response = router
         .dispatch(json!({
             "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
             "params": {"sessionId": gateway_id, "prompt": []}
         }))
         .await
-        .expect_err("session/prompt must not rehydrate a closed session");
-    assert!(matches!(err, RouterError::UnknownSession(id) if id == gateway_id));
+        .unwrap_or_else(|err| panic!("session/prompt should rehydrate from persistence: {err}"));
+    assert!(
+        prompt_response.get("error").is_none(),
+        "session/prompt returned a JSON-RPC error: {prompt_response:?}"
+    );
+}
+
+/// A gateway session id that genuinely never existed (or belongs to a
+/// different tenant) must still fail `UnknownSession` for `session/
+/// prompt` even with persistence configured -- widening rehydration to
+/// ordinary `Proxied` methods must never turn a real typo/stale-id bug
+/// into a silent success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_prompt_still_fails_for_a_truly_unknown_gateway_id() {
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    let mut router = Router::new("stand-in-agent").with_persistence(store);
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+
+    let err = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/prompt",
+            "params": {"sessionId": "never-existed", "prompt": []}
+        }))
+        .await
+        .expect_err("session/prompt against a never-created session must still fail");
+    assert!(matches!(err, RouterError::UnknownSession(id) if id == "never-existed"));
 }
 
 /// No persistence configured at all -- `session/load` against an

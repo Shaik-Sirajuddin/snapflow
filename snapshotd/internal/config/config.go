@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is the daemon's runtime configuration. Defaults follow the
@@ -50,6 +51,21 @@ type Config struct {
 	// missing, never panic or hang.
 	SnapshotBinPath string
 
+	// LaunchConnectTimeout is how long daemon.launch waits for a newly
+	// spawned instance to open its own SAP control socket before giving
+	// up and killing it (procmgr.Manager.ConnectTimeout, default 5s).
+	// Configurable via SNAPSHOTD_LAUNCH_TIMEOUT (a Go duration string,
+	// e.g. "30s") since a real Qt/MLT cold start -- font/plugin
+	// enumeration, first-paint layout -- can genuinely take longer than
+	// 5s under software rendering (observed directly: a real launch on
+	// this checkout's Xvfb+software-renderer setup took 15-20s to open
+	// its socket, well past the previous hardcoded default, causing
+	// every `daemon.launch --gui` call to fail with a misleading
+	// "child did not open ... within 5s" error even though the child
+	// process itself was healthy and would have opened it shortly after
+	// being killed for "taking too long").
+	LaunchConnectTimeout time.Duration
+
 	// MCPSSEAddr is the address the always-on MCP SSE adapter listens on, per
 	// 08's "SSE MCP enabled by default" decision.
 	MCPSSEAddr string
@@ -72,6 +88,15 @@ type Config struct {
 
 	// AcpxConfigPath is the generated ACPX_CONFIG_FILE path.
 	AcpxConfigPath string
+
+	// AcpxBackendCmd is optional ACPX_BACKEND_CMD for the bundled
+	// acpx-server's "default" profile (SNAPSHOTD_ACPX_BACKEND_CMD).
+	// Empty means acpx-server picks its own built-in default backend
+	// (a real, auth-requiring adapter) -- set this to point the bundled
+	// gateway at a no-auth stdio ACP agent (e.g. panel-rust's
+	// `rui-mock-agent` dev/test binary) for local verification flows
+	// that shouldn't need real provider credentials.
+	AcpxBackendCmd string
 }
 
 // Default returns the v1 default configuration, honoring the handful of
@@ -91,6 +116,13 @@ func Default() Config {
 	binPath := os.Getenv("SNAPSHOT_BIN_PATH")
 	if binPath == "" {
 		binPath = discoverSnapshotBinPath()
+	}
+
+	launchTimeout := 30 * time.Second
+	if v := os.Getenv("SNAPSHOTD_LAUNCH_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			launchTimeout = d
+		}
 	}
 
 	mcpAddr := os.Getenv("SNAPSHOTD_MCP_SSE_ADDR")
@@ -118,21 +150,24 @@ func Default() Config {
 		// Default on only when a binary is discoverable so plain serve stays quiet.
 		acpxEnabled = acpxBin != ""
 	}
+	acpxBackendCmd := os.Getenv("SNAPSHOTD_ACPX_BACKEND_CMD")
 
 	return Config{
-		HomeDir:           home,
-		DBPath:            filepath.Join(home, "registry.db"),
-		ControlSocketPath: filepath.Join(home, "control.sock"),
-		RunDir:            filepath.Join(home, "run"),
-		LogDir:            filepath.Join(home, "logs"),
-		ProjectsRoot:      filepath.Join(home, "projects"),
-		SnapshotBinPath:   binPath,
-		MCPSSEAddr:        mcpAddr,
-		AudioEnabled:      audioEnabled,
-		AcpxEnabled:       acpxEnabled,
-		AcpxBinPath:       acpxBin,
-		AcpxHttpBind:      acpxBind,
-		AcpxConfigPath:    acpxConfig,
+		HomeDir:              home,
+		DBPath:               filepath.Join(home, "registry.db"),
+		ControlSocketPath:    filepath.Join(home, "control.sock"),
+		RunDir:               filepath.Join(home, "run"),
+		LogDir:               filepath.Join(home, "logs"),
+		ProjectsRoot:         filepath.Join(home, "projects"),
+		SnapshotBinPath:      binPath,
+		LaunchConnectTimeout: launchTimeout,
+		MCPSSEAddr:           mcpAddr,
+		AudioEnabled:         audioEnabled,
+		AcpxEnabled:          acpxEnabled,
+		AcpxBinPath:          acpxBin,
+		AcpxHttpBind:         acpxBind,
+		AcpxConfigPath:       acpxConfig,
+		AcpxBackendCmd:       acpxBackendCmd,
 	}
 }
 

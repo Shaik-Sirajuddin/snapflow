@@ -3365,3 +3365,85 @@ test -p acpx-server --test real_ambient_multi_agent_test
 ambient_codex_only_conversation_conforms_to_generated_schema -- --ignored
 --nocapture` (passed in 13.93 seconds). OpenHands live restart recovery
 remains externally gated by a running agent-server/session API key.
+
+## Phase 44: `ensure_backend_initialized` had no timeout -- `session/load`/bridge-binding could hang forever (fixed)
+
+**Confirmed real, then fixed, as of July 19, 2026.** Investigated a live
+report of `"bridge session binding is in progress; retry the request"`
+(`BridgeDispatchError::BindingInProgress`) never clearing, alongside an
+`acpx-server` log line (`"acpx idle scavenger saw an id-bearing frame with no
+in-flight caller; ignoring"`) consistent with a caller abandoning a backend
+round trip it never got an answer for. Root cause, already half-flagged in
+the code's own comments (`ensure_backend_initialized`'s doc comment,
+`acp_bridge.rs`'s `MODEL_PROBE_TIMEOUT` doc comment): the `initialize`/
+`authenticate` handshake reads inside `ensure_backend_initialized`
+(`proc.reader.read_value().await`, no `tokio::time::timeout` around either)
+were the only reads on every `session/new`/`session/load`/`session/resume`/
+`session/prompt` path *not* bounded by `BACKEND_IDLE_READ_TIMEOUT`/
+`SESSION_ESTABLISH_IDLE_READ_TIMEOUT` -- `read_matching_response_with_
+idle_timeout` only starts covering the *next* read, after the handshake
+already completed. A backend that never answered `initialize` left the
+call -- and the per-process `BackendProcess` lock every caller holds around
+it -- hanging forever; at the bridge layer this manifested as a permanent
+`BridgeSessionState::Binding` livelock, since `bind()`'s `result = async {
+... }.await` block never resolved and neither `finish_binding` nor
+`fail_binding` could ever run.
+
+**The fix:** a new `BACKEND_HANDSHAKE_TIMEOUT` constant (30s, shorter than
+`SESSION_ESTABLISH_IDLE_READ_TIMEOUT`'s already-aggressive 45s connect
+budget) now bounds both the `initialize` and `authenticate` handshake reads
+in `ensure_backend_initialized`. On expiry the wedged process is killed
+(same "free the lock for every other session on this agent" pattern as
+`BACKEND_IDLE_READ_TIMEOUT`'s existing kill-on-expiry) and the call fails
+with a new `RouterError::BackendHandshakeTimeout(&'static str, Duration)`
+variant naming which handshake timed out. `ensure_backend_initialized` was
+split into a thin public wrapper plus `ensure_backend_initialized_with_
+handshake_timeout` (parameterized on the timeout), mirroring the existing
+`read_matching_response`/`read_matching_response_with_idle_timeout` and
+`refresh_models`/`refresh_models_with_config` testability seam.
+
+At the bridge layer, this converts the permanent `BindingInProgress`
+livelock into a real, actionable outcome: the original `session/prompt`
+that triggered lazy `bind()` now resolves with the backend's handshake-
+timeout error, `bind()`'s existing `Err` branch calls `fail_binding`
+(unchanged), and every subsequent retry observes the distinct, terminal
+`BindingFailed` (`"bridge session binding previously failed; create a new
+session"`) instead of spinning on `BindingInProgress` forever.
+
+Four layers of test coverage, cheapest to most expensive:
+
+- `acpx-core/src/router.rs`'s `backend_handshake_timeout_kills_a_wedged_
+  process_and_frees_the_lock` unit test: the low-level kill-on-expiry
+  mechanism, at a millisecond-scale timeout via the private test-only seam.
+- `acpx-core/tests/session_load_backend_handshake_timeout_test.rs`'s
+  `session_load_fails_cleanly_after_the_handshake_timeout_instead_of_
+  hanging_forever`: `session/load` through the public `Router::dispatch`
+  entry point, against a durable session whose backend never completes the
+  handshake, at the real unshortened 30-second production timeout.
+- `acpx-server/src/transport/acp_bridge.rs`'s `bridge_binding_eventually_
+  fails_cleanly_and_stops_livelocking_when_the_backend_never_answers_
+  initialize`: in-process bridge dispatch, proving the `BindingInProgress`
+  -> `BindingFailed` transition end to end (first prompt eventually resolves
+  with `BackendHandshakeTimeout`; the immediate retry still observes
+  `BindingInProgress` since binding is genuinely still in flight; the
+  post-failure retry observes `BindingFailed`, never `BindingInProgress`
+  again).
+- `acpx-server/tests/acp_bridge_binary_test.rs`'s `real_binary_bridge_
+  binding_unsticks_itself_after_the_backend_handshake_times_out`: **true
+  end-to-end**, spawning the real, already-compiled `acpx-server` binary
+  with the strict `/acp` bridge enabled, driving it purely over real HTTP
+  (`POST /acp/rpc`) against a real silent stand-in backend process -- same
+  "spawn the real binary" pattern as `binary_self_test.rs`/`provisioning_
+  binary_test.rs`, not an in-process dispatch call. Proves the exact live
+  incident's full lifecycle at the real process/network boundary: the
+  documented retry-in-progress error while binding is genuinely in flight,
+  the original call's real ~30s resolution with the handshake-timeout error,
+  and the terminal "create a new session" error on the next retry.
+
+Verified with `cargo test -p acpx-core --lib router::` (96 passed), `cargo
+test -p acpx-core --test session_load_rehydration_test --test
+session_load_backend_handshake_timeout_test` (session_load_backend_
+handshake_timeout_test genuinely takes ~30s), `cargo test -p acpx-server
+--bin acpx-server transport::http::acp_bridge::tests -- --nocapture` (7
+passed, ~50s), and `cargo test -p acpx-server --test acp_bridge_binary_test
+-- --nocapture` (passed in 70.79s).

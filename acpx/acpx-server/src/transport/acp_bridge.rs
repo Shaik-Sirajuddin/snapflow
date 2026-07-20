@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 
 use acpx_bridge::{BridgeConfig, BridgeModel};
 use acpx_core::persistence::PersistenceError;
@@ -99,12 +101,27 @@ pub enum BridgeDispatchError {
 }
 
 /// Shared state mounted only when the strict bridge feature is enabled.
-#[derive(Clone)]
+/// Always held behind `Arc<BridgeRuntime>` (see `AppState::bridge_runtime`)
+/// rather than cloned by value -- `config`'s `ArcSwap` isn't `Clone` (and
+/// deliberately so: cloning it would let a caller hold a stale snapshot
+/// past a [`BridgeRuntime::reload_config`] swap without realizing it).
 pub struct BridgeRuntime {
-    pub config: Arc<BridgeConfig>,
+    /// **`config_hot_reload` (phase 2).** Lock-free swappable so
+    /// [`Self::reload_config`] (driven by the background file-watcher
+    /// spawned in `serve_on_with_bridge_and_tenant_tokens`) can publish a
+    /// freshly-validated `BridgeConfig` without a restart and without any
+    /// concurrent reader ever blocking on a lock. Use [`Self::config`] to
+    /// read it -- never add a second public field pointing at the same
+    /// data, or a stale clone becomes possible to hold past a reload.
+    config: arc_swap::ArcSwap<BridgeConfig>,
     pub sessions: BridgeSessionStore,
     models: Arc<RwLock<Vec<BridgeModel>>>,
     config_options: Arc<RwLock<Vec<Value>>>,
+    /// Guards [`Self::refresh_models`] from running its (bounded, but
+    /// still real) per-agent capability probe on every single dispatch.
+    /// See [`MODEL_REFRESH_COOLDOWN`]'s doc comment for the live incident
+    /// this closes.
+    last_refresh_attempt: Arc<StdMutex<Option<Instant>>>,
 }
 
 /// Hard ceiling on one adapter's capability probe inside [`BridgeRuntime::refresh_models`].
@@ -125,22 +142,122 @@ pub struct BridgeRuntime {
 /// down with it.
 const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Minimum time between [`BridgeRuntime::refresh_models`] actually probing
+/// backends, regardless of how many dispatches arrive in between.
+///
+/// **Real incident this guards against, not a hypothetical.** Before this
+/// existed, `dispatch_with_interaction` called `refresh_models` --
+/// unconditionally, on *every* bridge request, including session-less ones
+/// like `agents/list` and every `session/prompt` for an unrelated session
+/// -- with zero debounce. Each call re-acquires the global router mutex
+/// and re-probes every configured agent id from scratch, bounded to
+/// `MODEL_PROBE_TIMEOUT` (20s) per agent by `tokio::time::timeout`, but
+/// that per-call bound did not prevent pile-up: while one backend was
+/// merely busy (a real in-flight `session/prompt`, not even wedged), its
+/// `probe_adapter_capabilities` call queued behind the *same*
+/// per-backend-process lock the live prompt held, so it burned close to
+/// the full 20s holding the router mutex before giving up. Every other
+/// concurrent bridge request -- including ones with nothing to do with
+/// that backend, like a plain `agents/list` -- queued behind the *router*
+/// mutex during that window, and if several concurrent requests each
+/// tried their own redundant refresh in turn, the stalls serialized and
+/// compounded instead of overlapping. Reproduced live: a single in-flight
+/// prompt against `codex-acp` caused a completely unrelated `agents/list`
+/// call to hang for minutes, well past any single `MODEL_PROBE_TIMEOUT`
+/// window, with `/health` (which never touches the router lock) still
+/// answering instantly the whole time -- proof the stall was this
+/// per-request refresh, not a genuine full-router deadlock. Once any
+/// refresh attempt has been made, every dispatch within this cooldown
+/// window returns immediately using the already-cached model list instead
+/// of re-probing; the first-ever call (start of process lifetime, `None`)
+/// always proceeds so model discovery still happens at least once.
+const MODEL_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+
 impl BridgeRuntime {
     pub fn new(config: Arc<BridgeConfig>) -> Self {
         Self {
             models: Arc::new(RwLock::new(config.models.clone())),
             config_options: Arc::new(RwLock::new(Vec::new())),
-            config,
+            config: arc_swap::ArcSwap::new(config),
             sessions: BridgeSessionStore::new(),
+            last_refresh_attempt: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// Current live `BridgeConfig` -- a cheap `Arc` clone, never blocks on
+    /// a lock. Call fresh each time you need it rather than caching the
+    /// returned `Arc` across an `.await` point that could span a reload,
+    /// unless holding a momentarily-stale snapshot is genuinely fine for
+    /// that call site (it is for every existing read site this phase
+    /// touched: each reads one field once, synchronously).
+    pub fn config(&self) -> Arc<BridgeConfig> {
+        self.config.load_full()
+    }
+
+    /// **`config_hot_reload` (phase 2).** Publish a freshly-validated
+    /// `BridgeConfig`, replacing the live one for every subsequent
+    /// [`Self::config`] read -- no restart, no dropped sessions (nothing
+    /// session-scoped lives on `BridgeConfig` itself; `BridgeSessionStore`
+    /// is untouched by a reload). Callers must have already validated
+    /// `new_config` (e.g. via [`BridgeConfig::from_file`], which validates
+    /// internally) -- this method does not re-validate, it only swaps.
+    ///
+    /// Also resets the static baseline of [`Self::models`] to
+    /// `new_config.models` (mirroring what [`Self::new`] does at
+    /// construction), so a model list edit is reflected immediately
+    /// without waiting for the next cooldown-gated [`Self::refresh_models`]
+    /// probe to layer live-discovered entries back on top.
+    pub async fn reload_config(&self, new_config: BridgeConfig) {
+        let mut models = self.models.write().await;
+        *models = new_config.models.clone();
+        drop(models);
+        self.config.store(Arc::new(new_config));
     }
 
     /// Refreshes public models from each configured adapter's cached
     /// capability probe. Static entries remain as an operator fallback, but
     /// every discovered model is exposed without hand-maintaining aliases.
     pub async fn refresh_models(&self, router: &SharedRouter) {
+        self.refresh_models_with_config(router, MODEL_PROBE_TIMEOUT, MODEL_REFRESH_COOLDOWN)
+            .await
+    }
+
+    /// Real logic behind [`Self::refresh_models`], parameterized so a unit
+    /// test can use millisecond-scale timeouts instead of waiting out
+    /// `MODEL_PROBE_TIMEOUT`/`MODEL_REFRESH_COOLDOWN`'s real production
+    /// durations. `refresh_models` is a thin wrapper always passing the
+    /// prod constants -- this seam exists purely for testability, mirroring
+    /// `acpx_core::router`'s identical `read_matching_response`/
+    /// `read_matching_response_with_idle_timeout` split.
+    async fn refresh_models_with_config(
+        &self,
+        router: &SharedRouter,
+        probe_timeout: Duration,
+        cooldown: Duration,
+    ) {
+        {
+            // Claim the right to refresh *before* doing any router-lock
+            // work, and claim it eagerly (write the new timestamp even
+            // though the probes below haven't run yet) so a burst of
+            // concurrent callers within the same instant all see the
+            // claim and skip, rather than all passing the check and all
+            // piling onto the router lock together. A `std::sync::Mutex`
+            // is safe here (never held across an `.await`): this block
+            // ends before any async work begins.
+            let mut last_attempt = self
+                .last_refresh_attempt
+                .lock()
+                .expect("last_refresh_attempt mutex poisoned");
+            let now = Instant::now();
+            if let Some(previous) = *last_attempt {
+                if now.duration_since(previous) < cooldown {
+                    return;
+                }
+            }
+            *last_attempt = Some(now);
+        }
         let agent_ids: Vec<String> = self
-            .config
+            .config()
             .agent_ids()
             .into_iter()
             .map(ToOwned::to_owned)
@@ -152,7 +269,7 @@ impl BridgeRuntime {
                 let mut router = router.lock().await;
                 router.probe_adapter_capabilities(&agent_id, "/tmp").await
             };
-            let capabilities = match tokio::time::timeout(MODEL_PROBE_TIMEOUT, probe).await {
+            let capabilities = match tokio::time::timeout(probe_timeout, probe).await {
                 Ok(result) => result,
                 Err(_) => {
                     // Timing out here drops `probe` -- and with it the router
@@ -162,7 +279,7 @@ impl BridgeRuntime {
                     // doc comment for the live incident this fixes.
                     tracing::warn!(
                         agent_id = %agent_id,
-                        timeout_secs = MODEL_PROBE_TIMEOUT.as_secs(),
+                        timeout_secs = probe_timeout.as_secs(),
                         "capability probe timed out; skipping model discovery for \
                          this adapter this refresh (static/previously-discovered \
                          models remain available)"
@@ -237,7 +354,7 @@ impl BridgeRuntime {
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": self.config.default_model,
+            "currentValue": self.config().default_model,
             "options": models.iter().map(|model| json!({
                 "value": model.id,
                 "name": model.name.as_deref().unwrap_or(&model.id),
@@ -338,6 +455,104 @@ impl BridgeRuntime {
     }
 }
 
+/// **`config_hot_reload` (phase 2).** Watches `config_path`
+/// (`ACPX_ACP_BRIDGE_CONFIG_FILE`) for filesystem changes and publishes
+/// each valid edit to `runtime` via [`BridgeRuntime::reload_config`], with
+/// no restart. An invalid candidate (fails [`BridgeConfig::validate`], or
+/// isn't even parseable JSON) is logged and discarded -- the previously
+/// live config keeps serving every request, exactly the "reject and log,
+/// keep old config live" contract
+/// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json` phase 2
+/// specifies.
+///
+/// Runs on its own dedicated OS thread, not a tokio task: `notify`'s
+/// watcher callback fires from a platform-native (inotify on Linux) event
+/// thread outside tokio's runtime, and every step this loop takes in
+/// response (`BridgeConfig::from_file` -- a small synchronous disk read
+/// + JSON parse + validate -- and `ArcSwap::store`) is itself synchronous
+/// and non-blocking-in-the-async-sense, so there is nothing here that
+/// benefits from running inside tokio; keeping it on a plain thread
+/// avoids ever needing `spawn_blocking` or bridging the callback into an
+/// async channel. The one truly async step, [`BridgeRuntime::reload_
+/// config`] (it briefly awaits `self.models`'s `RwLock`), is driven via a
+/// short-lived single-threaded `tokio::runtime::Handle::block_on` call
+/// scoped to just that one await -- cheap and rare (config edits are not
+/// a hot path) enough that spinning up a tiny runtime per reload is the
+/// simplest correct option, not a performance concern.
+///
+/// A failure to construct or start the watcher itself (rare -- e.g. the
+/// config file's parent directory disappearing, or the platform's
+/// notification backend being unavailable) is logged and this task simply
+/// exits: config changes then require a restart, exactly today's
+/// pre-phase-2 behavior, never a startup failure.
+pub fn spawn_config_watcher(runtime: Arc<BridgeRuntime>, config_path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        use notify::{RecursiveMode, Watcher};
+
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    path = %config_path.display(),
+                    "acpx bridge config hot-reload: failed to create a file watcher; \
+                     config changes will require a restart"
+                );
+                return;
+            }
+        };
+        if let Err(err) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+            tracing::warn!(
+                %err,
+                path = %config_path.display(),
+                "acpx bridge config hot-reload: failed to watch the bridge config file; \
+                 config changes will require a restart"
+            );
+            return;
+        }
+        tracing::info!(
+            path = %config_path.display(),
+            "acpx bridge config hot-reload: watching for changes"
+        );
+
+        for event in rx {
+            let event = match event {
+                Ok(event) => event,
+                Err(err) => {
+                    tracing::warn!(%err, "acpx bridge config hot-reload: watch error");
+                    continue;
+                }
+            };
+            if !(event.kind.is_modify() || event.kind.is_create()) {
+                continue;
+            }
+            match BridgeConfig::from_file(&config_path) {
+                Ok(candidate) => {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("build a tiny current-thread runtime for one reload swap");
+                    rt.block_on(runtime.reload_config(candidate));
+                    tracing::info!(
+                        path = %config_path.display(),
+                        "acpx bridge config hot-reloaded"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        path = %config_path.display(),
+                        "acpx bridge config hot-reload: candidate failed validation, \
+                         keeping the previous config live"
+                    );
+                }
+            }
+        }
+    });
+}
+
 pub async fn dispatch(
     router: &SharedRouter,
     runtime: &BridgeRuntime,
@@ -397,7 +612,7 @@ async fn new_session(
     let session_id = runtime.sessions.try_register(
         tenant_id,
         parsed,
-        runtime.config.max_virtual_sessions_per_tenant,
+        runtime.config().max_virtual_sessions_per_tenant,
     )?;
     Ok(json!({
         "jsonrpc": "2.0",
@@ -491,10 +706,11 @@ async fn set_config_option(
         BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
         BridgeSessionState::Failed => Err(BridgeDispatchError::BindingFailed),
         BridgeSessionState::Bound => {
+            let config = runtime.config();
             let current_alias = session
                 .selected_public_model_alias
                 .as_deref()
-                .unwrap_or(&runtime.config.default_model);
+                .unwrap_or(&config.default_model);
             let current = runtime
                 .resolve_model(current_alias)
                 .await
@@ -525,27 +741,153 @@ async fn set_config_option(
     }
 }
 
+/// On-demand counterpart to [`BridgeRuntime::restore_recovered_sessions`]
+/// (which only ever runs once, in bulk, at daemon startup, and only
+/// restores rows the startup batch itself already marked `Restored`
+/// within a fixed timeout window -- see that method's doc comment).
+/// Every live request path that resolves an *existing* bridge session id
+/// (`close_or_delete`, `forward_bound`) calls this first instead of
+/// reading `BridgeSessionStore` directly: an in-memory hit returns
+/// immediately, unchanged from before; a miss falls back to
+/// `PersistenceStore::find_session_by_bridge_session_id` and, if a
+/// still-open row for this exact bridge session id is found, restores it
+/// into the in-memory store on the spot before continuing.
+///
+/// **Real live incident this closes.** A restart whose startup recovery
+/// batch times out or never runs for a given session (a slow/cold
+/// backend spawn, or the daemon simply not having gotten to it within
+/// `ACPX_STARTUP_SESSION_RECOVERY_TIMEOUT_SECONDS`) used to permanently
+/// orphan that session's bridge-visible virtual id: `restore_recovered_
+/// sessions`'s bulk pass would never revisit it (it only runs once, at
+/// startup), so every later request against that same id -- exactly
+/// what a real client (Zed) reconnecting with its own locally-persisted
+/// session id does -- failed with "bridge session ... was not found",
+/// even though the underlying native session was still genuinely
+/// recoverable via `Router::rehydrate_session` (which has no such
+/// startup-only restriction). This also covers a same-process, non-
+/// restart eviction from `BridgeSessionStore` for any reason not
+/// specifically preserved by `Router::maybe_suppress_close`'s `_acpx.
+/// backgroundClose` handling.
+///
+/// Deliberately not filtered to `RecoveryStatus::Restored` the way the
+/// startup batch is (see `find_session_by_bridge_session_id`'s own
+/// doc comment): the downstream native dispatch path independently
+/// re-validates and re-establishes the underlying gateway session
+/// regardless of what status a prior startup attempt left it in, exactly
+/// as it already does for a client's own explicit `session/load`/
+/// `session/resume` retry.
+///
+/// Two callers racing the same miss is handled without surfacing an
+/// error to either: `BridgeSessionStore::restore_bound` rejects a second
+/// insert over an already-present entry, which this treats as "someone
+/// else already recovered it" and simply re-reads via `.get()`.
+async fn resolve_or_recover_bridge_session(
+    router: &SharedRouter,
+    runtime: &BridgeRuntime,
+    tenant_id: &TenantId,
+    session_id: &BridgeSessionId,
+) -> Result<BridgeSession, BridgeDispatchError> {
+    if let Some(session) = runtime.sessions.get(tenant_id, session_id) {
+        return Ok(session);
+    }
+    let not_found = || {
+        BridgeDispatchError::from(BridgeSessionError::NotFound {
+            tenant_id: tenant_id.0.clone(),
+            session_id: session_id.0.clone(),
+        })
+    };
+    let Some(store) = router.lock().await.persistence_store() else {
+        return Err(not_found());
+    };
+    let Some(record) = store
+        .find_session_by_bridge_session_id(tenant_id.0.clone(), session_id.0.clone())
+        .await?
+    else {
+        return Err(not_found());
+    };
+    let (Some(virtual_id), Some(model_alias), Some(params)) = (
+        record.bridge_session_id.clone(),
+        record.bridge_model_alias.clone(),
+        record.recovery_params.clone(),
+    ) else {
+        return Err(not_found());
+    };
+    let Ok(params) = serde_json::from_value::<NewSessionParams>(params) else {
+        tracing::warn!(
+            gateway_session_id = %record.gateway_session_id,
+            "on-demand bridge session recovery: skipping malformed persisted parameters"
+        );
+        return Err(not_found());
+    };
+    let options = record
+        .bridge_config_options
+        .and_then(|value| serde_json::from_value::<HashMap<String, String>>(value).ok())
+        .unwrap_or_default();
+    // Errors here mean a racing caller already restored this exact
+    // entry -- fall through to the `.get()` below rather than
+    // propagating, per this function's own doc comment.
+    let _ = runtime.sessions.restore_bound(
+        tenant_id,
+        BridgeSessionId(virtual_id),
+        params,
+        Some(model_alias),
+        options,
+        record.gateway_session_id,
+    );
+    runtime
+        .sessions
+        .get(tenant_id, session_id)
+        .ok_or_else(not_found)
+}
+
 async fn close_or_delete(
     router: &SharedRouter,
     runtime: &BridgeRuntime,
     tenant_id: &TenantId,
     request: Value,
 ) -> Result<Value, BridgeDispatchError> {
-    reject_acpx_extension(&request)?;
+    reject_acpx_extension_except_bg(&request)?;
+    let is_delete = request.get("method").and_then(Value::as_str) == Some("session/delete");
     let session_id = request_session_id(&request)?;
-    let Some(session) = runtime.sessions.get(tenant_id, &session_id) else {
-        return Err(BridgeSessionError::NotFound {
-            tenant_id: tenant_id.0.clone(),
-            session_id: session_id.0.clone(),
-        }
-        .into());
-    };
+    let session = resolve_or_recover_bridge_session(router, runtime, tenant_id, &session_id).await?;
     if session.state == BridgeSessionState::Unbound {
         runtime.sessions.remove(tenant_id, &session_id);
         return Ok(success(&request, json!({})));
     }
     let response = forward_session_request(router, tenant_id, &session, request).await?;
-    if response.get("error").is_none() {
+    // **Real ACP semantics, `close` vs `delete`.** `session/close` means
+    // "free this session's resources", not "this session id is
+    // permanently gone" -- the entire reason `sessionCapabilities.close`
+    // and `.resume` both exist is so a client can free a session now and
+    // legitimately `session/resume` the *same* id later (a real Zed
+    // conversation-tab close/reopen does exactly this, reconnecting with
+    // a brand new `AgentConnection`/bridge subprocess and calling
+    // `resume_session` with the id it remembers -- see `agent_ui::
+    // conversation_view`'s `resume_session` call site). Only `session/
+    // delete` is the real "this id is gone for good" signal. So a
+    // successful `session/close` must keep this bridge's own virtual
+    // session-id mapping (`BridgeRuntime::sessions`, separate from the
+    // native gateway `SessionRegistry` `Router::maybe_suppress_close`
+    // manages) -- `forward_bound`'s `session/resume`/`session/load`
+    // handling needs it to still find `bound_gateway_session_id` to
+    // rewrite onto. `session/prompt` and friends against this same id
+    // in the meantime still correctly fail: the *native* gateway session
+    // is genuinely gone (unless background mode kept it alive), and
+    // `rehydrate_session`'s restart-survival fallback only accepts
+    // `session/load`/`session/resume`, not `session/prompt`. Found live,
+    // running a real Zed-shaped close-then-resume round trip against
+    // this feature: `session/resume` on a session this same bridge had
+    // genuinely closed came back "bridge session not found", despite
+    // ACPX's own `initialize` response advertising `sessionCapabilities.
+    // resume` as fully supported.
+    //
+    // `_acpx.backgroundClose` (see `Router::maybe_suppress_close`'s doc
+    // comment) is a stronger case of the same thing -- the underlying
+    // gateway session was never even touched -- but is otherwise now
+    // redundant with the `!is_delete` rule below; kept as an explicit,
+    // documented marker (not just relied on implicitly) since a real
+    // ACP client's response parser must never depend on it existing.
+    if response.get("error").is_none() && is_delete {
         runtime.sessions.remove(tenant_id, &session_id);
     }
     Ok(response)
@@ -560,13 +902,7 @@ async fn forward_bound(
 ) -> Result<Value, BridgeDispatchError> {
     reject_acpx_extension(&request)?;
     let session_id = request_session_id(&request)?;
-    let session = runtime
-        .sessions
-        .get(tenant_id, &session_id)
-        .ok_or_else(|| BridgeSessionError::NotFound {
-            tenant_id: tenant_id.0.clone(),
-            session_id: session_id.0.clone(),
-        })?;
+    let session = resolve_or_recover_bridge_session(router, runtime, tenant_id, &session_id).await?;
     let session = match session.state {
         BridgeSessionState::Unbound => {
             bind(router, runtime, tenant_id, &session_id, session).await?
@@ -673,10 +1009,11 @@ async fn bind(
         }
     }
 
+    let config = runtime.config();
     let model_alias = session
         .selected_public_model_alias
         .as_deref()
-        .unwrap_or(&runtime.config.default_model);
+        .unwrap_or(&config.default_model);
     let model = match runtime.resolve_model(model_alias).await {
         Some(model) => model,
         None => {
@@ -796,7 +1133,7 @@ async fn persist_bridge_binding(
             session
                 .selected_public_model_alias
                 .clone()
-                .unwrap_or_else(|| runtime.config.default_model.clone()),
+                .unwrap_or_else(|| runtime.config().default_model.clone()),
             serde_json::to_value(&session.selected_adapter_config_options)
                 .expect("bridge adapter options serialize"),
         )
@@ -866,6 +1203,28 @@ fn reject_acpx_extension(request: &Value) -> Result<(), BridgeDispatchError> {
     }
 }
 
+/// `close_or_delete`'s narrow relaxation of [`reject_acpx_extension`]:
+/// `_acpx.bg` (see `acpx_core::router`'s `take_background_override` and
+/// `LifecycleConfig::background_mode`'s doc comment) is the one
+/// acpx-specific extension field this otherwise byte-for-byte
+/// spec-conformant bridge accepts, because it's purely additive and
+/// silently ignorable by any real ACP client that never sends it --
+/// exactly the "ignore unrecognized fields" contract every conformant
+/// JSON-RPC implementation already has to honor on both sides, so
+/// accepting it here breaks nothing for a client that doesn't opt in.
+/// Router-side dispatch strips it before anything is ever forwarded to
+/// a real backend. Any other `_acpx.*` key alongside `bg` is still
+/// rejected, same as `reject_acpx_extension`.
+fn reject_acpx_extension_except_bg(request: &Value) -> Result<(), BridgeDispatchError> {
+    let Some(extension) = request.pointer("/params/_acpx").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if extension.keys().any(|key| key != "bg") {
+        return Err(BridgeDispatchError::AcpxExtensionNotAllowed);
+    }
+    Ok(())
+}
+
 fn request_session_id(request: &Value) -> Result<BridgeSessionId, BridgeDispatchError> {
     request
         .pointer("/params/sessionId")
@@ -898,6 +1257,371 @@ mod tests {
         sessions::{RecoveryMetadata, RecoveryMethod},
         PersistenceStore,
     };
+
+    /// **`_acpx.bg` bridge carve-out.** The strict `/acp` bridge rejects
+    /// any `_acpx` extension on every method except `session/close`/
+    /// `session/delete`'s narrow `bg`-only allowance -- see
+    /// `LifecycleConfig::background_mode`'s doc comment for the feature.
+    /// A real ACP client that never sends `_acpx` at all must remain
+    /// entirely unaffected (empty extension object and no extension
+    /// object are both accepted); a client that sends `bg` alone is
+    /// accepted; any other key, alone or alongside `bg`, is still
+    /// rejected exactly like `reject_acpx_extension` would reject it.
+    #[test]
+    fn reject_acpx_extension_except_bg_only_allows_the_bg_key() {
+        let no_extension = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/close",
+            "params": {"sessionId": "s1"}
+        });
+        assert!(reject_acpx_extension_except_bg(&no_extension).is_ok());
+
+        let bg_only = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/close",
+            "params": {"sessionId": "s1", "_acpx": {"bg": "off"}}
+        });
+        assert!(reject_acpx_extension_except_bg(&bg_only).is_ok());
+
+        let bg_boolean = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/close",
+            "params": {"sessionId": "s1", "_acpx": {"bg": true}}
+        });
+        assert!(reject_acpx_extension_except_bg(&bg_boolean).is_ok());
+
+        let unrelated_extension = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/close",
+            "params": {"sessionId": "s1", "_acpx": {"profile": "work"}}
+        });
+        assert!(matches!(
+            reject_acpx_extension_except_bg(&unrelated_extension),
+            Err(BridgeDispatchError::AcpxExtensionNotAllowed)
+        ));
+
+        let bg_plus_other = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/close",
+            "params": {"sessionId": "s1", "_acpx": {"bg": "off", "profile": "work"}}
+        });
+        assert!(matches!(
+            reject_acpx_extension_except_bg(&bg_plus_other),
+            Err(BridgeDispatchError::AcpxExtensionNotAllowed)
+        ));
+    }
+
+    /// **Live-incident regression test.** `background_mode`'s `session/
+    /// close` suppression (`Router::maybe_suppress_close`) keeps the
+    /// underlying *gateway* session alive, but this bridge separately
+    /// tracks its own virtual-session-id -> gateway-session-id mapping
+    /// (`BridgeRuntime::sessions`) -- found live, running a real
+    /// Zed-shaped WS round trip against this feature, that
+    /// `close_or_delete` unconditionally dropped *that* mapping on any
+    /// successful `session/close` response, so a client (like Zed) that
+    /// keeps using the same session id after a suppressed close got
+    /// "bridge session not found" on its very next call despite the
+    /// backend session being fully alive. Fixed via the `_acpx.
+    /// backgroundClose` response marker `close_or_delete` now checks
+    /// before deciding whether to evict its own mapping. Exercises a
+    /// real lazy-bind-on-first-prompt sequence (closing an `Unbound`
+    /// session -- before any prompt -- is a different, already-correct
+    /// code path with nothing to preserve, so this deliberately prompts
+    /// once first).
+    #[tokio::test]
+    async fn background_mode_close_keeps_the_bridges_own_virtual_session_mapping_too() {
+        use acpx_core::router::Router;
+        use acpx_core::LifecycleConfig;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        const STAND_IN_BACKEND_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+
+        let mut router = Router::new("stand-in-agent".to_string()).with_lifecycle_config(
+            LifecycleConfig {
+                background_mode: true,
+                ..LifecycleConfig::default()
+            },
+        );
+        router.register_agent(
+            "stand-in-agent",
+            acpx_conductor::SpawnSpec::new(
+                "sh",
+                vec!["-c".to_string(), STAND_IN_BACKEND_SCRIPT.to_string()],
+            ),
+        );
+        let router: SharedRouter = Arc::new(AsyncMutex::new(router));
+
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: "stand-in/default".to_string(),
+            models: vec![BridgeModel {
+                id: "stand-in/default".to_string(),
+                name: None,
+                agent_id: "stand-in-agent".to_string(),
+                model_id: "default".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: None,
+        }));
+        let tenant_id = TenantId::from("tenant-a");
+
+        let new_response = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+        )
+        .await
+        .expect("session/new");
+        let sid = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+
+        // Binds for real (lazy binding happens on the first prompt).
+        dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": sid, "prompt": []}}),
+        )
+        .await
+        .expect("first session/prompt binds the session");
+
+        let close_response = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/close", "params": {"sessionId": sid}}),
+        )
+        .await
+        .expect("background-mode session/close");
+        assert_eq!(close_response["result"], json!({}));
+
+        let prompt_after_close = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": sid, "prompt": []}}),
+        )
+        .await;
+        assert!(
+            prompt_after_close.is_ok(),
+            "the bridge's own virtual session mapping must survive a \
+             background-suppressed close, not just the gateway session: \
+             {prompt_after_close:?}"
+        );
+    }
+
+    /// **Live-incident regression test.** Seeds a persisted session row
+    /// exactly the way a real gateway session ends up on disk (via
+    /// `persist_bridge_binding`'s `update_bridge_binding` call after a
+    /// live bind), but marks its `RecoveryStatus` `RecoveryFailed` --
+    /// simulating a startup recovery batch that timed out or never ran
+    /// for this session (the real failure mode this round's live
+    /// incident traced back to) -- and, crucially, never calls
+    /// `restore_recovered_sessions` at all, so `BridgeRuntime::sessions`
+    /// starts out with no in-memory entry for it whatsoever, unlike
+    /// `restored_native_session_rebuilds_its_virtual_bridge_mapping`
+    /// above (which exercises the *bulk* startup path this test
+    /// deliberately bypasses). A live `session/resume` call against this
+    /// exact bridge session id -- the same call Zed's own
+    /// `AcpConnection::resume_session` makes when reconnecting with a
+    /// locally-remembered session id -- must still succeed via
+    /// `resolve_or_recover_bridge_session`'s on-demand persistence
+    /// fallback, not fail with "bridge session ... not found".
+    /// **Real live-production regression test.** Reproduces the exact
+    /// incident this round chased: a bridge session that was genuinely,
+    /// durably closed (`status = 'closed'`, `closed_at` set -- what a
+    /// real `session/close` round trip persists) must still be
+    /// resumable via `session/resume` on the same bridge session id, at
+    /// any point afterward, matching `Router::rehydrate_session`'s own
+    /// "no status/closed_at restriction for `session/load`/`session/
+    /// resume`" behavior -- this is not a bug in the fix, it's the
+    /// entire reason `sessionCapabilities.resume` exists as a *distinct*
+    /// capability from `.close`. Confirmed against a real production
+    /// row: `sqlite3 ... "SELECT status, closed_at FROM sessions WHERE
+    /// bridge_session_id = '...'"` returned `closed | 1784439119...`
+    /// for a session Zed's own reconnect reported as "bridge session ...
+    /// not found" against the *pre-fix* deployed binary.
+    #[tokio::test]
+    async fn bridge_session_resumable_after_a_genuine_durable_close() {
+        use acpx_core::router::Router;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        const STAND_IN_BACKEND_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+
+        let store = PersistenceStore::open_in_memory().expect("persistence store");
+        store
+            .record_session_with_recovery(
+                "gateway-closed",
+                "stand-in-agent",
+                "backend-closed",
+                None,
+                "2026-07-19T00:00:00Z",
+                "tenant-a",
+                RecoveryMetadata {
+                    cwd: Some("/tmp".to_string()),
+                    recovery_params: Some(json!({"cwd": "/tmp", "mcpServers": []})),
+                    status: RecoveryStatus::Restored,
+                    recovery_method: RecoveryMethod::Load,
+                    bridge_session_id: Some("virtual-closed".to_string()),
+                    bridge_model_alias: Some("stand-in/default".to_string()),
+                    bridge_config_options: Some(json!({})),
+                    ..RecoveryMetadata::default()
+                },
+            )
+            .await
+            .expect("seed row");
+        // Mirrors exactly what `Router::dispatch_proxied_shared`'s
+        // `session/close` handling persists on a real close.
+        store
+            .close_session("gateway-closed", "2026-07-19T00:05:00Z")
+            .await
+            .expect("mark the row durably closed");
+
+        let mut router =
+            Router::new("stand-in-agent".to_string()).with_persistence(store.clone());
+        router.register_agent(
+            "stand-in-agent",
+            acpx_conductor::SpawnSpec::new(
+                "sh",
+                vec!["-c".to_string(), STAND_IN_BACKEND_SCRIPT.to_string()],
+            ),
+        );
+        let router: SharedRouter = Arc::new(AsyncMutex::new(router));
+
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: "stand-in/default".to_string(),
+            models: vec![BridgeModel {
+                id: "stand-in/default".to_string(),
+                name: None,
+                agent_id: "stand-in-agent".to_string(),
+                model_id: "default".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: None,
+        }));
+        let tenant_id = TenantId::from("tenant-a");
+
+        let resume_response = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "session/resume",
+                "params": {"sessionId": "virtual-closed", "cwd": "/tmp"}
+            }),
+        )
+        .await
+        .expect("session/resume must succeed against a genuinely closed bridge session");
+        assert!(
+            resume_response.get("error").is_none(),
+            "resuming a closed session must produce a real success response, not \
+             a lingering 'bridge session not found': {resume_response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_session_recovers_on_demand_when_startup_recovery_never_restored_it() {
+        use acpx_core::router::Router;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        const STAND_IN_BACKEND_SCRIPT: &str = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/new'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+
+        let store = PersistenceStore::open_in_memory().expect("persistence store");
+        store
+            .record_session_with_recovery(
+                "gateway-on-demand",
+                "stand-in-agent",
+                "backend-on-demand",
+                None,
+                "2026-07-19T00:00:00Z",
+                "tenant-a",
+                RecoveryMetadata {
+                    cwd: Some("/tmp".to_string()),
+                    recovery_params: Some(json!({"cwd": "/tmp", "mcpServers": []})),
+                    status: RecoveryStatus::RecoveryFailed,
+                    recovery_method: RecoveryMethod::Resume,
+                    last_recovery_error: Some("startup recovery timed out".to_string()),
+                    bridge_session_id: Some("virtual-on-demand".to_string()),
+                    bridge_model_alias: Some("stand-in/default".to_string()),
+                    bridge_config_options: Some(json!({})),
+                    ..RecoveryMetadata::default()
+                },
+            )
+            .await
+            .expect("seed a startup-recovery-failed but still-open session row");
+
+        let mut router =
+            Router::new("stand-in-agent".to_string()).with_persistence(store.clone());
+        router.register_agent(
+            "stand-in-agent",
+            acpx_conductor::SpawnSpec::new(
+                "sh",
+                vec!["-c".to_string(), STAND_IN_BACKEND_SCRIPT.to_string()],
+            ),
+        );
+        let router: SharedRouter = Arc::new(AsyncMutex::new(router));
+
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: "stand-in/default".to_string(),
+            models: vec![BridgeModel {
+                id: "stand-in/default".to_string(),
+                name: None,
+                agent_id: "stand-in-agent".to_string(),
+                model_id: "default".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: None,
+        }));
+        let tenant_id = TenantId::from("tenant-a");
+
+        // Deliberately never call `runtime.restore_recovered_sessions`
+        // here -- `runtime.sessions` starts genuinely empty, exactly
+        // like a fresh process whose startup batch skipped/timed out on
+        // this session.
+        let resume_response = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "session/resume",
+                "params": {"sessionId": "virtual-on-demand", "cwd": "/tmp"}
+            }),
+        )
+        .await
+        .expect("session/resume must recover the bridge mapping on demand, not error");
+        assert!(
+            resume_response.get("error").is_none(),
+            "on-demand recovery must produce a real success response: {resume_response:?}"
+        );
+
+        // The mapping is now genuinely present in memory -- a follow-up
+        // call no longer needs the persistence fallback at all.
+        assert!(
+            runtime
+                .sessions
+                .get(&tenant_id, &BridgeSessionId("virtual-on-demand".to_string()))
+                .is_some(),
+            "on-demand recovery must actually populate BridgeSessionStore, not just answer once"
+        );
+    }
 
     #[tokio::test]
     async fn restored_native_session_rebuilds_its_virtual_bridge_mapping() {
@@ -956,6 +1680,261 @@ mod tests {
                 .selected_adapter_config_options
                 .get("permissionMode"),
             Some(&"acceptEdits".to_string())
+        );
+    }
+
+    /// **Live incident regression test for `MODEL_REFRESH_COOLDOWN`.**
+    /// Registers one agent backed by a real, deliberately silent
+    /// subprocess (`sh -c 'cat > /dev/null'` -- never answers on stdout,
+    /// mirrors `router.rs`'s own wedged-backend test), so every capability
+    /// probe against it is guaranteed to actually block until
+    /// `probe_timeout` elapses rather than resolving instantly by luck.
+    /// A call that genuinely re-probes takes at least `probe_timeout`;
+    /// a call the cooldown correctly skips returns near-instantly. This
+    /// distinguishes "cooldown skipped the probe" from "probe happened to
+    /// be fast" in a way pure timing assertions against a real network
+    /// probe never could.
+    #[tokio::test]
+    async fn refresh_models_cooldown_skips_redundant_probes_of_a_wedged_backend() {
+        use acpx_core::router::Router;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        let mut router = Router::new("codex-acp".to_string());
+        router.register_agent(
+            "codex-acp",
+            acpx_conductor::SpawnSpec::new(
+                "sh",
+                vec!["-c".to_string(), "cat > /dev/null".to_string()],
+            ),
+        );
+        let router: SharedRouter = Arc::new(AsyncMutex::new(router));
+
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: "codex/default".to_string(),
+            models: vec![BridgeModel {
+                id: "codex/default".to_string(),
+                name: None,
+                agent_id: "codex-acp".to_string(),
+                model_id: "default".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: None,
+        }));
+
+        let probe_timeout = Duration::from_millis(150);
+        let cooldown = Duration::from_millis(600);
+
+        let first_start = std::time::Instant::now();
+        runtime
+            .refresh_models_with_config(&router, probe_timeout, cooldown)
+            .await;
+        let first_elapsed = first_start.elapsed();
+        assert!(
+            first_elapsed >= probe_timeout,
+            "first call must actually probe the wedged backend and block \
+             for the full probe_timeout, took {first_elapsed:?}"
+        );
+
+        let second_start = std::time::Instant::now();
+        runtime
+            .refresh_models_with_config(&router, probe_timeout, cooldown)
+            .await;
+        let second_elapsed = second_start.elapsed();
+        assert!(
+            second_elapsed < probe_timeout,
+            "second call within the cooldown window must skip the probe \
+             entirely and return near-instantly, took {second_elapsed:?}"
+        );
+
+        tokio::time::sleep(cooldown).await;
+
+        let third_start = std::time::Instant::now();
+        runtime
+            .refresh_models_with_config(&router, probe_timeout, cooldown)
+            .await;
+        let third_elapsed = third_start.elapsed();
+        assert!(
+            third_elapsed >= probe_timeout,
+            "third call after the cooldown expired must probe again, \
+             took {third_elapsed:?}"
+        );
+    }
+
+    /// **Fix regression test for the reported live incident.**
+    /// Reproduced `"bridge session binding is in progress; retry the
+    /// request"` (`BridgeDispatchError::BindingInProgress`) never
+    /// clearing: [`bind`]'s lazy-binding work is the `session/new` +
+    /// `session/set_config_option` round trip against the real backend
+    /// process, run entirely inside `dispatch_shared_for_tenant` ->
+    /// `dispatch_session_new_shared` -> `ensure_backend_initialized`.
+    /// Before `router.rs`'s `BACKEND_HANDSHAKE_TIMEOUT` fix,
+    /// `ensure_backend_initialized`'s `initialize` handshake read had no
+    /// timeout of its own, so a backend that never answered `initialize`
+    /// left [`bind`]'s `result = async { ... }.await` block permanently
+    /// pending: neither `finish_binding` nor `fail_binding` was ever
+    /// called, so [`BridgeSessionState`] stayed `Binding` forever, and
+    /// every retry -- including the exact one the error message itself
+    /// instructs -- kept returning `BindingInProgress` indefinitely.
+    ///
+    /// Now that the handshake read is bounded, this proves the livelock
+    /// is actually broken: the original `session/prompt` eventually
+    /// resolves with a clear backend error (not the client's own
+    /// timeout), `bind()`'s `Err` branch calls `fail_binding`, moving
+    /// [`BridgeSessionState`] to `Failed` -- and a subsequent retry
+    /// immediately observes the distinct, terminal `BindingFailed`
+    /// (`"bridge session binding previously failed; create a new
+    /// session"`), never `BindingInProgress` again. That is a real,
+    /// qualitative behavior change a client can act on (create a new
+    /// session) instead of a livelock it can only spin against forever.
+    /// See `acpx-core/tests/session_load_backend_handshake_timeout_test.rs`
+    /// for the lower-level `Router::dispatch` proof, and
+    /// `acp_bridge_binary_test.rs` for the real-process, real-HTTP
+    /// version of this same proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridge_binding_eventually_fails_cleanly_and_stops_livelocking_when_the_backend_never_answers_initialize(
+    ) {
+        use acpx_core::router::Router;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        // Same silent-backend idiom as `refresh_models_cooldown_skips_
+        // redundant_probes_of_a_wedged_backend` just above: spawns, never
+        // writes a single byte to stdout, so `initialize` is guaranteed
+        // to never be answered.
+        let mut router = Router::new("stand-in-agent".to_string());
+        router.register_agent(
+            "stand-in-agent",
+            acpx_conductor::SpawnSpec::new(
+                "sh",
+                vec!["-c".to_string(), "cat > /dev/null".to_string()],
+            ),
+        );
+        let router: SharedRouter = Arc::new(AsyncMutex::new(router));
+
+        let runtime = Arc::new(BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: "stand-in/default".to_string(),
+            models: vec![BridgeModel {
+                id: "stand-in/default".to_string(),
+                name: None,
+                agent_id: "stand-in-agent".to_string(),
+                model_id: "default".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: None,
+        })));
+        let tenant_id = TenantId::from("tenant-a");
+
+        // Pre-warm `refresh_models`'s cooldown gate with a short probe
+        // timeout so the real `dispatch()` calls below (which always use
+        // the production `MODEL_PROBE_TIMEOUT`/`MODEL_REFRESH_COOLDOWN`
+        // constants) skip re-probing this wedged backend and this test
+        // isn't stuck paying `MODEL_PROBE_TIMEOUT` (20s) on top of the
+        // gap this test actually exercises -- an unrelated, already-
+        // fixed cost (see `refresh_models_cooldown_skips_redundant_
+        // probes_of_a_wedged_backend` above), not part of what this
+        // test is proving.
+        runtime
+            .refresh_models_with_config(&router, Duration::from_millis(50), Duration::from_secs(60))
+            .await;
+
+        // `session/new` never touches the backend at all (lazy binding),
+        // so this returns immediately with a virtual session id.
+        let new_response = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+        )
+        .await
+        .expect("session/new");
+        let sid = new_response["result"]["sessionId"].as_str().unwrap().to_string();
+
+        // The first prompt triggers `bind()`, which claims `Binding`
+        // ownership and then blocks inside `ensure_backend_initialized`
+        // until `BACKEND_HANDSHAKE_TIMEOUT` (30s) elapses. Spawned so
+        // this test can observe the `BindingInProgress` window in
+        // between, then await the same handle to observe the eventual
+        // resolution.
+        let first_router = Arc::clone(&router);
+        let first_runtime = Arc::clone(&runtime);
+        let first_tenant = tenant_id.clone();
+        let first_sid = sid.clone();
+        let first_prompt = tokio::spawn(async move {
+            dispatch(
+                &first_router,
+                &first_runtime,
+                &first_tenant,
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                    "params": {"sessionId": first_sid, "prompt": []}
+                }),
+            )
+            .await
+        });
+
+        // Give the spawned prompt time to actually claim `Binding`
+        // ownership and reach the wedged `initialize` read.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !first_prompt.is_finished(),
+            "the first prompt should still be blocked inside bind() at this point"
+        );
+
+        // The exact retry the error message instructs a client to make,
+        // made while binding is still genuinely in flight.
+        let retry = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": []}
+            }),
+        )
+        .await;
+        assert!(
+            matches!(retry, Err(BridgeDispatchError::BindingInProgress)),
+            "expected the documented 'retry the request' error, got {retry:?}"
+        );
+
+        // The livelock is broken: awaiting the original call (bounded
+        // generously above the real 30s `BACKEND_HANDSHAKE_TIMEOUT`, so
+        // a regression back to an unbounded hang still fails this test
+        // deterministically instead of wedging the suite) shows it
+        // eventually resolves with the backend's own handshake-timeout
+        // error, not the client's timeout.
+        let first_outcome = tokio::time::timeout(Duration::from_secs(40), first_prompt)
+            .await
+            .expect("the original session/prompt must eventually resolve, not hang forever")
+            .expect("spawned task must not panic");
+        assert!(
+            matches!(
+                first_outcome,
+                Err(BridgeDispatchError::Router(RouterError::BackendHandshakeTimeout(
+                    "initialize",
+                    _
+                )))
+            ),
+            "expected the original call to fail with the backend's own handshake timeout, \
+             got {first_outcome:?}"
+        );
+
+        // A retry after that point must observe the distinct, terminal
+        // `BindingFailed` -- never `BindingInProgress` again. This is
+        // the qualitative proof the livelock is gone: a real client now
+        // gets an actionable "create a new session" error instead of an
+        // instruction to retry something that can never succeed.
+        let post_failure_retry = dispatch(
+            &router,
+            &runtime,
+            &tenant_id,
+            json!({
+                "jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": []}
+            }),
+        )
+        .await;
+        assert!(
+            matches!(post_failure_retry, Err(BridgeDispatchError::BindingFailed)),
+            "expected BindingFailed once the handshake timeout has moved the session out of \
+             Binding, got {post_failure_retry:?}"
         );
     }
 }

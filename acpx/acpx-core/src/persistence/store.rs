@@ -234,6 +234,25 @@ impl PersistenceStore {
 
     /// List sessions that are still open and have an explicit recovery
     /// mechanism. These rows are candidates for startup recovery.
+    ///
+    /// Excludes rows already marked [`RecoveryStatus::RecoveryFailed`] by a
+    /// *previous* pass of this same eager, startup-time batch. Without this,
+    /// a session whose backend permanently rejects `session/load`/
+    /// `session/resume` (for example codex-acp's "no rollout found for
+    /// thread id" when the underlying agent process never actually
+    /// persisted anything for that thread -- confirmed live, 3 orphaned
+    /// rows from sessions that were created but never completed a turn,
+    /// retried and failed identically on every one of several consecutive
+    /// restarts) gets re-attempted, and re-fails, forever: one doomed
+    /// backend spawn + rejection round trip added to every single startup,
+    /// permanently, plus `last_recovery_error`/the `/health` `failed`
+    /// counter staying polluted with the same stale failure. A row that
+    /// already failed once here stays durable (`last_recovery_error`
+    /// remains inspectable) and is still eligible for a *client-triggered*
+    /// retry through the on-demand path (`find_session_by_bridge_session_id`
+    /// / `rehydrate_session`, which deliberately applies no such filter --
+    /// see that method's own doc comment) -- it just never gets
+    /// automatically retried again by the unattended eager batch.
     pub async fn list_recoverable_sessions(&self) -> Result<Vec<SessionRecord>, PersistenceError> {
         let conn = self.conn.clone();
         run_blocking(move || {
@@ -247,11 +266,73 @@ impl PersistenceStore {
                  FROM sessions \
                  WHERE closed_at IS NULL \
                    AND status != 'closed' \
+                   AND status != 'recovery_failed' \
                    AND recovery_method IN ('load', 'resume') \
                  ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map([], row_to_session_record)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    /// Look up a session -- open *or* closed -- by its bridge-visible
+    /// virtual session id, scoped to `tenant_id` (a bridge session id is
+    /// only ever meaningful within the tenant that created it -- see
+    /// `rehydrate_session`'s identical tenant check for why this must
+    /// never leak a cross-tenant hit as anything other than a miss).
+    ///
+    /// Backs the strict `/acp` bridge's on-demand recovery fallback
+    /// (`transport::acp_bridge`'s `resolve_or_recover_bridge_session`):
+    /// unlike `list_recoverable_sessions`, which only feeds the eager
+    /// startup-time batch job and deliberately skips already-closed rows
+    /// (no sense proactively respawning a backend for a session no
+    /// client has actually asked to resume), this is queried lazily, per
+    /// live request, on a `BridgeSessionStore` cache miss -- the same
+    /// on-demand shape as `Router::rehydrate_session`, which this
+    /// deliberately mirrors: `rehydrate_session` places no `status`/
+    /// `closed_at` restriction on `session/load`/`session/resume`
+    /// specifically (only `session/prompt` et al. are excluded, by
+    /// simply never reaching `rehydrate_session` at all -- see that
+    /// method's own method-allowlist guard), because resuming a
+    /// previously-closed session by id, without replaying history, is
+    /// exactly what `session/resume` is *for* (and precisely why ACPX
+    /// advertises `sessionCapabilities.resume` alongside `.close` at
+    /// all). So this query intentionally does not filter on `closed_at`/
+    /// `status` either -- a `RecoveryFailed` row (a startup batch that
+    /// timed out, or never ran) and a genuinely `closed` row are both
+    /// legitimate candidates here, in both cases because the downstream
+    /// `rehydrate_session` call this feeds into independently
+    /// re-validates and re-establishes the underlying gateway session on
+    /// its own, exactly as it already does for a client's own explicit
+    /// `session/load`/`session/resume` retry against a plain (non-bridge)
+    /// native session id.
+    pub async fn find_session_by_bridge_session_id(
+        &self,
+        tenant_id: impl Into<String>,
+        bridge_session_id: impl Into<String>,
+    ) -> Result<Option<SessionRecord>, PersistenceError> {
+        let tenant_id = tenant_id.into();
+        let bridge_session_id = bridge_session_id.into();
+        let conn = self.conn.clone();
+        run_blocking(move || {
+            let conn = lock(&conn)?;
+            let mut stmt = conn.prepare(
+                "SELECT gateway_session_id, agent_id, backend_session_id, profile_name, \
+                        created_at, closed_at, tenant_id, cwd, recovery_params_json, status, \
+                        recovery_method, last_recovery_error, pinned, created_at_unix_nanos, \
+                        last_activity_at_unix_nanos, bridge_session_id, bridge_model_alias, \
+                        bridge_config_options_json, custom_idle_ttl_seconds \
+                 FROM sessions \
+                 WHERE bridge_session_id = ?1 AND tenant_id = ?2 \
+                 ORDER BY created_at DESC LIMIT 1",
+            )?;
+            let mut rows =
+                stmt.query_map(params![bridge_session_id, tenant_id], row_to_session_record)?;
+            match rows.next() {
+                Some(row) => Ok(Some(row?)),
+                None => Ok(None),
+            }
         })
         .await
     }

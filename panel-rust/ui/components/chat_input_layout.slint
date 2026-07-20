@@ -65,7 +65,13 @@ export component ChatInputLayout inherits Rectangle {
                     color: Theme.text-muted;
                     font-size: 11px * Theme.font-scale;
                     font-family: Theme.font-sans;
-                    wrap: word-wrap;
+                    // Single line + elide, not word-wrap: at the box's
+                    // collapsed min-height (34px, one text row) a wrapped
+                    // two-line placeholder overflowed its own row and
+                    // visually spilled past the field -- an ellipsis on a
+                    // single line stays inside the field at any width.
+                    wrap: no-wrap;
+                    overflow: elide;
                     visible: compose.text == "";
                     x: Metrics.pad-lg;
                     y: Metrics.pad-lg / 2;
