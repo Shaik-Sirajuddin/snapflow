@@ -2468,6 +2468,33 @@ pub extern "C" fn panel_rust_destroy(_handle: *mut PanelHandle) {
     });
 }
 
+/// Maps a `CursorHost.kind` string (set declaratively by every interactive
+/// component's `has-hover`/`has-focus` change-handler -- see
+/// `ui/tokens/cursor_host.slint` for why this indirection exists instead of
+/// Slint's own internal cursor-shape tracking) to a `Qt::CursorShape` enum
+/// value, so `RustPanelItem::poll()` (rustpanelitem.cpp) can call
+/// `setCursor(static_cast<Qt::CursorShape>(shape))` directly -- the same
+/// "map Qt-specific values on the Rust side" convention `map_qt_key` already
+/// uses for keyboard input.
+fn qt_cursor_shape_for_kind(kind: &str) -> c_int {
+    match kind {
+        "pointer" => 13, // Qt::PointingHandCursor
+        "text" => 4,     // Qt::IBeamCursor
+        _ => 0,          // Qt::ArrowCursor
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn panel_rust_cursor_shape(_handle: *mut PanelHandle) -> c_int {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return 0; // Qt::ArrowCursor
+        };
+        qt_cursor_shape_for_kind(panel.component.global::<CursorHost>().get_kind().as_str())
+    })
+}
+
 /// Forward a click at physical pixel coordinates, as a press+release pair.
 #[no_mangle]
 pub extern "C" fn panel_rust_input_click(_handle: *mut PanelHandle, x: c_uint, y: c_uint) -> bool {
@@ -2983,6 +3010,19 @@ pub extern "C" fn panel_rust_height(_handle: *mut PanelHandle) -> c_uint {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn cursor_shape_maps_known_kinds_to_qt_enum_values() {
+        assert_eq!(qt_cursor_shape_for_kind("pointer"), 13); // Qt::PointingHandCursor
+        assert_eq!(qt_cursor_shape_for_kind("text"), 4); // Qt::IBeamCursor
+    }
+
+    #[test]
+    fn cursor_shape_defaults_to_arrow_for_default_and_unknown_kinds() {
+        assert_eq!(qt_cursor_shape_for_kind("default"), 0); // Qt::ArrowCursor
+        assert_eq!(qt_cursor_shape_for_kind(""), 0);
+        assert_eq!(qt_cursor_shape_for_kind("some-future-kind"), 0);
+    }
 
     #[test]
     fn panel_create_destroy_create_reuses_slint_platform() {

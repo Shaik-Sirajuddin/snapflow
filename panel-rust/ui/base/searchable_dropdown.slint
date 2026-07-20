@@ -3,6 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { DropdownEntry } from "../types.slint";
 import { TextUtil } from "text_util.slint";
 import { Icon } from "icon.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- a trigger button that opens a list of `DropdownEntry`
 // rows, with an optional filter box. The filter box only appears once the
@@ -61,6 +62,7 @@ export component SearchableDropdown inherits Rectangle {
         accessible-label: root.trigger-label;
         accessible-action-default => { root.filter = ""; root.open = !root.open; }
         clicked => { root.filter = ""; root.open = !root.open; }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
     HorizontalLayout {
         padding-left: Metrics.space-3;
@@ -135,6 +137,7 @@ export component SearchableDropdown inherits Rectangle {
                             width: parent.width;
                             height: parent.height;
                             edited => { root.filter = self.text; }
+                            changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
                         }
                     }
                 }
@@ -168,6 +171,9 @@ export component SearchableDropdown inherits Rectangle {
                             clicked => {
                                 root.entry-selected(entry.id, entry.value);
                                 root.close();
+                            }
+                            changed has-hover => {
+                                CursorHost.kind = (self.has-hover && !entry.is-header) ? "pointer" : "default";
                             }
                         }
                         HorizontalLayout {

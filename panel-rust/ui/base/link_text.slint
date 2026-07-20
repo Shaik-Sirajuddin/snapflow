@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- href-styled text for markdown `link-clicked` targets
 // and any other explicit URL/label affordance. Pointer cursor + primary
@@ -23,6 +24,7 @@ export component LinkText inherits Rectangle {
         accessible-label: root.text;
         accessible-action-default => { root.clicked(); }
         clicked => { root.clicked(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
     label := Text {
         text: root.text;

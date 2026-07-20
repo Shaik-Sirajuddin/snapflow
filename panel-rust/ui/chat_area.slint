@@ -1,6 +1,7 @@
 import { Theme } from "./tokens/theme.slint";
 import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
+import { CursorHost } from "./tokens/cursor_host.slint";
 import { IconButton } from "./base/icon_button.slint";
 import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
@@ -349,6 +350,9 @@ export component ChatArea inherits Rectangle {
                                 load-older-requested();
                             }
                         }
+                        changed has-hover => {
+                            CursorHost.kind = (self.has-hover && !loading-older-messages) ? "pointer" : "default";
+                        }
                     }
                     Text {
                         text: loading-older-messages ? "Loading older messages..." : "Load older messages";
@@ -447,6 +451,7 @@ export component ChatArea inherits Rectangle {
                         root.stick-to-bottom = true;
                         message-scroll.viewport-y = -root.msg-max-scroll;
                     }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                 }
                 Icon {
                     source: pending-request.active

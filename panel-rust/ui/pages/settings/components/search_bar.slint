@@ -1,5 +1,6 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
+import { CursorHost } from "../../../tokens/cursor_host.slint";
 
 // Settings page chrome -- the search bar from the settings-pane-redesign
 // plan's "Component layout" section, sitting above the active section's
@@ -34,6 +35,7 @@ export component SettingsSearchBar inherits Rectangle {
         height: parent.height;
         width: parent.width - 2 * Metrics.space-4;
         vertical-alignment: center;
+        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
     }
     if root.query == "" : Text {
         text: "Search settings...";

@@ -3,6 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { LocalTerminalItem } from "../types.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Client-local PTY terminal view -- companion to `terminal_card.slint`'s
 // agent-created (read-only) `TerminalCard`/`TerminalOverlay`. This one
@@ -51,6 +52,7 @@ export component LocalTerminalCard inherits Rectangle {
                     clicked => {
                         focus-scope.focus();
                     }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                 }
                 HorizontalLayout {
                     spacing: Metrics.space-3;

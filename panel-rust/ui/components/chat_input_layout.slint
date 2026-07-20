@@ -4,6 +4,7 @@ import { Icon } from "../base/icon.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
 import { TextUtil } from "../base/text_util.slint";
 import { DropdownEntry } from "../types.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // ChatInputLayout — bottom compose surface for ChatArea:
 //   row 1: multi-line user input + send/stop
@@ -111,6 +112,7 @@ export component ChatInputLayout inherits Rectangle {
                         height: max(self.preferred-height, parent.height);
                         single-line: false;
                         wrap: word-wrap;
+                        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
                         key-pressed(event) => {
                             // Panel chords first so they still work while composing.
                             if (root.panel-shortcut(event) == EventResult.accept) {
@@ -159,6 +161,7 @@ export component ChatInputLayout inherits Rectangle {
                             if root.sending { root.stop-requested(); }
                             else { root.send-requested(); }
                         }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     }
                     VerticalLayout {
                         alignment: center;

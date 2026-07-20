@@ -1,5 +1,6 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
+import { CursorHost } from "../../../tokens/cursor_host.slint";
 
 // Settings page chrome -- the left-side section rail from the
 // settings-pane-redesign plan's "Component layout" section: `MCP Servers`
@@ -30,6 +31,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-label: "MCP Servers section";
                 accessible-action-default => { root.section-selected("mcp_servers"); }
                 clicked => { root.section-selected("mcp_servers"); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             Text {
                 text: "MCP Servers";
@@ -53,6 +55,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-label: "Agents section";
                 accessible-action-default => { root.section-selected("agents"); }
                 clicked => { root.section-selected("agents"); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             Text {
                 text: "Agents";
@@ -76,6 +79,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-label: "Harness section";
                 accessible-action-default => { root.section-selected("harness"); }
                 clicked => { root.section-selected("harness"); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             Text {
                 text: "Harness";
@@ -99,6 +103,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-label: "Skills section";
                 accessible-action-default => { root.section-selected("skills"); }
                 clicked => { root.section-selected("skills"); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             Text {
                 text: "Skills";

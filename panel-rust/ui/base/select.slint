@@ -1,6 +1,7 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "icon.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- generic single-select dropdown. Nothing in this
 // codebase had a reusable "pick one of a fixed list" control before this
@@ -83,6 +84,7 @@ export component Select inherits Rectangle {
         accessible-label: root.select-accessible-label;
         accessible-action-default => { root.query = ""; popup.show(); }
         clicked => { root.query = ""; popup.show(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
 
     Text {
@@ -144,6 +146,7 @@ export component Select inherits Rectangle {
                         x: Metrics.space-4;
                         width: parent.width - 2 * Metrics.space-4;
                         vertical-alignment: center;
+                        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
                     }
                     if root.query == "" : Text {
                         text: "Search...";

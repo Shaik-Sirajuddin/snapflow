@@ -2,6 +2,7 @@ import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
 import { Icon } from "../../base/icon.slint";
 import { IconButton } from "../../base/icon_button.slint";
+import { CursorHost } from "../../tokens/cursor_host.slint";
 
 // Skill editor -- `active_pane_and_editor_view` phase. Replaces
 // `ChatArea` in the main content area (see `app.slint`'s `active-pane`
@@ -70,6 +71,7 @@ export component SkillEditorView inherits Rectangle {
                     accessible-role: button;
                     accessible-label: "Copy skill path";
                     clicked => { root.copy-path-requested(); }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     copy-path-label := Text {
                         text: "Copy path";
                         color: Theme.text-secondary;
@@ -87,6 +89,7 @@ export component SkillEditorView inherits Rectangle {
                     accessible-role: button;
                     accessible-label: "Open in " + editor-name;
                     clicked => { root.open-in-editor-requested(editor-name); }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     open-label := Text {
                         text: "Open in " + editor-name;
                         color: Theme.text-secondary;
@@ -100,6 +103,7 @@ export component SkillEditorView inherits Rectangle {
                     accessible-role: button;
                     accessible-label: "Open with OS default application";
                     clicked => { root.open-with-os-default-requested(); }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     open-default-label := Text {
                         text: "Open";
                         color: Theme.text-secondary;
@@ -146,6 +150,7 @@ export component SkillEditorView inherits Rectangle {
                 single-line: false;
                 text <=> root.skill-content;
                 edited => { root.content-edited(self.text); }
+                changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
             }
         }
     }

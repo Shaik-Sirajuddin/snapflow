@@ -2,6 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Badge } from "../base/badge.slint";
 import { MessageItem } from "../types.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Agent / thinking / legacy tool-call card.
 // Styling on top of the working baseline:
@@ -100,6 +101,7 @@ export component MessageCard inherits Rectangle {
                 accessible-label: item.expanded ? "Hide logs" : "Show logs";
                 accessible-action-default => { toggle-expanded(item.index); }
                 clicked => { toggle-expanded(item.index); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             VerticalLayout {
                 spacing: Metrics.space-3;

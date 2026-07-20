@@ -3,6 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 import { ThreadItem, SkillOption } from "../types.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
@@ -154,6 +155,7 @@ export component Sidebar inherits Rectangle {
                     accessible-role: button;
                     accessible-label: "Show threads";
                     clicked => { skill-mode = false; }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
                         text: "Threads";
                         color: !skill-mode ? Theme.bg-primary : Theme.text-muted;
@@ -167,6 +169,7 @@ export component Sidebar inherits Rectangle {
                     accessible-role: button;
                     accessible-label: "Show skills";
                     clicked => { skill-mode = true; }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
                         text: "Skills";
                         color: skill-mode ? Theme.bg-primary : Theme.text-muted;
@@ -222,6 +225,7 @@ export component Sidebar inherits Rectangle {
                         font-size: 11px * Theme.font-scale;
                         vertical-alignment: center;
                         edited => { search-changed(self.text); }
+                        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
                     }
                 }
             }
@@ -635,6 +639,7 @@ export component Sidebar inherits Rectangle {
                             }
                             return EventResult.reject;
                         }
+                        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
                     }
                 }
                 HorizontalLayout {
@@ -645,6 +650,7 @@ export component Sidebar inherits Rectangle {
                         accessible-role: button;
                         accessible-label: "Cancel";
                         clicked => { new-skill-dialog-open = false; }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                         Text {
                             text: "Cancel";
                             color: Theme.text-secondary;
@@ -661,6 +667,9 @@ export component Sidebar inherits Rectangle {
                             root.new-skill-requested(new-skill-name-input.text);
                             new-skill-name-input.text = "";
                             new-skill-dialog-open = false;
+                        }
+                        changed has-hover => {
+                            CursorHost.kind = (self.has-hover && new-skill-name-input.text != "") ? "pointer" : "default";
                         }
                         Text {
                             text: "Create";
