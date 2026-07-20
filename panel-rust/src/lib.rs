@@ -77,10 +77,15 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
 /// Wraps `current + delta` into `0..visible_len`, both directions. Pulled
 /// out of `on_thread_navigation_requested` as a pure function so the
 /// clamp/wrap behavior (empty list, single-thread no-op, negative wrap,
-/// overflow wrap) is unit-testable without a full `PanelSingleton`.
-/// `visible_len` must be non-zero -- callers already guard on that.
+/// overflow wrap) is unit-testable without a full `PanelSingleton`. Returns
+/// `0` for `visible_len == 0` -- `rem_euclid` panics on a zero divisor, and
+/// a `debug_assert` alone would let that reach a release build, so this is
+/// a real guard, not just documentation, even though today's only caller
+/// already checks `visible_len` first.
 fn wrap_thread_index(current: usize, delta: i32, visible_len: usize) -> usize {
-    debug_assert!(visible_len > 0);
+    if visible_len == 0 {
+        return 0;
+    }
     ((current as i64 + delta as i64).rem_euclid(visible_len as i64)) as usize
 }
 
@@ -114,6 +119,27 @@ mod thread_navigation_tests {
         assert_eq!(wrap_thread_index(0, 1, 1), 0);
         assert_eq!(wrap_thread_index(0, -1, 1), 0);
     }
+
+    #[test]
+    fn empty_list_does_not_panic() {
+        assert_eq!(wrap_thread_index(0, 1, 0), 0);
+        assert_eq!(wrap_thread_index(5, -1, 0), 0);
+    }
+}
+
+/// Maps a bare `Qt::Key_Shift/Control/Meta/Alt` code to Slint's matching
+/// `Key`. Shared between `map_qt_key`'s press-side special-case table and
+/// `panel_rust_input_key`'s release handling -- see the doc comments at
+/// both call sites for why bare modifier keys need both press *and*
+/// release forwarded, unlike every other key this bridge handles.
+fn modifier_key_for_qt_key(qt_key: c_int) -> Option<Key> {
+    match qt_key {
+        0x0100_0020 => Some(Key::Shift),
+        0x0100_0021 => Some(Key::Control),
+        0x0100_0022 => Some(Key::Meta),
+        0x0100_0023 => Some(Key::Alt),
+        _ => None,
+    }
 }
 
 fn map_qt_key(qt_key: c_int, text: &str, shift: bool) -> Option<SharedString> {
@@ -129,7 +155,19 @@ fn map_qt_key(qt_key: c_int, text: &str, shift: bool) -> Option<SharedString> {
         0x0100_0013 => Some(Key::UpArrow),
         0x0100_0014 => Some(Key::RightArrow),
         0x0100_0015 => Some(Key::DownArrow),
-        _ => None,
+        // Bare modifier presses. Without these, a real Ctrl/Alt press is
+        // never forwarded as a `KeyPressed` at all (their `QKeyEvent::
+        // text()` is empty and their `qt_key` is far outside the 0x20-0x7E
+        // ASCII-graphic range the `text.is_empty()` fallback below
+        // recovers), so Slint's own internal modifier tracking
+        // (`InternalKeyboardModifierState`, keyed off exactly these
+        // `Key::*` text values) never learns a modifier is held -- every
+        // `event.modifiers.control`/`.alt`/`.shift` check anywhere in the
+        // UI (Ctrl+B/N/K/Alt+Up/Down here, Shift+Enter in the compose box,
+        // etc.) would silently always read `false` when driven by a real
+        // host keyboard, despite working in slint-viewer/tests that
+        // dispatch these `Key::*` events directly.
+        _ => modifier_key_for_qt_key(qt_key),
     };
     if let Some(k) = special {
         return Some(k.into());
@@ -3066,8 +3104,24 @@ pub extern "C" fn panel_rust_input_key(
     // TextInput consumes text on key press. Forwarding Qt's matching release
     // with the same text can make a character appear twice in an embedded
     // host, so consume releases after the focus guard without redispatching
-    // their text to Slint.
+    // their text to Slint -- EXCEPT for the bare modifier keys `map_qt_key`
+    // now maps on press (Shift/Control/Meta/Alt). Those aren't text at all,
+    // and Slint's internal modifier tracking (`InternalKeyboardModifierState`)
+    // only clears a modifier on a matching `KeyReleased`; without forwarding
+    // this, a modifier would look permanently "held" in Slint after the
+    // very first press, since this bridge otherwise never sends releases.
     if !pressed {
+        if let Some(key) = modifier_key_for_qt_key(qt_key) {
+            trace_host_input(format_args!(
+                "key qt_key={qt_key:#x} pressed=false text={text:?} \
+                 compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+                 modifier_release={key:?}"
+            ));
+            window.window().dispatch_event(WindowEvent::KeyReleased {
+                text: SharedString::from(key),
+            });
+            return true;
+        }
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed=false text={text:?} \
              compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus}"
@@ -3568,5 +3622,302 @@ mod lifecycle_tests {
                 std::env::remove_var(key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod keyboard_shortcut_tests {
+    use super::*;
+    use i_slint_backend_testing::ElementHandle;
+
+    /// Forces the bridge into its documented display-only fallback (see
+    /// `lifecycle_tests`) and constructs a real panel via `panel_rust_
+    /// create` -- the actual production entry point, not a bare `ChatPanel::
+    /// new()` -- so `on_thread_navigation_requested`/`on_thread_selected`
+    /// are really wired the way they are in the shipped app. Returns a
+    /// guard that restores the previous env vars on drop.
+    struct TestPanel {
+        handle: *mut PanelHandle,
+        previous_env: Vec<(&'static str, Option<String>)>,
+        _cache_dir: tempfile::TempDir,
+    }
+
+    impl TestPanel {
+        fn new() -> Self {
+            let cache_dir = tempfile::tempdir().expect("cache dir");
+            let previous_env = [
+                (
+                    "RUI_ACPX_CODEX_URL",
+                    std::env::var("RUI_ACPX_CODEX_URL").ok(),
+                ),
+                (
+                    "RUI_ACPX_CLAUDE_URL",
+                    std::env::var("RUI_ACPX_CLAUDE_URL").ok(),
+                ),
+                ("RUI_ACP_CACHE_DIR", std::env::var("RUI_ACP_CACHE_DIR").ok()),
+            ]
+            .to_vec();
+            std::env::set_var("RUI_ACPX_CODEX_URL", "http://127.0.0.1:1");
+            std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
+            std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+
+            let handle = panel_rust_create(240, 260);
+            assert!(!handle.is_null());
+            Self {
+                handle,
+                previous_env,
+                _cache_dir: cache_dir,
+            }
+        }
+
+        fn component(&self) -> ChatPanel {
+            PANEL.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .expect("panel exists")
+                    .component
+                    .clone_strong()
+            })
+        }
+
+        /// Sets the Slint `threads` model *and* the Rust-side `visible_
+        /// indices` it's paired with in real production code (see `refresh_
+        /// thread_items`'s `*self.visible_indices.borrow_mut() = ...` next
+        /// to its own `set_threads` call) -- `select_visible_thread` clamps
+        /// against `visible_indices`, not the Slint model, so setting only
+        /// `threads` directly (bypassing the real bridge-driven population
+        /// pipeline this test doesn't spin up) would leave it stale/empty
+        /// and silently break navigation.
+        fn set_threads(&self, threads: Vec<ThreadItem>) {
+            let count = threads.len();
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let panel = slot.as_ref().expect("panel exists");
+                panel.component.set_threads(ModelRc::new(VecModel::from(threads)));
+                *panel.visible_indices.borrow_mut() = (0..count).collect();
+            });
+        }
+
+        /// Presses then releases `qt_key` through the real `panel_rust_
+        /// input_key` FFI boundary -- the literal function `RustPanelItem::
+        /// keyPressEvent`/`keyReleaseEvent` call in the shipped C++ host,
+        /// not a direct `WindowEvent` dispatch that would bypass `map_qt_
+        /// key`'s Qt -> Slint translation entirely.
+        fn press_and_release(&self, qt_key: c_int, text: &str) {
+            let bytes = text.as_bytes();
+            panel_rust_input_key(
+                self.handle,
+                qt_key,
+                bytes.as_ptr(),
+                bytes.len(),
+                /*pressed=*/ true,
+                0,
+            );
+            panel_rust_input_key(
+                self.handle,
+                qt_key,
+                bytes.as_ptr(),
+                bytes.len(),
+                /*pressed=*/ false,
+                0,
+            );
+        }
+
+        /// Holds `qt_key` down without releasing it -- for modifier keys,
+        /// used to build a real chord before pressing the "real" key.
+        fn press_only(&self, qt_key: c_int) {
+            panel_rust_input_key(self.handle, qt_key, std::ptr::null(), 0, true, 0);
+        }
+
+        fn release_only(&self, qt_key: c_int) {
+            panel_rust_input_key(self.handle, qt_key, std::ptr::null(), 0, false, 0);
+        }
+    }
+
+    impl Drop for TestPanel {
+        fn drop(&mut self) {
+            panel_rust_destroy(self.handle);
+            for (key, value) in self.previous_env.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    const QT_KEY_CONTROL: c_int = 0x0100_0021;
+    const QT_KEY_ALT: c_int = 0x0100_0023;
+    const QT_KEY_UP: c_int = 0x0100_0013;
+    const QT_KEY_DOWN: c_int = 0x0100_0015;
+    const QT_KEY_K: c_int = 0x4b;
+
+    fn thread_item(name: &str) -> ThreadItem {
+        ThreadItem {
+            name: name.into(),
+            status: "idle".into(),
+            busy: false,
+            open: true,
+            background: false,
+            description: "".into(),
+            closed: false,
+            provider: "".into(),
+            model: "".into(),
+            project_name: "".into(),
+            project_path: "".into(),
+        }
+    }
+
+    /// Real Ctrl+Alt+Up/Down and Ctrl+K chords, driven through the actual
+    /// `panel_rust_input_key` FFI boundary (the function C++'s
+    /// `RustPanelItem::keyPressEvent`/`keyReleaseEvent` call), with the
+    /// composer focused -- the "AI chat has focus" case. Exercises the
+    /// full real path: Qt key codes -> `map_qt_key` -> Slint `KeyPressed`
+    /// -> `panel-keys`/composer `panel-shortcut` re-dispatch ->
+    /// `handle-panel-shortcut` -> `thread-navigation-requested`/`open-
+    /// thread-search` -> the real `on_thread_navigation_requested`/`on_
+    /// thread_selected` Rust handlers -> `select_visible_thread`.
+    #[test]
+    fn ctrl_alt_arrows_and_ctrl_k_work_through_the_real_input_key_bridge() {
+        let panel = TestPanel::new();
+        let component = panel.component();
+
+        panel.set_threads(vec![
+            thread_item("Fix timeline crash"),
+            thread_item("Render title card"),
+            thread_item("Draft narration script"),
+        ]);
+        component.set_selected_thread(0);
+        component.set_sidebar_expanded(false);
+
+        // `panel_rust_create` installs the real production `SpikePlatform`,
+        // not `i_slint_backend_testing`'s mock-time testing platform, so
+        // `ElementHandle::mock_single_click` (which needs the latter)
+        // panics here with "the platform's clock is not monotonic". Drive
+        // focus through `panel_rust_input_click` instead -- the same
+        // real-click FFI a genuine mouse click goes through in the shipped
+        // app -- at the compose box's real on-screen center.
+        let compose = ElementHandle::find_by_accessible_label(&component, "Compose message")
+            .next()
+            .expect("compose input must be accessible");
+        let position = compose.absolute_position();
+        let size = compose.size();
+        assert!(
+            panel_rust_input_click(
+                panel.handle,
+                (position.x + size.width / 2.0) as c_uint,
+                (position.y + size.height / 2.0) as c_uint,
+            ),
+            "click on the composer must reach the real input-click FFI"
+        );
+        assert!(
+            component.get_compose_has_focus(),
+            "composer must accept real focus before dispatching chords"
+        );
+
+        // Ctrl+Alt+Down: next thread.
+        panel.press_only(QT_KEY_CONTROL);
+        panel.press_only(QT_KEY_ALT);
+        panel.press_and_release(QT_KEY_DOWN, "");
+        panel.release_only(QT_KEY_ALT);
+        panel.release_only(QT_KEY_CONTROL);
+        assert_eq!(
+            component.get_selected_thread(),
+            1,
+            "Ctrl+Alt+Down through the real FFI boundary must advance to the next thread"
+        );
+
+        // Wraps past the end back to the first thread.
+        panel.press_only(QT_KEY_CONTROL);
+        panel.press_only(QT_KEY_ALT);
+        panel.press_and_release(QT_KEY_DOWN, "");
+        panel.press_and_release(QT_KEY_DOWN, "");
+        panel.release_only(QT_KEY_ALT);
+        panel.release_only(QT_KEY_CONTROL);
+        assert_eq!(
+            component.get_selected_thread(),
+            0,
+            "Ctrl+Alt+Down must wrap from the last thread back to the first"
+        );
+
+        // Ctrl+Alt+Up: previous thread, wrapping the other direction.
+        panel.press_only(QT_KEY_CONTROL);
+        panel.press_only(QT_KEY_ALT);
+        panel.press_and_release(QT_KEY_UP, "");
+        panel.release_only(QT_KEY_ALT);
+        panel.release_only(QT_KEY_CONTROL);
+        assert_eq!(
+            component.get_selected_thread(),
+            2,
+            "Ctrl+Alt+Up must wrap from the first thread back to the last"
+        );
+
+        assert_eq!(
+            component.get_compose_text(),
+            "",
+            "the chord must not leak arrow-key text into the composer"
+        );
+
+        // Released modifiers must not stay "stuck" held in Slint's
+        // internal tracking -- a plain Down arrow now (no modifiers) must
+        // NOT be treated as another thread-switch chord.
+        panel.press_and_release(QT_KEY_DOWN, "");
+        assert_eq!(
+            component.get_selected_thread(),
+            2,
+            "a bare Down arrow after releasing Ctrl+Alt must not still switch threads"
+        );
+
+        // Ctrl+K: opens/focuses thread search, expanding the collapsed
+        // rail first -- observable end-to-end via sidebar-expanded.
+        assert!(!component.get_sidebar_expanded());
+        panel.press_only(QT_KEY_CONTROL);
+        panel.press_and_release(QT_KEY_K, "k");
+        panel.release_only(QT_KEY_CONTROL);
+        assert!(
+            component.get_sidebar_expanded(),
+            "Ctrl+K through the real FFI boundary must expand the thread rail to reach search"
+        );
+    }
+
+    /// The focus-independent path a real C++ host takes when the panel has
+    /// no Qt focus at all (`panel_rust_input_key`'s own focus guard drops
+    /// everything in that case -- see its doc comment) or when Shotcut's
+    /// global `ChatRustDock` `QShortcut`s fire: `panel_rust_invoke_command`,
+    /// with no composer focus and no key events at all.
+    #[test]
+    fn invoke_command_switches_threads_and_opens_search_without_any_focus() {
+        let panel = TestPanel::new();
+        let component = panel.component();
+
+        panel.set_threads(vec![
+            thread_item("Fix timeline crash"),
+            thread_item("Render title card"),
+        ]);
+        component.set_selected_thread(0);
+        component.set_sidebar_expanded(false);
+        assert!(
+            !component.get_compose_has_focus(),
+            "this path must not require composer focus"
+        );
+
+        assert!(panel_rust_invoke_command(
+            panel.handle,
+            PANEL_COMMAND_NEXT_THREAD
+        ));
+        assert_eq!(component.get_selected_thread(), 1);
+
+        assert!(panel_rust_invoke_command(
+            panel.handle,
+            PANEL_COMMAND_PREVIOUS_THREAD
+        ));
+        assert_eq!(component.get_selected_thread(), 0);
+
+        assert!(panel_rust_invoke_command(
+            panel.handle,
+            PANEL_COMMAND_OPEN_THREAD_SEARCH
+        ));
+        assert!(component.get_sidebar_expanded());
     }
 }
