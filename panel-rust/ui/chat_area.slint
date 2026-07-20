@@ -154,6 +154,17 @@ export component ChatArea inherits Rectangle {
                         horizontal-alignment: left;
                         vertical-alignment: center;
                         visible: !compact && active-thread-description != "";
+                        // Same overflow-avoidance convention as the
+                        // thread-name Text above: without preferred/min
+                        // width pinned to 0, this Text's un-elided natural
+                        // width (descriptions can run to
+                        // THREAD_DESCRIPTION_MAX_CHARS) forces the whole
+                        // header wider than the available small/tablet
+                        // width instead of eliding.
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        overflow: elide;
                     }
                 }
                 Rectangle { }
@@ -199,6 +210,13 @@ export component ChatArea inherits Rectangle {
                     spacing: Metrics.space-1;
                     accessible-role: text;
                     accessible-label: "Connection status: " + connection-status;
+                    // The inner Text already elides, but without pinning
+                    // this wrapping layout's own preferred/min width to 0
+                    // it can't actually shrink below its natural content
+                    // width under space pressure -- same convention gap as
+                    // the description Text above.
+                    preferred-width: 0px;
+                    min-width: 0px;
                     // Same left-end state-icon language as the sidebar's
                     // thread rows (see sidebar.slint) -- a spinner while
                     // still connecting, otherwise a plain idle dot.
@@ -219,6 +237,9 @@ export component ChatArea inherits Rectangle {
                         font-size: 9px * Theme.font-scale;
                         font-family: Theme.font-mono;
                         vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
                         overflow: elide;
                     }
                 }

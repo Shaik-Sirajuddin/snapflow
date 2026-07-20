@@ -55,6 +55,15 @@ pub struct SettingsDocument {
     pub default_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<HarnessSettings>,
+    // `dev_mode` -- `dev-mode` task's "Dev mode option for the system".
+    // Deliberately Global tier only: read/written directly against
+    // `SettingsPaths::global` by `SettingsPaths::dev_mode()`/
+    // `set_dev_mode()` below, bypassing `merge_documents`'s generic
+    // Project-overrides-Global layering entirely -- a project-scoped
+    // settings.json setting this key has no effect, since dev mode is a
+    // system-level toggle, not a per-project one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_mode: Option<bool>,
 }
 
 fn schema_version_default() -> u32 {
@@ -246,6 +255,28 @@ impl SettingsPaths {
         let refs: Vec<&SettingsDocument> = layers.iter().collect();
         Ok(merge_documents(&refs))
     }
+
+    /// Reads `dev_mode` from the Global document only -- see
+    /// `SettingsDocument::dev_mode`'s doc comment for why this
+    /// deliberately does not go through `load_resolved`'s generic
+    /// Project-overrides-Global merge.
+    pub fn dev_mode(&self) -> bool {
+        load_document(&self.global)
+            .ok()
+            .and_then(|doc| doc.dev_mode)
+            .unwrap_or(false)
+    }
+
+    /// Writes `dev_mode` into the Global document, preserving every
+    /// other field already on disk (same read-modify-write shape
+    /// `lib.rs::save_panel_prefs_to_json` already uses for the other
+    /// Global-tier fields).
+    pub fn set_dev_mode(&self, enabled: bool) -> Result<(), SettingsFileError> {
+        let mut doc = load_document(&self.global)?;
+        doc.schema_version = 1;
+        doc.dev_mode = Some(enabled);
+        save_document(&self.global, &doc)
+    }
 }
 
 fn dirs_fallback_config() -> PathBuf {
@@ -357,6 +388,7 @@ mod tests {
             background_session_default: Some(false),
             default_agent_id: None,
             harness: None,
+            dev_mode: None,
         };
         let global = SettingsDocument {
             schema_version: 1,
@@ -365,6 +397,7 @@ mod tests {
             background_session_default: Some(true),
             default_agent_id: Some("codex".into()),
             harness: None,
+            dev_mode: None,
         };
         let project = SettingsDocument {
             schema_version: 1,
@@ -377,6 +410,7 @@ mod tests {
                 notify_on_input_required: true,
                 auto_resume_on_rate_limit_reset: true,
             }),
+            dev_mode: None,
         };
         let r = merge_documents(&[&bundled, &global, &project]);
         assert_eq!(r.default_profile.as_deref(), Some("project-prof"));
@@ -398,12 +432,65 @@ mod tests {
             background_session_default: Some(true),
             default_agent_id: None,
             harness: Some(HarnessSettings::default()),
+            dev_mode: None,
         };
         save_document(&path, &doc).unwrap();
         let loaded = load_document(&path).unwrap();
         assert_eq!(loaded.default_profile.as_deref(), Some("default"));
         assert_eq!(loaded.permission_profile.as_deref(), Some("full"));
         assert_eq!(loaded.background_session_default, Some(true));
+    }
+
+    #[test]
+    fn dev_mode_defaults_to_false_and_round_trips_through_global_only() {
+        let dir = tempdir().unwrap();
+        let paths = SettingsPaths {
+            global: dir.path().join("settings.global.json"),
+            project: Some(dir.path().join("settings.project.json")),
+            bundled_default: None,
+        };
+        assert!(!paths.dev_mode());
+
+        paths.set_dev_mode(true).unwrap();
+        assert!(paths.dev_mode());
+
+        // A project-tier document setting dev_mode has no effect --
+        // dev_mode() only ever reads the Global document.
+        save_document(
+            paths.project.as_ref().unwrap(),
+            &SettingsDocument {
+                dev_mode: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(paths.dev_mode());
+
+        paths.set_dev_mode(false).unwrap();
+        assert!(!paths.dev_mode());
+    }
+
+    #[test]
+    fn set_dev_mode_preserves_other_global_fields() {
+        let dir = tempdir().unwrap();
+        let global = dir.path().join("settings.global.json");
+        save_document(
+            &global,
+            &SettingsDocument {
+                default_profile: Some("kept".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let paths = SettingsPaths {
+            global: global.clone(),
+            project: None,
+            bundled_default: None,
+        };
+        paths.set_dev_mode(true).unwrap();
+        let reloaded = load_document(&global).unwrap();
+        assert_eq!(reloaded.default_profile.as_deref(), Some("kept"));
+        assert_eq!(reloaded.dev_mode, Some(true));
     }
 
     #[test]
@@ -469,5 +556,160 @@ mod tests {
             profiles.iter().any(|p| p.as_deref() == Some("b")),
             "expected watcher to observe profile b, got {profiles:?}"
         );
+    }
+
+    /// `settings_reflection_matrix` phase (skills-settings-e2e-verification
+    /// plan): a small curated matrix of setting-change -> file-reflection ->
+    /// live-pickup scenarios, per tasks/v2/init.yaml's testing-a block
+    /// ("matrix to test different scenarios, different options").
+    ///
+    /// Deliberately scoped to panel-rust's own `SettingsWatcher` -- the
+    /// real, already-shipped live-pickup mechanism `lib.rs`'s
+    /// `settings_reload_pending`/`apply_json_prefs_to_component` uses to
+    /// notice an externally-rewritten settings file while the panel is
+    /// running. Direct investigation confirmed acpx-server has no config
+    /// hot-reload mechanism at all (`ACPX_ACP_BRIDGE_CONFIG_FILE` is read
+    /// once at startup only) -- there is nothing real to test at that layer
+    /// without first building a feature that doesn't exist, which is out of
+    /// scope for a test-only phase. This matrix covers every field
+    /// `ResolvedSettings` exposes, plus Project-overrides-Global precedence
+    /// and dev_mode's deliberate Global-tier-only exception, all through the
+    /// same watcher path a live conversation actually observes settings
+    /// changes through.
+    #[test]
+    fn settings_reflection_matrix() {
+        let dir = tempdir().unwrap();
+        let global = dir.path().join("settings.global.json");
+        let project = dir.path().join("settings.project.json");
+        save_document(&global, &SettingsDocument::default()).unwrap();
+        let paths = SettingsPaths {
+            global: global.clone(),
+            project: Some(project.clone()),
+            bundled_default: None,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_c = seen.clone();
+        let watcher = SettingsWatcher::start(
+            paths,
+            Duration::from_millis(50),
+            Arc::new(Mutex::new(move |r: ResolvedSettings| {
+                seen_c.lock().unwrap().push(r);
+            })),
+        );
+        thread::sleep(Duration::from_millis(80));
+
+        // Scenario 1: default_profile set at Global tier.
+        save_document(
+            &global,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("gpt-profile".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| r.default_profile.as_deref() == Some("gpt-profile"));
+
+        // Scenario 2: permission_profile and background_session_default set
+        // together at Global tier, in the same write.
+        save_document(
+            &global,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("gpt-profile".into()),
+                permission_profile: Some("readonly".into()),
+                background_session_default: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| {
+            r.permission_profile.as_deref() == Some("readonly") && r.background_session_default
+        });
+
+        // Scenario 3: default_agent_id set at Global tier.
+        save_document(
+            &global,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("gpt-profile".into()),
+                permission_profile: Some("readonly".into()),
+                background_session_default: Some(true),
+                default_agent_id: Some("claude".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| r.default_agent_id.as_deref() == Some("claude"));
+
+        // Scenario 4: Project-tier override takes precedence over the
+        // Global value already on disk, without touching Global at all.
+        save_document(
+            &project,
+            &SettingsDocument {
+                schema_version: 1,
+                default_profile: Some("project-only-profile".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        wait_for(&seen, |r| {
+            r.default_profile.as_deref() == Some("project-only-profile")
+        });
+
+        // Scenario 5: removing the Project-tier override (writing an empty
+        // document back) falls back to the Global value again -- proves the
+        // precedence isn't a one-way ratchet.
+        save_document(&project, &SettingsDocument::default()).unwrap();
+        wait_for(&seen, |r| {
+            r.default_profile.as_deref() == Some("gpt-profile")
+        });
+
+        watcher.stop();
+
+        // Scenario 6 (dev_mode's Global-tier-only exception): a
+        // Project-tier dev_mode write must never reach ResolvedSettings at
+        // all -- dev_mode is deliberately not part of the generic
+        // Project-overrides-Global merge (see SettingsDocument::dev_mode's
+        // doc comment), so it's read directly via SettingsPaths::dev_mode()
+        // rather than through the watcher's ResolvedSettings callback.
+        let paths_after = SettingsPaths {
+            global: global.clone(),
+            project: Some(project.clone()),
+            bundled_default: None,
+        };
+        assert!(!paths_after.dev_mode(), "dev_mode should still be false before this scenario");
+        save_document(
+            &project,
+            &SettingsDocument {
+                schema_version: 1,
+                dev_mode: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths_after.dev_mode(),
+            "a Project-tier dev_mode write must have zero effect -- dev_mode is Global-tier only"
+        );
+        paths_after.set_dev_mode(true).unwrap();
+        assert!(
+            paths_after.dev_mode(),
+            "dev_mode written via set_dev_mode (Global tier) must take effect"
+        );
+    }
+
+    /// Polls `seen`'s most recent entries for up to ~2s, matching
+    /// `watcher_fires_on_external_write`'s own poll shape -- shared here
+    /// since `settings_reflection_matrix` needs it at 5 distinct points.
+    fn wait_for(seen: &Arc<Mutex<Vec<ResolvedSettings>>>, matches: impl Fn(&ResolvedSettings) -> bool) {
+        for _ in 0..40 {
+            if seen.lock().unwrap().iter().any(&matches) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let snapshot = seen.lock().unwrap().clone();
+        panic!("expected watcher to observe a matching ResolvedSettings within ~2s, got {snapshot:?}");
     }
 }

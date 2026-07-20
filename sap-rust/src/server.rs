@@ -52,6 +52,117 @@ pub struct ServerConfig {
 struct Session {
     authenticated: bool,
     project_id: Option<String>,
+    /// `mcp-selection-state` plan's `selection_state` phase: the session's
+    /// current track/clip/filter selection cursor, per the ag-note in
+    /// `snapshotd-mcp-tool-report.md` Table 2 -- resolved there as
+    /// session-scoped (not shared across other sessions bound to the same
+    /// project), so this lives on `Session` itself rather than anywhere
+    /// keyed by `project_id`. Cleared on `project.exit` (a selection from
+    /// one project is meaningless once unbound) and on a fresh
+    /// `project.select` to the same project (re-entering a project starts
+    /// with nothing selected, matching a fresh connection's own default).
+    current: CurrentSelection,
+}
+
+/// `mcp-selection-state` plan: `current { trackIndex, clipId, filterIndex }`
+/// per the ag-note. `filter_index` is only meaningful once a clip is also
+/// selected (a filter belongs to a clip), but is not itself validated
+/// against `clip_id` here -- callers are expected to exit/re-enter in the
+/// right order (`clip.exit` before selecting a different clip's filter),
+/// matching how the ag-note describes enter/exit as the only mutation path.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentSelection {
+    track_index: Option<usize>,
+    clip_id: Option<String>,
+    filter_index: Option<usize>,
+}
+
+/// `lock_tools_to_selection` phase: every `edit.*` method whose own params
+/// actually include `trackIndex` -- checked directly against each match
+/// arm's `struct P` in `build_op` before including it here.
+/// `edit.addTrack` is excluded (creates a brand new track -- nothing to
+/// select yet). `edit.reorderTrack` (`fromIndex`/`toIndex`) and
+/// `edit.setTrackHeight` (no track index at all, a global height setting)
+/// are also excluded: neither has a `trackIndex` field to lock in the
+/// first place, so including them would incorrectly gate a method that
+/// never needed a selection behind `track.enter`.
+const TRACK_INDEX_METHODS: &[&str] = &[
+    "edit.removeTrack",
+    "edit.setTrackProperties",
+    "edit.appendClip",
+    "edit.insertClip",
+    "edit.overwriteClip",
+    "edit.listClips",
+];
+
+/// Every `filter.*` method, all of which are scoped to a specific clip by
+/// `clipId` per the source ag-note's own Table 2 categorization.
+const CLIP_ID_METHODS: &[&str] = &[
+    "filter.add",
+    "filter.addKeyframe",
+    "filter.list",
+    "filter.listKeyframes",
+    "filter.remove",
+    "filter.removeKeyframe",
+    "filter.reorder",
+    "filter.setProperty",
+];
+
+/// Overwrites (never merely supplements) `trackIndex`/`clipId` on every
+/// method in [`TRACK_INDEX_METHODS`]/[`CLIP_ID_METHODS`] with this
+/// session's own `current` selection, dropping the client's ability to
+/// pass either explicitly -- the user's explicit decision on the plan's
+/// open escape-hatch question ("keep an override for scripted/batch
+/// callers, or drop it entirely"): drop it entirely, no exception.
+/// `filterIndex` is deliberately NOT locked here -- no `filter.enter`/
+/// `filter.exit` tool exists to set `CurrentSelection::filter_index` at
+/// all (only `track.enter`/`exit` and `clip.enter`/`exit` do), so locking
+/// it would make every `filter.*` method needing a specific filter
+/// permanently uncallable. Out of scope for this phase; a future
+/// `filter.enter`/`exit` pair would need to land first.
+fn apply_selection_lock(
+    method: &str,
+    mut params: Value,
+    current: &CurrentSelection,
+) -> Result<Value, RpcError> {
+    if TRACK_INDEX_METHODS.contains(&method) {
+        let Some(track_index) = current.track_index else {
+            return Err(RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: format!(
+                    "{method} needs a selected track -- call track.enter first"
+                ),
+                data: None,
+            });
+        };
+        match params.as_object_mut() {
+            Some(obj) => {
+                obj.insert("trackIndex".to_string(), json!(track_index));
+            }
+            None => {
+                params = json!({ "trackIndex": track_index });
+            }
+        }
+    }
+    if CLIP_ID_METHODS.contains(&method) {
+        let Some(clip_id) = current.clip_id.clone() else {
+            return Err(RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: format!("{method} needs a selected clip -- call clip.enter first"),
+                data: None,
+            });
+        };
+        match params.as_object_mut() {
+            Some(obj) => {
+                obj.insert("clipId".to_string(), json!(clip_id));
+            }
+            None => {
+                params = json!({ "clipId": clip_id });
+            }
+        }
+    }
+    Ok(params)
 }
 
 /// Outcome of running one op against the backend: the RPC result to send
@@ -1847,7 +1958,7 @@ fn build_op_ext(
 /// 2.0 notification semantics — SAP clients are expected to always send an
 /// `id`, but nothing here assumes it.
 async fn handle_request(
-    req: RpcRequest,
+    mut req: RpcRequest,
     session: &mut Session,
     token: &str,
     dispatch_tx: &DispatchSender,
@@ -1890,6 +2001,7 @@ async fn handle_request(
     if req.method == "project.exit" {
         return match session.project_id.take() {
             Some(_project_id) => {
+                session.current = CurrentSelection::default();
                 let outcome = dispatch(
                     dispatch_tx,
                     Box::new(move |b| match b.project_exit() {
@@ -1961,6 +2073,7 @@ async fn handle_request(
             let sender = channel_for_project(channels, &project_id);
             *notif_rx = Some(sender.subscribe());
             session.project_id = Some(project_id);
+            session.current = CurrentSelection::default();
         }
         return respond(outcome.result);
     }
@@ -1972,6 +2085,80 @@ async fn handle_request(
         None => return respond(Err(rpc_error(error_codes::NO_PROJECT_BOUND))),
     };
 
+    // `mcp-selection-state` plan: `track.enter`/`track.exit`/`clip.enter`/
+    // `clip.exit`/`currentView`. Namespaced (`track.*`/`clip.*`) chosen over
+    // the top-level `enterTrack`/`exitTrack` alternative the ag-note also
+    // named, since it matches the rest of this dot-namespaced surface
+    // (`edit.*`, `filter.*`, `playlist.*`) -- pure session bookkeeping, no
+    // backend dispatch, so these are handled directly here rather than
+    // through `build_op`/`build_op_ext` like every project-mutating method.
+    // Deliberately does NOT validate that `trackIndex`/`clipId` actually
+    // exist in the backend at entry time -- existence validation would need
+    // a dispatch round trip this minimal first pass doesn't add yet; a
+    // stale/nonexistent selection is caught the same way an out-of-range
+    // index always was, whenever a tool that actually reads the backend
+    // acts on it.
+    if req.method == "track.enter" {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P {
+            track_index: usize,
+        }
+        return match serde_json::from_value::<P>(req.params) {
+            Ok(p) => {
+                session.current.track_index = Some(p.track_index);
+                respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")))
+            }
+            Err(e) => respond(Err(invalid_params(&e))),
+        };
+    }
+    if req.method == "track.exit" {
+        session.current.track_index = None;
+        // A clip only makes sense within an entered track -- exiting the
+        // track also exits any clip/filter selection nested under it,
+        // rather than leaving a clip-id selection dangling with no track.
+        session.current.clip_id = None;
+        session.current.filter_index = None;
+        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+    }
+    if req.method == "clip.enter" {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P {
+            clip_id: String,
+        }
+        return match serde_json::from_value::<P>(req.params) {
+            Ok(p) => {
+                session.current.clip_id = Some(p.clip_id);
+                respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")))
+            }
+            Err(e) => respond(Err(invalid_params(&e))),
+        };
+    }
+    if req.method == "clip.exit" {
+        session.current.clip_id = None;
+        // A filter only makes sense within an entered clip.
+        session.current.filter_index = None;
+        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+    }
+    if req.method == "currentView" {
+        return respond(Ok(serde_json::to_value(&session.current).expect("CurrentSelection serializes")));
+    }
+
+    // `lock_tools_to_selection` phase: the user decided to drop the
+    // explicit-index escape hatch entirely (not keep it for scripted/batch
+    // callers) -- edit.*/filter.* methods scoped to an existing track/clip
+    // no longer accept a client-supplied trackIndex/clipId at all; both are
+    // always overwritten from this session's own `current` selection
+    // (track.enter/clip.enter), and a method needing a selection component
+    // the session hasn't entered yet is rejected before ever reaching the
+    // backend.
+    req.params = match apply_selection_lock(&req.method, req.params, &session.current) {
+        Ok(params) => params,
+        Err(e) => return respond(Err(e)),
+    };
+
+    let params_for_remap = req.params.clone();
     let op = match build_op(&req.method, req.params.clone(), project_id.clone()) {
         Ok(op) => op,
         Err(_) => match build_op_ext(&req.method, req.params, project_id.clone(), audio_enabled) {
@@ -1989,8 +2176,88 @@ async fn handle_request(
             // has nothing to fan out to yet, which is not a failure.
             let _ = sender.send(notification.clone());
         }
+        // `selection_remap_on_mutation` phase: keep the session's current
+        // selection following the same logical item after a mutation that
+        // could shift/invalidate the index it was pointing at, rather than
+        // silently going stale.
+        remap_selection_after_mutation(&req.method, &params_for_remap, &mut session.current);
     }
     respond(outcome.result)
+}
+
+/// `selection_remap_on_mutation` phase: audited every `edit.*`/`filter.*`
+/// method that can shift or remove a track/clip index a live selection
+/// could be pointing at (the ag-note's own removeTrack question mark, plus
+/// reorderTrack, removeClip):
+///
+/// - `edit.removeTrack`: `apply_selection_lock` already forces this
+///   method's `trackIndex` to equal `current.track_index` (it's in
+///   `TRACK_INDEX_METHODS`) -- so a successful call always means the
+///   currently-selected track was the one just removed. Clears the
+///   selection entirely (cascading clip/filter, same as `track.exit`),
+///   the same "the selected item is just gone" case `clip.exit`/
+///   `track.exit` already handle -- there is no "shift" to apply, unlike
+///   the array-reindex case below, since the selected track itself no
+///   longer exists.
+/// - `edit.reorderTrack`: standard array-move semantics -- if the
+///   selected track was the one moved, follow it to its new index; if it
+///   was merely inside the shifted range, adjust by one slot.
+/// - `edit.removeClip`: `clipId` is a persistent identity, not a
+///   position, so removing some OTHER clip never invalidates an
+///   already-selected `clip_id`. Only clears the selection if the
+///   backend's own response names the removed clip as the one currently
+///   selected (a defensive check that's currently unreachable in
+///   practice, since `edit.removeClip` is a positional trackIndex+
+///   clipIndex operation, deliberately excluded from `apply_selection_lock`
+///   per that function's own doc comment -- kept for whenever a future
+///   phase gives `edit.removeClip` a `clipId`-based form instead).
+///
+/// `edit.moveClip`/`edit.splitClip`/`filter.remove`/`filter.reorder` were
+/// also audited and found NOT to need remapping: `moveClip` relocates a
+/// clip between tracks without changing its `clipId` identity (the
+/// session's `track_index`/`clip_id` selections are independent, not a
+/// "clip must belong to selected track" invariant); `splitClip` only ever
+/// grows the clip list, never shifts an existing clip's identity out from
+/// under a selection; `filter.remove`/`filter.reorder` shift
+/// `filterIndex`, which nothing enters/exits yet (`CurrentSelection::
+/// filter_index` is never set by any tool today -- see
+/// `apply_selection_lock`'s doc comment on why `filterIndex` isn't locked
+/// either), so there is nothing live to remap there yet.
+fn remap_selection_after_mutation(method: &str, params: &Value, current: &mut CurrentSelection) {
+    match method {
+        "edit.removeTrack" => {
+            current.track_index = None;
+            current.clip_id = None;
+            current.filter_index = None;
+        }
+        "edit.reorderTrack" => {
+            let Some(selected) = current.track_index else {
+                return;
+            };
+            let from = params.get("fromIndex").and_then(|v| v.as_u64());
+            let to = params.get("toIndex").and_then(|v| v.as_u64());
+            let (Some(from), Some(to)) = (from, to) else {
+                return;
+            };
+            let (from, to, selected_u64) = (from as usize, to as usize, selected as u64);
+            if selected as usize == from {
+                current.track_index = Some(to);
+            } else if from < to && selected_u64 > from as u64 && selected_u64 <= to as u64 {
+                current.track_index = Some(selected - 1);
+            } else if to < from && selected_u64 >= to as u64 && selected_u64 < from as u64 {
+                current.track_index = Some(selected + 1);
+            }
+        }
+        "edit.removeClip" => {
+            if let Some(removed_clip_id) = params.get("clipId").and_then(|v| v.as_str()) {
+                if current.clip_id.as_deref() == Some(removed_clip_id) {
+                    current.clip_id = None;
+                    current.filter_index = None;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Pulls the next fanned-out notification for this connection, if it's

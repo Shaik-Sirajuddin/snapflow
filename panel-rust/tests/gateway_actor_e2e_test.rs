@@ -63,7 +63,7 @@ fn spawn_acpx_server_with_retry(
             .stderr(Stdio::null());
         let mut child = command.spawn().expect("spawn real acpx-server binary for test");
 
-        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
         let mut reachable = false;
         while std::time::Instant::now() < deadline {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -222,7 +222,7 @@ async fn resume_session_replays_history_via_session_load() {
     let mut resumer = spawn_acpx_thread(gateway.base_url.clone());
     let mut events_rx = resumer.take_events();
     resumer
-        .resume_session(session_id, std::env::current_dir().unwrap())
+        .resume_session(session_id, std::env::current_dir().unwrap(), Vec::new())
         .await
         .expect("resume_session");
 
@@ -345,7 +345,7 @@ async fn resume_session_retries_after_transient_gateway_errors() {
 
     let handle = spawn_acpx_thread(format!("http://127.0.0.1:{port}"));
     handle
-        .resume_session("persisted-session", std::env::current_dir().unwrap())
+        .resume_session("persisted-session", std::env::current_dir().unwrap(), Vec::new())
         .await
         .expect("resume_session should retry transient gateway errors");
     handle

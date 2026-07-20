@@ -214,6 +214,13 @@ struct ThreadSlot {
     /// of every thread until a caller explicitly closes it (never set
     /// implicitly by window/process teardown).
     closed: Mutex<bool>,
+    /// `thread_item_project_context` phase: the project directory this
+    /// thread's session was actually opened/resumed/reattached against
+    /// (the `cwd` passed to ACP at creation time -- see `cwd_for_session`),
+    /// captured once and never updated afterward, since ACP has no way to
+    /// move an existing session to a new cwd. `None` when no project was
+    /// active at creation time (the pre-`active_project_binding` default).
+    project_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -263,6 +270,15 @@ pub struct AgentBridge {
     // (`refresh_terminals_for` and friends) rely on being able to call
     // without needing `&mut self.bridge` threaded through.
     local_terminals: std::cell::RefCell<std::collections::HashMap<usize, crate::local_terminal::LocalTerminal>>,
+    // `chat_sessions_project_path` phase: the active MLT project's path
+    // (set from `PanelSingleton::active_project_path` via
+    // `set_active_project_path`), consulted by `cwd_for_session` at every
+    // new-session call site instead of the process's own cwd, once one is
+    // known. `Arc<Mutex<..>>`, not a plain field, so the background
+    // attachment task spawned in the constructor's loop (which runs on a
+    // tokio worker thread, well past this struct's own lifetime scope at
+    // spawn time) can observe updates made after construction.
+    session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// A point-in-time read of a client-local terminal's VT100 screen state
@@ -294,11 +310,9 @@ async fn open_session_maybe_profiled(
     handle: &AcpxThreadHandle,
     cwd: PathBuf,
     profile: Option<&str>,
+    mcp_servers: Vec<serde_json::Value>,
 ) -> Result<String, crate::gateway_actor::AcpxThreadError> {
-    match profile {
-        Some(profile) => handle.open_session_with_profile(cwd, profile).await,
-        None => handle.open_session(cwd).await,
-    }
+    handle.open_session_with(cwd, profile.map(str::to_string), mcp_servers).await
 }
 
 /// Recomputes `slot.transcript` from `slot.history`'s current full
@@ -595,6 +609,62 @@ fn resolve_acpx_server_bin() -> PathBuf {
     )
 }
 
+/// Resolves the `skills-mcp-server` binary path (`skill_injection_
+/// verification` phase): `RUI_SKILLS_MCP_SERVER_BIN` env override, else a
+/// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
+/// convention as [`resolve_acpx_server_bin`].
+fn resolve_skills_mcp_server_bin_from(
+    override_bin: Option<&str>,
+    current_exe: Option<&Path>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
+        return PathBuf::from(bin);
+    }
+    if let Some(parent) = current_exe.and_then(Path::parent) {
+        let candidate = parent.join("skills-mcp-server");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    manifest_dir.join("target/debug/skills-mcp-server")
+}
+
+fn resolve_skills_mcp_server_bin() -> PathBuf {
+    resolve_skills_mcp_server_bin_from(
+        std::env::var("RUI_SKILLS_MCP_SERVER_BIN").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+/// Builds the `mcpServers` array `session/new`/`session/load` now send
+/// (previously always `[]`, see `gateway_actor::thread_actor`'s doc
+/// comments on `Command::OpenSession`/`Command::ResumeSession`) -- one
+/// entry pointing at `skills-mcp-server`, always present regardless of
+/// which ACPX profile (if any) the session uses. `project_path` is the
+/// active MLT project's *file* path (`PanelSingleton::active_project_path`
+/// as threaded through `AgentBridge::session_cwd_override`) -- passed
+/// through as-is; `skills-mcp-server` itself derives the project's
+/// `.skills/` directory from its parent, same as `refresh_skills_model`
+/// (lib.rs) already does.
+fn skills_mcp_servers_entry(project_path: Option<&std::path::Path>) -> Vec<serde_json::Value> {
+    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+    let mut args = vec![
+        "--global-dir".to_string(),
+        global_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(project_path) = project_path.and_then(|p| p.parent()) {
+        args.push("--project-dir".to_string());
+        args.push(project_path.to_string_lossy().into_owned());
+    }
+    vec![serde_json::json!({
+        "name": "skills",
+        "command": resolve_skills_mcp_server_bin().to_string_lossy(),
+        "args": args,
+    })]
+}
+
 /// Resolves the mock backend agent binary the locally-spawned gateway
 /// should proxy to: `RUI_ACP_AGENT_CMD` env override (a real
 /// ACP-compliant agent binary/command), else the dev-checkout
@@ -683,17 +753,16 @@ fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
             return false;
         }
     }
-    if expected_agent.is_some() {
-        // acpx-server's real `/health` handler (acpx-server/src/transport/
-        // http.rs's health_handler) reports readiness as
-        // `"status": "ready"` (or "degraded"/absent on failure) and never
-        // includes an `agentId` field at all -- there is no per-agent
-        // identity signal on this endpoint, only "is a real acpx-server
-        // listening and healthy here". A single shared daemon-owned
-        // gateway (snapshotd's bundled acpx-server) serves one default
-        // backend for all providers, so "healthy" is the right bar for
-        // reuse regardless of which provider name was requested.
-        envelope.get("status").and_then(|s| s.as_str()) == Some("ready")
+    if let Some(expected_agent) = expected_agent {
+        // acpx-server's `/health` handler now reports a `defaultAgentId`
+        // field alongside `status` (see acpx-server/src/transport/http.rs),
+        // so we can actually verify provider identity instead of treating
+        // any "ready" gateway as reusable regardless of which provider was
+        // requested.
+        matches!(
+            envelope.get("status").and_then(|s| s.as_str()),
+            Some("ready") | Some("recovering")
+        ) && envelope.get("defaultAgentId").and_then(|id| id.as_str()) == Some(expected_agent)
     } else {
         envelope
             .get("result")
@@ -982,13 +1051,18 @@ fn now_token() -> String {
     format!("unix:{secs}")
 }
 
-/// The `cwd` argument ACP's `session/new` wants -- this crate has no
-/// concept of a project directory of its own (the chat panel isn't
-/// editing files directly), so the process's own working directory is
-/// as reasonable a default as any, with `.` as a last-resort fallback if
-/// that's somehow unavailable.
-fn cwd_for_session() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+/// The `cwd` argument ACP's `session/new` wants. `chat_sessions_project_path`
+/// phase: prefers the active MLT project's path (see
+/// `AgentBridge::set_active_project_path`) when one is known, since that's
+/// the directory a skill/session should actually be scoped to; falls back
+/// to the process's own working directory (with `.` as a last resort) when
+/// no project is open, matching this function's pre-existing behavior.
+fn cwd_for_session(session_cwd_override: &Mutex<Option<PathBuf>>) -> PathBuf {
+    session_cwd_override
+        .lock()
+        .expect("session cwd override mutex poisoned")
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 fn replay_matches_cached_position(
@@ -1122,10 +1196,17 @@ fn spawn_background_attachment(
     has_cached_transcript: bool,
     profile_name: Option<String>,
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
+    session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
 ) {
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
-        let cwd = cwd_for_session();
+        let cwd = cwd_for_session(&session_cwd_override);
+        let mcp_servers = skills_mcp_servers_entry(
+            session_cwd_override
+                .lock()
+                .expect("session cwd override mutex poisoned")
+                .as_deref(),
+        );
         let result = if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
@@ -1145,11 +1226,11 @@ fn spawn_background_attachment(
                             "panel-rust: session/resume unavailable for cached thread {:?} ({reattach_error}); falling back to session/load",
                             slot.thread_id
                         );
-                        handle.resume_session(session_id.clone(), cwd.clone()).await
+                        handle.resume_session(session_id.clone(), cwd.clone(), mcp_servers.clone()).await
                     }
                 }
             } else {
-                handle.resume_session(session_id.clone(), cwd.clone()).await
+                handle.resume_session(session_id.clone(), cwd.clone(), mcp_servers.clone()).await
             };
             match resume_result {
                 Ok(()) => Ok(session_id),
@@ -1158,11 +1239,11 @@ fn spawn_background_attachment(
                         "panel-rust: cached acpx session resume failed for thread {:?} ({resume_error}); opening a fresh session",
                         slot.thread_id
                     );
-                    open_session_maybe_profiled(&handle, cwd, profile_name.as_deref()).await
+                    open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
                 }
             }
         } else {
-            open_session_maybe_profiled(&handle, cwd, profile_name.as_deref()).await
+            open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
         };
 
         match result {
@@ -1348,6 +1429,7 @@ impl AgentBridge {
         let gateways = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut gateway_setters: HashMap<String, Vec<AcpxThreadGatewaySetter>> = HashMap::new();
         let mut attachment_gates: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
+        let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
 
         // `spawn_acpx_thread_with_gateway` calls the free-function `tokio::spawn` internally,
         // which needs an active runtime context on this (calling) thread --
@@ -1440,6 +1522,9 @@ impl AgentBridge {
                attachment: Mutex::new(AttachmentState::default()),
                attachment_ready: tokio::sync::Notify::new(),
                closed: Mutex::new(false),
+               // No project can be active yet at construction time --
+               // `session_cwd_override` was just created above, unset.
+               project_path: None,
             });
             slots.push(slot.clone());
 
@@ -1455,6 +1540,7 @@ impl AgentBridge {
                 has_cached_transcript,
                 spec.profile_name.clone(),
                 attachment_gate,
+                session_cwd_override.clone(),
             );
         }
         drop(_guard);
@@ -1481,7 +1567,21 @@ impl AgentBridge {
             gateways,
             store,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
+            session_cwd_override,
         })
+    }
+
+    /// `chat_sessions_project_path` phase: called from the FFI-driven
+    /// `panel_rust_set_project_path` path whenever the active MLT project
+    /// changes, so every subsequently-opened/resumed/reattached session
+    /// picks up the new project directory as its `cwd`. Deliberately does
+    /// NOT retroactively move already-open sessions -- ACP has no
+    /// "change an existing session's cwd" operation.
+    pub fn set_active_project_path(&self, path: Option<PathBuf>) {
+        *self
+            .session_cwd_override
+            .lock()
+            .expect("session cwd override mutex poisoned") = path;
     }
 
    /// Adds one open thread using the already-provisioned provider gateway.
@@ -1524,26 +1624,6 @@ impl AgentBridge {
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
-        let gateways = self.gateways.clone();
-        let gateway = self.runtime.block_on(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                if let Some(gateway) = gateways
-                    .lock()
-                    .expect("gateways mutex poisoned")
-                    .get(&base_url)
-                    .cloned()
-                {
-                    return Ok(gateway);
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(BridgeError::Gateway(format!(
-                        "gateway connection missing for {base_url}"
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })?;
         let (
             seeded,
             cached_session_id,
@@ -1554,12 +1634,65 @@ impl AgentBridge {
             seed_thread_from_cache(self.store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
         let has_cached_transcript = !seeded.is_empty();
 
-        let mut handle = {
+        // `thread_new_loading_state` phase: `session/new`/`session/resume`
+        // is a real network round trip that must never block the calling
+        // (single-threaded Slint UI) thread -- this used to `self.runtime.
+        // block_on` it inline, which froze the whole UI for the call's
+        // duration. Mirrors the constructor's own async-attachment pattern
+        // instead: hand the gateway over through the same delayed-setter
+        // `spawn_acpx_thread_with_delayed_gateway` uses (so creating the
+        // handle itself never waits on the gateway either), then delegate
+        // the actual session resolution to `spawn_background_attachment`
+        // (the exact function the constructor's own per-thread loop already
+        // uses for this), which sets `attachment`/notifies waiters and
+        // persists the thread record once the session id is known --
+        // `sync_thread_records` (lib.rs) already polls for that and was
+        // written specifically to support creation returning before
+        // attachment finishes.
+        let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
-            spawn_acpx_thread_with_gateway(gateway)
+            spawn_acpx_thread_with_delayed_gateway()
         };
-        let mut events_rx = handle.take_events();
+        match self
+            .gateways
+            .lock()
+            .expect("gateways mutex poisoned")
+            .get(&base_url)
+            .cloned()
+        {
+            Some(gateway) => gateway_setter.set_gateway(gateway),
+            None => {
+                // Only reachable in the narrow window right after
+                // construction, before the background `Gateway::connect`
+                // task (spawned in the constructor) has resolved yet.
+                let gateways = self.gateways.clone();
+                self.runtime.spawn(async move {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if let Some(gateway) = gateways
+                            .lock()
+                            .expect("gateways mutex poisoned")
+                            .get(&base_url)
+                            .cloned()
+                        {
+                            gateway_setter.set_gateway(gateway);
+                            return;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+            }
+        }
+        let events_rx = handle.take_events();
         let handle = Arc::new(handle);
+        let project_path_for_slot = self
+            .session_cwd_override
+            .lock()
+            .expect("session cwd override mutex poisoned")
+            .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
             provider: provider.to_string(),
@@ -1597,132 +1730,30 @@ impl AgentBridge {
             ),
             session_modes: Mutex::new(runtime_snapshot.session_modes),
             config_options: Mutex::new(runtime_snapshot.config_options),
-            attachment: Mutex::new(AttachmentState {
-                complete: true,
-                error: None,
-            }),
+            attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            project_path: project_path_for_slot,
         });
-       let cwd = cwd_for_session();
-       let session_id = if let Some(session_id) = cached_session_id.clone() {
-           let resume_result = if has_cached_transcript {
-               match self
-                   .runtime
-                   .block_on(handle.reattach_session(session_id.clone(), cwd.clone()))
-               {
-                   Ok(()) => Ok(()),
-                   Err(reattach_error) => {
-                       eprintln!(
-                           "panel-rust: session/resume unavailable for cached thread {thread_id:?} ({reattach_error}); falling back to session/load"
-                       );
-                       self.runtime
-                           .block_on(handle.resume_session(session_id.clone(), cwd.clone()))
-                   }
-               }
-           } else {
-               self.runtime
-                   .block_on(handle.resume_session(session_id.clone(), cwd.clone()))
-           };
-           match resume_result {
-               Ok(()) => session_id,
-                Err(_) => self
-                    .runtime
-                    .block_on(open_session_maybe_profiled(&handle, cwd, profile))
-                    .map_err(|error| BridgeError::Gateway(error.to_string()))?,
-            }
-        } else {
-            self.runtime
-                .block_on(open_session_maybe_profiled(&handle, cwd, profile))
-                .map_err(|error| BridgeError::Gateway(error.to_string()))?
-        };
-        *slot
-            .acp_session_id
-            .lock()
-            .expect("acp_session_id mutex poisoned") = Some(session_id);
-        persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
+        self.slots.push(slot.clone());
 
-        if cached_session_id.is_some() && !has_cached_transcript {
-            let mut cached_index = 0usize;
-            let mut replayed_any = false;
-            while let Ok(event) = events_rx.try_recv() {
-                if let AgentEvent::Message(message) = event {
-                    let mut history = slot.history.lock().expect("history mutex poisoned");
-                    if !replay_matches_cached_position(&history, &mut cached_index, &message) {
-                        history.push(message.clone());
-                        replayed_any = true;
-                        if let Some(store) = &self.store {
-                            let _ = store.append(&slot.thread_id, &message);
-                        }
-                    }
-                }
-            }
-            if replayed_any {
-                refresh_transcript(&slot);
-            }
-        }
+        spawn_background_attachment(
+            &self.runtime,
+            slot,
+            handle,
+            events_rx,
+            self.events.clone(),
+            self.store.clone(),
+            idx,
+            cached_session_id,
+            has_cached_transcript,
+            profile.map(str::to_string),
+            Arc::new(tokio::sync::Mutex::new(())),
+            self.session_cwd_override.clone(),
+        );
 
-        let events_out = self.events.clone();
-        let store_for_task = self.store.clone();
-        let slot_for_task = slot.clone();
-        self.runtime.spawn(async move {
-            while let Some(event) = events_rx.recv().await {
-                match &event {
-                    AgentEvent::Message(message) => {
-                        slot_for_task
-                            .history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .push(message.clone());
-                        refresh_transcript(&slot_for_task);
-                        if let Some(store) = &store_for_task {
-                            let _ = store.append(&slot_for_task.thread_id, message);
-                        }
-                    }
-                    AgentEvent::TurnEnded(_) => {
-                        persist_thread_snapshot(
-                            store_for_task.as_ref(),
-                            &slot_for_task,
-                            now_token(),
-                        );
-                        slot_for_task
-                            .transcript
-                            .lock()
-                            .expect("transcript mutex poisoned")
-                            .mark_all_streaming_completed();
-                    }
-                    AgentEvent::Error(_) => {}
-                    AgentEvent::PermissionRequest(req) => {
-                        slot_for_task
-                            .pending_requests
-                            .lock()
-                            .expect("pending_requests mutex poisoned")
-                            .push(req.clone());
-                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
-                    }
-                    AgentEvent::TerminalOutput(term_ev) => {
-                        store_terminal_output(&slot_for_task, term_ev);
-                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
-                    }
-                    AgentEvent::SessionModes(_)
-                    | AgentEvent::CurrentModeChanged(_)
-                    | AgentEvent::ConfigOptions(_) => {
-                        store_capability_event(&slot_for_task, &event);
-                        persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
-                    }
-                }
-                events_out
-                    .lock()
-                    .expect("event queue mutex poisoned")
-                    .push_back(BridgeEvent {
-                        thread_index: idx,
-                        event,
-                    });
-            }
-        });
-       self.slots.push(slot);
-       Ok(idx)
-   }
+        Ok(idx)
+    }
 
     /// `session/list` scoped to thread `idx`'s own provider -- what a
     /// recovery/import sheet populates its choices from. Blocking, same
@@ -1836,6 +1867,11 @@ impl AgentBridge {
         };
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
+        let project_path_for_slot = self
+            .session_cwd_override
+            .lock()
+            .expect("session cwd override mutex poisoned")
+            .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
             provider: provider.to_string(),
@@ -1858,11 +1894,18 @@ impl AgentBridge {
             }),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            project_path: project_path_for_slot,
         });
 
-        let cwd = cwd_for_session();
+        let cwd = cwd_for_session(&self.session_cwd_override);
+        let mcp_servers = skills_mcp_servers_entry(
+            self.session_cwd_override
+                .lock()
+                .expect("session cwd override mutex poisoned")
+                .as_deref(),
+        );
         self.runtime
-            .block_on(handle.resume_session(session_id.to_string(), cwd))
+            .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
         *slot
             .acp_session_id
@@ -1974,6 +2017,18 @@ impl AgentBridge {
     /// because a preceding thread was deleted.
     pub fn thread_provider(&self, idx: usize) -> Option<String> {
         self.slots.get(idx).map(|slot| slot.provider.clone())
+    }
+
+    /// `thread_item_project_context` phase: the project directory this
+    /// thread's session was opened against (see `ThreadSlot::project_path`'s
+    /// doc comment) -- `None` when no project was active at creation time,
+    /// distinct from `Some("")`, which never occurs here.
+    pub fn thread_project_path(&self, idx: usize) -> Option<String> {
+        self.slots.get(idx).and_then(|slot| {
+            slot.project_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
     }
 
     /// Snapshot of a thread's currently-pending interactive requests
@@ -2725,7 +2780,17 @@ mod tests {
                 .spawn()
                 .expect("spawn real acpx-server binary for test");
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+            // acpx-server's own startup (before it even binds its listen
+            // socket) does a real network fetch of the ACP registry
+            // (acpx-core's ensure_registry_loaded, called from
+            // warm_default_profiles at the top of main.rs), falling back
+            // to a bundled snapshot on any error. That client used to have
+            // no timeout at all -- fixed (acpx-core/src/router.rs) to a
+            // bounded 5s -- but even the bounded case can take a bit over
+            // 1.5s to fail-and-fall-back in this sandbox's network
+            // conditions (measured ~1.6s directly). 3s gives real headroom
+            // without materially slowing down the common fast-startup case.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
             let mut reachable = false;
             while std::time::Instant::now() < deadline {
                 if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -4720,6 +4785,45 @@ done
         // `load_older_page` actually refreshed `transcript`, not just
         // `history`.
         assert_eq!(bridge.transcript(0).len(), total_messages);
+    }
+
+    /// `skill_injection_verification` phase: `skills_mcp_servers_entry`'s
+    /// output shape -- the actual client-supplied `mcpServers` entry every
+    /// `session/new`/`session/load` now sends (see `Command::OpenSession`/
+    /// `Command::ResumeSession`'s doc comments), verified directly rather
+    /// than through a real acpx-server round trip (this sandbox's
+    /// acpx-server makes a real network call to cdn.agentclientprotocol.com
+    /// at startup before binding its port -- confirmed directly by
+    /// inspecting its own startup log -- making real round-trip tests here
+    /// flaky on network latency, unrelated to this logic itself).
+    #[test]
+    fn skills_mcp_servers_entry_always_includes_the_skills_server() {
+        let entries = skills_mcp_servers_entry(None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "skills");
+        assert!(entries[0]["command"].as_str().unwrap().contains("skills-mcp-server"));
+        let args = entries[0]["args"].as_array().expect("args is an array");
+        assert!(args.contains(&serde_json::Value::String("--global-dir".to_string())));
+        assert!(
+            !args.contains(&serde_json::Value::String("--project-dir".to_string())),
+            "no project open -- args must not claim a --project-dir"
+        );
+    }
+
+    #[test]
+    fn skills_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
+        let project_file = std::path::Path::new("/tmp/my-project/timeline.mlt");
+        let entries = skills_mcp_servers_entry(Some(project_file));
+        let args = entries[0]["args"].as_array().expect("args is an array");
+        let project_dir_idx = args
+            .iter()
+            .position(|a| a == "--project-dir")
+            .expect("--project-dir must be present when a project is open");
+        assert_eq!(
+            args[project_dir_idx + 1],
+            serde_json::Value::String("/tmp/my-project".to_string()),
+            "--project-dir must be the project FILE's parent directory, not the file itself"
+        );
     }
 }
 /// Refreshes `slot`'s trailer (`acp_session_id`/`updated_at`), taking

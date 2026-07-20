@@ -855,7 +855,10 @@ impl Router {
             admission: Arc::new(Mutex::new(AdmissionState::default())),
             default_agent_id: default_agent_id.into(),
             native_auth_method_id: None,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("valid HTTP client configuration"),
             registry_cache: None,
             capability_cache: acpx_registry::CapabilityCache::new(Duration::from_secs(300)),
             persistence: None,

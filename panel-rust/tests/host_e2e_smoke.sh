@@ -81,7 +81,8 @@ start_shotcut() {
     if [[ "${PANEL_HOST_E2E_DRIVE:-0}" == "1" || "${PANEL_HOST_E2E_RESTART:-0}" == "1" \
           || "${PANEL_HOST_E2E_CANCEL:-0}" == "1" || "${PANEL_HOST_E2E_PERMISSION:-0}" == "1" \
           || "${PANEL_HOST_E2E_TOOL_STREAM:-0}" == "1" \
-          || "${PANEL_HOST_E2E_LOCAL_TERMINAL:-0}" == "1" ]]; then
+          || "${PANEL_HOST_E2E_LOCAL_TERMINAL:-0}" == "1" \
+          || "${PANEL_HOST_E2E_INPUT_MATRIX:-0}" == "1" ]]; then
         trace_env=(RUI_PANEL_INPUT_TRACE=1)
     fi
     env "${trace_env[@]}" \
@@ -219,6 +220,28 @@ if [[ "${PANEL_HOST_E2E_TOOL_STREAM:-0}" == "1" ]]; then
         --wait-for-attachment \
         --wait-for-turn \
         --assert-tool-stream
+fi
+
+if [[ "${PANEL_HOST_E2E_INPUT_MATRIX:-0}" == "1" ]]; then
+    if [[ -z "$dock_width" ]]; then
+        printf 'PANEL_HOST_E2E_INPUT_MATRIX requires PANEL_HOST_E2E_DOCK_WIDTH\n' >&2
+        exit 1
+    fi
+    # Self-contained, same reasoning as PANEL_HOST_E2E_CANCEL/PERMISSION/
+    # TOOL_STREAM: sends its own deterministic prompt (--exercise-input-
+    # matrix computes the expected text itself), so no PANEL_HOST_E2E_DRIVE
+    # dependency. designa v2 'input' task's three named scenarios in one
+    # compose+send: full a-z alphabet, several backspaces in a row (not
+    # --exercise-backspace's single fix-a-typo tap), then a multi-word
+    # sequence -- verified via the same session/prompt event-log detail
+    # check every other scenario uses.
+    python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
+        --dock-width "$dock_width" \
+        --event-log "$state_dir/acpx/backend-events.jsonl" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --exercise-input-matrix \
+        --wait-for-attachment \
+        --wait-for-turn
 fi
 
 if [[ "${PANEL_HOST_E2E_LOCAL_TERMINAL:-0}" == "1" ]]; then

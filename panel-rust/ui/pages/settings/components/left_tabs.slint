@@ -8,7 +8,7 @@ import { Metrics } from "../../../tokens/metrics.slint";
 // `SettingsPage` via `active-section`/`section-selected`, same "dumb
 // strip" pattern as `SettingsTopTabs`.
 export component SettingsLeftTabs inherits Rectangle {
-    in property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness"
+    in property <string> active-section: "mcp_servers"; // "mcp_servers" | "agents" | "harness" | "skills"
     callback section-selected(string);
 
     width: 128px;
@@ -82,6 +82,29 @@ export component SettingsLeftTabs inherits Rectangle {
                 color: root.active-section == "harness" ? Theme.text-primary : Theme.text-secondary;
                 font-size: 11px * Theme.font-scale;
                 font-weight: root.active-section == "harness" ? 700 : 400;
+                x: Metrics.space-4;
+                vertical-alignment: center;
+            }
+        }
+        skills-tab := Rectangle {
+            height: 30px;
+            border-radius: Theme.radius-sm;
+            background: root.active-section == "skills"
+                ? Theme.bg-primary-container
+                : (skills-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
+            animate background { duration: 100ms; }
+            skills-touch := TouchArea {
+                mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: "Skills section";
+                accessible-action-default => { root.section-selected("skills"); }
+                clicked => { root.section-selected("skills"); }
+            }
+            Text {
+                text: "Skills";
+                color: root.active-section == "skills" ? Theme.text-primary : Theme.text-secondary;
+                font-size: 11px * Theme.font-scale;
+                font-weight: root.active-section == "skills" ? 700 : 400;
                 x: Metrics.space-4;
                 vertical-alignment: center;
             }

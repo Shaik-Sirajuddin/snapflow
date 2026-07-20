@@ -17,6 +17,7 @@
 mod agent_bridge;
 mod appearance;
 mod conversation;
+mod editor_detect;
 pub mod gateway_actor;
 pub mod jsonl_store;
 mod local_terminal;
@@ -24,7 +25,12 @@ mod markdown;
 mod models;
 mod permission;
 pub mod protocol_types;
+mod send_queue;
 mod settings_file;
+// `pub` (not just `mod`) so the new `skills-mcp-server` bin target can
+// reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
+// of duplicating the SKILL.md front-matter parsing logic.
+pub mod skills_state;
 mod state_store;
 mod theme;
 
@@ -147,6 +153,7 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore) {
         background_session_default: Some(defaults.background_session),
         default_agent_id: None,
         harness: None,
+        dev_mode: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
         eprintln!("panel-rust: failed to migrate panel defaults to JSON: {error}");
@@ -219,6 +226,15 @@ struct PanelSingleton {
     bridge: Option<AgentBridge>,
     panel_state: Option<PanelStateStore>,
     appearance: RefCell<AppearanceState>,
+    /// `active_project_binding` phase: the currently-open Shotcut MLT
+    /// project's path, pushed in from the C++ host via
+    /// `panel_rust_set_project_path` (mirroring `panel_rust_set_theme`'s
+    /// byte-buffer FFI shape) whenever `MainWindow::producerOpened`
+    /// fires. `None` before the first project opens, or if Shotcut has
+    /// no project open. This is deliberately just storage for now --
+    /// `thread_item_project_context`/`chat_sessions_project_path`
+    /// consume it.
+    active_project_path: RefCell<Option<String>>,
     thread_names: RefCell<Vec<String>>,
     /// Immutable ACPX profile bindings, held alongside the display names so
     /// a background session attachment can persist a complete `ThreadRecord`
@@ -230,6 +246,16 @@ struct PanelSingleton {
     traced_attachment_threads: RefCell<HashSet<String>>,
     thread_state: RefCell<Vec<ThreadState>>,
     thread_errors: RefCell<Vec<String>>,
+    /// `queued_send_queue_behavior` phase: one `SendQueue` per thread,
+    /// parallel to `thread_state`/`thread_names` (same real_index
+    /// convention, grown at exactly the two thread-creation call sites
+    /// that also grow those). In-memory only for now -- restart
+    /// persistence (`SendQueue::load`/JSONL) needs a real per-thread
+    /// identity available at construction time, which isn't wired up
+    /// yet; this still gets the core behavior (always-typeable input,
+    /// correct enqueue/drain) without gambling on that extra plumbing
+    /// in the same pass.
+    send_queues: RefCell<Vec<crate::send_queue::SendQueue>>,
     /// Phase 2 (chat-panel-ui-theme-parity.md): current sidebar search
     /// filter, empty means "show all".
     search_query: RefCell<String>,
@@ -365,13 +391,20 @@ impl PanelSingleton {
     /// before that attachment finishes so cached UI can render immediately;
     /// attempting this work only during creation silently skipped every
     /// initial record and made the next host process unable to reattach.
-    fn sync_thread_records(&self) {
+    ///
+    /// Returns whether any thread's attachment newly resolved this tick
+    /// (`thread_new_loading_state` phase) -- `panel_rust_poll` uses this to
+    /// know when to call `refresh_threads_model` so a thread's sidebar row
+    /// flips from its "loading" placeholder to its real state even when no
+    /// other `AgentEvent` happens to arrive in the same tick.
+    fn sync_thread_records(&self) -> bool {
         let (Some(store), Some(bridge)) = (&self.panel_state, &self.bridge) else {
-            return;
+            return false;
         };
         let names = self.thread_names.borrow();
         let profiles = self.thread_profiles.borrow();
         let permission_profiles = self.thread_permission_profiles.borrow();
+        let mut newly_attached = false;
         for idx in 0..names.len() {
             let Some(binding) = bridge.thread_binding(idx) else {
                 continue;
@@ -395,6 +428,7 @@ impl PanelSingleton {
                         .borrow_mut()
                         .insert(record.thread_id.clone())
                     {
+                        newly_attached = true;
                         trace_host_input(format_args!(
                             "attachment ready thread={idx} session={:?}",
                             record.session_id
@@ -409,6 +443,7 @@ impl PanelSingleton {
                 }
             }
         }
+        newly_attached
     }
 
     /// Rebuilds and pushes the `threads` model from the dynamic thread list +
@@ -488,6 +523,16 @@ impl PanelSingleton {
                     .unwrap_or_default()
             })
             .collect();
+        let thread_project_paths: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                self.bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_project_path(idx))
+                    .unwrap_or_default()
+            })
+            .collect();
         let items = build_thread_items(
             &*names,
             &state,
@@ -503,11 +548,72 @@ impl PanelSingleton {
                 let mut item = i.item;
                 item.provider = providers.get(i.real_index).cloned().unwrap_or_default().into();
                 item.model = thread_models.get(i.real_index).cloned().unwrap_or_default().into();
+                let project_path = thread_project_paths
+                    .get(i.real_index)
+                    .cloned()
+                    .unwrap_or_default();
+                item.project_name = std::path::Path::new(&project_path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .into();
+                item.project_path = project_path.into();
+                // `thread_new_loading_state` phase: a thread whose ACP
+                // session hasn't resolved yet (`thread_binding` is only
+                // `None` before `spawn_background_attachment` completes --
+                // see `add_thread_with_profile`'s doc comment) shows as
+                // loading/busy instead of a misleadingly-idle empty chat
+                // view, from the moment "+" is clicked until attachment
+                // finishes. Closed threads are excluded since a closed
+                // session legitimately has no binding either.
+                if !item.closed
+                    && self
+                        .bridge
+                        .as_ref()
+                        .is_some_and(|bridge| bridge.thread_binding(i.real_index).is_none())
+                {
+                    item.status = "loading".into();
+                    item.busy = true;
+                }
                 item
             })
             .collect();
         self.component
             .set_threads(ModelRc::new(VecModel::from(items)));
+    }
+
+    /// Rebuilds the `skills` sidebar model from the global skills
+    /// directory (`skill_discovery_backend` phase). Project-local
+    /// scanning is deliberately not wired here yet -- it needs
+    /// `active_project_binding`'s active-project state, which doesn't
+    /// exist yet -- so this only ever reports global skills for now.
+    fn refresh_skills_model(&self) {
+        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        let mut entries = crate::skills_state::scan_skills_dir(
+            &global_dir,
+            crate::skills_state::SkillScope::Global,
+        );
+        // `project_scoped_skill_isolation`: now that `active_project_binding`
+        // is real, also scan the active project's own `.skills/` directory
+        // -- entirely additive to the always-scanned global directory, and
+        // naturally empty (not an error) when no project is open or it has
+        // no `.skills/` yet, since `scan_skills_dir` already treats a
+        // missing directory as an empty result.
+        if let Some(project_path) = self.active_project_path.borrow().as_ref() {
+            // `active_project_path` is the open MLT *file*'s path
+            // (`MainWindow::fileName()`), not its containing directory --
+            // `.skills/` lives alongside the project file, so this needs
+            // the parent directory.
+            if let Some(project_dir) = std::path::Path::new(project_path).parent() {
+                let skills_dir = crate::skills_state::project_skills_dir(project_dir);
+                entries.extend(crate::skills_state::scan_skills_dir(
+                    &skills_dir,
+                    crate::skills_state::SkillScope::Project,
+                ));
+            }
+        }
+        self.component
+            .set_available_skills(crate::models::to_skill_options(entries));
     }
 
     /// Translates a Slint-side filtered-list index (what `thread-selected`
@@ -829,6 +935,39 @@ impl PanelSingleton {
                             if let Some(error) = self.thread_errors.borrow_mut().get_mut(idx) {
                                 error.clear();
                             }
+                            // queued_send_queue_behavior: auto-advance
+                            // this thread's send queue now that its turn
+                            // has genuinely ended. `is_compose_focused`
+                            // is always passed false here (a simplification
+                            // vs. Zed's precedent, which suppresses
+                            // auto-send while the user is actively
+                            // editing the *next* message) -- this
+                            // integration pass doesn't thread per-thread
+                            // compose-focus state down to this event
+                            // loop; documented, not silently dropped.
+                            let popped = self
+                                .send_queues
+                                .borrow_mut()
+                                .get_mut(idx)
+                                .and_then(|q| q.on_generation_stopped(false).ok().flatten());
+                            if let Some(entry) = popped {
+                                bridge.push_local(
+                                    idx,
+                                    ChatMessage {
+                                        kind: MessageKind::User,
+                                        text: entry.text.clone(),
+                                        status: None,
+                                        id: None,
+                                        raw_input: None,
+                                        raw_output: None,
+                                    },
+                                );
+                                *slot = ThreadState::Loading;
+                                bridge.send_prompt(idx, entry.text);
+                                trace_host_input(format_args!(
+                                    "queued message auto-sent real_thread={idx}"
+                                ));
+                            }
                         }
                         AgentEvent::Error(error) => {
                             trace_host_input(format_args!(
@@ -1053,6 +1192,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .chain(std::iter::repeat(None))
             .take(initial_names.len())
             .collect();
+        let initial_thread_count = initial_names.len();
         let (bridge, initial_state) = match AgentBridge::new_with_thread_specs(&initial_specs) {
             Ok(b) => (Some(b), vec![ThreadState::Idle; initial_names.len()]),
             Err(e) => {
@@ -1091,12 +1231,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             bridge,
             panel_state,
             appearance: RefCell::new(AppearanceState::default()),
+            active_project_path: RefCell::new(None),
             thread_names: RefCell::new(initial_names),
             thread_profiles: RefCell::new(initial_profiles),
             thread_permission_profiles: RefCell::new(initial_permission_profiles),
             traced_attachment_threads: RefCell::new(HashSet::new()),
             thread_state: RefCell::new(initial_state),
             thread_errors: RefCell::new(Vec::new()),
+            send_queues: RefCell::new(
+                (0..initial_thread_count)
+                    .map(|_| crate::send_queue::SendQueue::new())
+                    .collect(),
+            ),
             search_query: RefCell::new(String::new()),
             visible_indices: RefCell::new(Vec::new()),
             expanded: RefCell::new(Vec::new()),
@@ -1108,6 +1254,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             _settings_watcher: settings_watcher,
         };
         panel.refresh_threads_model();
+        panel.refresh_skills_model();
         // Multi-process prefs live in JSON; selected thread stays in SQLite.
         if let Some(store) = panel.panel_state.as_ref() {
             maybe_migrate_sqlite_defaults_to_json(store);
@@ -1131,6 +1278,20 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         panel
             .component
             .set_background_default(defaults.background_session);
+        let dev_mode_at_startup = settings_file::SettingsPaths::from_env().dev_mode();
+        panel.component.set_dev_mode(dev_mode_at_startup);
+        if dev_mode_at_startup {
+            // Mirrors on_dev_mode_toggled's install-on-enable behavior --
+            // that callback only fires on the OFF->ON transition, so a
+            // fresh launch that loads dev_mode already persisted `true`
+            // never got the bundled default skill installed at all,
+            // leaving dev mode on with zero global skills to show.
+            let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+            if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
+                eprintln!("panel-rust: failed to install bundled global skill at startup: {error}");
+            }
+            panel.refresh_skills_model();
+        }
         if let Some(selected_thread_id) = defaults.selected_thread_id {
             if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
                 (0..panel.thread_names.borrow().len()).find(|idx| {
@@ -1546,6 +1707,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     panel.thread_permission_profiles.borrow_mut().push(None);
                     panel.thread_state.borrow_mut().push(ThreadState::Idle);
                     panel.thread_errors.borrow_mut().push(String::new());
+                    panel
+                        .send_queues
+                        .borrow_mut()
+                        .push(crate::send_queue::SendQueue::new());
                     panel.search_query.borrow_mut().clear();
                     panel.refresh_threads_model();
                     // The recovered session is now bound locally --
@@ -1659,6 +1824,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     .push(non_empty(component.get_permission_profile().to_string()));
                 panel.thread_state.borrow_mut().push(ThreadState::Idle);
                 panel.thread_errors.borrow_mut().push(String::new());
+                panel
+                    .send_queues
+                    .borrow_mut()
+                    .push(crate::send_queue::SendQueue::new());
                 panel.search_query.borrow_mut().clear();
                 // New session: clear compose so it never carries over.
                 component.set_compose_text("".into());
@@ -1680,6 +1849,135 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     panel.refresh_messages_for(real_idx);
                 }
             });
+        });
+
+        panel.component.on_new_skill_requested(move |name| {
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                let dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                match crate::skills_state::scaffold_new_skill(&dir, name.as_str()) {
+                    Ok(skill_dir) => {
+                        trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
+                        panel.refresh_skills_model();
+                    }
+                    Err(error) => {
+                        eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
+                    }
+                }
+            });
+        });
+
+        panel.component.on_skill_promote_to_global(move |path| {
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                let skill_dir = std::path::PathBuf::from(path.as_str());
+                let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                match crate::skills_state::promote_skill_to_global(&skill_dir, &global_dir) {
+                    Ok(destination) => {
+                        trace_host_input(format_args!("skill promoted to global at {destination:?}"));
+                        panel.refresh_skills_model();
+                    }
+                    Err(error) => {
+                        eprintln!("panel-rust: failed to promote skill {path:?} to global: {error}");
+                    }
+                }
+            });
+        });
+
+        panel.component.on_dev_mode_toggled(move |enabled| {
+            let paths = settings_file::SettingsPaths::from_env();
+            if let Err(error) = paths.set_dev_mode(enabled) {
+                eprintln!("panel-rust: failed to persist dev mode: {error}");
+            }
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                panel.component.set_dev_mode(enabled);
+                if enabled {
+                    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+                    if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
+                        eprintln!("panel-rust: failed to install bundled global skill: {error}");
+                    }
+                    panel.refresh_skills_model();
+                }
+            });
+        });
+
+        panel.component.on_skill_editor_open_requested(move |path| {
+            PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let Some(panel) = slot.as_ref() else {
+                    return;
+                };
+                let path = std::path::PathBuf::from(path.as_str());
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let content =
+                    std::fs::read_to_string(path.join("SKILL.md")).unwrap_or_default();
+                panel.component.set_active_skill_name(name.into());
+                panel
+                    .component
+                    .set_active_skill_path(path.to_string_lossy().into_owned().into());
+                panel.component.set_active_skill_content(content.into());
+                let detected: Vec<slint::SharedString> = crate::editor_detect::detect_installed_editors()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                panel
+                    .component
+                    .set_detected_editors(ModelRc::new(VecModel::from(detected)));
+            });
+        });
+
+        panel.component.on_skill_content_edited(move |path, content| {
+            let skill_md = std::path::Path::new(path.as_str()).join("SKILL.md");
+            if let Err(error) = std::fs::write(&skill_md, content.as_str()) {
+                eprintln!("panel-rust: failed to save skill {path:?}: {error}");
+            }
+        });
+
+        panel.component.on_skill_copy_path_requested(move |path| {
+            trace_host_input(format_args!("skill copy-path requested for {path:?}"));
+            // No system clipboard dependency in this crate today -- see
+            // panel-rust/Cargo.lock check in skill-manager-workspace's
+            // 03-open-risks.md for the same "no new dependency without a
+            // concrete need" stance applied to the opener crate. Logged
+            // for now; a real clipboard write is a small, separate
+            // addition once a clipboard crate is actually needed
+            // elsewhere too.
+        });
+
+        panel.component.on_skill_open_in_editor_requested(move |editor_name, path| {
+            let Some((bin, _)) = crate::editor_detect::EDITOR_CANDIDATES
+                .iter()
+                .find(|(_, name)| *name == editor_name.as_str())
+            else {
+                eprintln!("panel-rust: unknown editor {editor_name:?}");
+                return;
+            };
+            if let Err(error) =
+                crate::editor_detect::open_in_editor(bin, std::path::Path::new(path.as_str()))
+            {
+                eprintln!("panel-rust: failed to open skill in {editor_name:?}: {error}");
+            }
+        });
+
+        panel.component.on_skill_open_with_os_default_requested(move |path| {
+            if let Err(error) =
+                crate::editor_detect::open_with_os_default(std::path::Path::new(path.as_str()))
+            {
+                eprintln!("panel-rust: failed to open skill with OS default: {error}");
+            }
         });
 
         let component_weak = panel.component.as_weak();
@@ -1710,9 +2008,23 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         .get(idx)
                         .is_some_and(|state| *state == ThreadState::Loading)
                     {
-                        trace_host_input(format_args!(
-                            "send ignored real_thread={idx} because it is already loading"
-                        ));
+                        // queued_send_queue_behavior: a turn is already
+                        // in flight, so this message goes on the queue
+                        // instead of being silently dropped (compose is
+                        // no longer disabled while sending -- see
+                        // chat_input_layout.slint's `enabled: true` --
+                        // so this branch is reachable for real now,
+                        // unlike before this phase).
+                        if let Some(queue) = panel.send_queues.borrow_mut().get_mut(idx) {
+                            match queue.enqueue(text.to_string(), false) {
+                                Ok(_) => trace_host_input(format_args!(
+                                    "send queued real_thread={idx} (turn in flight)"
+                                )),
+                                Err(error) => eprintln!(
+                                    "panel-rust: failed to enqueue message for thread {idx}: {error}"
+                                ),
+                            }
+                        }
                         return;
                     }
                     if bridge.thread_closed(idx) {
@@ -2308,6 +2620,50 @@ pub extern "C" fn panel_rust_set_theme(
     })
 }
 
+/// `active_project_binding` phase's FFI crossing point -- mirrors
+/// `panel_rust_set_theme`'s byte-buffer shape exactly.
+/// `ChatRustDock::updateProjectPath` calls this whenever `MainWindow::
+/// producerOpened` fires, passing `MainWindow::fileName()`. An empty
+/// buffer (zero length, not necessarily a null pointer) means "no
+/// project open" and clears the stored path -- Shotcut's own
+/// `producerOpened(false)` firing on project close is expected to pass
+/// an empty string, not skip the call, so panel-rust's state can't go
+/// stale after a close.
+#[no_mangle]
+pub extern "C" fn panel_rust_set_project_path(
+    _handle: *mut PanelHandle,
+    path_ptr: *const c_uchar,
+    path_len: usize,
+) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        let path = if path_ptr.is_null() || path_len == 0 {
+            None
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+            std::str::from_utf8(bytes).ok().map(str::to_string)
+        };
+        // `chat_sessions_project_path` phase: also propagate to the
+        // bridge, whose `cwd_for_session` reads this to scope every
+        // subsequently-opened ACP session to the active project instead
+        // of the process's own working directory.
+        if let Some(bridge) = panel.bridge.as_ref() {
+            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
+        }
+        panel
+            .component
+            .set_active_project_path(path.clone().unwrap_or_default().into());
+        *panel.active_project_path.borrow_mut() = path;
+        // `project_scoped_skill_isolation`: re-scan now that the active
+        // project (and therefore its `.skills/` directory) changed.
+        panel.refresh_skills_model();
+        true
+    })
+}
+
 /// Applies a generation-ordered host appearance snapshot. The host owns only
 /// selector values; the panel retains its component palette and tokens.
 #[no_mangle]
@@ -2405,17 +2761,19 @@ pub extern "C" fn panel_rust_apply_host_appearance(
 #[no_mangle]
 pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
     // Slint `animate` blocks (hover fades, entrance/exit transitions, the
-    // loading spinner, ...) only progress when something calls this --
-    // under a real windowing backend the platform event loop does it
-    // automatically, but this crate's `SpikePlatform`/`MinimalSoftwareWindow`
-    // has no event loop of its own, only this 80ms QTimer poll
-    // (rustpanelitem.cpp's RustPanelItem::poll). Without this call every
-    // `animate` was simply frozen -- properties jumped straight to their
-    // end value with no interpolation, since nothing ever advanced
-    // Slint's animation clock. Called unconditionally, every tick,
-    // regardless of `apply_bridge_events`/etc. below finding anything
-    // "changed" -- an in-flight animation is itself a reason to redraw
-    // even with zero application-state change this tick.
+    // loading spinner, the sidebar rail's `animate width`, ...) -- and a
+    // `Flickable`'s own interactive flick/momentum motion -- only progress
+    // when something calls this. Under a real windowing backend the
+    // platform event loop does it automatically, but this crate's
+    // `SpikePlatform`/`MinimalSoftwareWindow` has no event loop of its own,
+    // only this 80ms QTimer poll (rustpanelitem.cpp's RustPanelItem::poll).
+    // Without this call every `animate` was simply frozen -- properties
+    // jumped straight to their end value with no interpolation, and a
+    // Flickable's drag-then-release momentum never advanced either, since
+    // nothing ever advanced Slint's animation clock. Called unconditionally,
+    // every tick, regardless of whatever else below finds "changed" -- an
+    // in-flight animation is itself a reason to redraw even with zero
+    // application-state change this tick.
     slint::platform::update_timers_and_animations();
     PANEL.with(|cell| {
         let slot = cell.borrow();
@@ -2423,7 +2781,15 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
             return false;
         };
         let bridge_changed = panel.apply_bridge_events();
-        panel.sync_thread_records();
+        // `thread_new_loading_state` phase: a newly-created thread's
+        // attachment can resolve with no other AgentEvent arriving in the
+        // same tick -- refresh the sidebar so its row flips out of the
+        // "loading" placeholder as soon as that happens, not only on the
+        // next unrelated bridge event.
+        let attachment_changed = panel.sync_thread_records();
+        if attachment_changed {
+            panel.refresh_threads_model();
+        }
         // Multi-process settings watch: reload prefs when another process
         // rewrote the global/project JSON (skip during our own save window).
         let mut settings_changed = false;
@@ -2458,17 +2824,24 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let connection_changed = selected
             .map(|idx| panel.refresh_connection_status_for(idx))
             .unwrap_or(false);
-        // Always true, not just `bridge_changed || ... || settings_changed`:
-        // this crate has no cheap way to ask Slint "is an `animate` block
-        // still mid-transition right now" from a custom platform, and an
-        // in-flight animation needs a repaint every tick even when every
-        // other signal above is false. 80ms (this function's own caller,
-        // rustpanelitem.cpp's QTimer) was already budgeted as "nowhere
-        // near a hot loop" for a chat panel this size, so redrawing
-        // unconditionally at that cadence costs nothing that mattered
-        // before this fix wasn't already the norm during real activity.
-        let _ = (bridge_changed, local_terminal_changed, connection_changed, settings_changed);
-        true
+        // An in-flight `animate` (or a Flickable's own interactive flick/
+        // momentum motion) is itself a reason to repaint even when nothing
+        // else above changed this tick -- update_timers_and_animations()
+        // above only advances the animation clock, it doesn't make the C++
+        // side (RustPanelItem::poll, which only calls update() when this
+        // function returns true) know a frame still needs painting. Without
+        // this, every animation was silently truncated to whichever single
+        // tick happened to coincide with an unrelated state change, which
+        // in practice meant "frozen" for anything driven purely by
+        // animation (the sidebar rail's `animate width`, a Flickable's
+        // drag-release momentum, hover fades, ...).
+        let animating = panel.window.window().has_active_animations();
+        bridge_changed
+            || local_terminal_changed
+            || connection_changed
+            || settings_changed
+            || attachment_changed
+            || animating
     })
 }
 
@@ -2493,6 +2866,10 @@ const MIN_RENDERABLE_SIZE: u32 = 16;
 
 #[no_mangle]
 pub extern "C" fn panel_rust_render(_handle: *mut PanelHandle) -> bool {
+    panel_rust_render_impl()
+}
+
+fn panel_rust_render_impl() -> bool {
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
@@ -2572,7 +2949,7 @@ mod lifecycle_tests {
         assert!(!first.is_null());
         assert_eq!(panel_rust_width(first), 96);
         assert_eq!(panel_rust_height(first), 64);
-        assert!(panel_rust_render(first));
+        assert!(panel_rust_render_impl());
         assert!(panel_rust_input_scroll(first, 48.0, 32.0, 0.0, -40.0));
         PANEL.with(|cell| {
             let panel = cell.borrow();

@@ -28,6 +28,14 @@ export component TextField inherits Rectangle {
         color: Theme.text-primary;
         font-size: root.field-font-size * Theme.font-scale;
         x: Metrics.pad-md;
+        // `settings_view_input_and_propagation` phase: this TextInput had
+        // no explicit y/height, so it defaulted to its own single-line
+        // preferred height anchored at y:0 -- leaving most of this 26px
+        // field's lower area outside the actual clickable/focusable
+        // element even though it visually looks like part of the input box,
+        // matching the reported "input box doesn't accept input" symptom.
+        y: 0px;
+        height: parent.height;
         width: parent.width - 2 * Metrics.pad-md;
         vertical-alignment: center;
         edited => { root.edited(); }

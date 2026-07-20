@@ -59,6 +59,30 @@ def type_text(xdisplay, text):
         tap(xdisplay, keycode(xdisplay, char))
 
 
+# designa v2 'input' task: "continuous backspace, all a-z characters, words".
+# Deterministic so the driver and the assertion agree on the final text
+# without needing to inspect intermediate compose state -- same style as
+# --exercise-backspace's expected_prompt[:-2] + "x" arithmetic below.
+INPUT_MATRIX_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+INPUT_MATRIX_BACKSPACE_COUNT = 5
+INPUT_MATRIX_WORDS = " two words"
+INPUT_MATRIX_EXPECTED = (
+    INPUT_MATRIX_ALPHABET[: -INPUT_MATRIX_BACKSPACE_COUNT] + INPUT_MATRIX_WORDS
+)
+
+
+def type_input_matrix(xdisplay):
+    """Types the full alphabet, several backspaces in a row (not a single
+    fix-a-typo tap), then a multi-word sequence -- the three scenarios
+    designa v2's 'input' task names, composed into one compose+send so the
+    existing single-prompt wait_for_prompts/event-log check verifies all
+    three at once."""
+    type_text(xdisplay, INPUT_MATRIX_ALPHABET)
+    for _ in range(INPUT_MATRIX_BACKSPACE_COUNT):
+        tap(xdisplay, keycode(xdisplay, "BackSpace"))
+    type_text(xdisplay, INPUT_MATRIX_WORDS)
+
+
 def prompt_events(event_log):
     if not event_log.exists():
         return []
@@ -658,6 +682,18 @@ def main():
         help="type and remove a typo before sending the prompt",
     )
     parser.add_argument(
+        "--exercise-input-matrix",
+        action="store_true",
+        help=(
+            "designa v2 'input' task's three named scenarios in one compose: "
+            "type the full a-z alphabet, continuous backspace (multiple taps "
+            "in a row, not exercise-backspace's single fix-a-typo tap), then "
+            "type a multi-word sequence -- overrides --prompt with the "
+            "resulting deterministic text and verifies it via the same "
+            "event-log session/prompt detail check every other scenario uses"
+        ),
+    )
+    parser.add_argument(
         "--same-session-as",
         help="assert this prompt is delivered to the session used by an earlier prompt",
     )
@@ -757,7 +793,7 @@ def main():
     # covered by the real gateway actor suite, where sessions have stable IDs.
     compose_x = max(12, args.dock_width - 92)
     compose_y = 520
-    expected_prompt = args.prompt
+    expected_prompt = INPUT_MATRIX_EXPECTED if args.exercise_input_matrix else args.prompt
 
     if args.wait_for_attachment:
         wait_for_attachment(args.host_log)
@@ -785,7 +821,9 @@ def main():
     if args.select_thread_row is not None:
         select_thread_row(xdisplay, args.select_thread_row, args.host_log)
     focus_compose(xdisplay, compose_x, compose_y, args.host_log)
-    if args.exercise_backspace:
+    if args.exercise_input_matrix:
+        type_input_matrix(xdisplay)
+    elif args.exercise_backspace:
         # This explicitly checks that the focused chat composer owns editing
         # keys from Shotcut: remove the injected typo before dispatching.
         type_text(xdisplay, expected_prompt[:-2] + "x")

@@ -1,13 +1,14 @@
 import { Theme } from "tokens/theme.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
 import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
 import { SettingsPage } from "pages/settings/settings_page.slint";
+import { SkillEditorView } from "pages/skills/skill_view.slint";
 import { TextUtil } from "base/text_util.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, TextUtil, Theme }
+export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -51,7 +52,6 @@ export component ChatPanel inherits Window {
     in-out property <bool> background-default: false;
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
-    in-out property <string> agent-badge: "agent . ask";
     in property <string> connection-status: "Connecting...";
     in property <bool> compact: true;
     in-out property <bool> narrow: false;
@@ -79,6 +79,33 @@ export component ChatPanel inherits Window {
     in property <[McpServerOption]> available-mcp-servers: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
+    // Skill-manager backend addition (skill_discovery_backend phase) --
+    // populated by `lib.rs` from `models::to_skill_options`. Plumbed
+    // through now, ahead of the sidebar/settings UI that will actually
+    // render it (sidebar_skill_tree_and_new_skill_flow /
+    // skills_management_settings phases), same "property exists before
+    // its consuming UI" precedent as `available-mcp-servers` originally.
+    in property <[SkillOption]> available-skills: [];
+    in property <bool> dev-mode: false;
+    // `active_pane_and_editor_view` phase: which surface the main content
+    // area shows -- "chat" (ChatArea, the default) or "skill" (a live
+    // SkillEditorView for the sidebar's currently-selected skill).
+    in-out property <string> active-pane: "chat";
+    in property <string> active-skill-name: "";
+    in property <string> active-skill-path: "";
+    in-out property <string> active-skill-content: "";
+    in property <[string]> detected-editors: [];
+    // `thread_item_project_context` phase: the currently-open MLT
+    // project's path (mirrors PanelSingleton::active_project_path),
+    // pushed from Rust on every `panel_rust_set_project_path` FFI call.
+    // Empty string means no project is open. Sidebar rows use this to
+    // decide whether a thread's own project-path differs from "here".
+    in property <string> active-project-path: "";
+    callback skill-content-edited(string, string /* path, new content */);
+    callback skill-copy-path-requested(string);
+    callback skill-open-in-editor-requested(string, string /* editor name, path */);
+    callback skill-open-with-os-default-requested(string);
+    callback skill-editor-open-requested(string /* path */);
     // Mode/config selector addition -- see chat_area.slint's own doc
     // comment on these properties; passed straight through to `ChatArea`
     // below (this root component owns no mode/config state of its own,
@@ -95,6 +122,9 @@ export component ChatPanel inherits Window {
 
     callback thread-selected(int);
     callback new-thread-requested();
+    callback new-skill-requested(string);
+    callback skill-promote-to-global(string);
+    callback dev-mode-toggled(bool);
     callback thread-close-requested(int);
     callback thread-delete-requested(int);
     callback thread-archive-requested(int);
@@ -222,11 +252,18 @@ export component ChatPanel inherits Window {
                 selected-thread: selected-thread;
                 compact: compact;
                 expanded: root.narrow ? false : sidebar-expanded;
+                skills: available-skills;
+                active-project-path: root.active-project-path;
                 thread-selected(i) => {
                     selected-thread = i;
                     thread-selected(i);
                 }
                 new-thread-requested => { new-thread-requested(); }
+                new-skill-requested(name) => { new-skill-requested(name); }
+                skill-selected(path) => {
+                    root.active-pane = "skill";
+                    root.skill-editor-open-requested(path);
+                }
                 thread-close-requested(i) => { thread-close-requested(i); }
                 thread-delete-requested(i) => { thread-delete-requested(i); }
                 thread-archive-requested(i) => { thread-archive-requested(i); }
@@ -235,6 +272,7 @@ export component ChatPanel inherits Window {
                 toggle-expanded => { sidebar-expanded = !sidebar-expanded; }
             }
             chat-area := ChatArea {
+                visible: root.active-pane == "chat";
                 x: sidebar.width;
                 y: 0px;
                 width: root.width - self.x;
@@ -249,7 +287,19 @@ export component ChatPanel inherits Window {
                 has-older-messages: has-older-messages;
                 loading-older-messages <=> loading-older-messages;
                 load-older-requested => { load-older-requested(); }
-                agent-badge: agent-badge;
+                // `default_variables_display` phase: `agent-badge` used to
+                // be a static "agent . ask" default that nothing ever set
+                // from Rust, so it never reflected the active thread's real
+                // provider/model or updated on model selection. Derived
+                // here instead, the same way `active-thread-name`/
+                // `active-thread-description` already are, from the same
+                // live per-thread `provider`/`model` fields the sidebar row
+                // already shows -- always current, no separate Rust-side
+                // property push needed.
+                agent-badge: threads.length > 0 && threads[selected-thread].provider != ""
+                    ? threads[selected-thread].provider
+                        + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
+                    : "agent . ask";
                 connection-status: connection-status;
                 sending: threads.length > 0
                     ? threads[selected-thread].status == "loading"
@@ -281,6 +331,27 @@ export component ChatPanel inherits Window {
                 panel-shortcut(event) => {
                     return root.handle-panel-shortcut(event);
                 }
+            }
+            if root.active-pane == "skill" : SkillEditorView {
+                x: sidebar.width;
+                y: 0px;
+                width: root.width - self.x;
+                height: parent.height;
+                skill-name: root.active-skill-name;
+                skill-path: root.active-skill-path;
+                skill-content <=> root.active-skill-content;
+                detected-editors: root.detected-editors;
+                copy-path-requested => { root.skill-copy-path-requested(root.active-skill-path); }
+                open-in-editor-requested(editor-name) => {
+                    root.skill-open-in-editor-requested(editor-name, root.active-skill-path);
+                }
+                open-with-os-default-requested => {
+                    root.skill-open-with-os-default-requested(root.active-skill-path);
+                }
+                content-edited(new-content) => {
+                    root.skill-content-edited(root.active-skill-path, new-content);
+                }
+                close-requested => { root.active-pane = "chat"; }
             }
         }
         if expanded-terminal.terminal-id != "" : TerminalOverlay {
@@ -335,6 +406,8 @@ export component ChatPanel inherits Window {
                 available-mcp-servers: available-mcp-servers;
                 agent-catalog: agent-catalog;
                 recoverable-sessions: recoverable-sessions;
+                available-skills: available-skills;
+                dev-mode: dev-mode;
                 save => { settings-save(); }
                 close => {
                     settings-open = false;
@@ -349,6 +422,8 @@ export component ChatPanel inherits Window {
                 profile-delete(name) => { profile-delete(name); }
                 agent-install-requested(id) => { agent-install-requested(id); }
                 recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
+                skill-promote-to-global(path) => { skill-promote-to-global(path); }
+                dev-mode-toggled(enabled) => { dev-mode-toggled(enabled); }
             }
         }
     }

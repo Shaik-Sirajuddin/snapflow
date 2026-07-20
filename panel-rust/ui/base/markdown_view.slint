@@ -98,6 +98,7 @@ export component MarkdownView inherits VerticalLayout {
                 font-family: Theme.font-sans;
                 font-size: 12px * Theme.font-scale;
                 color: Theme.text-secondary;
+                horizontal-alignment: left;
                 vertical-alignment: top;
             }
 
@@ -112,6 +113,16 @@ export component MarkdownView inherits VerticalLayout {
                     color: run.strike ? Theme.text-muted
                         : is-code ? Theme.text-terminal
                         : Theme.text-primary;
+                    // `md_formatter_default_alignment` phase: every markdown
+                    // row (paragraph, heading, list item, table row, quote)
+                    // must default to left alignment when the source markdown
+                    // doesn't specify one -- explicit here rather than relying
+                    // on Text's own implicit default, since this component has
+                    // no concept of column/paragraph alignment at all today
+                    // (table cells are joined into one plain string, see
+                    // markdown.rs's BlockAst::Table doc comment) and never
+                    // will unless a real alignment marker is threaded through.
+                    horizontal-alignment: left;
                     vertical-alignment: top;
                 }
             }
