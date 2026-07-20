@@ -18,7 +18,12 @@ func TestWriteConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(raw)
-	for _, part := range []string{`"name": "snapshotd"`, `"url": "http://127.0.0.1:7777/mcp"`, `"name": "default"`} {
+	// The registered profile is deliberately NOT named after agentID (see
+	// WriteConfig's own doc comment: a profile name equal to agentID gets
+	// silently picked up by acpx-core's native-session fallback lookup and
+	// breaks ACPX_NATIVE_AUTH_METHOD_ID). agentID surfaces as the
+	// profile's "agent_id" field instead, not its "name".
+	for _, part := range []string{`"name": "snapshotd"`, `"url": "http://127.0.0.1:7777/mcp"`, `"agent_id": "default"`} {
 		if !strings.Contains(s, part) {
 			t.Fatalf("missing %q in:\n%s", part, s)
 		}
