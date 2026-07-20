@@ -74,6 +74,48 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
 /// work by the time `text()` is populated). Returns `None` for pure
 /// modifier presses (empty text, no special mapping) which Slint doesn't
 /// need forwarded as a `KeyPressed`/`KeyReleased` text event.
+/// Wraps `current + delta` into `0..visible_len`, both directions. Pulled
+/// out of `on_thread_navigation_requested` as a pure function so the
+/// clamp/wrap behavior (empty list, single-thread no-op, negative wrap,
+/// overflow wrap) is unit-testable without a full `PanelSingleton`.
+/// `visible_len` must be non-zero -- callers already guard on that.
+fn wrap_thread_index(current: usize, delta: i32, visible_len: usize) -> usize {
+    debug_assert!(visible_len > 0);
+    ((current as i64 + delta as i64).rem_euclid(visible_len as i64)) as usize
+}
+
+#[cfg(test)]
+mod thread_navigation_tests {
+    use super::wrap_thread_index;
+
+    #[test]
+    fn next_advances_by_one() {
+        assert_eq!(wrap_thread_index(0, 1, 3), 1);
+        assert_eq!(wrap_thread_index(1, 1, 3), 2);
+    }
+
+    #[test]
+    fn previous_retreats_by_one() {
+        assert_eq!(wrap_thread_index(2, -1, 3), 1);
+    }
+
+    #[test]
+    fn next_wraps_past_the_end() {
+        assert_eq!(wrap_thread_index(2, 1, 3), 0);
+    }
+
+    #[test]
+    fn previous_wraps_before_the_start() {
+        assert_eq!(wrap_thread_index(0, -1, 3), 2);
+    }
+
+    #[test]
+    fn single_thread_is_a_no_op_either_direction() {
+        assert_eq!(wrap_thread_index(0, 1, 1), 0);
+        assert_eq!(wrap_thread_index(0, -1, 1), 0);
+    }
+}
+
 fn map_qt_key(qt_key: c_int, text: &str, shift: bool) -> Option<SharedString> {
     let special = match qt_key {
         0x0100_0000 => Some(Key::Escape),
@@ -852,6 +894,42 @@ impl PanelSingleton {
         self.refresh_connection_status_for(real_idx);
     }
 
+    /// Single entry point for "make `filtered_idx` (a Slint filtered-list
+    /// index, same space as `thread-selected`/`get_selected_thread`) the
+    /// displayed thread": clamps against `visible_indices`, updates the
+    /// Slint `selected-thread` property, persists the choice, and refreshes
+    /// messages/capabilities/settings lists. Sidebar clicks (`on_thread_
+    /// selected` below) and keyboard cycling (`on_thread_navigation_
+    /// requested`) both call this so selection behavior can't drift between
+    /// the two entry points. No-op (returns `false`) when the visible list
+    /// is empty.
+    fn select_visible_thread(&self, filtered_idx: usize) -> bool {
+        let visible_len = self.visible_indices.borrow().len();
+        if visible_len == 0 {
+            return false;
+        }
+        let clamped_idx = filtered_idx.min(visible_len - 1);
+        let Some(real_idx) = self.real_index(clamped_idx) else {
+            return false;
+        };
+        self.component.set_selected_thread(clamped_idx as i32);
+        if let (Some(store), Some(binding)) = (
+            self.panel_state.as_ref(),
+            self.bridge
+                .as_ref()
+                .and_then(|bridge| bridge.thread_binding(real_idx)),
+        ) {
+            if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
+                eprintln!("panel-rust: failed to persist selected chat thread: {error}");
+            }
+        }
+        self.refresh_messages_for(real_idx);
+        if self.component.get_settings_open() {
+            self.refresh_settings_gateway_lists();
+        }
+        true
+    }
+
     fn refresh_connection_status_for(&self, real_idx: usize) -> bool {
         let status = self
             .bridge
@@ -1512,29 +1590,26 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    // `idx` is a filtered-list index (Phase 2) -- translate
-                    // to the real thread index before touching the bridge.
-                    let Some(real_idx) = panel.real_index(idx as usize) else {
+                    // `idx` is a filtered-list index (Phase 2).
+                    panel.select_visible_thread(idx as usize);
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_thread_navigation_requested(move |delta| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let visible_len = panel.visible_indices.borrow().len();
+                    if visible_len == 0 {
                         return;
-                    };
-                    if let (Some(store), Some(binding)) = (
-                        panel.panel_state.as_ref(),
-                        panel
-                            .bridge
-                            .as_ref()
-                            .and_then(|bridge| bridge.thread_binding(real_idx)),
-                    ) {
-                        if let Err(error) =
-                            store.set_selected_thread_id(Some(&binding.thread_id))
-                        {
-                            eprintln!("panel-rust: failed to persist selected chat thread: {error}");
-                        }
                     }
-                    panel.refresh_messages_for(real_idx);
-                    // Settings lists must follow the selected gateway.
-                    if panel.component.get_settings_open() {
-                        panel.refresh_settings_gateway_lists();
-                    }
+                    let current = panel.component.get_selected_thread().max(0) as usize;
+                    let next = wrap_thread_index(current, delta, visible_len);
+                    panel.select_visible_thread(next);
                 }
             });
         });
@@ -3018,6 +3093,61 @@ pub extern "C" fn panel_rust_input_key(
         .window()
         .dispatch_event(WindowEvent::KeyPressed { text: key_text });
     true
+}
+
+/// Command ids for [`panel_rust_invoke_command`]. Kept in sync with the C++
+/// side's own constants in `rustpanelitem.cpp` -- there is no shared header
+/// enum because this crate's `cbindgen`-style boundary is plain `extern
+/// "C"` functions, matching every other entry point in this file.
+const PANEL_COMMAND_PREVIOUS_THREAD: c_int = 0;
+const PANEL_COMMAND_NEXT_THREAD: c_int = 1;
+const PANEL_COMMAND_OPEN_THREAD_SEARCH: c_int = 2;
+
+/// Narrow, focus-independent command dispatch for host-side global
+/// shortcuts (switch thread, open thread search) that must work even when
+/// neither the compose box nor a local terminal owns Slint focus --
+/// `panel_rust_input_key` above intentionally drops everything in that
+/// case (see its focus guard) so Shotcut's own bare-letter shortcuts don't
+/// get eaten while, say, the sidebar merely has Qt focus. This function is
+/// the escape hatch: it goes straight to the same Slint callbacks the
+/// in-panel Ctrl+Alt+Up/Down and Ctrl+K bindings use
+/// (`thread-navigation-requested` / `open-thread-search` in app.slint), so
+/// there is exactly one implementation of "switch thread" / "open search"
+/// regardless of which input path triggered it.
+#[no_mangle]
+pub extern "C" fn panel_rust_invoke_command(_handle: *mut PanelHandle, command: c_int) -> bool {
+    // Clone the (cheap, Weak-backed) Slint component handle and drop the
+    // `PANEL` borrow before invoking anything on it. `invoke_*` calls run
+    // their Rust callback synchronously and in-stack -- `on_thread_
+    // navigation_requested`'s own handler re-enters `PANEL.with(|cell| cell.
+    // borrow() ...)`, which is harmless while this borrow is also a shared
+    // `Ref` (RefCell allows many), but would panic the moment either side
+    // ever needed `borrow_mut()`. Not holding the guard across the call
+    // removes that landmine instead of relying on both sides staying
+    // read-only forever.
+    let component_weak = PANEL.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|panel| panel.component.as_weak())
+    });
+    let Some(component) = component_weak.and_then(|weak| weak.upgrade()) else {
+        return false;
+    };
+    match command {
+        PANEL_COMMAND_PREVIOUS_THREAD => {
+            component.invoke_thread_navigation_requested(-1);
+            true
+        }
+        PANEL_COMMAND_NEXT_THREAD => {
+            component.invoke_thread_navigation_requested(1);
+            true
+        }
+        PANEL_COMMAND_OPEN_THREAD_SEARCH => {
+            component.invoke_open_thread_search();
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Sets the theme variant ("dark"/"light"/anything else treated as dark),

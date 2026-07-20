@@ -138,6 +138,10 @@ export component ChatPanel inherits Window {
     in-out property <TerminalItem> expanded-terminal: { terminal-id: "" };
 
     callback thread-selected(int);
+    // Relative move in the filtered thread list -- +1/-1 for next/previous,
+    // wrapping. Fired by `handle-panel-shortcut`'s Ctrl+Alt+Up/Down, and by
+    // anything re-dispatching through it (see that function's doc comment).
+    callback thread-navigation-requested(int);
     callback new-thread-requested();
     callback new-skill-requested(string, string);
     callback skill-promote-to-global(string);
@@ -232,6 +236,13 @@ export component ChatPanel inherits Window {
         settings-requested();
     }
 
+    // Shared target for Ctrl+K and the C++-side global "focus thread
+    // search" command (`panel_rust_invoke_command`'s open-search case),
+    // so both paths stay in sync with whatever "open search" means here.
+    public function open-thread-search() {
+        sidebar.open-search();
+    }
+
     // layout-redesign.md Phase 5 -- panel-level shortcuts. Also re-run
     // from the compose TextInput (chat_area) so they still fire while the
     // composer owns focus (TextInput swallows keys before this scope).
@@ -283,7 +294,19 @@ export component ChatPanel inherits Window {
             }
             // Ctrl+K -- expand rail if needed and focus thread search.
             if (event.text == "k" || event.text == "K") {
-                sidebar.open-search();
+                root.open-thread-search();
+                return EventResult.accept;
+            }
+            // Ctrl+Alt+Up/Down -- previous/next thread, wrapping. Deliberately
+            // not bare arrows, Ctrl+Up/Down, or PageUp/PageDown -- those
+            // collide with in-field text navigation and Shotcut's own
+            // transport/navigation shortcuts (see the execution plan).
+            if (event.modifiers.alt && event.text == Key.UpArrow) {
+                root.thread-navigation-requested(-1);
+                return EventResult.accept;
+            }
+            if (event.modifiers.alt && event.text == Key.DownArrow) {
+                root.thread-navigation-requested(1);
                 return EventResult.accept;
             }
             // Ctrl+Enter -- first allow option (host or local demo card).
