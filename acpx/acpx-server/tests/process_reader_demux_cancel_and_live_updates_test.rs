@@ -346,3 +346,217 @@ async fn cancelling_one_session_does_not_disturb_a_concurrent_sessions_live_upda
 
     drop(guard);
 }
+
+/// Shared spawn helper for the two tests below: same real-binary,
+/// real-stand-in-agent setup the core proof above uses, parameterized only
+/// on whether `ACPX_PROCESS_READER_DEMUX` is set.
+async fn spawn_server_with_demux(demux: Option<&str>) -> (ServerGuard, SocketAddr) {
+    let addr = ephemeral_addr().await;
+    let script_path = write_temp_file("acpx-notif-stall-stand-in-agent", STAND_IN_AGENT_SCRIPT);
+    let db_path = write_temp_file("acpx-notif-stall-db", "");
+    std::fs::remove_file(&db_path).expect("clear placeholder db file");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    cmd.env(
+        "ACPX_BACKEND_CMD",
+        format!("python3 {} {TURN_DELAY_SECS}", script_path.display()),
+    )
+    .env("ACPX_HTTP_BIND", addr.to_string())
+    .env("ACPX_DB_PATH", db_path.display().to_string())
+    .env_remove("ACPX_AUTH_TOKEN")
+    .env_remove("ACPX_PROCESS_READER_DEMUX")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    if let Some(value) = demux {
+        cmd.env("ACPX_PROCESS_READER_DEMUX", value);
+    }
+    let child = cmd.spawn().expect("spawn real acpx-server binary");
+    let guard = ServerGuard {
+        child,
+        _script_path: script_path,
+    };
+    wait_for_listener(addr).await;
+    (guard, addr)
+}
+
+/// **Pins the live production bug this session's user report described:**
+/// "two sessions of the same agent launched, notifications aren't
+/// delivered to Zed." `ACPX_PROCESS_READER_DEMUX` unset is the actual
+/// live default (see `acpx-server/src/config.rs`) -- session A (plain
+/// HTTP) gets its `session/prompt` genuinely in flight first, holding the
+/// shared backend process's per-process lock for A's *entire* turn (the
+/// pre-demux legacy behavior this whole phase's doc comments describe).
+/// Session B then tries to open a live WS connection and merely call
+/// `session/new` on the *same* shared agent -- with the flag off, B's
+/// `session/new` itself cannot even resolve until A's whole turn is done,
+/// so B receives literally nothing (not even a session id, let alone any
+/// `session/update`) for the entire window. This is a strictly worse
+/// symptom than "missed a live update" -- the second thread just sits
+/// with no response at all, which is exactly Zed's reported
+/// stuck-in-loading behavior for a second concurrent thread on one agent.
+#[tokio::test]
+async fn demux_off_a_second_sessions_launch_and_live_updates_stall_behind_first_sessions_turn() {
+    let (guard, addr) = spawn_server_with_demux(None).await;
+    let http = reqwest::Client::new();
+
+    let new_a = rpc(
+        &http,
+        addr,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp", "mcpServers": []}}),
+    )
+    .await;
+    let sid_a = new_a["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new returned no sessionId: {new_a:?}"))
+        .to_string();
+    let http_a = http.clone();
+    let addr_a = addr;
+    let sid_a_c = sid_a.clone();
+    let a_prompt = tokio::spawn(async move {
+        rpc(
+            &http_a,
+            addr_a,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": sid_a_c, "prompt": []}}),
+        )
+        .await
+    });
+
+    // Give A's turn time to genuinely register/hold the shared process's
+    // lock before B ever tries to touch it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!a_prompt.is_finished(), "A's prompt should still be in flight when B connects");
+
+    let (mut ws_b, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("ws connect");
+    let b_new_started = tokio::time::Instant::now();
+    ws_send(
+        &mut ws_b,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "session/new", "params": {"cwd": "/tmp", "mcpServers": []}}),
+    )
+    .await;
+    let b_new = ws_recv(&mut ws_b).await;
+    let b_new_elapsed = b_new_started.elapsed();
+    let sid_b = b_new["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new returned no sessionId: {b_new:?}"))
+        .to_string();
+
+    assert!(
+        b_new_elapsed >= Duration::from_secs_f64(TURN_DELAY_SECS - 0.5),
+        "REGRESSION CHECK (pins today's live bug, should FAIL once process_reader_demux \
+         defaults on): B's session/new resolved in {b_new_elapsed:?} while A's turn was still \
+         in flight on the shared backend process -- expected it to be blocked for close to A's \
+         full {TURN_DELAY_SECS}s turn, proving the per-process lock is held across A's entire \
+         turn and starves B of any response (session/new result, and by extension any \
+         session/update) for that whole window"
+    );
+
+    // B is not permanently broken -- once A's lock is released, B's own
+    // turn proceeds and its live updates flow normally over the same WS
+    // connection that was stalled a moment ago.
+    ws_send(
+        &mut ws_b,
+        json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": sid_b, "prompt": []}}),
+    )
+    .await;
+    let mut b_update_count = 0usize;
+    loop {
+        let frame = ws_recv(&mut ws_b).await;
+        if frame.get("id") == Some(&json!(4)) {
+            assert_eq!(frame["result"]["stopReason"], json!("end_turn"), "{frame:?}");
+            break;
+        }
+        assert_eq!(frame["method"], json!("session/update"), "{frame:?}");
+        b_update_count += 1;
+    }
+    assert!(
+        b_update_count >= 1,
+        "B should receive at least one live session/update once it finally gets its own turn"
+    );
+
+    a_prompt.await.expect("a_prompt task must not panic");
+    drop(guard);
+}
+
+/// **The fix, proven from B's side.** Identical scenario to the test
+/// above, `ACPX_PROCESS_READER_DEMUX=1` this time: B's `session/new` (and
+/// then its live `session/update` stream) is not blocked behind A's
+/// in-flight turn -- B gets an immediate session id and its own updates
+/// arrive live over its WS connection well before A's turn finishes.
+#[tokio::test]
+async fn demux_on_a_second_sessions_launch_and_live_updates_do_not_stall_behind_first_sessions_turn(
+) {
+    let (guard, addr) = spawn_server_with_demux(Some("1")).await;
+    let http = reqwest::Client::new();
+
+    let new_a = rpc(
+        &http,
+        addr,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp", "mcpServers": []}}),
+    )
+    .await;
+    let sid_a = new_a["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new returned no sessionId: {new_a:?}"))
+        .to_string();
+    let http_a = http.clone();
+    let addr_a = addr;
+    let sid_a_c = sid_a.clone();
+    let a_prompt = tokio::spawn(async move {
+        rpc(
+            &http_a,
+            addr_a,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": sid_a_c, "prompt": []}}),
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!a_prompt.is_finished(), "A's prompt should still be in flight when B connects");
+
+    let (mut ws_b, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("ws connect");
+    let b_new_started = tokio::time::Instant::now();
+    ws_send(
+        &mut ws_b,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "session/new", "params": {"cwd": "/tmp", "mcpServers": []}}),
+    )
+    .await;
+    let b_new = ws_recv(&mut ws_b).await;
+    let b_new_elapsed = b_new_started.elapsed();
+    let sid_b = b_new["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new returned no sessionId: {b_new:?}"))
+        .to_string();
+    assert!(
+        b_new_elapsed < Duration::from_secs(1),
+        "B's session/new took {b_new_elapsed:?} with process_reader_demux ON while A's turn was \
+         in flight on the same shared backend process -- expected sub-1s"
+    );
+
+    ws_send(
+        &mut ws_b,
+        json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": sid_b, "prompt": []}}),
+    )
+    .await;
+    let b_first_update_started = tokio::time::Instant::now();
+    let first_b_frame = ws_recv(&mut ws_b).await;
+    let b_first_update_elapsed = b_first_update_started.elapsed();
+    assert_eq!(
+        first_b_frame["method"], json!("session/update"),
+        "expected B's first frame after its own prompt to be a live update, got {first_b_frame:?}"
+    );
+    assert!(
+        b_first_update_elapsed < Duration::from_secs_f64(TURN_DELAY_SECS - 0.5),
+        "B's first live session/update took {b_first_update_elapsed:?} to arrive while A was \
+         still mid-turn on the shared process -- expected well under A's full \
+         {TURN_DELAY_SECS}s turn, proving B's own updates aren't starved behind A's"
+    );
+
+    a_prompt.await.expect("a_prompt task must not panic");
+    drop(guard);
+}

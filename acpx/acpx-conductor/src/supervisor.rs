@@ -198,15 +198,37 @@ impl Supervisor {
 
         // Check liveness first and drop the borrow immediately (as an owned
         // bool) rather than holding a lock guard across the branches below.
-        // Locking here is a brief, uncontended (in the common case) check,
-        // never held across an `.await` on backend I/O -- the only other
-        // holder of this same per-process lock would be a concurrent
-        // request already in flight against this exact agent, in which
-        // case blocking briefly to confirm liveness is correct anyway
-        // (see `status`'s doc comment for the non-blocking variant used
-        // there instead).
+        // **Must be `try_lock`, never `handle.lock().await`**: every real
+        // caller of `ensure_running` (`dispatch_proxied_shared`,
+        // `dispatch_session_new_shared` in acpx-core/src/router.rs) calls
+        // it from inside a block that still holds *this router's own*
+        // outer `Arc<Mutex<Router>>` guard -- so if this awaited the
+        // per-process lock and lost the race to a concurrent in-flight
+        // `session/prompt` (which legitimately holds that same lock for
+        // its *entire* turn on the legacy, non-`process_reader_demux`
+        // path), the wait here would transitively hold the *router-wide*
+        // mutex hostage for that whole turn -- freezing every other
+        // client on this daemon (a different agent's `session/prompt`,
+        // `/health`, everything funnels through
+        // `dispatch_shared_for_tenant`'s `router.lock().await` first).
+        // Reproduced live: two sessions sharing one agent with demux off,
+        // one WS-connected session's `session/new` blocked, and `/health`
+        // on an unrelated connection went fully unresponsive for the same
+        // window (`process_reader_demux_cancel_and_live_updates_test.rs`'s
+        // `demux_off_a_second_sessions_launch_and_live_updates_stall_
+        // behind_first_sessions_turn` pins the fixed, no-longer-server-
+        // wide behavior). `try_lock`'s `Err` case (lock currently held by
+        // someone else) is treated as "still running" -- correct, since a
+        // process a concurrent caller is actively doing I/O against right
+        // now cannot have silently exited out from under it; if it did,
+        // that caller's own read/write would itself error and this
+        // process gets removed from `running` and respawned on its own
+        // next call, same as any other backend I/O error path.
         let exited = match self.running.get(agent_id) {
-            Some(handle) => Some(handle.lock().await.has_exited()),
+            Some(handle) => match handle.try_lock() {
+                Ok(mut guard) => Some(guard.has_exited()),
+                Err(_) => Some(false),
+            },
             None => None,
         };
 
