@@ -11,6 +11,7 @@
 /.idea/
 /.vscode/
 acpx/target/
+/snapshotd/snapshotd
 
 # Stray relative-path test export artifacts (some *_realsaprust_test.go
 # tests pass a relative outputPath to file.export; when run from the repo
