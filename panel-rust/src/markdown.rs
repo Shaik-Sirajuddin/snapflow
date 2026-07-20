@@ -96,9 +96,15 @@ struct Block {
 enum BlockAst {
     Heading(u8, Vec<Run>),
     Paragraph(Vec<Run>),
-    Code { lines: Vec<String> },
+    Code {
+        lines: Vec<String>,
+    },
     Quote(Vec<BlockAst>),
-    List { ordered: bool, start: u32, items: Vec<Vec<BlockAst>> },
+    List {
+        ordered: bool,
+        start: u32,
+        items: Vec<Vec<BlockAst>>,
+    },
     Rule,
     Table(Vec<Vec<String>>),
 }
@@ -132,8 +138,13 @@ fn parse_one_block(events: &[(Event, Range<usize>)], i: usize) -> (BlockAst, usi
     match event {
         Event::Start(Tag::Heading { level, .. }) => {
             let level = *level;
-            let (runs, end_i, end_byte) = collect_inline_runs(events, i + 1, TagEnd::Heading(level));
-            (BlockAst::Heading(level as u8, runs), end_i, start_byte..end_byte)
+            let (runs, end_i, end_byte) =
+                collect_inline_runs(events, i + 1, TagEnd::Heading(level));
+            (
+                BlockAst::Heading(level as u8, runs),
+                end_i,
+                start_byte..end_byte,
+            )
         }
         Event::Start(Tag::Paragraph) => {
             let (runs, end_i, end_byte) = collect_inline_runs(events, i + 1, TagEnd::Paragraph);
@@ -232,7 +243,11 @@ fn parse_one_block(events: &[(Event, Range<usize>)], i: usize) -> (BlockAst, usi
                 }
             }
             (
-                BlockAst::List { ordered, start: start_num, items },
+                BlockAst::List {
+                    ordered,
+                    start: start_num,
+                    items,
+                },
                 j,
                 start_byte..end_byte,
             )
@@ -262,7 +277,10 @@ fn parse_one_block(events: &[(Event, Range<usize>)], i: usize) -> (BlockAst, usi
                                     let (runs, next_k, _) =
                                         collect_inline_runs(events, k + 1, TagEnd::TableCell);
                                     cells.push(
-                                        runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>().join(""),
+                                        runs.iter()
+                                            .map(|r| r.text.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(""),
                                     );
                                     k = next_k;
                                 }
@@ -287,7 +305,10 @@ fn parse_one_block(events: &[(Event, Range<usize>)], i: usize) -> (BlockAst, usi
         _ => {
             let text = leaf_event_text(event);
             (
-                BlockAst::Paragraph(vec![Run { text, ..Default::default() }]),
+                BlockAst::Paragraph(vec![Run {
+                    text,
+                    ..Default::default()
+                }]),
                 i + 1,
                 range.clone(),
             )
@@ -348,7 +369,10 @@ fn collect_inline_runs(
                 });
             }
             Event::SoftBreak | Event::HardBreak => {
-                runs.push(Run { text: " ".to_string(), ..Default::default() });
+                runs.push(Run {
+                    text: " ".to_string(),
+                    ..Default::default()
+                });
             }
             Event::Start(Tag::Strong) => bold_depth += 1,
             Event::End(TagEnd::Strong) => bold_depth = bold_depth.saturating_sub(1),
@@ -404,25 +428,45 @@ fn wrap_runs(runs: &[Run], wrap_cols: usize) -> Vec<Vec<Run>> {
         }
         let (bold, italic, code, strike) = word.style;
         let needs_space = current_cols > 0;
-        let text = if needs_space { format!(" {}", word.text) } else { word.text };
+        let text = if needs_space {
+            format!(" {}", word.text)
+        } else {
+            word.text
+        };
         // Merge into the previous run when the style matches, so runs
         // in the output stay maximally coalesced (fewer `Text`
         // elements for `markdown_view.slint` to lay out per line).
         if let Some(last) = current.last_mut() {
-            if last.bold == bold && last.italic == italic && last.code == code && last.strike == strike {
+            if last.bold == bold
+                && last.italic == italic
+                && last.code == code
+                && last.strike == strike
+            {
                 last.text.push_str(&text);
                 current_cols += extra + word_cols;
                 continue;
             }
         }
-        current.push(Run { text, bold, italic, code, strike });
+        current.push(Run {
+            text,
+            bold,
+            italic,
+            code,
+            strike,
+        });
         current_cols += extra + word_cols;
     }
     lines.push(current);
     lines
 }
 
-fn render_ast(ast: &BlockAst, indent: u8, wrap_cols: usize, code_block_id: &mut i32, out: &mut Vec<Line>) {
+fn render_ast(
+    ast: &BlockAst,
+    indent: u8,
+    wrap_cols: usize,
+    code_block_id: &mut i32,
+    out: &mut Vec<Line>,
+) {
     match ast {
         BlockAst::Heading(level, runs) => {
             for wrapped in wrap_runs(runs, wrap_cols) {
@@ -452,7 +496,11 @@ fn render_ast(ast: &BlockAst, indent: u8, wrap_cols: usize, code_block_id: &mut 
             for line in lines {
                 out.push(Line {
                     kind: LineKind::Code,
-                    runs: vec![Run { text: line.clone(), code: true, ..Default::default() }],
+                    runs: vec![Run {
+                        text: line.clone(),
+                        code: true,
+                        ..Default::default()
+                    }],
                     indent,
                     ordinal: 0,
                     code_block_id: id,
@@ -475,7 +523,11 @@ fn render_ast(ast: &BlockAst, indent: u8, wrap_cols: usize, code_block_id: &mut 
                 }
             }
         }
-        BlockAst::List { ordered, start, items } => {
+        BlockAst::List {
+            ordered,
+            start,
+            items,
+        } => {
             for (idx, item) in items.iter().enumerate() {
                 let ordinal = if *ordered { start + idx as u32 } else { 0 };
                 let mut first = true;
@@ -486,7 +538,11 @@ fn render_ast(ast: &BlockAst, indent: u8, wrap_cols: usize, code_block_id: &mut 
                     render_ast(block, indent + 1, wrap_cols, code_block_id, out);
                     if kind_override {
                         if let Some(line) = out.get_mut(before) {
-                            line.kind = if *ordered { LineKind::OrderedListItem } else { LineKind::ListItem };
+                            line.kind = if *ordered {
+                                LineKind::OrderedListItem
+                            } else {
+                                LineKind::ListItem
+                            };
                             line.ordinal = ordinal;
                         }
                     }
@@ -506,7 +562,10 @@ fn render_ast(ast: &BlockAst, indent: u8, wrap_cols: usize, code_block_id: &mut 
             for row in rows {
                 out.push(Line {
                     kind: LineKind::Table,
-                    runs: vec![Run { text: row.join("  |  "), ..Default::default() }],
+                    runs: vec![Run {
+                        text: row.join("  |  "),
+                        ..Default::default()
+                    }],
                     indent,
                     ordinal: 0,
                     code_block_id: -1,
@@ -582,8 +641,11 @@ impl StreamingMarkdownRenderer {
         let closed_count = blocks.len().saturating_sub(1);
         while self.frozen_block_count < closed_count {
             let block = &blocks[self.frozen_block_count];
-            self.frozen_lines
-                .extend(render_block(&block.ast, self.wrap_cols, &mut self.frozen_code_block_id));
+            self.frozen_lines.extend(render_block(
+                &block.ast,
+                self.wrap_cols,
+                &mut self.frozen_code_block_id,
+            ));
             self.frozen_block_count += 1;
         }
         let mut out = self.frozen_lines.clone();
@@ -601,8 +663,11 @@ impl StreamingMarkdownRenderer {
         let blocks = parse_blocks(&self.source);
         while self.frozen_block_count < blocks.len() {
             let block = &blocks[self.frozen_block_count];
-            self.frozen_lines
-                .extend(render_block(&block.ast, self.wrap_cols, &mut self.frozen_code_block_id));
+            self.frozen_lines.extend(render_block(
+                &block.ast,
+                self.wrap_cols,
+                &mut self.frozen_code_block_id,
+            ));
             self.frozen_block_count += 1;
         }
         self.frozen_lines.clone()
@@ -647,7 +712,10 @@ mod tests {
 
     #[test]
     fn fenced_code_block_lines() {
-        let lines = render_document("```rust\nfn main() {}\nlet x = 1;\n```\n", DEFAULT_WRAP_COLS);
+        let lines = render_document(
+            "```rust\nfn main() {}\nlet x = 1;\n```\n",
+            DEFAULT_WRAP_COLS,
+        );
         let code_lines: Vec<&Line> = lines.iter().filter(|l| l.kind == LineKind::Code).collect();
         assert_eq!(code_lines.len(), 2);
         assert_eq!(code_lines[0].runs[0].text, "fn main() {}");
@@ -686,7 +754,11 @@ mod tests {
     fn wrap_splits_long_paragraph_and_preserves_bold_run() {
         let text = "one two three four **five six seven eight** nine ten";
         let lines = render_document(text, 20);
-        assert!(lines.len() > 1, "expected wrapping into multiple lines, got {:?}", lines);
+        assert!(
+            lines.len() > 1,
+            "expected wrapping into multiple lines, got {:?}",
+            lines
+        );
         let has_bold = lines.iter().any(|l| l.runs.iter().any(|r| r.bold));
         assert!(has_bold, "bold run should survive wrapping: {:?}", lines);
     }
@@ -697,7 +769,13 @@ mod tests {
         let expected = render_document(full, DEFAULT_WRAP_COLS);
 
         let mut renderer = StreamingMarkdownRenderer::new(DEFAULT_WRAP_COLS);
-        for chunk in ["# Title\n\n", "Some **bold** text.\n\n", "- item one\n- item two\n\n", "> a quote\n\n", "```\ncode line\n```\n"] {
+        for chunk in [
+            "# Title\n\n",
+            "Some **bold** text.\n\n",
+            "- item one\n- item two\n\n",
+            "> a quote\n\n",
+            "```\ncode line\n```\n",
+        ] {
             renderer.push(chunk);
             renderer.render();
         }
@@ -710,7 +788,11 @@ mod tests {
         let mut renderer = StreamingMarkdownRenderer::new(DEFAULT_WRAP_COLS);
         renderer.push("# Title\n\nParagraph one.\n\n");
         renderer.render();
-        assert_eq!(renderer.frozen_block_count(), 1, "heading should be frozen once paragraph starts");
+        assert_eq!(
+            renderer.frozen_block_count(),
+            1,
+            "heading should be frozen once paragraph starts"
+        );
 
         renderer.push("Paragraph two is still growing");
         renderer.render();

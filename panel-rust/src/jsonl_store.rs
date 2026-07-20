@@ -13,9 +13,7 @@
 //! crate diffs against `session/list`'s response, per Decision 2's
 //! local-first / lazy-verify sequencing.
 
-use crate::protocol_types::{
-    AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
-};
+use crate::protocol_types::{AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -127,7 +125,9 @@ impl JsonlStore {
         let path = self.path_for(thread_id);
         let file = match fs::File::open(&path) {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CachedThread::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CachedThread::default())
+            }
             Err(source) => return Err(CacheError::Io { path, source }),
         };
         let mut out = CachedThread::default();
@@ -228,7 +228,8 @@ impl JsonlStore {
                 source,
             }
         })?;
-        file.write_all(b"\n").map_err(|source| CacheError::Io { path, source })?;
+        file.write_all(b"\n")
+            .map_err(|source| CacheError::Io { path, source })?;
         self.append_index_offset(thread_id, offset)?;
         Ok(())
     }
@@ -258,7 +259,11 @@ impl JsonlStore {
     /// Decision 2's diff check: does `remote` (freshly fetched
     /// `session/list` metadata) match what the local trailer last recorded?
     /// `true` means the cache is stale and `session/load` should run.
-    pub fn is_stale(local: Option<&ThreadTrailer>, remote_title: &Option<String>, remote_updated_at: &Option<String>) -> bool {
+    pub fn is_stale(
+        local: Option<&ThreadTrailer>,
+        remote_title: &Option<String>,
+        remote_updated_at: &Option<String>,
+    ) -> bool {
         match local {
             None => true, // no cache yet -- always resync
             Some(t) => &t.title != remote_title || &t.updated_at != remote_updated_at,
@@ -283,10 +288,7 @@ impl JsonlStore {
     /// Loads one typed interaction-state snapshot. Missing files are a
     /// normal first-run condition; malformed snapshots degrade only this
     /// state surface and never prevent the transcript tail from rendering.
-    pub fn runtime_snapshot(
-        &self,
-        thread_id: &str,
-    ) -> Result<ThreadRuntimeSnapshot, CacheError> {
+    pub fn runtime_snapshot(&self, thread_id: &str) -> Result<ThreadRuntimeSnapshot, CacheError> {
         let path = self.runtime_snapshot_path_for(thread_id);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -342,7 +344,11 @@ impl JsonlStore {
     /// Public (unlike the file-write internals above) since this is a
     /// real, intentional part of this store's API surface, not an
     /// implementation detail of [`Self::overwrite`].
-    pub fn update_trailer(&self, thread_id: &str, trailer: &ThreadTrailer) -> Result<(), CacheError> {
+    pub fn update_trailer(
+        &self,
+        thread_id: &str,
+        trailer: &ThreadTrailer,
+    ) -> Result<(), CacheError> {
         self.write_trailer(thread_id, trailer)
     }
 
@@ -374,11 +380,12 @@ impl JsonlStore {
         let path = self.trailer_path_for(thread_id);
         match fs::read_to_string(&path) {
             Ok(content) => {
-                let trailer = serde_json::from_str(&content).map_err(|source| CacheError::Parse {
-                    path: path.clone(),
-                    line_no: 0,
-                    source,
-                })?;
+                let trailer =
+                    serde_json::from_str(&content).map_err(|source| CacheError::Parse {
+                        path: path.clone(),
+                        line_no: 0,
+                        source,
+                    })?;
                 Ok(Some(trailer))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -528,11 +535,12 @@ impl JsonlStore {
                     source,
                 })?;
             let trimmed = line.trim_end_matches(['\n', '\r']);
-            let parsed: Line = serde_json::from_str(trimmed).map_err(|source| CacheError::Parse {
-                path: path.clone(),
-                line_no: 0,
-                source,
-            })?;
+            let parsed: Line =
+                serde_json::from_str(trimmed).map_err(|source| CacheError::Parse {
+                    path: path.clone(),
+                    line_no: 0,
+                    source,
+                })?;
             if let Line::Message(m) = parsed {
                 out.push(m);
             }
@@ -667,11 +675,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = JsonlStore::open(dir.path()).expect("open");
         let messages: Vec<ChatMessage> = (0..10).map(|i| msg(&format!("m{i}"))).collect();
-        store.overwrite("t1", &messages, &trailer()).expect("overwrite");
+        store
+            .overwrite("t1", &messages, &trailer())
+            .expect("overwrite");
 
         let page = store.tail("t1", 3).expect("tail");
         assert_eq!(
-            page.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            page.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["m7", "m8", "m9"]
         );
         assert!(page.older_available);
@@ -696,14 +709,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = JsonlStore::open(dir.path()).expect("open");
         let messages: Vec<ChatMessage> = (0..10).map(|i| msg(&format!("m{i}"))).collect();
-        store.overwrite("t1", &messages, &trailer()).expect("overwrite");
+        store
+            .overwrite("t1", &messages, &trailer())
+            .expect("overwrite");
 
         let tail_page = store.tail("t1", 3).expect("tail");
         let older = store
             .predecessor_page("t1", tail_page.oldest_loaded_index, 3)
             .expect("predecessor_page");
         assert_eq!(
-            older.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            older
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["m4", "m5", "m6"]
         );
         assert!(older.older_available);
@@ -713,7 +732,11 @@ mod tests {
             .predecessor_page("t1", older.oldest_loaded_index, 100)
             .expect("predecessor_page to start");
         assert_eq!(
-            earliest.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            earliest
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["m0", "m1", "m2", "m3"]
         );
         assert!(!earliest.older_available);
@@ -724,13 +747,18 @@ mod tests {
     fn appended_messages_are_immediately_visible_to_tail_via_the_incremental_index() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = JsonlStore::open(dir.path()).expect("open");
-        store.overwrite("t1", &[msg("a")], &trailer()).expect("overwrite");
+        store
+            .overwrite("t1", &[msg("a")], &trailer())
+            .expect("overwrite");
         store.append("t1", &msg("b")).expect("append");
         store.append("t1", &msg("c")).expect("append");
 
         let page = store.tail("t1", 2).expect("tail");
         assert_eq!(
-            page.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            page.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
         assert_eq!(store.message_count("t1").expect("message_count"), 3);
@@ -747,7 +775,10 @@ mod tests {
 
         let page = store.tail("t1", 2).expect("tail after index removed");
         assert_eq!(
-            page.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            page.messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
         assert!(dir.path().join("t1.idx").is_file());
@@ -797,7 +828,10 @@ mod tests {
         store
             .overwrite("t1", &[msg("a")], &trailer())
             .expect("overwrite");
-        let read_back = store.trailer("t1").expect("trailer t1").expect("some trailer");
+        let read_back = store
+            .trailer("t1")
+            .expect("trailer t1")
+            .expect("some trailer");
         assert_eq!(read_back.acp_session_id, "s1");
 
         // Deleting the jsonl file entirely must not affect trailer()'s
@@ -874,7 +908,10 @@ mod tests {
             .write_runtime_snapshot("t1", &snapshot)
             .expect("write runtime snapshot");
 
-        assert_eq!(store.runtime_snapshot("t1").expect("read snapshot"), snapshot);
+        assert_eq!(
+            store.runtime_snapshot("t1").expect("read snapshot"),
+            snapshot
+        );
         assert_eq!(
             store.load("t1").expect("read transcript").messages,
             vec![msg("transcript")],

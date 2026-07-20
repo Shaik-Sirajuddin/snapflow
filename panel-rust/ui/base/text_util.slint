@@ -4,8 +4,7 @@
 // Kept domain-free so any base primitive can depend on it.
 export global TextUtil {
     // Case-insensitive substring test. Returns false until Rust installs
-    // the implementation, which is harmless (nothing matches -> the caller
-    // simply shows its list unfiltered).
+    // the implementation.
     pure callback contains-ci(string, string) -> bool;
     // Byte offset of the start of the word immediately before `cursor`
     // (given as a byte offset into the text) -- skips any run of
@@ -22,4 +21,27 @@ export global TextUtil {
     // Replace the full active token with `replacement` (caller usually
     // includes a trailing space). Returns the new full text.
     pure callback replace-active-token(string, int, string) -> string;
+
+    // True once the host (or ui-dev-viewer) has installed contains-ci.
+    public pure function filter-ready() -> bool {
+        return contains-ci("AbC", "b");
+    }
+
+    // Filter helper for mention / dropdown lists.
+    // - empty needle → match everything
+    // - host installed → case-insensitive substring
+    // - host missing → case-insensitive exact match only (avoids blanking
+    //   the list when pure-callback defaults return false for every call)
+    public pure function matches-filter(haystack: string, needle: string) -> bool {
+        if (needle == "") {
+            return true;
+        }
+        if (contains-ci(haystack, needle)) {
+            return true;
+        }
+        if (filter-ready()) {
+            return false;
+        }
+        return haystack.to-lowercase() == needle.to-lowercase();
+    }
 }

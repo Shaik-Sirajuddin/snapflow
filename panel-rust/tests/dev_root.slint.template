@@ -1,34 +1,62 @@
 // Dev-only viewer wrapper -- NOT part of production ui/ sources.
-// Gives the real ChatPanel a sane initial window size around it so
-// slint-viewer (which has no --width/--height flag and no host to
-// drive resize) doesn't render at its cramped natural minimum size.
-// Uses preferred-width/preferred-height (initial-size hint only) rather
-// than width/height (which Slint treats as a fixed, non-resizable
-// window size) so the window stays freely resizable/maximizable via
-// the window manager after launch.
+// Wraps the real ChatPanel with a floating size adjuster so you can
+// live-resize the panel over VNC/slint-viewer without restarting.
 // Imports the real app.slint unmodified, so --auto-reload still
 // picks up edits to any production .slint file.
 //
 // Mock chat data below is set as plain property-override bindings
 // (not --load-data JSON) -- --load-data only reflects properties
 // declared directly on the loaded component, not ones inherited
-// from ChatPanel, so JSON-driven mock data silently fails
-// ("ignoring unknown property: threads" etc). Overriding via normal
-// Slint inheritance (like width/height below) works because these
-// bindings are compiled directly against DevRoot, same mechanism.
+// from ChatPanel. Overriding via normal inheritance works.
+import { Button, SpinBox, Slider, HorizontalBox, VerticalBox } from "std-widgets.slint";
 import { ChatPanel } from "__CHATPANEL_SLINT__";
 
 export component DevRoot inherits ChatPanel {
-    preferred-width: 1600px;
-    preferred-height: 1000px;
-    // Index 0 is idle — must not pick a "loading" thread or ChatArea
-    // sets sending=true and disables the compose TextInput.
+    // Live OS-window size driven by the floating adjuster bar / corner grip.
+    // Prefer binding width/height (not only preferred-*) so SpinBox/Slider
+    // changes take effect immediately instead of acting as a first-show hint.
+    in-out property <int> viewport-w: 1280;
+    in-out property <int> viewport-h: 800;
+    in-out property <bool> size-bar-open: false;
+    // Keep float mirrors so Slider (float) stays in sync with SpinBox (int).
+    property <float> viewport-w-f: 1280;
+    property <float> viewport-h-f: 800;
+
+    // Binding width/height is mutually exclusive with min-width/min-height
+    // on Window; clamp in apply-size instead.
+    width: viewport-w * 1px;
+    height: viewport-h * 1px;
+    preferred-width: viewport-w * 1px;
+    preferred-height: viewport-h * 1px;
+
+    pure function clamp-w(v: int) -> int {
+        return max(320, min(3840, v));
+    }
+    pure function clamp-h(v: int) -> int {
+        return max(240, min(2400, v));
+    }
+    function apply-size(w: int, h: int) {
+        viewport-w = clamp-w(w);
+        viewport-h = clamp-h(h);
+        viewport-w-f = viewport-w;
+        viewport-h-f = viewport-h;
+    }
+    function bump-w(delta: int) {
+        apply-size(viewport-w + delta, viewport-h);
+    }
+    function bump-h(delta: int) {
+        apply-size(viewport-w, viewport-h + delta);
+    }
+
     selected-thread: 0;
     connection-status: "Connected";
     compact: false;
     sidebar-expanded: true;
     narrow: false;
-    agent-badge: "codex . ask";
+    settings-open: true;
+    settings-active-section: "agents";
+    // agent-badge is derived in ChatPanel from the selected thread's
+    // provider/model (default_variables_display phase) — not a root prop.
     has-older-messages: true;
     loading-older-messages: false;
 
@@ -41,23 +69,77 @@ export component DevRoot inherits ChatPanel {
         { name: "full-access", agent-id: "claude", terminal-enabled: true, fs-enabled: true },
     ];
 
-    // Compose bar row 2 -- mode + model selectors. Capability-gated on
-    // non-empty lists; seed them here so the VNC/slint-viewer fixture
-    // shows the same controls the host fills from ACP.
+    // Session context ring (ui.yaml chat-view-input).
+    context-ratio: 0.42;
+    context-used-tokens: 42000;
+    context-limit-tokens: 100000;
+
+    // Compose `/` skills · `@` mcp · `#` files popup catalogs.
+    // (skills list set below with demo-permission trigger included)
+    available-mcp-servers: [
+        { name: "snapshot", command: "snapshotd", transport: "stdio", url: "", enabled: true, status: "connected", needs-auth: false, auth-status: "", tools: [] },
+        { name: "chrome", command: "mcp-chrome", transport: "stdio", url: "", enabled: true, status: "connected", needs-auth: false, auth-status: "", tools: [] },
+        { name: "github", command: "", transport: "http", url: "https://api.github.com/mcp", enabled: true, status: "idle", needs-auth: true, auth-status: "required", tools: [] },
+    ];
+    // Connected entries come first so the Agents view shows its installed
+    // row before the not-found row and separator.
+    agent-catalog: [
+        { id: "codex", name: "Codex", version: "5.2", status: "installed" },
+        { id: "claude-code", name: "Claude Code", version: "1.0.34", status: "installed" },
+        { id: "gemini-cli", name: "Gemini CLI", version: "0.18.2", status: "installed_no_session" },
+        { id: "amp", name: "Amp", version: "", status: "runtime_missing" },
+    ];
+    file-options: [
+        "panel-rust/ui/app.slint",
+        "panel-rust/ui/chat_area.slint",
+        "panel-rust/ui/components/sidebar.slint",
+        "memory/acpx/tasks/ui.yaml",
+    ];
+
+    // Compose bar row 2 -- mode + model selectors. Shape matches what the
+    // host builds via models::to_mode_dropdown_entries /
+    // to_config_dropdown_entries (mode rows: empty value; config: header
+    // then value rows sharing configId, payload in `value`).
     mode-trigger-label: "ask";
+    config-trigger-label: "claude-sonnet-4";
     mode-dropdown-entries: [
-        { id: "ask", label: "ask", value: "ask", is-header: false, is-current: true },
-        { id: "code", label: "code", value: "code", is-header: false, is-current: false },
-        { id: "plan", label: "plan", value: "plan", is-header: false, is-current: false },
-        { id: "architect", label: "architect", value: "architect", is-header: false, is-current: false },
+        { id: "ask", label: "ask", value: "", is-header: false, is-current: true },
+        { id: "code", label: "code", value: "", is-header: false, is-current: false },
+        { id: "plan", label: "plan", value: "", is-header: false, is-current: false },
+        { id: "architect", label: "architect", value: "", is-header: false, is-current: false },
     ];
     config-dropdown-entries: [
-        { id: "model-hdr", label: "model", value: "", is-header: true, is-current: false },
-        { id: "model-sonnet", label: "claude-sonnet-4", value: "claude-sonnet-4", is-header: false, is-current: true },
-        { id: "model-haiku", label: "claude-haiku-4", value: "claude-haiku-4", is-header: false, is-current: false },
-        { id: "model-opus", label: "claude-opus-4", value: "claude-opus-4", is-header: false, is-current: false },
-        { id: "model-gpt", label: "gpt-4.1", value: "gpt-4.1", is-header: false, is-current: false },
-        { id: "model-o3", label: "o3", value: "o3", is-header: false, is-current: false },
+        { id: "model", label: "model", value: "", is-header: true, is-current: false },
+        { id: "model", label: "claude-sonnet-4", value: "claude-sonnet-4", is-header: false, is-current: true },
+        { id: "model", label: "claude-haiku-4", value: "claude-haiku-4", is-header: false, is-current: false },
+        { id: "model", label: "claude-opus-4", value: "claude-opus-4", is-header: false, is-current: false },
+        { id: "model", label: "gpt-4.1", value: "gpt-4.1", is-header: false, is-current: false },
+        { id: "model", label: "o3", value: "o3", is-header: false, is-current: false },
+        { id: "model", label: "gpt-5-mini", value: "gpt-5-mini", is-header: false, is-current: false },
+        { id: "model", label: "codex/gpt-5.4-mini", value: "codex/gpt-5.4-mini", is-header: false, is-current: false },
+    ];
+
+    // Approval card starts hidden. Type `/demo-permission` (or
+    // `/demo-approve` / `demo permission`) in the compose box and press
+    // Send/Enter — ChatArea opens a local one-of select card with dummy
+    // Allow once / Allow always / Reject options. Esc or pick dismisses.
+    // (Real ACP permissions still arrive via host `pending-request`.)
+    pending-request: {
+        active: false,
+        relay-id: "",
+        method: "",
+        title: "",
+        summary: "",
+        supported: false,
+        options: [],
+    };
+
+    // Slash catalog includes the demo trigger so `/demo` filters to it.
+    available-skills: [
+        { name: "demo-permission", description: "Open the local approval one-of card (type /demo-permission + Enter)", scope: "global", path: "/skills/demo-permission", started-from: "" },
+        { name: "artifact-design", description: "Design polished UI artifacts", scope: "global", path: "/skills/artifact-design", started-from: "" },
+        { name: "code-review", description: "Review a PR for regressions", scope: "project", path: "/skills/code-review", started-from: "code-review" },
+        { name: "debug-race", description: "Hunt flaky concurrency bugs", scope: "global", path: "/skills/debug-race", started-from: "" },
     ];
 
     threads: [
@@ -261,4 +343,164 @@ export component DevRoot inherits ChatPanel {
             first-use: false,
         },
     ];
+
+    // ----- floating size adjuster (dev-only chrome, bottom-right) -----
+    size-bar := Rectangle {
+        // Anchor to bottom-right; width/height change with open state so
+        // recompute x/y from root each frame.
+        x: root.width - self.width - 10px;
+        y: root.height - self.height - 10px;
+        z: 100000;
+        width: size-bar-open ? min(760px, root.width - 20px) : 148px;
+        height: size-bar-open ? 108px : 32px;
+        background: #0f172a.with-alpha(0.94);
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: #334155;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #000000.with-alpha(0.45);
+        drop-shadow-offset-y: 2px;
+
+        VerticalBox {
+            padding: 6px;
+            spacing: 4px;
+
+            HorizontalBox {
+                spacing: 8px;
+                alignment: start;
+
+                Text {
+                    text: size-bar-open
+                        ? "Viewport  " + viewport-w + " × " + viewport-h
+                        : viewport-w + "×" + viewport-h;
+                    color: #e2e8f0;
+                    font-size: 12px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    text: size-bar-open ? "▾ hide" : "▸ size";
+                    clicked => { size-bar-open = !size-bar-open; }
+                }
+            }
+
+            if size-bar-open: VerticalBox {
+                spacing: 4px;
+                padding: 0;
+
+                HorizontalBox {
+                    spacing: 6px;
+                    alignment: center;
+
+                    Text { text: "W"; color: #94a3b8; font-size: 11px; vertical-alignment: center; horizontal-stretch: 0; }
+                    SpinBox {
+                        minimum: 320;
+                        maximum: 3840;
+                        step-size: 10;
+                        value <=> viewport-w;
+                        horizontal-stretch: 0;
+                        width: 110px;
+                        edited(v) => { apply-size(v, viewport-h); }
+                    }
+                    Slider {
+                        minimum: 320;
+                        maximum: 1920;
+                        step: 10;
+                        value <=> viewport-w-f;
+                        horizontal-stretch: 1;
+                        min-width: 80px;
+                        changed(v) => { apply-size(round(v), viewport-h); }
+                    }
+                    Button { text: "−50"; clicked => { bump-w(-50); } }
+                    Button { text: "+50"; clicked => { bump-w(50); } }
+                }
+
+                HorizontalBox {
+                    spacing: 6px;
+                    alignment: center;
+
+                    Text { text: "H"; color: #94a3b8; font-size: 11px; vertical-alignment: center; horizontal-stretch: 0; }
+                    SpinBox {
+                        minimum: 240;
+                        maximum: 2400;
+                        step-size: 10;
+                        value <=> viewport-h;
+                        horizontal-stretch: 0;
+                        width: 110px;
+                        edited(v) => { apply-size(viewport-w, v); }
+                    }
+                    Slider {
+                        minimum: 240;
+                        maximum: 1200;
+                        step: 10;
+                        value <=> viewport-h-f;
+                        horizontal-stretch: 1;
+                        min-width: 80px;
+                        changed(v) => { apply-size(viewport-w, round(v)); }
+                    }
+                    Button { text: "−50"; clicked => { bump-h(-50); } }
+                    Button { text: "+50"; clicked => { bump-h(50); } }
+                }
+
+                HorizontalBox {
+                    spacing: 4px;
+                    alignment: start;
+                    Text { text: "Presets"; color: #64748b; font-size: 10px; vertical-alignment: center; }
+                    Button { text: "390×844"; clicked => { apply-size(390, 844); } }
+                    Button { text: "768×1024"; clicked => { apply-size(768, 1024); } }
+                    Button { text: "1280×800"; clicked => { apply-size(1280, 800); } }
+                    Button { text: "1600×1000"; clicked => { apply-size(1600, 1000); } }
+                    Button { text: "1920×1200"; clicked => { apply-size(1920, 1200); } }
+                }
+            }
+        }
+    }
+
+    // Drag grip just outside the size chip (bottom-right corner).
+    resize-grip := TouchArea {
+        z: 100001;
+        width: 22px;
+        height: 22px;
+        x: root.width - self.width - 4px;
+        y: root.height - self.height - 4px;
+        // Sit on the outer corner; size-bar is inset 10px so they don't fully overlap.
+        mouse-cursor: nwse-resize;
+
+        property <int> grab-w: 0;
+        property <int> grab-h: 0;
+        property <length> grab-mx: 0px;
+        property <length> grab-my: 0px;
+
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                grab-w = viewport-w;
+                grab-h = viewport-h;
+                grab-mx = self.mouse-x;
+                grab-my = self.mouse-y;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                apply-size(
+                    grab-w + round((self.mouse-x - grab-mx) / 1px),
+                    grab-h + round((self.mouse-y - grab-my) / 1px)
+                );
+            }
+        }
+
+        Rectangle {
+            background: #38bdf8.with-alpha(parent.has-hover || parent.pressed ? 0.95 : 0.7);
+            border-radius: 4px;
+            Text {
+                text: "⤡";
+                color: #0f172a;
+                font-size: 12px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
 }

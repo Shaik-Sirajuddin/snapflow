@@ -16,6 +16,7 @@
 //! decoupling discovery from that wiring lets this phase be built and
 //! tested in isolation.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -142,6 +143,24 @@ pub fn scan_skills_dir(dir: &Path, scope: SkillScope) -> Vec<SkillEntry> {
     entries
 }
 
+/// Combines global and project skills for an agent session. A project-local
+/// skill with the same declared name deliberately shadows the global skill:
+/// the active project is the more specific context, and MCP's `read_skill`
+/// API accepts only a name so returning both would make the lookup ambiguous.
+pub fn merge_skills_for_context(
+    global_skills: Vec<SkillEntry>,
+    project_skills: Vec<SkillEntry>,
+) -> Vec<SkillEntry> {
+    let mut by_name = BTreeMap::new();
+    for skill in global_skills {
+        by_name.insert(skill.name.clone(), skill);
+    }
+    for skill in project_skills {
+        by_name.insert(skill.name.clone(), skill);
+    }
+    by_name.into_values().collect()
+}
+
 /// `<ProjectsRoot>/<project-name>/.skills/` -- the project-local skills
 /// directory inside the project's existing canonical folder, per
 /// `01-architecture.md`'s resolved storage-path decision.
@@ -154,6 +173,34 @@ pub fn project_skills_dir(project_dir: &Path) -> PathBuf {
 /// resolve_cache_dir()` already resolves -- no new env var needed.
 pub fn global_skills_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("skills")
+}
+
+/// Selects the on-disk destination for a newly-created skill. Project
+/// creation requires the active project's file path so it cannot silently
+/// fall back to global storage and break project isolation.
+pub fn skill_creation_dir(
+    scope: SkillScope,
+    cache_dir: &Path,
+    active_project_file: Option<&Path>,
+) -> std::io::Result<PathBuf> {
+    match scope {
+        SkillScope::Global => Ok(global_skills_dir(cache_dir)),
+        SkillScope::Project => {
+            let Some(project_file) = active_project_file else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "cannot create a project skill without an open project",
+                ));
+            };
+            let Some(project_dir) = project_file.parent() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "active project path has no parent directory",
+                ));
+            };
+            Ok(project_skills_dir(project_dir))
+        }
+    }
 }
 
 /// Filesystem-safe directory name for a new skill: lowercase, spaces and
@@ -200,7 +247,7 @@ pub fn scaffold_new_skill(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     }
     fs::create_dir_all(&skill_dir)?;
     let front_matter = format!(
-        "---\nname: {name}\ndescription: >-\n  TODO: describe what this skill does and when to use it.\n---\n\n# {name}\n\nTODO: write the skill's instructions here.\n",
+        "---\nname: {name}\ndescription: >-\n  TODO: describe what this skill does and when to use it.\nmetadata:\n  created_by: panel-rust\n---\n\n# {name}\n\nTODO: write the skill's instructions here.\n",
         name = name.trim(),
     );
     fs::write(skill_dir.join("SKILL.md"), front_matter)?;
@@ -301,7 +348,11 @@ mod tests {
     #[test]
     fn falls_back_to_directory_name_when_front_matter_name_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        write_skill(dir.path(), "unnamed-skill", "---\ndescription: no name field\n---\n");
+        write_skill(
+            dir.path(),
+            "unnamed-skill",
+            "---\ndescription: no name field\n---\n",
+        );
         let entries = scan_skills_dir(dir.path(), SkillScope::Project);
         assert_eq!(entries[0].name, "unnamed-skill");
     }
@@ -354,7 +405,10 @@ mod tests {
         let entries = scan_skills_dir(dir.path(), SkillScope::Global);
         assert_eq!(entries.len(), 2);
         let garbled = entries.iter().find(|e| e.name == "totally-garbled");
-        assert!(garbled.is_some(), "malformed skill should still appear, name-only fallback");
+        assert!(
+            garbled.is_some(),
+            "malformed skill should still appear, name-only fallback"
+        );
         assert_eq!(garbled.unwrap().description, "");
         let well_formed = entries.iter().find(|e| e.name == "well-formed").unwrap();
         assert_eq!(well_formed.description, "still works");
@@ -372,7 +426,11 @@ mod tests {
     fn results_are_sorted_by_name() {
         let dir = tempfile::tempdir().unwrap();
         write_skill(dir.path(), "zeta", "---\nname: zeta\ndescription: z\n---\n");
-        write_skill(dir.path(), "alpha", "---\nname: alpha\ndescription: a\n---\n");
+        write_skill(
+            dir.path(),
+            "alpha",
+            "---\nname: alpha\ndescription: a\n---\n",
+        );
         let entries = scan_skills_dir(dir.path(), SkillScope::Global);
         assert_eq!(entries[0].name, "alpha");
         assert_eq!(entries[1].name, "zeta");
@@ -385,6 +443,74 @@ mod tests {
             project_skills_dir(project_dir),
             Path::new("/tmp/example-project/.skills")
         );
+    }
+
+    #[test]
+    fn skill_creation_dir_uses_the_selected_scope_without_fallback() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_file = project_dir.path().join("project.mlt");
+
+        assert_eq!(
+            skill_creation_dir(SkillScope::Global, cache_dir.path(), Some(&project_file)).unwrap(),
+            global_skills_dir(cache_dir.path())
+        );
+        assert_eq!(
+            skill_creation_dir(SkillScope::Project, cache_dir.path(), Some(&project_file)).unwrap(),
+            project_skills_dir(project_dir.path())
+        );
+        let err = skill_creation_dir(SkillScope::Project, cache_dir.path(), None).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn scoped_skill_creation_persists_in_its_own_directory() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_file = project_dir.path().join("project.mlt");
+        let global_dir =
+            skill_creation_dir(SkillScope::Global, cache_dir.path(), Some(&project_file)).unwrap();
+        let local_dir =
+            skill_creation_dir(SkillScope::Project, cache_dir.path(), Some(&project_file)).unwrap();
+
+        scaffold_new_skill(&global_dir, "global only").unwrap();
+        let project_skill = scaffold_new_skill(&local_dir, "project only").unwrap();
+
+        let global = scan_skills_dir(&global_dir, SkillScope::Global);
+        let project = scan_skills_dir(&local_dir, SkillScope::Project);
+        assert_eq!(global[0].name, "global only");
+        assert_eq!(project[0].name, "project only");
+        assert_eq!(
+            project_skill,
+            project_skills_dir(project_dir.path()).join("project-only")
+        );
+        let contents = fs::read_to_string(project_skill.join("SKILL.md")).unwrap();
+        assert!(contents.contains("created_by: panel-rust"));
+    }
+
+    #[test]
+    fn project_skill_shadows_a_same_named_global_skill_in_agent_context() {
+        let global_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        write_skill(
+            global_dir.path(),
+            "release-notes",
+            "---\nname: release-notes\ndescription: global instructions\n---\n",
+        );
+        write_skill(
+            &project_skills_dir(project_dir.path()),
+            "release-notes",
+            "---\nname: release-notes\ndescription: project instructions\n---\n",
+        );
+
+        let merged = merge_skills_for_context(
+            scan_skills_dir(global_dir.path(), SkillScope::Global),
+            scan_skills_dir(&project_skills_dir(project_dir.path()), SkillScope::Project),
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].scope, SkillScope::Project);
+        assert_eq!(merged[0].description, "project instructions");
     }
 
     /// `project_scoped_skill_isolation` phase: proves two distinct
@@ -442,6 +568,8 @@ mod tests {
         assert_eq!(name, "Voice Embedding");
         assert!(description.contains("TODO"));
         assert_eq!(started_from, None);
+        assert!(contents.contains("created_by: panel-rust"));
+        assert!(contents.contains("# Voice Embedding"));
     }
 
     #[test]
@@ -499,7 +627,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         ensure_bundled_global_skill(dir.path()).unwrap();
         let skill_md = dir.path().join(BUNDLED_SKILL_NAME).join("SKILL.md");
-        fs::write(&skill_md, "---\nname: getting-started\ndescription: edited\n---\n").unwrap();
+        fs::write(
+            &skill_md,
+            "---\nname: getting-started\ndescription: edited\n---\n",
+        )
+        .unwrap();
 
         // Re-running (simulating dev mode disabled then re-enabled) must
         // not overwrite the user's edit.

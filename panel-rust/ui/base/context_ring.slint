@@ -1,0 +1,124 @@
+import { Theme } from "../tokens/theme.slint";
+
+// Session context usage indicator -- circular ring + percentage.
+// Hover reveals a small card with used/full token counts.
+// Ratio is 0.0..1.0; token counts are display-only (Rust/host may leave
+// them at 0 until real session accounting is wired).
+export component ContextRing inherits Rectangle {
+    in property <float> ratio: 0.0;
+    in property <int> used-tokens: 0;
+    in property <int> limit-tokens: 0;
+    // Default size matches SearchableDropdown (24px) so both compose-row
+    // controls share the same geometric center when the parent uses
+    // cross-axis-alignment: center.
+    in property <length> size: 24px;
+    // Opens the future context-breakdown surface (host may no-op).
+    callback context-view-requested();
+
+    property <int> pct: Math.round(Math.min(1.0, Math.max(0.0, ratio)) * 100);
+    property <color> ring-color:
+        pct >= 90 ? Theme.text-secondary
+        : pct >= 70 ? Theme.bg-primary
+        : Theme.text-muted;
+
+    width: size;
+    height: size;
+    preferred-width: size;
+    preferred-height: size;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    // Inset for the percentage so it doesn't touch the ring stroke.
+    property <length> num-pad: size * 0.18;
+
+    // Track (full circle).
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: self.width / 2;
+        border-width: 2px;
+        border-color: Theme.border-default;
+        background: transparent;
+    }
+    // Soft fill disc that grows with usage (readable stand-in for a true
+    // arc until Path arc math is worth the complexity).
+    Rectangle {
+        width: parent.width * Math.min(1.0, Math.max(0.05, ratio));
+        height: parent.height * Math.min(1.0, Math.max(0.05, ratio));
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: self.width / 2;
+        background: root.ring-color.with-alpha(0.18);
+    }
+    // Outer accent ring.
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: self.width / 2;
+        border-width: 2px;
+        border-color: root.ring-color.with-alpha(0.35 + 0.55 * Math.min(1.0, ratio));
+        background: transparent;
+    }
+    // Percentage — smaller type + padded inset so it clears the ring.
+    Text {
+        text: root.pct + "%";
+        color: Theme.text-primary;
+        font-size: 6px * Theme.font-scale;
+        font-weight: 600;
+        font-family: Theme.font-mono;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        x: root.num-pad;
+        y: root.num-pad;
+        width: parent.width - 2 * root.num-pad;
+        height: parent.height - 2 * root.num-pad;
+    }
+
+    hit := TouchArea {
+        mouse-cursor: pointer;
+        accessible-role: button;
+        accessible-label: "Session context " + root.pct + " percent";
+        clicked => { root.context-view-requested(); }
+    }
+
+    // Hover card: used / full context.
+    if hit.has-hover : Rectangle {
+        // The ring lives at the bottom-right end of the compose controls.
+        // Open upward and align the card's right edge to the ring so it
+        // cannot spill off the chat's bottom or right edge.
+        x: parent.width - self.width;
+        y: -self.height - 8px;
+        z: 1000;
+        width: 168px;
+        height: 64px;
+        background: Theme.bg-card;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-md;
+        drop-shadow-blur: 10px;
+        drop-shadow-color: #000000.with-alpha(0.35);
+        drop-shadow-offset-y: 2px;
+        VerticalLayout {
+            padding: 8px;
+            spacing: 3px;
+            Text {
+                text: "Session context";
+                color: Theme.text-secondary;
+                font-size: 9px * Theme.font-scale;
+                font-weight: 700;
+                font-family: Theme.font-mono;
+            }
+            Text {
+                text: root.used-tokens + " / " + root.limit-tokens + " tokens";
+                color: Theme.text-primary;
+                font-size: 11px * Theme.font-scale;
+                font-family: Theme.font-sans;
+            }
+            Text {
+                text: root.pct + "% used";
+                color: root.ring-color;
+                font-size: 10px * Theme.font-scale;
+                font-family: Theme.font-mono;
+            }
+        }
+    }
+}

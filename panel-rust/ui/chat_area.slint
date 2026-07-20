@@ -2,7 +2,7 @@ import { Theme } from "./tokens/theme.slint";
 import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
 import { IconButton } from "./base/icon_button.slint";
-import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem } from "./types.slint";
+import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -59,15 +59,32 @@ export component ChatArea inherits Rectangle {
     // The active mode's display name for the mode-selector trigger (empty
     // until a mode is advertised; the trigger falls back to "Mode").
     in property <string> mode-trigger-label: "";
+    // Active model/config option display name for the model trigger
+    // (empty until advertised; trigger falls back to "Model").
+    in property <string> config-trigger-label: "";
+    // Session context usage for the compose-bar context ring (ui.yaml).
+    in property <float> context-ratio: 0.0;
+    in property <int> context-used-tokens: 0;
+    in property <int> context-limit-tokens: 0;
+    // Catalogs for compose `/` `@` `#` popups.
+    in property <[SkillOption]> skill-options: [];
+    in property <[McpServerOption]> mcp-options: [];
+    in property <[string]> file-options: [];
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback context-view-requested();
     callback send-requested();
     callback stop-requested();
     callback settings-requested();
     callback new-thread-requested();
+    callback thread-rename-started();
+    callback thread-rename-cancelled();
+    callback thread-rename-confirmed(string);
     callback toggle-expanded(int);
     callback approve-request();
     callback reject-request();
+    // One-of permission option pick (optionId from ACP / synthetic id).
+    callback permission-option-selected(string);
     callback expand-terminal(string);
     callback local-terminal-toggle-requested();
     callback local-terminal-key-input(string);
@@ -84,12 +101,156 @@ export component ChatArea inherits Rectangle {
     out property <bool> local-terminal-has-focus:
         local-terminal.open && local-terminal-card.has-focus;
 
+    // --- Demo approval (local one-of card, no ACP round-trip) ------------
+    // Type one of these in the compose box and press Send / Enter:
+    //   /demo-permission
+    //   /demo-approve
+    //   demo permission
+    // Opens the same PermissionCard UI the host fills from real
+    // session/request_permission events. Pick an option (or Esc /
+    // Ctrl+Enter) to dismiss. Host pending-request always wins when active.
+    property <bool> demo-approval-active: false;
+    property <string> demo-approval-summary:
+        "The agent wants to run: cargo test -p panel-rust --lib permission";
+
+    pure function is-demo-permission-trigger(t: string) -> bool {
+        // Exact matches (optional trailing space). Keep the set small so
+        // real chat about "permission" is never hijacked.
+        return t == "/demo-permission"
+            || t == "/demo-permission "
+            || t == "/demo-approve"
+            || t == "/demo-approve "
+            || t == "demo permission"
+            || t == "demo permission ";
+    }
+
+    property <PendingRequestItem> demo-pending: {
+        active: demo-approval-active,
+        relay-id: "demo-local",
+        method: "session/request_permission",
+        title: "Permission requested",
+        summary: demo-approval-summary,
+        supported: true,
+        options: [
+            { option-id: "allow-once", name: "Allow once", kind: "allow_once", is-allow: true },
+            { option-id: "allow-always", name: "Allow always", kind: "allow_always", is-allow: true },
+            { option-id: "reject-once", name: "Reject", kind: "reject_once", is-allow: false },
+        ],
+    };
+
+    // Host relay wins; otherwise show the local demo card.
+    property <PendingRequestItem> shown-pending:
+        pending-request.active ? pending-request : demo-pending;
+
+    // Exposed so ChatPanel Escape / Ctrl+Enter treat demo like a real
+    // pending request (app.slint checks pending-request.active — also
+    // mirror via out for host shortcuts if needed).
+    out property <bool> has-pending-approval: shown-pending.active;
+
+    // Scratch so we never pass compose-text twice into helpers (SharedString
+    // move quirk in generated Rust — same pattern as mention-filter).
+    property <string> demo-trigger-scratch: "";
+
+    function close-demo-approval() {
+        demo-approval-active = false;
+    }
+
+    function handle-send() {
+        root.demo-trigger-scratch = root.compose-text;
+        if (root.is-demo-permission-trigger(root.demo-trigger-scratch)) {
+            root.demo-approval-summary =
+                "Demo approval triggered by: \"" + root.demo-trigger-scratch + "\"";
+            root.demo-approval-active = true;
+            root.compose-text = "";
+            root.demo-trigger-scratch = "";
+            return;
+        }
+        root.demo-trigger-scratch = "";
+        root.send-requested();
+    }
+
+    function handle-permission-option(option-id: string) {
+        if (root.demo-approval-active && !root.pending-request.active) {
+            // Local demo only — dismiss and keep option id in summary
+            // so the click is visible without a host.
+            root.demo-approval-summary = "Demo selected: " + option-id + " (dismissed)";
+            root.close-demo-approval();
+            return;
+        }
+        root.permission-option-selected(option-id);
+    }
+
+    function handle-approve() {
+        if (root.demo-approval-active && !root.pending-request.active) {
+            root.demo-approval-summary = "Demo selected: allow-once (Ctrl+Enter)";
+            root.close-demo-approval();
+            return;
+        }
+        root.approve-request();
+    }
+
+    function handle-reject() {
+        if (root.demo-approval-active && !root.pending-request.active) {
+            root.demo-approval-summary = "Demo selected: reject-once (Esc)";
+            root.close-demo-approval();
+            return;
+        }
+        root.reject-request();
+    }
+
+    // Called from ChatPanel keyboard shortcuts (Esc / Ctrl+Enter).
+    public function approve-pending() {
+        root.handle-approve();
+    }
+    public function reject-pending() {
+        root.handle-reject();
+    }
+
     // The native v1 dock launches at 20% width. Keep the chat surface in
     // its compact side-panel treatment even after a user widens it; this
     // avoids a width-to-implicit-size binding loop in Slint layouts.
     in property <bool> compact: true;
     in property <bool> narrow: false;
+    // When the thread rail is collapsed (or narrow forces the rail), match
+    // the sidebar toggle header height.
+    in property <bool> sidebar-expanded: true;
+    property <bool> match-title-bar: !sidebar-expanded || narrow;
+    in property <bool> rename-editing: false;
+    in property <string> rename-focus-target: "";
+    property <bool> rename-focus-pending: false;
+    in-out property <string> rename-draft: "";
+    // Filled hand is reserved for a pending decision/input that needs the
+    // user's attention. Never use it for ordinary connection states.
+    property <bool> status-needs-attention: root.shown-pending.active;
+    // Shared with the collapsed sidebar toggle header.
+    property <length> title-bar-h: 36px;
+    // Allow compose `/` `@` `#` popup to paint above the message stream.
+    clip: false;
     background: Theme.bg-chat;
+
+    public function begin-thread-rename() {
+        if (root.active-thread-name == "") {
+            return;
+        }
+        root.thread-rename-started();
+    }
+
+    function cancel-thread-rename() {
+        root.rename-focus-pending = false;
+        root.thread-rename-cancelled();
+    }
+
+    function confirm-thread-rename() {
+        if (root.rename-draft != "") {
+            root.thread-rename-confirmed(root.rename-draft);
+        }
+    }
+
+    changed rename-editing => {
+        if (root.rename-editing && root.rename-focus-target == "chat") {
+            root.rename-focus-pending = true;
+        }
+    }
 
     // Phase 6 (scroll-position preservation + jump-to-latest): whether the
     // user is following the newest message. Live updates only snap the
@@ -107,36 +268,90 @@ export component ChatArea inherits Rectangle {
         min-height: parent.height;
         preferred-height: parent.height;
         vertical-stretch: 1;
-        // Thread header -- icon glyph + title/description + right-hand
-        // agent-name chip and static layout label (HTML's layout
-        // switcher is out of scope, per the plan; this always reads
-        // "CHAT").
+        // Thread header — ui.yaml `chat-view-top`.
+        // When the left rail is collapsed (`match-title-bar`), its height
+        // matches the collapsed sidebar toggle header.
         Rectangle {
-            height: compact ? 44px : 52px;
-            background: Theme.bg-chat;
+            height: root.match-title-bar ? root.title-bar-h
+                : (compact ? 48px : 56px);
+            // Match sidebar title strip surface when collapsed.
+            background: root.match-title-bar ? Theme.bg-card : Theme.bg-chat;
+            property <angle> header-spin: 0deg;
+            header-spin-timer := Timer {
+                interval: 80ms;
+                running: root.sending || connection-status == "Connecting...";
+                triggered => { header-spin += 30deg; }
+            }
             HorizontalLayout {
-                padding: compact ? Metrics.space-3 : Metrics.space-6;
-                spacing: compact ? Metrics.space-3 : Metrics.space-5;
-                Rectangle {
-                    width: compact ? 22px : 28px;
-                    height: compact ? 22px : 28px;
-                    background: Theme.bg-primary-container;
-                    border-color: Theme.border-default;
-                    border-width: 1px;
-                    border-radius: Theme.radius-sm;
-                    Icon {
-                        source: @image-url("./assets/icons/chevron-right.svg");
+                width: 100%;
+                height: 100%;
+                // Sidebar title uses space-2/4 padding + icon-md (16px).
+                padding-left: root.match-title-bar
+                    ? (compact ? Metrics.space-2 : Metrics.space-4)
+                    : (compact ? Metrics.space-3 : Metrics.space-6);
+                padding-right: root.match-title-bar
+                    ? (compact ? Metrics.space-2 : Metrics.space-4)
+                    : (compact ? Metrics.space-3 : Metrics.space-6);
+                spacing: root.match-title-bar
+                    ? (compact ? Metrics.space-1 : Metrics.space-3)
+                    : (compact ? Metrics.space-3 : Metrics.space-5);
+                alignment: stretch;
+                cross-axis-alignment: center;
+
+                // --- LEFT (ui.yaml): status icon + thread title ---
+                left-cluster := HorizontalLayout {
+                    spacing: root.match-title-bar ? Metrics.space-2 : Metrics.space-3;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    alignment: stretch;
+                    cross-axis-alignment: center;
+                    rename-focus-delay := Timer {
+                        interval: 1ms;
+                        running: root.rename-focus-pending;
+                        triggered => {
+                            root.rename-focus-pending = false;
+                            rename-input.focus();
+                        }
+                    }
+                    // Status icon — Metrics.icon-md (16px), same as sidebar title icons.
+                    // No height: parent.height (binding loop with layoutinfo-v).
+                    if root.sending || connection-status == "Connecting..." : Rectangle {
+                        width: Metrics.icon-md;
+                        height: Metrics.icon-md;
+                        horizontal-stretch: 0;
+                        vertical-stretch: 0;
+                        Icon {
+                            source: @image-url("./assets/icons/loader-circle.svg");
+                            size: Metrics.icon-md;
+                            color: Theme.bg-primary;
+                            transform-rotation: header-spin;
+                            transform-origin: { x: 8px, y: 8px };
+                        }
+                    }
+                    if !(root.sending || connection-status == "Connecting...")
+                        && root.status-needs-attention : Icon {
+                        source: @image-url("./assets/icons/hand-filled.svg");
                         size: Metrics.icon-md;
                         color: Theme.bg-primary;
+                        horizontal-stretch: 0;
+                        vertical-stretch: 0;
                     }
-                }
-                if !compact : VerticalLayout {
-                    alignment: center;
-                    spacing: 1px;
-                    Text {
-                        text: active-thread-name;
+                    if !(root.sending || connection-status == "Connecting...")
+                        && !root.status-needs-attention : Rectangle {
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: Theme.text-muted;
+                        horizontal-stretch: 0;
+                        vertical-stretch: 0;
+                    }
+                    if !root.rename-editing : Text {
+                        text: active-thread-name != "" ? active-thread-name : "No thread";
                         color: Theme.text-primary;
-                        font-size: (compact ? 11px : 13px) * Theme.font-scale;
+                        // Match sidebar "Chats" title when rail collapsed.
+                        font-size: (root.match-title-bar ? 14px
+                            : (compact ? 13px : 15px)) * Theme.font-scale;
                         font-weight: 600;
                         font-family: Theme.font-sans;
                         horizontal-alignment: left;
@@ -146,140 +361,120 @@ export component ChatArea inherits Rectangle {
                         min-width: 0px;
                         overflow: elide;
                     }
-                    Text {
-                        text: active-thread-description;
-                        color: Theme.text-muted;
-                        font-size: 10px * Theme.font-scale;
-                        font-family: Theme.font-sans;
-                        horizontal-alignment: left;
-                        vertical-alignment: center;
-                        visible: !compact && active-thread-description != "";
-                        // Same overflow-avoidance convention as the
-                        // thread-name Text above: without preferred/min
-                        // width pinned to 0, this Text's un-elided natural
-                        // width (descriptions can run to
-                        // THREAD_DESCRIPTION_MAX_CHARS) forces the whole
-                        // header wider than the available small/tablet
-                        // width instead of eliding.
+                    rename-editor := Rectangle {
+                        visible: root.rename-editing;
+                        height: root.match-title-bar ? 26px : 30px;
+                        background: Theme.bg-sidebar;
+                        border-width: 1px;
+                        border-color: Theme.border-default;
+                        border-radius: Theme.radius-sm;
                         horizontal-stretch: 1;
                         preferred-width: 0px;
-                        min-width: 0px;
-                        overflow: elide;
+                        min-width: 72px;
+                        rename-input := TextInput {
+                            x: Metrics.space-3;
+                            y: 0px;
+                            width: parent.width - 2 * Metrics.space-3;
+                            height: parent.height;
+                            accessible-label: "Thread name";
+                            text <=> root.rename-draft;
+                            color: Theme.text-primary;
+                            font-family: Theme.font-sans;
+                            font-size: (root.match-title-bar ? 13px
+                                : (compact ? 12px : 14px)) * Theme.font-scale;
+                            vertical-alignment: center;
+                            single-line: true;
+                            key-pressed(event) => {
+                                if (event.text == Key.Return) {
+                                    root.confirm-thread-rename();
+                                    return EventResult.accept;
+                                }
+                                if (event.text == Key.Escape) {
+                                    root.cancel-thread-rename();
+                                    return EventResult.accept;
+                                }
+                                return EventResult.reject;
+                            }
+                        }
+                    }
+                    if !root.rename-editing && active-thread-name != "" : IconButton {
+                        btn-width: 20px;
+                        btn-height: 20px;
+                        button-accessible-label: "Rename thread";
+                        clicked => { root.begin-thread-rename(); }
+                        Icon {
+                            source: @image-url("./assets/icons/pencil.svg");
+                            size: 13px;
+                            color: Theme.text-muted;
+                        }
+                    }
+                    if root.rename-editing : IconButton {
+                        btn-width: 20px;
+                        btn-height: 20px;
+                        button-accessible-label: "Save thread name";
+                        clicked => { root.confirm-thread-rename(); }
+                        Icon {
+                            source: @image-url("./assets/icons/check.svg");
+                            size: 14px;
+                            color: Theme.bg-primary;
+                        }
+                    }
+                    if root.rename-editing : IconButton {
+                        btn-width: 20px;
+                        btn-height: 20px;
+                        button-accessible-label: "Cancel thread rename";
+                        clicked => { root.cancel-thread-rename(); }
+                        Icon {
+                            source: @image-url("./assets/icons/x.svg");
+                            size: 14px;
+                            color: Theme.text-muted;
+                        }
                     }
                 }
-                Rectangle { }
-                if !compact : Text {
-                    text: "Agent:";
-                    color: Theme.text-secondary;
-                    font-size: 10px * Theme.font-scale;
-                    font-family: Theme.font-sans;
-                    vertical-alignment: center;
-                }
-                if !compact : Rectangle {
-                    background: Theme.bg-canvas;
-                    border-color: Theme.border-default;
-                    border-width: 1px;
-                    border-radius: Theme.radius-sm;
-                    HorizontalLayout {
-                        padding-left: Metrics.space-3;
-                        padding-right: Metrics.space-3;
-                        padding-top: Metrics.space-1;
-                        padding-bottom: Metrics.space-1;
+
+                // --- RIGHT (ui.yaml): agent name [top right] + tools ---
+                right-cluster := HorizontalLayout {
+                    spacing: root.match-title-bar ? Metrics.space-2
+                        : (compact ? Metrics.space-2 : Metrics.space-3);
+                    horizontal-stretch: 0;
+                    alignment: end;
+                    cross-axis-alignment: center;
+
+                    Text {
+                        text: agent-badge;
+                        color: Theme.text-primary;
+                        font-size: (root.match-title-bar ? 10px : 11px) * Theme.font-scale;
+                        font-family: Theme.font-mono;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                        horizontal-stretch: 0;
+                        vertical-stretch: 0;
+                        overflow: elide;
+                        max-width: compact ? 120px : 200px;
+                    }
+
+                    if narrow : IconButton {
+                        button-accessible-label: "New thread";
+                        clicked => { new-thread-requested(); }
+                        Icon {
+                            source: @image-url("./assets/icons/plus.svg");
+                            size: Metrics.icon-md;
+                            color: Theme.bg-primary;
+                        }
+                    }
+                    IconButton {
+                        active: local-terminal.open;
+                        button-accessible-label: "Toggle local terminal";
+                        clicked => { local-terminal-toggle-requested(); }
                         Text {
-                            text: agent-badge;
-                            color: Theme.text-primary;
-                            font-size: 10px * Theme.font-scale;
-                            font-family: Theme.font-mono;
+                            text: "\u{2318}";
+                            color: local-terminal.open ? Theme.bg-primary : Theme.text-secondary;
+                            font-size: 12px * Theme.font-scale;
+                            horizontal-alignment: center;
                             vertical-alignment: center;
                         }
                     }
                 }
-                if !compact : Rectangle {
-                    width: 1px;
-                    background: Theme.border-default;
-                }
-                if !compact : Text {
-                    text: "CHAT";
-                    color: Theme.bg-primary;
-                    font-size: 9px * Theme.font-scale;
-                    font-weight: 700;
-                    font-family: Theme.font-mono;
-                    vertical-alignment: center;
-                }
-                if !compact : HorizontalLayout {
-                    spacing: Metrics.space-1;
-                    accessible-role: text;
-                    accessible-label: "Connection status: " + connection-status;
-                    // The inner Text already elides, but without pinning
-                    // this wrapping layout's own preferred/min width to 0
-                    // it can't actually shrink below its natural content
-                    // width under space pressure -- same convention gap as
-                    // the description Text above.
-                    preferred-width: 0px;
-                    min-width: 0px;
-                    // Same left-end state-icon language as the sidebar's
-                    // thread rows (see sidebar.slint) -- a spinner while
-                    // still connecting, otherwise a plain idle dot.
-                    if connection-status == "Connecting..." : Icon {
-                        source: @image-url("./assets/icons/loader-circle.svg");
-                        size: Metrics.icon-sm;
-                        color: Theme.bg-primary;
-                    }
-                    if connection-status != "Connecting..." : Rectangle {
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: Theme.text-muted;
-                    }
-                    Text {
-                        text: connection-status;
-                        color: Theme.text-muted;
-                        font-size: 9px * Theme.font-scale;
-                        font-family: Theme.font-mono;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        overflow: elide;
-                    }
-                }
-                if narrow : IconButton {
-                    button-accessible-label: "New thread";
-                    clicked => { new-thread-requested(); }
-                    Text {
-                        text: "+";
-                        color: Theme.bg-primary;
-                        font-size: 16px * Theme.font-scale;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-                IconButton {
-                    active: active-thread-background;
-                    button-accessible-label: active-thread-background
-                        ? "Disable background mode for this thread"
-                        : "Enable background mode for this thread";
-                    clicked => { toggle-background(); }
-                    Icon {
-                        source: @image-url("./assets/icons/moon.svg");
-                        size: Metrics.icon-sm;
-                        color: active-thread-background ? Theme.text-tertiary : Theme.text-secondary;
-                    }
-                }
-                IconButton {
-                    active: local-terminal.open;
-                    button-accessible-label: "Toggle local terminal";
-                    clicked => { local-terminal-toggle-requested(); }
-                    Text {
-                        text: "\u{2318}"; // same terminal glyph stand-in as TerminalCard
-                        color: local-terminal.open ? Theme.bg-primary : Theme.text-secondary;
-                        font-size: 12px * Theme.font-scale;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-                // Settings lives at the bottom of the thread sidebar only.
             }
         }
         Rectangle {
@@ -368,11 +563,69 @@ export component ChatArea inherits Rectangle {
                         || msg.kind == "mcp_server_call"
                         || msg.kind == "skill_load"
                         || msg.kind == "skill_use";
-                    // In the compact dock, full-width cards are more
-                    // legible than the desktop right-anchored bubble
-                    // treatment, which would leave user cards only a few
-                    // pixels wide beside the thread list.
-                    Rectangle { width: is-user ? 8px : 0px; }
+                    // Active-session rail on the *latest* row while the
+                    // thread is loading (same `sending` state as the
+                    // header/sidebar spinner). Pulse *flows* top → bottom.
+                    property <bool> is-live-tail:
+                        root.sending && i == root.messages.length - 1;
+                    // Fixed gutter widths — never toggle 0↔N when the live
+                    // rail appears, or the bubble column jumps horizontally.
+                    property <length> rail-w: 3px;
+                    property <length> rail-gap: Metrics.space-3;
+                    property <length> user-indent: 8px;
+                    // 0..1 progress of the traveling highlight.
+                    property <float> flow-t: 0.0;
+                    property <length> flow-blob: 36px;
+                    live-flow-timer := Timer {
+                        interval: 40ms;
+                        running: is-live-tail;
+                        triggered => {
+                            // ~1.2s full trip (30 × 40ms), then loop.
+                            flow-t = flow-t + 0.033;
+                            if (flow-t > 1.0) {
+                                flow-t = 0.0;
+                            }
+                        }
+                    }
+
+                    // Left rail track — always reserved for non-user rows
+                    // so agent/tool width is stable when is-live-tail flips.
+                    // User rows keep a fixed indent instead (no rail).
+                    live-rail := Rectangle {
+                        // Always claim rail-w for non-user rows (placeholder
+                        // when idle) so live pulse never changes row width.
+                        width: is-user ? 0px : rail-w;
+                        horizontal-stretch: 0;
+                        min-height: 12px;
+                        clip: true;
+                        border-radius: 1.5px;
+                        // Dim track only while live; transparent placeholder
+                        // otherwise (same width, no layout shift).
+                        background: is-live-tail
+                            ? Theme.bg-primary.with-alpha(0.18)
+                            : transparent;
+
+                        // Bright segment that travels down the rail.
+                        if is-live-tail : Rectangle {
+                            width: parent.width;
+                            height: min(flow-blob, parent.height);
+                            y: (parent.height + flow-blob) * flow-t - flow-blob;
+                            border-radius: 1.5px;
+                            background: Theme.bg-primary.with-alpha(0.95);
+                        }
+                        if is-live-tail : Rectangle {
+                            width: parent.width;
+                            height: min(flow-blob * 0.55, parent.height);
+                            y: (parent.height + flow-blob) * flow-t - flow-blob * 1.45;
+                            border-radius: 1.5px;
+                            background: Theme.bg-primary.with-alpha(0.35);
+                        }
+                    }
+                    // Gap after rail / user indent — fixed per kind.
+                    Rectangle {
+                        width: is-user ? user-indent : rail-gap;
+                        horizontal-stretch: 0;
+                    }
                     if is-user : UserBubble {
                         // Stretch within the available chat column instead
                         // of binding width back to the Flickable viewport.
@@ -438,7 +691,7 @@ export component ChatArea inherits Rectangle {
                 jump-touch := TouchArea {
                     mouse-cursor: pointer;
                     accessible-role: button;
-                    accessible-label: pending-request.active ? "Jump to pending request" : "Jump to latest message";
+                    accessible-label: root.shown-pending.active ? "Jump to pending request" : "Jump to latest message";
                     accessible-action-default => {
                         root.stick-to-bottom = true;
                         message-scroll.viewport-y = -root.msg-max-scroll;
@@ -449,7 +702,7 @@ export component ChatArea inherits Rectangle {
                     }
                 }
                 Icon {
-                    source: pending-request.active
+                    source: root.shown-pending.active
                         ? @image-url("./assets/icons/hand.svg")
                         : @image-url("./assets/icons/arrow-down.svg");
                     size: Metrics.icon-sm;
@@ -498,22 +751,35 @@ export component ChatArea inherits Rectangle {
                 }
             }
         }
-        // Interactive agent-request relay addition: docked above the
-        // compose bar whenever the active thread has a live pending
-        // decision -- deliberately outside the scrollable message
-        // Flickable above, so it stays visible without the user needing
-        // to scroll to the bottom to see/answer it.
-        if pending-request.active : Rectangle {
-            background: Theme.bg-chat;
-            HorizontalLayout {
-                padding: compact ? 6px : 10px;
-                PermissionCard {
-                    item: pending-request;
-                    horizontal-stretch: 1;
-                    preferred-width: 0px;
-                    min-width: 0px;
-                    approve() => { approve-request(); }
-                    reject() => { reject-request(); }
+        // Approval band — full-width bg-approval-band so the strip reads
+        // as a decision zone vs chat (bg-chat) and compose (bg-sidebar).
+        if root.shown-pending.active : VerticalLayout {
+            vertical-stretch: 0;
+            // Top hairline only (full border on the band looked heavy).
+            Rectangle {
+                height: 1px;
+                background: Theme.border-strong;
+            }
+            Rectangle {
+                vertical-stretch: 0;
+                background: Theme.bg-approval-band;
+                HorizontalLayout {
+                    width: 100%;
+                    padding-left: Metrics.pad-2xl;
+                    padding-right: Metrics.pad-2xl;
+                    padding-top: Metrics.pad-xs;
+                    padding-bottom: Metrics.pad-xs;
+                    alignment: stretch;
+                    PermissionCard {
+                        item: root.shown-pending;
+                        horizontal-stretch: 1;
+                        vertical-stretch: 0;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        option-selected(option-id) => { root.handle-permission-option(option-id); }
+                        approve() => { root.handle-approve(); }
+                        reject() => { root.handle-reject(); }
+                    }
                 }
             }
         }
@@ -531,10 +797,18 @@ export component ChatArea inherits Rectangle {
             mode-dropdown-entries: mode-dropdown-entries;
             config-dropdown-entries: config-dropdown-entries;
             mode-trigger-label: mode-trigger-label;
-            send-requested => { send-requested(); }
+            config-trigger-label: config-trigger-label;
+            context-ratio: context-ratio;
+            context-used-tokens: context-used-tokens;
+            context-limit-tokens: context-limit-tokens;
+            skill-options: skill-options;
+            mcp-options: mcp-options;
+            file-options: file-options;
+            send-requested => { root.handle-send(); }
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+            context-view-requested => { context-view-requested(); }
             panel-shortcut(event) => { return panel-shortcut(event); }
         }
     }

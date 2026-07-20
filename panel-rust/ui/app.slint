@@ -1,5 +1,5 @@
 import { Theme } from "tokens/theme.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
+import { ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
@@ -8,7 +8,7 @@ import { SettingsPage } from "pages/settings/settings_page.slint";
 import { SkillEditorView } from "pages/skills/skill_view.slint";
 import { TextUtil } from "base/text_util.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme }
+export { ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -47,9 +47,15 @@ export component ChatPanel inherits Window {
     callback load-older-requested();
     in-out property <string> compose-text: "";
     in-out property <bool> settings-open: false;
+    in-out property <string> settings-scope: "global";
+    // Retains the active settings section while the page is open. The dev
+    // fixture sets this to "agents" so its agent cards are visible on load.
+    in-out property <string> settings-active-section: "mcp_servers";
+    in-out property <bool> settings-sections-expanded: true;
     in-out property <string> default-profile: "";
     in-out property <string> permission-profile: "";
     in-out property <bool> background-default: false;
+    in-out property <string> default-agent-id: "";
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <string> connection-status: "Connecting...";
@@ -113,6 +119,17 @@ export component ChatPanel inherits Window {
     in-out property <[DropdownEntry]> mode-dropdown-entries: [];
     in-out property <[DropdownEntry]> config-dropdown-entries: [];
     in-out property <string> mode-trigger-label: "";
+    // Active model/config display name for the compose-bar trigger
+    // (host: models::current_config_trigger_label). Empty → "Model".
+    in-out property <string> config-trigger-label: "";
+    // Session context ring (ui.yaml chat-view-input). Host fills real
+    // numbers when available; defaults stay at zero until then.
+    in property <float> context-ratio: 0.0;
+    in property <int> context-used-tokens: 0;
+    in property <int> context-limit-tokens: 0;
+    // Compose `/` `@` `#` popup catalogs (skills / mcp / files).
+    in property <[string]> file-options: [];
+    callback context-view-requested();
     // Set by Rust whenever `expand-terminal` fires (looked up from
     // `terminals` at that moment, since Slint has no `for`-as-expression
     // find/filter construct) -- an empty `terminal-id` means no overlay
@@ -122,19 +139,23 @@ export component ChatPanel inherits Window {
 
     callback thread-selected(int);
     callback new-thread-requested();
-    callback new-skill-requested(string);
+    callback new-skill-requested(string, string);
     callback skill-promote-to-global(string);
     callback dev-mode-toggled(bool);
     callback thread-close-requested(int);
     callback thread-delete-requested(int);
     callback thread-archive-requested(int);
+    callback thread-rename-requested(int, string);
+    callback search-submitted(string, bool, bool);
     callback send-requested();
     callback stop-requested();
     callback settings-requested();
+    callback settings-scope-changed(string);
     callback settings-save();
     callback settings-close();
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
+    callback mcp-server-enabled-changed(string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -143,6 +164,8 @@ export component ChatPanel inherits Window {
     callback toggle-expanded(int);
     callback approve-request();
     callback reject-request();
+    // One-of permission option pick (ACP optionId or synthetic approve/reject).
+    callback permission-option-selected(string);
     callback expand-terminal(string);
     callback close-terminal-overlay();
     callback local-terminal-toggle-requested();
@@ -151,6 +174,53 @@ export component ChatPanel inherits Window {
     callback mode-selected(string);
     callback config-option-selected(string, string);
     callback thread-toggle-background(int);
+    property <int> rename-thread-index: -1;
+    property <string> rename-thread-draft: "";
+    property <string> rename-focus-target: "";
+    property <bool> pending-compose-focus: false;
+
+    function start-new-thread() {
+        root.active-pane = "chat";
+        if (root.narrow) {
+            root.sidebar-expanded = false;
+        }
+        root.pending-compose-focus = true;
+        root.new-thread-requested();
+    }
+
+    function begin-thread-rename(index: int, focus-target: string) {
+        if (index < 0 || index >= root.threads.length) {
+            return;
+        }
+        root.selected-thread = index;
+        root.active-pane = "chat";
+        root.thread-selected(index);
+        root.rename-thread-draft = root.threads[index].name;
+        root.rename-focus-target = focus-target;
+        root.rename-thread-index = index;
+    }
+
+    function cancel-thread-rename() {
+        root.rename-thread-index = -1;
+        root.rename-thread-draft = "";
+        root.rename-focus-target = "";
+    }
+
+    function confirm-thread-rename(index: int, name: string) {
+        if (name != "") {
+            root.thread-rename-requested(index, name);
+        }
+        root.cancel-thread-rename();
+    }
+
+    compose-focus-delay := Timer {
+        interval: 100ms;
+        running: root.pending-compose-focus;
+        triggered => {
+            root.pending-compose-focus = false;
+            chat-area.restore-compose-focus();
+        }
+    }
 
     // Open the settings overlay in Slint itself, then notify the host.
     // Pure viewers (slint-viewer --auto-reload) have no Rust callback that
@@ -169,8 +239,9 @@ export component ChatPanel inherits Window {
         // Escape: reject pending permission, else close the top overlay /
         // settings sheet. Always wins over type-to-compose.
         if (event.text == Key.Escape) {
-            if (pending-request.active) {
-                reject-request();
+            // Host pending OR local `/demo-permission` card.
+            if (pending-request.active || chat-area.has-pending-approval) {
+                chat-area.reject-pending();
                 return EventResult.accept;
             }
             if (expanded-terminal.terminal-id != "") {
@@ -202,7 +273,7 @@ export component ChatPanel inherits Window {
             }
             // Ctrl+N -- new thread.
             if (event.text == "n" || event.text == "N") {
-                new-thread-requested();
+                root.start-new-thread();
                 return EventResult.accept;
             }
             // Ctrl+, -- open settings.
@@ -210,17 +281,15 @@ export component ChatPanel inherits Window {
                 root.open-settings();
                 return EventResult.accept;
             }
-            // Ctrl+K -- focus thread search (expand rail first if needed).
+            // Ctrl+K -- expand rail if needed and focus thread search.
             if (event.text == "k" || event.text == "K") {
-                if (!root.narrow) {
-                    sidebar-expanded = true;
-                }
-                sidebar.focus-search();
+                sidebar.open-search();
                 return EventResult.accept;
             }
-            // Ctrl+Enter -- approve pending permission request.
-            if ((event.text == Key.Return || event.text == "\n") && pending-request.active) {
-                approve-request();
+            // Ctrl+Enter -- first allow option (host or local demo card).
+            if ((event.text == Key.Return || event.text == "\n")
+                && (pending-request.active || chat-area.has-pending-approval)) {
+                chat-area.approve-pending();
                 return EventResult.accept;
             }
         }
@@ -243,23 +312,30 @@ export component ChatPanel inherits Window {
                 x: 0px;
                 y: 0px;
                 height: parent.height;
-                // Mobile/narrow no longer hides the sidebar outright -- it
-                // collapses to the same icon-only rail the desktop "collapse"
-                // toggle already produces (only the left-end state icon per
-                // row stays visible), so a thread's live status is still
-                // glanceable without spending any horizontal space on text.
+                // Narrow mode begins collapsed, but the user can open the
+                // rail to browse. Double-clicking a selected row closes it
+                // again to reveal the chat or skill editor.
                 threads: threads;
                 selected-thread: selected-thread;
                 compact: compact;
-                expanded: root.narrow ? false : sidebar-expanded;
+                narrow: root.narrow;
+                expanded: sidebar-expanded;
                 skills: available-skills;
                 active-project-path: root.active-project-path;
+                rename-thread-index <=> root.rename-thread-index;
+                rename-thread-draft <=> root.rename-thread-draft;
+                rename-focus-target: root.rename-focus-target;
                 thread-selected(i) => {
                     selected-thread = i;
+                    // Leave live skill editor when a thread is chosen —
+                    // main surface returns to chat (active-pane switch).
+                    root.active-pane = "chat";
                     thread-selected(i);
                 }
-                new-thread-requested => { new-thread-requested(); }
-                new-skill-requested(name) => { new-skill-requested(name); }
+                new-thread-requested => {
+                    root.start-new-thread();
+                }
+                new-skill-requested(name, scope) => { new-skill-requested(name, scope); }
                 skill-selected(path) => {
                     root.active-pane = "skill";
                     root.skill-editor-open-requested(path);
@@ -267,9 +343,23 @@ export component ChatPanel inherits Window {
                 thread-close-requested(i) => { thread-close-requested(i); }
                 thread-delete-requested(i) => { thread-delete-requested(i); }
                 thread-archive-requested(i) => { thread-archive-requested(i); }
+                thread-rename-started(i) => { root.begin-thread-rename(i, "sidebar"); }
+                thread-rename-cancelled => { root.cancel-thread-rename(); }
+                thread-rename-confirmed(i, name) => { root.confirm-thread-rename(i, name); }
                 settings-requested => { root.open-settings(); }
+                skills-settings-requested => {
+                    root.settings-active-section = "skills";
+                    root.open-settings();
+                }
                 search-changed(q) => { search-changed(q); }
+                search-submitted(query, search-skills, show-global) => {
+                    root.search-submitted(query, search-skills, show-global);
+                }
                 toggle-expanded => { sidebar-expanded = !sidebar-expanded; }
+                collapse-requested => { sidebar-expanded = false; }
+                expand-requested => {
+                    sidebar-expanded = true;
+                }
             }
             chat-area := ChatArea {
                 visible: root.active-pane == "chat";
@@ -279,6 +369,10 @@ export component ChatPanel inherits Window {
                 height: parent.height;
                 compact: compact;
                 narrow: root.narrow;
+                sidebar-expanded: sidebar-expanded;
+                rename-editing: root.rename-thread-index == selected-thread;
+                rename-draft <=> root.rename-thread-draft;
+                rename-focus-target: root.rename-focus-target;
                 active-thread-name: threads.length > 0 ? threads[selected-thread].name : "";
                 active-thread-description: threads.length > 0 ? threads[selected-thread].description : "";
                 active-thread-background: threads.length > 0 ? threads[selected-thread].background : false;
@@ -309,11 +403,19 @@ export component ChatPanel inherits Window {
                 send-requested => { send-requested(); }
                 stop-requested => { stop-requested(); }
                 settings-requested => { root.open-settings(); }
-                new-thread-requested => { new-thread-requested(); }
+                new-thread-requested => { root.start-new-thread(); }
+                thread-rename-started => {
+                    root.begin-thread-rename(selected-thread, "chat");
+                }
+                thread-rename-cancelled => { root.cancel-thread-rename(); }
+                thread-rename-confirmed(name) => {
+                    root.confirm-thread-rename(selected-thread, name);
+                }
                 toggle-expanded(i) => { toggle-expanded(i); }
                 pending-request: pending-request;
                 approve-request => { approve-request(); }
                 reject-request => { reject-request(); }
+                permission-option-selected(option-id) => { permission-option-selected(option-id); }
                 terminals: terminals;
                 expand-terminal(id) => { expand-terminal(id); }
                 local-terminal: local-terminal;
@@ -324,8 +426,16 @@ export component ChatPanel inherits Window {
                 mode-dropdown-entries: mode-dropdown-entries;
                 config-dropdown-entries: config-dropdown-entries;
                 mode-trigger-label: mode-trigger-label;
+                config-trigger-label: config-trigger-label;
+                context-ratio: context-ratio;
+                context-used-tokens: context-used-tokens;
+                context-limit-tokens: context-limit-tokens;
+                skill-options: available-skills;
+                mcp-options: available-mcp-servers;
+                file-options: file-options;
                 mode-selected(id) => { mode-selected(id); }
                 config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+                context-view-requested => { context-view-requested(); }
                 // Compose owns focus for typing -- re-dispatch panel chords
                 // so Ctrl+B/N/K/, and Escape still work while composing.
                 panel-shortcut(event) => {
@@ -397,9 +507,13 @@ export component ChatPanel inherits Window {
                 y: 8px;
                 width: parent.width - 16px;
                 height: parent.height - 16px;
+                active-section <=> root.settings-active-section;
+                scope <=> root.settings-scope;
+                sections-expanded <=> root.settings-sections-expanded;
                 default-profile <=> default-profile;
                 permission-profile <=> permission-profile;
                 background-default <=> background-default;
+                default-agent-id <=> root.default-agent-id;
                 background-override-set <=> background-override-set;
                 background-override <=> background-override;
                 available-profiles: available-profiles;
@@ -409,6 +523,7 @@ export component ChatPanel inherits Window {
                 available-skills: available-skills;
                 dev-mode: dev-mode;
                 save => { settings-save(); }
+                scope-changed(scope) => { root.settings-scope-changed(scope); }
                 close => {
                     settings-open = false;
                     settings-close();
@@ -416,6 +531,9 @@ export component ChatPanel inherits Window {
                 }
                 mcp-server-create(name, command) => { mcp-server-create(name, command); }
                 mcp-server-delete(name) => { mcp-server-delete(name); }
+                mcp-server-enabled-changed(name, enabled) => {
+                    mcp-server-enabled-changed(name, enabled);
+                }
                 profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
                     profile-create(name, agent-id, terminal-enabled, fs-enabled);
                 }

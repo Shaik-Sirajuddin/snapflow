@@ -32,6 +32,10 @@ import { Metrics } from "../tokens/metrics.slint";
 // slint`), so don't drop that binding when using this component.
 export component SettingsSection inherits VerticalLayout {
     spacing: Metrics.space-6;
+    // Settings views live inside the page's scrolling viewport. They must
+    // retain their content height so sparse sections do not spread rows
+    // across all available vertical space.
+    vertical-stretch: 0;
     @children
 }
 
@@ -51,6 +55,7 @@ export component SettingsSectionHeader inherits Text {
 // of separate sections.
 export component SettingsRowGroup inherits VerticalLayout {
     spacing: Metrics.space-2;
+    vertical-stretch: 0;
     @children
 }
 
@@ -63,6 +68,7 @@ export component SettingsRowGroup inherits VerticalLayout {
 export component SettingsField inherits VerticalLayout {
     in property <string> label;
     spacing: Metrics.gap-sm;
+    vertical-stretch: 0;
     Text {
         text: root.label;
         color: Theme.text-secondary;
