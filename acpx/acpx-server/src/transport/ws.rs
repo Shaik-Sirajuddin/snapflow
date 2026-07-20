@@ -67,10 +67,11 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 use acpx_core::router::{dispatch_shared_for_tenant, stream_resume_state_shared};
-use acpx_core::{InteractionBinding, StreamResumeState, TenantId};
+use acpx_core::{InteractionBinding, StreamResumeState, TenantId, INTERACTION_QUEUE_CAPACITY};
 
 use super::http::{
     json_rpc_error, json_rpc_subscribe_error, resolve_authorized_tenant, AppState, SharedRouter,
@@ -103,6 +104,53 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state.router, tenant_id))
 }
 
+/// Hard ceiling on writing one frame to a WS client's shared sink.
+///
+/// **Why this exists.** `sink` (`Arc<AsyncMutex<WsSink>>`) is shared by
+/// this connection's read loop, every per-request response task, and
+/// every live-notification/interaction forwarder task spawned for it --
+/// all serialized through the same `Mutex` deliberately (see this
+/// module's own doc comment on frame ordering). None of those writes was
+/// ever bounded: a client that stops draining its TCP receive window
+/// (laptop sleep, network stall, a genuinely wedged peer) leaves
+/// `WsSink::send` blocked on backpressure forever, and every other task
+/// for this same connection queued behind the same lock right along with
+/// it -- a permanent per-connection leak (subscriptions, background
+/// tasks, and their memory never freed) that a client reconnect can't
+/// even displace, since nothing ever notices the old connection is dead.
+/// Same reasoning as `acpx_core::router`'s `BACKEND_WRITE_TIMEOUT` and
+/// `acpx_client::ws`'s `WS_SEND_TIMEOUT` for the other two legs of this
+/// same wire.
+const WS_FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Sends `message` on `sink`, bounded by [`WS_FRAME_WRITE_TIMEOUT`].
+/// Returns `true` on success, `false` on any failure (send error *or*
+/// timeout) -- every caller already treats a failed send identically
+/// (stop this forwarder task/connection; the peer is presumed dead), so
+/// a timeout is deliberately folded into the same `false` outcome rather
+/// than given its own variant no caller would handle differently.
+async fn send_frame_bounded(sink: &Arc<AsyncMutex<WsSink>>, message: Message) -> bool {
+    let send = async { sink.lock().await.send(message).await };
+    match tokio::time::timeout(WS_FRAME_WRITE_TIMEOUT, send).await {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            tracing::debug!(?err, "ws send failed (connection likely closed)");
+            false
+        }
+        Err(_) => {
+            // Dropping `send` here releases the `sink` lock it may still
+            // hold, so a wedged client only stalls this one frame instead
+            // of every other task sharing this connection's sink forever.
+            tracing::warn!(
+                timeout_secs = WS_FRAME_WRITE_TIMEOUT.as_secs(),
+                "ws send timed out; treating this connection as dead rather than blocking \
+                 every other task sharing its sink lock indefinitely"
+            );
+            false
+        }
+    }
+}
+
 /// Write `value` out as one standalone frame. Serialization failure is
 /// logged and swallowed (nothing sensible to retry); a send failure means
 /// the connection is gone, also just logged here since each caller (the
@@ -117,9 +165,7 @@ async fn write_frame(sink: &Arc<AsyncMutex<WsSink>>, value: &serde_json::Value) 
             return;
         }
     };
-    if let Err(err) = sink.lock().await.send(Message::Text(payload)).await {
-        tracing::debug!(?err, "ws send failed (connection likely closed)");
-    }
+    send_frame_bounded(sink, Message::Text(payload)).await;
 }
 
 /// Strict ACP bridge counterpart to [`ws_handler`]. It shares the same
@@ -183,7 +229,7 @@ async fn handle_acp_socket(
     // though the exact same interactive round trip already works for the
     // native (non-bridge) WS/stdio transports via this same `InteractionHub`.
     let interaction_hub = { router.lock().await.interaction_hub() };
-    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let (interaction_tx, mut interaction_rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
     let interaction_bindings: Arc<AsyncMutex<HashMap<String, InteractionBinding>>> =
         Arc::new(AsyncMutex::new(HashMap::new()));
     let interaction_ctx = super::http::acp_bridge::BridgeInteractionCtx {
@@ -216,13 +262,7 @@ async fn handle_acp_socket(
                 let Ok(frame) = serde_json::to_string(&request) else {
                     continue;
                 };
-                if interaction_sink
-                    .lock()
-                    .await
-                    .send(Message::Text(frame))
-                    .await
-                    .is_err()
-                {
+                if !send_frame_bounded(&interaction_sink, Message::Text(frame)).await {
                     break;
                 }
             }
@@ -347,12 +387,7 @@ async fn handle_acp_socket(
                                     let Ok(frame) = serde_json::to_string(&update) else {
                                         continue;
                                     };
-                                    if forwarder_sink
-                                        .lock()
-                                        .await
-                                        .send(Message::Text(frame))
-                                        .await
-                                        .is_err()
+                                    if !send_frame_bounded(&forwarder_sink, Message::Text(frame)).await
                                     {
                                         break;
                                     }
@@ -433,7 +468,7 @@ async fn handle_acp_socket(
                     let Ok(frame) = serde_json::to_string(&update) else {
                         continue;
                     };
-                    if sink.lock().await.send(Message::Text(frame)).await.is_err() {
+                    if !send_frame_bounded(&sink, Message::Text(frame)).await {
                         return;
                     }
                     flushed_updates = true;
@@ -533,12 +568,11 @@ async fn handle_acp_socket(
                                         let Ok(frame) = serde_json::to_string(&update) else {
                                             continue;
                                         };
-                                        if forwarder_sink
-                                            .lock()
-                                            .await
-                                            .send(Message::Text(frame))
-                                            .await
-                                            .is_err()
+                                        if !send_frame_bounded(
+                                            &forwarder_sink,
+                                            Message::Text(frame),
+                                        )
+                                        .await
                                         {
                                             break;
                                         }
@@ -562,7 +596,7 @@ async fn handle_acp_socket(
             // the terminal response so an ACP client observes streamed
             // updates first.
             tokio::task::yield_now().await;
-            let _ = sink.lock().await.send(Message::Text(frame)).await;
+            send_frame_bounded(&sink, Message::Text(frame)).await;
         });
         background_tasks.lock().await.push(handle);
     }
@@ -646,7 +680,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
     let hub = { router.lock().await.notification_hub() };
     let agent_relay = { router.lock().await.agent_request_hub() };
     let interaction_hub = { router.lock().await.interaction_hub() };
-    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let (interaction_tx, mut interaction_rx) = mpsc::channel(INTERACTION_QUEUE_CAPACITY);
     let interaction_sink = Arc::clone(&sink);
     // See `handle_acp_socket`'s identical `background_tasks` doc comment:
     // every forwarder below is spawned independently and holds its own
@@ -665,13 +699,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
             let Ok(payload) = serde_json::to_string(&request) else {
                 continue;
             };
-            if interaction_sink
-                .lock()
-                .await
-                .send(Message::Text(payload))
-                .await
-                .is_err()
-            {
+            if !send_frame_bounded(&interaction_sink, Message::Text(payload)).await {
                 break;
             }
         }
@@ -691,13 +719,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                     continue;
                 }
             };
-            if sink
-                .lock()
-                .await
-                .send(Message::Text(payload))
-                .await
-                .is_err()
-            {
+            if !send_frame_bounded(&sink, Message::Text(payload)).await {
                 break;
             }
         }};
@@ -842,12 +864,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                 let Ok(payload) = serde_json::to_string(&update) else {
                                     continue;
                                 };
-                                if forwarder_sink
-                                    .lock()
-                                    .await
-                                    .send(Message::Text(payload))
-                                    .await
-                                    .is_err()
+                                if !send_frame_bounded(&forwarder_sink, Message::Text(payload)).await
                                 {
                                     break;
                                 }
@@ -949,12 +966,8 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                     let Ok(payload) = serde_json::to_string(&update) else {
                                         continue;
                                     };
-                                    if forwarder_sink
-                                        .lock()
+                                    if !send_frame_bounded(&forwarder_sink, Message::Text(payload))
                                         .await
-                                        .send(Message::Text(payload))
-                                        .await
-                                        .is_err()
                                     {
                                         break;
                                     }
@@ -973,7 +986,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                 let Ok(payload) = serde_json::to_string(&response) else {
                     return;
                 };
-                let _ = sink.lock().await.send(Message::Text(payload)).await;
+                send_frame_bounded(&sink, Message::Text(payload)).await;
             });
             background_tasks.lock().await.push(handle);
             continue;
@@ -1029,12 +1042,7 @@ async fn handle_socket(socket: WebSocket, router: SharedRouter, tenant_id: Tenan
                                 let Ok(payload) = serde_json::to_string(&update) else {
                                     continue;
                                 };
-                                if forwarder_sink
-                                    .lock()
-                                    .await
-                                    .send(Message::Text(payload))
-                                    .await
-                                    .is_err()
+                                if !send_frame_bounded(&forwarder_sink, Message::Text(payload)).await
                                 {
                                     break;
                                 }

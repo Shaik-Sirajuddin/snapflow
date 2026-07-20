@@ -805,6 +805,11 @@ pub enum RouterError {
          this call's response arrived"
     )]
     BackendDemuxReaderClosed,
+    #[error(
+        "backend stdin write timed out after {0:?}; the wedged process was killed and this \
+         call failed rather than holding its per-process/writer lock forever"
+    )]
+    BackendWriteTimeout(Duration),
 }
 
 /// Hard ceiling on the per-candidate backend `session/close` round trip
@@ -1694,17 +1699,16 @@ impl Router {
             let initialize_result = backend.agent_capabilities.clone().unwrap_or_default();
 
             let new_id = serde_json::json!("acpx-capability-probe-new");
-            backend
-                .writer
-                .lock()
-                .await
-                .write_value(&serde_json::json!({
+            write_backend_value_locked(
+                &mut backend,
+                &serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": new_id,
                     "method": "session/new",
                     "params": {"cwd": cwd, "mcpServers": []}
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             let (response, _, _) =
                 read_matching_response(&mut backend, &new_id, BackendCallPolicy::default(), None)
                     .await?;
@@ -1716,17 +1720,16 @@ impl Router {
             );
 
             let close_id = serde_json::json!("acpx-capability-probe-close");
-            backend
-                .writer
-                .lock()
-                .await
-                .write_value(&serde_json::json!({
+            write_backend_value_locked(
+                &mut backend,
+                &serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": close_id,
                     "method": "session/close",
                     "params": {"sessionId": backend_session_id}
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             if let Err(error) =
                 read_matching_response(&mut backend, &close_id, BackendCallPolicy::default(), None)
                     .await
@@ -2686,7 +2689,7 @@ impl Router {
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut backend, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response_with_idle_timeout(
                     &mut backend,
@@ -2827,7 +2830,7 @@ impl Router {
         let response = {
             let mut proc = backend.lock().await;
             ensure_backend_initialized(&mut proc, call_policy.clone()).await?;
-            proc.writer.lock().await.write_value(&outbound).await?;
+            write_backend_value_locked(&mut proc, &outbound).await?;
             let (response, _notifications, _agent_requests) =
                 read_matching_response(&mut proc, &id, call_policy, None).await?;
             response
@@ -3404,7 +3407,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         let response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut backend, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response_with_idle_timeout(
                     &mut backend,
@@ -3537,7 +3540,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         let mut response = {
             let mut backend = backend.lock().await;
             ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-            backend.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut backend, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut backend, &id, call_policy, None).await?;
             attach_updates(response, notifications, agent_requests)
@@ -3681,7 +3684,7 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
         // backend isn't even running has, definitionally, nothing left
         // to interrupt.
         if let Some(writer) = self.supervisor.cancel_writer(&agent_id) {
-            writer.lock().await.write_value(&notification).await?;
+            write_cancel_notification_best_effort(&writer, &notification).await;
         }
 
         Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
@@ -4261,6 +4264,111 @@ impl BackendCallPolicy {
 /// either guessing a method id or silently proceeding to `session/new`
 /// and letting the backend's own downstream rejection stand in for a
 /// real error message about *why*.
+/// Hard ceiling on writing one JSON-RPC line to a backend process's stdin
+/// pipe.
+///
+/// **Why this exists.** Every dispatch path either holds the per-process
+/// `BackendProcess` lock across its `write_value` call (non-demux path,
+/// and every `process_reader_demux` path's `if proc.pending.is_none()`
+/// setup block) or serializes on the shared `writer` handle alone (the
+/// demux "write-then-register" fast path). Neither was ever bounded: a
+/// backend that stops draining its own stdin (wedged, deadlocked, or
+/// swapped/suspended) leaves `ChildStdin::write_all`'s kernel-pipe-buffer
+/// wait blocking forever, and with it every other session sharing this
+/// exact process -- the same "one stuck backend freezes the whole
+/// gateway" class of incident `BACKEND_IDLE_READ_TIMEOUT`/
+/// `BACKEND_HANDSHAKE_TIMEOUT`/`CANCEL_WRITE_TIMEOUT` already close on
+/// the read side and the best-effort-cancel side. Same reasoning as
+/// `CANCEL_WRITE_TIMEOUT`'s doc comment: writing a few hundred bytes to a
+/// healthy process's stdin pipe completes in microseconds, so a multi-
+/// second bound is generous, not aggressive.
+const BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Writes one JSON-RPC value onto `proc`'s stdin, bounded by
+/// `BACKEND_WRITE_TIMEOUT`. `proc` is already exclusively held by the
+/// caller (a `BackendProcess` guard or `&mut` reference), so on timeout
+/// this kills it directly and returns `RouterError::BackendWriteTimeout`
+/// instead of leaving every other session sharing `proc`'s lock queued
+/// up behind a wedged stdin pipe forever.
+async fn write_backend_value_locked(
+    proc: &mut acpx_conductor::BackendProcess,
+    value: &serde_json::Value,
+) -> Result<(), RouterError> {
+    let writer = proc.writer_handle();
+    let write = async move { writer.lock().await.write_value(value).await };
+    match tokio::time::timeout(BACKEND_WRITE_TIMEOUT, write).await {
+        Ok(result) => result.map_err(RouterError::from),
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = BACKEND_WRITE_TIMEOUT.as_secs(),
+                "backend stdin write timed out; killing the wedged process so every other \
+                 session sharing its lock isn't blocked forever"
+            );
+            let _ = proc.kill().await;
+            Err(RouterError::BackendWriteTimeout(BACKEND_WRITE_TIMEOUT))
+        }
+    }
+}
+
+/// Same bound as [`write_backend_value_locked`], for the
+/// `process_reader_demux` fast path where the per-process lock (`proc`)
+/// was already dropped in favor of a standalone `writer` handle before
+/// this write -- exactly the shape `Router::dispatch_session_list_real`
+/// and friends use once they register a pending-response slot. Since
+/// `proc` isn't held here, killing on timeout re-acquires `backend`'s
+/// own lock first (a wedged stdin pipe means the process is already
+/// unusable, so a short re-lock to kill it is safe and cannot itself
+/// deadlock: nothing else holds `backend` for longer than one register/
+/// write/read step in this codebase).
+async fn write_backend_value_via_handle(
+    backend: &acpx_conductor::supervisor::SharedBackendProcess,
+    writer: &std::sync::Arc<tokio::sync::Mutex<acpx_conductor::framing::FramedWriter>>,
+    value: &serde_json::Value,
+) -> Result<(), RouterError> {
+    let write = async { writer.lock().await.write_value(value).await };
+    match tokio::time::timeout(BACKEND_WRITE_TIMEOUT, write).await {
+        Ok(result) => result.map_err(RouterError::from),
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = BACKEND_WRITE_TIMEOUT.as_secs(),
+                "backend stdin write timed out (process-reader-demux path); killing the \
+                 wedged process so every other session sharing it is unblocked"
+            );
+            let mut proc = backend.lock().await;
+            let _ = proc.kill().await;
+            Err(RouterError::BackendWriteTimeout(BACKEND_WRITE_TIMEOUT))
+        }
+    }
+}
+
+/// Best-effort variant for the standalone `Supervisor::cancel_writer`
+/// pipe (`session/cancel` notifications), which has no `BackendProcess`
+/// handle to kill on timeout -- mirrors `Router::cancel_stuck_turns`'s
+/// existing `CANCEL_WRITE_TIMEOUT` handling exactly: `session/cancel` is
+/// fire-and-forget with no confirmation in the ACP wire contract, so
+/// timing out here logs and moves on rather than failing the whole
+/// dispatch (a stuck cancel write shouldn't turn into a stuck cancel
+/// *request*).
+async fn write_cancel_notification_best_effort(
+    writer: &std::sync::Arc<tokio::sync::Mutex<acpx_conductor::framing::FramedWriter>>,
+    value: &serde_json::Value,
+) {
+    let write = async { writer.lock().await.write_value(value).await };
+    match tokio::time::timeout(CANCEL_WRITE_TIMEOUT, write).await {
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to deliver best-effort session/cancel");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CANCEL_WRITE_TIMEOUT.as_secs(),
+                "best-effort session/cancel write timed out; skipping rather than blocking \
+                 this dispatch on a wedged stdin pipe"
+            );
+        }
+        Ok(Ok(())) => {}
+    }
+}
+
 async fn ensure_backend_initialized(
     proc: &mut acpx_conductor::BackendProcess,
     call_policy: BackendCallPolicy,
@@ -4314,7 +4422,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
                 }
             }
         });
-        proc.writer.lock().await.write_value(&request).await?;
+        write_backend_value_locked(proc, &request).await?;
         // Bounded by `BACKEND_HANDSHAKE_TIMEOUT` (see its own doc comment
         // for the live incident this closes): a bare, unbounded
         // `proc.reader.read_value().await` loop here left this call --
@@ -4397,7 +4505,7 @@ async fn ensure_backend_initialized_with_handshake_timeout(
                 "method": "authenticate",
                 "params": { "methodId": method_id }
             });
-            proc.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(proc, &request).await?;
             // Same `BACKEND_HANDSHAKE_TIMEOUT` bound as the `initialize`
             // handshake just above -- this read was the other half of the
             // same unbounded-hang gap.
@@ -4609,6 +4717,29 @@ async fn handle_fs_request(request: &serde_json::Value, method: &str) -> serde_j
     }
 }
 
+/// Hard ceiling on `terminal/wait_for_exit`'s blocking wait.
+///
+/// **Why this exists.** `handle_terminal_request` runs with `proc: &mut
+/// BackendProcess` -- the *same* per-process lock every other session
+/// sharing this backend depends on (every caller of `handle_unmatched_
+/// frame`, this function's own caller, holds it for the entire call --
+/// see that function's own doc comment). Real ACP `terminal/wait_for_
+/// exit` semantics are genuinely blocking-until-exit by design (unlike
+/// `terminal/output`'s non-blocking snapshot), so a client that starts a
+/// long-running command and immediately awaits its exit is not itself
+/// misbehaving -- but nothing about that call should be allowed to
+/// freeze every *other* session on this same backend agent process for
+/// however long that command happens to run. Bounding it here means a
+/// command that legitimately runs longer than this window still keeps
+/// running (this does not kill the terminal, only fails *this specific
+/// RPC call*) -- a well-behaved caller falls back to polling `terminal/
+/// output`/`terminal/kill` instead, the same pattern a non-blocking ACP
+/// client already needs for any command it isn't sure will finish
+/// quickly. Sized the same as `BACKEND_IDLE_READ_TIMEOUT` -- both exist
+/// for the identical reason (bound how long one call may hold this
+/// exact lock hostage on every other session's behalf).
+const TERMINAL_WAIT_FOR_EXIT_TIMEOUT: Duration = BACKEND_IDLE_READ_TIMEOUT;
+
 /// Answer a real `terminal/*` request against acpx's own host, backed by
 /// `acpx_conductor::TerminalHandle` (see that module's doc comment).
 /// Schema per `agentclientprotocol.com/protocol/v1/terminals`:
@@ -4719,13 +4850,42 @@ async fn handle_terminal_request(
             None => error(-32602, format!("unknown terminalId '{terminal_id}'")),
         },
         "terminal/wait_for_exit" => match proc.terminals.get_mut(&terminal_id) {
-            Some(handle) => match handle.wait_for_exit().await {
-                Ok(status) => serde_json::json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": {"exitStatus": {"exitCode": status.exit_code, "signal": status.signal}}
-                }),
-                Err(err) => error(-32001, format!("terminal/wait_for_exit: {err}")),
-            },
+            Some(handle) => {
+                match tokio::time::timeout(TERMINAL_WAIT_FOR_EXIT_TIMEOUT, handle.wait_for_exit())
+                    .await
+                {
+                    Ok(Ok(status)) => serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"exitStatus": {"exitCode": status.exit_code, "signal": status.signal}}
+                    }),
+                    Ok(Err(err)) => error(-32001, format!("terminal/wait_for_exit: {err}")),
+                    Err(_elapsed) => {
+                        // See `TERMINAL_WAIT_FOR_EXIT_TIMEOUT`'s doc
+                        // comment: the command keeps running (not
+                        // killed) -- only this call fails, freeing the
+                        // per-process lock for every other session
+                        // sharing this backend instead of holding it
+                        // hostage for the command's entire runtime.
+                        tracing::warn!(
+                            timeout_secs = TERMINAL_WAIT_FOR_EXIT_TIMEOUT.as_secs(),
+                            %terminal_id,
+                            "terminal/wait_for_exit exceeded its timeout; the command is \
+                             still running (not killed) but this call is failing so it \
+                             doesn't hold the per-process lock hostage for every other \
+                             session sharing this backend -- poll terminal/output or \
+                             terminal/kill instead"
+                        );
+                        error(
+                            -32001,
+                            format!(
+                                "terminal/wait_for_exit exceeded {TERMINAL_WAIT_FOR_EXIT_TIMEOUT:?}; \
+                                 the command is still running -- poll terminal/output or call \
+                                 terminal/kill instead of waiting again"
+                            ),
+                        )
+                    }
+                }
+            }
             None => error(-32602, format!("unknown terminalId '{terminal_id}'")),
         },
         "terminal/kill" => match proc.terminals.get_mut(&terminal_id) {
@@ -5143,7 +5303,7 @@ fn spawn_demux_consumer(
     notification_hub: NotificationHub,
     backend: acpx_conductor::supervisor::SharedBackendProcess,
     policy: BackendCallPolicy,
-    mut unmatched_rx: tokio::sync::mpsc::UnboundedReceiver<acpx_conductor::UnmatchedFrame>,
+    mut unmatched_rx: tokio::sync::mpsc::Receiver<acpx_conductor::UnmatchedFrame>,
 ) {
     let ctx = LiveNotifyCtx {
         router,
@@ -5593,7 +5753,7 @@ async fn handle_unmatched_frame(
                         // The outer client sees ACPX's opaque interaction id;
                         // the backend must receive the id it originally sent.
                         reply["id"] = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                        backend.writer.lock().await.write_value(&reply).await?;
+                        write_backend_value_locked(backend, &reply).await?;
                         return Ok(UnmatchedOutcome::AgentRequestAnswered(
                             serde_json::json!({"request": value, "reply": reply}),
                         ));
@@ -5608,7 +5768,7 @@ async fn handle_unmatched_frame(
                                 "message": format!("acpx interactive client request failed: {error}"),
                             }
                         });
-                        backend.writer.lock().await.write_value(&reply).await?;
+                        write_backend_value_locked(backend, &reply).await?;
                         return Ok(UnmatchedOutcome::AgentRequestAnswered(
                             serde_json::json!({"request": value, "reply": reply}),
                         ));
@@ -5788,7 +5948,7 @@ async fn handle_unmatched_frame(
                     }
                 })
             };
-        backend.writer.lock().await.write_value(&reply).await?;
+        write_backend_value_locked(backend, &reply).await?;
         return Ok(UnmatchedOutcome::AgentRequestAnswered(
             serde_json::json!({"request": value, "reply": reply}),
         ));
@@ -6019,12 +6179,7 @@ async fn execute_open_session_recovery(
     let response = {
         let mut backend = job.backend.lock().await;
         ensure_backend_initialized(&mut backend, job.call_policy.clone()).await?;
-        backend
-            .writer
-            .lock()
-            .await
-            .write_value(&job.request)
-            .await?;
+        write_backend_value_locked(&mut backend, &job.request).await?;
         let (response, _, _) =
             read_matching_response(&mut backend, &job.request_id, job.call_policy.clone(), None)
                 .await?;
@@ -6512,7 +6667,7 @@ async fn dispatch_session_cancel_shared(
     // Same "nothing running, nothing to cancel" no-op as
     // `Router::dispatch_session_cancel` -- see that method's comment.
     if let Some(writer) = cancel_writer {
-        writer.lock().await.write_value(&notification).await?;
+        write_cancel_notification_best_effort(&writer, &notification).await;
     }
 
     Ok(serde_json::json!({ "jsonrpc": "2.0", "id": client_id, "result": {} }))
@@ -6617,7 +6772,7 @@ async fn dispatch_session_list_real_shared(
             let writer = proc.writer_handle();
             drop(proc);
             let rx = pending.register(&id).await;
-            writer.lock().await.write_value(&outbound).await?;
+            write_backend_value_via_handle(&backend, &writer, &outbound).await?;
             match tokio::time::timeout(BACKEND_IDLE_READ_TIMEOUT, acpx_conductor::demux::recv(rx))
                 .await
             {
@@ -6638,7 +6793,7 @@ async fn dispatch_session_list_real_shared(
                 }
             }
         } else {
-            proc.writer.lock().await.write_value(&outbound).await?;
+            write_backend_value_locked(&mut proc, &outbound).await?;
             let (response, _notifications, _agent_requests) =
                 read_matching_response(&mut proc, &id, call_policy, None).await?;
             response
@@ -6813,7 +6968,7 @@ async fn dispatch_proxied_shared(
             drop(proc);
             let idle_timeout = session_establish_or_default_idle_timeout(&method);
             let rx = pending.register(&id).await;
-            writer.lock().await.write_value(&request).await?;
+            write_backend_value_via_handle(&backend, &writer, &request).await?;
             let response = match tokio::time::timeout(idle_timeout, acpx_conductor::demux::recv(rx)).await
             {
                 Ok(Ok(value)) => value,
@@ -6847,7 +7002,7 @@ async fn dispatch_proxied_shared(
             };
             Ok::<_, RouterError>(attach_updates(response, buffered_updates, Vec::new()))
         } else {
-            proc.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut proc, &request).await?;
             let live = LiveNotifyCtx {
                 router: std::sync::Arc::clone(router),
                 agent_id,
@@ -7029,7 +7184,7 @@ async fn dispatch_session_fork_shared(
             let writer = proc.writer_handle();
             drop(proc);
             let rx = pending.register(&id).await;
-            writer.lock().await.write_value(&request).await?;
+            write_backend_value_via_handle(&backend, &writer, &request).await?;
             let response = match tokio::time::timeout(
                 BACKEND_IDLE_READ_TIMEOUT,
                 acpx_conductor::demux::recv(rx),
@@ -7054,7 +7209,7 @@ async fn dispatch_session_fork_shared(
             };
             Ok::<_, RouterError>(attach_updates(response, Vec::new(), Vec::new()))
         } else {
-            proc.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut proc, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response(&mut proc, &id, call_policy, None).await?;
             Ok::<_, RouterError>(attach_updates(response, notifications, agent_requests))
@@ -7291,7 +7446,7 @@ async fn dispatch_session_new_shared(
             let writer = proc.writer_handle();
             drop(proc);
             let rx = pending.register(&id).await;
-            writer.lock().await.write_value(&request).await?;
+            write_backend_value_via_handle(&backend, &writer, &request).await?;
             let response = match tokio::time::timeout(
                 SESSION_ESTABLISH_IDLE_READ_TIMEOUT,
                 acpx_conductor::demux::recv(rx),
@@ -7327,7 +7482,7 @@ async fn dispatch_session_new_shared(
                 agent_capabilities,
             ))
         } else {
-            proc.writer.lock().await.write_value(&request).await?;
+            write_backend_value_locked(&mut proc, &request).await?;
             let (response, notifications, agent_requests) =
                 read_matching_response_with_idle_timeout(
                     &mut proc,

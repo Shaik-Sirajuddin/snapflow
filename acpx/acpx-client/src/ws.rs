@@ -9,9 +9,33 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+/// Hard ceiling on writing one WebSocket frame to the gateway connection.
+/// A live TCP connection should accept a small JSON-RPC frame in
+/// microseconds; anything stuck this long means the socket is wedged
+/// (peer stopped reading, network partition, etc.), not merely slow, so
+/// this is treated the same as a send failure rather than left to hang
+/// the caller -- and every future caller behind it, since `sink` is a
+/// single shared `Mutex` -- forever. Mirrors `acpx-core::router`'s
+/// `BACKEND_WRITE_TIMEOUT` for the same reasoning on the gateway's own
+/// backend-stdin side.
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard ceiling on waiting for a gateway response once a request has been
+/// sent. Deliberately generous -- long enough to comfortably exceed any
+/// legitimate long-running turn or permission-approval wait the gateway
+/// itself will still be servicing (`acpx_core::router`'s own
+/// `BACKEND_IDLE_READ_TIMEOUT` backstop is 20 minutes) -- this exists
+/// only to catch a connection that looks alive at the TCP level but will
+/// never actually answer (e.g. the gateway process wedged without ever
+/// closing the socket), so a caller doesn't hang forever and this
+/// request's `pending` table entry doesn't leak for the rest of the
+/// connection's lifetime.
+const WS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 type WsSink = futures_util::stream::SplitSink<
     WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
@@ -120,13 +144,42 @@ impl GatewayWsClient {
         });
         let encoded = serde_json::to_string(&payload)
             .map_err(|error| ClientError::WebSocket(error.to_string()))?;
-        if let Err(error) = self.sink.lock().await.send(Message::Text(encoded)).await {
-            self.pending.lock().await.remove(&id);
-            return Err(ClientError::WebSocket(error.to_string()));
+        let send = async { self.sink.lock().await.send(Message::Text(encoded)).await };
+        match tokio::time::timeout(WS_SEND_TIMEOUT, send).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.pending.lock().await.remove(&id);
+                return Err(ClientError::WebSocket(error.to_string()));
+            }
+            Err(_) => {
+                // See `WS_SEND_TIMEOUT`'s doc comment: dropping `send`
+                // here releases the `sink` lock it may still hold, so a
+                // wedged socket write only fails this one request
+                // instead of blocking every other caller sharing this
+                // connection's single sink `Mutex` forever.
+                self.pending.lock().await.remove(&id);
+                return Err(ClientError::WebSocket(format!(
+                    "gateway WebSocket send timed out after {WS_SEND_TIMEOUT:?}"
+                )));
+            }
         }
-        response_rx
-            .await
-            .map_err(|_| ClientError::WebSocket("gateway response channel closed".to_string()))?
+        match tokio::time::timeout(WS_RESPONSE_TIMEOUT, response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ClientError::WebSocket(
+                "gateway response channel closed".to_string(),
+            )),
+            Err(_) => {
+                // The connection never closed (or `fail_pending` would
+                // have already resolved this), yet nothing answered
+                // within `WS_RESPONSE_TIMEOUT` -- remove this call's own
+                // entry so it doesn't leak in `pending` for the rest of
+                // the connection's lifetime.
+                self.pending.lock().await.remove(&id);
+                Err(ClientError::WebSocket(format!(
+                    "gateway response to {method:?} timed out after {WS_RESPONSE_TIMEOUT:?}"
+                )))
+            }
+        }
     }
 
     async fn deliver_frame(&self, text: &str) {

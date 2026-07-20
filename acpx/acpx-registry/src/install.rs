@@ -94,14 +94,14 @@ pub async fn install_into(
 
     match method {
         "npx" => {
-            check_runtime("node", agent, "npx")?;
-            check_runtime("npm", agent, "npx")?;
+            check_runtime("node", agent, "npx").await?;
+            check_runtime("npm", agent, "npx").await?;
             Ok(InstallOutcome::RuntimeConfirmed {
                 runtime: "node+npm",
             })
         }
         "uvx" => {
-            check_runtime("uv", agent, "uvx")?;
+            check_runtime("uv", agent, "uvx").await?;
             Ok(InstallOutcome::RuntimeConfirmed { runtime: "uv" })
         }
         "binary" => install_binary(agent, adapters_root).await,
@@ -110,21 +110,46 @@ pub async fn install_into(
     }
 }
 
+/// Hard ceiling on one `<bin> --version` probe.
+///
+/// **Why this exists.** `check_runtime` previously ran
+/// `std::process::Command::status()` -- a synchronous, blocking call --
+/// directly inline inside this crate's `async fn install_into`, with no
+/// timeout: a `--version` invocation that never returns (a broken/wrapped
+/// binary, a stalled network-mounted `PATH` entry, a shell wrapper
+/// blocking despite `Stdio::null()`) parked the calling tokio worker
+/// thread forever, and unlike a plain hang in owned async code, this one
+/// doesn't even show up as an await point another task could interleave
+/// around -- it starves the whole worker thread for any other task
+/// scheduled onto it. Now run via `spawn_blocking` (so it can't starve an
+/// async worker thread) and bounded by this timeout (so a caller doesn't
+/// wait forever even though the spawned blocking thread itself isn't
+/// forcibly killed -- `std::process::Command` has no async cancellation
+/// primitive to hook into here).
+const RUNTIME_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Shells out to `<bin> --version` to confirm an on-demand runtime is
 /// available, mirroring the check `acpx-core`'s `detect.rs` does for
 /// `agents/status` (not shared code -- that module is owned by the main
 /// agent).
-fn check_runtime(
+async fn check_runtime(
     bin: &'static str,
     agent: &Agent,
     method: &'static str,
 ) -> Result<(), InstallError> {
-    let ok = Command::new(bin)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
+    let probe = tokio::task::spawn_blocking(move || {
+        Command::new(bin)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    });
+    let ok = tokio::time::timeout(RUNTIME_PROBE_TIMEOUT, probe)
+        .await
+        .ok()
+        .and_then(|joined| joined.ok())
         .unwrap_or(false);
 
     if ok {
@@ -398,10 +423,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn check_runtime_reports_runtime_missing_for_absent_binary() {
+    #[tokio::test]
+    async fn check_runtime_reports_runtime_missing_for_absent_binary() {
         let agent = test_agent("unit-test-agent", Distribution::default());
-        let err = check_runtime("definitely-not-a-real-binary-xyz", &agent, "npx").unwrap_err();
+        let err = check_runtime("definitely-not-a-real-binary-xyz", &agent, "npx")
+            .await
+            .unwrap_err();
         assert!(matches!(err, InstallError::RuntimeMissing { .. }));
     }
 

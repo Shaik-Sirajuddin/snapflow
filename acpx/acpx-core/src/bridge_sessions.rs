@@ -471,9 +471,18 @@ impl BridgeSessionStore {
     fn lock_sessions(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<TenantId, HashMap<BridgeSessionId, BridgeSession>>> {
+        // Self-heals on poison instead of permanently wedging every
+        // future bridge-session operation this process ever makes: a
+        // panic mid-critical-section here is already a bug worth its own
+        // fix, but a poisoned `std::sync::Mutex` otherwise means every
+        // caller's own `.expect()` panics forever after, turning one
+        // isolated panic into a permanent, process-wide "no bridge
+        // session can ever be read or written again" outage -- strictly
+        // worse than proceeding with whatever (still internally
+        // consistent, plain-data `HashMap`) state the guard protects.
         self.sessions
             .lock()
-            .expect("bridge session store mutex must not be poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 

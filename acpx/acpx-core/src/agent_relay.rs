@@ -54,7 +54,7 @@ pub struct AgentRequestEnvelope {
 /// lock for either side of a relay.
 #[derive(Clone, Default)]
 pub struct AgentRequestHub {
-    subscribers: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<AgentRequestEnvelope>>>>,
+    subscribers: Arc<Mutex<HashMap<String, mpsc::Sender<AgentRequestEnvelope>>>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<serde_json::Value>>>>,
 }
 
@@ -73,6 +73,22 @@ fn fresh_relay_id() -> String {
     format!("relay-{nanos:x}-{n}")
 }
 
+/// Capacity of each session's live agent-request delivery channel.
+///
+/// **Why bounded, not unbounded.** [`AgentRequestHub::relay`] already
+/// bounds how long *it* waits for an answer (`timeout`, e.g. `router`'s
+/// `PERMISSION_RELAY_TIMEOUT`), but the channel a subscribed connection's
+/// forwarder task drains (`acpx-server/src/transport/ws.rs`'s per-session
+/// relay loop) had no ceiling of its own: a backend emitting
+/// agent-initiated requests faster than that connection's own send loop
+/// can forward them (now itself bounded -- see `acpx-server::transport::
+/// ws::WS_FRAME_WRITE_TIMEOUT`, but still finite per frame) had no bound
+/// on how many envelopes could queue up in memory in the meantime. This
+/// lock is dropped before ever sending (see [`AgentRequestHub::relay`]'s
+/// body), so a bounded `send(..).await` here only ever delays this one
+/// relay attempt -- it cannot deadlock any other caller of this hub.
+const AGENT_REQUEST_QUEUE_CAPACITY: usize = 256;
+
 impl AgentRequestHub {
     pub fn new() -> Self {
         Self::default()
@@ -85,8 +101,8 @@ impl AgentRequestHub {
     pub async fn subscribe(
         &self,
         gateway_session_id: impl Into<String>,
-    ) -> mpsc::UnboundedReceiver<AgentRequestEnvelope> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    ) -> mpsc::Receiver<AgentRequestEnvelope> {
+        let (tx, rx) = mpsc::channel(AGENT_REQUEST_QUEUE_CAPACITY);
         self.subscribers
             .lock()
             .await
@@ -122,11 +138,21 @@ impl AgentRequestHub {
             gateway_session_id: gateway_session_id.to_string(),
             request,
         };
-        if sender.send(envelope).is_err() {
-            // Subscriber's receiver was already dropped (connection
-            // closing) but hadn't yet called `unsubscribe` -- treat this
-            // exactly like "no subscriber" rather than hanging until
-            // `timeout`.
+        // Bounded channel now (see `AGENT_REQUEST_QUEUE_CAPACITY`'s doc
+        // comment) -- `send` can briefly wait on backpressure instead of
+        // succeeding instantly, so it shares this call's own `timeout`
+        // budget rather than being allowed to block beyond it.
+        if tokio::time::timeout(timeout, sender.send(envelope))
+            .await
+            .map(|result| result.is_err())
+            .unwrap_or(true)
+        {
+            // Either the subscriber's receiver was already dropped
+            // (connection closing) but hadn't yet called `unsubscribe`,
+            // or its queue stayed full for this call's entire `timeout`
+            // (a connection too far behind to be a usable relay target
+            // right now either way) -- both treated identically to "no
+            // subscriber" rather than hanging further.
             self.pending.lock().await.remove(&relay_id);
             return None;
         }
