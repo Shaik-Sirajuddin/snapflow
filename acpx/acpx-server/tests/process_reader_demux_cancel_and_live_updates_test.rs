@@ -248,6 +248,20 @@ async fn cancelling_one_session_does_not_disturb_a_concurrent_sessions_live_upda
         json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": sid_a, "prompt": []}}),
     )
     .await;
+    // Measured from here, right after A's own prompt is actually sent --
+    // not from some later point after B's whole create/prompt/cancel
+    // dance completes. This assertion exists to prove A's turn ran its
+    // full, real `TURN_DELAY_SECS` undisturbed by B's concurrent
+    // cancellation; anchoring the clock to A's own request is what that
+    // claim requires. A previous version of this test started the clock
+    // only once the code reached the final drain loop below (after the
+    // 400ms sleep, B's cancel round trip, and awaiting `b_prompt`), which
+    // silently baked ~500ms of *unrelated* setup time into the assertion
+    // and left as little as ~0ms of slack against its own `TURN_DELAY_
+    // SECS - 0.5` threshold -- flaky by construction, independent of any
+    // real backend behavior (reproduces on unmodified `main`, no router
+    // changes involved, ~3 of 4 runs locally).
+    let a_started = tokio::time::Instant::now();
 
     // Session B: plain HTTP, created only after A's prompt is already
     // in flight so both genuinely overlap on the shared backend process.
@@ -309,7 +323,6 @@ async fn cancelling_one_session_does_not_disturb_a_concurrent_sessions_live_upda
     // resolve end_turn on schedule, and must never see anything
     // referencing B's session -- A's turn is completely undisturbed by
     // B's concurrent cancellation.
-    let a_started = tokio::time::Instant::now();
     let mut a_update_count = 0usize;
     let a_final = loop {
         let frame = ws_recv(&mut ws).await;
