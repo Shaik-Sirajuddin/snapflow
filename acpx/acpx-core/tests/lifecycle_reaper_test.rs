@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::{LifecycleConfig, Router};
+use acpx_core::router::dispatch_shared;
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const BACKEND: &str = r#"
 while IFS= read -r line; do
@@ -176,4 +179,67 @@ done
     assert!(unrelated.is_ok());
 
     let _ = session_id; // kept for readability of the setup above
+}
+
+/// **Regression: `process_reader_demux` lifecycle-reaper panic gap.**
+/// Same class of bug `session_list_real_shared_test.rs`'s and
+/// `session_fork_test.rs`'s equivalent tests pin, but for
+/// `Router::reap_expired_sessions` specifically -- this is the one
+/// call site those two fixes (and the `backend_idle_scavenger` fix
+/// before them) missed. `reap_expired_sessions` always sent its own
+/// `session/close` via `read_matching_response`'s unconditional
+/// `reader_mut()`, which panics once any earlier live call on this
+/// same shared backend process already activated
+/// `process_reader_demux` (`BackendProcess::start_demux` takes the raw
+/// reader). This was observed live, twice, in a real `acpx-server` run
+/// (`journalctl`: "BackendProcess::reader_mut called after
+/// start_demux() took the reader"), and the panic unwound out of the
+/// reaper's own periodic background task -- silently ending all future
+/// idle-session cleanup for the rest of that process's uptime, and
+/// leaving the reaped session's `in_flight` flag stuck at `1` until
+/// `cancel_stuck_turns`'s much longer `active_turn_deadline` eventually
+/// force-cleared it. Reproduces the exact live sequence: a real
+/// `dispatch_shared` call activates demux for the process first, then
+/// the same session goes idle and must still be reaped cleanly.
+#[tokio::test]
+async fn reap_expired_session_works_after_demux_is_already_active_on_the_process() {
+    let log = std::env::temp_dir().join(format!("acpx-reaper-demux-{}.log", uuid::Uuid::new_v4()));
+    let router = router(&log).with_process_reader_demux(true);
+    let router = Arc::new(Mutex::new(router));
+
+    let new_response = dispatch_shared(
+        &router,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": "/tmp"}}),
+    )
+    .await
+    .expect("session/new activates process-reader-demux for this shared process");
+    let session_id = new_response["result"]["sessionId"]
+        .as_str()
+        .expect("gateway session id")
+        .to_string();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    let report = {
+        let mut r = router.lock().await;
+        r.reap_expired_sessions(std::time::Instant::now()).await
+    };
+    assert_eq!(report.closed, 1, "must not panic once demux is already active");
+    assert_eq!(report.failed, 0);
+
+    let log_contents = tokio::fs::read_to_string(&log).await.expect("reaper log");
+    assert!(log_contents.lines().any(|line| line == "session/close"));
+
+    let prompt_after_close = dispatch_shared(
+        &router,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+            "params": {"sessionId": session_id, "prompt": []}
+        }),
+    )
+    .await;
+    assert!(
+        prompt_after_close.is_err(),
+        "reaped mapping must no longer accept a prompt"
+    );
+    let _ = tokio::fs::remove_file(log).await;
 }

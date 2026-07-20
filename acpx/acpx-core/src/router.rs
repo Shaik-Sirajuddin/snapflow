@@ -2231,14 +2231,52 @@ impl Router {
                     .await;
                 let mut backend = backend.lock().await;
                 ensure_backend_initialized(&mut backend, call_policy.clone()).await?;
-                backend.writer.lock().await.write_value(&request).await?;
-                let (response, _, _) = read_matching_response(
-                    &mut backend,
-                    &serde_json::json!(999_998),
-                    call_policy,
-                    None,
-                )
-                .await?;
+                // **Real production panic this closes.** Once any other
+                // `_shared` dispatch path sharing this exact agent's
+                // backend process has already called `start_demux` (the
+                // default now that `process_reader_demux` defaults on),
+                // `backend.reader` is permanently `None` and the old
+                // unconditional `read_matching_response` -> `reader_mut()`
+                // call below panics outright -- observed live in
+                // `journalctl` (`acpx-conductor/src/process.rs:187`) not
+                // in a test. That panic unwinds straight out of this
+                // `call` future, so the `set_in_flight(..., 0)` reset a
+                // few lines below never runs and this exact gateway
+                // session's `in_flight` flag is stuck at `1` until
+                // `cancel_stuck_turns`'s `active_turn_deadline` finally
+                // force-clears it. A demux consumer is already running
+                // for this process (whichever call activated `pending`
+                // spawned one) -- route this call's own response through
+                // the same pending-request table instead of ever
+                // touching `backend.reader` again, mirroring every other
+                // `_shared` dispatch path's `if proc.pending.is_some()`
+                // guard.
+                let response = if backend.pending.is_some() {
+                    let pending = backend
+                        .pending
+                        .clone()
+                        .expect("just checked is_some() above");
+                    let writer = backend.writer_handle();
+                    let close_id = serde_json::json!(999_998);
+                    let rx = pending.register(&close_id).await;
+                    writer.lock().await.write_value(&request).await?;
+                    match acpx_conductor::demux::recv(rx).await {
+                        Ok(value) => value,
+                        Err(acpx_conductor::DemuxRecvError::ReaderClosed) => {
+                            return Err(RouterError::BackendDemuxReaderClosed);
+                        }
+                    }
+                } else {
+                    backend.writer.lock().await.write_value(&request).await?;
+                    let (response, _, _) = read_matching_response(
+                        &mut backend,
+                        &serde_json::json!(999_998),
+                        call_policy,
+                        None,
+                    )
+                    .await?;
+                    response
+                };
                 if let Some(error) = response.get("error") {
                     return Err(RouterError::BackendSessionNewError(error.clone()));
                 }
