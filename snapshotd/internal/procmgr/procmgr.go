@@ -109,11 +109,26 @@ type Manager struct {
 // New constructs a Manager with sane defaults for unset fields.
 func New(reg *registry.Registry, binPath, runDir, logDir string) *Manager {
 	return &Manager{
-		Reg:            reg,
-		BinPath:        binPath,
-		RunDir:         runDir,
-		LogDir:         logDir,
-		ConnectTimeout: 5 * time.Second,
+		Reg:      reg,
+		BinPath:  binPath,
+		RunDir:   runDir,
+		LogDir:   logDir,
+		// 5s (the original default here) only ever worked for headless/
+		// MockBackend-style cold starts. A real Qt/MLT GUI cold start
+		// (real_ffi's FfiBackend, the only backend `daemon serve`'s
+		// production path actually launches for a GUI-visible instance)
+		// takes ~15-20s in this sandbox -- this repo's own real-process
+		// Go tests already work around the old 5s default by manually
+		// overriding `d.Proc.ConnectTimeout` to 60s (see e.g.
+		// icon_render_realsaprust_test.go), but `daemon.New` (the
+		// `serve` command's own construction path, used by every real
+		// `daemon_launch` MCP call) never did the same override, so a
+		// real non-headless launch through the daemon always failed
+		// with "child did not open <sock> within 5s" even though the
+		// child was still mid-startup, not actually stuck. 30s gives
+		// real headroom without making a genuinely-stuck child take
+		// forever to report failure.
+		ConnectTimeout: 30 * time.Second,
 		PollInterval:   25 * time.Millisecond,
 		cmds:           make(map[string]*exec.Cmd),
 	}
