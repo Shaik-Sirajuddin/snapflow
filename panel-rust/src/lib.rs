@@ -2509,6 +2509,45 @@ pub extern "C" fn panel_rust_input_click(_handle: *mut PanelHandle, x: c_uint, y
     true
 }
 
+/// Forwards hover-only mouse movement (no button held) at physical pixel
+/// coordinates. Without this, a `TouchArea`'s `has-hover` (the shared
+/// `Button`/`IconButton` components' hover-tinted background, and any
+/// `mouse-cursor` binding) never updates at all outside of a
+/// press/release, since Slint only learns about pointer position via
+/// explicit `WindowEvent::PointerMoved` dispatches -- `panel_rust_input_click`
+/// already sends one immediately before its own Press, but that's the only
+/// place any `PointerMoved` was ever dispatched before this. Real bug this
+/// closes (tasks/v2/enhance.yaml#task-4): "hover effects... cursor change,
+/// the ui components picking hover... are not propagated" -- confirmed via
+/// direct inspection that `RustPanelItem` (rustpanelitem.cpp) never called
+/// `setAcceptHoverEvents(true)` nor overrode `hoverMoveEvent` at all, so Qt
+/// never even told this item about mouse movement without a button down.
+#[no_mangle]
+pub extern "C" fn panel_rust_input_hover(_handle: *mut PanelHandle, x: c_uint, y: c_uint) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(x as f32, y as f32),
+    });
+    true
+}
+
+/// Forwards the pointer leaving the panel's bounds entirely (Qt's
+/// `hoverLeaveEvent`), so any `has-hover` state correctly clears instead of
+/// staying stuck at whatever it was under the last position inside the
+/// panel that ever received a move event.
+#[no_mangle]
+pub extern "C" fn panel_rust_input_hover_exit(_handle: *mut PanelHandle) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window.window().dispatch_event(WindowEvent::PointerExited);
+    true
+}
+
 /// Forwards a Qt wheel/touchpad gesture in logical pixels. Slint's nested
 /// Flickables consume only the scroll they can apply and automatically bubble
 /// any boundary remainder to their parent surface.
