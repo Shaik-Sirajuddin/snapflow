@@ -715,8 +715,7 @@ fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
-    let request = if let Some(expected_agent) = expected_agent {
-        let _ = expected_agent;
+    let request = if expected_agent.is_some() {
         format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
     } else {
         let body = r#"{"jsonrpc":"2.0","id":0,"method":"session/list","params":{}}"#;
@@ -755,8 +754,10 @@ fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
         }
     }
     if let Some(expected_agent) = expected_agent {
-        envelope.get("status").and_then(|s| s.as_str()) == Some("ok")
-            && envelope.get("agentId").and_then(|id| id.as_str()) == Some(expected_agent)
+        matches!(
+            envelope.get("status").and_then(|s| s.as_str()),
+            Some("ready") | Some("recovering")
+        ) && envelope.get("defaultAgentId").and_then(|id| id.as_str()) == Some(expected_agent)
     } else {
         envelope
             .get("result")
