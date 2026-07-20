@@ -2034,6 +2034,14 @@ impl Router {
     /// Restore all durable, open sessions before the router begins serving
     /// prompts. Failed rows remain durable for later inspection/retry but
     /// are intentionally never added to the live registry.
+    ///
+    /// "Retry" here means client-triggered, on-demand retry only (an
+    /// explicit `session/load`/`session/resume` against that exact id) --
+    /// `list_recoverable_sessions` itself excludes already-`RecoveryFailed`
+    /// rows from this eager batch, so a permanently-doomed row (backend
+    /// rejects the resume every time, e.g. no underlying rollout ever
+    /// existed) is only ever attempted once here, not on every subsequent
+    /// restart forever.
     pub async fn recover_open_sessions(&mut self) -> Result<StartupRecoveryReport, RouterError> {
         let Some(store) = self.persistence.clone() else {
             return Ok(StartupRecoveryReport::default());

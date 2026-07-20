@@ -152,6 +152,84 @@ async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
 }
 
 #[tokio::test]
+async fn recovery_failed_rows_are_excluded_from_the_eager_startup_batch() {
+    // Regression test for a live incident: a `codex-acp` session that was
+    // created but never completed a turn (so the backend never persisted
+    // any rollout for it) fails `session/load`/`session/resume` on restart
+    // with a permanent, deterministic backend error. Before this fix,
+    // `list_recoverable_sessions` kept returning that same row on every
+    // subsequent restart forever (only `status == 'closed'` was excluded),
+    // so the eager startup batch re-attempted, and re-failed, identically,
+    // every single time -- one doomed backend spawn per restart, plus a
+    // permanently polluted `/health` `failed` counter.
+    let store = PersistenceStore::open_in_memory().expect("open in-memory store");
+    store
+        .record_session_with_recovery(
+            "gw-dead",
+            "codex-acp",
+            "backend-dead",
+            None,
+            "2026-07-18T21:45:00Z",
+            "default",
+            RecoveryMetadata {
+                cwd: Some("/workspace/project".to_string()),
+                recovery_params: Some(json!({})),
+                status: RecoveryStatus::Active,
+                recovery_method: RecoveryMethod::Load,
+                last_recovery_error: None,
+                ..RecoveryMetadata::default()
+            },
+        )
+        .await
+        .expect("record recoverable session");
+
+    // First startup pass: the row is a genuine candidate.
+    let candidates = store
+        .list_recoverable_sessions()
+        .await
+        .expect("list recoverable sessions");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].gateway_session_id, "gw-dead");
+
+    // The startup batch attempts it, the backend permanently rejects it
+    // (mirrors codex-acp's real "no rollout found for thread id" error),
+    // and the row is marked `RecoveryFailed` -- exactly what
+    // `Router::recover_open_sessions`/`recover_open_sessions_shared` do on
+    // an `Err` from `restore_open_session`.
+    store
+        .update_recovery_status(
+            "gw-dead",
+            RecoveryStatus::RecoveryFailed,
+            Some(
+                "backend rejected session/load: no rollout found for thread id backend-dead"
+                    .to_string(),
+            ),
+        )
+        .await
+        .expect("record recovery failure");
+
+    // Every subsequent restart's eager batch must never see this row
+    // again -- it stays durable (inspectable via `get_session`) but is no
+    // longer an unattended-retry candidate.
+    let candidates_after_failure = store
+        .list_recoverable_sessions()
+        .await
+        .expect("list recoverable sessions");
+    assert!(
+        candidates_after_failure.is_empty(),
+        "a RecoveryFailed row must not be retried by the eager startup batch again"
+    );
+
+    let still_durable = store
+        .get_session("gw-dead")
+        .await
+        .expect("get session")
+        .expect("row still exists for inspection/on-demand retry");
+    assert_eq!(still_durable.status, RecoveryStatus::RecoveryFailed);
+    assert!(still_durable.last_recovery_error.is_some());
+}
+
+#[tokio::test]
 async fn recovery_diagnostics_are_aggregated_and_errors_are_bounded() {
     let store = PersistenceStore::open_in_memory().expect("open in-memory store");
     for (id, status) in [
