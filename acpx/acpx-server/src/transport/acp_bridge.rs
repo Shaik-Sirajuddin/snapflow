@@ -101,9 +101,19 @@ pub enum BridgeDispatchError {
 }
 
 /// Shared state mounted only when the strict bridge feature is enabled.
-#[derive(Clone)]
+/// Always held behind `Arc<BridgeRuntime>` (see `AppState::bridge_runtime`)
+/// rather than cloned by value -- `config`'s `ArcSwap` isn't `Clone` (and
+/// deliberately so: cloning it would let a caller hold a stale snapshot
+/// past a [`BridgeRuntime::reload_config`] swap without realizing it).
 pub struct BridgeRuntime {
-    pub config: Arc<BridgeConfig>,
+    /// **`config_hot_reload` (phase 2).** Lock-free swappable so
+    /// [`Self::reload_config`] (driven by the background file-watcher
+    /// spawned in `serve_on_with_bridge_and_tenant_tokens`) can publish a
+    /// freshly-validated `BridgeConfig` without a restart and without any
+    /// concurrent reader ever blocking on a lock. Use [`Self::config`] to
+    /// read it -- never add a second public field pointing at the same
+    /// data, or a stale clone becomes possible to hold past a reload.
+    config: arc_swap::ArcSwap<BridgeConfig>,
     pub sessions: BridgeSessionStore,
     models: Arc<RwLock<Vec<BridgeModel>>>,
     config_options: Arc<RwLock<Vec<Value>>>,
@@ -168,10 +178,40 @@ impl BridgeRuntime {
         Self {
             models: Arc::new(RwLock::new(config.models.clone())),
             config_options: Arc::new(RwLock::new(Vec::new())),
-            config,
+            config: arc_swap::ArcSwap::new(config),
             sessions: BridgeSessionStore::new(),
             last_refresh_attempt: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// Current live `BridgeConfig` -- a cheap `Arc` clone, never blocks on
+    /// a lock. Call fresh each time you need it rather than caching the
+    /// returned `Arc` across an `.await` point that could span a reload,
+    /// unless holding a momentarily-stale snapshot is genuinely fine for
+    /// that call site (it is for every existing read site this phase
+    /// touched: each reads one field once, synchronously).
+    pub fn config(&self) -> Arc<BridgeConfig> {
+        self.config.load_full()
+    }
+
+    /// **`config_hot_reload` (phase 2).** Publish a freshly-validated
+    /// `BridgeConfig`, replacing the live one for every subsequent
+    /// [`Self::config`] read -- no restart, no dropped sessions (nothing
+    /// session-scoped lives on `BridgeConfig` itself; `BridgeSessionStore`
+    /// is untouched by a reload). Callers must have already validated
+    /// `new_config` (e.g. via [`BridgeConfig::from_file`], which validates
+    /// internally) -- this method does not re-validate, it only swaps.
+    ///
+    /// Also resets the static baseline of [`Self::models`] to
+    /// `new_config.models` (mirroring what [`Self::new`] does at
+    /// construction), so a model list edit is reflected immediately
+    /// without waiting for the next cooldown-gated [`Self::refresh_models`]
+    /// probe to layer live-discovered entries back on top.
+    pub async fn reload_config(&self, new_config: BridgeConfig) {
+        let mut models = self.models.write().await;
+        *models = new_config.models.clone();
+        drop(models);
+        self.config.store(Arc::new(new_config));
     }
 
     /// Refreshes public models from each configured adapter's cached
@@ -217,7 +257,7 @@ impl BridgeRuntime {
             *last_attempt = Some(now);
         }
         let agent_ids: Vec<String> = self
-            .config
+            .config()
             .agent_ids()
             .into_iter()
             .map(ToOwned::to_owned)
@@ -314,7 +354,7 @@ impl BridgeRuntime {
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": self.config.default_model,
+            "currentValue": self.config().default_model,
             "options": models.iter().map(|model| json!({
                 "value": model.id,
                 "name": model.name.as_deref().unwrap_or(&model.id),
@@ -415,6 +455,104 @@ impl BridgeRuntime {
     }
 }
 
+/// **`config_hot_reload` (phase 2).** Watches `config_path`
+/// (`ACPX_ACP_BRIDGE_CONFIG_FILE`) for filesystem changes and publishes
+/// each valid edit to `runtime` via [`BridgeRuntime::reload_config`], with
+/// no restart. An invalid candidate (fails [`BridgeConfig::validate`], or
+/// isn't even parseable JSON) is logged and discarded -- the previously
+/// live config keeps serving every request, exactly the "reject and log,
+/// keep old config live" contract
+/// `memory/acpx/gen/acpx-concurrency-config-execution.meta.json` phase 2
+/// specifies.
+///
+/// Runs on its own dedicated OS thread, not a tokio task: `notify`'s
+/// watcher callback fires from a platform-native (inotify on Linux) event
+/// thread outside tokio's runtime, and every step this loop takes in
+/// response (`BridgeConfig::from_file` -- a small synchronous disk read
+/// + JSON parse + validate -- and `ArcSwap::store`) is itself synchronous
+/// and non-blocking-in-the-async-sense, so there is nothing here that
+/// benefits from running inside tokio; keeping it on a plain thread
+/// avoids ever needing `spawn_blocking` or bridging the callback into an
+/// async channel. The one truly async step, [`BridgeRuntime::reload_
+/// config`] (it briefly awaits `self.models`'s `RwLock`), is driven via a
+/// short-lived single-threaded `tokio::runtime::Handle::block_on` call
+/// scoped to just that one await -- cheap and rare (config edits are not
+/// a hot path) enough that spinning up a tiny runtime per reload is the
+/// simplest correct option, not a performance concern.
+///
+/// A failure to construct or start the watcher itself (rare -- e.g. the
+/// config file's parent directory disappearing, or the platform's
+/// notification backend being unavailable) is logged and this task simply
+/// exits: config changes then require a restart, exactly today's
+/// pre-phase-2 behavior, never a startup failure.
+pub fn spawn_config_watcher(runtime: Arc<BridgeRuntime>, config_path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        use notify::{RecursiveMode, Watcher};
+
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        }) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    path = %config_path.display(),
+                    "acpx bridge config hot-reload: failed to create a file watcher; \
+                     config changes will require a restart"
+                );
+                return;
+            }
+        };
+        if let Err(err) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+            tracing::warn!(
+                %err,
+                path = %config_path.display(),
+                "acpx bridge config hot-reload: failed to watch the bridge config file; \
+                 config changes will require a restart"
+            );
+            return;
+        }
+        tracing::info!(
+            path = %config_path.display(),
+            "acpx bridge config hot-reload: watching for changes"
+        );
+
+        for event in rx {
+            let event = match event {
+                Ok(event) => event,
+                Err(err) => {
+                    tracing::warn!(%err, "acpx bridge config hot-reload: watch error");
+                    continue;
+                }
+            };
+            if !(event.kind.is_modify() || event.kind.is_create()) {
+                continue;
+            }
+            match BridgeConfig::from_file(&config_path) {
+                Ok(candidate) => {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("build a tiny current-thread runtime for one reload swap");
+                    rt.block_on(runtime.reload_config(candidate));
+                    tracing::info!(
+                        path = %config_path.display(),
+                        "acpx bridge config hot-reloaded"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        path = %config_path.display(),
+                        "acpx bridge config hot-reload: candidate failed validation, \
+                         keeping the previous config live"
+                    );
+                }
+            }
+        }
+    });
+}
+
 pub async fn dispatch(
     router: &SharedRouter,
     runtime: &BridgeRuntime,
@@ -474,7 +612,7 @@ async fn new_session(
     let session_id = runtime.sessions.try_register(
         tenant_id,
         parsed,
-        runtime.config.max_virtual_sessions_per_tenant,
+        runtime.config().max_virtual_sessions_per_tenant,
     )?;
     Ok(json!({
         "jsonrpc": "2.0",
@@ -568,10 +706,11 @@ async fn set_config_option(
         BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
         BridgeSessionState::Failed => Err(BridgeDispatchError::BindingFailed),
         BridgeSessionState::Bound => {
+            let config = runtime.config();
             let current_alias = session
                 .selected_public_model_alias
                 .as_deref()
-                .unwrap_or(&runtime.config.default_model);
+                .unwrap_or(&config.default_model);
             let current = runtime
                 .resolve_model(current_alias)
                 .await
@@ -870,10 +1009,11 @@ async fn bind(
         }
     }
 
+    let config = runtime.config();
     let model_alias = session
         .selected_public_model_alias
         .as_deref()
-        .unwrap_or(&runtime.config.default_model);
+        .unwrap_or(&config.default_model);
     let model = match runtime.resolve_model(model_alias).await {
         Some(model) => model,
         None => {
@@ -993,7 +1133,7 @@ async fn persist_bridge_binding(
             session
                 .selected_public_model_alias
                 .clone()
-                .unwrap_or_else(|| runtime.config.default_model.clone()),
+                .unwrap_or_else(|| runtime.config().default_model.clone()),
             serde_json::to_value(&session.selected_adapter_config_options)
                 .expect("bridge adapter options serialize"),
         )
