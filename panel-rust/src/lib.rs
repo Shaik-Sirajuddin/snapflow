@@ -850,6 +850,27 @@ impl PanelSingleton {
         self.refresh_capabilities_for(real_idx);
         self.refresh_local_terminal_for(real_idx);
         self.refresh_connection_status_for(real_idx);
+        self.refresh_last_error_for(real_idx);
+    }
+
+    /// Mirrors `real_idx`'s `thread_errors` slot (already populated by
+    /// `AgentEvent::Error` -- see that arm's own comment) into the
+    /// `last-error` property `chat_area.slint`'s banner reads, so a send/
+    /// session-attach failure becomes visible in the transcript itself,
+    /// not only as the sidebar's "Error: ..." subtitle (`refresh_threads_
+    /// model`'s `errors` mapping) -- that subtitle is easy to miss
+    /// entirely while looking at the message view, which is exactly the
+    /// "sent a message, saw nothing happen" symptom this closes.
+    fn refresh_last_error_for(&self, real_idx: usize) {
+        let error = self
+            .thread_errors
+            .borrow()
+            .get(real_idx)
+            .cloned()
+            .unwrap_or_default();
+        if self.component.get_last_error().as_str() != error {
+            self.component.set_last_error(error.into());
+        }
     }
 
     fn refresh_connection_status_for(&self, real_idx: usize) -> bool {
@@ -1429,7 +1450,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             thread_permission_profiles: RefCell::new(initial_permission_profiles),
             traced_attachment_threads: RefCell::new(HashSet::new()),
             thread_state: RefCell::new(initial_state),
-            thread_errors: RefCell::new(Vec::new()),
+            // Sized to match thread_state/thread_names from construction,
+            // not left empty -- an empty Vec here made every `.get_mut(idx)`
+            // in the `AgentEvent::Error` handler silently no-op for any
+            // thread that existed at startup (the whole bootstrap set),
+            // so neither the sidebar's "Error: ..." subtitle nor the
+            // transcript error banner ever recorded a real failure for
+            // them, only for threads created afterward via "New Thread"
+            // (whose creation path does push a matching entry). Found live
+            // against a real running instance: a bootstrap thread's
+            // AgentEvent::Error genuinely fired (confirmed via
+            // RUI_PANEL_INPUT_TRACE) and set ThreadState::Error, yet
+            // last-error stayed empty the whole time.
+            thread_errors: RefCell::new(vec![String::new(); initial_thread_count]),
             send_queues: RefCell::new(
                 (0..initial_thread_count)
                     .map(|_| crate::send_queue::SendQueue::new())
@@ -1695,6 +1728,25 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             if let Some(component) = component_weak.upgrade() {
                 component.set_settings_open(false);
             }
+        });
+
+        panel.component.on_error_banner_dismissed(move || {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let selected = panel.component.get_selected_thread();
+                    let Some(real_idx) = panel.real_index(selected.max(0) as usize) else {
+                        return;
+                    };
+                    if let Some(error) = panel.thread_errors.borrow_mut().get_mut(real_idx) {
+                        error.clear();
+                    }
+                    panel.refresh_last_error_for(real_idx);
+                    // Sidebar subtitle mirrors the same error string --
+                    // dismissing the banner should clear both, not leave
+                    // the sidebar still saying "Error: ...".
+                    panel.refresh_threads_model();
+                }
+            });
         });
 
         panel.component.on_thread_toggle_background(move |slint_index| {

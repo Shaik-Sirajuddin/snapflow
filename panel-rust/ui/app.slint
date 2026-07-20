@@ -60,6 +60,13 @@ export component ChatPanel inherits Window {
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <string> connection-status: "Connecting...";
+    // Non-empty when the currently-displayed thread's most recent send/
+    // session-attach failed (AgentEvent::Error) -- previously only
+    // surfaced as a sidebar subtitle ("Error: ..."), which was easy to
+    // miss entirely if you were looking at the message transcript, not
+    // the thread list. Rendered as a dismissible banner in chat_area.
+    in property <string> last-error: "";
+    callback error-banner-dismissed();
     in property <bool> compact: true;
     in-out property <bool> narrow: false;
     in-out property <bool> sidebar-expanded: false;
@@ -396,6 +403,8 @@ export component ChatPanel inherits Window {
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
                 connection-status: connection-status;
+                last-error: last-error;
+                error-banner-dismissed => { error-banner-dismissed(); }
                 sending: threads.length > 0
                     ? threads[selected-thread].status == "loading"
                         || threads[selected-thread].status == "cancelling"

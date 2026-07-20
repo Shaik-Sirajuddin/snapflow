@@ -39,6 +39,8 @@ export component ChatArea inherits Rectangle {
     callback load-older-requested();
     in property <string> agent-badge: "agent . ask";
     in property <string> connection-status: "Connecting...";
+    in property <string> last-error: "";
+    callback error-banner-dismissed();
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
@@ -484,6 +486,52 @@ export component ChatArea inherits Rectangle {
             // HTML's `border-b border-sys-border`.
             height: 1px;
             background: Theme.border-default;
+        }
+        // Send/session-attach failure banner. Previously this only ever
+        // surfaced as a small "Error: ..." sidebar subtitle under the
+        // thread's name (models::describe_thread's error branch) --
+        // easy to miss entirely while looking at the transcript itself,
+        // which is exactly the "sent a message, got no visible response
+        // or explanation at all" symptom this closes. Dismissing just
+        // clears the Rust-side per-thread error string; a later real
+        // error re-shows it.
+        if root.last-error != "" : Rectangle {
+            height: error-banner-text.preferred-height + 2 * Metrics.space-3;
+            background: Theme.bg-card;
+            border-color: #b91c1c;
+            border-width: 1px;
+            HorizontalLayout {
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
+                padding-top: Metrics.space-3;
+                padding-bottom: Metrics.space-3;
+                spacing: Metrics.space-3;
+                error-banner-text := Text {
+                    text: "⚠ " + root.last-error;
+                    color: #ef4444;
+                    font-size: 10px * Theme.font-scale;
+                    font-family: Theme.font-mono;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                }
+                dismiss-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    width: 16px;
+                    accessible-role: button;
+                    accessible-label: "Dismiss error";
+                    clicked => { root.error-banner-dismissed(); }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                    Text {
+                        text: "\u{2715}";
+                        color: Theme.text-muted;
+                        font-size: 10px * Theme.font-scale;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
         }
         message-area := Rectangle {
             // The one elastic region in the chat column: the Flickable fills

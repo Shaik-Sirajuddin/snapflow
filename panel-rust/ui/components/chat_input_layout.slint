@@ -323,6 +323,19 @@ export component ChatInputLayout inherits Rectangle {
     // Second-row band height — same as SearchableDropdown + ContextRing
     // so all three share one center line.
     property <length> row2-h: 24px;
+    // Row 2's mode + model triggers (each min-width 72px, see
+    // searchable_dropdown.slint) plus the context ring (row2-h wide) and
+    // inter-item spacing add up to just over 180px at their narrowest --
+    // in a compact/narrow dock (observed live at ~230px total width, only
+    // ~180px of that left after this component's own pad-2xl horizontal
+    // padding) that already exceeds the available width. Nothing here
+    // clips (root.clip is false, deliberately, so the mention popup can
+    // escape upward) -- content past the visible width just renders
+    // outside the panel's own pixel buffer and is effectively invisible,
+    // which is the "hidden model selector" symptom this threshold fixes:
+    // drop the least essential item (the context ring) first so the two
+    // selects stay reachable.
+    property <bool> row2-compact: root.width < 280px;
 
     width: 100%;
     horizontal-stretch: 1;
@@ -527,7 +540,11 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
 
-            ContextRing {
+            // Hidden below row2-compact's width threshold -- see its own
+            // doc comment. Least essential of row 2's three controls
+            // (decorative usage indicator, not a picker), so it's the one
+            // dropped to keep the mode/model selects reachable.
+            if !root.row2-compact : ContextRing {
                 size: root.row2-h;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;

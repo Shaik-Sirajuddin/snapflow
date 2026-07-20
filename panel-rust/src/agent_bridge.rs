@@ -678,8 +678,8 @@ fn skills_mcp_servers_entry(project_path: Option<&std::path::Path>) -> Vec<serde
 /// `rui-mock-agent` binary this crate itself builds (`src/bin/
 /// mock_agent.rs`, ported directly from the former `rui-acp-client`
 /// crate's own `[[bin]]` of the same name -- Phase 2, chat-panel-
-/// production-ui/execution-plan.md) *only if that binary genuinely
-/// exists on disk* -- the acpx-gateway's own default backend for dev/test.
+/// production-ui/execution-plan.md) *only if `RUI_USE_DEV_MOCK_AGENT=1`
+/// is also set* -- the acpx-gateway's own default backend for dev/test.
 ///
 /// Returns `None` (previously always returned a `String`, unconditionally)
 /// when neither applies -- a real production install: no operator has set
@@ -696,9 +696,25 @@ fn skills_mcp_servers_entry(project_path: Option<&std::path::Path>) -> Vec<serde
 /// `/verify-impl`'s production-build lens (this session); see
 /// designa-v2-plan-order.meta.json's skill_injection_verification/
 /// runtime_and_edge_pass `verified[]` entries for the original finding.
+///
+/// **Second real bug this closes** (found live against a real running
+/// instance, not just by re-reading the code): checking only
+/// `dev_mock_agent.is_file()` is not actually a "is this a dev/test
+/// context" signal -- that debug binary exists on disk in ANY checkout
+/// that has ever run `cargo build`/`cargo test` once, including a
+/// checkout being used specifically to verify real end-to-end acpx
+/// behavior. That meant every new (non-resumed) chat session silently
+/// talked to the mock agent instead of the real gateway default, with no
+/// way to tell short of reading source -- exactly the "new sessions don't
+/// go through real acpx" symptom observed live. Now gated behind an
+/// explicit `RUI_USE_DEV_MOCK_AGENT=1` opt-in so the file's mere existence
+/// is never sufficient by itself.
 fn resolve_backend_agent_command() -> Option<String> {
     if let Ok(cmd) = std::env::var("RUI_ACP_AGENT_CMD") {
         return Some(cmd);
+    }
+    if std::env::var("RUI_USE_DEV_MOCK_AGENT").as_deref() != Ok("1") {
+        return None;
     }
     let dev_mock_agent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/debug/rui-mock-agent");
@@ -2784,6 +2800,36 @@ mod tests {
             None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
         }
         assert_eq!(resolved.as_deref(), Some("/some/real/agent --flag"));
+    }
+
+    /// The real bug found live this session: a debug build of
+    /// `rui-mock-agent` merely existing on disk (true in any dev checkout
+    /// that has ever run `cargo build`/`cargo test`) must NOT by itself
+    /// route new sessions to the mock agent -- only an explicit
+    /// `RUI_USE_DEV_MOCK_AGENT=1` opt-in may do that, so a dev checkout
+    /// used to verify real acpx behavior gets the real gateway default
+    /// unless someone deliberately asks for the mock.
+    #[test]
+    fn resolve_backend_agent_command_ignores_mock_binary_without_explicit_opt_in() {
+        let prior_override = std::env::var("RUI_ACP_AGENT_CMD").ok();
+        let prior_opt_in = std::env::var("RUI_USE_DEV_MOCK_AGENT").ok();
+        unsafe {
+            std::env::remove_var("RUI_ACP_AGENT_CMD");
+            std::env::remove_var("RUI_USE_DEV_MOCK_AGENT");
+        }
+        let resolved = resolve_backend_agent_command();
+        match prior_override {
+            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
+            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
+        }
+        match prior_opt_in {
+            Some(value) => unsafe { std::env::set_var("RUI_USE_DEV_MOCK_AGENT", value) },
+            None => unsafe { std::env::remove_var("RUI_USE_DEV_MOCK_AGENT") },
+        }
+        // Even though target/debug/rui-mock-agent genuinely exists in this
+        // checkout (every other real-process test in this file depends on
+        // it), resolve_backend_agent_command must still return None here.
+        assert_eq!(resolved, None);
     }
 
     fn mock_agent_bin() -> std::path::PathBuf {
