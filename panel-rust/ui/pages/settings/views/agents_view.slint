@@ -28,6 +28,8 @@ export component AgentsView inherits Rectangle {
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
+    // See FilterSearchBar.input-has-focus's doc comment.
+    out property <bool> search-has-focus: agent-search-bar.input-has-focus;
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -268,7 +270,7 @@ export component AgentsView inherits Rectangle {
 
         SettingsSectionHeader { text: "Agents"; subsection: true; }
 
-        SettingsSearchBar {
+        agent-search-bar := SettingsSearchBar {
             width: parent.width;
             query <=> root.agent-search-query;
         }
