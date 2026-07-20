@@ -667,20 +667,38 @@ fn skills_mcp_servers_entry(project_path: Option<&std::path::Path>) -> Vec<serde
 
 /// Resolves the mock backend agent binary the locally-spawned gateway
 /// should proxy to: `RUI_ACP_AGENT_CMD` env override (a real
-/// ACP-compliant agent binary/command), else the dev-checkout
+/// ACP-compliant agent binary/command) if set, else the dev-checkout
 /// `rui-mock-agent` binary this crate itself builds (`src/bin/
 /// mock_agent.rs`, ported directly from the former `rui-acp-client`
 /// crate's own `[[bin]]` of the same name -- Phase 2, chat-panel-
-/// production-ui/execution-plan.md) -- the acpx-gateway's own default
-/// backend for dev/test.
-fn resolve_backend_agent_command() -> String {
+/// production-ui/execution-plan.md) *only if that binary genuinely
+/// exists on disk* -- the acpx-gateway's own default backend for dev/test.
+///
+/// Returns `None` (previously always returned a `String`, unconditionally)
+/// when neither applies -- a real production install: no operator has set
+/// `RUI_ACP_AGENT_CMD`, and `<CARGO_MANIFEST_DIR>/target/debug/
+/// rui-mock-agent` is a compile-time-baked dev-checkout path that doesn't
+/// exist on an end user's machine at all. The old code returned that
+/// nonexistent path anyway, and [`spawn_gateway_process`] set
+/// `ACPX_BACKEND_CMD` to it *unconditionally* -- so a real release install
+/// with no operator-started acpx-server never reached a real agent on this
+/// autospawn path at all: acpx-server would try to exec a garbage path
+/// instead of falling back to its own real, working default
+/// (`npx -y @agentclientprotocol/codex-acp@1.1.2`, see
+/// `acpx-server/src/config.rs`'s `ServerConfig::from_env`). Found via
+/// `/verify-impl`'s production-build lens (this session); see
+/// designa-v2-plan-order.meta.json's skill_injection_verification/
+/// runtime_and_edge_pass `verified[]` entries for the original finding.
+fn resolve_backend_agent_command() -> Option<String> {
     if let Ok(cmd) = std::env::var("RUI_ACP_AGENT_CMD") {
-        return cmd;
+        return Some(cmd);
     }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/rui-mock-agent")
-        .to_string_lossy()
-        .into_owned()
+    let dev_mock_agent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/debug/rui-mock-agent");
+    if dev_mock_agent.is_file() {
+        return Some(dev_mock_agent.to_string_lossy().into_owned());
+    }
+    None
 }
 
 /// Real (not just "is the TCP port open") liveness probe: issues an
@@ -934,12 +952,20 @@ fn spawn_gateway_process(
 ) -> Result<(), String> {
     let mut cmd = std::process::Command::new(resolve_acpx_server_bin());
     cmd.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-        .env("ACPX_BACKEND_CMD", resolve_backend_agent_command())
         .env("ACPX_DEFAULT_AGENT_ID", provider)
         .env("RUI_MOCK_AGENT_PERSONA", provider)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Only set ACPX_BACKEND_CMD when we have a real command to point it
+    // at (an explicit override, or a dev-checkout mock binary confirmed
+    // to actually exist) -- leaving it unset lets acpx-server fall back
+    // to its own real, working default (a genuine LLM-backed ACP adapter)
+    // instead of being pointed at a nonexistent path. See
+    // resolve_backend_agent_command's doc comment for the full story.
+    if let Some(backend_cmd) = resolve_backend_agent_command() {
+        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2702,6 +2728,33 @@ mod tests {
     /// `resolve_acpx_server_bin` uses in production.
     fn acpx_server_bin() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
+    }
+
+    /// `RUI_ACP_AGENT_CMD` (a real override) always wins over the
+    /// dev-checkout mock-agent fallback -- the production-build regression
+    /// found this session was resolve_backend_agent_command silently
+    /// defaulting to a nonexistent path when NEITHER applies (see its own
+    /// doc comment); this specific override-wins branch is unaffected by
+    /// that fix but is the one part of this function cheaply testable
+    /// without touching the real dev_mock_agent build artifact every other
+    /// real-process test in this file also depends on existing.
+    #[test]
+    fn resolve_backend_agent_command_prefers_explicit_override() {
+        // SAFETY (env mutation in a test): guarded by restoring the prior
+        // value unconditionally before returning, and this whole suite
+        // already runs under --test-threads=1 per this crate's own
+        // convention for exactly this reason (see module doc references
+        // elsewhere in this file to real-process serialization).
+        let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
+        unsafe {
+            std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
+        }
+        let resolved = resolve_backend_agent_command();
+        match prior {
+            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
+            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
+        }
+        assert_eq!(resolved.as_deref(), Some("/some/real/agent --flag"));
     }
 
     fn mock_agent_bin() -> std::path::PathBuf {
