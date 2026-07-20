@@ -128,6 +128,17 @@ export component SkillEditorView inherits Rectangle {
                 x: Metrics.space-6;
                 y: Metrics.space-4;
                 width: parent.width - 2 * Metrics.space-6;
+                // Explicit height -- without one, this multi-line
+                // TextInput's focusable/clickable hit-region collapsed to
+                // its own single-line preferred height at y:0, leaving
+                // everything below the first line visually part of the
+                // editor but not actually clickable/focusable (same bug
+                // class as chat_input_layout.slint's compose TextInput
+                // and ui/base/text_field.slint's shared component --
+                // found by this session's own /verify-impl pass against
+                // skill-manager-workspace/active_pane_and_editor_view's
+                // "live edit of skill files" claim).
+                height: max(self.preferred-height, parent.height);
                 color: Theme.text-primary;
                 font-family: Theme.font-mono;
                 font-size: 11px * Theme.font-scale;
