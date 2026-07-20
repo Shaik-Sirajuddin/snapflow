@@ -1047,15 +1047,36 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 existing
                     .window
                     .set_size(slint::PhysicalSize::new(width, height));
-                existing.buffer.replace(vec![
+                // `resize` in place, not `replace(vec![...])` -- a live
+                // window/dock drag fires this on every intermediate
+                // geometry step, and the previous full
+                // fresh-allocate-and-zero-every-pixel approach did real,
+                // avoidable work on every single one of those ticks (a
+                // full heap allocation plus writing every element to the
+                // same default color, discarding the old buffer's already-
+                // reserved capacity every time). `resize` reuses existing
+                // capacity when the new size fits (the common case for
+                // small drag deltas) and only initializes newly-added
+                // elements when growing -- correctness is unaffected by
+                // stale/reinterpreted content from a width change, since
+                // panel_rust_render always redraws every pixel of the
+                // buffer fresh on the next frame regardless (this is a
+                // full-buffer software renderer, not incremental), so
+                // nothing here is ever visible before that overwrite.
+                // Reported symptom this closes: "resize is not smooth,
+                // layout elements bump up and down a bit" -- the
+                // reallocation cost on every drag tick could fall behind
+                // Qt's own frame pacing, visibly desyncing the panel's
+                // content from the window chrome resizing around it.
+                existing.buffer.borrow_mut().resize(
+                    (width * height) as usize,
                     PremultipliedRgbaColor {
                         red: 0,
                         green: 0,
                         blue: 0,
-                        alpha: 0
-                    };
-                    (width * height) as usize
-                ]);
+                        alpha: 0,
+                    },
+                );
                 existing.width = width;
                 existing.height = height;
                 existing.component.set_compact(width < 320);
