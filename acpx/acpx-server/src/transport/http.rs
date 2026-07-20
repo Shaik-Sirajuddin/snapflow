@@ -509,11 +509,15 @@ async fn health_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
     if !state.auth.authorize(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let store = state.router.lock().await.persistence_store();
+    let router = state.router.lock().await;
+    let default_agent_id = router.default_agent_id().to_string();
+    let store = router.persistence_store();
+    drop(router);
     let Some(store) = store else {
         return Json(serde_json::json!({
             "status": "ready",
             "persistenceEnabled": false,
+            "defaultAgentId": default_agent_id,
             "recovery": {
                 "active": 0,
                 "restoring": 0,
@@ -528,6 +532,7 @@ async fn health_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
         Ok(counts) => Json(serde_json::json!({
             "status": if counts.restoring == 0 { "ready" } else { "recovering" },
             "persistenceEnabled": true,
+            "defaultAgentId": default_agent_id,
             "recovery": {
                 "active": counts.active,
                 "restoring": counts.restoring,
