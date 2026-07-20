@@ -34,6 +34,15 @@ export component ChatPanel inherits Window {
     // shortcuts work even when no TextInput currently owns focus.
     forward-focus: panel-keys;
     out property <bool> compose-has-focus: chat-area.compose-has-focus;
+    // Aggregates every editable Slint surface's own focus state besides
+    // compose/local-terminal (thread search, skill search -- both share
+    // Sidebar's one thread-search FilterSearchBar instance) -- see
+    // FilterSearchBar.input-has-focus's doc comment for why this chain
+    // exists: the host's panel_rust_input_key only forwards real
+    // keystrokes into Slint when *something* in this OR-chain reads true,
+    // so a field left out of it silently receives clicks but no typed
+    // text at all.
+    out property <bool> secondary-text-input-has-focus: sidebar.search-has-focus;
     out property <bool> local-terminal-has-focus:
         chat-area.local-terminal-has-focus
         || (local-terminal-overlay-open && local-terminal-overlay.has-focus);

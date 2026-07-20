@@ -3086,18 +3086,30 @@ pub extern "C" fn panel_rust_input_key(
     // surface owns focus. Besides the composer, a local PTY terminal is a
     // genuine keyboard target and must receive printable keys, editing keys,
     // and arrows without Shotcut handling them as global shortcuts.
-    let (compose_has_focus, local_terminal_has_focus) = PANEL.with(|cell| {
-        cell.borrow().as_ref().map_or((false, false), |panel| {
-            (
-                panel.component.get_compose_has_focus(),
-                panel.component.get_local_terminal_has_focus(),
-            )
-        })
-    });
-    if !compose_has_focus && !local_terminal_has_focus {
+    let (compose_has_focus, local_terminal_has_focus, secondary_text_input_has_focus) =
+        PANEL.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map_or((false, false, false), |panel| {
+                    (
+                        panel.component.get_compose_has_focus(),
+                        panel.component.get_local_terminal_has_focus(),
+                        panel.component.get_secondary_text_input_has_focus(),
+                    )
+                })
+        });
+    // `secondary_text_input_has_focus` covers every editable Slint surface
+    // besides the composer/terminal (thread search, skill search -- see
+    // app.slint's own doc comment on that property for the full list and
+    // why a field left out of its OR-chain silently drops all keystrokes
+    // here). Without it, clicking into e.g. thread search focuses it fine
+    // (a real click) but every subsequent keystroke was dropped right here
+    // before ever reaching Slint -- the search box "didn't take input at
+    // all" despite compiling and rendering correctly.
+    if !compose_has_focus && !local_terminal_has_focus && !secondary_text_input_has_focus {
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed={pressed} text={text:?} \
-             compose_focus=false local_terminal_focus=false"
+             compose_focus=false local_terminal_focus=false secondary_focus=false"
         ));
         return false;
     }
@@ -3114,7 +3126,7 @@ pub extern "C" fn panel_rust_input_key(
         if let Some(key) = modifier_key_for_qt_key(qt_key) {
             trace_host_input(format_args!(
                 "key qt_key={qt_key:#x} pressed=false text={text:?} \
-                 compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+                 compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus} \
                  modifier_release={key:?}"
             ));
             window.window().dispatch_event(WindowEvent::KeyReleased {
@@ -3124,7 +3136,7 @@ pub extern "C" fn panel_rust_input_key(
         }
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed=false text={text:?} \
-             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus}"
+             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus}"
         ));
         return true;
     }
@@ -3133,14 +3145,14 @@ pub extern "C" fn panel_rust_input_key(
     let Some(key_text) = map_qt_key(qt_key, text, shift) else {
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed=true text={text:?} \
-             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus} \
              mapped=false"
         ));
         return false;
     };
     trace_host_input(format_args!(
         "key qt_key={qt_key:#x} pressed=true text={text:?} \
-         compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+         compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus} \
          mapped={key_text:?}"
     ));
     window
