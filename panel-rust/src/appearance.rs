@@ -20,7 +20,7 @@ pub struct HostAppearance {
     pub density: f32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppearanceState {
     current: Option<HostAppearance>,
 }

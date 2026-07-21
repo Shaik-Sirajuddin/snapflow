@@ -55,6 +55,7 @@ enum ProcessingState {
 
 /// Holds follow-up messages typed while the agent is generating, along
 /// with the state machine that decides when they're auto-sent.
+#[derive(Debug, Clone)]
 pub struct SendQueue {
     entries: VecDeque<QueueEntry>,
     processing_state: ProcessingState,

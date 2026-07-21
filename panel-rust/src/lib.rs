@@ -17,12 +17,16 @@
 mod agent_bridge;
 mod appearance;
 mod conversation;
+mod dirty;
 mod editor_detect;
+mod effect;
 pub mod gateway_actor;
 pub mod jsonl_store;
 mod local_terminal;
 mod markdown;
+mod model;
 pub mod models;
+mod msg;
 mod permission;
 pub mod protocol_types;
 mod send_queue;
