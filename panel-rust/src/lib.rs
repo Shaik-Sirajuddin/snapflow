@@ -599,11 +599,17 @@ impl PanelSingleton {
             .iter()
             .enumerate()
             .map(|(idx, thread)| {
-                if thread.thread_id.is_empty() {
-                    format!("thread:{idx}")
-                } else {
-                    thread.thread_id.clone()
-                }
+                self.bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_binding(idx))
+                    .map(|binding| binding.thread_id)
+                    .unwrap_or_else(|| {
+                        if thread.thread_id.is_empty() {
+                            format!("thread:{idx}")
+                        } else {
+                            thread.thread_id.clone()
+                        }
+                    })
             })
             .collect();
         let errors: Vec<String> = model

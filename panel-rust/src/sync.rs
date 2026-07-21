@@ -24,6 +24,34 @@ pub fn sync(model: &Model, component: &ChatPanel, dirty: &[Dirty]) {
     }
 }
 
+fn trace_transcript_tail(model: &Model, thread_id: &str) {
+    if std::env::var_os("RUI_PANEL_INPUT_TRACE").is_none() {
+        return;
+    }
+    let Some(idx) = displayed_thread_for_id(model, thread_id) else {
+        return;
+    };
+    let Some(thread) = model.threads.get(idx) else {
+        return;
+    };
+    let items = thread.transcript.iter().rev().take(3).collect::<Vec<_>>();
+    for item in items.into_iter().rev() {
+        let (kind, text) = match item {
+            crate::conversation::TranscriptItem::User { text, .. } => ("user", text),
+            crate::conversation::TranscriptItem::Assistant { text, .. } => ("agent", text),
+            crate::conversation::TranscriptItem::Thought { text, .. } => ("thinking", text),
+            crate::conversation::TranscriptItem::Tool { title, .. } => ("tool_use", title),
+            crate::conversation::TranscriptItem::Terminal { output, .. } => ("terminal", output),
+            crate::conversation::TranscriptItem::Notice { text } => ("notice", text),
+        };
+        let preview: String = text.chars().take(60).collect();
+        crate::trace_host_input(format_args!(
+            "transcript thread={} kind={} text={:?}",
+            idx, kind, preview
+        ));
+    }
+}
+
 fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
     match dirty {
         Dirty::Scalar(field) => sync_scalar(model, component, *field),
@@ -34,10 +62,14 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         Dirty::MessageAppended { thread_id } => {
             sync_message_snapshot(model, thread_id);
             sync_has_older_messages(model, component, thread_id);
+            trace_transcript_tail(model, thread_id);
         }
         Dirty::MessagesDiff { thread_id, ops } => {
             apply_message_ops(model, thread_id, ops);
             sync_has_older_messages(model, component, thread_id);
+            if !thread_id.is_empty() {
+                trace_transcript_tail(model, thread_id);
+            }
         }
         Dirty::MessageStreamingDelta {
             thread_id,

@@ -24,6 +24,25 @@ impl<'a> ExternalSnapshotSource<'a> {
             .as_ref()
             .map(AgentBridge::poll)
             .unwrap_or_default();
+        let bridge_event_thread_ids = bridge_events
+            .iter()
+            .map(|event| {
+                self.panel
+                    .bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_binding(event.thread_index))
+                    .map(|binding| binding.thread_id)
+                    .or_else(|| {
+                        self.panel
+                            .model
+                            .borrow()
+                            .threads
+                            .get(event.thread_index)
+                            .map(|thread| thread.thread_id.clone())
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
         let thread_record_snapshots = self.panel.collect_thread_record_snapshots();
         let settings_reload_pending = self
             .panel
@@ -38,6 +57,7 @@ impl<'a> ExternalSnapshotSource<'a> {
         msg::FrameInput {
             bridge_events_pending: !bridge_events.is_empty(),
             bridge_events,
+            bridge_event_thread_ids,
             thread_record_snapshots,
             settings_reload_pending,
             local_terminal_snapshot: None,

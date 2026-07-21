@@ -212,6 +212,11 @@ pub enum HostMsg {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FrameInput {
     pub bridge_events: Vec<crate::agent_bridge::BridgeEvent>,
+    /// Durable thread identity captured at the same time as each bridge
+    /// event. The numeric event index is only a bridge lookup location and
+    /// may no longer identify the same Model row when a frame also carries a
+    /// list-shape change.
+    pub bridge_event_thread_ids: Vec<String>,
     pub bridge_events_pending: bool,
     pub thread_record_snapshots: Vec<crate::state_store::ThreadRecord>,
     pub settings_reload_pending: bool,

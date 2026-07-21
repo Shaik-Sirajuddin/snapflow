@@ -996,8 +996,19 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
 fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect>, Vec<Dirty>) {
     let mut effects = Vec::new();
     let mut dirty = Vec::new();
-    for bridge_event in &frame.bridge_events {
-        let Some(thread) = model.threads.get_mut(bridge_event.thread_index) else {
+    for (event_index, bridge_event) in frame.bridge_events.iter().enumerate() {
+        let target_index = frame
+            .bridge_event_thread_ids
+            .get(event_index)
+            .filter(|thread_id| !thread_id.is_empty())
+            .and_then(|thread_id| {
+                model
+                    .threads
+                    .iter()
+                    .position(|thread| Model::thread_matches_id(thread, thread_id))
+            })
+            .unwrap_or(bridge_event.thread_index);
+        let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
         };
         match &bridge_event.event {
@@ -1030,7 +1041,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                         text: entry.text,
                     });
                 }
-                dirty.push(Dirty::ThreadRow(bridge_event.thread_index));
+                dirty.push(Dirty::ThreadRow(target_index));
             }
             crate::protocol_types::AgentEvent::Error(error) => {
                 thread.state = ThreadState::Error;
@@ -1047,7 +1058,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::SessionModes(_)
             | crate::protocol_types::AgentEvent::CurrentModeChanged(_)
             | crate::protocol_types::AgentEvent::ConfigOptions(_) => {
-                dirty.push(Dirty::ThreadRow(bridge_event.thread_index));
+                dirty.push(Dirty::ThreadRow(target_index));
             }
         }
     }
@@ -1556,6 +1567,42 @@ mod tests {
     }
 
     #[test]
+    fn frame_event_resolves_by_durable_thread_id_after_model_row_shift() {
+        let mut model = model_with_threads(&["target", "other"]);
+        model.threads[0].thread_id = "target-id".to_owned();
+        model.threads[1].thread_id = "other-id".to_owned();
+        model.threads[0]
+            .send_queue
+            .enqueue("queued".to_owned(), false)
+            .expect("queue entry");
+
+        model.threads.swap(0, 1);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
+                }],
+                bridge_event_thread_ids: vec!["target-id".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            effects,
+            vec![Effect::SendPrompt {
+                real_index: 0,
+                text: "queued".to_owned(),
+            }]
+        );
+        assert_eq!(model.threads[0].thread_id, "other-id");
+        assert_eq!(model.threads[1].thread_id, "target-id");
+        assert_eq!(model.threads[1].state, ThreadState::Loading);
+        assert!(dirty.contains(&Dirty::ThreadRow(1)));
+    }
+
+    #[test]
     fn frame_event_for_a_removed_thread_is_a_no_op() {
         let mut model = Model::default();
         let (effects, dirty) = update(
@@ -1861,6 +1908,7 @@ mod tests {
             &mut model,
             Msg::Frame(FrameInput {
                 bridge_events: Vec::new(),
+                bridge_event_thread_ids: Vec::new(),
                 bridge_events_pending: true,
                 thread_record_snapshots: Vec::new(),
                 settings_reload_pending: true,
