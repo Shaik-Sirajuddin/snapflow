@@ -182,10 +182,9 @@ def wait_for_pending_request(host_log, thread_index=0, timeout=10):
 def wait_for_attachment(host_log, thread_index=0):
     if host_log is None:
         raise RuntimeError("--wait-for-attachment requires --host-log")
-    marker = "panel-rust input: attachment ready thread={} ".format(thread_index)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        if host_log.exists() and marker in host_log.read_text(errors="replace"):
+        if len(attachment_names(host_log)) > thread_index:
             return
         time.sleep(0.1)
     raise RuntimeError(
@@ -193,16 +192,19 @@ def wait_for_attachment(host_log, thread_index=0):
     )
 
 
-ATTACHMENT_RE = re.compile(r"panel-rust input: attachment ready thread=(\d+) ")
+ATTACHMENT_RE = re.compile(r"panel-rust attachment: thread=([^ ]+) ")
+
+
+def attachment_names(host_log):
+    if host_log is None or not host_log.exists():
+        return []
+    return ATTACHMENT_RE.findall(host_log.read_text(errors="replace"))
 
 
 def known_thread_indices(host_log):
-    if host_log is None or not host_log.exists():
-        return set()
-    return {
-        int(match)
-        for match in ATTACHMENT_RE.findall(host_log.read_text(errors="replace"))
-    }
+    """Compatibility name retained for the driver callers; the host trace
+    records durable thread names, not bridge indices."""
+    return set(attachment_names(host_log))
 
 
 def open_second_thread(xdisplay, host_log):
@@ -609,6 +611,20 @@ def local_terminal_focus_dock_xy(dock_width):
     return center_x, (row_y1 + row_y2) // 2
 
 
+def compose_input_dock_xy(dock_width):
+    """Return the center of the ChatInputLayout text input.
+
+    ChatArea's bottom layout is: separator, ChatInputLayout, with the
+    message stream taking the remaining height. ChatInputLayout's compact
+    layout has 12px top/bottom padding, an input row clamped to 34px, an
+    8px row gap, and a 24px selector row.
+    """
+    dock_height = 260
+    shell_height = 12 + 34 + 8 + 24 + 12
+    input_top = dock_height - shell_height + 12
+    return max(12, dock_width // 2), input_top + 17
+
+
 def local_terminal_events(host_log, thread_index=0):
     if host_log is None or not host_log.exists():
         return []
@@ -650,17 +666,17 @@ def focus_compose(xdisplay, x, y, host_log):
         click(xdisplay, x, y)
         return
 
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         # Dock restoration is allowed to change the vertical split. Probe a
         # compact band in the chat column, but do not type until Rust confirms
         # a click reached the actual TextInput.
-        for candidate_y in (y, y + 60, y - 60, y + 120, y - 120, y + 180, y - 180):
+        for candidate_y in (y, y + 12, y - 12, y + 24, y - 24):
             if candidate_y < 0:
                 continue
             offset = host_log.stat().st_size if host_log.exists() else 0
             click(xdisplay, x, candidate_y)
-            focus_deadline = time.monotonic() + 0.5
+            focus_deadline = time.monotonic() + 0.25
             while time.monotonic() < focus_deadline:
                 if host_log.exists():
                     recent = host_log.read_text(errors="replace")[offset:]
@@ -791,8 +807,9 @@ def main():
     # compose control sits in the chat dock's lower half. This gate drives
     # only the deterministic compose coordinate; multi-session routing is
     # covered by the real gateway actor suite, where sessions have stable IDs.
-    compose_x = max(12, args.dock_width - 92)
-    compose_y = 520
+    compose_x, compose_y = compose_input_dock_xy(args.dock_width)
+    compose_x += DOCK_X_OFFSET
+    compose_y += DOCK_Y_OFFSET
     expected_prompt = INPUT_MATRIX_EXPECTED if args.exercise_input_matrix else args.prompt
 
     if args.wait_for_attachment:

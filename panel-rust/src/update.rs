@@ -999,6 +999,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             crate::protocol_types::AgentEvent::TurnEnded(_) => {
                 thread.state = ThreadState::Idle;
                 thread.error = None;
+                crate::trace_host_input(format_args!(
+                    "turn ended thread={} reason=frame",
+                    bridge_event.thread_index
+                ));
                 if let Some(entry) = thread
                     .send_queue
                     .on_generation_stopped(false)
