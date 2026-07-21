@@ -21,6 +21,7 @@ mod dirty;
 mod dispatch;
 mod editor_detect;
 mod effect;
+mod external_snapshot;
 pub mod gateway_actor;
 pub mod jsonl_store;
 mod list_model;
@@ -1517,41 +1518,6 @@ impl PanelSingleton {
     pub(crate) fn collect_selected_thread_snapshot(&self) -> Option<msg::ThreadFrameSnapshot> {
         let selected = self.real_index(self.component.get_selected_thread() as usize);
         selected.and_then(|real_idx| self.collect_thread_snapshot_for(real_idx))
-    }
-
-    pub(crate) fn collect_frame_input(&self) -> msg::FrameInput {
-        let bridge_events = self
-            .bridge
-            .as_ref()
-            .map(AgentBridge::poll)
-            .unwrap_or_default();
-        let thread_record_snapshots = self.collect_thread_record_snapshots();
-        let settings_reload_pending = self
-            .settings_reload_pending
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-            && !self
-                .settings_ignore_watch_until
-                .get()
-                .is_some_and(|until| std::time::Instant::now() < until);
-        msg::FrameInput {
-            bridge_events_pending: !bridge_events.is_empty(),
-            bridge_events,
-            thread_record_snapshots,
-            settings_reload_pending,
-            local_terminal_snapshot: None,
-            prepend_expanded_rows: 0,
-            clear_selected_thread: false,
-            thread_list_snapshot: Some(self.collect_thread_list_snapshot()),
-            selected_thread_snapshot: self.collect_selected_thread_snapshot(),
-            settings_preferences_snapshot: (self.component.get_settings_open()
-                || settings_reload_pending)
-                .then(|| self.collect_settings_preferences_snapshot(None)),
-            settings_gateway_snapshot: self
-                .component
-                .get_settings_open()
-                .then(|| self.collect_settings_gateway_snapshot()),
-            skills_snapshot: None,
-        }
     }
 
     fn collect_thread_record_snapshots(&self) -> Vec<crate::state_store::ThreadRecord> {

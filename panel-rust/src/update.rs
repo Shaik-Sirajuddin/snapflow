@@ -248,7 +248,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 thread.state = ThreadState::Idle;
             }
             (
-                vec![Effect::PersistThread { real_index: idx }],
+                vec![Effect::CloseThread { real_index: idx }],
                 vec![Dirty::ThreadRow(idx)],
             )
         }
@@ -1392,6 +1392,18 @@ mod tests {
         assert_eq!(model.selected_thread, 1);
         assert_eq!(effects, vec![Effect::DeleteThread { real_index: 1 }]);
         assert_eq!(dirty, vec![Dirty::ThreadListDiff(vec![])]);
+    }
+
+    #[test]
+    fn thread_close_requested_emits_one_close_effect() {
+        let mut model = model_with_threads(&["a"]);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::CloseRequested(0))),
+        );
+        assert!(model.threads[0].closed);
+        assert_eq!(effects, vec![Effect::CloseThread { real_index: 0 }]);
+        assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
     }
 
     #[test]

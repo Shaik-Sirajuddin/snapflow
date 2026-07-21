@@ -227,6 +227,11 @@ fn execute_effects(panel: &PanelSingleton, effects: Vec<crate::effect::Effect>) 
             crate::effect::Effect::SetActiveProjectPath { path } => {
                 panel.apply_active_project_path(path);
             }
+            crate::effect::Effect::CloseThread { real_index } => {
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    let _ = bridge.close_thread(real_index);
+                }
+            }
             crate::effect::Effect::PersistThreadRecord { record } => {
                 let result = panel
                     .panel_state
@@ -635,12 +640,6 @@ pub(crate) fn dispatch_thread_close(
     let Some(idx) = panel.real_index(filtered_idx) else {
         return;
     };
-    let Some(bridge) = &panel.bridge else {
-        return;
-    };
-    if !bridge.close_thread(idx) {
-        return;
-    }
     let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Thread(ThreadMsg::CloseRequested(idx))),
@@ -663,16 +662,11 @@ pub(crate) fn dispatch_thread_delete(
     let Some(idx) = panel.real_index(filtered_idx) else {
         return;
     };
-    let Some(bridge) = &panel.bridge else {
-        return;
-    };
-    if !bridge.delete_thread(idx) {
-        return;
-    }
-    let _ = update_persistent(
+    let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Thread(ThreadMsg::DeleteRequested(idx))),
     );
+    execute_effects(panel, effects);
     panel.dispatch_frame_input(crate::msg::FrameInput { thread_list_snapshot: Some(panel.collect_thread_list_snapshot()), ..crate::msg::FrameInput::default() });
     if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
         panel.dispatch_frame_input(crate::msg::FrameInput {
@@ -1313,7 +1307,8 @@ pub(crate) fn dispatch_frame_input(
 /// and folded through `Msg::Frame` so `sync()` owns its transcript,
 /// connection, request, terminal, PTY, and capability projections.
 pub(crate) fn dispatch_frame_poll(panel: &PanelSingleton) -> bool {
-    let frame = panel.collect_frame_input();
+    let frame = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+        .collect_frame_input();
     dispatch_frame_input(panel, frame)
 }
 

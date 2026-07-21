@@ -43,6 +43,9 @@ pub enum Effect {
         profile_name: Option<String>,
         permission_profile: Option<String>,
     },
+    CloseThread {
+        real_index: usize,
+    },
     DeleteThread {
         real_index: usize,
     },
