@@ -1295,6 +1295,74 @@ impl PanelSingleton {
         }
     }
 
+    /// `dispatch.rs`'s Terminal-domain wrapper (tea-slint-model Phase 4)
+    /// calls this -- extracted verbatim from the former
+    /// `on_expand_terminal` closure body.
+    pub(crate) fn dispatch_expand_terminal(&self, component: &ChatPanel, terminal_id: &str) {
+        *self.expanded_terminal_id.borrow_mut() = Some(terminal_id.to_string());
+        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+            return;
+        };
+        self.refresh_terminals_for(real_idx);
+    }
+
+    /// See `dispatch_expand_terminal`'s doc comment -- extracted verbatim
+    /// from the former `on_close_terminal_overlay` closure body.
+    pub(crate) fn dispatch_close_terminal_overlay(&self) {
+        *self.expanded_terminal_id.borrow_mut() = None;
+    }
+
+    /// See `dispatch_expand_terminal`'s doc comment -- extracted verbatim
+    /// from the former `on_local_terminal_toggle_requested` closure body.
+    pub(crate) fn dispatch_local_terminal_toggle(&self, component: &ChatPanel) {
+        trace_host_input("local terminal toggle callback invoked");
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+            return;
+        };
+        if bridge.has_local_terminal(real_idx) {
+            bridge.close_local_terminal(real_idx);
+            trace_host_input(format_args!(
+                "local terminal toggled thread={real_idx} open=false"
+            ));
+        } else {
+            let (cols, rows) = self.local_terminal_dimensions();
+            bridge.open_local_terminal(real_idx, cols, rows);
+            trace_host_input(format_args!(
+                "local terminal toggled thread={real_idx} open=true cols={cols} rows={rows}"
+            ));
+        }
+        self.refresh_local_terminal_for(real_idx);
+    }
+
+    /// See `dispatch_expand_terminal`'s doc comment -- extracted verbatim
+    /// from the former `on_local_terminal_key_input` closure body.
+    pub(crate) fn dispatch_local_terminal_key_input(&self, component: &ChatPanel, text: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+            return;
+        };
+        let bytes = models::translate_local_terminal_key(text);
+        if !bytes.is_empty() {
+            bridge.write_local_terminal_input(real_idx, &bytes);
+            trace_host_input(format_args!(
+                "local terminal key thread={real_idx} bytes={:?}",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+    }
+
+    /// See `dispatch_expand_terminal`'s doc comment -- extracted verbatim
+    /// from the former `on_local_terminal_close_requested` closure body.
+    pub(crate) fn dispatch_local_terminal_close(&self, component: &ChatPanel) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+            return;
+        };
+        bridge.close_local_terminal(real_idx);
+        self.refresh_local_terminal_for(real_idx);
+    }
+
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
     pub(crate) fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
@@ -2798,6 +2866,12 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // every `refresh_messages_for`) keeps whichever terminal is
         // currently expanded live-updating; these two callbacks only
         // own which id (if any) is expanded.
+        // tea-slint-model Phase 4 (Terminal domain): routed through
+        // Msg::Ui(UiMsg::Terminal(..)) -> update() -> dispatch's bridge
+        // into the dispatch_expand_terminal/dispatch_close_terminal_overlay/
+        // dispatch_local_terminal_toggle/dispatch_local_terminal_key_input/
+        // dispatch_local_terminal_close methods (unchanged, now
+        // pub(crate)) -- see dispatch.rs's doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_expand_terminal(move |terminal_id| {
             let Some(component) = component_weak.upgrade() else {
@@ -2805,12 +2879,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    *panel.expanded_terminal_id.borrow_mut() = Some(terminal_id.to_string());
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    panel.refresh_terminals_for(real_idx);
+                    dispatch::dispatch_terminal_expand(panel, &component, terminal_id.to_string());
                 }
             });
         });
@@ -2822,7 +2891,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    *panel.expanded_terminal_id.borrow_mut() = None;
+                    dispatch::dispatch_terminal_close_overlay(panel);
                 }
             });
         });
@@ -2836,27 +2905,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
-            trace_host_input("local terminal toggle callback invoked");
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    if bridge.has_local_terminal(real_idx) {
-                        bridge.close_local_terminal(real_idx);
-                        trace_host_input(format_args!(
-                            "local terminal toggled thread={real_idx} open=false"
-                        ));
-                    } else {
-                        let (cols, rows) = panel.local_terminal_dimensions();
-                        bridge.open_local_terminal(real_idx, cols, rows);
-                        trace_host_input(format_args!(
-                            "local terminal toggled thread={real_idx} open=true cols={cols} rows={rows}"
-                        ));
-                    }
-                    panel.refresh_local_terminal_for(real_idx);
+                    dispatch::dispatch_terminal_local_toggle(panel, &component);
                 }
             });
         });
@@ -2868,19 +2919,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    let bytes = models::translate_local_terminal_key(text.as_str());
-                    if !bytes.is_empty() {
-                        bridge.write_local_terminal_input(real_idx, &bytes);
-                        trace_host_input(format_args!(
-                            "local terminal key thread={real_idx} bytes={:?}",
-                            String::from_utf8_lossy(&bytes)
-                        ));
-                    }
+                    dispatch::dispatch_terminal_local_key_input(
+                        panel,
+                        &component,
+                        text.to_string(),
+                    );
                 }
             });
         });
@@ -2892,13 +2935,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    bridge.close_local_terminal(real_idx);
-                    panel.refresh_local_terminal_for(real_idx);
+                    dispatch::dispatch_terminal_local_close(panel, &component);
                 }
             });
         });

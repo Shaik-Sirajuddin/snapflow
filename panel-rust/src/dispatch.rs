@@ -26,7 +26,7 @@
 
 use crate::dirty::{Dirty, ScalarField};
 use crate::model::{Model, ThreadModel};
-use crate::msg::{ComposeMsg, Msg, RequestMsg, ThreadMsg, UiMsg};
+use crate::msg::{ComposeMsg, Msg, RequestMsg, TerminalMsg, ThreadMsg, UiMsg};
 use crate::update::update;
 use crate::ChatPanel;
 use crate::PanelSingleton;
@@ -218,6 +218,84 @@ pub(crate) fn dispatch_request_load_older(panel: &PanelSingleton) {
         "Request::LoadOlderRequested must produce zero (no selected thread) or one LoadOlderMessages effect"
     );
     panel.dispatch_load_older_requested();
+}
+
+/// Wired from `component.on_expand_terminal` (tea-slint-model Phase 4,
+/// Terminal domain). See `dispatch_request_approve`'s doc comment for
+/// the shared bridge shape -- `update()` runs for real, then the actual
+/// cascade is delegated to the existing `dispatch_expand_terminal`.
+pub(crate) fn dispatch_terminal_expand(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    terminal_id: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let (_effects, dirty) = update(
+        &mut model,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand(terminal_id.clone()))),
+    );
+    debug_assert!(
+        matches!(dirty.as_slice(), [Dirty::Terminal { .. }]),
+        "Terminal::Expand must always produce exactly one Dirty::Terminal"
+    );
+    panel.dispatch_expand_terminal(component, &terminal_id);
+}
+
+/// Wired from `component.on_close_terminal_overlay` (tea-slint-model
+/// Phase 4, Terminal domain). See `dispatch_terminal_expand`'s doc
+/// comment -- same bridge shape.
+pub(crate) fn dispatch_terminal_close_overlay(panel: &PanelSingleton) {
+    let mut model = thread_selection_model(panel);
+    let (_effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseOverlay)));
+    panel.dispatch_close_terminal_overlay();
+}
+
+/// Wired from `component.on_local_terminal_toggle_requested`
+/// (tea-slint-model Phase 4, Terminal domain). See
+/// `dispatch_terminal_expand`'s doc comment -- same bridge shape.
+pub(crate) fn dispatch_terminal_local_toggle(panel: &PanelSingleton, component: &ChatPanel) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalToggle)));
+    debug_assert!(
+        matches!(effects.as_slice(), [crate::effect::Effect::LocalTerminalSpawn]),
+        "Terminal::LocalToggle must always produce exactly one LocalTerminalSpawn effect"
+    );
+    panel.dispatch_local_terminal_toggle(component);
+}
+
+/// Wired from `component.on_local_terminal_key_input` (tea-slint-model
+/// Phase 4, Terminal domain). See `dispatch_terminal_expand`'s doc
+/// comment -- same bridge shape.
+pub(crate) fn dispatch_terminal_local_key_input(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    text: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(
+        &mut model,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalKeyInput(
+            text.clone().into_bytes(),
+        ))),
+    );
+    debug_assert!(
+        matches!(effects.as_slice(), [crate::effect::Effect::LocalTerminalWrite { .. }]),
+        "Terminal::LocalKeyInput must always produce exactly one LocalTerminalWrite effect"
+    );
+    panel.dispatch_local_terminal_key_input(component, &text);
+}
+
+/// Wired from `component.on_local_terminal_close_requested`
+/// (tea-slint-model Phase 4, Terminal domain). See
+/// `dispatch_terminal_expand`'s doc comment -- same bridge shape.
+pub(crate) fn dispatch_terminal_local_close(panel: &PanelSingleton, component: &ChatPanel) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalClose)));
+    debug_assert!(
+        matches!(effects.as_slice(), [crate::effect::Effect::LocalTerminalKill]),
+        "Terminal::LocalClose must always produce exactly one LocalTerminalKill effect"
+    );
+    panel.dispatch_local_terminal_close(component);
 }
 
 #[cfg(test)]
