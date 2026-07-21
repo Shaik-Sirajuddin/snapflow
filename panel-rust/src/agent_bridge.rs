@@ -1139,8 +1139,10 @@ fn reserve_ephemeral_port() -> Option<(u16, File)> {
 ///    already-running acpx-server this process should just dial,
 ///    trusted as-is with no liveness probe, matching
 ///    `RUI_ACP_AGENT_CMD`'s established override-precedence convention).
-/// 2. Else, a fixed per-provider loopback default port (8790 codex /
-///    8791 claude) is probed with [`probe_acpx_gateway`] -- if a real
+/// 2. Else, the single shared loopback default bind
+///    (`acpx_client::DEFAULT_ACPX_HTTP_ADDR`, one place, same value
+///    acpx-server itself defaults `ACPX_HTTP_BIND` to) is probed with
+///    [`probe_acpx_gateway`] for every provider -- if a real
 ///    acpx-server is already answering there (an operator-started one,
 ///    *or this same panel process's own gateway surviving a prior
 ///    thread's earlier call in this same construction loop, or -- the
@@ -1198,15 +1200,21 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
         return Ok(url);
     }
 
-    let default_port: u16 = if provider == "codex" { 8790 } else { 8791 };
-    if probe_acpx_gateway_for_agent(default_port, Some(provider)) {
-        return Ok(format!("http://127.0.0.1:{default_port}"));
-    }
-    // Healthy gateway on default codex port may still serve both providers
-    // when snapshotd bundles one acpx-server — reuse if any acpx answers.
-    // Any acpx on the shared default port (snapshotd single gateway).
-    if provider != "codex" && probe_acpx_gateway_once(default_port, None) {
-        return Ok(format!("http://127.0.0.1:{default_port}"));
+    // One shared default bind for every provider -- the single source of
+    // truth is acpx_client::DEFAULT_ACPX_HTTP_ADDR, which acpx-server also
+    // uses for its own ACPX_HTTP_BIND default. snapshotd ships exactly one
+    // acpx-server serving all agents; genuine per-provider gateways remain
+    // expressible via the RUI_ACPX_<PROVIDER>_URL overrides above. (The old
+    // codex=8790 / claude=8791 split assumed one acpx-server per provider,
+    // which no live deployment uses -- confirmed against the running system.)
+    let default_port: u16 = acpx_client::default_acpx_http_port();
+    // Prefer an agent-specific health match, but reuse any acpx answering the
+    // shared port (a single bundled gateway may advertise a different default
+    // agent-id than this provider while still serving it).
+    if probe_acpx_gateway_for_agent(default_port, Some(provider))
+        || probe_acpx_gateway_once(default_port, None)
+    {
+        return Ok(acpx_client::default_acpx_http_url());
     }
 
     // When snapshotd (or an operator) owns acpx, do not auto-spawn a second

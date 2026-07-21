@@ -16,3 +16,9 @@ pub mod raw;
 pub mod ws;
 
 pub use gateway::{AgentRequest, Gateway, TransportMode};
+
+/// Re-export of the single-source-of-truth default acpx bind address (and
+/// its URL/port helpers) from `acpx-proto`, so panel-rust -- which only
+/// depends on this SDK crate -- can reach the same value acpx-server uses
+/// for its own `ACPX_HTTP_BIND` default.
+pub use acpx_proto::{default_acpx_http_port, default_acpx_http_url, DEFAULT_ACPX_HTTP_ADDR};

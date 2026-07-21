@@ -4,6 +4,22 @@ Automated host E2E drives Shotcut through XTEST on its Xvfb display and uses
 the mock ACP backend event log as its source of truth. Screenshots are not a
 test gate.
 
+## Gateway port: single source of truth
+
+The panel-rust ↔ acpx-server HTTP/WS port has one authority:
+`acpx_proto::DEFAULT_ACPX_HTTP_ADDR` (`acpx/acpx-proto/src/lib.rs`, currently
+`127.0.0.1:8790`). acpx-server uses it as its `ACPX_HTTP_BIND` default and
+panel-rust (via acpx-client's re-export) dials it as the default gateway URL
+for **every** provider when no `RUI_ACPX_DEFAULT_URL` / `RUI_ACPX_<PROVIDER>_URL`
+override is set — there is no longer a per-provider `8790`/`8791` default
+split. Genuine per-provider gateways are expressed only through the
+`RUI_ACPX_<PROVIDER>_URL` overrides. snapshotd's Go default mirrors the same
+value (cross-language, kept in sync by comment). This harness picks its own
+port from the single `PANEL_HOST_E2E_GATEWAY_PORT` variable (default `18790`)
+and points both `RUI_ACPX_CODEX_URL` and `RUI_ACPX_CLAUDE_URL` at it, so a
+non-default port works without editing any scattered `8790`/`8791`/`18790`
+literal.
+
 | Scenario | Parallelism | Event evidence | Status |
 | --- | --- | --- | --- |
 | Composer prompt | One focused compose field | `session/prompt` contains the exact typed text | Proven (`PANEL_HOST_E2E_DRIVE=1`) |
