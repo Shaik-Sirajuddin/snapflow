@@ -313,8 +313,8 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
         SettingsMsg::DevModeToggled(enabled) => {
             (vec![Effect::SaveDevMode { enabled }], vec![Dirty::Settings])
         }
-        SettingsMsg::McpServerCreate { name, config } => (
-            vec![Effect::McpServerCreate { real_index: idx, name, config }],
+        SettingsMsg::McpServerCreate { name, command } => (
+            vec![Effect::McpServerCreate { real_index: idx, name, command }],
             vec![Dirty::Settings],
         ),
         SettingsMsg::McpServerDelete { name } => (
@@ -325,8 +325,19 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             vec![Effect::McpServerEnabledChanged { real_index: idx, name, enabled }],
             vec![Dirty::Settings],
         ),
-        SettingsMsg::ProfileCreate { name, config } => (
-            vec![Effect::ProfileCreate { real_index: idx, name, config }],
+        SettingsMsg::ProfileCreate {
+            name,
+            agent_id,
+            terminal_enabled,
+            fs_enabled,
+        } => (
+            vec![Effect::ProfileCreate {
+                real_index: idx,
+                name,
+                agent_id,
+                terminal_enabled,
+                fs_enabled,
+            }],
             vec![Dirty::Settings],
         ),
         SettingsMsg::ProfileDelete { name } => (

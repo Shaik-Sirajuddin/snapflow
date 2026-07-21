@@ -1363,6 +1363,234 @@ impl PanelSingleton {
         self.refresh_local_terminal_for(real_idx);
     }
 
+    /// `dispatch.rs`'s Settings-domain wrappers (tea-slint-model Phase 4)
+    /// call these -- extracted verbatim from the former `on_settings_*`/
+    /// `on_mcp_server_*`/`on_profile_*`/`on_mode_selected`/
+    /// `on_config_option_selected`/`on_agent_install_requested`/
+    /// `on_dev_mode_toggled` closure bodies.
+    pub(crate) fn dispatch_settings_requested(&self, component: &ChatPanel) {
+        component.set_settings_open(true);
+        let scope = if settings_file::SettingsPaths::from_env().project.is_some() {
+            "project"
+        } else {
+            "global"
+        };
+        component.set_settings_scope(scope.into());
+        self.apply_json_prefs_to_component();
+        if let Some(store) = self.panel_state.as_ref() {
+            let selected_override = self
+                .real_index(component.get_selected_thread() as usize)
+                .and_then(|idx| {
+                    self.bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_binding(idx))
+                        .map(|binding| binding.thread_id)
+                })
+                .and_then(|thread_id| {
+                    store
+                        .thread_settings(&thread_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|settings| settings.background_session)
+                });
+            component.set_background_override_set(selected_override.is_some());
+            component.set_background_override(selected_override.unwrap_or(false));
+        }
+        self.refresh_settings_gateway_lists();
+    }
+
+    pub(crate) fn dispatch_settings_scope_changed(&self, component: &ChatPanel, scope: &str) {
+        if load_scoped_panel_prefs(scope, None).is_none() {
+            component.set_settings_scope("global".into());
+        }
+        self.apply_json_prefs_to_component();
+    }
+
+    pub(crate) fn dispatch_settings_save(&self, component: &ChatPanel) {
+        let defaults = PanelDefaults {
+            profile_name: non_empty(component.get_default_profile().to_string()),
+            permission_profile: non_empty(component.get_permission_profile().to_string()),
+            background_session: component.get_background_default(),
+            selected_thread_id: self
+                .real_index(component.get_selected_thread() as usize)
+                .and_then(|idx| {
+                    self.bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_binding(idx))
+                        .map(|binding| binding.thread_id)
+                }),
+        };
+        if let Err(error) = save_panel_prefs_to_json(
+            component.get_settings_scope().as_str(),
+            &defaults,
+            non_empty(component.get_default_agent_id().to_string()),
+        ) {
+            eprintln!("panel-rust: failed to save panel settings JSON: {error}");
+            return;
+        }
+        self.sync_runtime_defaults(&load_panel_prefs(None));
+        self.settings_ignore_watch_until.set(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        ));
+        if let Some(store) = self.panel_state.as_ref() {
+            if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
+                if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
+                    eprintln!("panel-rust: failed to persist selected chat thread: {error}");
+                }
+            }
+            if let Some(thread_id) = defaults.selected_thread_id.as_deref() {
+                let override_value = component
+                    .get_background_override_set()
+                    .then_some(component.get_background_override());
+                if let Err(error) = store.set_background_override(thread_id, override_value) {
+                    eprintln!(
+                        "panel-rust: failed to save background-session override: {error}"
+                    );
+                }
+            }
+        }
+        self.refresh_threads_model();
+        component.set_settings_open(false);
+    }
+
+    pub(crate) fn dispatch_mcp_server_create(
+        &self,
+        component: &ChatPanel,
+        name: &str,
+        command: &str,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let entry = if command.is_empty() {
+            serde_json::json!({ "name": name })
+        } else {
+            serde_json::json!({ "name": name, "command": command })
+        };
+        let gw = self.settings_gateway_index();
+        bridge.create_mcp_server(gw, entry);
+        component.set_available_mcp_servers(models::to_mcp_server_options(
+            bridge.list_mcp_servers(gw),
+        ));
+    }
+
+    pub(crate) fn dispatch_mcp_server_delete(&self, component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        bridge.delete_mcp_server(gw, name);
+        component.set_available_mcp_servers(models::to_mcp_server_options(
+            bridge.list_mcp_servers(gw),
+        ));
+    }
+
+    pub(crate) fn dispatch_mcp_server_enabled_changed(
+        &self,
+        component: &ChatPanel,
+        name: &str,
+        enabled: bool,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        let Some(mut entry) = bridge
+            .list_mcp_servers(gw)
+            .into_iter()
+            .find(|entry| entry.name == name)
+        else {
+            eprintln!(
+                "panel-rust: MCP server {:?} disappeared before its enabled state could update",
+                name
+            );
+            component.set_available_mcp_servers(models::to_mcp_server_options(
+                bridge.list_mcp_servers(gw),
+            ));
+            return;
+        };
+        entry.extra["enabled"] = serde_json::Value::Bool(enabled);
+        if !bridge.update_mcp_server(gw, entry.extra) {
+            eprintln!(
+                "panel-rust: failed to update enabled state for MCP server {:?}",
+                name
+            );
+        }
+        component.set_available_mcp_servers(models::to_mcp_server_options(
+            bridge.list_mcp_servers(gw),
+        ));
+    }
+
+    pub(crate) fn dispatch_profile_create(
+        &self,
+        component: &ChatPanel,
+        name: &str,
+        agent_id: Option<&str>,
+        terminal_enabled: bool,
+        fs_enabled: bool,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let mut entry = serde_json::json!({
+            "name": name,
+            "allow_terminal_access": terminal_enabled,
+            "allow_fs_access": fs_enabled,
+        });
+        if let Some(agent_id) = agent_id.filter(|s| !s.is_empty()) {
+            entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
+        }
+        let gw = self.settings_gateway_index();
+        bridge.create_profile(gw, entry);
+        component.set_available_profiles(models::to_profile_options(bridge.list_profiles(gw)));
+    }
+
+    pub(crate) fn dispatch_profile_delete(&self, component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        bridge.delete_profile(gw, name);
+        component.set_available_profiles(models::to_profile_options(bridge.list_profiles(gw)));
+    }
+
+    pub(crate) fn dispatch_agent_install_requested(&self, component: &ChatPanel, agent_id: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        bridge.install_agent(gw, agent_id);
+        component.set_agent_catalog(models::to_agent_catalog_entries(bridge.list_agents(gw)));
+    }
+
+    pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
+        let paths = settings_file::SettingsPaths::from_env();
+        if let Err(error) = paths.set_dev_mode(enabled) {
+            eprintln!("panel-rust: failed to persist dev mode: {error}");
+        }
+        self.component.set_dev_mode(enabled);
+        if enabled {
+            let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+            if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
+                eprintln!("panel-rust: failed to install bundled global skill: {error}");
+            }
+            self.refresh_skills_model();
+        }
+    }
+
+    pub(crate) fn dispatch_mode_selected(&self, component: &ChatPanel, mode_id: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+            return;
+        };
+        bridge.set_mode(real_idx, mode_id.to_string());
+    }
+
+    pub(crate) fn dispatch_config_option_selected(
+        &self,
+        component: &ChatPanel,
+        option_id: &str,
+        value: &str,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+            return;
+        };
+        bridge.set_config_option(
+            real_idx,
+            option_id.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
     pub(crate) fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
@@ -1907,6 +2135,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        // tea-slint-model Phase 4 (Settings domain): routed through
+        // Msg::Ui(UiMsg::Settings(..)) -> update() -> dispatch's bridge
+        // into the dispatch_settings_*/dispatch_mcp_server_*/
+        // dispatch_profile_*/dispatch_agent_install_requested methods
+        // (unchanged, now pub(crate)) -- see dispatch.rs's doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_settings_requested(move || {
             let Some(component) = component_weak.upgrade() else {
@@ -1914,40 +2147,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    // Open immediately so a slow/failed gateway list cannot
-                    // leave the user thinking Settings is dead.
-                    component.set_settings_open(true);
-                    let scope = if settings_file::SettingsPaths::from_env()
-                        .project
-                        .is_some()
-                    {
-                        "project"
-                    } else {
-                        "global"
-                    };
-                    component.set_settings_scope(scope.into());
-                    panel.apply_json_prefs_to_component();
-                    if let Some(store) = panel.panel_state.as_ref() {
-                        let selected_override = panel
-                            .real_index(component.get_selected_thread() as usize)
-                            .and_then(|idx| {
-                                panel
-                                    .bridge
-                                    .as_ref()
-                                    .and_then(|bridge| bridge.thread_binding(idx))
-                                    .map(|binding| binding.thread_id)
-                            })
-                            .and_then(|thread_id| {
-                                store
-                                    .thread_settings(&thread_id)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|settings| settings.background_session)
-                            });
-                        component.set_background_override_set(selected_override.is_some());
-                        component.set_background_override(selected_override.unwrap_or(false));
-                    }
-                    panel.refresh_settings_gateway_lists();
+                    dispatch::dispatch_settings_open(panel, &component);
                 }
             });
         });
@@ -1958,14 +2158,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 return;
             };
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                if load_scoped_panel_prefs(scope.as_str(), None).is_none() {
-                    component.set_settings_scope("global".into());
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_settings_scope_changed(panel, &component, scope.to_string());
                 }
-                panel.apply_json_prefs_to_component();
             });
         });
 
@@ -1976,72 +2171,21 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let defaults = PanelDefaults {
-                        profile_name: non_empty(component.get_default_profile().to_string()),
-                        permission_profile: non_empty(
-                            component.get_permission_profile().to_string(),
-                        ),
-                        background_session: component.get_background_default(),
-                        selected_thread_id: panel
-                            .real_index(component.get_selected_thread() as usize)
-                            .and_then(|idx| {
-                                panel
-                                    .bridge
-                                    .as_ref()
-                                    .and_then(|bridge| bridge.thread_binding(idx))
-                                    .map(|binding| binding.thread_id)
-                            }),
-                    };
-                    // JSON is the multi-process source of truth for prefs.
-                    if let Err(error) = save_panel_prefs_to_json(
-                        component.get_settings_scope().as_str(),
-                        &defaults,
-                        non_empty(component.get_default_agent_id().to_string()),
-                    ) {
-                        eprintln!("panel-rust: failed to save panel settings JSON: {error}");
-                        return;
-                    }
-                    // JSON remains the cross-process source of truth. The
-                    // SQLite mirror exists solely for immediate thread-level
-                    // background-session resolution in this panel process.
-                    panel.sync_runtime_defaults(&load_panel_prefs(None));
-                    // Mark self-write so the file watcher does not bounce UI.
-                    panel.settings_ignore_watch_until.set(Some(
-                        std::time::Instant::now() + std::time::Duration::from_millis(500),
-                    ));
-                    if let Some(store) = panel.panel_state.as_ref() {
-                        // Selected thread stays process-local SQLite only.
-                        if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
-                            if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
-                                eprintln!(
-                                    "panel-rust: failed to persist selected chat thread: {error}"
-                                );
-                            }
-                        }
-                        if let Some(thread_id) = defaults.selected_thread_id.as_deref() {
-                            let override_value = component
-                                .get_background_override_set()
-                                .then_some(component.get_background_override());
-                            if let Err(error) =
-                                store.set_background_override(thread_id, override_value)
-                            {
-                                eprintln!(
-                                    "panel-rust: failed to save background-session override: {error}"
-                                );
-                            }
-                        }
-                    }
-                    panel.refresh_threads_model();
-                    component.set_settings_open(false);
+                    dispatch::dispatch_settings_save(panel, &component);
                 }
             });
         });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_settings_close(move || {
-            if let Some(component) = component_weak.upgrade() {
-                component.set_settings_open(false);
-            }
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_settings_close(panel, &component);
+                }
+            });
         });
 
         panel.component.on_error_banner_dismissed(move || {
@@ -2104,25 +2248,12 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let entry = if command.is_empty() {
-                        serde_json::json!({ "name": name.to_string() })
-                    } else {
-                        serde_json::json!({ "name": name.to_string(), "command": command.to_string() })
-                    };
-                    // Don't optimistically append -- re-list from the
-                    // gateway's own state either way, same posture as
-                    // the mode/config selector's `refresh_capabilities_
-                    // for`. A failed create still triggers a re-list so
-                    // the sheet reflects reality (e.g. a duplicate name
-                    // the gateway rejected).
-                    let gw = panel.settings_gateway_index();
-                    bridge.create_mcp_server(gw, entry);
-                    component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(gw),
-                    ));
+                    dispatch::dispatch_mcp_server_create(
+                        panel,
+                        &component,
+                        name.to_string(),
+                        command.to_string(),
+                    );
                 }
             });
         });
@@ -2134,14 +2265,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let gw = panel.settings_gateway_index();
-                    bridge.delete_mcp_server(gw, &name);
-                    component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(gw),
-                    ));
+                    dispatch::dispatch_mcp_server_delete(panel, &component, name.to_string());
                 }
             });
         });
@@ -2151,43 +2275,17 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .component
             .on_mcp_server_enabled_changed(move |name, enabled| {
                 let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                    let slot = cell.borrow();
-                    let Some(panel) = slot.as_ref() else {
-                        return;
-                    };
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let gw = panel.settings_gateway_index();
-                    let Some(mut entry) = bridge
-                        .list_mcp_servers(gw)
-                        .into_iter()
-                        .find(|entry| entry.name == name.as_str())
-                    else {
-                        eprintln!(
-                            "panel-rust: MCP server {:?} disappeared before its enabled state could update",
-                            name
-                        );
-                        component.set_available_mcp_servers(models::to_mcp_server_options(
-                            bridge.list_mcp_servers(gw),
-                        ));
-                        return;
-                    };
-                    entry.extra["enabled"] = serde_json::Value::Bool(enabled);
-                    if !bridge.update_mcp_server(gw, entry.extra) {
-                        eprintln!(
-                            "panel-rust: failed to update enabled state for MCP server {:?}",
-                            name
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_enabled_changed(
+                            panel,
+                            &component,
+                            name.to_string(),
+                            enabled,
                         );
                     }
-                    // The gateway is authoritative. Re-list after either
-                    // outcome rather than leaving an optimistic UI value.
-                    component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(gw),
-                    ));
                 });
             });
 
@@ -2200,28 +2298,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 PANEL.with(|cell| {
                     if let Some(panel) = cell.borrow().as_ref() {
-                        let Some(bridge) = &panel.bridge else {
-                            return;
-                        };
-                        let mut entry = serde_json::json!({
-                            "name": name.to_string(),
-                            "allow_terminal_access": terminal_enabled,
-                            "allow_fs_access": fs_enabled,
-                        });
-                        if !agent_id.is_empty() {
-                            entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
-                        }
-                        // Don't optimistically append -- re-list from
-                        // the gateway's own state either way, same
-                        // posture as `on_mcp_server_create` above. A
-                        // failed create still triggers a re-list so the
-                        // sheet reflects reality (e.g. a duplicate name
-                        // the gateway rejected).
-                        let gw = panel.settings_gateway_index();
-                        bridge.create_profile(gw, entry);
-                        component.set_available_profiles(models::to_profile_options(
-                            bridge.list_profiles(gw),
-                        ));
+                        dispatch::dispatch_profile_create(
+                            panel,
+                            &component,
+                            name.to_string(),
+                            (!agent_id.is_empty()).then(|| agent_id.to_string()),
+                            terminal_enabled,
+                            fs_enabled,
+                        );
                     }
                 });
             });
@@ -2233,14 +2317,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let gw = panel.settings_gateway_index();
-                    bridge.delete_profile(gw, &name);
-                    component.set_available_profiles(models::to_profile_options(
-                        bridge.list_profiles(gw),
-                    ));
+                    dispatch::dispatch_profile_delete(panel, &component, name.to_string());
                 }
             });
         });
@@ -2252,25 +2329,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    // Blocking, same posture as `add_thread_with_
-                    // profile`'s own gateway calls -- `agents/install`
-                    // is a low-frequency settings-sheet action, and
-                    // this call can be genuinely slow (a real first-time
-                    // npx/binary install). A future progress/job model
-                    // is an explicitly open, undecided item (see acpx-
-                    // client::ext::registry::install's own doc comment)
-                    // -- not addressed by this call site.
-                   let gw = panel.settings_gateway_index();
-                   bridge.install_agent(gw, &agent_id);
-                   component.set_agent_catalog(models::to_agent_catalog_entries(
-                       bridge.list_agents(gw),
-                   ));
-               }
-           });
-       });
+                    dispatch::dispatch_agent_install_requested(
+                        panel,
+                        &component,
+                        agent_id.to_string(),
+                    );
+                }
+            });
+        });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2630,22 +2696,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         });
 
         panel.component.on_dev_mode_toggled(move |enabled| {
-            let paths = settings_file::SettingsPaths::from_env();
-            if let Err(error) = paths.set_dev_mode(enabled) {
-                eprintln!("panel-rust: failed to persist dev mode: {error}");
-            }
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                panel.component.set_dev_mode(enabled);
-                if enabled {
-                    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-                    if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
-                        eprintln!("panel-rust: failed to install bundled global skill: {error}");
-                    }
-                    panel.refresh_skills_model();
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_dev_mode_toggled(panel, enabled);
                 }
             });
         });
@@ -2960,13 +3013,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) =
-                        panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    bridge.set_mode(real_idx, mode_id.to_string());
+                    dispatch::dispatch_mode_selected(panel, &component, mode_id.to_string());
                 }
             });
         });
@@ -2980,16 +3027,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 PANEL.with(|cell| {
                     if let Some(panel) = cell.borrow().as_ref() {
-                        let Some(bridge) = &panel.bridge else { return };
-                        let Some(real_idx) =
-                            panel.real_index(component.get_selected_thread() as usize)
-                        else {
-                            return;
-                        };
-                        bridge.set_config_option(
-                            real_idx,
+                        dispatch::dispatch_config_option_selected(
+                            panel,
+                            &component,
                             option_id.to_string(),
-                            serde_json::Value::String(value.to_string()),
+                            value.to_string(),
                         );
                     }
                 });

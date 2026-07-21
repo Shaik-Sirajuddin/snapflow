@@ -78,10 +78,15 @@ pub enum SettingsMsg {
     ConfigOptionSelected { key: String, value: String },
     ModeSelected(String),
     DevModeToggled(bool),
-    McpServerCreate { name: String, config: String },
+    McpServerCreate { name: String, command: String },
     McpServerDelete { name: String },
     McpServerEnabledChanged { name: String, enabled: bool },
-    ProfileCreate { name: String, config: String },
+    ProfileCreate {
+        name: String,
+        agent_id: Option<String>,
+        terminal_enabled: bool,
+        fs_enabled: bool,
+    },
     ProfileDelete { name: String },
     AgentInstallRequested { agent_id: String },
 }

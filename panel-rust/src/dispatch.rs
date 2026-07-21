@@ -26,7 +26,7 @@
 
 use crate::dirty::{Dirty, ScalarField};
 use crate::model::{Model, ThreadModel};
-use crate::msg::{ComposeMsg, Msg, RequestMsg, TerminalMsg, ThreadMsg, UiMsg};
+use crate::msg::{ComposeMsg, Msg, RequestMsg, SettingsMsg, TerminalMsg, ThreadMsg, UiMsg};
 use crate::update::update;
 use crate::ChatPanel;
 use crate::PanelSingleton;
@@ -296,6 +296,161 @@ pub(crate) fn dispatch_terminal_local_close(panel: &PanelSingleton, component: &
         "Terminal::LocalClose must always produce exactly one LocalTerminalKill effect"
     );
     panel.dispatch_local_terminal_close(component);
+}
+
+// Settings-domain wrappers (tea-slint-model Phase 4). Same bridge shape
+// as the domains above: `update()` genuinely runs (proving the Msg
+// routes), then the real cascade is delegated to the matching
+// `dispatch_*`/`answer_*` PanelSingleton method, moved verbatim from the
+// former closure bodies. Kept terser here (no per-function doc comment,
+// no debug_assert on Dirty/Effect shape) since the pattern is now
+// established by the four domains above -- see `dispatch_terminal_expand`
+// for the fuller-commented version of the same shape.
+
+pub(crate) fn dispatch_settings_open(panel: &PanelSingleton, component: &ChatPanel) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(crate::msg::SettingsMsg::Open)));
+    panel.dispatch_settings_requested(component);
+}
+
+pub(crate) fn dispatch_settings_scope_changed(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    scope: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ScopeChanged(scope.clone()))),
+    );
+    panel.dispatch_settings_scope_changed(component, &scope);
+}
+
+pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, component: &ChatPanel) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(String::new()))));
+    panel.dispatch_settings_save(component);
+}
+
+pub(crate) fn dispatch_settings_close(_panel: &PanelSingleton, component: &ChatPanel) {
+    component.set_settings_open(false);
+}
+
+pub(crate) fn dispatch_mcp_server_create(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    name: String,
+    command: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
+            name: name.clone(),
+            command: command.clone(),
+        })),
+    );
+    panel.dispatch_mcp_server_create(component, &name, &command);
+}
+
+pub(crate) fn dispatch_mcp_server_delete(panel: &PanelSingleton, component: &ChatPanel, name: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerDelete { name: name.clone() })),
+    );
+    panel.dispatch_mcp_server_delete(component, &name);
+}
+
+pub(crate) fn dispatch_mcp_server_enabled_changed(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    name: String,
+    enabled: bool,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
+            name: name.clone(),
+            enabled,
+        })),
+    );
+    panel.dispatch_mcp_server_enabled_changed(component, &name, enabled);
+}
+
+pub(crate) fn dispatch_profile_create(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    name: String,
+    agent_id: Option<String>,
+    terminal_enabled: bool,
+    fs_enabled: bool,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileCreate {
+            name: name.clone(),
+            agent_id: agent_id.clone(),
+            terminal_enabled,
+            fs_enabled,
+        })),
+    );
+    panel.dispatch_profile_create(component, &name, agent_id.as_deref(), terminal_enabled, fs_enabled);
+}
+
+pub(crate) fn dispatch_profile_delete(panel: &PanelSingleton, component: &ChatPanel, name: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileDelete { name: name.clone() })),
+    );
+    panel.dispatch_profile_delete(component, &name);
+}
+
+pub(crate) fn dispatch_agent_install_requested(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    agent_id: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::AgentInstallRequested {
+            agent_id: agent_id.clone(),
+        })),
+    );
+    panel.dispatch_agent_install_requested(component, &agent_id);
+}
+
+pub(crate) fn dispatch_dev_mode_toggled(panel: &PanelSingleton, enabled: bool) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(SettingsMsg::DevModeToggled(enabled))));
+    panel.dispatch_dev_mode_toggled(enabled);
+}
+
+pub(crate) fn dispatch_mode_selected(panel: &PanelSingleton, component: &ChatPanel, mode_id: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(SettingsMsg::ModeSelected(mode_id.clone()))));
+    panel.dispatch_mode_selected(component, &mode_id);
+}
+
+pub(crate) fn dispatch_config_option_selected(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    key: String,
+    value: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ConfigOptionSelected {
+            key: key.clone(),
+            value: value.clone(),
+        })),
+    );
+    panel.dispatch_config_option_selected(component, &key, &value);
 }
 
 #[cfg(test)]
