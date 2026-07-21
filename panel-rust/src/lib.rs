@@ -36,7 +36,9 @@ mod settings_file;
 // of duplicating the SKILL.md front-matter parsing logic.
 pub mod skills_state;
 mod state_store;
+mod sync;
 mod theme;
+mod update;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec};
 use appearance::{AppearanceState, ColorScheme, HostAppearance};

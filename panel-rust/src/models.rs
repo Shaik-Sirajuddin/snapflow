@@ -559,7 +559,7 @@ pub fn describe_thread(msgs: &[ChatMessage], max_chars: usize) -> String {
 /// (`thread-selected(filtered_idx)`) can be translated back to the
 /// actual thread the bridge/`thread_state` know about. See
 /// `PanelSingleton::visible_indices`/`real_index` in `lib.rs`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct VisibleThreadItem {
     pub real_index: usize,
     pub item: ThreadItem,
