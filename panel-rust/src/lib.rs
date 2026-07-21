@@ -3743,12 +3743,33 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // animation (the sidebar rail's `animate width`, a Flickable's
         // drag-release momentum, hover fades, ...).
         let animating = panel.window.window().has_active_animations();
+        // chat_area.slint's `live-flow-timer` (the traveling pulse on the
+        // last row of a streaming/cancelling thread, `is-live-tail`) is a
+        // plain `Timer` manually mutating `flow-t` every 40ms, not a Slint
+        // `animate`/`@keyframes` block -- so `has_active_animations()`
+        // above never sees it as "active" even though
+        // update_timers_and_animations() (top of this fn) is ticking it
+        // correctly every poll. The property value keeps advancing
+        // in-memory, but nothing told Qt a frame still needs painting, so
+        // the pulse only ever became visible on some unrelated repaint
+        // (e.g. a mouse move triggering RustPanelItem::hoverMoveEvent) --
+        // with zero mouse/keyboard activity it looked completely frozen.
+        // Mirrors is-live-tail's own condition (app.slint's `sending`
+        // binding) directly off `thread_state` instead of reading back
+        // through the Slint model.
+        let live_tail_pulsing = selected.is_some_and(|idx| {
+            matches!(
+                panel.thread_state.borrow().get(idx),
+                Some(ThreadState::Loading) | Some(ThreadState::Cancelling)
+            )
+        });
         bridge_changed
             || local_terminal_changed
             || connection_changed
             || settings_changed
             || attachment_changed
             || animating
+            || live_tail_pulsing
     })
 }
 
