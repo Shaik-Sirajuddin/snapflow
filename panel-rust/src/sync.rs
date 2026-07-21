@@ -84,11 +84,17 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             }
         }
         Dirty::Error { thread_id, detail } => {
-            let displayed_thread_id = model
-                .displayed_thread
-                .and_then(|idx| model.threads.get(idx))
-                .and_then(|thread| thread.session_id.as_deref());
-            if thread_id.is_empty() || displayed_thread_id == Some(thread_id.as_str()) {
+            // Match durable thread_id *or* session_id (same contract as
+            // MessageStreamingDelta / frame snapshots). Comparing only
+            // session_id dropped banners for pre-attach threads.
+            let for_displayed = thread_id.is_empty()
+                || model.displayed_thread.is_some_and(|idx| {
+                    model
+                        .threads
+                        .get(idx)
+                        .is_some_and(|thread| Model::thread_matches_id(thread, thread_id))
+                });
+            if for_displayed {
                 component.set_last_error(detail.message.clone().into());
             }
         }
@@ -100,9 +106,8 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         Dirty::Terminal { .. } => {
             if let Some(idx) = model.displayed_thread {
                 if let Some(thread) = model.threads.get(idx) {
-                    component.set_terminals(slint::ModelRc::new(slint::VecModel::from(
-                        thread.terminals.clone(),
-                    )));
+                    reconcile_terminals(model, &thread.terminals);
+                    component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
                     if let Some(expanded) = &thread.expanded_terminal {
                         component.set_expanded_terminal(expanded.clone());
                     } else {
@@ -373,6 +378,19 @@ fn apply_skill_ops(model: &Model, ops: &[RowOp<crate::SkillOption>]) {
     }
 }
 
+fn reconcile_terminals(model: &Model, terminals: &[crate::TerminalItem]) {
+    let new_keys: Vec<String> = terminals
+        .iter()
+        .map(|term| term.terminal_id.to_string())
+        .collect();
+    crate::list_model::reconcile(
+        &model.terminals_model,
+        &mut model.terminal_model_keys.borrow_mut(),
+        &new_keys,
+        terminals,
+    );
+}
+
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
     let profile_keys: Vec<String> = model
@@ -502,6 +520,7 @@ pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_threads(slint::ModelRc::from(model.thread_model.clone()));
     component.set_messages(slint::ModelRc::from(model.messages_model.clone()));
     component.set_available_skills(slint::ModelRc::from(model.skills_model.clone()));
+    component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
     reconcile_settings_models(model, component);
 }
 
@@ -520,6 +539,7 @@ pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
 mod tests {
     use super::*;
     use crate::models::VisibleThreadItem;
+    use std::rc::Rc;
 
     #[test]
     fn thread_row_ops_apply_to_the_persistent_model_and_key_cache() {
@@ -636,6 +656,42 @@ mod tests {
         apply_message_streaming(&model, "background-thread", "shared-id", " must not appear");
 
         assert_eq!(model.messages_model.row_data(0).unwrap().text, "displayed");
+    }
+
+    #[test]
+    fn terminals_reconcile_in_place_without_replacing_the_model() {
+        let model = Model::default();
+        model.terminals_model.push(crate::TerminalItem {
+            terminal_id: "t1".into(),
+            output: "old".into(),
+            ..crate::TerminalItem::default()
+        });
+        *model.terminal_model_keys.borrow_mut() = vec!["t1".to_owned()];
+        let identity = model.terminals_model.clone();
+
+        reconcile_terminals(
+            &model,
+            &[
+                crate::TerminalItem {
+                    terminal_id: "t1".into(),
+                    output: "new".into(),
+                    ..crate::TerminalItem::default()
+                },
+                crate::TerminalItem {
+                    terminal_id: "t2".into(),
+                    output: "added".into(),
+                    ..crate::TerminalItem::default()
+                },
+            ],
+        );
+
+        assert!(Rc::ptr_eq(&identity, &model.terminals_model));
+        assert_eq!(model.terminals_model.row_count(), 2);
+        assert_eq!(model.terminals_model.row_data(0).unwrap().output, "new");
+        assert_eq!(
+            *model.terminal_model_keys.borrow(),
+            vec!["t1".to_owned(), "t2".to_owned()]
+        );
     }
 
     #[test]

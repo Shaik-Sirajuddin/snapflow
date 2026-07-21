@@ -1084,7 +1084,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 })),
             ))
         };
-        let mut model = model::Model::from_initial_state(model::InitialState {
+        // Cold-start payload is collected once, then folded only through
+        // Init -> InitialStateLoaded. The shell Model starts empty so the
+        // TEA path owns the first real hydration (no pre-seed + replace).
+        let initial = model::InitialState {
             threads: initial_specs.clone(),
             thread_ids: restored_records
                 .iter()
@@ -1101,7 +1104,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             } else {
                 vec![ThreadState::Error; initial_specs.len()]
             },
-        });
+        };
+        let mut model = model::Model::default();
         let thread_model = Rc::new(VecModel::default());
         let messages_model = Rc::new(VecModel::default());
         let skills_model = Rc::new(VecModel::default());
@@ -1129,31 +1133,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             settings_ignore_watch_until: Cell::new(None),
             _settings_watcher: settings_watcher,
         };
+        // Bind persistent VecModels before any callback can fire; content
+        // arrives from the Init hydration + first Frame snapshot below.
         crate::sync::sync_initial_models(&panel.model.borrow(), &panel.component);
-        // Cold start enters through the same TEA path as every later event.
-        // The store/bridge snapshot has already been collected above, so
-        // this synchronous effect completion is the local executor for the
-        // initial-state load. It establishes the first Model before any
-        // Slint callback can observe the panel.
         {
-            let initial = model::InitialState {
-                threads: initial_specs.clone(),
-                thread_ids: restored_records
-                    .iter()
-                    .map(|record| record.thread_id.clone())
-                    .chain(
-                        (restored_records.len()..initial_specs.len())
-                            .map(|idx| format!("thread:{idx}")),
-                    )
-                    .collect(),
-                selected_thread_id: initial_selected_thread_id.clone(),
-                permission_profiles: initial_permission_profiles.clone(),
-                thread_states: if bridge_available {
-                    vec![ThreadState::Idle; initial_specs.len()]
-                } else {
-                    vec![ThreadState::Error; initial_specs.len()]
-                },
-            };
             let mut model = panel.model.borrow_mut();
             let (effects, _) = update::update(&mut model, msg::Msg::Host(msg::HostMsg::Init));
             debug_assert!(matches!(

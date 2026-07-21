@@ -6,9 +6,21 @@
 
 use crate::dispatch::update_persistent;
 use crate::effect::{Effect, EffectError, EffectResultMsg};
-use crate::msg::Msg;
+use crate::msg::{FrameInput, Msg};
 use crate::PanelSingleton;
 use slint::ComponentHandle;
+
+/// Default frame poll does not collect skills. After filesystem skill
+/// mutations, re-scan and fold an explicit skills snapshot so the list
+/// stays in sync without a dual-path `refresh_skills_model`.
+fn refresh_skills_after_effect(panel: &PanelSingleton) {
+    let skills_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+        .collect_skills_snapshot();
+    panel.dispatch_frame_input(FrameInput {
+        skills_snapshot: Some(skills_snapshot),
+        ..FrameInput::default()
+    });
+}
 
 fn execute_skill_effects(effects: Vec<Effect>) {
     for effect in effects {
@@ -27,7 +39,7 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                                 panel,
                                 Msg::Effect(EffectResultMsg::SkillWritten(result)),
                             );
-                            crate::dispatch::dispatch_frame_poll(panel);
+                            // Content write does not change list identity; no skills rescan.
                         });
                     });
                 });
@@ -70,7 +82,7 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                                 Msg::Effect(EffectResultMsg::SkillCreated(result)),
                             );
                             execute_effects(panel, follow_up);
-                            crate::dispatch::dispatch_frame_poll(panel);
+                            refresh_skills_after_effect(panel);
                         });
                     });
                 });
@@ -163,7 +175,7 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                                 panel,
                                 Msg::Effect(EffectResultMsg::SkillPromoted(result)),
                             );
-                            crate::dispatch::dispatch_frame_poll(panel);
+                            refresh_skills_after_effect(panel);
                         });
                     });
                 });
@@ -303,7 +315,9 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             }
             Effect::CloseThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
-                    let _ = bridge.close_thread(real_index);
+                    if !bridge.close_thread(real_index) {
+                        eprintln!("panel-rust: close_thread({real_index}) returned false");
+                    }
                 }
             }
             Effect::PersistSelectedThread { thread_id } => {
@@ -400,13 +414,25 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             }
             Effect::DeleteThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
-                    let _ = bridge.delete_thread(real_index);
+                    if !bridge.delete_thread(real_index) {
+                        eprintln!("panel-rust: delete_thread({real_index}) returned false");
+                    }
                 }
             }
             Effect::SkillDelete { path } => {
-                if let Err(error) = std::fs::remove_dir_all(path) {
+                let result = std::fs::remove_dir_all(&path)
+                    .map_err(|error| EffectError::new(error.to_string()));
+                if let Err(error) = &result {
                     eprintln!("panel-rust: failed to delete skill: {error}");
                 }
+                let _ = update_persistent(
+                    panel,
+                    Msg::Effect(match result {
+                        Ok(()) => EffectResultMsg::SkillWritten(Ok(())),
+                        Err(error) => EffectResultMsg::SkillWritten(Err(error)),
+                    }),
+                );
+                refresh_skills_after_effect(panel);
             }
             Effect::NewThread { .. } | Effect::RecoverSessionAttach { .. } => {
                 debug_assert!(

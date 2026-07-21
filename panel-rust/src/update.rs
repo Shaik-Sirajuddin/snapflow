@@ -90,12 +90,12 @@ fn selected_real_index(model: &Model) -> usize {
         .unwrap_or(model.selected_thread)
 }
 
-fn visible_thread_row(model: &Model, real_index: usize) -> crate::models::VisibleThreadItem {
-    let thread = model
-        .threads
-        .get(real_index)
-        .expect("visible thread index must resolve in Model");
-    crate::models::VisibleThreadItem {
+fn visible_thread_row(
+    model: &Model,
+    real_index: usize,
+) -> Option<crate::models::VisibleThreadItem> {
+    let thread = model.threads.get(real_index)?;
+    Some(crate::models::VisibleThreadItem {
         real_index,
         thread_id: thread.thread_id.clone(),
         item: crate::ThreadItem {
@@ -106,25 +106,20 @@ fn visible_thread_row(model: &Model, real_index: usize) -> crate::models::Visibl
             closed: thread.closed,
             ..crate::ThreadItem::default()
         },
-    }
+    })
 }
 
 fn thread_list_dirty_with_keys(model: &mut Model, old_keys: Vec<String>) -> Dirty {
     let new_indices = visible_thread_indices(model);
-    let new_keys: Vec<String> = new_indices
+    let rows: Vec<crate::models::VisibleThreadItem> = new_indices
         .iter()
-        .filter_map(|idx| {
-            model
-                .threads
-                .get(*idx)
-                .map(|thread| thread.thread_id.clone())
-        })
+        .filter_map(|idx| visible_thread_row(model, *idx))
         .collect();
-    model.visible_indices = new_indices.clone();
-    let rows = new_indices
-        .iter()
-        .map(|idx| visible_thread_row(model, *idx))
-        .collect::<Vec<_>>();
+    // Keep indices aligned with rows that still resolve; never panic on a
+    // stale filtered index (rust-audit: no expect on model hot path).
+    let new_indices: Vec<usize> = rows.iter().map(|row| row.real_index).collect();
+    let new_keys: Vec<String> = rows.iter().map(|row| row.thread_id.clone()).collect();
+    model.visible_indices = new_indices;
     model.thread_rows = rows.clone();
     Dirty::ThreadListDiff(crate::dirty::diff_by_id(&old_keys, &new_keys, &rows))
 }
@@ -762,6 +757,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let mcp_servers_model = model.mcp_servers_model.clone();
             let agent_catalog_model = model.agent_catalog_model.clone();
             let recoverable_sessions_model = model.recoverable_sessions_model.clone();
+            let terminals_model = model.terminals_model.clone();
             let thread_keys = model.thread_model_keys.borrow().clone();
             let message_keys = model.message_model_keys.borrow().clone();
             let skill_keys = model.skill_model_keys.borrow().clone();
@@ -769,6 +765,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let mcp_server_keys = model.mcp_server_model_keys.borrow().clone();
             let agent_catalog_keys = model.agent_catalog_model_keys.borrow().clone();
             let recoverable_session_keys = model.recoverable_session_model_keys.borrow().clone();
+            let terminal_keys = model.terminal_model_keys.borrow().clone();
             *model = Model::from_initial_state(initial);
             model.thread_model = thread_model;
             model.messages_model = messages_model;
@@ -777,6 +774,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             model.mcp_servers_model = mcp_servers_model;
             model.agent_catalog_model = agent_catalog_model;
             model.recoverable_sessions_model = recoverable_sessions_model;
+            model.terminals_model = terminals_model;
             *model.thread_model_keys.borrow_mut() = thread_keys.clone();
             *model.message_model_keys.borrow_mut() = message_keys;
             *model.skill_model_keys.borrow_mut() = skill_keys;
@@ -784,6 +782,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             *model.mcp_server_model_keys.borrow_mut() = mcp_server_keys;
             *model.agent_catalog_model_keys.borrow_mut() = agent_catalog_keys;
             *model.recoverable_session_model_keys.borrow_mut() = recoverable_session_keys;
+            *model.terminal_model_keys.borrow_mut() = terminal_keys;
             let thread_list_dirty = thread_list_dirty_with_keys(model, thread_keys);
             // Cold start: everything is dirty, there is no prior row
             // identity to preserve (see 00-plan.md's known-gap section).

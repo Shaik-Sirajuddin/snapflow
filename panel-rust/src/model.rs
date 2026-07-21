@@ -130,6 +130,10 @@ pub struct Model {
     pub agent_catalog_model_keys: RefCell<Vec<String>>,
     pub recoverable_sessions_model: Rc<VecModel<crate::RemoteSessionOption>>,
     pub recoverable_session_model_keys: RefCell<Vec<String>>,
+    /// Agent terminals for the *currently displayed* thread. Reconciled
+    /// in place so streaming output does not tear down row delegates.
+    pub terminals_model: Rc<VecModel<crate::TerminalItem>>,
+    pub terminal_model_keys: RefCell<Vec<String>>,
 }
 
 impl Default for ThreadModel {
