@@ -486,6 +486,14 @@ struct PanelSingleton {
     /// Host-test trace deduplication for asynchronous attachment readiness.
     /// This never affects persistence or routing.
     traced_attachment_threads: RefCell<HashSet<String>>,
+    /// Threads whose `save_thread_record` call hit a `SessionBindingConflict`
+    /// (this run's in-memory session id differs from an old, immutable
+    /// binding already on disk -- expected after a fresh gateway can't
+    /// resume a stale session and opens a new one instead). The write is
+    /// guaranteed to keep failing identically every tick, so this is
+    /// tracked to log and stop retrying once per thread instead of
+    /// spamming the same failure at the poll tick's 60-90fps forever.
+    binding_conflict_threads: RefCell<HashSet<String>>,
     thread_state: RefCell<Vec<ThreadState>>,
     thread_errors: RefCell<Vec<String>>,
     /// `queued_send_queue_behavior` phase: one `SendQueue` per thread,
@@ -682,6 +690,13 @@ impl PanelSingleton {
             let Some(provider) = bridge.thread_provider(idx) else {
                 continue;
             };
+            if self
+                .binding_conflict_threads
+                .borrow()
+                .contains(&binding.thread_id)
+            {
+                continue;
+            }
             let record = ThreadRecord {
                 thread_id: binding.thread_id,
                 display_name: names[idx].clone(),
@@ -708,8 +723,17 @@ impl PanelSingleton {
                 Err(error) => {
                     // A record may already have a deliberately immutable
                     // profile/permission binding. Keep the live session usable
-                    // and leave that durable identity untouched.
-                    eprintln!("panel-rust: failed to persist chat thread binding: {error}");
+                    // and leave that durable identity untouched. This write
+                    // will fail identically on every future tick (the on-disk
+                    // binding never changes), so log once and stop retrying
+                    // rather than spamming the same error at poll-tick rate.
+                    if self
+                        .binding_conflict_threads
+                        .borrow_mut()
+                        .insert(record.thread_id.clone())
+                    {
+                        eprintln!("panel-rust: failed to persist chat thread binding: {error}");
+                    }
                 }
             }
         }
@@ -1646,6 +1670,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             thread_profiles: RefCell::new(initial_profiles),
             thread_permission_profiles: RefCell::new(initial_permission_profiles),
             traced_attachment_threads: RefCell::new(HashSet::new()),
+            binding_conflict_threads: RefCell::new(HashSet::new()),
             thread_state: RefCell::new(initial_state),
             // Sized to match thread_state/thread_names from construction,
             // not left empty -- an empty Vec here made every `.get_mut(idx)`
