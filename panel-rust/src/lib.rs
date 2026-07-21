@@ -2359,7 +2359,25 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let Some(panel) = slot.as_ref() else {
             return false;
         };
-        dispatch::dispatch_frame_poll(panel) || panel.window.window().has_active_animations()
+        let frame_changed = dispatch::dispatch_frame_poll(panel);
+        let animating = panel.window.window().has_active_animations();
+        // chat_area.slint's `live-flow-timer` (the traveling pulse on the
+        // last row of a streaming/cancelling thread) is a plain `Timer`
+        // mutating `flow-t`, not a Slint `animate`/`@keyframes` block, so
+        // `has_active_animations()` never reports it active even though
+        // `update_timers_and_animations()` above ticks it every poll.
+        // Without repainting on that condition the pulse only advanced on
+        // some unrelated repaint (a mouse move), looking frozen otherwise.
+        let live_tail_pulsing = {
+            let model = panel.model.borrow();
+            model
+                .displayed_thread
+                .and_then(|idx| model.threads.get(idx))
+                .is_some_and(|thread| {
+                    matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                })
+        };
+        frame_changed || animating || live_tail_pulsing
     })
 }
 
