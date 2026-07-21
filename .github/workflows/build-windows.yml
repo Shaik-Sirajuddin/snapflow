@@ -140,24 +140,35 @@ jobs:
       # FFmpeg/x264/x265/etc compile. MSYS2 ships all of these as real,
       # maintained native packages, so build directly with cmake instead
       # of the fragile from-source pipeline (which also depended on a
-      # since-revoked S3 bucket for a prebuilt MLT). The msys-repo `rust`
-      # package is MSYS2's own Rust toolchain build, which (unlike the Windows
-      # runner's preinstalled native rustup, which targets MSVC) produces
-      # GNU/mingw-ABI-compatible output matching the rest of this MinGW64
-      # toolchain -- required for Corrosion to link sap-rust in correctly.
+      # since-revoked S3 bucket for a prebuilt MLT).
+      #
+      # Rust is deliberately NOT installed via MSYS2's own `rust` package
+      # here: it produces "error: failed to join paths from
+      # `$LD_LIBRARY_PATH` together" for any absolute path, because it
+      # parses paths POSIX-style (colon-separated) and every path on a
+      # GitHub-hosted Windows runner starts with a drive letter (`D:\...`)
+      # -- the colon in "D:" gets misread as a list separator (this is
+      # rust-lang/cargo#9355, not specific to this project). The Windows
+      # runner's preinstalled native rustup handles Windows paths
+      # correctly, so we add the mingw/GNU target to it instead (below) to
+      # match this MinGW64 toolchain's ABI (native rustup otherwise
+      # defaults to the MSVC target).
       - name: Install packages
         shell: msys2 {0}
         run: |
           pacman -S --noconfirm \
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
             mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf \
-            rust \
             mingw-w64-x86_64-mlt mingw-w64-x86_64-fftw \
             mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-charts \
             mingw-w64-x86_64-qt6-declarative mingw-w64-x86_64-qt6-imageformats \
             mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-svg \
             mingw-w64-x86_64-qt6-tools mingw-w64-x86_64-qt6-translations \
             mingw-w64-x86_64-qt6-websockets
+
+      - name: Add GNU/mingw Rust target to the native toolchain
+        shell: pwsh
+        run: rustup target add x86_64-pc-windows-gnu
 
       - name: Set version
         id: set_version
@@ -171,12 +182,12 @@ jobs:
         shell: msys2 {0}
         working-directory: shotcut-rebrand
         run: |
-          # Corrosion's cargo invocation fails with "error: failed to join
-          # paths from `$LD_LIBRARY_PATH` together" -- an MSYS2-inherited
-          # POSIX-style path list confuses cargo's native-Windows path
-          # joining. It's a Linux-ism with nothing to do with this
-          # Windows/MinGW build, so just drop it.
-          unset LD_LIBRARY_PATH
+          # Put the native rustup toolchain ahead of anything MSYS2 might
+          # resolve on PATH -- see "Install packages"'s comment for why
+          # MSYS2's own `rust` package isn't used.
+          export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
+          which cargo
+          cargo --version
           cmake -B build -G Ninja \
             -D SNAPFLOW_VERSION="$VERSION" \
             -D CMAKE_BUILD_TYPE=Release \
