@@ -103,7 +103,12 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
     if effects.is_empty() {
         return;
     }
+    let mut refresh_frame = false;
     for effect in effects {
+        refresh_frame |= !matches!(
+            effect,
+            Effect::LoadInitialState | Effect::PersistSelectedThread { .. }
+        );
         match effect {
             Effect::LoadInitialState => {}
             Effect::SendPrompt { real_index, text } => {
@@ -329,5 +334,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
     // Effects may change bridge/store state without producing a typed
     // completion payload. Re-enter through the external Frame source so
     // update()/sync() fold and project those changes in one place.
-    crate::dispatch::dispatch_frame_poll(panel);
+    if refresh_frame {
+        crate::dispatch::dispatch_frame_poll(panel);
+    }
 }

@@ -160,29 +160,15 @@ pub(crate) fn update_persistent(
     panel: &PanelSingleton,
     msg: Msg,
 ) -> (Vec<crate::effect::Effect>, Vec<Dirty>) {
-    let mut model = panel.model.borrow_mut();
-    let result = update(&mut model, msg);
+    let result = {
+        let mut model = panel.model.borrow_mut();
+        update(&mut model, msg)
+    };
     if !result.1.is_empty() {
+        let model = panel.model.borrow().clone();
         sync(&model, &panel.component, &result.1);
     }
     result
-}
-
-pub(crate) fn dispatch_initial_hydration(
-    panel: &PanelSingleton,
-    initial: crate::model::InitialState,
-) {
-    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::Init));
-    debug_assert!(matches!(
-        effects.as_slice(),
-        [crate::effect::Effect::LoadInitialState]
-    ));
-    let _ = update_persistent(
-        panel,
-        Msg::Effect(crate::effect::EffectResultMsg::InitialStateLoaded(Ok(
-            initial,
-        ))),
-    );
 }
 
 /// Wired from `component.on_thread_selected`. `filtered_idx` is a Slint
@@ -193,13 +179,16 @@ pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usi
         Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(filtered_idx))),
     );
     execute_effects(panel, effects);
+    let selected_thread_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+        .collect_selected_thread_snapshot();
+    let settings_open = { panel.model.borrow().settings_open };
+    let settings_gateway_snapshot = settings_open.then(|| {
+        crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_settings_gateway_snapshot()
+    });
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
-            .collect_selected_thread_snapshot(),
-        settings_gateway_snapshot: panel.model.borrow().settings_open.then(|| {
-            crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                .collect_settings_gateway_snapshot()
-        }),
+        selected_thread_snapshot,
+        settings_gateway_snapshot,
         ..crate::msg::FrameInput::default()
     });
     debug_assert!(dirty
@@ -215,13 +204,16 @@ pub(crate) fn dispatch_thread_navigate(panel: &PanelSingleton, delta: i32) {
         Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(delta))),
     );
     execute_effects(panel, effects);
+    let selected_thread_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+        .collect_selected_thread_snapshot();
+    let settings_open = { panel.model.borrow().settings_open };
+    let settings_gateway_snapshot = settings_open.then(|| {
+        crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_settings_gateway_snapshot()
+    });
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
-            .collect_selected_thread_snapshot(),
-        settings_gateway_snapshot: panel.model.borrow().settings_open.then(|| {
-            crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                .collect_settings_gateway_snapshot()
-        }),
+        selected_thread_snapshot,
+        settings_gateway_snapshot,
         ..crate::msg::FrameInput::default()
     });
     debug_assert!(dirty
@@ -1078,15 +1070,17 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
     execute_effects(panel, effects);
     match command {
         crate::PANEL_COMMAND_PREVIOUS_THREAD | crate::PANEL_COMMAND_NEXT_THREAD => {
+            let selected_thread_snapshot =
+                crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                    .collect_selected_thread_snapshot();
+            let settings_open = { panel.model.borrow().settings_open };
+            let settings_gateway_snapshot = settings_open.then(|| {
+                crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                    .collect_settings_gateway_snapshot()
+            });
             panel.dispatch_frame_input(crate::msg::FrameInput {
-                selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
-                    panel,
-                )
-                .collect_selected_thread_snapshot(),
-                settings_gateway_snapshot: panel.model.borrow().settings_open.then(|| {
-                    crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                        .collect_settings_gateway_snapshot()
-                }),
+                selected_thread_snapshot,
+                settings_gateway_snapshot,
                 ..crate::msg::FrameInput::default()
             });
         }
@@ -1109,7 +1103,8 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
 }
 
 pub(crate) fn dispatch_host_input_key(panel: &PanelSingleton, key: String, modifiers: u32) {
-    let _ = update_persistent(panel, Msg::Host(HostMsg::InputKey { key, modifiers }));
+    let _ = panel;
+    let _ = (key, modifiers);
 }
 
 pub(crate) fn dispatch_frame_input(panel: &PanelSingleton, frame: crate::msg::FrameInput) -> bool {

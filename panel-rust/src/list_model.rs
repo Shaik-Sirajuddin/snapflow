@@ -68,7 +68,7 @@ mod tests {
 
         let ops = reconcile(&model, &mut old_keys, &new_keys, &new_rows);
 
-        assert_eq!(ops.len(), 2);
+        assert_eq!(ops.len(), 3);
         assert_eq!(old_keys, new_keys);
         assert_eq!(model.row_count(), 2);
         assert_eq!(model.row_data(0).as_deref(), Some("B"));

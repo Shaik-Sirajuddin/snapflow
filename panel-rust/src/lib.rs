@@ -1251,7 +1251,17 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     vec![ThreadState::Error; initial_specs.len()]
                 },
             };
-            dispatch::dispatch_initial_hydration(&panel, initial);
+            let mut model = panel.model.borrow_mut();
+            let (effects, _) = update::update(&mut model, msg::Msg::Host(msg::HostMsg::Init));
+            debug_assert!(matches!(
+                effects.as_slice(),
+                [effect::Effect::LoadInitialState]
+            ));
+            let (_, dirty) = update::update(
+                &mut model,
+                msg::Msg::Effect(effect::EffectResultMsg::InitialStateLoaded(Ok(initial))),
+            );
+            sync::sync(&model, &panel.component, &dirty);
         }
         // Fold the first bridge/store-backed presentation snapshot as one
         // Frame message. This makes cold start's first post-hydration sync a
@@ -1295,13 +1305,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         .is_some_and(|binding| binding.thread_id == selected_thread_id)
                 })
             }) {
-                if let Some(filtered_idx) = panel
-                    .model
-                    .borrow()
-                    .visible_indices
-                    .iter()
-                    .position(|idx| *idx == real_idx)
-                {
+                let filtered_idx = {
+                    panel
+                        .model
+                        .borrow()
+                        .visible_indices
+                        .iter()
+                        .position(|idx| *idx == real_idx)
+                };
+                if let Some(filtered_idx) = filtered_idx {
                     dispatch::dispatch_thread_selected(&panel, filtered_idx);
                 }
             }
@@ -1332,7 +1344,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 ..crate::msg::FrameInput::default()
             });
         }
-        if let Some(real_idx) = panel.real_index(panel.model.borrow().selected_thread) {
+        let selected_thread = { panel.model.borrow().selected_thread };
+        if let Some(real_idx) = panel.real_index(selected_thread) {
             panel.dispatch_frame_input(crate::msg::FrameInput {
                 selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
                     &panel,
