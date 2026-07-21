@@ -27,13 +27,7 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                                 panel,
                                 Msg::Effect(EffectResultMsg::SkillWritten(result)),
                             );
-                            panel.dispatch_frame_input(crate::msg::FrameInput {
-                                skills_snapshot: Some(
-                                    crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                                        .collect_skills_snapshot(),
-                                ),
-                                ..crate::msg::FrameInput::default()
-                            });
+                            crate::dispatch::dispatch_frame_poll(panel);
                         });
                     });
                 });
@@ -87,13 +81,7 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                                 panel,
                                 Msg::Effect(EffectResultMsg::SkillPromoted(result)),
                             );
-                            panel.dispatch_frame_input(crate::msg::FrameInput {
-                                skills_snapshot: Some(
-                                    crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                                        .collect_skills_snapshot(),
-                                ),
-                                ..crate::msg::FrameInput::default()
-                            });
+                            crate::dispatch::dispatch_frame_poll(panel);
                         });
                     });
                 });

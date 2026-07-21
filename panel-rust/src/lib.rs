@@ -852,13 +852,7 @@ impl PanelSingleton {
         match crate::skills_state::scaffold_new_skill(&dir, name) {
             Ok(skill_dir) => {
                 trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
-                self.dispatch_frame_input(msg::FrameInput {
-                    skills_snapshot: Some(
-                        crate::external_snapshot::ExternalSnapshotSource::new(self)
-                            .collect_skills_snapshot(),
-                    ),
-                    ..msg::FrameInput::default()
-                });
+                crate::dispatch::dispatch_frame_poll(self);
                 crate::dispatch::dispatch_skill_editor_open_requested(
                     self,
                     skill_dir.to_string_lossy().into_owned(),
@@ -950,11 +944,6 @@ impl PanelSingleton {
         let Some(event) = pending.first() else { return };
         let response = permission::build_response_for_option(event, option_id);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
-        self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(self)
-                .collect_thread_snapshot_for(real_idx),
-            ..msg::FrameInput::default()
-        });
     }
 
     /// Keyboard convenience: approve/reject maps to the first allow_* /
@@ -983,11 +972,6 @@ impl PanelSingleton {
         // fall through to build_response's cancel policy.
         let response = permission::build_response(event, approved);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
-        self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(self)
-                .collect_thread_snapshot_for(real_idx),
-            ..msg::FrameInput::default()
-        });
     }
 }
 
