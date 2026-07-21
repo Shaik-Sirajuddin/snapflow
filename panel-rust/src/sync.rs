@@ -44,7 +44,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             message_id,
             delta,
         } => {
-            apply_message_streaming(model, message_id, delta);
+            apply_message_streaming(model, thread_id, message_id, delta);
             sync_has_older_messages(model, component, thread_id);
         }
         Dirty::Connection { thread_id } => {
@@ -189,7 +189,10 @@ fn sync_has_older_messages(model: &Model, component: &ChatPanel, thread_id: &str
     }
 }
 
-fn apply_message_streaming(model: &Model, message_id: &str, delta: &str) {
+fn apply_message_streaming(model: &Model, thread_id: &str, message_id: &str, delta: &str) {
+    if displayed_thread_for_id(model, thread_id).is_none() {
+        return;
+    }
     let candidates = [
         format!("assistant:{message_id}"),
         format!("thought:{message_id}"),
@@ -539,16 +542,54 @@ mod tests {
 
     #[test]
     fn message_streaming_delta_resolves_by_stable_id_not_position() {
-        let model = Model::default();
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            session_id: Some("thread-1".to_owned()),
+            ..crate::model::ThreadModel::default()
+        });
+        model.displayed_thread = Some(0);
         model.messages_model.push(crate::MessageItem {
             text: "hello".into(),
             ..crate::MessageItem::default()
         });
         *model.message_model_keys.borrow_mut() = vec!["assistant:m-1".to_owned()];
-        apply_message_streaming(&model, "m-1", " world");
+        apply_message_streaming(&model, "thread-1", "m-1", " world");
         assert_eq!(
             model.messages_model.row_data(0).unwrap().text,
             "hello world"
+        );
+    }
+
+    #[test]
+    fn message_streaming_delta_for_background_thread_is_ignored() {
+        let mut model = Model::default();
+        model.threads.extend([
+            crate::model::ThreadModel {
+                session_id: Some("displayed-thread".to_owned()),
+                ..crate::model::ThreadModel::default()
+            },
+            crate::model::ThreadModel {
+                session_id: Some("background-thread".to_owned()),
+                ..crate::model::ThreadModel::default()
+            },
+        ]);
+        model.displayed_thread = Some(0);
+        model.messages_model.push(crate::MessageItem {
+            text: "displayed".into(),
+            ..crate::MessageItem::default()
+        });
+        *model.message_model_keys.borrow_mut() = vec!["assistant:shared-id".to_owned()];
+
+        apply_message_streaming(
+            &model,
+            "background-thread",
+            "shared-id",
+            " must not appear",
+        );
+
+        assert_eq!(
+            model.messages_model.row_data(0).unwrap().text,
+            "displayed"
         );
     }
 
