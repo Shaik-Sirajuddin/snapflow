@@ -1,0 +1,130 @@
+name: build-linux
+
+# Builds the three shippable pieces of the stack for Linux and bundles them
+# into one installable tarball:
+#   - snapshotd   (Go MCP daemon, real standalone binary)
+#   - panel-rust  (Rust staticlib linked into the Shotcut/Snapflow GUI --
+#                  built + tested here as a correctness gate; not shipped
+#                  standalone since nothing links it yet)
+#   - shotcut-rebrand (the Snapflow GUI app, compiled from this fork's own
+#                  branch via the upstream build-snapflow.sh toolchain
+#                  image -- see scripts/build-snapflow.sh REPOLOCS[7])
+#
+# `panel-rust` and `snapshotd` are fast (minutes) and run on every push/PR.
+# `shotcut-rebrand` recompiles FFmpeg/MLT/x265/etc from source and easily
+# takes 45-90+ minutes, so it's workflow_dispatch/tag-only to keep the
+# ordinary push/PR loop fast.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  panel-rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: panel-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # panel-rust's integration tests spawn a real acpx-server binary
+      # (see agent_bridge.rs resolve_acpx_server_bin, defaults to
+      # ../acpx/target/debug/acpx-server) -- build it first or the suite
+      # fails with "No such file or directory".
+      - name: Build acpx-server (test dependency)
+        working-directory: acpx
+        run: cargo build -p acpx-server
+      - run: cargo build --release
+      - run: cargo test --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel-rust-staticlib
+          path: panel-rust/target/release/libpanel_rust.a
+
+  snapshotd:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: snapshotd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: snapshotd/go.mod
+      - run: go build -o dist/snapshotd ./cmd/snapshotd
+      - run: go test ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshotd-linux-x86_64
+          path: snapshotd/dist/snapshotd
+
+  shotcut-rebrand:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: mltframework/shotcut-build:qt6.10.3-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build snapflow (from this fork's rebrand/snapflow branch)
+        run: |
+          VERSION=$(date +"%y.%-m.%-d")
+          echo VERSION=$VERSION
+          FILENAME_VERSION=$VERSION
+          cd shotcut-rebrand/scripts
+          echo Making build script config file
+          {
+            echo "CLEANUP=0"
+            echo "SNAPFLOW_VERSION=\"$VERSION\""
+            echo "SNAPFLOW_HEAD=0"
+            echo "SNAPFLOW_REVISION=origin/rebrand/snapflow"
+            echo "SNAPFLOW_REPO=https://github.com/Shaik-Sirajuddin/shotcut.git"
+          } > build-snapflow.conf
+          docker run -v "$PWD:/root/snapflow" -e SNAPFLOW_REPO "$IMAGE_NAME"
+          mv snapflow.txz "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shotcut-rebrand-linux-x86_64
+          path: shotcut-rebrand/scripts/snapflow-linux-x86_64-*.txz
+
+  package:
+    needs: [panel-rust, snapshotd, shotcut-rebrand]
+    if: always() && needs.panel-rust.result == 'success' && needs.snapshotd.result == 'success' && needs.shotcut-rebrand.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Assemble install bundle
+        run: |
+          set -euo pipefail
+          VERSION=$(date +"%y.%-m.%-d")
+          OUT="snapflow-linux-x86_64-$VERSION"
+          mkdir -p "$OUT/bin"
+          cp dist/snapshotd-linux-x86_64/snapshotd "$OUT/bin/snapshotd"
+          chmod +x "$OUT/bin/snapshotd"
+          tar -xJf dist/shotcut-rebrand-linux-x86_64/snapflow-linux-x86_64-*.txz -C "$OUT"
+          cp dist/panel-rust-staticlib/libpanel_rust.a "$OUT/bin/libpanel_rust.a"
+          tar -czf "$OUT.tar.gz" "$OUT"
+          sha256sum "$OUT.tar.gz" > "$OUT.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapflow-linux-install-bundle
+          path: |
+            snapflow-linux-x86_64-*.tar.gz
+            snapflow-linux-x86_64-*.tar.gz.sha256
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            snapflow-linux-x86_64-*.tar.gz
+            snapflow-linux-x86_64-*.tar.gz.sha256
