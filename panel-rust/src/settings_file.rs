@@ -287,6 +287,21 @@ fn dirs_fallback_config() -> PathBuf {
     PathBuf::from(".config")
 }
 
+/// The literal string `"default"` is never a real, assignable ACPX
+/// profile name in this system -- auto-seeded profiles are named after
+/// their real agent id (e.g. `"codex-acp"`), never `"default"` itself
+/// (see acpx-core's `Router::ensure_default_profiles_seeded`). A stale or
+/// hand-edited settings file that persisted this literal string as a
+/// "chosen" profile must not be forwarded to `session/new` as a real
+/// profile name -- doing so fails every new session with "no profile
+/// named default" instead of falling back to native/unmanaged mode the
+/// way an actually-empty value would. Found live: a real settings.global.
+/// json on a real dev machine had exactly this value, silently breaking
+/// every new thread's session/new call with no indication why.
+fn non_default_sentinel(value: Option<String>) -> Option<String> {
+    value.filter(|v| v != "default")
+}
+
 /// Map resolved settings into the legacy [`crate::state_store::PanelDefaults`]
 /// fields (without selected_thread_id — that stays process-local).
 pub fn resolved_to_panel_defaults(
@@ -294,8 +309,8 @@ pub fn resolved_to_panel_defaults(
     selected_thread_id: Option<String>,
 ) -> crate::state_store::PanelDefaults {
     crate::state_store::PanelDefaults {
-        profile_name: resolved.default_profile.clone(),
-        permission_profile: resolved.permission_profile.clone(),
+        profile_name: non_default_sentinel(resolved.default_profile.clone()),
+        permission_profile: non_default_sentinel(resolved.permission_profile.clone()),
         background_session: resolved.background_session_default,
         selected_thread_id,
     }
