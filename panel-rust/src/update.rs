@@ -1639,6 +1639,67 @@ mod tests {
     }
 
     #[test]
+    fn streaming_delta_survives_unrelated_thread_insert_and_ignores_removed_target() {
+        let mut model = model_with_threads(&["target", "unrelated"]);
+        model.threads[0].session_id = Some("target-session".to_owned());
+        model.threads[0].message_ids.push("message-1".to_owned());
+        model.threads[0].transcript_keys = vec!["assistant:message-1".to_owned()];
+        model.threads[0].message_rows = vec![crate::MessageItem {
+            text: "hello".into(),
+            ..crate::MessageItem::default()
+        }];
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::PromptStreamDelta {
+                thread_id: "target-session".to_owned(),
+                message_id: "message-1".to_owned(),
+                delta: " next".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            dirty,
+            vec![Dirty::MessageStreamingDelta {
+                thread_id: "target-session".to_owned(),
+                message_id: "message-1".to_owned(),
+                delta: " next".to_owned(),
+            }]
+        );
+        assert_eq!(model.threads[0].message_rows[0].text, "hello next");
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::NewResolved {
+                display_name: "inserted".to_owned(),
+                provider: "codex".to_owned(),
+                profile_name: None,
+                permission_profile: None,
+                session_id: Some("inserted-session".to_owned()),
+                thread_id: Some("inserted-thread".to_owned()),
+            })),
+        );
+        assert!(dirty.iter().any(|item| matches!(
+            item,
+            Dirty::ThreadListDiff(ops)
+                if matches!(ops.as_slice(), [RowOp::Insert { at: 2, .. }])
+        )));
+
+        model.threads[0].closed = true;
+        model.threads.remove(0);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::PromptStreamDelta {
+                thread_id: "target-session".to_owned(),
+                message_id: "message-1".to_owned(),
+                delta: " late".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
     fn prompt_stream_delta_accepts_durable_thread_id_before_session_attach() {
         let mut model = model_with_threads(&["a"]);
         model.threads[0].thread_id = "durable-thread-1".to_owned();
