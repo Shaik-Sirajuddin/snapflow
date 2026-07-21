@@ -61,6 +61,16 @@ jobs:
         with:
           go-version-file: snapshotd/go.mod
       - run: go build -o dist/snapshotd.exe ./cmd/snapshotd
+      # Windows AF_UNIX has a much shorter max socket path than Linux; the
+      # default runner %TEMP% path is too long once the tests' own random
+      # subdirectories are appended (snapshotd's daemon/procmgr/sapproxy
+      # tests bind real unix sockets under a temp RunDir).
+      - name: Set a short TEMP dir for AF_UNIX socket paths
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\st | Out-Null
+          echo "TEMP=C:\st" >> $env:GITHUB_ENV
+          echo "TMP=C:\st" >> $env:GITHUB_ENV
       - run: go test ./...
       - uses: actions/upload-artifact@v4
         with:
