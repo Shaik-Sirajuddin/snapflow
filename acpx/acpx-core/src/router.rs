@@ -5567,10 +5567,33 @@ async fn try_relay_approval(
     timeout: Duration,
 ) -> Option<bool> {
     let ctx = live?;
-    let gateway_session_id = ctx.gateway_session_id.as_deref()?;
+    // Same `spawn_demux_consumer`-has-no-per-call tenant/session context
+    // gap as `try_relay_agent_request`/`try_forward_interaction` (see
+    // `resolve_gateway_session`'s doc comment): once `process_reader_demux`
+    // is active, `ctx.gateway_session_id` is `None` for every frame on a
+    // shared backend process, not just the caller's own session, so a
+    // bare `ctx.gateway_session_id.as_deref()?` here silently gave up on
+    // every `fs/*`/`terminal/create` approval relay under demux -- the
+    // request never reached a live client, it just fell straight through
+    // to this profile's own auto-allow-because-capability-is-on fallback
+    // (see both call sites' comments) with no visible error. Resolve from
+    // `value`'s own `params.sessionId` the same way the two already-fixed
+    // siblings do.
+    let gateway_session_id = match ctx.gateway_session_id.as_deref() {
+        Some(id) => id.to_string(),
+        None => {
+            let backend_session_id = value
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|s| s.as_str())?;
+            resolve_gateway_session(ctx, backend_session_id)
+                .await
+                .map(|(_, gateway_id)| gateway_id.0)?
+        }
+    };
     let decision = ctx
         .agent_relay
-        .relay(gateway_session_id, value.clone(), timeout)
+        .relay(&gateway_session_id, value.clone(), timeout)
         .await?;
     decision.get("approved").and_then(|a| a.as_bool())
 }
