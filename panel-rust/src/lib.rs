@@ -1591,6 +1591,208 @@ impl PanelSingleton {
         );
     }
 
+    /// `dispatch.rs`'s Skill-domain wrappers (tea-slint-model Phase 4)
+    /// call these -- extracted verbatim from the former `on_new_skill_
+    /// requested`/`on_skill_*` closure bodies.
+    pub(crate) fn dispatch_new_skill_requested(&self, name: &str, scope: &str) {
+        let skill_scope = match scope {
+            "global" => crate::skills_state::SkillScope::Global,
+            "project" => crate::skills_state::SkillScope::Project,
+            other => {
+                eprintln!("panel-rust: invalid new skill scope {other:?}");
+                return;
+            }
+        };
+        let active_project_path = self.active_project_path.borrow().clone();
+        let active_project_file = active_project_path.as_deref().map(std::path::Path::new);
+        let dir = match crate::skills_state::skill_creation_dir(
+            skill_scope,
+            &resolve_cache_dir(),
+            active_project_file,
+        ) {
+            Ok(dir) => dir,
+            Err(error) => {
+                eprintln!(
+                    "panel-rust: failed to resolve {scope} skill storage for {name:?}: {error}"
+                );
+                return;
+            }
+        };
+        match crate::skills_state::scaffold_new_skill(&dir, name) {
+            Ok(skill_dir) => {
+                trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
+                self.refresh_skills_model();
+                self.open_skill_editor(&skill_dir);
+            }
+            Err(error) => {
+                eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_skill_promote_to_global(&self, path: &str) {
+        let skill_dir = std::path::PathBuf::from(path);
+        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        match crate::skills_state::promote_skill_to_global(&skill_dir, &global_dir) {
+            Ok(destination) => {
+                trace_host_input(format_args!("skill promoted to global at {destination:?}"));
+                self.refresh_skills_model();
+            }
+            Err(error) => {
+                eprintln!("panel-rust: failed to promote skill {path:?} to global: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_skill_editor_open_requested(&self, path: &str) {
+        self.open_skill_editor(std::path::Path::new(path));
+    }
+
+    pub(crate) fn dispatch_skill_content_edited(&self, path: &str, content: &str) {
+        let skill_md = std::path::Path::new(path).join("SKILL.md");
+        if let Err(error) = std::fs::write(&skill_md, content) {
+            eprintln!("panel-rust: failed to save skill {path:?}: {error}");
+        }
+    }
+
+    pub(crate) fn dispatch_skill_copy_path_requested(&self, path: &str) {
+        trace_host_input(format_args!("skill copy-path requested for {path:?}"));
+    }
+
+    pub(crate) fn dispatch_skill_open_in_editor_requested(&self, editor_name: &str, path: &str) {
+        let Some((bin, _)) = crate::editor_detect::EDITOR_CANDIDATES
+            .iter()
+            .find(|(_, name)| *name == editor_name)
+        else {
+            eprintln!("panel-rust: unknown editor {editor_name:?}");
+            return;
+        };
+        if let Err(error) = crate::editor_detect::open_in_editor(bin, std::path::Path::new(path)) {
+            eprintln!("panel-rust: failed to open skill in {editor_name:?}: {error}");
+        }
+    }
+
+    pub(crate) fn dispatch_skill_open_with_os_default_requested(&self, path: &str) {
+        if let Err(error) =
+            crate::editor_detect::open_with_os_default(std::path::Path::new(path))
+        {
+            eprintln!("panel-rust: failed to open skill with OS default: {error}");
+        }
+    }
+
+    /// `dispatch.rs`'s Chrome-domain wrappers (tea-slint-model Phase 4)
+    /// call these -- extracted verbatim from the former `on_error_
+    /// banner_dismissed`/`on_thread_toggle_background`/`on_search_*`/
+    /// `on_toggle_expanded` closure bodies.
+    pub(crate) fn dispatch_error_banner_dismissed(&self) {
+        let selected = self.component.get_selected_thread();
+        let Some(real_idx) = self.real_index(selected.max(0) as usize) else {
+            return;
+        };
+        if let Some(error) = self.thread_errors.borrow_mut().get_mut(real_idx) {
+            error.clear();
+        }
+        self.refresh_last_error_for(real_idx);
+        self.refresh_threads_model();
+    }
+
+    pub(crate) fn dispatch_thread_toggle_background(&self, slint_index: usize) {
+        let Some(store) = self.panel_state.as_ref() else {
+            return;
+        };
+        let Some(thread_id) = self.real_index(slint_index).and_then(|idx| {
+            self.bridge
+                .as_ref()
+                .and_then(|bridge| bridge.thread_binding(idx))
+                .map(|binding| binding.thread_id)
+        }) else {
+            return;
+        };
+        let next = !store.effective_background_session(&thread_id).unwrap_or(false);
+        if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
+            eprintln!("panel-rust: failed to toggle background-session override: {error}");
+            return;
+        }
+        self.refresh_threads_model();
+    }
+
+    pub(crate) fn dispatch_search_changed(&self, component: &ChatPanel, query: &str) {
+        *self.search_query.borrow_mut() = query.to_string();
+        self.refresh_threads_model();
+        component.set_selected_thread(0);
+        match self.real_index(0) {
+            Some(real_idx) => self.refresh_messages_for(real_idx),
+            None => component.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new()))),
+        }
+    }
+
+    pub(crate) fn dispatch_search_submitted(
+        &self,
+        component: &ChatPanel,
+        query: &str,
+        search_skills: bool,
+        show_global: bool,
+    ) {
+        if search_skills {
+            let needle = query.trim().to_lowercase();
+            let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+            let mut entries = if show_global {
+                crate::skills_state::scan_skills_dir(
+                    &global_dir,
+                    crate::skills_state::SkillScope::Global,
+                )
+            } else {
+                Vec::new()
+            };
+            if let Some(project_path) = self.active_project_path.borrow().as_ref() {
+                if let Some(project_dir) = std::path::Path::new(project_path).parent() {
+                    entries.extend(crate::skills_state::scan_skills_dir(
+                        &crate::skills_state::project_skills_dir(project_dir),
+                        crate::skills_state::SkillScope::Project,
+                    ));
+                }
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            if let Some(entry) = entries.into_iter().find(|entry| {
+                needle.is_empty()
+                    || entry.name.to_lowercase().contains(&needle)
+                    || entry.description.to_lowercase().contains(&needle)
+            }) {
+                self.open_skill_editor(&entry.path);
+            }
+            return;
+        }
+
+        *self.search_query.borrow_mut() = query.to_string();
+        self.refresh_threads_model();
+        let Some(real_idx) = self.real_index(0) else {
+            component.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
+            return;
+        };
+        component.set_selected_thread(0);
+        if let (Some(store), Some(binding)) = (
+            self.panel_state.as_ref(),
+            self.bridge.as_ref().and_then(|bridge| bridge.thread_binding(real_idx)),
+        ) {
+            if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
+                eprintln!("panel-rust: failed to persist search-selected chat thread: {error}");
+            }
+        }
+        self.refresh_messages_for(real_idx);
+    }
+
+    pub(crate) fn dispatch_toggle_expanded(&self, index: usize) {
+        let Some(real_idx) = self.displayed_thread.get() else {
+            return;
+        };
+        let mut expanded = self.expanded.borrow_mut();
+        if let Some(slot) = expanded.get_mut(index) {
+            *slot = !*slot;
+        }
+        drop(expanded);
+        self.render_messages(real_idx);
+    }
+
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
     pub(crate) fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
@@ -2191,18 +2393,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         panel.component.on_error_banner_dismissed(move || {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let selected = panel.component.get_selected_thread();
-                    let Some(real_idx) = panel.real_index(selected.max(0) as usize) else {
-                        return;
-                    };
-                    if let Some(error) = panel.thread_errors.borrow_mut().get_mut(real_idx) {
-                        error.clear();
-                    }
-                    panel.refresh_last_error_for(real_idx);
-                    // Sidebar subtitle mirrors the same error string --
-                    // dismissing the banner should clear both, not leave
-                    // the sidebar still saying "Error: ...".
-                    panel.refresh_threads_model();
+                    dispatch::dispatch_error_banner_dismissed(panel);
                 }
             });
         });
@@ -2210,33 +2401,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         panel.component.on_thread_toggle_background(move |slint_index| {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(store) = panel.panel_state.as_ref() else {
-                        return;
-                    };
-                    let Some(thread_id) = panel
-                        .real_index(slint_index as usize)
-                        .and_then(|idx| {
-                            panel
-                                .bridge
-                                .as_ref()
-                                .and_then(|bridge| bridge.thread_binding(idx))
-                                .map(|binding| binding.thread_id)
-                        })
-                    else {
-                        return;
-                    };
-                    let next = !store
-                        .effective_background_session(&thread_id)
-                        .unwrap_or(false);
-                    if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
-                        eprintln!(
-                            "panel-rust: failed to toggle background-session override: {error}"
-                        );
-                        return;
-                    }
-                    // Threads model feeds sidebar moon + ChatArea
-                    // active-thread-background binding.
-                    panel.refresh_threads_model();
+                    dispatch::dispatch_thread_toggle_background(panel, slint_index as usize);
                 }
             });
         });
@@ -2635,62 +2800,16 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
 
         panel.component.on_new_skill_requested(move |name, scope| {
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                let skill_scope = match scope.as_str() {
-                    "global" => crate::skills_state::SkillScope::Global,
-                    "project" => crate::skills_state::SkillScope::Project,
-                    other => {
-                        eprintln!("panel-rust: invalid new skill scope {other:?}");
-                        return;
-                    }
-                };
-                let active_project_path = panel.active_project_path.borrow().clone();
-                let active_project_file = active_project_path.as_deref().map(std::path::Path::new);
-                let dir = match crate::skills_state::skill_creation_dir(
-                    skill_scope,
-                    &resolve_cache_dir(),
-                    active_project_file,
-                ) {
-                    Ok(dir) => dir,
-                    Err(error) => {
-                        eprintln!(
-                            "panel-rust: failed to resolve {scope} skill storage for {name:?}: {error}"
-                        );
-                        return;
-                    }
-                };
-                match crate::skills_state::scaffold_new_skill(&dir, name.as_str()) {
-                    Ok(skill_dir) => {
-                        trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
-                        panel.refresh_skills_model();
-                        panel.open_skill_editor(&skill_dir);
-                    }
-                    Err(error) => {
-                        eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
-                    }
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_new_skill_requested(panel, name.to_string(), scope.to_string());
                 }
             });
         });
 
         panel.component.on_skill_promote_to_global(move |path| {
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                let skill_dir = std::path::PathBuf::from(path.as_str());
-                let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-                match crate::skills_state::promote_skill_to_global(&skill_dir, &global_dir) {
-                    Ok(destination) => {
-                        trace_host_input(format_args!("skill promoted to global at {destination:?}"));
-                        panel.refresh_skills_model();
-                    }
-                    Err(error) => {
-                        eprintln!("panel-rust: failed to promote skill {path:?} to global: {error}");
-                    }
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_promote_to_global(panel, path.to_string());
                 }
             });
         });
@@ -2705,53 +2824,50 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
 
         panel.component.on_skill_editor_open_requested(move |path| {
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                panel.open_skill_editor(std::path::Path::new(path.as_str()));
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_editor_open_requested(panel, path.to_string());
+                }
             });
         });
 
         panel.component.on_skill_content_edited(move |path, content| {
-            let skill_md = std::path::Path::new(path.as_str()).join("SKILL.md");
-            if let Err(error) = std::fs::write(&skill_md, content.as_str()) {
-                eprintln!("panel-rust: failed to save skill {path:?}: {error}");
-            }
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_content_edited(
+                        panel,
+                        path.to_string(),
+                        content.to_string(),
+                    );
+                }
+            });
         });
 
         panel.component.on_skill_copy_path_requested(move |path| {
-            trace_host_input(format_args!("skill copy-path requested for {path:?}"));
-            // No system clipboard dependency in this crate today -- see
-            // panel-rust/Cargo.lock check in skill-manager-workspace's
-            // 03-open-risks.md for the same "no new dependency without a
-            // concrete need" stance applied to the opener crate. Logged
-            // for now; a real clipboard write is a small, separate
-            // addition once a clipboard crate is actually needed
-            // elsewhere too.
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_copy_path_requested(panel, path.to_string());
+                }
+            });
         });
 
         panel.component.on_skill_open_in_editor_requested(move |editor_name, path| {
-            let Some((bin, _)) = crate::editor_detect::EDITOR_CANDIDATES
-                .iter()
-                .find(|(_, name)| *name == editor_name.as_str())
-            else {
-                eprintln!("panel-rust: unknown editor {editor_name:?}");
-                return;
-            };
-            if let Err(error) =
-                crate::editor_detect::open_in_editor(bin, std::path::Path::new(path.as_str()))
-            {
-                eprintln!("panel-rust: failed to open skill in {editor_name:?}: {error}");
-            }
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_open_in_editor_requested(
+                        panel,
+                        editor_name.to_string(),
+                        path.to_string(),
+                    );
+                }
+            });
         });
 
         panel.component.on_skill_open_with_os_default_requested(move |path| {
-            if let Err(error) =
-                crate::editor_detect::open_with_os_default(std::path::Path::new(path.as_str()))
-            {
-                eprintln!("panel-rust: failed to open skill with OS default: {error}");
-            }
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_open_with_os_default_requested(panel, path.to_string());
+                }
+            });
         });
 
         // tea-slint-model Phase 4 (Compose domain): routed through
@@ -3044,19 +3160,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    *panel.search_query.borrow_mut() = query.to_string();
-                    panel.refresh_threads_model();
-                    // The filter can move/remove the previously-selected
-                    // row entirely -- reset to the first still-visible
-                    // thread (Phase 2 UX decision, documented in the
-                    // theme-parity plan's Phase 2 section) rather than
-                    // leaving a stale/out-of-range selection.
-                    component.set_selected_thread(0);
-                    match panel.real_index(0) {
-                        Some(real_idx) => panel.refresh_messages_for(real_idx),
-                        None => component
-                            .set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new()))),
-                    }
+                    dispatch::dispatch_search_changed(panel, &component, query.to_string());
                 }
             });
         });
@@ -3069,69 +3173,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     return;
                 };
                 PANEL.with(|cell| {
-                    let slot = cell.borrow();
-                    let Some(panel) = slot.as_ref() else {
-                        return;
-                    };
-                    if search_skills {
-                        let needle = query.trim().to_lowercase();
-                        let global_dir =
-                            crate::skills_state::global_skills_dir(&resolve_cache_dir());
-                        let mut entries = if show_global {
-                            crate::skills_state::scan_skills_dir(
-                                &global_dir,
-                                crate::skills_state::SkillScope::Global,
-                            )
-                        } else {
-                            Vec::new()
-                        };
-                        if let Some(project_path) = panel.active_project_path.borrow().as_ref() {
-                            if let Some(project_dir) =
-                                std::path::Path::new(project_path).parent()
-                            {
-                                entries.extend(crate::skills_state::scan_skills_dir(
-                                    &crate::skills_state::project_skills_dir(project_dir),
-                                    crate::skills_state::SkillScope::Project,
-                                ));
-                            }
-                        }
-                        entries.sort_by(|a, b| a.name.cmp(&b.name));
-                        if let Some(entry) = entries.into_iter().find(|entry| {
-                            needle.is_empty()
-                                || entry.name.to_lowercase().contains(&needle)
-                                || entry.description.to_lowercase().contains(&needle)
-                        }) {
-                            panel.open_skill_editor(&entry.path);
-                        }
-                        return;
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_search_submitted(
+                            panel,
+                            &component,
+                            query.to_string(),
+                            search_skills,
+                            show_global,
+                        );
                     }
-
-                    // Reapply the host-side filter immediately before
-                    // activation so Enter always opens the first current
-                    // result, even when the key arrives with the final edit
-                    // event still queued by the platform.
-                    *panel.search_query.borrow_mut() = query.to_string();
-                    panel.refresh_threads_model();
-                    let Some(real_idx) = panel.real_index(0) else {
-                        component
-                            .set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
-                        return;
-                    };
-                    component.set_selected_thread(0);
-                    if let (Some(store), Some(binding)) = (
-                        panel.panel_state.as_ref(),
-                        panel
-                            .bridge
-                            .as_ref()
-                            .and_then(|bridge| bridge.thread_binding(real_idx)),
-                    ) {
-                        if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
-                            eprintln!(
-                                "panel-rust: failed to persist search-selected chat thread: {error}"
-                            );
-                        }
-                    }
-                    panel.refresh_messages_for(real_idx);
                 });
             });
 
@@ -3142,16 +3192,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(real_idx) = panel.displayed_thread.get() else {
-                        return;
-                    };
-                    let idx = index as usize;
-                    let mut expanded = panel.expanded.borrow_mut();
-                    if let Some(slot) = expanded.get_mut(idx) {
-                        *slot = !*slot;
-                    }
-                    drop(expanded);
-                    panel.render_messages(real_idx);
+                    dispatch::dispatch_toggle_expanded(panel, index as usize);
                 }
             });
         });

@@ -353,7 +353,7 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
 
 fn update_skill(_model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
-        SkillMsg::NewSkillRequested => (vec![], vec![Dirty::SkillsListDiff(vec![])]),
+        SkillMsg::NewSkillRequested { .. } => (vec![], vec![Dirty::SkillsListDiff(vec![])]),
         SkillMsg::ContentEdited { path, content } => {
             (vec![Effect::SkillWrite { path, content }], vec![Dirty::SkillsListDiff(vec![])])
         }
@@ -369,7 +369,7 @@ fn update_skill(_model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) 
 
 fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
-        ChromeMsg::SearchChanged(query) | ChromeMsg::SearchSubmitted(query) => {
+        ChromeMsg::SearchChanged(query) => {
             model.search_query = query;
             (
                 vec![],
@@ -379,7 +379,17 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 ],
             )
         }
-        ChromeMsg::ToggleExpanded => (vec![], vec![]),
+        ChromeMsg::SearchSubmitted { query, .. } => {
+            model.search_query = query;
+            (
+                vec![],
+                vec![
+                    Dirty::Scalar(ScalarField::SearchQuery),
+                    Dirty::ThreadListDiff(vec![]),
+                ],
+            )
+        }
+        ChromeMsg::ToggleExpanded(_) => (vec![], vec![]),
         ChromeMsg::ErrorBannerDismissed => (
             vec![],
             vec![Dirty::Error {

@@ -26,7 +26,9 @@
 
 use crate::dirty::{Dirty, ScalarField};
 use crate::model::{Model, ThreadModel};
-use crate::msg::{ComposeMsg, Msg, RequestMsg, SettingsMsg, TerminalMsg, ThreadMsg, UiMsg};
+use crate::msg::{
+    ChromeMsg, ComposeMsg, Msg, RequestMsg, SettingsMsg, SkillMsg, TerminalMsg, ThreadMsg, UiMsg,
+};
 use crate::update::update;
 use crate::ChatPanel;
 use crate::PanelSingleton;
@@ -451,6 +453,138 @@ pub(crate) fn dispatch_config_option_selected(
         })),
     );
     panel.dispatch_config_option_selected(component, &key, &value);
+}
+
+// Skill-domain wrappers (tea-slint-model Phase 4). Same bridge shape as
+// Settings above.
+
+pub(crate) fn dispatch_new_skill_requested(panel: &PanelSingleton, name: String, scope: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Skill(SkillMsg::NewSkillRequested {
+            name: name.clone(),
+            scope: scope.clone(),
+        })),
+    );
+    panel.dispatch_new_skill_requested(&name, &scope);
+}
+
+pub(crate) fn dispatch_skill_promote_to_global(panel: &PanelSingleton, path: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Skill(SkillMsg::PromoteToGlobal { path: path.clone().into() })),
+    );
+    panel.dispatch_skill_promote_to_global(&path);
+}
+
+pub(crate) fn dispatch_skill_editor_open_requested(panel: &PanelSingleton, path: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Skill(SkillMsg::EditorOpenRequested { path: path.clone().into() })),
+    );
+    panel.dispatch_skill_editor_open_requested(&path);
+}
+
+pub(crate) fn dispatch_skill_content_edited(panel: &PanelSingleton, path: String, content: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Skill(SkillMsg::ContentEdited {
+            path: path.clone().into(),
+            content: content.clone(),
+        })),
+    );
+    panel.dispatch_skill_content_edited(&path, &content);
+}
+
+pub(crate) fn dispatch_skill_copy_path_requested(panel: &PanelSingleton, path: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Skill(SkillMsg::CopyPathRequested { path: path.clone().into() })),
+    );
+    panel.dispatch_skill_copy_path_requested(&path);
+}
+
+pub(crate) fn dispatch_skill_open_in_editor_requested(
+    panel: &PanelSingleton,
+    editor_name: String,
+    path: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Skill(SkillMsg::OpenInEditorRequested {
+            editor_name: editor_name.clone(),
+            path: path.clone().into(),
+        })),
+    );
+    panel.dispatch_skill_open_in_editor_requested(&editor_name, &path);
+}
+
+pub(crate) fn dispatch_skill_open_with_os_default_requested(panel: &PanelSingleton, path: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Skill(SkillMsg::OpenWithOsDefaultRequested {
+            path: path.clone().into(),
+        })),
+    );
+    panel.dispatch_skill_open_with_os_default_requested(&path);
+}
+
+// Chrome-domain wrappers, plus the two leftover Thread/Request-adjacent
+// callbacks (thread_toggle_background, error_banner_dismissed) that share
+// this domain's simplicity (tea-slint-model Phase 4). Same bridge shape
+// as Settings/Skill above.
+
+pub(crate) fn dispatch_error_banner_dismissed(panel: &PanelSingleton) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Ui(UiMsg::Chrome(ChromeMsg::ErrorBannerDismissed)));
+    panel.dispatch_error_banner_dismissed();
+}
+
+pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_index: usize) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Thread(ThreadMsg::ToggleBackground(slint_index))),
+    );
+    panel.dispatch_thread_toggle_background(slint_index);
+}
+
+pub(crate) fn dispatch_search_changed(panel: &PanelSingleton, component: &ChatPanel, query: String) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Ui(UiMsg::Chrome(ChromeMsg::SearchChanged(query.clone()))));
+    panel.dispatch_search_changed(component, &query);
+}
+
+pub(crate) fn dispatch_search_submitted(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    query: String,
+    search_skills: bool,
+    show_global: bool,
+) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(
+        &mut model,
+        Msg::Ui(UiMsg::Chrome(ChromeMsg::SearchSubmitted {
+            query: query.clone(),
+            search_skills,
+            show_global,
+        })),
+    );
+    panel.dispatch_search_submitted(component, &query, search_skills, show_global);
+}
+
+pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(index))));
+    panel.dispatch_toggle_expanded(index);
 }
 
 #[cfg(test)]

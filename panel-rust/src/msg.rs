@@ -93,11 +93,11 @@ pub enum SettingsMsg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillMsg {
-    NewSkillRequested,
+    NewSkillRequested { name: String, scope: String },
     ContentEdited { path: std::path::PathBuf, content: String },
     CopyPathRequested { path: std::path::PathBuf },
     EditorOpenRequested { path: std::path::PathBuf },
-    OpenInEditorRequested { path: std::path::PathBuf },
+    OpenInEditorRequested { editor_name: String, path: std::path::PathBuf },
     OpenWithOsDefaultRequested { path: std::path::PathBuf },
     PromoteToGlobal { path: std::path::PathBuf },
 }
@@ -105,8 +105,12 @@ pub enum SkillMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChromeMsg {
     SearchChanged(String),
-    SearchSubmitted(String),
-    ToggleExpanded,
+    SearchSubmitted {
+        query: String,
+        search_skills: bool,
+        show_global: bool,
+    },
+    ToggleExpanded(usize),
     ErrorBannerDismissed,
 }
 
