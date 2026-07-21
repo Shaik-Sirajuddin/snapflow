@@ -136,20 +136,24 @@ jobs:
       # FFmpeg/x264/x265/etc compile. MSYS2 ships all of these as real,
       # maintained native packages, so build directly with cmake instead
       # of the fragile from-source pipeline (which also depended on a
-      # since-revoked S3 bucket for a prebuilt MLT). mingw-w64-x86_64-rust
-      # is MSYS2's own Rust toolchain build, which (unlike the Windows
+      # since-revoked S3 bucket for a prebuilt MLT). The msys-repo `rust`
+      # package is MSYS2's own Rust toolchain build, which (unlike the Windows
       # runner's preinstalled native rustup, which targets MSVC) produces
       # GNU/mingw-ABI-compatible output matching the rest of this MinGW64
       # toolchain -- required for Corrosion to link sap-rust in correctly.
       - name: Install packages
         shell: msys2 {0}
         run: |
-          pacboy -S --noconfirm \
-            toolchain:p cmake:p ninja:p pkgconf:p rust:p \
-            mlt:p fftw:p \
-            qt6-base:p qt6-charts:p qt6-declarative:p qt6-imageformats:p \
-            qt6-multimedia:p qt6-svg:p qt6-tools:p qt6-translations:p \
-            qt6-websockets:p
+          pacman -S --noconfirm \
+            mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
+            mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf \
+            rust \
+            mingw-w64-x86_64-mlt mingw-w64-x86_64-fftw \
+            mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-charts \
+            mingw-w64-x86_64-qt6-declarative mingw-w64-x86_64-qt6-imageformats \
+            mingw-w64-x86_64-qt6-multimedia mingw-w64-x86_64-qt6-svg \
+            mingw-w64-x86_64-qt6-tools mingw-w64-x86_64-qt6-translations \
+            mingw-w64-x86_64-qt6-websockets
 
       - name: Set version
         id: set_version
