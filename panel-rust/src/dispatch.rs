@@ -676,12 +676,22 @@ pub(crate) fn dispatch_terminal_local_close(panel: &PanelSingleton, component: &
 // for the fuller-commented version of the same shape.
 
 pub(crate) fn dispatch_settings_open(panel: &PanelSingleton, component: &ChatPanel) {
-    let _ = update_persistent(
+    let (_, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Settings(crate::msg::SettingsMsg::Open)),
     );
     let _ = component;
-    panel.dispatch_settings_requested();
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        settings_preferences_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_preferences_snapshot(None),
+        ),
+        settings_gateway_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot(),
+        ),
+        ..crate::msg::FrameInput::default()
+    });
 }
 
 pub(crate) fn dispatch_settings_scope_changed(
@@ -689,12 +699,18 @@ pub(crate) fn dispatch_settings_scope_changed(
     component: &ChatPanel,
     scope: String,
 ) {
-    let _ = update_persistent(
+    let (_, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ScopeChanged(scope.clone()))),
     );
     let _ = component;
-    panel.dispatch_settings_scope_changed(&scope);
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        settings_preferences_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_preferences_snapshot(Some(&scope)),
+        ),
+        ..crate::msg::FrameInput::default()
+    });
 }
 
 pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPanel) {
@@ -863,14 +879,14 @@ pub(crate) fn dispatch_config_option_selected(
 // Settings above.
 
 pub(crate) fn dispatch_new_skill_requested(panel: &PanelSingleton, name: String, scope: String) {
-    let _ = update_persistent(
+    let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::NewSkillRequested {
             name: name.clone(),
             scope: scope.clone(),
         })),
     );
-    panel.dispatch_new_skill_requested(&name, &scope);
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_skill_promote_to_global(panel: &PanelSingleton, path: String) {
@@ -905,13 +921,13 @@ pub(crate) fn dispatch_skill_content_edited(panel: &PanelSingleton, path: String
 }
 
 pub(crate) fn dispatch_skill_copy_path_requested(panel: &PanelSingleton, path: String) {
-    let _ = update_persistent(
+    let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::CopyPathRequested {
             path: path.clone().into(),
         })),
     );
-    panel.dispatch_skill_copy_path_requested(&path);
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_skill_open_in_editor_requested(
@@ -919,24 +935,24 @@ pub(crate) fn dispatch_skill_open_in_editor_requested(
     editor_name: String,
     path: String,
 ) {
-    let _ = update_persistent(
+    let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::OpenInEditorRequested {
             editor_name: editor_name.clone(),
             path: path.clone().into(),
         })),
     );
-    panel.dispatch_skill_open_in_editor_requested(&editor_name, &path);
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_skill_open_with_os_default_requested(panel: &PanelSingleton, path: String) {
-    let _ = update_persistent(
+    let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::OpenWithOsDefaultRequested {
             path: path.clone().into(),
         })),
     );
-    panel.dispatch_skill_open_with_os_default_requested(&path);
+    execute_effects(panel, effects);
 }
 
 // Chrome-domain wrappers, plus the two leftover Thread/Request-adjacent

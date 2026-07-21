@@ -144,6 +144,11 @@ pub enum Effect {
         path: std::path::PathBuf,
         content: String,
     },
+    CreateSkill {
+        name: String,
+        scope: String,
+        active_project_path: Option<String>,
+    },
     SkillDelete {
         path: std::path::PathBuf,
     },
@@ -151,6 +156,13 @@ pub enum Effect {
         path: std::path::PathBuf,
     },
     OpenSkillEditor {
+        path: std::path::PathBuf,
+    },
+    OpenInEditor {
+        editor_name: String,
+        path: std::path::PathBuf,
+    },
+    OpenWithOsDefault {
         path: std::path::PathBuf,
     },
     /// Non-Slint-callback: propagate a Shotcut project-path change to the
@@ -178,7 +190,10 @@ pub enum EffectResultMsg {
         result: Result<String, EffectError>,
     },
     SkillWritten(Result<(), EffectError>),
+    SkillCreated(Result<std::path::PathBuf, EffectError>),
     SkillPromoted(Result<(), EffectError>),
+    ExternalEditorOpened(Result<(), EffectError>),
+    OsDefaultOpened(Result<(), EffectError>),
     SkillEditorLoaded(Result<crate::model::SkillEditorState, EffectError>),
     /// A streamed token/chunk arriving mid-generation -- not a
     /// completion. See 00-plan.md's stale-target no-op contract: if

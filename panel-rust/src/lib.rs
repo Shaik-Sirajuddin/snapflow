@@ -629,38 +629,6 @@ impl PanelSingleton {
         bridge.close_local_terminal(real_idx);
     }
 
-    /// `dispatch.rs`'s Settings-domain wrappers (tea-slint-model Phase 4)
-    /// call these -- extracted verbatim from the former `on_settings_*`/
-    /// `on_mcp_server_*`/`on_profile_*`/`on_mode_selected`/
-    /// `on_config_option_selected`/`on_agent_install_requested`/
-    /// `on_dev_mode_toggled` closure bodies.
-    pub(crate) fn dispatch_settings_requested(&self) {
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_preferences_snapshot: Some(
-                crate::external_snapshot::ExternalSnapshotSource::new(self)
-                    .collect_settings_preferences_snapshot(None),
-            ),
-            ..msg::FrameInput::default()
-        });
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(
-                crate::external_snapshot::ExternalSnapshotSource::new(self)
-                    .collect_settings_gateway_snapshot(),
-            ),
-            ..msg::FrameInput::default()
-        });
-    }
-
-    pub(crate) fn dispatch_settings_scope_changed(&self, scope: &str) {
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_preferences_snapshot: Some(
-                crate::external_snapshot::ExternalSnapshotSource::new(self)
-                    .collect_settings_preferences_snapshot(Some(scope)),
-            ),
-            ..msg::FrameInput::default()
-        });
-    }
-
     pub(crate) fn execute_settings_save(
         &self,
         input: msg::SettingsSaveInput,
@@ -820,71 +788,6 @@ impl PanelSingleton {
             option_id.to_string(),
             serde_json::Value::String(value.to_string()),
         );
-    }
-
-    /// `dispatch.rs`'s Skill-domain wrappers (tea-slint-model Phase 4)
-    /// call these -- extracted verbatim from the former `on_new_skill_
-    /// requested`/`on_skill_*` closure bodies.
-    pub(crate) fn dispatch_new_skill_requested(&self, name: &str, scope: &str) {
-        let skill_scope = match scope {
-            "global" => crate::skills_state::SkillScope::Global,
-            "project" => crate::skills_state::SkillScope::Project,
-            other => {
-                eprintln!("panel-rust: invalid new skill scope {other:?}");
-                return;
-            }
-        };
-        let active_project_path = self.model.borrow().active_project_path.clone();
-        let active_project_file = active_project_path.as_deref().map(std::path::Path::new);
-        let dir = match crate::skills_state::skill_creation_dir(
-            skill_scope,
-            &resolve_cache_dir(),
-            active_project_file,
-        ) {
-            Ok(dir) => dir,
-            Err(error) => {
-                eprintln!(
-                    "panel-rust: failed to resolve {scope} skill storage for {name:?}: {error}"
-                );
-                return;
-            }
-        };
-        match crate::skills_state::scaffold_new_skill(&dir, name) {
-            Ok(skill_dir) => {
-                trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
-                crate::dispatch::dispatch_frame_poll(self);
-                crate::dispatch::dispatch_skill_editor_open_requested(
-                    self,
-                    skill_dir.to_string_lossy().into_owned(),
-                );
-            }
-            Err(error) => {
-                eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
-            }
-        }
-    }
-
-    pub(crate) fn dispatch_skill_copy_path_requested(&self, path: &str) {
-        trace_host_input(format_args!("skill copy-path requested for {path:?}"));
-    }
-
-    pub(crate) fn dispatch_skill_open_in_editor_requested(&self, editor_name: &str, path: &str) {
-        let Some((bin, _)) = crate::editor_detect::EDITOR_CANDIDATES
-            .iter()
-            .find(|(_, name)| *name == editor_name)
-        else {
-            eprintln!("panel-rust: unknown editor {editor_name:?}");
-            return;
-        };
-        if let Err(error) = crate::editor_detect::open_in_editor(bin, std::path::Path::new(path)) {
-            eprintln!("panel-rust: failed to open skill in {editor_name:?}: {error}");
-        }
-    }
-
-    pub(crate) fn dispatch_skill_open_with_os_default_requested(&self, path: &str) {
-        if let Err(error) = crate::editor_detect::open_with_os_default(std::path::Path::new(path)) {
-            eprintln!("panel-rust: failed to open skill with OS default: {error}");
-        }
     }
 
     pub(crate) fn open_skill_search_result(&self, query: &str, show_global: bool) {

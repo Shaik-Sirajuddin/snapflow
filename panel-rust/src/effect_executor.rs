@@ -32,6 +32,49 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                     });
                 });
             }
+            Effect::CreateSkill {
+                name,
+                scope,
+                active_project_path,
+            } => {
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let skill_scope = match scope.as_str() {
+                            "global" => crate::skills_state::SkillScope::Global,
+                            "project" => crate::skills_state::SkillScope::Project,
+                            other => {
+                                return Err(EffectError::new(format!(
+                                    "invalid skill scope {other:?}"
+                                )));
+                            }
+                        };
+                        let active_project_file =
+                            active_project_path.as_deref().map(std::path::Path::new);
+                        let dir = crate::skills_state::skill_creation_dir(
+                            skill_scope,
+                            &crate::resolve_cache_dir(),
+                            active_project_file,
+                        )
+                        .map_err(|error| EffectError::new(error.to_string()))?;
+                        crate::skills_state::scaffold_new_skill(&dir, &name)
+                            .map_err(|error| EffectError::new(error.to_string()))
+                    })();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let (follow_up, _) = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::SkillCreated(result)),
+                            );
+                            execute_effects(panel, follow_up);
+                            crate::dispatch::dispatch_frame_poll(panel);
+                        });
+                    });
+                });
+            }
             Effect::OpenSkillEditor { path } => {
                 let result = (|| {
                     let name = path
@@ -60,6 +103,45 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                         let _ = update_persistent(
                             panel,
                             Msg::Effect(EffectResultMsg::SkillEditorLoaded(result)),
+                        );
+                    });
+                });
+            }
+            Effect::OpenInEditor { editor_name, path } => {
+                let result = crate::editor_detect::EDITOR_CANDIDATES
+                    .iter()
+                    .find(|(_, name)| *name == editor_name)
+                    .ok_or_else(|| EffectError::new(format!("unknown editor {editor_name:?}")))
+                    .and_then(|(bin, _)| {
+                        crate::editor_detect::open_in_editor(bin, std::path::Path::new(&path))
+                            .map_err(|error| EffectError::new(error.to_string()))
+                    });
+                let _ = slint::invoke_from_event_loop(move || {
+                    crate::PANEL.with(|cell| {
+                        let slot = cell.borrow();
+                        let Some(panel) = slot.as_ref() else {
+                            return;
+                        };
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::ExternalEditorOpened(result)),
+                        );
+                    });
+                });
+            }
+            Effect::OpenWithOsDefault { path } => {
+                let result =
+                    crate::editor_detect::open_with_os_default(std::path::Path::new(&path))
+                        .map_err(|error| EffectError::new(error.to_string()));
+                let _ = slint::invoke_from_event_loop(move || {
+                    crate::PANEL.with(|cell| {
+                        let slot = cell.borrow();
+                        let Some(panel) = slot.as_ref() else {
+                            return;
+                        };
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::OsDefaultOpened(result)),
                         );
                     });
                 });
@@ -209,8 +291,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 panel.dispatch_agent_install_requested(&component, &agent_id);
             }
             Effect::SkillWrite { .. }
+            | Effect::CreateSkill { .. }
             | Effect::SkillPromoteToGlobal { .. }
-            | Effect::OpenSkillEditor { .. } => {
+            | Effect::OpenSkillEditor { .. }
+            | Effect::OpenInEditor { .. }
+            | Effect::OpenWithOsDefault { .. } => {
                 execute_skill_effects(vec![effect]);
             }
             Effect::SetActiveProjectPath { path } => {

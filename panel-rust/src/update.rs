@@ -598,17 +598,27 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
     }
 }
 
-fn update_skill(_model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) {
+fn update_skill(model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
-        SkillMsg::NewSkillRequested { .. } => (vec![], vec![Dirty::SkillsListDiff(vec![])]),
+        SkillMsg::NewSkillRequested { name, scope } => (
+            vec![Effect::CreateSkill {
+                name,
+                scope,
+                active_project_path: model.active_project_path.clone(),
+            }],
+            vec![Dirty::SkillsListDiff(vec![])],
+        ),
         SkillMsg::ContentEdited { path, content } => (
             vec![Effect::SkillWrite { path, content }],
             vec![Dirty::SkillsListDiff(vec![])],
         ),
         SkillMsg::CopyPathRequested { .. } => (vec![], vec![]),
         SkillMsg::EditorOpenRequested { path } => (vec![Effect::OpenSkillEditor { path }], vec![]),
-        SkillMsg::OpenInEditorRequested { .. } | SkillMsg::OpenWithOsDefaultRequested { .. } => {
-            (vec![], vec![])
+        SkillMsg::OpenInEditorRequested { editor_name, path } => {
+            (vec![Effect::OpenInEditor { editor_name, path }], vec![])
+        }
+        SkillMsg::OpenWithOsDefaultRequested { path } => {
+            (vec![Effect::OpenWithOsDefault { path }], vec![])
         }
         SkillMsg::PromoteToGlobal { path } => (
             vec![Effect::SkillPromoteToGlobal { path }],
@@ -859,9 +869,15 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 ),
             }
         }
+        EffectResultMsg::SkillCreated(Ok(path)) => (
+            vec![Effect::OpenSkillEditor { path }],
+            vec![Dirty::SkillsListDiff(vec![])],
+        ),
         EffectResultMsg::SkillWritten(Ok(())) | EffectResultMsg::SkillPromoted(Ok(())) => {
             (vec![], vec![])
         }
+        EffectResultMsg::ExternalEditorOpened(Ok(()))
+        | EffectResultMsg::OsDefaultOpened(Ok(())) => (vec![], vec![]),
         EffectResultMsg::SkillEditorLoaded(Ok(state)) => {
             model.active_skill_name = state.name;
             model.active_skill_path = state.path;
@@ -879,7 +895,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 },
             }],
         ),
-        EffectResultMsg::SkillWritten(Err(err)) | EffectResultMsg::SkillPromoted(Err(err)) => (
+        EffectResultMsg::SkillCreated(Err(err))
+        | EffectResultMsg::SkillWritten(Err(err))
+        | EffectResultMsg::SkillPromoted(Err(err))
+        | EffectResultMsg::ExternalEditorOpened(Err(err))
+        | EffectResultMsg::OsDefaultOpened(Err(err)) => (
             vec![],
             vec![Dirty::Error {
                 thread_id: String::new(),
@@ -2109,6 +2129,68 @@ mod tests {
             [Dirty::SkillsListDiff(ops)]
                 if matches!(ops.as_slice(), [crate::dirty::RowOp::Insert { at: 0, .. }])
         ));
+    }
+
+    #[test]
+    fn skill_actions_are_described_as_effects() {
+        let mut model = Model::default();
+        model.active_project_path = Some("/tmp/project/shotcut.mlt".to_owned());
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Skill(SkillMsg::NewSkillRequested {
+                name: "review".to_owned(),
+                scope: "project".to_owned(),
+            })),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::CreateSkill {
+                name,
+                scope,
+                active_project_path: Some(path),
+            }] if name == "review" && scope == "project" && path == "/tmp/project/shotcut.mlt"
+        ));
+        assert!(matches!(dirty.as_slice(), [Dirty::SkillsListDiff(_)]));
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Skill(SkillMsg::OpenInEditorRequested {
+                editor_name: "VS Code".to_owned(),
+                path: "/tmp/project/review".into(),
+            })),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenInEditor { editor_name, path }]
+                if editor_name == "VS Code"
+                    && path == &std::path::PathBuf::from("/tmp/project/review")
+        ));
+        assert!(dirty.is_empty());
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Skill(SkillMsg::OpenWithOsDefaultRequested {
+                path: "/tmp/project/review".into(),
+            })),
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::OpenWithOsDefault { path }]
+                if path == &std::path::PathBuf::from("/tmp/project/review")
+        ));
+    }
+
+    #[test]
+    fn skill_creation_result_opens_the_new_skill_in_the_model_editor() {
+        let mut model = Model::default();
+        let path = std::path::PathBuf::from("/tmp/review");
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SkillCreated(Ok(path.clone()))),
+        );
+        assert_eq!(effects, vec![Effect::OpenSkillEditor { path }]);
+        assert!(matches!(dirty.as_slice(), [Dirty::SkillsListDiff(_)]));
     }
 
     #[test]
