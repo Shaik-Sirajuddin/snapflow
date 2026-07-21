@@ -1591,16 +1591,28 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             })
             .unwrap_or_default();
         let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
-            DEFAULT_THREAD_NAMES
-                .iter()
-                .enumerate()
-                .map(|(idx, name)| ThreadSpec {
-                    display_name: (*name).to_owned(),
-                    provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
-                    session_id: None,
-                    profile_name: None,
-                })
-                .collect()
+            // DEFAULT_THREAD_NAMES was v1 scaffolding from before dynamic
+            // thread create/rename/delete existed (see its own doc comment)
+            // -- a real cold start today should just start with zero
+            // threads, same as any other empty-DB state. Only seed the
+            // fixed demo set when a test suite explicitly opts in, so
+            // these stale placeholder threads (with real, network-reaching
+            // agent bindings) don't leak into ordinary dev or production
+            // launches.
+            if std::env::var("RUI_SEED_DEMO_THREADS").as_deref() == Ok("1") {
+                DEFAULT_THREAD_NAMES
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, name)| ThreadSpec {
+                        display_name: (*name).to_owned(),
+                        provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
+                        session_id: None,
+                        profile_name: None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
             restored_records
                 .iter()
