@@ -1843,6 +1843,25 @@ impl AgentBridge {
         // handshake/session reconciliation completes.
         let gateways = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut gateway_setters: HashMap<String, Vec<AcpxThreadGatewaySetter>> = HashMap::new();
+        // Pre-seed every resolved provider URL, including ones with zero
+        // current threads (e.g. codex/claude on an empty cold start) --
+        // the loop below spawns a Gateway::connect() task per key in this
+        // map, and self.gateways only ever gets populated by that loop.
+        // Without this, a provider with no initial thread never gets a
+        // self.gateways entry, and any later add_thread_with_profile_
+        // and_provider call for that provider falls into its own "wait
+        // for a connection nothing will ever establish" 10s timeout --
+        // the exact cause of a real "click + -> agent never responds"
+        // bug found live via a real VNC session and reproduced by
+        // add_thread_after_empty_cold_start_reaches_a_real_codex_backend.
+        // An empty Vec here is fine: the connect task's per-setter loop
+        // simply has nothing to iterate until a real thread's own setter
+        // is added to self.gateways separately (already-connected
+        // gateways are read from that map directly, not re-delivered
+        // through this one-shot setter list).
+        for url in resolved_urls.values() {
+            gateway_setters.entry(url.clone()).or_default();
+        }
         let mut attachment_gates: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
         let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
 
@@ -3609,6 +3628,116 @@ mod tests {
             .iter()
             .any(|message| { message.text.contains("HELLO FROM A NEW THREAD") }));
         assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
+    }
+
+    /// Real, live, billed reproduction of a bug found via a real VNC
+    /// interactive session, not from prior automated coverage: a cold
+    /// start with zero initial threads (the DEFAULT_THREAD_NAMES opt-in
+    /// fix, 830ec21) plus the gateway_urls-for-every-known-provider fix
+    /// (9b5fb03) plus RUI_TEST_MODE gating (76a1e16) together are supposed
+    /// to add up to "click + -> a real codex reply, no mock, no manual env
+    /// juggling" -- this proves that chain end to end against this
+    /// machine's own real, already-logged-in Codex CLI auth, exactly the
+    /// way `panel_rust_create`'s empty-cold-start path and
+    /// `on_new_thread_requested`'s click handler actually call these
+    /// functions, not a synthetic shortcut.
+    ///
+    /// `#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1`, matching
+    /// `acpx/acpx-server/tests/real_ambient_multi_agent_test.rs`'s own
+    /// convention -- makes a real, billed model call using whatever
+    /// account this machine's Codex CLI is logged into.
+    ///
+    /// Run with:
+    /// ```text
+    /// ACPX_LIVE_TEST_AMBIENT=1 cargo test --lib \
+    ///   agent_bridge::tests::add_thread_after_empty_cold_start_reaches_a_real_codex_backend \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn add_thread_after_empty_cold_start_reaches_a_real_codex_backend() {
+        if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
+                 machine's real, already-logged-in codex CLI session (makes a real \
+                 billed API call)"
+            );
+            return;
+        }
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_DEFAULT_AGENT_ID", "codex")
+                .env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key")
+                .env("RUST_LOG", "error");
+            // Same real-auth wiring spawn_gateway_process uses for a real
+            // "codex" thread -- no ACPX_BACKEND_CMD override, so
+            // acpx-server falls through to its own real default (real
+            // codex-acp via npx), not a mock.
+            if std::env::var_os("CODEX_API_KEY").is_none() {
+                if let Some(key) = read_codex_api_key_from_auth_file() {
+                    command.env("CODEX_API_KEY", key);
+                }
+            }
+        });
+        let _gateway_guard = TestGateway {
+            child,
+            base_url: base_url.clone(),
+        };
+
+        // Empty initial thread_specs -- the exact cold-start shape
+        // panel_rust_create now produces by default (830ec21), which is
+        // what exposed the gateway_urls regression this test chain fixes.
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[],
+            move |_provider| Ok(base_url.clone()),
+            Some(cache_dir.path().to_path_buf()),
+        )
+        .expect("bridge with zero initial threads");
+
+        // Exactly what on_new_thread_requested calls.
+        let index = bridge
+            .add_thread_with_profile_and_provider("Real codex smoke test", None, Some("codex"))
+            .expect("add_thread_with_profile_and_provider must succeed against a real, \
+                     correctly-configured codex gateway");
+
+        bridge.push_local(
+            index,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: "Reply with exactly the single word PANG and nothing else.".into(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+        bridge.send_prompt(
+            index,
+            "Reply with exactly the single word PANG and nothing else.".into(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline && !ended {
+            ended = bridge
+                .poll()
+                .into_iter()
+                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        assert!(ended, "real codex-acp turn did not finish within 60s");
+        let history = bridge.history(index);
+        assert!(
+            history
+                .iter()
+                .any(|message| message.text.to_uppercase().contains("PANG")),
+            "expected a real reply containing PANG, got: {history:?}"
+        );
     }
 
     /// Coverage Matrix `session/list` row: recoverable-session listing
