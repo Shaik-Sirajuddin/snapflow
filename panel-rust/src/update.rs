@@ -1636,6 +1636,7 @@ mod tests {
                         session_id: None,
                         profile_name: None,
                     }],
+                    thread_ids: vec!["thread-1".to_owned()],
                     selected_thread_id: None,
                     permission_profiles: vec![],
                     thread_states: vec![],

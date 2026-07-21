@@ -31,6 +31,7 @@ use std::rc::Rc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct InitialState {
     pub threads: Vec<ThreadSpec>,
+    pub thread_ids: Vec<String>,
     pub selected_thread_id: Option<String>,
     pub permission_profiles: Vec<Option<String>>,
     pub thread_states: Vec<ThreadState>,
@@ -160,9 +161,12 @@ impl Model {
             .into_iter()
             .enumerate()
             .map(|(idx, spec)| ThreadModel {
-                thread_id: spec
-                    .session_id
-                    .clone()
+                thread_id: initial
+                    .thread_ids
+                    .get(idx)
+                    .cloned()
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| spec.session_id.clone())
                     .unwrap_or_else(|| format!("thread:{idx}")),
                 display_name: spec.display_name,
                 provider: spec.provider,
@@ -203,6 +207,7 @@ mod tests {
     fn from_initial_state_cold_start_empty_db_produces_no_threads() {
         let model = Model::from_initial_state(InitialState {
             threads: vec![],
+            thread_ids: vec![],
             selected_thread_id: None,
             permission_profiles: vec![],
             thread_states: vec![],
@@ -228,6 +233,7 @@ mod tests {
                     profile_name: Some("default".to_owned()),
                 },
             ],
+            thread_ids: vec!["thread-1".to_owned(), "thread-2".to_owned()],
             selected_thread_id: Some("sess-2".to_owned()),
             permission_profiles: vec![None, None],
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
@@ -255,6 +261,7 @@ mod tests {
                 session_id: Some("sess-1".to_owned()),
                 profile_name: Some("balanced".to_owned()),
             }],
+            thread_ids: vec!["thread-1".to_owned()],
             selected_thread_id: None,
             permission_profiles: vec![Some("workspace".to_owned())],
             thread_states: vec![ThreadState::Error],

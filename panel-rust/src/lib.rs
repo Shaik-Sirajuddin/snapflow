@@ -1860,6 +1860,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         };
         let mut model = model::Model::from_initial_state(model::InitialState {
             threads: initial_specs.clone(),
+            thread_ids: restored_records
+                .iter()
+                .map(|record| record.thread_id.clone())
+                .chain((restored_records.len()..initial_specs.len()).map(|idx| {
+                    format!("thread:{idx}")
+                }))
+                .collect(),
             selected_thread_id: initial_selected_thread_id.clone(),
             permission_profiles: initial_permission_profiles.clone(),
             thread_states: if bridge_available {
@@ -1904,6 +1911,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         {
             let initial = model::InitialState {
                 threads: initial_specs.clone(),
+                thread_ids: restored_records
+                    .iter()
+                    .map(|record| record.thread_id.clone())
+                    .chain((restored_records.len()..initial_specs.len()).map(|idx| {
+                        format!("thread:{idx}")
+                    }))
+                    .collect(),
                 selected_thread_id: initial_selected_thread_id.clone(),
                 permission_profiles: initial_permission_profiles.clone(),
                 thread_states: if bridge_available {
