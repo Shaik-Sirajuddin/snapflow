@@ -504,7 +504,12 @@ def permission_button_dock_xy(dock_width, approve):
     """
     dock_height = 260
     compact = dock_width < 320
-    shell_height = 72 if compact else 78
+    # Compose shell height, matching compose_input_dock_xy /
+    # local_terminal_focus_dock_xy exactly: pad(12) + input(34) + spacing(8)
+    # + row-2 mode/model triggers(24) + pad(12) = 90px. This was re-grounded
+    # to 90 for the other bottom-anchored controls (commit 0877782) but this
+    # function kept the stale 72, putting the card's buttons ~18px too low.
+    shell_height = 12 + 34 + 8 + 24 + 12
     separator_height = 1
     outer_pad = 6 if compact else 10
     card_pad = 10
