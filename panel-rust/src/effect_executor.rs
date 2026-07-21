@@ -28,7 +28,10 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                                 Msg::Effect(EffectResultMsg::SkillWritten(result)),
                             );
                             panel.dispatch_frame_input(crate::msg::FrameInput {
-                                skills_snapshot: Some(panel.collect_skills_snapshot()),
+                                skills_snapshot: Some(
+                                    crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                                        .collect_skills_snapshot(),
+                                ),
                                 ..crate::msg::FrameInput::default()
                             });
                         });
@@ -85,7 +88,10 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                                 Msg::Effect(EffectResultMsg::SkillPromoted(result)),
                             );
                             panel.dispatch_frame_input(crate::msg::FrameInput {
-                                skills_snapshot: Some(panel.collect_skills_snapshot()),
+                                skills_snapshot: Some(
+                                    crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                                        .collect_skills_snapshot(),
+                                ),
                                 ..crate::msg::FrameInput::default()
                             });
                         });
@@ -106,6 +112,9 @@ fn execute_skill_effects(effects: Vec<Effect>) {
 /// `update()`. Effects are deliberately kept out of the reducer and out of
 /// the callback wrappers.
 pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
+    if effects.is_empty() {
+        return;
+    }
     for effect in effects {
         match effect {
             Effect::LoadInitialState => {}
@@ -116,38 +125,23 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 panel.execute_cancel_generation_real(real_index);
             }
             Effect::RespondAgentRequest { approve, .. } => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
-                panel.answer_pending_request(&component, approve);
+                panel.answer_pending_request(approve);
             }
             Effect::PermissionOptionSelected { option, .. } => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
-                panel.answer_pending_request_option(&component, &option);
+                panel.answer_pending_request_option(&option);
             }
             Effect::LoadOlderMessages { .. } => {
                 panel.dispatch_load_older_requested();
             }
             Effect::LocalTerminalSpawn => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
-                panel.dispatch_local_terminal_toggle(&component);
+                panel.dispatch_local_terminal_toggle();
             }
             Effect::LocalTerminalKill => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
-                panel.dispatch_local_terminal_close(&component);
+                panel.dispatch_local_terminal_close();
             }
             Effect::LocalTerminalWrite { bytes } => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
                 let text = String::from_utf8_lossy(&bytes);
-                panel.dispatch_local_terminal_key_input(&component, &text);
+                panel.dispatch_local_terminal_key_input(&text);
             }
             Effect::SaveSettings { input } => {
                 let result = panel.execute_settings_save(input);
@@ -165,16 +159,10 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::SetConfigOption { key, value, .. } => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
-                panel.dispatch_config_option_selected(&component, &key, &value);
+                panel.dispatch_config_option_selected(&key, &value);
             }
             Effect::SetMode { mode, .. } => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
-                panel.dispatch_mode_selected(&component, &mode);
+                panel.dispatch_mode_selected(&mode);
             }
             Effect::SaveDevMode { enabled } => {
                 panel.dispatch_dev_mode_toggled(enabled);
@@ -290,17 +278,19 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::PersistThread { real_index } => {
-                let result = panel.collect_thread_record(real_index).map(|record| {
-                    panel
-                        .panel_state
-                        .as_ref()
-                        .map(|store| {
-                            store
-                                .save_thread_record(&record)
-                                .map_err(|error| EffectError::new(error.to_string()))
-                        })
-                        .unwrap_or(Ok(()))
-                });
+                let result = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                    .collect_thread_record(real_index)
+                    .map(|record| {
+                        panel
+                            .panel_state
+                            .as_ref()
+                            .map(|store| {
+                                store
+                                    .save_thread_record(&record)
+                                    .map_err(|error| EffectError::new(error.to_string()))
+                            })
+                            .unwrap_or(Ok(()))
+                    });
                 let result = result.unwrap_or(Ok(()));
                 let _ = slint::invoke_from_event_loop(move || {
                     crate::PANEL.with(|cell| {
@@ -348,4 +338,8 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             }
         }
     }
+    // Effects may change bridge/store state without producing a typed
+    // completion payload. Re-enter through the external Frame source so
+    // update()/sync() fold and project those changes in one place.
+    crate::dispatch::dispatch_frame_poll(panel);
 }

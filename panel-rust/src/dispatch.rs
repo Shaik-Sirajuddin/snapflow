@@ -168,6 +168,23 @@ pub(crate) fn update_persistent(
     result
 }
 
+pub(crate) fn dispatch_initial_hydration(
+    panel: &PanelSingleton,
+    initial: crate::model::InitialState,
+) {
+    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::Init));
+    debug_assert!(matches!(
+        effects.as_slice(),
+        [crate::effect::Effect::LoadInitialState]
+    ));
+    let _ = update_persistent(
+        panel,
+        Msg::Effect(crate::effect::EffectResultMsg::InitialStateLoaded(Ok(
+            initial,
+        ))),
+    );
+}
+
 /// Wired from `component.on_thread_selected`. `filtered_idx` is a Slint
 /// filtered-list index.
 pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usize) {
@@ -177,11 +194,12 @@ pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usi
     );
     execute_effects(panel, effects);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        selected_thread_snapshot: panel.collect_selected_thread_snapshot(),
-        settings_gateway_snapshot: panel
-            .component
-            .get_settings_open()
-            .then(|| panel.collect_settings_gateway_snapshot()),
+        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_selected_thread_snapshot(),
+        settings_gateway_snapshot: panel.model.borrow().settings_open.then(|| {
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot()
+        }),
         ..crate::msg::FrameInput::default()
     });
     debug_assert!(dirty
@@ -198,11 +216,12 @@ pub(crate) fn dispatch_thread_navigate(panel: &PanelSingleton, delta: i32) {
     );
     execute_effects(panel, effects);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        selected_thread_snapshot: panel.collect_selected_thread_snapshot(),
-        settings_gateway_snapshot: panel
-            .component
-            .get_settings_open()
-            .then(|| panel.collect_settings_gateway_snapshot()),
+        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_selected_thread_snapshot(),
+        settings_gateway_snapshot: panel.model.borrow().settings_open.then(|| {
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot()
+        }),
         ..crate::msg::FrameInput::default()
     });
     debug_assert!(dirty
@@ -258,11 +277,17 @@ pub(crate) fn dispatch_thread_recover_session_attach(
     let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
     execute_effects(panel, follow_up);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+        thread_list_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_list_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        settings_gateway_snapshot: Some(panel.collect_settings_gateway_snapshot()),
+        settings_gateway_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
     let filtered_idx = panel
@@ -289,7 +314,10 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
     let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
     execute_effects(panel, follow_up);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+        thread_list_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_list_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
 
@@ -335,7 +363,10 @@ pub(crate) fn dispatch_thread_rename(
     );
     execute_effects(panel, effects);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+        thread_list_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_list_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
     let updated_filtered_idx = panel
@@ -366,12 +397,16 @@ pub(crate) fn dispatch_thread_close(
     );
     execute_effects(panel, effects);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+        thread_list_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_list_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
     if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
         panel.dispatch_frame_input(crate::msg::FrameInput {
-            selected_thread_snapshot: panel.collect_thread_snapshot_for(idx),
+            selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_snapshot_for(idx),
             ..crate::msg::FrameInput::default()
         });
     }
@@ -391,12 +426,16 @@ pub(crate) fn dispatch_thread_delete(
     );
     execute_effects(panel, effects);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+        thread_list_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_list_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
     if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
         panel.dispatch_frame_input(crate::msg::FrameInput {
-            selected_thread_snapshot: panel.collect_thread_snapshot_for(idx),
+            selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_snapshot_for(idx),
             ..crate::msg::FrameInput::default()
         });
     }
@@ -557,7 +596,8 @@ pub(crate) fn dispatch_terminal_expand(
     );
     let _ = component;
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        selected_thread_snapshot: panel.collect_selected_thread_snapshot(),
+        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_selected_thread_snapshot(),
         ..crate::msg::FrameInput::default()
     });
 }
@@ -569,7 +609,8 @@ pub(crate) fn dispatch_terminal_close_overlay(panel: &PanelSingleton) {
     let (_effects, _dirty) =
         update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseOverlay)));
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        selected_thread_snapshot: panel.collect_selected_thread_snapshot(),
+        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_selected_thread_snapshot(),
         ..crate::msg::FrameInput::default()
     });
 }
@@ -647,7 +688,8 @@ pub(crate) fn dispatch_settings_open(panel: &PanelSingleton, component: &ChatPan
         panel,
         Msg::Ui(UiMsg::Settings(crate::msg::SettingsMsg::Open)),
     );
-    panel.dispatch_settings_requested(component);
+    let _ = component;
+    panel.dispatch_settings_requested();
 }
 
 pub(crate) fn dispatch_settings_scope_changed(
@@ -659,29 +701,30 @@ pub(crate) fn dispatch_settings_scope_changed(
         panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ScopeChanged(scope.clone()))),
     );
-    panel.dispatch_settings_scope_changed(component, &scope);
+    let _ = component;
+    panel.dispatch_settings_scope_changed(&scope);
 }
 
-pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, component: &ChatPanel) {
-    let selected_thread_id = panel
-        .real_index(component.get_selected_thread().max(0) as usize)
-        .and_then(|idx| {
-            panel
-                .bridge
-                .as_ref()
-                .and_then(|bridge| bridge.thread_binding(idx))
-                .map(|binding| binding.thread_id)
-        });
+pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, _component: &ChatPanel) {
+    let model = panel.model.borrow();
+    let selected_thread_id = panel.real_index(model.selected_thread).and_then(|idx| {
+        panel
+            .bridge
+            .as_ref()
+            .and_then(|bridge| bridge.thread_binding(idx))
+            .map(|binding| binding.thread_id)
+    });
     let input = crate::msg::SettingsSaveInput {
-        scope: component.get_settings_scope().to_string(),
-        default_profile: component.get_default_profile().to_string(),
-        permission_profile: component.get_permission_profile().to_string(),
-        background_default: component.get_background_default(),
-        default_agent_id: component.get_default_agent_id().to_string(),
+        scope: model.settings_scope.clone(),
+        default_profile: model.default_profile.clone(),
+        permission_profile: model.permission_profile.clone(),
+        background_default: model.background_default,
+        default_agent_id: model.default_agent_id.clone(),
         selected_thread_id,
-        background_override_set: component.get_background_override_set(),
-        background_override: component.get_background_override(),
+        background_override_set: model.background_override_set,
+        background_override: model.background_override,
     };
+    drop(model);
     let (effects, _) = update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))));
     execute_effects(panel, effects);
 }
@@ -924,7 +967,10 @@ pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_in
     );
     execute_effects(panel, effects);
     panel.dispatch_frame_input(crate::msg::FrameInput {
-        thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+        thread_list_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_list_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
 }
@@ -944,7 +990,10 @@ pub(crate) fn dispatch_search_changed(
         .any(|item| matches!(item, Dirty::ThreadListDiff(_)))
     {
         panel.dispatch_frame_input(crate::msg::FrameInput {
-            thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+            thread_list_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                    .collect_thread_list_snapshot(),
+            ),
             ..crate::msg::FrameInput::default()
         });
     }
@@ -974,7 +1023,10 @@ pub(crate) fn dispatch_search_submitted(
         .any(|item| matches!(item, Dirty::ThreadListDiff(_)))
     {
         panel.dispatch_frame_input(crate::msg::FrameInput {
-            thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+            thread_list_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                    .collect_thread_list_snapshot(),
+            ),
             ..crate::msg::FrameInput::default()
         });
         if panel.model.borrow().visible_indices.is_empty() {
@@ -1027,11 +1079,14 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
     match command {
         crate::PANEL_COMMAND_PREVIOUS_THREAD | crate::PANEL_COMMAND_NEXT_THREAD => {
             panel.dispatch_frame_input(crate::msg::FrameInput {
-                selected_thread_snapshot: panel.collect_selected_thread_snapshot(),
-                settings_gateway_snapshot: panel
-                    .component
-                    .get_settings_open()
-                    .then(|| panel.collect_settings_gateway_snapshot()),
+                selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
+                    panel,
+                )
+                .collect_selected_thread_snapshot(),
+                settings_gateway_snapshot: panel.model.borrow().settings_open.then(|| {
+                    crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                        .collect_settings_gateway_snapshot()
+                }),
                 ..crate::msg::FrameInput::default()
             });
         }

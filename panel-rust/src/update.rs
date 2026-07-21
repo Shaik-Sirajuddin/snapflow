@@ -1055,7 +1055,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 {
                     thread.state = ThreadState::Loading;
                     effects.push(Effect::SendPrompt {
-                        real_index: bridge_event.thread_index,
+                        real_index: target_index,
                         text: entry.text,
                     });
                 }
@@ -1099,9 +1099,6 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
     }
     if frame.settings_reload_pending {
         dirty.push(Dirty::Settings);
-    }
-    if frame.local_terminal_snapshot.is_some() {
-        dirty.push(Dirty::LocalTerminal);
     }
     if frame.prepend_expanded_rows > 0 {
         let mut expanded = vec![false; frame.prepend_expanded_rows];
@@ -1610,7 +1607,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                real_index: 1,
                 text: "queued".to_owned(),
             }]
         );
@@ -1930,7 +1927,6 @@ mod tests {
                 bridge_events_pending: true,
                 thread_record_snapshots: Vec::new(),
                 settings_reload_pending: true,
-                local_terminal_snapshot: Some("$ ".to_owned()),
                 prepend_expanded_rows: 0,
                 thread_list_snapshot: None,
                 selected_thread_snapshot: None,
@@ -1949,7 +1945,6 @@ mod tests {
             thread_id: String::new(),
         }));
         assert!(dirty.contains(&Dirty::Settings));
-        assert!(dirty.contains(&Dirty::LocalTerminal));
     }
 
     #[test]

@@ -220,7 +220,6 @@ pub struct FrameInput {
     pub bridge_events_pending: bool,
     pub thread_record_snapshots: Vec<crate::state_store::ThreadRecord>,
     pub settings_reload_pending: bool,
-    pub local_terminal_snapshot: Option<String>,
     pub prepend_expanded_rows: usize,
     pub thread_list_snapshot: Option<ThreadListSnapshot>,
     pub selected_thread_snapshot: Option<ThreadFrameSnapshot>,

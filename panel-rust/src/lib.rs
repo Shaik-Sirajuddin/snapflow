@@ -46,13 +46,13 @@ mod update;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec};
 use appearance::{ColorScheme, HostAppearance};
-use models::{build_thread_items, describe_thread, ThreadState};
+use models::ThreadState;
 use protocol_types::{ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
 use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{SharedString, VecModel};
 use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
 use std::os::raw::{c_int, c_uchar, c_uint};
@@ -431,7 +431,8 @@ impl PanelSingleton {
     /// Gateway index for settings RPCs: selected real thread, else first
     /// bound thread, else `0` only as last resort when the bridge exists.
     fn settings_gateway_index(&self) -> usize {
-        if let Some(idx) = self.real_index(self.component.get_selected_thread() as usize) {
+        let selected_thread = self.model.borrow().selected_thread;
+        if let Some(idx) = self.real_index(selected_thread) {
             if self
                 .bridge
                 .as_ref()
@@ -454,83 +455,6 @@ impl PanelSingleton {
 
     pub(crate) fn dispatch_frame_input(&self, frame: msg::FrameInput) -> bool {
         crate::dispatch::dispatch_frame_input(self, frame)
-    }
-
-    pub(crate) fn collect_settings_gateway_snapshot(&self) -> crate::msg::SettingsGatewaySnapshot {
-        self.bridge
-            .as_ref()
-            .map(|bridge| {
-                let gw = self.settings_gateway_index();
-                crate::msg::SettingsGatewaySnapshot {
-                    profiles: bridge.list_profiles(gw),
-                    mcp_servers: bridge.list_mcp_servers(gw),
-                    agents: bridge.list_agents(gw),
-                    recoverable_sessions: bridge.recoverable_sessions(gw),
-                    recovery_provider: bridge.thread_provider(gw).unwrap_or_default(),
-                }
-            })
-            .unwrap_or(crate::msg::SettingsGatewaySnapshot {
-                profiles: Vec::new(),
-                mcp_servers: Vec::new(),
-                agents: Vec::new(),
-                recoverable_sessions: Vec::new(),
-                recovery_provider: String::new(),
-            })
-    }
-
-    pub(crate) fn collect_settings_preferences_snapshot(
-        &self,
-        requested_scope: Option<&str>,
-    ) -> msg::SettingsPreferencesSnapshot {
-        let model_scope = self.model.borrow().settings_scope.clone();
-        let default_scope = if settings_file::SettingsPaths::from_env().project.is_some() {
-            "project"
-        } else {
-            "global"
-        };
-        let scope = requested_scope
-            .filter(|scope| *scope == "global" || *scope == "project")
-            .or_else(|| (!model_scope.is_empty()).then_some(model_scope.as_str()))
-            .unwrap_or(default_scope);
-        let selected_thread_id = self
-            .real_index(self.component.get_selected_thread().max(0) as usize)
-            .and_then(|idx| {
-                self.bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_binding(idx))
-                    .map(|binding| binding.thread_id)
-            });
-        let prefs = load_scoped_panel_prefs(scope, selected_thread_id.clone());
-        let (defaults, default_agent_id) = prefs
-            .map(|prefs| (prefs.defaults, prefs.default_agent_id))
-            .unwrap_or_else(|| {
-                let defaults = load_panel_prefs(selected_thread_id.clone());
-                let default_agent_id = settings_file::SettingsPaths::from_env()
-                    .load_resolved()
-                    .ok()
-                    .and_then(|resolved| resolved.default_agent_id);
-                (defaults, default_agent_id)
-            });
-        let (background_override_set, background_override) = selected_thread_id
-            .as_deref()
-            .and_then(|thread_id| {
-                self.panel_state
-                    .as_ref()
-                    .and_then(|store| store.thread_settings(thread_id).ok().flatten())
-                    .and_then(|settings| settings.background_session)
-                    .map(|value| (true, value))
-            })
-            .unwrap_or((false, false));
-        msg::SettingsPreferencesSnapshot {
-            scope: scope.to_owned(),
-            default_profile: defaults.profile_name.unwrap_or_default(),
-            permission_profile: defaults.permission_profile.unwrap_or_default(),
-            background_default: defaults.background_session,
-            default_agent_id: default_agent_id.unwrap_or_default(),
-            dev_mode: settings_file::SettingsPaths::from_env().dev_mode(),
-            background_override_set,
-            background_override,
-        }
     }
 
     fn sync_runtime_defaults(&self, effective: &PanelDefaults) {
@@ -570,228 +494,6 @@ impl PanelSingleton {
                 bridge.resize_local_terminal(idx, cols, rows);
             }
         }
-    }
-
-    /// Rebuilds and pushes the `threads` model from the dynamic thread list +
-    /// current `thread_state`, narrowed by `search_query` (Phase 2's
-    /// real client-side filter -- see `models::build_thread_items`).
-    /// Called any time a thread's status changes (send in flight, turn
-    /// ended, error) or the search box is edited.
-    pub(crate) fn collect_thread_list_snapshot(&self) -> msg::ThreadListSnapshot {
-        let model = self.model.borrow();
-        let state: Vec<ThreadState> = model
-            .threads
-            .iter()
-            .map(|thread| thread.state.clone())
-            .collect();
-        let query = model.search_query.clone();
-        // Phase 3: sidebar description is synthesized from each
-        // thread's latest cached message (`models::describe_thread`) --
-        // recomputed here rather than cached, since it must track the
-        // live/bridge history, not just `thread_state`.
-        let names: Vec<String> = model
-            .threads
-            .iter()
-            .map(|thread| thread.display_name.clone())
-            .collect();
-        let thread_ids: Vec<String> = model
-            .threads
-            .iter()
-            .enumerate()
-            .map(|(idx, thread)| {
-                self.bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_binding(idx))
-                    .map(|binding| binding.thread_id)
-                    .unwrap_or_else(|| {
-                        if thread.thread_id.is_empty() {
-                            format!("thread:{idx}")
-                        } else {
-                            thread.thread_id.clone()
-                        }
-                    })
-            })
-            .collect();
-        let errors: Vec<String> = model
-            .threads
-            .iter()
-            .map(|thread| thread.error.clone().unwrap_or_default())
-            .collect();
-        drop(model);
-        let descriptions: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if let Some(error) = errors.get(i).filter(|error| !error.is_empty()) {
-                    return format!("Error: {error}");
-                }
-                match &self.bridge {
-                    Some(bridge) => {
-                        describe_thread(&bridge.history(i), THREAD_DESCRIPTION_MAX_CHARS)
-                    }
-                    None => String::new(),
-                }
-            })
-            .collect();
-        let background_sessions: Vec<bool> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                let Some(store) = self.panel_state.as_ref() else {
-                    return false;
-                };
-                let Some(thread_id) = self
-                    .bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_binding(idx))
-                    .map(|binding| binding.thread_id)
-                else {
-                    return false;
-                };
-                store
-                    .effective_background_session(&thread_id)
-                    .unwrap_or(false)
-            })
-            .collect();
-        let closed: Vec<bool> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .map(|bridge| bridge.thread_closed(idx))
-                    .unwrap_or(false)
-            })
-            .collect();
-        let providers: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_provider(idx))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let thread_models: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .map(|bridge| models::model_name_from_config(&bridge.config_options(idx)))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let thread_project_paths: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_project_path(idx))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let items = build_thread_items(
-            &*names,
-            &state,
-            &descriptions,
-            &background_sessions,
-            &closed,
-            &query,
-        );
-        let visible_indices: Vec<usize> = items.iter().map(|i| i.real_index).collect();
-        let rows: Vec<models::VisibleThreadItem> = items
-            .into_iter()
-            .map(|i| {
-                let mut item = i.item;
-                item.provider = providers
-                    .get(i.real_index)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into();
-                item.model = thread_models
-                    .get(i.real_index)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into();
-                let project_path = thread_project_paths
-                    .get(i.real_index)
-                    .cloned()
-                    .unwrap_or_default();
-                item.project_name = std::path::Path::new(&project_path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-                    .into();
-                item.project_path = project_path.into();
-                // `thread_new_loading_state` phase: a thread whose ACP
-                // session hasn't resolved yet (`thread_binding` is only
-                // `None` before `spawn_background_attachment` completes --
-                // see `add_thread_with_profile`'s doc comment) shows as
-                // loading/busy instead of a misleadingly-idle empty chat
-                // view, from the moment "+" is clicked until attachment
-                // finishes. Closed threads are excluded since a closed
-                // session legitimately has no binding either.
-                if !item.closed
-                    && self
-                        .bridge
-                        .as_ref()
-                        .is_some_and(|bridge| bridge.thread_binding(i.real_index).is_none())
-                {
-                    item.status = "loading".into();
-                    item.busy = true;
-                }
-                models::VisibleThreadItem {
-                    real_index: i.real_index,
-                    thread_id: thread_ids
-                        .get(i.real_index)
-                        .cloned()
-                        .unwrap_or_else(|| format!("thread:{}", i.real_index)),
-                    item,
-                }
-            })
-            .collect();
-        msg::ThreadListSnapshot {
-            visible_indices,
-            visible_thread_ids: rows.iter().map(|row| row.thread_id.clone()).collect(),
-            rows,
-        }
-    }
-
-    /// Rebuilds the `skills` sidebar model from the global skills
-    /// directory (`skill_discovery_backend` phase). Project-local
-    /// scanning is deliberately not wired here yet -- it needs
-    /// `active_project_binding`'s active-project state, which doesn't
-    /// exist yet -- so this only ever reports global skills for now.
-    pub(crate) fn collect_skills_snapshot(&self) -> Vec<crate::skills_state::SkillEntry> {
-        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-        let mut entries = crate::skills_state::scan_skills_dir(
-            &global_dir,
-            crate::skills_state::SkillScope::Global,
-        );
-        // `project_scoped_skill_isolation`: now that `active_project_binding`
-        // is real, also scan the active project's own `.skills/` directory
-        // -- entirely additive to the always-scanned global directory, and
-        // naturally empty (not an error) when no project is open or it has
-        // no `.skills/` yet, since `scan_skills_dir` already treats a
-        // missing directory as an empty result.
-        let active_project_path = self.model.borrow().active_project_path.clone();
-        if let Some(project_path) = active_project_path.as_ref() {
-            // `active_project_path` is the open MLT *file*'s path
-            // (`MainWindow::fileName()`), not its containing directory --
-            // `.skills/` lives alongside the project file, so this needs
-            // the parent directory.
-            if let Some(project_dir) = std::path::Path::new(project_path).parent() {
-                let skills_dir = crate::skills_state::project_skills_dir(project_dir);
-                entries.extend(crate::skills_state::scan_skills_dir(
-                    &skills_dir,
-                    crate::skills_state::SkillScope::Project,
-                ));
-            }
-        }
-        entries
     }
 
     /// Translates a Slint-side filtered-list index (what `thread-selected`
@@ -835,16 +537,6 @@ impl PanelSingleton {
                 raw_output: None,
             },
         );
-        self.dispatch_frame_input(msg::FrameInput {
-            thread_list_snapshot: Some(self.collect_thread_list_snapshot()),
-            ..msg::FrameInput::default()
-        });
-        if Some(idx) == self.real_index(self.component.get_selected_thread() as usize) {
-            self.dispatch_frame_input(msg::FrameInput {
-                selected_thread_snapshot: self.collect_thread_snapshot_for(idx),
-                ..msg::FrameInput::default()
-            });
-        }
         bridge.send_prompt(idx, text.to_string());
         trace_host_input(format_args!("send dispatched real_thread={idx}"));
     }
@@ -880,7 +572,10 @@ impl PanelSingleton {
             let grown_by = after_len.saturating_sub(before_len);
             self.dispatch_frame_input(msg::FrameInput {
                 prepend_expanded_rows: grown_by,
-                selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
+                selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
+                    self,
+                )
+                .collect_thread_snapshot_for(real_idx),
                 ..msg::FrameInput::default()
             });
         }
@@ -888,10 +583,10 @@ impl PanelSingleton {
 
     /// Extracted from the former `on_local_terminal_toggle_requested`
     /// closure body.
-    pub(crate) fn dispatch_local_terminal_toggle(&self, component: &ChatPanel) {
+    pub(crate) fn dispatch_local_terminal_toggle(&self) {
         trace_host_input("local terminal toggle callback invoked");
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         if bridge.has_local_terminal(real_idx) {
@@ -906,16 +601,12 @@ impl PanelSingleton {
                 "local terminal toggled thread={real_idx} open=true cols={cols} rows={rows}"
             ));
         }
-        self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
-            ..msg::FrameInput::default()
-        });
     }
 
     /// Extracted from the former `on_local_terminal_key_input` closure body.
-    pub(crate) fn dispatch_local_terminal_key_input(&self, component: &ChatPanel, text: &str) {
+    pub(crate) fn dispatch_local_terminal_key_input(&self, text: &str) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         let bytes = models::translate_local_terminal_key(text);
@@ -930,16 +621,12 @@ impl PanelSingleton {
 
     /// Extracted from the former `on_local_terminal_close_requested`
     /// closure body.
-    pub(crate) fn dispatch_local_terminal_close(&self, component: &ChatPanel) {
+    pub(crate) fn dispatch_local_terminal_close(&self) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         bridge.close_local_terminal(real_idx);
-        self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
-            ..msg::FrameInput::default()
-        });
     }
 
     /// `dispatch.rs`'s Settings-domain wrappers (tea-slint-model Phase 4)
@@ -947,23 +634,28 @@ impl PanelSingleton {
     /// `on_mcp_server_*`/`on_profile_*`/`on_mode_selected`/
     /// `on_config_option_selected`/`on_agent_install_requested`/
     /// `on_dev_mode_toggled` closure bodies.
-    pub(crate) fn dispatch_settings_requested(&self, component: &ChatPanel) {
-        let _ = component;
+    pub(crate) fn dispatch_settings_requested(&self) {
         self.dispatch_frame_input(msg::FrameInput {
-            settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(None)),
+            settings_preferences_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(self)
+                    .collect_settings_preferences_snapshot(None),
+            ),
             ..msg::FrameInput::default()
         });
         self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            settings_gateway_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(self)
+                    .collect_settings_gateway_snapshot(),
+            ),
             ..msg::FrameInput::default()
         });
     }
 
-    pub(crate) fn dispatch_settings_scope_changed(&self, component: &ChatPanel, scope: &str) {
-        let _ = component;
+    pub(crate) fn dispatch_settings_scope_changed(&self, scope: &str) {
         self.dispatch_frame_input(msg::FrameInput {
             settings_preferences_snapshot: Some(
-                self.collect_settings_preferences_snapshot(Some(scope)),
+                crate::external_snapshot::ExternalSnapshotSource::new(self)
+                    .collect_settings_preferences_snapshot(Some(scope)),
             ),
             ..msg::FrameInput::default()
         });
@@ -1011,14 +703,6 @@ impl PanelSingleton {
                 }
             }
         }
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(None)),
-            ..msg::FrameInput::default()
-        });
-        self.dispatch_frame_input(msg::FrameInput {
-            thread_list_snapshot: Some(self.collect_thread_list_snapshot()),
-            ..msg::FrameInput::default()
-        });
         Ok(())
     }
 
@@ -1036,20 +720,12 @@ impl PanelSingleton {
         };
         let gw = self.settings_gateway_index();
         bridge.create_mcp_server(gw, entry);
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
-            ..msg::FrameInput::default()
-        });
     }
 
     pub(crate) fn dispatch_mcp_server_delete(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         bridge.delete_mcp_server(gw, name);
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
-            ..msg::FrameInput::default()
-        });
     }
 
     pub(crate) fn dispatch_mcp_server_enabled_changed(
@@ -1069,10 +745,6 @@ impl PanelSingleton {
                 "panel-rust: MCP server {:?} disappeared before its enabled state could update",
                 name
             );
-            self.dispatch_frame_input(msg::FrameInput {
-                settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
-                ..msg::FrameInput::default()
-            });
             return;
         };
         entry.extra["enabled"] = serde_json::Value::Bool(enabled);
@@ -1082,10 +754,6 @@ impl PanelSingleton {
                 name
             );
         }
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
-            ..msg::FrameInput::default()
-        });
     }
 
     pub(crate) fn dispatch_profile_create(
@@ -1107,30 +775,18 @@ impl PanelSingleton {
         }
         let gw = self.settings_gateway_index();
         bridge.create_profile(gw, entry);
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
-            ..msg::FrameInput::default()
-        });
     }
 
     pub(crate) fn dispatch_profile_delete(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         bridge.delete_profile(gw, name);
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
-            ..msg::FrameInput::default()
-        });
     }
 
     pub(crate) fn dispatch_agent_install_requested(&self, _component: &ChatPanel, agent_id: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         bridge.install_agent(gw, agent_id);
-        self.dispatch_frame_input(msg::FrameInput {
-            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
-            ..msg::FrameInput::default()
-        });
     }
 
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
@@ -1143,29 +799,20 @@ impl PanelSingleton {
             if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
                 eprintln!("panel-rust: failed to install bundled global skill: {error}");
             }
-            self.dispatch_frame_input(msg::FrameInput {
-                skills_snapshot: Some(self.collect_skills_snapshot()),
-                ..msg::FrameInput::default()
-            });
         }
     }
 
-    pub(crate) fn dispatch_mode_selected(&self, component: &ChatPanel, mode_id: &str) {
+    pub(crate) fn dispatch_mode_selected(&self, mode_id: &str) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         bridge.set_mode(real_idx, mode_id.to_string());
     }
 
-    pub(crate) fn dispatch_config_option_selected(
-        &self,
-        component: &ChatPanel,
-        option_id: &str,
-        value: &str,
-    ) {
+    pub(crate) fn dispatch_config_option_selected(&self, option_id: &str, value: &str) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         bridge.set_config_option(
@@ -1206,7 +853,10 @@ impl PanelSingleton {
             Ok(skill_dir) => {
                 trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
                 self.dispatch_frame_input(msg::FrameInput {
-                    skills_snapshot: Some(self.collect_skills_snapshot()),
+                    skills_snapshot: Some(
+                        crate::external_snapshot::ExternalSnapshotSource::new(self)
+                            .collect_skills_snapshot(),
+                    ),
                     ..msg::FrameInput::default()
                 });
                 crate::dispatch::dispatch_skill_editor_open_requested(
@@ -1283,140 +933,13 @@ impl PanelSingleton {
         if let Some(bridge) = self.bridge.as_ref() {
             bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
         }
-        self.dispatch_frame_input(msg::FrameInput {
-            skills_snapshot: Some(self.collect_skills_snapshot()),
-            ..msg::FrameInput::default()
-        });
-    }
-
-    /// Collects non-destructive external snapshots for one frame tick.
-    /// Draining bridge events and consuming watcher flags happens only after
-    /// this value has gone through `Msg::Frame`/`update()`.
-    pub(crate) fn collect_thread_snapshot_for(
-        &self,
-        real_idx: usize,
-    ) -> Option<msg::ThreadFrameSnapshot> {
-        let bridge = self.bridge.as_ref()?;
-        let pending_request = match bridge.pending_requests(real_idx).first() {
-            Some(event) => {
-                let view = permission::to_pending_request_view(event);
-                crate::PendingRequestItem {
-                    active: true,
-                    relay_id: view.relay_id.into(),
-                    method: view.method.into(),
-                    title: view.title.into(),
-                    summary: view.summary.into(),
-                    supported: permission::is_supported_method(&event.method),
-                    options: ModelRc::new(slint::VecModel::from(
-                        permission::to_permission_option_rows(view.options),
-                    )),
-                }
-            }
-            None => crate::PendingRequestItem::default(),
-        };
-        let terminal_ids = bridge.active_terminals(real_idx);
-        let terminals = terminal_ids
-            .iter()
-            .map(|id| (id.clone(), bridge.terminal_buffer(real_idx, id)))
-            .collect();
-        let expanded_id = self.model.borrow().expanded_terminal_id.clone();
-        let expanded_terminal = expanded_id.and_then(|id| {
-            bridge
-                .terminal_buffer(real_idx, &id)
-                .map(|buffer| crate::TerminalItem {
-                    terminal_id: id.into(),
-                    output: buffer.output.into(),
-                    truncated: buffer.truncated,
-                    has_exited: buffer.exit_status.is_some(),
-                    exit_code: buffer
-                        .exit_status
-                        .and_then(|(code, _signal)| code)
-                        .unwrap_or_default(),
-                })
-        });
-        Some(msg::ThreadFrameSnapshot {
-            thread_id: self
-                .bridge
-                .as_ref()
-                .and_then(|bridge| bridge.thread_binding(real_idx))
-                .map(|binding| binding.thread_id)
-                .or_else(|| {
-                    self.model
-                        .borrow()
-                        .threads
-                        .get(real_idx)
-                        .map(|thread| thread.thread_id.clone())
-                })
-                .unwrap_or_else(|| format!("thread:{real_idx}")),
-            real_index: real_idx,
-            transcript: bridge.transcript(real_idx),
-            has_older_messages: bridge.has_older_page(real_idx),
-            pending_request,
-            terminals: models::to_terminal_item_rows(terminals),
-            expanded_terminal,
-            local_terminal: models::to_local_terminal_item(
-                bridge.local_terminal_snapshot(real_idx),
-            ),
-            connection_status: bridge.transport_status(real_idx),
-            session_modes: bridge.session_modes(real_idx),
-            config_options: bridge.config_options(real_idx),
-        })
-    }
-
-    pub(crate) fn collect_selected_thread_snapshot(&self) -> Option<msg::ThreadFrameSnapshot> {
-        let selected = self.real_index(self.component.get_selected_thread() as usize);
-        selected.and_then(|real_idx| self.collect_thread_snapshot_for(real_idx))
-    }
-
-    fn collect_thread_record_snapshots(&self) -> Vec<crate::state_store::ThreadRecord> {
-        let Some(bridge) = self.bridge.as_ref() else {
-            return Vec::new();
-        };
-        let model = self.model.borrow();
-        model
-            .threads
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, thread)| {
-                let binding = bridge.thread_binding(idx)?;
-                let provider = bridge.thread_provider(idx)?;
-                Some(crate::state_store::ThreadRecord {
-                    thread_id: binding.thread_id,
-                    display_name: thread.display_name.clone(),
-                    provider,
-                    session_id: binding.session_id,
-                    profile_name: thread.profile_name.clone(),
-                    permission_profile: thread.permission_profile.clone(),
-                    background_session: None,
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn collect_thread_record(
-        &self,
-        real_idx: usize,
-    ) -> Option<crate::state_store::ThreadRecord> {
-        let bridge = self.bridge.as_ref()?;
-        let thread = self.model.borrow().threads.get(real_idx)?.clone();
-        let binding = bridge.thread_binding(real_idx)?;
-        let provider = bridge.thread_provider(real_idx)?;
-        Some(crate::state_store::ThreadRecord {
-            thread_id: binding.thread_id,
-            display_name: thread.display_name,
-            provider,
-            session_id: binding.session_id,
-            profile_name: thread.profile_name,
-            permission_profile: thread.permission_profile,
-            background_session: None,
-        })
     }
 
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
-    pub(crate) fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
+    pub(crate) fn answer_pending_request_option(&self, option_id: &str) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         let pending = bridge.pending_requests(real_idx);
@@ -1428,7 +951,8 @@ impl PanelSingleton {
         let response = permission::build_response_for_option(event, option_id);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
         self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
+            selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(self)
+                .collect_thread_snapshot_for(real_idx),
             ..msg::FrameInput::default()
         });
     }
@@ -1438,9 +962,9 @@ impl PanelSingleton {
     /// [`permission::build_response`]).
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
-    pub(crate) fn answer_pending_request(&self, component: &ChatPanel, approved: bool) {
+    pub(crate) fn answer_pending_request(&self, approved: bool) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         let pending = bridge.pending_requests(real_idx);
@@ -1452,7 +976,7 @@ impl PanelSingleton {
             permission::default_reject_option_id(&options)
         };
         if let Some(id) = option_id {
-            self.answer_pending_request_option(component, id);
+            self.answer_pending_request_option(id);
             return;
         }
         // No matching option (e.g. reject with only allow offered) —
@@ -1460,7 +984,8 @@ impl PanelSingleton {
         let response = permission::build_response(event, approved);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
         self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
+            selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(self)
+                .collect_thread_snapshot_for(real_idx),
             ..msg::FrameInput::default()
         });
     }
@@ -1742,24 +1267,20 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     vec![ThreadState::Error; initial_specs.len()]
                 },
             };
-            let mut model = panel.model.borrow_mut();
-            let (effects, _) = update::update(&mut model, msg::Msg::Host(msg::HostMsg::Init));
-            debug_assert!(matches!(
-                effects.as_slice(),
-                [effect::Effect::LoadInitialState]
-            ));
-            let (_, dirty) = update::update(
-                &mut model,
-                msg::Msg::Effect(effect::EffectResultMsg::InitialStateLoaded(Ok(initial))),
-            );
-            sync::sync(&model, &panel.component, &dirty);
+            dispatch::dispatch_initial_hydration(&panel, initial);
         }
         // Fold the first bridge/store-backed presentation snapshot as one
         // Frame message. This makes cold start's first post-hydration sync a
         // single reducer turn instead of several adapter-driven pushes.
         panel.dispatch_frame_input(crate::msg::FrameInput {
-            thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
-            skills_snapshot: Some(panel.collect_skills_snapshot()),
+            thread_list_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                    .collect_thread_list_snapshot(),
+            ),
+            skills_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                    .collect_skills_snapshot(),
+            ),
             ..crate::msg::FrameInput::default()
         });
         // Multi-process prefs live in JSON; selected thread stays in SQLite.
@@ -1803,7 +1324,8 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         }
         panel.dispatch_frame_input(crate::msg::FrameInput {
             settings_preferences_snapshot: Some(
-                panel.collect_settings_preferences_snapshot(Some(settings_scope)),
+                crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                    .collect_settings_preferences_snapshot(Some(settings_scope)),
             ),
             ..crate::msg::FrameInput::default()
         });
@@ -1819,13 +1341,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 eprintln!("panel-rust: failed to install bundled global skill at startup: {error}");
             }
             panel.dispatch_frame_input(crate::msg::FrameInput {
-                skills_snapshot: Some(panel.collect_skills_snapshot()),
+                skills_snapshot: Some(
+                    crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                        .collect_skills_snapshot(),
+                ),
                 ..crate::msg::FrameInput::default()
             });
         }
-        if let Some(real_idx) = panel.real_index(panel.component.get_selected_thread() as usize) {
+        if let Some(real_idx) = panel.real_index(panel.model.borrow().selected_thread) {
             panel.dispatch_frame_input(crate::msg::FrameInput {
-                selected_thread_snapshot: panel.collect_thread_snapshot_for(real_idx),
+                selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
+                    &panel,
+                )
+                .collect_thread_snapshot_for(real_idx),
                 ..crate::msg::FrameInput::default()
             });
         } else {
