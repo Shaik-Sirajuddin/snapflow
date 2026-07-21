@@ -1272,6 +1272,18 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 });
             }
             if pending_changed {
+                if thread.pending_request.active {
+                    // Coverage-matrix `session/request_permission` host
+                    // scenario: the one observable signal that an agent-
+                    // initiated request card is now live for this thread, so
+                    // a host test can wait for it before clicking the card.
+                    // (Restored: the pre-TEA refresh_pending_request_for
+                    // emitted this; the TEA cutover dropped it.)
+                    crate::trace_host_input(format_args!(
+                        "pending request active thread={} method={}",
+                        snapshot.real_index, thread.pending_request.method
+                    ));
+                }
                 dirty.push(Dirty::PendingRequest {
                     thread_id: thread_id.clone(),
                 });
