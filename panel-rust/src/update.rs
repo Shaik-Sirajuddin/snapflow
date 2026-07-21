@@ -1144,10 +1144,27 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         }
     }
     if let Some(snapshot) = frame.selected_thread_snapshot {
-        let switched_thread = model.displayed_thread != Some(snapshot.real_index);
+        // The bridge index is only a collection-time location. Resolve the
+        // snapshot by durable identity first so a concurrent list diff cannot
+        // hydrate the wrong thread after indices shift.
+        let target_index = if snapshot.thread_id.is_empty() {
+            Some(snapshot.real_index)
+        } else {
+            model
+                .threads
+                .iter()
+                .position(|thread| {
+                    thread.thread_id == snapshot.thread_id
+                        || thread.session_id.as_deref() == Some(snapshot.thread_id.as_str())
+                })
+        };
+        let Some(target_index) = target_index else {
+            return (effects, dirty);
+        };
+        let switched_thread = model.displayed_thread != Some(target_index);
         if switched_thread {
             model.expanded.clear();
-            model.displayed_thread = Some(snapshot.real_index);
+            model.displayed_thread = Some(target_index);
         }
         let transcript_row_count =
             crate::models::to_message_rows_from_transcript(snapshot.transcript.clone(), &[])
@@ -1156,7 +1173,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.expanded.resize(transcript_row_count, false);
         }
         let expanded = model.expanded.clone();
-        if let Some(thread) = model.threads.get_mut(snapshot.real_index) {
+        if let Some(thread) = model.threads.get_mut(target_index) {
             let thread_id = thread.session_id.clone().unwrap_or_default();
             let old_keys = thread.transcript_keys.clone();
             let rows = crate::models::to_message_rows_from_transcript(
@@ -1508,6 +1525,7 @@ mod tests {
                     event: crate::protocol_types::AgentEvent::TurnEnded("late".to_owned()),
                 }],
                 selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread:7".to_owned(),
                     real_index: 7,
                     transcript: Vec::new(),
                     has_older_messages: false,
@@ -1754,6 +1772,7 @@ mod tests {
             &mut model,
             Msg::Frame(FrameInput {
                 selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
                     real_index: 0,
                     transcript: transcript.clone(),
                     has_older_messages: true,
@@ -1784,6 +1803,52 @@ mod tests {
         assert!(dirty.iter().any(|item| matches!(
             item,
             Dirty::Connection { thread_id } if thread_id == "thread-1"
+        )));
+    }
+
+    #[test]
+    fn frame_snapshot_resolves_by_thread_id_after_index_shift() {
+        let mut model = model_with_threads(&["first", "target", "last"]);
+        model.threads[1].session_id = Some("session-target".to_owned());
+        model.threads.insert(
+            0,
+            ThreadModel {
+                thread_id: "inserted".to_owned(),
+                ..ThreadModel::default()
+            },
+        );
+
+        let transcript = vec![crate::conversation::TranscriptItem::Assistant {
+            message_id: "shifted-message".to_owned(),
+            text: "correct target".to_owned(),
+            streaming: true,
+        }];
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "session-target".to_owned(),
+                    real_index: 1,
+                    transcript: transcript.clone(),
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: "Live".to_owned(),
+                    session_modes: None,
+                    config_options: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert!(model.threads[1].transcript.is_empty());
+        assert_eq!(model.threads[2].display_name, "target");
+        assert_eq!(model.threads[2].transcript, transcript);
+        assert!(dirty.iter().any(|item| matches!(
+            item,
+            Dirty::MessagesDiff { thread_id, .. } if thread_id == "session-target"
         )));
     }
 

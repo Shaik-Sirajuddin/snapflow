@@ -264,6 +264,10 @@ pub struct SettingsPreferencesSnapshot {
 /// resulting presentation state after this value is folded into `Model`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadFrameSnapshot {
+    /// Durable reducer identity. `real_index` is only the bridge lookup
+    /// location at collection time and may change before this snapshot is
+    /// folded into Model.
+    pub thread_id: String,
     pub real_index: usize,
     pub transcript: Vec<crate::conversation::TranscriptItem>,
     pub has_older_messages: bool,

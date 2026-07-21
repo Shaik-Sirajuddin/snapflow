@@ -1486,6 +1486,19 @@ impl PanelSingleton {
                 })
         });
         Some(msg::ThreadFrameSnapshot {
+            thread_id: self
+                .bridge
+                .as_ref()
+                .and_then(|bridge| bridge.thread_binding(real_idx))
+                .map(|binding| binding.thread_id)
+                .or_else(|| {
+                    self.model
+                        .borrow()
+                        .threads
+                        .get(real_idx)
+                        .map(|thread| thread.thread_id.clone())
+                })
+                .unwrap_or_else(|| format!("thread:{real_idx}")),
             real_index: real_idx,
             transcript: bridge.transcript(real_idx),
             has_older_messages: bridge.has_older_page(real_idx),
