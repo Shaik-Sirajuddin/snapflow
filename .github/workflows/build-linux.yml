@@ -68,7 +68,16 @@ jobs:
     env:
       IMAGE_NAME: mltframework/shotcut-build:qt6.10.3-ubuntu22.04
     steps:
+      # shotcut-rebrand isn't part of this repo's tree (no submodule entry --
+      # it started life as a local-only git worktree on the dev machine, now
+      # pushed to Shaik-Sirajuddin/shotcut.git's rebrand/snapflow branch), so
+      # check it out separately rather than expecting it in this repo's own
+      # checkout.
       - uses: actions/checkout@v4
+        with:
+          repository: Shaik-Sirajuddin/shotcut
+          ref: rebrand/snapflow
+          path: shotcut-rebrand
 
       - name: Build snapflow (from this fork's rebrand/snapflow branch)
         run: |
@@ -83,8 +92,15 @@ jobs:
             echo "SNAPFLOW_HEAD=0"
             echo "SNAPFLOW_REVISION=origin/rebrand/snapflow"
             echo "SNAPFLOW_REPO=https://github.com/Shaik-Sirajuddin/shotcut.git"
+            # The docker image's entrypoint hardcodes /root/shotcut as the
+            # mount point (and its own default INSTALL_DIR=$HOME/snapflow
+            # would otherwise write build output outside the mount) --
+            # keep everything inside the one mounted directory so the
+            # final .txz actually lands back on the runner's filesystem.
+            echo "INSTALL_DIR=/root/shotcut"
+            echo "SOURCE_DIR=/root/shotcut/src"
           } > build-snapflow.conf
-          docker run -v "$PWD:/root/snapflow" -e SNAPFLOW_REPO "$IMAGE_NAME"
+          docker run -v "$PWD:/root/shotcut" "$IMAGE_NAME"
           mv snapflow.txz "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
 
       - uses: actions/upload-artifact@v4
