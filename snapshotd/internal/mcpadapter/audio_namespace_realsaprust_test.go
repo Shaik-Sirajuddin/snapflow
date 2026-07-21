@@ -102,23 +102,30 @@ func TestMCPAdapter_AudioSetGainWhenEnabled(t *testing.T) {
 	agent := newMCPAgent(t, ctx, testServer.URL+"/sse")
 	defer agent.Close()
 
-	searchReq := mcp.CallToolRequest{}
-	searchReq.Params.Name = "sap.search"
-	searchReq.Params.Arguments = map[string]any{"query": "audio.setGain"}
-	searchRes, err := agent.client.CallTool(ctx, searchReq)
+	// sap.search is gone -- the equivalent live-server behavior for "is
+	// this audio.* method available when the namespace is enabled" is
+	// that its typed tool is present in ListTools() at all.
+	toolsResult, err := agent.client.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
-		t.Fatalf("search audio.setGain: %v", err)
+		t.Fatalf("list tools: %v", err)
 	}
-	if searchRes.IsError {
-		t.Fatalf("audio.setGain search should succeed when enabled: %s", toolResultText(searchRes))
+	found := false
+	for _, tl := range toolsResult.Tools {
+		if tl.Name == "audio.setGain" {
+			found = true
+			break
+		}
 	}
-	matches := decodeArrayResult(t, toolResultText(searchRes))
-	if len(matches) != 1 || matches[0]["method"] != "audio.setGain" {
-		t.Fatalf("expected enabled audio.setGain to be discoverable, got %+v", matches)
+	if !found {
+		t.Fatalf("expected audio.setGain tool to be registered when AudioNamespaceEnabled is true, got tools: %+v", toolsResult.Tools)
 	}
 
 	agent.sapCall("project.select", map[string]any{"projectId": proj.ID})
 	agent.sapCall("edit.addTrack", map[string]any{"kind": "video"})
+	// edit.appendClip/filter.* need a selected track/clip -- an explicit
+	// trackIndex/clipId is never honored as an override (see the
+	// selection-state end-to-end test).
+	agent.sapCall("track.enter", map[string]any{"trackIndex": 0})
 	entry := agent.sapCall("playlist.append", map[string]any{"source": map[string]any{"path": source}})
 	clip := agent.sapCall("edit.appendClip", map[string]any{
 		"trackIndex": float64(0),
@@ -128,6 +135,7 @@ func TestMCPAdapter_AudioSetGainWhenEnabled(t *testing.T) {
 	if clipID == "" {
 		t.Fatalf("edit.appendClip returned no clipId: %+v", clip)
 	}
+	agent.sapCall("clip.enter", map[string]any{"clipId": clipID})
 
 	exportAndWait := func(outputPath string) {
 		t.Helper()
@@ -242,6 +250,17 @@ func TestMCPAdapter_AudioRemainingHelpersWhenEnabled(t *testing.T) {
 	agent := newMCPAgent(t, ctx, testServer.URL+"/sse")
 	defer agent.Close()
 
+	// sap.search is gone -- the equivalent live-server behavior for "is
+	// this audio.* method available when the namespace is enabled" is
+	// that its typed tool is present in ListTools() at all.
+	toolsResult, err := agent.client.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	present := make(map[string]bool, len(toolsResult.Tools))
+	for _, tl := range toolsResult.Tools {
+		present[tl.Name] = true
+	}
 	for _, method := range []string{
 		"audio.setPan",
 		"audio.setBalance",
@@ -249,24 +268,14 @@ func TestMCPAdapter_AudioRemainingHelpersWhenEnabled(t *testing.T) {
 		"audio.setFadeInOut",
 		"audio.setAutoFade",
 	} {
-		searchReq := mcp.CallToolRequest{}
-		searchReq.Params.Name = "sap.search"
-		searchReq.Params.Arguments = map[string]any{"query": method}
-		searchRes, err := agent.client.CallTool(ctx, searchReq)
-		if err != nil {
-			t.Fatalf("search %s: %v", method, err)
-		}
-		if searchRes.IsError {
-			t.Fatalf("%s search should succeed when enabled: %s", method, toolResultText(searchRes))
-		}
-		matches := decodeArrayResult(t, toolResultText(searchRes))
-		if len(matches) != 1 || matches[0]["method"] != method {
-			t.Fatalf("expected enabled %s to be discoverable, got %+v", method, matches)
+		if !present[method] {
+			t.Fatalf("expected %s tool to be registered when AudioNamespaceEnabled is true, got tools: %+v", method, toolsResult.Tools)
 		}
 	}
 
 	agent.sapCall("project.select", map[string]any{"projectId": proj.ID})
 	agent.sapCall("edit.addTrack", map[string]any{"kind": "video"})
+	agent.sapCall("track.enter", map[string]any{"trackIndex": 0})
 	entry := agent.sapCall("playlist.append", map[string]any{"source": map[string]any{"path": source}})
 	clip := agent.sapCall("edit.appendClip", map[string]any{
 		"trackIndex": float64(0),
@@ -276,6 +285,7 @@ func TestMCPAdapter_AudioRemainingHelpersWhenEnabled(t *testing.T) {
 	if clipID == "" {
 		t.Fatalf("edit.appendClip returned no clipId: %+v", clip)
 	}
+	agent.sapCall("clip.enter", map[string]any{"clipId": clipID})
 
 	// clipLen (project-timeline frames, NOT the source's native 30fps
 	// encoding) is read back from the real edit.appendClip response

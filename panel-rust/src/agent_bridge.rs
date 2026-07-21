@@ -655,7 +655,10 @@ fn resolve_skills_mcp_server_bin() -> PathBuf {
 /// through as-is; `skills-mcp-server` itself derives the project's
 /// `.skills/` directory from its parent, same as `refresh_skills_model`
 /// (lib.rs) already does.
-fn skills_mcp_servers_entry(project_path: Option<&std::path::Path>) -> Vec<serde_json::Value> {
+fn skills_mcp_servers_entry(
+    project_path: Option<&std::path::Path>,
+    provider: &str,
+) -> Vec<serde_json::Value> {
     let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
     let mut args = vec![
         "--global-dir".to_string(),
@@ -665,11 +668,83 @@ fn skills_mcp_servers_entry(project_path: Option<&std::path::Path>) -> Vec<serde
         args.push("--project-dir".to_string());
         args.push(project_path.to_string_lossy().into_owned());
     }
-    vec![serde_json::json!({
+    let mut entries = vec![serde_json::json!({
         "name": "skills",
         "command": resolve_skills_mcp_server_bin().to_string_lossy(),
         "args": args,
+    })];
+    entries.extend(snapshotd_mcp_server_entry(provider));
+    entries
+}
+
+/// snapshotd's video/media-editing MCP surface (`project.*`/`edit.*`/
+/// `sap.call`/etc, see `snapshotd/internal/mcpadapter`) is served over SSE
+/// by `snapshotd serve`, on by default -- but nothing ever added it to the
+/// `mcpServers` array `session/new`/`session/load` send, unlike the
+/// `skills` stdio server above. Found live: a real running `snapshotd
+/// serve` instance's MCP SSE listener answered a probe correctly, yet no
+/// chat session ever advertised it to the backend agent at all -- a
+/// genuine "MCP server not made available by default" gap, not just an
+/// auth or process-wiring issue. `SNAPSHOTD_MCP_SSE_ADDR` mirrors
+/// `snapshotd/internal/config`'s own env var for where that listener
+/// binds (default `127.0.0.1:7777`); only included when a real listener
+/// actually answers there, so this stays silent instead of advertising a
+/// dead MCP server when no snapshotd daemon is running at all.
+///
+/// **`"type": "http"`, not `"sse"`, even though the URL is the same `/sse`
+/// endpoint** -- found live, correcting this function's own first draft:
+/// an `sse`-typed entry made real `codex-acp` reject `session/new`
+/// outright (`Invalid request: Codex doesn't support MCP SSE transport
+/// protocol`; its own advertised `mcpCapabilities` are `{http: true, sse:
+/// false}`). Re-sending the *identical* URL as `"type": "http"` instead
+/// was accepted by both real adapters and confirmed live end-to-end on
+/// both: a real `session/prompt` on each backend discovered the
+/// `snapshotd` tools and completed a real tool call (`daemon_listProjects`
+/// on Codex, an attempted `daemon_list` on Claude) -- codex-acp's
+/// "http" transport client evidently tolerates this server's classic
+/// SSE-stream response shape in practice, so one entry shape now covers
+/// both providers instead of needing a provider-gated split.
+fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
+    let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
+    let addr = std::env::var("SNAPSHOTD_MCP_SSE_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string());
+    if !probe_http_endpoint(&addr, "/sse") {
+        return Vec::new();
+    }
+    vec![serde_json::json!({
+        "type": "http",
+        "name": "snapshotd",
+        "url": format!("http://{addr}/sse"),
+        "headers": [],
     })]
+}
+
+/// One-shot "is anything answering here at all" probe -- deliberately not
+/// a full protocol round trip like `probe_acpx_gateway_once` (an SSE
+/// stream never sends a normal HTTP response body to read), just enough
+/// to avoid advertising a dead MCP server to every new session when no
+/// snapshotd daemon happens to be running on this machine.
+fn probe_http_endpoint(addr: &str, path: &str) -> bool {
+    use std::io::{Read, Write};
+    let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 32];
+    // An SSE endpoint streams indefinitely -- a short-timeout partial read
+    // that returns *some* bytes (the start of the HTTP/SSE response) is
+    // already proof of life; a connect-but-nothing-ever-sent case (or
+    // connection refused/reset) is treated as "not a real listener".
+    matches!(stream.read(&mut buf), Ok(n) if n > 0)
 }
 
 /// Resolves the mock backend agent binary the locally-spawned gateway
@@ -720,6 +795,161 @@ fn resolve_backend_agent_command() -> Option<String> {
         .join("target/debug/rui-mock-agent");
     if dev_mock_agent.is_file() {
         return Some(dev_mock_agent.to_string_lossy().into_owned());
+    }
+    None
+}
+
+/// `ServerConfig::from_env`'s own `ACPX_BACKEND_CMD` fallback
+/// (`acpx-server/src/config.rs`) is unconditionally `codex-acp` -- it has
+/// no notion of `provider`/`ACPX_DEFAULT_AGENT_ID` at all, that field is
+/// display-only. So when [`resolve_backend_agent_command`] found no
+/// explicit override, a "claude" persona gateway was *still* silently
+/// spawning the real `codex-acp` adapter as its backend: found live
+/// (chat-panel-live-fixes.md phase 4) via a running instance's actual
+/// spawned child-process list, not by re-reading the code. Mirrors the
+/// per-provider default `acpx/scripts/openhands-acpx-claude.sh` already
+/// documents and tests for exactly this integration point.
+fn default_backend_command_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "claude" => Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1"),
+        // "codex" (and anything else) already matches acpx-server's own
+        // built-in default -- nothing to override.
+        _ => None,
+    }
+}
+
+/// Reads `CODEX_API_KEY` out of the Codex CLI's own on-disk login
+/// (`~/.codex/auth.json`, overrideable via `ACPX_CODEX_AUTH_FILE`), the
+/// same recipe `acpx/scripts/openhands-acpx-codex.sh` already uses (there
+/// via `jq`) to give the real `codex-acp` adapter noninteractive
+/// `api-key` auth instead of its `chat-gpt` device-login flow, which does
+/// not complete headlessly (see `acpx/TEST_REPORT.md`'s documented
+/// limitation) -- exactly the `-32000: backend requires authentication`
+/// error this closes for a system that already has `codex login`
+/// completed. Returns `None` on any missing file/field/parse error so the
+/// caller can fall back to whatever `codex-acp` does with no key (still
+/// better than a hard failure at gateway-spawn time).
+fn read_codex_api_key_from_auth_file() -> Option<String> {
+    let path = std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .or_else(|| codex_home_dir().map(|dir| dir.join("auth.json")))?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    value
+        .get("OPENAI_API_KEY")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Resolves the real Codex CLI's own `.codex` directory (holding
+/// `auth.json` and `config.toml`) -- shared by
+/// read_codex_api_key_from_auth_file, read_codex_model_provider_from_config,
+/// and spawn_gateway_process's own `CODEX_HOME` wiring. Prefers
+/// `ACPX_CODEX_AUTH_FILE`'s parent (set by snapshotd's procmgr.Launch to
+/// the real, unsandboxed user's `~/.codex/auth.json` when this process is
+/// running inside a sandboxed per-project HOME -- see that Go code's own
+/// doc comment) over `$HOME/.codex`, since `$HOME` itself is exactly what's
+/// sandboxed and wrong in that case.
+fn codex_home_dir() -> Option<PathBuf> {
+    std::env::var_os("ACPX_CODEX_AUTH_FILE")
+        .map(PathBuf::from)
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .or_else(|| dirs_home().map(|home| home.join(".codex")))
+}
+
+/// Builds (or reuses) a project-scoped `.codex` directory containing only
+/// symlinks to the real `auth.json`/`config.toml` from
+/// [`codex_home_dir`], and returns its path -- this, not the real
+/// `.codex` directory itself, is what gets handed to the child process as
+/// `CODEX_HOME`.
+///
+/// **Real live bug this closes.** Pointing `CODEX_HOME` straight at the
+/// real `~/.codex` (the previous fix, made to solve Bifrost auth) also
+/// hands the bundled Codex engine the real, unsandboxed `~/.codex/sessions/`
+/// directory -- found live: a fresh per-project gateway's own `session/list`
+/// call (`acpx-core/src/router.rs`'s `dispatch_session_list_real`) forwards
+/// straight to that engine, which happily reported the real user's entire
+/// personal session history (1200+ rollout files spanning every project
+/// ever worked in on this host, not just this one), and acpx-server
+/// auto-imported every single one as a "discovered" gateway session
+/// (`translate_or_register_backend_session`) until instantly hitting
+/// `max_sessions_per_tenant` -- confirmed by every row in a *freshly
+/// deleted and recreated* per-project session db carrying a `created_at`
+/// within microseconds of the gateway's own process start, not spread
+/// across real usage. Deleting the local db and relaunching only
+/// re-triggered the same import from the real, untouched `~/.codex/sessions`.
+///
+/// The fix mirrors this whole file's existing sandboxing philosophy (see
+/// `procmgr.go`'s `qtHomeDir` doc comment for the same idea applied to the
+/// Qt process's `$HOME`): give the engine its own project-scoped `.codex`
+/// with an empty `sessions/`, so its `session/list` genuinely starts empty
+/// for a fresh project, while still symlinking in just the two files
+/// (`auth.json`, `config.toml`) actually needed for Bifrost auth to keep
+/// working. Symlinks (not copies) so a real, external `codex login`
+/// refreshing `auth.json` is still picked up without any resync step.
+fn sandboxed_codex_home(cache_dir: &PathBuf) -> Option<PathBuf> {
+    let real_home = codex_home_dir()?;
+    let sandboxed = cache_dir.join("codex-home");
+    std::fs::create_dir_all(&sandboxed).ok()?;
+    for name in ["auth.json", "config.toml"] {
+        let link = sandboxed.join(name);
+        if link.exists() || link.symlink_metadata().is_ok() {
+            continue;
+        }
+        let target = real_home.join(name);
+        if !target.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(not(unix))]
+        let _ = std::fs::copy(&target, &link);
+    }
+    Some(sandboxed)
+}
+
+/// Reads the top-level `model_provider = "..."` key out of the Codex
+/// CLI's own `~/.codex/config.toml`, so codex-acp is told to use whatever
+/// custom model provider (e.g. an internal proxy/gateway) this system's
+/// real `codex` CLI is already configured for -- found live, not assumed:
+/// this system's stored `CODEX_API_KEY` (from auth.json) is a
+/// provider-specific token, not a raw OpenAI secret key, and codex-acp
+/// defaults to calling `https://api.openai.com` directly when
+/// MODEL_PROVIDER is unset, which genuinely rejects that token with a
+/// real 401 from OpenAI's own API ("invalid_api_key") -- the key was
+/// never invalid, it just was never meant to be used against that
+/// endpoint. codex-acp's own MODEL_PROVIDER runtime option (its README:
+/// "model provider to pass to Codex for new sessions") routes through the
+/// bundled real Codex engine's own `[model_providers.<name>]` config
+/// table instead, the same one the real `codex` CLI already uses
+/// successfully with this exact key. Minimal line-based TOML parse
+/// (stops at the first `[table]` header, i.e. before any nested table
+/// could shadow a same-named top-level key) rather than pulling in a full
+/// TOML parser dependency for one scalar field.
+fn read_codex_model_provider_from_config() -> Option<String> {
+    let contents = std::fs::read_to_string(codex_home_dir()?.join("config.toml")).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        let Some(rest) = trimmed.strip_prefix("model_provider") else {
+            continue;
+        };
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = value.strip_prefix('"').unwrap_or(value);
+        let value = value.split('"').next().unwrap_or("").trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
     }
     None
 }
@@ -988,6 +1218,67 @@ fn spawn_gateway_process(
     // resolve_backend_agent_command's doc comment for the full story.
     if let Some(backend_cmd) = resolve_backend_agent_command() {
         cmd.env("ACPX_BACKEND_CMD", backend_cmd);
+    } else if let Some(backend_cmd) = default_backend_command_for_provider(provider) {
+        // No explicit override: acpx-server's own built-in default is
+        // codex-only (see default_backend_command_for_provider's doc
+        // comment), so a non-codex provider needs its real adapter
+        // spelled out here instead of silently getting codex-acp anyway.
+        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
+    }
+    // Independent of which ACPX_BACKEND_CMD branch above fired --
+    // found live via /verify-impl-style subagent review: this used to be
+    // an else-if off the branches above, so an explicit RUI_ACP_AGENT_CMD/
+    // RUI_USE_DEV_MOCK_AGENT override (still legitimately codex-acp
+    // underneath, e.g. an operator pinning a specific npx version) would
+    // silently skip this auth wiring and reintroduce the original
+    // -32000 auth error with no diagnostic. A real backend-command
+    // override for a non-codex adapter is harmless to check here too --
+    // the provider == "codex" guard keeps it a no-op in that case.
+    if provider == "codex" {
+        // acpx-server's own default already resolves to the real
+        // codex-acp adapter; give it a noninteractive path to this
+        // system's already-authenticated Codex CLI login instead of
+        // codex-acp's headless-incapable chat-gpt device flow (see
+        // read_codex_api_key_from_auth_file's doc comment).
+        if std::env::var_os("ACPX_NATIVE_AUTH_METHOD_ID").is_none() {
+            cmd.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+        }
+        if std::env::var_os("CODEX_API_KEY").is_none() {
+            if let Some(key) = read_codex_api_key_from_auth_file() {
+                cmd.env("CODEX_API_KEY", key);
+            }
+        }
+        // See read_codex_model_provider_from_config's own doc comment:
+        // this system's stored Codex API key is only valid against the
+        // custom model provider (e.g. an internal proxy) the real codex
+        // CLI is already configured for, not OpenAI's own API directly --
+        // codex-acp defaults to the latter unless told otherwise.
+        if std::env::var_os("MODEL_PROVIDER").is_none() {
+            if let Some(provider) = read_codex_model_provider_from_config() {
+                cmd.env("MODEL_PROVIDER", provider);
+            }
+        }
+        // MODEL_PROVIDER names a provider (e.g. "bifrost"); the actual
+        // [model_providers.bifrost] table (base_url, wire_api, etc.) still
+        // has to be resolved from a real config.toml somewhere -- found
+        // live: the bundled Codex engine reads $CODEX_HOME/config.toml
+        // (default $HOME/.codex), which is this launch's *sandboxed*
+        // $HOME, so it has none of that and fails with "Model provider
+        // `bifrost` not found" even with MODEL_PROVIDER correctly set.
+        // CODEX_HOME (a real, documented override the bundled `codex`
+        // engine itself supports -- see its own `--help`) redirects that
+        // lookup -- but *not* to the real ~/.codex directly (see
+        // sandboxed_codex_home's doc comment for the real session-history
+        // leak that caused live), only to a project-scoped mirror
+        // containing just the auth/config files.
+        if std::env::var_os("CODEX_HOME").is_none() {
+            let sandboxed_home = cache_dir
+                .and_then(sandboxed_codex_home)
+                .or_else(codex_home_dir);
+            if let Some(dir) = sandboxed_home {
+                cmd.env("CODEX_HOME", dir);
+            }
+        }
     }
     #[cfg(unix)]
     {
@@ -1247,15 +1538,25 @@ fn spawn_background_attachment(
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
 ) {
+    // Resolved synchronously, before the async task below, not inside it:
+    // skills_mcp_servers_entry now transitively probes snapshotd's MCP
+    // liveness over a real (blocking std::net::TcpStream) connection --
+    // rust-audit's "blocking calls inside async fn" anti-pattern would
+    // otherwise apply here, tying up a tokio worker thread (and holding
+    // attachment_gate's async guard, below) for the probe's connect/read
+    // timeouts. This function itself is a plain sync fn, so the blocking
+    // call here is no different from provision_gateway's own pre-existing
+    // synchronous network probes at construction time.
+    let mcp_servers = skills_mcp_servers_entry(
+        session_cwd_override
+            .lock()
+            .expect("session cwd override mutex poisoned")
+            .as_deref(),
+        &slot.provider,
+    );
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
         let cwd = cwd_for_session(&session_cwd_override);
-        let mcp_servers = skills_mcp_servers_entry(
-            session_cwd_override
-                .lock()
-                .expect("session cwd override mutex poisoned")
-                .as_deref(),
-        );
         let result = if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
@@ -1956,6 +2257,7 @@ impl AgentBridge {
                 .lock()
                 .expect("session cwd override mutex poisoned")
                 .as_deref(),
+            provider,
         );
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
@@ -2830,6 +3132,147 @@ mod tests {
         // checkout (every other real-process test in this file depends on
         // it), resolve_backend_agent_command must still return None here.
         assert_eq!(resolved, None);
+    }
+
+    /// acpx-server's own ACPX_BACKEND_CMD default is codex-only (see this
+    /// function's own doc comment) -- "claude" is the one provider that
+    /// genuinely needs an explicit override; every other provider string
+    /// (including "codex" itself and anything unrecognized) must return
+    /// None so spawn_gateway_process leaves ACPX_BACKEND_CMD unset and
+    /// falls through to that real default instead.
+    #[test]
+    fn default_backend_command_for_provider_only_overrides_claude() {
+        assert_eq!(
+            default_backend_command_for_provider("claude"),
+            Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1")
+        );
+        assert_eq!(default_backend_command_for_provider("codex"), None);
+        assert_eq!(default_backend_command_for_provider("unknown-provider"), None);
+    }
+
+    /// read_codex_api_key_from_auth_file's real, only call site
+    /// (spawn_gateway_process) requires this to be correct without ever
+    /// touching this developer's actual ~/.codex/auth.json -- covered via
+    /// ACPX_CODEX_AUTH_FILE pointing at a disposable temp file instead.
+    #[test]
+    fn read_codex_api_key_from_auth_file_reads_the_configured_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "rui-codex-auth-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let auth_file = dir.join("auth.json");
+        std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": "sk-test-key"}"#)
+            .expect("write temp auth file");
+
+        let prior = std::env::var("ACPX_CODEX_AUTH_FILE").ok();
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+        }
+        let found = read_codex_api_key_from_auth_file();
+        match prior {
+            Some(value) => unsafe { std::env::set_var("ACPX_CODEX_AUTH_FILE", value) },
+            None => unsafe { std::env::remove_var("ACPX_CODEX_AUTH_FILE") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(found.as_deref(), Some("sk-test-key"));
+    }
+
+    /// Missing file, malformed JSON, an empty key, or a missing field
+    /// must all fall back to None (letting codex-acp run with whatever
+    /// auth it can find on its own) rather than panicking or returning a
+    /// bogus empty-string "key".
+    #[test]
+    fn read_codex_api_key_from_auth_file_is_none_on_any_bad_input() {
+        let missing = std::env::temp_dir().join(format!(
+            "rui-codex-auth-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let prior = std::env::var("ACPX_CODEX_AUTH_FILE").ok();
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &missing);
+        }
+        let missing_file_result = read_codex_api_key_from_auth_file();
+
+        let empty_key_file = std::env::temp_dir().join(format!(
+            "rui-codex-auth-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&empty_key_file, r#"{"OPENAI_API_KEY": ""}"#)
+            .expect("write empty-key temp auth file");
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &empty_key_file);
+        }
+        let empty_key_result = read_codex_api_key_from_auth_file();
+
+        match prior {
+            Some(value) => unsafe { std::env::set_var("ACPX_CODEX_AUTH_FILE", value) },
+            None => unsafe { std::env::remove_var("ACPX_CODEX_AUTH_FILE") },
+        }
+        let _ = std::fs::remove_file(&empty_key_file);
+
+        assert_eq!(missing_file_result, None);
+        assert_eq!(empty_key_result, None);
+    }
+
+    /// read_codex_model_provider_from_config derives the .codex directory
+    /// from ACPX_CODEX_AUTH_FILE's parent (matching how spawn_gateway_process
+    /// actually calls it -- both auth.json and config.toml live in the
+    /// same real ~/.codex directory), and must stop scanning at the first
+    /// `[table]` header so a same-named key inside e.g.
+    /// [model_providers.bifrost] can never shadow the real top-level
+    /// model_provider value.
+    #[test]
+    fn read_codex_model_provider_from_config_reads_top_level_key_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "rui-codex-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "model_catalog_json = \"/home/siraj/.codex/bifrost-model-catalog.json\"\n\
+             model_provider = \"bifrost\"\n\
+             \n\
+             [model_providers.bifrost]\n\
+             base_url = \"http://bifrost.localdev.com/v1\"\n\
+             model_provider = \"not-this-one\"\n",
+        )
+        .expect("write temp config.toml");
+        // config.toml lives alongside a (never-read-in-this-test) auth.json
+        // at the SAME path spawn_gateway_process derives its .codex dir
+        // from -- the file need not exist for this function's own lookup.
+        let auth_file = dir.join("auth.json");
+
+        let prior = std::env::var("ACPX_CODEX_AUTH_FILE").ok();
+        unsafe {
+            std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
+        }
+        let found = read_codex_model_provider_from_config();
+        match prior {
+            Some(value) => unsafe { std::env::set_var("ACPX_CODEX_AUTH_FILE", value) },
+            None => unsafe { std::env::remove_var("ACPX_CODEX_AUTH_FILE") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(found.as_deref(), Some("bifrost"));
     }
 
     fn mock_agent_bin() -> std::path::PathBuf {
@@ -4946,8 +5389,14 @@ done
     /// flaky on network latency, unrelated to this logic itself).
     #[test]
     fn skills_mcp_servers_entry_always_includes_the_skills_server() {
-        let entries = skills_mcp_servers_entry(None);
-        assert_eq!(entries.len(), 1);
+        // Not asserting entries.len() == 1: a real snapshotd daemon
+        // happening to run on the test host makes snapshotd_mcp_server_
+        // entry's liveness probe legitimately append a second "snapshotd"
+        // entry (see that function's own doc comment) regardless of
+        // provider -- this test only cares that "skills" is always
+        // present, first, and correctly shaped.
+        let entries = skills_mcp_servers_entry(None, "codex");
+        assert!(!entries.is_empty());
         assert_eq!(entries[0]["name"], "skills");
         assert!(entries[0]["command"]
             .as_str()
@@ -4964,7 +5413,7 @@ done
     #[test]
     fn skills_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
         let project_file = std::path::Path::new("/tmp/my-project/timeline.mlt");
-        let entries = skills_mcp_servers_entry(Some(project_file));
+        let entries = skills_mcp_servers_entry(Some(project_file), "codex");
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()
@@ -4975,6 +5424,30 @@ done
             serde_json::Value::String("/tmp/my-project".to_string()),
             "--project-dir must be the project FILE's parent directory, not the file itself"
         );
+    }
+
+    /// `"type": "http"` was confirmed live to work with both real
+    /// `codex-acp` (which otherwise hard-rejects `"type": "sse"`
+    /// entirely) and real `claude-agent-acp` -- this entry is provider-
+    /// agnostic by design now, so the shape must stay identical
+    /// regardless of which provider string is passed in.
+    #[test]
+    fn snapshotd_mcp_server_entry_is_absent_when_no_daemon_answers_for_any_provider() {
+        // SNAPSHOTD_MCP_SSE_ADDR pointed at a certainly-unbound loopback
+        // port -- deterministic "nothing is listening" regardless of
+        // what may or may not be running on the machine executing this
+        // test. The entry is provider-agnostic (see the function's own
+        // doc comment for why "http", not "sse", covers both real
+        // adapters), so every provider string must behave identically
+        // here.
+        std::env::set_var("SNAPSHOTD_MCP_SSE_ADDR", "127.0.0.1:1");
+        for provider in ["codex", "claude", ""] {
+            assert!(
+                snapshotd_mcp_server_entry(provider).is_empty(),
+                "no daemon reachable -- must stay empty for provider {provider:?}"
+            );
+        }
+        std::env::remove_var("SNAPSHOTD_MCP_SSE_ADDR");
     }
 }
 /// Refreshes `slot`'s trailer (`acp_session_id`/`updated_at`), taking

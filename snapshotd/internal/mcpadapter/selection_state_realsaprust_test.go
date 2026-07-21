@@ -6,11 +6,13 @@ package mcpadapter_test
 // selection_remap_on_mutation behavior over the real MCP -> daemon ->
 // sap-rust chain (the real Qt/real_ffi shotcut binary, same as
 // sapcall_realsaprust_test.go), not just the sap-rust crate's own
-// server_integration.rs tests. No snapshotd-side code changes were needed
-// for this at all: "sap.call" is already a fully generic method+params
-// passthrough (mcpadapter.go's own doc comment), so track.enter/clip.enter/
-// currentView work through it automatically, the same as any other real
-// SAP method.
+// server_integration.rs tests. track.enter/clip.enter/currentView are now
+// typed tools (tools_selection.go) rather than reached through the
+// generic sap.call passthrough this comment originally described --
+// sap.call/sap.search were dropped from the live server once every
+// method they used to reach (including these three, which had no typed
+// tool at the time) got a typed tool of its own; see mcpadapter.go's
+// New() doc comment.
 //
 // Covers both halves the source task asks for:
 //  1. the selection/index state stays correct through a real sequence
@@ -94,11 +96,11 @@ func TestMCPAdapter_SelectionState_RealSapRust_EndToEnd(t *testing.T) {
 	call := func(method string, params map[string]any) *mcp.CallToolResult {
 		t.Helper()
 		req := mcp.CallToolRequest{}
-		req.Params.Name = "sap.call"
-		req.Params.Arguments = map[string]any{"method": method, "params": params}
+		req.Params.Name = method
+		req.Params.Arguments = params
 		res, err := c.CallTool(ctx, req)
 		if err != nil {
-			t.Fatalf("call sap.call(%s): %v", method, err)
+			t.Fatalf("call %s: %v", method, err)
 		}
 		return res
 	}

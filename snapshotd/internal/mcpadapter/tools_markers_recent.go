@@ -1,8 +1,6 @@
 package mcpadapter
 
 import (
-	"encoding/json"
-
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -51,11 +49,13 @@ func markersRecentTools(s *server.MCPServer, h Handler) []server.ServerTool {
 		),
 		sapTool(s, h, "markers.next", "markers.next", "Find the next marker frame after fromFrame, or null if none.",
 			mcp.WithInteger("fromFrame", mcp.Required(), mcp.Description("Frame to search after")),
-			mcp.WithRawOutputSchema(json.RawMessage(nullableFrameOutputSchema)),
+			// No output schema -- see nullableFrameOutputSchema's doc
+			// comment (output_types.go) for why.
 		),
 		sapTool(s, h, "markers.prev", "markers.prev", "Find the previous marker frame before fromFrame, or null if none.",
 			mcp.WithInteger("fromFrame", mcp.Required(), mcp.Description("Frame to search before")),
-			mcp.WithRawOutputSchema(json.RawMessage(nullableFrameOutputSchema)),
+			// No output schema -- see nullableFrameOutputSchema's doc
+			// comment (output_types.go) for why.
 		),
 		sapTool(s, h, "recent.add", "recent.add", "Add a path to the project-scoped recent-files list.",
 			mcp.WithString("path", mcp.Required(), mcp.Description("Filesystem path")),

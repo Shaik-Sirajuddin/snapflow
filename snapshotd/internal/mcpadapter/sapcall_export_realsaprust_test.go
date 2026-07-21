@@ -2,8 +2,8 @@ package mcpadapter_test
 
 // TestMCPAdapter_SapCallTool_RealExport_EndToEnd is the concrete proof
 // requested by 11-e2e-scenario-tests.md Phase A: an MCP client (exactly the
-// transport/tool shape a real agent uses -- SSE, `sap.call`) drives the
-// daemon -> sapproxy -> real sap-rust binary chain through a realistic
+// transport/tool shape a real agent uses -- SSE, typed per-method tools)
+// drives the daemon -> sapproxy -> real sap-rust binary chain through a realistic
 // creative sequence (playlist.append a real source, add a track, generate a
 // title, attach a clip, export) and asserts a REAL playable video file
 // exists on disk afterward, inspected with a real `ffprobe` run against the
@@ -292,14 +292,14 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	sapCall := func(method string, params map[string]any) map[string]any {
 		t.Helper()
 		req := mcp.CallToolRequest{}
-		req.Params.Name = "sap.call"
-		req.Params.Arguments = map[string]any{"method": method, "params": params}
+		req.Params.Name = method
+		req.Params.Arguments = params
 		res, err := c.CallTool(ctx, req)
 		if err != nil {
-			t.Fatalf("sap.call(%s): %v", method, err)
+			t.Fatalf("%s: %v", method, err)
 		}
 		if res.IsError {
-			t.Fatalf("sap.call(%s) returned an error result: %s", method, toolResultText(res))
+			t.Fatalf("%s returned an error result: %s", method, toolResultText(res))
 		}
 		return decodeToolResultJSON(t, res)
 	}
@@ -342,6 +342,10 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	}
 
 	sapCall("edit.addTrack", map[string]any{"kind": "video"})
+	// edit.appendClip needs a selected track -- an explicit trackIndex is
+	// never honored as an override (see the selection-state end-to-end
+	// test).
+	sapCall("track.enter", map[string]any{"trackIndex": 0})
 
 	title := sapCall("generator.createTitle", map[string]any{"mode": "simple", "text": "MCP E2E Highlights"})
 	titleIndex, _ := title["index"].(float64)
@@ -418,6 +422,9 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	})
 
 	seg1ClipID, _ := seg1["clipId"].(string)
+	// filter.add/filter.addKeyframe need a selected clip -- an explicit
+	// clipId is never honored as an override.
+	sapCall("clip.enter", map[string]any{"clipId": seg1ClipID})
 	zoom := sapCall("filter.add", map[string]any{
 		"clipId":     seg1ClipID,
 		"mltService": "affine",
@@ -461,6 +468,11 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 	const overlayLead = 130
 	const overlayTrail = 10
 	sapCall("edit.addTrack", map[string]any{"kind": "video"})
+	// A freshly added video track is always inserted at trackIndex 0 (see
+	// the comment above), so the selection must be re-entered for it --
+	// V1's own track.enter(0) from earlier now refers to V1's shifted
+	// trackIndex 1, not this new track.
+	sapCall("track.enter", map[string]any{"trackIndex": 0})
 	spacer := sapCall("generator.createColor", map[string]any{"hexColor": "#00000000"})
 	spacerIndex, _ := spacer["index"].(float64)
 	sapCall("edit.appendClip", map[string]any{
@@ -486,6 +498,7 @@ func TestMCPAdapter_SapCallTool_RealExport_EndToEnd(t *testing.T) {
 		"newFrame":   float64(overlayTrail - 1),
 	})
 	overlayClipID, _ := overlayClip["clipId"].(string)
+	sapCall("clip.enter", map[string]any{"clipId": overlayClipID})
 
 	slide := sapCall("filter.add", map[string]any{
 		"clipId":     overlayClipID,

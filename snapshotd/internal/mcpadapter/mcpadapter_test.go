@@ -99,8 +99,8 @@ func TestMCPAdapter_ToolsListedAndCallable(t *testing.T) {
 		"daemon.list":          false,
 		"daemon.health":        false,
 		"daemon.close":         false,
-		"sap.call":             false,
-		"sap.search":           false,
+		"project.select":       false,
+		"project.exit":         false,
 	}
 	for _, tl := range toolsResult.Tools {
 		if _, ok := want[tl.Name]; ok {
@@ -112,8 +112,14 @@ func TestMCPAdapter_ToolsListedAndCallable(t *testing.T) {
 			t.Fatalf("expected tool %s to be listed, got tools: %+v", name, toolsResult.Tools)
 		}
 	}
-	if len(toolsResult.Tools) != len(want) {
-		t.Fatalf("expected compact initial tool list of %d tools, got %d: %+v", len(want), len(toolsResult.Tools), toolsResult.Tools)
+	// Not asserting an exact tool count here: New() now registers every
+	// typed per-method tool (edit.*/playlist.*/filter.*/etc, ~74 with this
+	// fakeHandler's audio namespace left disabled), not just the compact
+	// daemon.*/sap.call/sap.search set this test originally checked for
+	// exact equality against. want above only spot-checks the ones this
+	// test actually exercises below.
+	if len(toolsResult.Tools) <= len(want) {
+		t.Fatalf("expected more than the %d spot-checked tools (typed per-method tools should also be registered), got %d: %+v", len(want), len(toolsResult.Tools), toolsResult.Tools)
 	}
 
 	// Call daemon.launch and confirm arguments + result flow through.
@@ -154,7 +160,15 @@ func TestMCPAdapter_ToolsListedAndCallable(t *testing.T) {
 	}
 }
 
-func TestMCPAdapter_SapSearchAndMissingBindingOverSSE(t *testing.T) {
+// TestMCPAdapter_AudioToolsHiddenAndMissingBindingOverSSE replaces the old
+// sap.search-based coverage (search("audio.setGain") returning no results
+// when the namespace is disabled) now that sap.search no longer exists:
+// the equivalent live-server behavior is that audio.* tools are absent
+// from ListTools() entirely when AudioNamespaceEnabled is false (fakeHandler
+// doesn't implement it, so New() treats audioEnabled as false). Also keeps
+// the missing-project-binding coverage the old test had, now exercised
+// through the typed edit.addTrack tool instead of sap.call.
+func TestMCPAdapter_AudioToolsHiddenAndMissingBindingOverSSE(t *testing.T) {
 	h := &fakeHandler{}
 	mcpServer := mcpadapter.New(h)
 	testServer := server.NewTestServer(mcpServer)
@@ -175,42 +189,22 @@ func TestMCPAdapter_SapSearchAndMissingBindingOverSSE(t *testing.T) {
 		t.Fatalf("initialize: %v", err)
 	}
 
-	search := func(query string) []map[string]any {
-		t.Helper()
-		req := mcp.CallToolRequest{}
-		req.Params.Name = "sap.search"
-		req.Params.Arguments = map[string]any{"query": query}
-		res, err := c.CallTool(ctx, req)
-		if err != nil {
-			t.Fatalf("call sap.search(%q): %v", query, err)
+	toolsResult, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	for _, tl := range toolsResult.Tools {
+		if strings.HasPrefix(tl.Name, "audio.") {
+			t.Fatalf("expected no audio.* tools when AudioNamespaceEnabled is false, found %s", tl.Name)
 		}
-		if res.IsError {
-			t.Fatalf("sap.search(%q) returned an error: %s", query, toolResultText(res))
-		}
-		return decodeArrayResult(t, toolResultText(res))
-	}
-
-	crossfade := search("transitions.addCrossfade")
-	if len(crossfade) != 1 || crossfade[0]["method"] != "transitions.addCrossfade" {
-		t.Fatalf("expected crossfade search result, got %+v", crossfade)
-	}
-	title := search("generator.createTitle")
-	if len(title) != 1 || title[0]["method"] != "generator.createTitle" {
-		t.Fatalf("expected title search result, got %+v", title)
-	}
-	if audio := search("audio.setGain"); len(audio) != 0 {
-		t.Fatalf("expected audio methods to be undiscoverable, got %+v", audio)
 	}
 
 	req := mcp.CallToolRequest{}
-	req.Params.Name = "sap.call"
-	req.Params.Arguments = map[string]any{
-		"method": "edit.addTrack",
-		"params": map[string]any{"kind": "video"},
-	}
+	req.Params.Name = "edit.addTrack"
+	req.Params.Arguments = map[string]any{"kind": "video"}
 	res, err := c.CallTool(ctx, req)
 	if err != nil {
-		t.Fatalf("call sap.call before project.select: %v", err)
+		t.Fatalf("call edit.addTrack before project.select: %v", err)
 	}
 	if !res.IsError {
 		t.Fatalf("expected missing project binding to be a tool error, got %s", toolResultText(res))
@@ -220,10 +214,14 @@ func TestMCPAdapter_SapSearchAndMissingBindingOverSSE(t *testing.T) {
 	}
 }
 
-// TestMCPAdapter_SapCallTool_ForwardsOpaquely proves the "sap.call" tool
-// routes to Handler.ForwardSAP (not Dispatch), forwards method+params
-// verbatim, and surfaces a ForwardSAP error as a tool-level error result.
-func TestMCPAdapter_SapCallTool_ForwardsOpaquely(t *testing.T) {
+// TestMCPAdapter_TypedToolForwardsToSAP proves a typed tool (edit.addTrack)
+// routes to Handler.ForwardSAP (not Dispatch) with its fixed SAP method and
+// forwards its arguments verbatim as params, and that a ForwardSAP error
+// surfaces as a tool-level error result -- replaces
+// TestMCPAdapter_SapCallTool_ForwardsOpaquely now that sap.call (arbitrary
+// method name + free-form opaque forwarding) no longer exists; every
+// method is now its own fixed-name typed tool instead.
+func TestMCPAdapter_TypedToolForwardsToSAP(t *testing.T) {
 	h := &fakeHandler{}
 	mcpServer := mcpadapter.New(h)
 	testServer := server.NewTestServer(mcpServer)
@@ -245,14 +243,11 @@ func TestMCPAdapter_SapCallTool_ForwardsOpaquely(t *testing.T) {
 	}
 
 	selectReq := mcp.CallToolRequest{}
-	selectReq.Params.Name = "sap.call"
-	selectReq.Params.Arguments = map[string]any{
-		"method": "project.select",
-		"params": map[string]any{"projectId": "proj-1"},
-	}
+	selectReq.Params.Name = "project.select"
+	selectReq.Params.Arguments = map[string]any{"projectId": "proj-1"}
 	selectRes, err := c.CallTool(ctx, selectReq)
 	if err != nil {
-		t.Fatalf("call sap.call(project.select): %v", err)
+		t.Fatalf("call project.select: %v", err)
 	}
 	if selectRes.IsError {
 		t.Fatalf("unexpected error result: %+v", selectRes)
@@ -262,45 +257,23 @@ func TestMCPAdapter_SapCallTool_ForwardsOpaquely(t *testing.T) {
 	}
 
 	echoReq := mcp.CallToolRequest{}
-	echoReq.Params.Name = "sap.call"
-	echoReq.Params.Arguments = map[string]any{
-		"method": "edit.addTrack",
-		"params": map[string]any{"kind": "video"},
-	}
+	echoReq.Params.Name = "edit.addTrack"
+	echoReq.Params.Arguments = map[string]any{"kind": "video"}
 	echoRes, err := c.CallTool(ctx, echoReq)
 	if err != nil {
-		t.Fatalf("call sap.call(edit.addTrack): %v", err)
+		t.Fatalf("call edit.addTrack: %v", err)
 	}
 	if echoRes.IsError {
 		t.Fatalf("unexpected error result: %+v", echoRes)
+	}
+	if h.lastMethod != "edit.addTrack" {
+		t.Fatalf("expected ForwardSAP dispatch to edit.addTrack, got %s", h.lastMethod)
 	}
 	var gotParams map[string]any
 	if err := json.Unmarshal(h.lastParams, &gotParams); err != nil {
 		t.Fatalf("unmarshal forwarded params: %v", err)
 	}
 	if gotParams["kind"] != "video" {
-		t.Fatalf("expected opaque params forwarded verbatim, got %+v", gotParams)
-	}
-
-	boomReq := mcp.CallToolRequest{}
-	boomReq.Params.Name = "sap.call"
-	boomReq.Params.Arguments = map[string]any{"method": "sap.boom", "params": map[string]any{}}
-	boomRes, err := c.CallTool(ctx, boomReq)
-	if err != nil {
-		t.Fatalf("call sap.call(sap.boom): %v", err)
-	}
-	if !boomRes.IsError {
-		t.Fatalf("expected an error tool result for sap.boom, got %+v", boomRes)
-	}
-
-	missingMethodReq := mcp.CallToolRequest{}
-	missingMethodReq.Params.Name = "sap.call"
-	missingMethodReq.Params.Arguments = map[string]any{}
-	missingRes, err := c.CallTool(ctx, missingMethodReq)
-	if err != nil {
-		t.Fatalf("call sap.call with no method: %v", err)
-	}
-	if !missingRes.IsError {
-		t.Fatalf("expected an error tool result when \"method\" is omitted")
+		t.Fatalf("expected arguments forwarded verbatim as SAP params, got %+v", gotParams)
 	}
 }

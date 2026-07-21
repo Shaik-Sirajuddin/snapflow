@@ -489,7 +489,7 @@ export component Sidebar inherits Rectangle {
             viewport-height: thread-list-col.preferred-height;
             thread-list-col := VerticalLayout {
                 spacing: Metrics.space-1;
-                for thread[i] in threads : HoverSurface {
+                for thread[i] in threads : thread-row := HoverSurface {
                     // Taller only when the model line is shown under the name.
                     height: expanded && thread.model != "" ? 52px : 44px;
                     // Fill the rail width so the left stick can pin to x=0
@@ -673,7 +673,7 @@ export component Sidebar inherits Rectangle {
                                     font-family: Theme.font-mono;
                                     vertical-alignment: center;
                                 }
-                                if expanded && root.rename-thread-index == -1 : IconButton {
+                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Rename thread " + thread.name;
@@ -718,7 +718,7 @@ export component Sidebar inherits Rectangle {
                                 // `settings_sheet.slint`'s profile
                                 // delete control.
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.closed && root.pending-close-index != i : IconButton {
+                                    && !thread.closed && root.pending-close-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Close thread " + thread.name;
@@ -759,7 +759,7 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && thread.closed && root.pending-delete-index != i : IconButton {
+                                    && thread.closed && root.pending-delete-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Delete thread " + thread.name;
@@ -799,7 +799,7 @@ export component Sidebar inherits Rectangle {
                                         }
                                     }
                                 }
-                                if expanded && root.rename-thread-index != i : IconButton {
+                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Archive thread " + thread.name;

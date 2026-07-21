@@ -259,6 +259,26 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_PROJECT_MLT_FILENAME="+opts.MltFileName,
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
+	// The child's own embedded chat panel (panel-rust's agent_bridge.rs)
+	// spawns its own per-provider acpx-server gateways and, for the
+	// "codex" provider, tries to read $HOME/.codex/auth.json for
+	// noninteractive api-key auth (falling back to codex-acp's
+	// interactive chat-gpt device flow, which cannot complete headlessly,
+	// otherwise -- found live: real per-project launches through this
+	// exact Launch crash-looped on that fallback). $HOME here is
+	// qtHomeDir, this launch's sandboxed per-project directory (see its
+	// own doc comment above for why it must stay sandboxed) -- it has no
+	// .codex of its own. ACPX_CODEX_AUTH_FILE is the override
+	// read_codex_api_key_from_auth_file already checks first, before
+	// $HOME/.codex/auth.json -- pointing it at the real, unsandboxed
+	// user's own auth.json here fixes the auth lookup without touching
+	// the sandbox itself or routing this chat panel's two providers
+	// (codex and claude) through one shared single-backend gateway, which
+	// would silently reintroduce the "claude thread gets codex-acp"
+	// class of bug this session already found and fixed once.
+	if realHome, err := os.UserHomeDir(); err == nil && realHome != "" {
+		cmd.Env = append(cmd.Env, "ACPX_CODEX_AUTH_FILE="+filepath.Join(realHome, ".codex", "auth.json"))
+	}
 	var logFile *os.File
 	if m.LogDir != "" {
 		if err := os.MkdirAll(m.LogDir, 0o755); err != nil {

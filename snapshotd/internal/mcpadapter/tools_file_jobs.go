@@ -5,14 +5,23 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// fileJobsTools builds file.import/file.export and the 3 jobs.* export-job
-// tools. file.probe is built separately in mcpadapter.go's projectTools,
-// since it is deliberately not project-bound.
+// fileJobsTools builds file.import/file.export/file.probe and the 3
+// jobs.* export-job tools. file.probe is deliberately not project-bound
+// (shells out to real ffprobe directly, stateless, independent of any
+// live MLT project profile -- see sapcall_export_realsaprust_test.go's
+// own doc comment for the concrete contrast against playlist.append's
+// profile-relative frame count), but it lives here rather than in
+// tools_project.go since its own name is already file.*-prefixed and it
+// needs no special project-binding awareness the way project.* does.
 func fileJobsTools(s *server.MCPServer, h Handler) []server.ServerTool {
 	return []server.ServerTool{
 		sapTool(s, h, "file.import", "file.import", "Import a media file inside the current project's root.",
 			mcp.WithString("path", mcp.Required(), mcp.Description("Filesystem path to the media file")),
 			mcp.WithOutputSchema[PlaylistEntry](),
+		),
+		sapTool(s, h, "file.probe", "file.probe", "Probe a media file's own native metadata (codec, duration) directly via ffprobe, without needing any project bound -- independent of any live project's profile.",
+			mcp.WithString("path", mcp.Required(), mcp.Description("Filesystem path to the media file")),
+			mcp.WithOutputSchema[FileProbe](),
 		),
 		sapTool(s, h, "file.export", "file.export", "Start an export job for the current project.",
 			mcp.WithString("outputPath", mcp.Required(), mcp.Description("Filesystem path to write the exported file")),

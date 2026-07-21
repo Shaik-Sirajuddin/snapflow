@@ -120,8 +120,12 @@ func TestMCPAdapter_PhaseC_DifferentProjectsIsolation(t *testing.T) {
 		t.Fatalf("copy source into project B root: %v", err)
 	}
 
-	// Give each project one real track + real clip to work with.
+	// Give each project one real track + real clip to work with. Each
+	// agent's edit.appendClip needs a selected track first -- an explicit
+	// trackIndex is never honored as an override (see the selection-state
+	// end-to-end test).
 	agent1.sapCall("edit.addTrack", map[string]any{"kind": "video"})
+	agent1.sapCall("track.enter", map[string]any{"trackIndex": 0})
 	entryA := agent1.sapCall("playlist.append", map[string]any{"source": map[string]any{"path": sourceA}})
 	clipA := agent1.sapCall("edit.appendClip", map[string]any{
 		"trackIndex": float64(0),
@@ -133,6 +137,7 @@ func TestMCPAdapter_PhaseC_DifferentProjectsIsolation(t *testing.T) {
 	}
 
 	agent2.sapCall("edit.addTrack", map[string]any{"kind": "video"})
+	agent2.sapCall("track.enter", map[string]any{"trackIndex": 0})
 	entryB := agent2.sapCall("playlist.append", map[string]any{"source": map[string]any{"path": sourceB}})
 	// sap-rust's clip ids are per-process sequential ("clip-1", "clip-2",
 	// ...) -- since project A and project B are two totally separate
@@ -170,6 +175,13 @@ func TestMCPAdapter_PhaseC_DifferentProjectsIsolation(t *testing.T) {
 	// Agent 1 (bound to project A's process) references project B's real
 	// clipId. Project A's process has never heard of that id -- it should
 	// come back as a clean SAP-level NotFound-style error, not a hang/crash.
+	// clip.enter itself is permissive (it sets the selection optimistically
+	// without validating the id against the bound project's real clip
+	// table -- confirmed live: clip.enter(clipBID) against project A
+	// succeeds), so the actual cross-project rejection now surfaces one
+	// step later, at filter.add, once it tries to resolve the (locally
+	// nonexistent) selected clip for real.
+	agent1.sapCall("clip.enter", map[string]any{"clipId": clipBID})
 	errText := agent1.sapCallExpectError("filter.add", map[string]any{
 		"clipId":     clipBID,
 		"mltService": "brightness",
@@ -179,7 +191,8 @@ func TestMCPAdapter_PhaseC_DifferentProjectsIsolation(t *testing.T) {
 
 	// Sanity check the reverse direction too: project A's own clipId does
 	// work against project A's own process, so test 1 above is really about
-	// cross-project isolation, not a generally-broken filter.add call.
+	// cross-project isolation, not a generally-broken clip.enter/filter.add.
+	agent1.sapCall("clip.enter", map[string]any{"clipId": clipAID})
 	okResult := agent1.sapCall("filter.add", map[string]any{
 		"clipId":     clipAID,
 		"mltService": "brightness",
