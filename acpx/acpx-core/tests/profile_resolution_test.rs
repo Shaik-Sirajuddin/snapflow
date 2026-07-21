@@ -51,6 +51,7 @@ fn sample_profile(name: &str, agent_id: &str) -> Profile {
     Profile {
         name: name.to_string(),
         agent_id: agent_id.to_string(),
+        source: acpx_core::profile::ProfileSource::Provisioned,
         provider: None,
         key_ref: None,
         launch_overrides: HashMap::new(),

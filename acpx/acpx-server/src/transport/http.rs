@@ -484,6 +484,24 @@ pub async fn serve_on_with_bridge_and_tenant_tokens(
                 }
             }
         });
+
+        // Kick off the first model-discovery probe in the background
+        // rather than awaiting it inline here: with no static `models`
+        // list required anymore (the normal shape now that discovery
+        // sources its seed from provisioned profiles, not this file),
+        // startup must never block on however many agents are
+        // provisioned each taking up to `MODEL_PROBE_TIMEOUT` --
+        // sequential, per the single global router mutex -- to answer.
+        // `session/new`/`GET /acp/models` before this completes just see
+        // whatever was in the static config (possibly empty) and
+        // self-heal the moment this finishes; every other refresh path
+        // (`GET /acp/models`, the config-file watcher) already tolerates
+        // an empty/incomplete model list the same way.
+        let warmup_runtime = Arc::clone(runtime);
+        let warmup_router = state.router.clone();
+        tokio::spawn(async move {
+            warmup_runtime.refresh_models(&warmup_router).await;
+        });
     }
     let auth_enabled = state.auth.token.is_some();
     let bridge_enabled = state.bridge.is_some();
@@ -674,8 +692,9 @@ async fn acp_models_handler(State(state): State<AppState>, headers: HeaderMap) -
         };
     let agents_result = response.get("result").cloned().unwrap_or_default();
     runtime.refresh_models(&state.router).await;
+    let default_model = runtime.effective_default_model().await;
     Json(serde_json::json!({
-        "defaultModel": runtime.config().default_model,
+        "defaultModel": default_model,
         "models": runtime.public_models(&agents_result).await,
     }))
     .into_response()

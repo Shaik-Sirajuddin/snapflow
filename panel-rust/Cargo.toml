@@ -36,6 +36,14 @@ vt100 = "0.15"
 # one new dependency rather than hand-rolling per-OS Command branching.
 opener = "0.7"
 
+[target.'cfg(windows)'.dependencies]
+# Windows CI runners have no system sqlite3.lib (link.exe: LNK1181 cannot
+# open input file 'sqlite3.lib') -- bundled compiles SQLite from source
+# instead of dynamically linking, matching Linux/macOS's usual
+# system-sqlite behavior in effect without needing a vcpkg/choco install
+# step. Linux and macOS are unaffected by this override.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 [dev-dependencies]
 tempfile = "3"
 i-slint-backend-testing = "1.17.1"

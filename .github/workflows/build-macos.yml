@@ -66,6 +66,14 @@ jobs:
       run:
         working-directory: shotcut-rebrand
     steps:
+      # This repo, for sap-rust -- shotcut-rebrand/CMakeLists.txt builds it
+      # via Corrosion at ${CMAKE_SOURCE_DIR}/../sap-rust (a sibling crate,
+      # not part of the shotcut-rebrand checkout itself), so it needs to
+      # land as a sibling of the shotcut-rebrand checkout below.
+      - uses: actions/checkout@v4
+        with:
+          path: multi-media-main
+
       # shotcut-rebrand isn't part of this repo's tree (no submodule entry --
       # it started life as a local-only git worktree on the dev machine, now
       # pushed to Shaik-Sirajuddin/shotcut.git's rebrand/snapflow branch), so
@@ -76,6 +84,10 @@ jobs:
           repository: Shaik-Sirajuddin/shotcut
           ref: rebrand/snapflow
           path: shotcut-rebrand
+
+      - name: Place sap-rust as a sibling of shotcut-rebrand
+        working-directory: ${{ github.workspace }}
+        run: cp -r multi-media-main/sap-rust sap-rust
 
       - name: Install build deps from Homebrew (prebuilt, no from-source ffmpeg/mlt compile)
         run: |

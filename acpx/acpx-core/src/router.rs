@@ -2580,6 +2580,7 @@ impl Router {
             let profile = Profile {
                 name: agent.id.clone(),
                 agent_id: agent.id.clone(),
+                source: crate::profile::ProfileSource::AutoSeeded,
                 // Not `Profile::default()`'s `false`/`false`: every
                 // registry-listed agent (`claude-acp`/`codex-acp`/`gemini`)
                 // is a locally-spawned subprocess that already has
@@ -2611,6 +2612,30 @@ impl Router {
             // turn a benign race into a panic.
             let _ = self.profiles.create(profile);
         }
+    }
+
+    /// Every explicitly-provisioned (`profiles/create`/`update`, which
+    /// includes `ACPX_CONFIG_FILE` startup provisioning) profile's
+    /// `agent_id`, excluding [`crate::profile::ProfileSource::AutoSeeded`]
+    /// entries. Deliberately does **not** call
+    /// [`Self::ensure_default_profiles_seeded`] first -- unlike
+    /// `profiles/list`, callers of this accessor (the `/acp` bridge's
+    /// model-discovery seed) want only what an operator/client actually
+    /// asked for, and running that seeding sweep here would pay its real
+    /// cost (a registry fetch plus a `<runtime> --version` subprocess
+    /// spawn per not-yet-seen registry agent) on every call, including
+    /// from a hot, cooldown-gated refresh path that must stay cheap.
+    /// Explicitly-created profiles are already in `self.profiles`
+    /// without needing that sweep -- it only ever adds entries for names
+    /// nobody has claimed, so skipping it here can't hide one.
+    /// Synchronous and `&self`-only (no lock upgrade, no `.await`) since
+    /// it does nothing but read the in-memory `ProfileStore`.
+    pub fn provisioned_profile_agent_ids(&self) -> std::collections::HashSet<String> {
+        self.profiles
+            .list()
+            .filter(|profile| profile.source == crate::profile::ProfileSource::Provisioned)
+            .map(|profile| profile.agent_id.clone())
+            .collect()
     }
 
     /// Dispatch one JSON-RPC request, returning the JSON-RPC response to
@@ -8199,6 +8224,7 @@ mod tests {
         let auto_seeded_profile = crate::profile::Profile {
             name: "codex-acp".to_string(),
             agent_id: "codex-acp".to_string(),
+            source: crate::profile::ProfileSource::AutoSeeded,
             provider: None,
             key_ref: None,
             launch_overrides: HashMap::new(),
@@ -8240,5 +8266,45 @@ mod tests {
             "no profile at all must keep falling back to native_auth_method_id, \
              same as before this fix"
         );
+    }
+
+    /// Regression coverage for the `/acp` bridge's model-discovery seed
+    /// (`acpx-server`'s `refresh_models_with_config`): it must only ever
+    /// probe agents behind explicitly-provisioned profiles, never every
+    /// installed CLI `ensure_default_profiles_seeded` auto-fills a name
+    /// for. See `provisioned_profile_agent_ids`'s own doc comment for
+    /// the full rationale.
+    #[test]
+    fn provisioned_profile_agent_ids_excludes_auto_seeded_profiles() {
+        let mut router = Router::new("default");
+        router
+            .register_profile(crate::profile::Profile {
+                name: "work-claude".to_string(),
+                agent_id: "claude-agent-acp".to_string(),
+                source: crate::profile::ProfileSource::Provisioned,
+                ..crate::profile::Profile::default()
+            })
+            .expect("register explicit profile");
+        router
+            .register_profile(crate::profile::Profile {
+                name: "codex-acp".to_string(),
+                agent_id: "codex-acp".to_string(),
+                source: crate::profile::ProfileSource::AutoSeeded,
+                ..crate::profile::Profile::default()
+            })
+            .expect("register auto-seeded profile");
+
+        let seeded = router.provisioned_profile_agent_ids();
+        assert!(
+            seeded.contains("claude-agent-acp"),
+            "an explicitly provisioned profile's agent must be included"
+        );
+        assert!(
+            !seeded.contains("codex-acp"),
+            "an auto-seeded profile's agent must never be included -- only \
+             an operator/client explicitly asking for it (profiles/create \
+             or ACPX_CONFIG_FILE) should widen what the bridge probes"
+        );
+        assert_eq!(seeded.len(), 1);
     }
 }

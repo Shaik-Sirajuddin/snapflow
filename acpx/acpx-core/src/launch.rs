@@ -112,6 +112,7 @@ mod tests {
         Profile {
             name: "test-profile".to_string(),
             agent_id: "codex-acp".to_string(),
+            source: crate::profile::ProfileSource::Provisioned,
             provider: None,
             key_ref: None,
             launch_overrides: overrides,

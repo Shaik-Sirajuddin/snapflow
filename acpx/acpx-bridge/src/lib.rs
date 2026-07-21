@@ -29,7 +29,27 @@ pub struct BridgeModel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeConfig {
+    /// Explicit default model alias. `#[serde(default)]` (empty string)
+    /// so a config with no static `models` at all -- the normal shape
+    /// now that the bridge's live seed comes from provisioned profiles,
+    /// not this file -- doesn't need to name one either: an empty value
+    /// means "whatever `BridgeRuntime::effective_default_model` picks
+    /// live" (first discovered model), resolved at runtime rather than
+    /// load time. Still validated against `models` (below) whenever it
+    /// *is* set and `models` is non-empty, so an operator-pinned default
+    /// stays a hard startup error if it typos the alias.
+    #[serde(default)]
     pub default_model: String,
+    /// Optional static/pinned model entries. `#[serde(default)]` (empty)
+    /// -- this is now purely an operator override/pin mechanism, never
+    /// required for the bridge to work: with an empty list, every model
+    /// comes from `BridgeRuntime::refresh_models_with_config` probing
+    /// the agents named by provisioned profiles (`ACPX_CONFIG_FILE`'s
+    /// `profiles` array or a `profiles/create` call), same as the
+    /// registry-derived provider list `/admin/agents` already exposes.
+    /// A non-empty entry here is never pruned by live discovery (see
+    /// `refresh_models_with_config`'s doc comment).
+    #[serde(default)]
     pub models: Vec<BridgeModel>,
     /// **`virtual_and_pinned_resource_limits`.** Caps how many virtual
     /// bridge sessions (`BridgeSessionStore` entries, any state) one
@@ -123,7 +143,14 @@ impl BridgeConfig {
                 return Err(BridgeConfigError::DuplicateModel(model.id.clone()));
             }
         }
-        if !model_ids.contains(self.default_model.as_str()) {
+        // An empty `default_model` always passes -- it means "resolve
+        // live" (see the field's doc comment) rather than "pin to this
+        // alias." A *non-empty* `default_model` must still name a real
+        // static entry: it can only ever resolve against `models` at
+        // load time (profile-discovered models don't exist yet), so a
+        // non-empty value naming anything else is still a real typo,
+        // same as before this change.
+        if !self.default_model.is_empty() && !model_ids.contains(self.default_model.as_str()) {
             return Err(BridgeConfigError::UnknownDefaultModel(
                 self.default_model.clone(),
             ));
