@@ -352,14 +352,26 @@ impl BridgeRuntime {
             .cloned()
     }
 
-    pub async fn model_config_options(&self) -> Value {
+    /// `current_model_alias` is the bridge session's own
+    /// `selected_public_model_alias` (or `None` for a brand new,
+    /// never-configured session). Callers MUST pass the session's actual
+    /// current selection here -- this used to always stamp
+    /// `self.config().default_model`, so every `session/set_config_option`
+    /// response (bound or unbound) reported the global default as
+    /// `currentValue` regardless of what was just selected, and Zed's
+    /// `AcpSessionConfigOptions::set_config_option` applies that response
+    /// verbatim to its cached UI state -- so picking e.g. Haiku would
+    /// immediately snap the picker back to showing the default model.
+    pub async fn model_config_options(&self, current_model_alias: Option<&str>) -> Value {
         let models = self.models.read().await;
+        let config = self.config();
+        let current_value = current_model_alias.unwrap_or(config.default_model.as_str());
         let mut options = vec![json!({
             "id": "model",
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": self.config().default_model,
+            "currentValue": current_value,
             "options": models.iter().map(|model| json!({
                 "value": model.id,
                 "name": model.name.as_deref().unwrap_or(&model.id),
@@ -624,7 +636,7 @@ async fn new_session(
         "id": request.get("id").cloned().unwrap_or(Value::Null),
         "result": {
             "sessionId": session_id.0,
-            "configOptions": runtime.model_config_options().await,
+            "configOptions": runtime.model_config_options(None).await,
         }
     }))
 }
@@ -668,7 +680,9 @@ async fn set_config_option(
                 )?;
                 Ok(success(
                     &request,
-                    json!({"configOptions": runtime.model_config_options().await}),
+                    json!({"configOptions": runtime
+                        .model_config_options(session.selected_public_model_alias.as_deref())
+                        .await}),
                 ))
             }
             BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
@@ -705,7 +719,7 @@ async fn set_config_option(
                 .select_model(tenant_id, &session_id, selected.id.clone())?;
             Ok(success(
                 &request,
-                json!({"configOptions": runtime.model_config_options().await}),
+                json!({"configOptions": runtime.model_config_options(Some(&selected.id)).await}),
             ))
         }
         BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
@@ -736,9 +750,18 @@ async fn set_config_option(
                 )?;
                 persist_bridge_binding(router, runtime, &updated).await?;
                 if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
-                    result
-                        .entry("configOptions".to_string())
-                        .or_insert(runtime.model_config_options().await);
+                    // Always overwrite rather than `.entry().or_insert()`: the
+                    // native backend's own response may carry its own
+                    // "configOptions" in terms of native model ids, which
+                    // would silently stick if we only filled in a missing
+                    // key -- Zed (talking to the bridge) needs the bridge's
+                    // public-alias view, stamped with the selection that
+                    // was just applied, not whatever the native adapter
+                    // happened to return.
+                    result.insert(
+                        "configOptions".to_string(),
+                        runtime.model_config_options(Some(&selected.id)).await,
+                    );
                 }
             }
             Ok(response)

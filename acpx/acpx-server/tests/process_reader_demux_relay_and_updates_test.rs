@@ -400,3 +400,135 @@ async fn http_only_caller_still_sees_updates_under_demux() {
         Some("agent_message_chunk"),
     );
 }
+
+/// A `session/prompt` backend that asks for a profile-gated
+/// `fs/read_text_file` approval, then echoes back whatever reply it got
+/// verbatim as `result.readReply` -- lets a test assert on the exact
+/// approval outcome (approved vs. rejected) instead of only "did the
+/// turn complete".
+fn fs_approval_backend_spec() -> SpawnSpec {
+    let script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-fsterm"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    printf '{"jsonrpc":"2.0","id":950,"method":"fs/read_text_file","params":{"sessionId":"backend-fsterm","path":"/does/not/matter"}}\n'
+    reply=""
+    while IFS= read -r reply_line; do
+      echo "$reply_line" | grep -q '"id":950' && { reply="$reply_line"; break; }
+    done
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","readReply":%s}}\n' "$id" "$reply"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+    SpawnSpec::new("sh", vec!["-c".to_string(), script.to_string()])
+}
+
+/// Regression test for a fourth demux-relay sibling missed by the fix
+/// this whole file otherwise documents: `try_relay_approval` (the
+/// `fs/*`/`terminal/create` capability-gate relay used by both the
+/// `fs/*` and `terminal/create` arms in the unmatched-frame handler)
+/// still required `LiveNotifyCtx::gateway_session_id` to already be
+/// `Some` with no `resolve_gateway_session` fallback, unlike its two
+/// siblings (`try_forward_interaction`, `try_relay_agent_request`)
+/// fixed alongside this file's other three tests. Under demux,
+/// `spawn_demux_consumer`'s per-process ctx always leaves that field
+/// `None`, so every fs/terminal approval relay silently fell through to
+/// the profile's own auto-allow-because-capability-is-on fallback
+/// instead of ever reaching a live client -- a live WS client's explicit
+/// rejection was never honored, and no request ever surfaced as a
+/// pending/relayed frame at all. A passing assertion here (a real
+/// rejection error, not an auto-allowed read) can only mean the relay
+/// actually reached this client under demux.
+#[tokio::test]
+async fn native_ws_fs_terminal_approval_relay_works_under_demux() {
+    let mut router = Router::new("fs-term-demux-agent");
+    router.register_agent("fs-term-demux-agent", fs_approval_backend_spec());
+    let router = router.with_process_reader_demux(true);
+    let router: SharedRouter = Arc::new(Mutex::new(router));
+    let addr = spawn_server(router).await;
+
+    let (mut socket, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("ws connect");
+
+    ws_send(
+        &mut socket,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "profiles/create",
+            "params": {
+                "name": "fs-term-demux-enabled",
+                "agent_id": "fs-term-demux-agent",
+                "allow_fs_access": true
+            }
+        }),
+    )
+    .await;
+    let _create_reply = ws_receive(&mut socket).await;
+
+    ws_send(
+        &mut socket,
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": "/tmp", "_acpx": {"profile": "fs-term-demux-enabled"}}
+        }),
+    )
+    .await;
+    let new_reply = ws_receive(&mut socket).await;
+    let gateway_id = new_reply["result"]["sessionId"].as_str().expect("sessionId").to_string();
+
+    ws_send(
+        &mut socket,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": gateway_id, "prompt": []}
+        }),
+    )
+    .await;
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let frame = ws_receive(&mut socket).await;
+            if frame.get("method").and_then(|m| m.as_str()) == Some("acpx/agent_request") {
+                let relay_id = frame["params"]["relayId"].as_str().expect("relayId").to_string();
+                // Explicitly reject -- the profile's own allow_fs_access
+                // toggle would auto-allow this if the relay never
+                // reached this client at all (the pre-fix regression
+                // under demux), so only an honored rejection proves the
+                // relay itself worked.
+                ws_send(
+                    &mut socket,
+                    json!({
+                        "jsonrpc": "2.0", "id": 4, "method": "acpx/agent_response",
+                        "params": {"relayId": relay_id, "response": {"approved": false}}
+                    }),
+                )
+                .await;
+                continue;
+            }
+            if frame.get("id") == Some(&json!(3)) {
+                break frame;
+            }
+        }
+    })
+    .await
+    .expect("fs approval relay flow under demux timed out -- see this test's own doc comment");
+
+    let read_reply = &outcome["result"]["readReply"];
+    assert!(
+        read_reply.get("error").is_some(),
+        "expected the live rejection to be honored under demux, got {read_reply} \
+         (an auto-allowed real read here would mean the relay silently fell \
+         through to policy instead of reaching this client)"
+    );
+    assert!(
+        read_reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rejected"),
+        "expected a clear rejection message, got {read_reply}"
+    );
+}
