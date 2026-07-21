@@ -2344,6 +2344,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 let gw = panel.settings_gateway_index();
                 let (real_idx, binding, provider) = {
                     let Some(bridge) = panel.bridge.as_mut() else {
+                        eprintln!(
+                            "panel-rust: new-thread-requested ignored, agent bridge unavailable"
+                        );
                         return;
                     };
                     // Validate profile name against gateway list when set.
@@ -2363,13 +2366,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     let preferred_provider = default_agent_id
                         .as_deref()
                         .and_then(provider_for_default_agent);
-                    let Ok(real_idx) = bridge.add_thread_with_profile_and_provider(
+                    let real_idx = match bridge.add_thread_with_profile_and_provider(
                         &name,
                         profile.as_deref(),
                         preferred_provider,
-                    )
-                    else {
-                        return;
+                    ) {
+                        Ok(idx) => idx,
+                        Err(error) => {
+                            eprintln!(
+                                "panel-rust: new-thread-requested failed to add thread {name:?}: {error}"
+                            );
+                            return;
+                        }
                     };
                     (
                         real_idx,

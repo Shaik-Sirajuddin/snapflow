@@ -1810,6 +1810,18 @@ impl AgentBridge {
                 resolved_urls.insert(provider.clone(), resolve_gateway(&provider)?);
             }
         }
+        // Always resolve both known providers (see provider_for_index), not
+        // just whichever ones happen to appear in thread_specs -- a cold
+        // start with zero initial threads (an empty specs slice is valid
+        // and normal, not just a test fixture) previously left gateway_urls
+        // completely empty, so add_thread_with_profile_and_provider's own
+        // gateway_urls lookup failed for every single new thread with no
+        // existing thread ever able to bootstrap a provider into the map.
+        for provider in ["codex", "claude"] {
+            if !resolved_urls.contains_key(provider) {
+                resolved_urls.insert(provider.to_string(), resolve_gateway(provider)?);
+            }
+        }
 
         // Gateway connection is intentionally deferred. Cached transcript and
         // interaction state below must be observable before any remote
