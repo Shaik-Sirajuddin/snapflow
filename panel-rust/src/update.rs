@@ -330,7 +330,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);
             };
-            let thread_id = thread.session_id.clone().unwrap_or_default();
+            let thread_id = thread.thread_id.clone();
             if matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling) {
                 return match thread.send_queue.enqueue(text, false) {
                     Ok(_) => (
@@ -655,7 +655,7 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
             (
                 vec![],
                 vec![Dirty::MessagesDiff {
-                    thread_id: thread.session_id.clone().unwrap_or_default(),
+                    thread_id: thread.thread_id.clone(),
                     ops: crate::dirty::diff_by_id(&old_keys, &thread.transcript_keys, &rows),
                 }],
             )
@@ -665,7 +665,7 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
             let Some(thread) = model.threads.get_mut(real_idx) else {
                 return (vec![], vec![]);
             };
-            let thread_id = thread.session_id.clone().unwrap_or_default();
+            let thread_id = thread.thread_id.clone();
             thread.error = None;
             (
                 vec![],
@@ -836,7 +836,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 Err(err) => (
                     vec![],
                     vec![Dirty::Error {
-                        thread_id: thread.session_id.clone().unwrap_or_default(),
+                        thread_id: thread.thread_id.clone(),
                         detail: ErrorDetail {
                             message: err.message,
                         },
@@ -867,14 +867,14 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let thread_exists = model
                 .threads
                 .iter()
-                .any(|t| t.session_id.as_deref() == Some(thread_id.as_str()));
+                .any(|thread| Model::thread_matches_id(thread, &thread_id));
             if !thread_exists {
                 return (vec![], vec![]);
             }
             let Some(thread) = model
                 .threads
                 .iter_mut()
-                .find(|t| t.session_id.as_deref() == Some(thread_id.as_str()))
+                .find(|thread| Model::thread_matches_id(thread, &thread_id))
             else {
                 return (vec![], vec![]);
             };
@@ -916,11 +916,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                         vec![],
                         vec![
                             Dirty::MessagesDiff {
-                                thread_id: thread.session_id.clone().unwrap_or_default(),
+                                thread_id: thread.thread_id.clone(),
                                 ops: vec![],
                             },
                             Dirty::Connection {
-                                thread_id: thread.session_id.clone().unwrap_or_default(),
+                                thread_id: thread.thread_id.clone(),
                             },
                         ],
                     )
@@ -931,7 +931,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     (
                         vec![],
                         vec![Dirty::Error {
-                            thread_id: thread.session_id.clone().unwrap_or_default(),
+                            thread_id: thread.thread_id.clone(),
                             detail: ErrorDetail {
                                 message: err.message,
                             },
@@ -993,7 +993,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     }
                 }
                 dirty.push(Dirty::MessageAppended {
-                    thread_id: thread.session_id.clone().unwrap_or_default(),
+                    thread_id: thread.thread_id.clone(),
                 });
             }
             crate::protocol_types::AgentEvent::TurnEnded(_) => {
@@ -1017,7 +1017,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 thread.state = ThreadState::Error;
                 thread.error = Some(error.clone());
                 dirty.push(Dirty::Error {
-                    thread_id: thread.session_id.clone().unwrap_or_default(),
+                    thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {
                         message: error.clone(),
                     },
@@ -1153,10 +1153,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model
                 .threads
                 .iter()
-                .position(|thread| {
-                    thread.thread_id == snapshot.thread_id
-                        || thread.session_id.as_deref() == Some(snapshot.thread_id.as_str())
-                })
+                .position(|thread| Model::thread_matches_id(thread, &snapshot.thread_id))
         };
         let Some(target_index) = target_index else {
             return (effects, dirty);
@@ -1174,7 +1171,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         }
         let expanded = model.expanded.clone();
         if let Some(thread) = model.threads.get_mut(target_index) {
-            let thread_id = thread.session_id.clone().unwrap_or_default();
+            let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
             let rows = crate::models::to_message_rows_from_transcript(
                 snapshot.transcript.clone(),
@@ -1241,7 +1238,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             }
             if switched_thread {
                 dirty.push(Dirty::Error {
-                    thread_id: thread.session_id.clone().unwrap_or_default(),
+                    thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {
                         message: thread.error.clone().unwrap_or_default(),
                     },
@@ -1598,6 +1595,29 @@ mod tests {
     }
 
     #[test]
+    fn prompt_stream_delta_accepts_durable_thread_id_before_session_attach() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].thread_id = "durable-thread-1".to_owned();
+        model.threads[0].message_ids.push("message-1".to_owned());
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::PromptStreamDelta {
+                thread_id: "durable-thread-1".to_owned(),
+                message_id: "message-1".to_owned(),
+                delta: "next".to_owned(),
+            }),
+        );
+        assert_eq!(
+            dirty,
+            vec![Dirty::MessageStreamingDelta {
+                thread_id: "durable-thread-1".to_owned(),
+                message_id: "message-1".to_owned(),
+                delta: "next".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
     fn prompt_sent_error_sets_thread_error_state_not_silently_dropped() {
         let mut model = model_with_threads(&["a"]);
         let (_, dirty) = update(
@@ -1799,11 +1819,11 @@ mod tests {
         assert_eq!(model.threads[0].connection_status, "Live connection");
         assert!(dirty.iter().any(|item| matches!(
             item,
-            Dirty::MessagesDiff { thread_id, .. } if thread_id == "thread-1"
+            Dirty::MessagesDiff { thread_id, .. } if thread_id == "thread-0"
         )));
         assert!(dirty.iter().any(|item| matches!(
             item,
-            Dirty::Connection { thread_id } if thread_id == "thread-1"
+            Dirty::Connection { thread_id } if thread_id == "thread-0"
         )));
     }
 
@@ -1849,7 +1869,7 @@ mod tests {
         assert_eq!(model.threads[2].transcript, transcript);
         assert!(dirty.iter().any(|item| matches!(
             item,
-            Dirty::MessagesDiff { thread_id, .. } if thread_id == "session-target"
+            Dirty::MessagesDiff { thread_id, .. } if thread_id == "thread-1"
         )));
     }
 

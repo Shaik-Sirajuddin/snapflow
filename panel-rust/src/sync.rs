@@ -156,7 +156,7 @@ fn thread_for_id<'a>(model: &'a Model, thread_id: &str) -> Option<&'a crate::mod
     model
         .threads
         .iter()
-        .find(|thread| thread_id.is_empty() || thread.session_id.as_deref() == Some(thread_id))
+        .find(|thread| Model::thread_matches_id(thread, thread_id))
 }
 
 fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
@@ -164,8 +164,7 @@ fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
         model
             .threads
             .get(*idx)
-            .and_then(|thread| thread.session_id.as_deref())
-            .is_some_and(|id| thread_id.is_empty() || id == thread_id)
+            .is_some_and(|thread| Model::thread_matches_id(thread, thread_id))
     })
 }
 
@@ -554,6 +553,28 @@ mod tests {
         });
         *model.message_model_keys.borrow_mut() = vec!["assistant:m-1".to_owned()];
         apply_message_streaming(&model, "thread-1", "m-1", " world");
+        assert_eq!(
+            model.messages_model.row_data(0).unwrap().text,
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn message_streaming_delta_resolves_by_durable_thread_id() {
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "durable-thread-1".to_owned(),
+            ..crate::model::ThreadModel::default()
+        });
+        model.displayed_thread = Some(0);
+        model.messages_model.push(crate::MessageItem {
+            text: "hello".into(),
+            ..crate::MessageItem::default()
+        });
+        *model.message_model_keys.borrow_mut() = vec!["assistant:m-1".to_owned()];
+
+        apply_message_streaming(&model, "durable-thread-1", "m-1", " world");
+
         assert_eq!(
             model.messages_model.row_data(0).unwrap().text,
             "hello world"

@@ -150,6 +150,10 @@ impl Default for ThreadModel {
 }
 
 impl Model {
+    pub(crate) fn thread_matches_id(thread: &ThreadModel, id: &str) -> bool {
+        id.is_empty() || thread.thread_id == id || thread.session_id.as_deref() == Some(id)
+    }
+
     /// Folds `Effect::LoadInitialState`'s result into a fresh `Model` --
     /// the one legitimate "everything is dirty" case, since there is no
     /// prior row identity to preserve on cold start (see 00-plan.md's
