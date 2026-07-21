@@ -1013,6 +1013,85 @@ impl PanelSingleton {
         true
     }
 
+    /// `dispatch.rs`'s Compose-domain wrapper (tea-slint-model Phase 4)
+    /// calls this -- extracted verbatim from the former
+    /// `on_send_requested` closure body, see that module's doc comment
+    /// for why the real bridge/queue-aware cascade stays here rather
+    /// than being reimplemented against `Model`.
+    pub(crate) fn dispatch_send_requested(&self, filtered_idx: usize, text: &str) {
+        let Some(idx) = self.real_index(filtered_idx) else {
+            return;
+        };
+        let Some(bridge) = &self.bridge else { return };
+        if self
+            .thread_state
+            .borrow()
+            .get(idx)
+            .is_some_and(|state| *state == ThreadState::Loading)
+        {
+            // queued_send_queue_behavior: a turn is already in flight, so
+            // this message goes on the queue instead of being silently
+            // dropped.
+            if let Some(queue) = self.send_queues.borrow_mut().get_mut(idx) {
+                match queue.enqueue(text.to_string(), false) {
+                    Ok(_) => trace_host_input(format_args!(
+                        "send queued real_thread={idx} (turn in flight)"
+                    )),
+                    Err(error) => eprintln!(
+                        "panel-rust: failed to enqueue message for thread {idx}: {error}"
+                    ),
+                }
+            }
+            return;
+        }
+        if bridge.thread_closed(idx) {
+            trace_host_input(format_args!(
+                "send ignored real_thread={idx} because the thread is closed"
+            ));
+            return;
+        }
+        if let Some(error) = self.thread_errors.borrow_mut().get_mut(idx) {
+            error.clear();
+        }
+        bridge.push_local(
+            idx,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: text.to_string(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+        if let Some(slot) = self.thread_state.borrow_mut().get_mut(idx) {
+            *slot = ThreadState::Loading;
+        }
+        self.refresh_threads_model();
+        if Some(idx) == self.real_index(self.component.get_selected_thread() as usize) {
+            self.refresh_messages_for(idx);
+        }
+        bridge.send_prompt(idx, text.to_string());
+        trace_host_input(format_args!("send dispatched real_thread={idx}"));
+    }
+
+    /// See `dispatch_send_requested`'s doc comment -- same purpose,
+    /// extracted verbatim from the former `on_stop_requested` closure
+    /// body.
+    pub(crate) fn dispatch_stop_requested(&self) {
+        let Some(idx) = self.real_index(self.component.get_selected_thread() as usize) else {
+            return;
+        };
+        if !matches!(self.thread_state.borrow().get(idx), Some(ThreadState::Loading)) {
+            return;
+        }
+        if let Some(slot) = self.thread_state.borrow_mut().get_mut(idx) {
+            *slot = ThreadState::Cancelling;
+        }
+        self.refresh_threads_model();
+        self.bridge.as_ref().map(|bridge| bridge.cancel_prompt(idx));
+    }
+
     fn refresh_connection_status_for(&self, real_idx: usize) -> bool {
         let status = self
             .bridge
@@ -2523,13 +2602,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             }
         });
 
+        // tea-slint-model Phase 4 (Compose domain): routed through
+        // Msg::Ui(UiMsg::Compose(..)) -> update() -> dispatch's bridge
+        // into dispatch_send_requested/dispatch_stop_requested (moved,
+        // not rewritten, from these closures' former bodies) -- see
+        // dispatch.rs's doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_send_requested(move || {
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
             let text = component.get_compose_text().to_string();
-            let text = text.trim();
+            let text = text.trim().to_owned();
             if text.is_empty() {
                 trace_host_input("send requested with empty composer");
                 return;
@@ -2539,95 +2623,21 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 "send requested selected_thread={filtered_idx} text={text:?}"
             ));
             component.set_compose_text("".into());
-            PANEL.with(|cell| {
+            PANEL.with(move |cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(idx) = panel.real_index(filtered_idx) else {
-                        return;
-                    };
-                    let Some(bridge) = &panel.bridge else { return };
-                    if panel
-                        .thread_state
-                        .borrow()
-                        .get(idx)
-                        .is_some_and(|state| *state == ThreadState::Loading)
-                    {
-                        // queued_send_queue_behavior: a turn is already
-                        // in flight, so this message goes on the queue
-                        // instead of being silently dropped (compose is
-                        // no longer disabled while sending -- see
-                        // chat_input_layout.slint's `enabled: true` --
-                        // so this branch is reachable for real now,
-                        // unlike before this phase).
-                        if let Some(queue) = panel.send_queues.borrow_mut().get_mut(idx) {
-                            match queue.enqueue(text.to_string(), false) {
-                                Ok(_) => trace_host_input(format_args!(
-                                    "send queued real_thread={idx} (turn in flight)"
-                                )),
-                                Err(error) => eprintln!(
-                                    "panel-rust: failed to enqueue message for thread {idx}: {error}"
-                                ),
-                            }
-                        }
-                        return;
-                    }
-                    if bridge.thread_closed(idx) {
-                        trace_host_input(format_args!(
-                            "send ignored real_thread={idx} because the thread is closed"
-                        ));
-                        return;
-                    }
-                    if let Some(error) = panel.thread_errors.borrow_mut().get_mut(idx) {
-                        error.clear();
-                    }
-                    bridge.push_local(
-                        idx,
-                        ChatMessage {
-                            kind: MessageKind::User,
-                            text: text.to_string(),
-                            status: None,
-                            id: None,
-                            raw_input: None,
-                            raw_output: None,
-                        },
-                    );
-                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
-                        *slot = ThreadState::Loading;
-                    }
-                    panel.refresh_threads_model();
-                    if Some(idx) == panel.real_index(component.get_selected_thread() as usize) {
-                        panel.refresh_messages_for(idx);
-                    }
-                    bridge.send_prompt(idx, text.to_string());
-                    trace_host_input(format_args!("send dispatched real_thread={idx}"));
+                    dispatch::dispatch_compose_send(panel, filtered_idx, text);
                 }
             });
         });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_stop_requested(move || {
-            let Some(component) = component_weak.upgrade() else {
+            let Some(_component) = component_weak.upgrade() else {
                 return;
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    if !matches!(
-                        panel.thread_state.borrow().get(idx),
-                        Some(ThreadState::Loading)
-                    ) {
-                        return;
-                    }
-                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
-                        *slot = ThreadState::Cancelling;
-                    }
-                    panel.refresh_threads_model();
-                    panel
-                        .bridge
-                        .as_ref()
-                        .map(|bridge| bridge.cancel_prompt(idx));
+                    dispatch::dispatch_compose_stop(panel);
                 }
             });
         });

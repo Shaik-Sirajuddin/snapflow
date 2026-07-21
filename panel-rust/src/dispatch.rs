@@ -26,7 +26,7 @@
 
 use crate::dirty::{Dirty, ScalarField};
 use crate::model::{Model, ThreadModel};
-use crate::msg::{Msg, ThreadMsg, UiMsg};
+use crate::msg::{ComposeMsg, Msg, ThreadMsg, UiMsg};
 use crate::update::update;
 use crate::PanelSingleton;
 
@@ -101,6 +101,42 @@ pub(crate) fn dispatch_thread_navigate(panel: &PanelSingleton, delta: i32) {
         Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(delta))),
     );
     apply_thread_selection_dirty(panel, &model, dirty);
+}
+
+/// Wired from `component.on_send_requested` (tea-slint-model Phase 4,
+/// Compose domain). Same bridge shape as the Thread domain above:
+/// `update()` is genuinely called (proving `Msg::Ui(Compose(SendRequested))`
+/// routes and produces the expected `Effect::SendPrompt`), then the real
+/// queue/bridge-aware cascade is delegated to
+/// `PanelSingleton::dispatch_send_requested` (moved, not rewritten, from
+/// the former `on_send_requested` closure body) since `Model` doesn't yet
+/// own send-queue/bridge state.
+pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(
+        &mut model,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
+    );
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::SendPrompt { .. }]),
+        "Compose::SendRequested must produce zero (no selected thread) or one SendPrompt effect"
+    );
+    panel.dispatch_send_requested(filtered_idx, &text);
+}
+
+/// Wired from `component.on_stop_requested` (tea-slint-model Phase 4,
+/// Compose domain). See `dispatch_compose_send`'s doc comment -- same
+/// bridge shape, delegating to `PanelSingleton::dispatch_stop_requested`.
+pub(crate) fn dispatch_compose_stop(panel: &PanelSingleton) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Compose(ComposeMsg::StopRequested)));
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
+        "Compose::StopRequested must produce zero (no selected thread) or one CancelGeneration effect"
+    );
+    panel.dispatch_stop_requested();
 }
 
 #[cfg(test)]
