@@ -267,21 +267,29 @@ def open_second_thread(xdisplay, host_log):
 
     baseline = known_thread_indices(host_log)
 
-    # `sidebar-toggle` is the leftmost 24x24 control in the 36px header
-    # row, at `padding` (4px while compact) from the left edge.
-    dock_click(xdisplay, 16, 18)
-    time.sleep(0.3)
+    # Collapsed expand-toggle: the panel-left IconButton at the top of the
+    # 48px collapsed rail. Ground-truthed visually (scrot of a held session)
+    # to dock ~ (12, 9), not the geometric header center -- the icon sits
+    # tight to the top-left. A single click toggles `sidebar-expanded`
+    # (app.slint), so do NOT click it more than once or it re-collapses. The
+    # New-thread scan below stays far right (x>=145), clear of this toggle,
+    # so it can never re-close the rail.
+    dock_click(xdisplay, 12, 9)
+    time.sleep(0.4)
 
     deadline = time.monotonic() + 20
-    # "New thread" sits after a stretching filler, just left of the
-    # trailing gear glyph, inside the now-144px-wide expanded header --
-    # scan the right two thirds of the header row so real glyph-width
-    # variance in the preceding "Chats" label/filler cannot make a single
-    # fixed pixel miss the control.
+    # "New thread" (`sidebar.slint`) is the right-most control in the 36px
+    # header of the expanded sidebar -- after the collapse toggle, the
+    # "Chats" label, and a stretching filler. While compact the expanded
+    # sidebar is 200px wide (`expanded ? (compact ? 200px : 260px) : 48px`),
+    # so the plus button sits near x~182 (200 - space-2 padding - a ~24px
+    # IconButton), well right of the driver's old 60-142 assumption. Scan
+    # the right edge band; the left toggle (which would re-collapse) is far
+    # left of this range so the scan cannot accidentally close the sidebar.
     candidates = [
         (x, y)
-        for y in range(6, 32, 4)
-        for x in range(60, 142, 4)
+        for y in range(4, 34, 3)
+        for x in range(145, 201, 3)
     ]
     for x, y in candidates:
         if known_thread_indices(host_log) - baseline:
@@ -306,30 +314,42 @@ def open_second_thread(xdisplay, host_log):
 
 
 def select_thread_row(xdisplay, index, host_log):
-    """Click an existing sidebar thread row by index. Rows are 48px tall,
-    stacked below the 36px header, and their `TouchArea` covers the full
-    row regardless of `expanded` (only the row's text label is gated on
-    that -- see `sidebar.slint`), so this works against the default
-    collapsed 48px-wide sidebar with no toggle needed. Confirms success
-    from the click's own host trace, which reports the *post-click*
-    `selected_thread` synchronously (Slint's `clicked` callback runs
-    inside the same `dispatch_event` call the click handler makes).
+    """Click an existing sidebar thread row by index. In the default
+    collapsed 48px-wide sidebar the vertical stack (`sidebar.slint`) is:
+    36px header, ~2px inter-child spacing (Metrics.space-1), 32px search
+    rail, ~2px, then the thread list -- collapsed rows are 44px tall
+    (`expanded ? 52px : 44px`) separated by 2px. Each row's `TouchArea`
+    covers the full row, so no toggle is needed. Because the software
+    renderer accumulates a little per-widget spacing/rounding slack, scan
+    a small vertical band around the computed row center instead of one
+    fixed pixel. Success is confirmed from the click's own host trace,
+    which reports the *post-click* `selected_thread` synchronously (Slint's
+    `clicked` callback runs inside the same `dispatch_event` call).
     """
     if host_log is None:
         raise RuntimeError("select_thread_row requires --host-log")
-    row_y = 36 + index * 48 + 24
-    offset = host_log.stat().st_size if host_log.exists() else 0
-    dock_click(xdisplay, 20, row_y)
-    deadline = time.monotonic() + 2
+    # 36px header + 2px + 32px search rail + 2px = top of the thread list.
+    list_top = 36 + 2 + 32 + 2
+    row_pitch = 44 + 2
+    row_center = list_top + index * row_pitch + 22
     marker = "selected_thread={}".format(index)
-    while time.monotonic() < deadline:
-        if host_log.exists() and marker in host_log.read_text(errors="replace")[offset:]:
-            return
-        time.sleep(0.05)
+    deadline = time.monotonic() + 6
+    last_y = row_center
+    for dy in (0, 4, -4, 8, -8, 12, -12, 16, -16):
+        last_y = row_center + dy
+        offset = host_log.stat().st_size if host_log.exists() else 0
+        dock_click(xdisplay, 20, last_y)
+        inner_deadline = time.monotonic() + 0.4
+        while time.monotonic() < inner_deadline:
+            if host_log.exists() and marker in host_log.read_text(errors="replace")[offset:]:
+                return
+            time.sleep(0.05)
+        if time.monotonic() > deadline:
+            break
     raise RuntimeError(
-        "clicking sidebar row {} at y={} did not select it (host trace never "
-        "reported {!r}; screen click was ({}, {}))".format(
-            index, row_y, marker, DOCK_X_OFFSET + 20, DOCK_Y_OFFSET + row_y
+        "clicking sidebar row {} near y={} did not select it (host trace never "
+        "reported {!r}; last screen click was ({}, {}))".format(
+            index, row_center, marker, DOCK_X_OFFSET + 20, DOCK_Y_OFFSET + last_y
         )
     )
 
