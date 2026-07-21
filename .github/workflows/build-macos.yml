@@ -1,0 +1,151 @@
+name: build-macos
+
+# Real source build on GitHub's hosted macos-latest runner (free for public
+# repos). Unlike shotcut-rebrand's from-scratch build-snapflow.sh path (used
+# for Linux release packaging), shotcut-rebrand's CMakeLists.txt only
+# requires `mlt++-7 >= 7.36.0` + fftw3 via pkg-config -- it does not need a
+# custom-built FFmpeg/MLT tree. Homebrew ships prebuilt bottles for `mlt`
+# (which pulls in ffmpeg as a dependency) and `fftw`, so this builds against
+# those directly instead of recompiling FFmpeg/MLT/x265/etc from source.
+#
+# Caveat: no Apple Developer ID / notarization secrets are configured, so
+# the .dmg this produces is unsigned -- Gatekeeper will require the user to
+# right-click -> Open the first time. Also, act cannot emulate macOS
+# runners (it only runs Linux containers regardless of `runs-on`), so this
+# job's first real validation has to happen on an actual GitHub-hosted
+# macos-latest runner, not locally.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  panel-rust:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: panel-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # See build-linux.yml: tests spawn a real acpx-server binary.
+      - name: Build acpx-server (test dependency)
+        working-directory: acpx
+        run: cargo build -p acpx-server
+      - run: cargo build --release
+      - run: cargo test --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel-rust-staticlib-macos
+          path: panel-rust/target/release/libpanel_rust.a
+
+  snapshotd:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: snapshotd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: snapshotd/go.mod
+      - run: go build -o dist/snapshotd ./cmd/snapshotd
+      - run: go test ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshotd-macos
+          path: snapshotd/dist/snapshotd
+
+  shotcut-rebrand:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: shotcut-rebrand
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps from Homebrew (prebuilt, no from-source ffmpeg/mlt compile)
+        run: |
+          brew update
+          brew install qt@6 mlt fftw pkg-config cmake ninja
+
+      - name: Configure + build
+        run: |
+          QT_PREFIX=$(brew --prefix qt@6)
+          cmake -B build -G Ninja \
+            -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Bundle app + Qt frameworks
+        run: |
+          QT_PREFIX=$(brew --prefix qt@6)
+          APP=$(find build -maxdepth 2 -name "*.app" -print -quit)
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          "$QT_PREFIX/bin/macdeployqt" "$APP"
+
+      - name: Embed MLT modules + data (Homebrew MLT is not statically bundled by macdeployqt)
+        run: |
+          MLT_PREFIX=$(brew --prefix mlt)
+          mkdir -p "$APP/Contents/lib" "$APP/Contents/share"
+          cp -R "$MLT_PREFIX/lib/mlt-7" "$APP/Contents/lib/mlt-7"
+          cp -R "$MLT_PREFIX/share/mlt-7" "$APP/Contents/share/mlt-7"
+          cat > "$APP/Contents/MacOS/mlt-env.sh" <<'EOF'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export MLT_REPOSITORY="$DIR/../lib/mlt-7"
+          export MLT_DATA="$DIR/../share/mlt-7"
+          EOF
+          chmod +x "$APP/Contents/MacOS/mlt-env.sh"
+
+      - name: Create unsigned dmg
+        run: |
+          VERSION=$(date +"%y.%-m.%-d")
+          hdiutil create -fs HFS+ -srcfolder "$APP" -volname Snapflow -format UDBZ \
+            "snapflow-macos-unsigned-$VERSION.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shotcut-rebrand-macos
+          path: shotcut-rebrand/snapflow-macos-unsigned-*.dmg
+
+  package:
+    needs: [panel-rust, snapshotd, shotcut-rebrand]
+    if: always() && needs.panel-rust.result == 'success' && needs.snapshotd.result == 'success' && needs.shotcut-rebrand.result == 'success'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Assemble install bundle
+        run: |
+          set -euo pipefail
+          VERSION=$(date +"%y.%-m.%-d")
+          OUT="snapflow-macos-$VERSION"
+          mkdir -p "$OUT/bin"
+          cp dist/snapshotd-macos/snapshotd "$OUT/bin/snapshotd"
+          chmod +x "$OUT/bin/snapshotd"
+          cp dist/panel-rust-staticlib-macos/libpanel_rust.a "$OUT/bin/libpanel_rust.a"
+          cp dist/shotcut-rebrand-macos/snapflow-macos-unsigned-*.dmg "$OUT/"
+          tar -czf "$OUT.tar.gz" "$OUT"
+          shasum -a 256 "$OUT.tar.gz" > "$OUT.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapflow-macos-install-bundle
+          path: |
+            snapflow-macos-*.tar.gz
+            snapflow-macos-*.tar.gz.sha256
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            snapflow-macos-*.tar.gz
+            snapflow-macos-*.tar.gz.sha256
