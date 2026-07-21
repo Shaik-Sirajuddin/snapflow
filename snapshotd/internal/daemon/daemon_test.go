@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -20,7 +21,13 @@ import (
 // not-yet-built sap-rust binary.
 func buildFixture(t *testing.T) string {
 	t.Helper()
-	out := filepath.Join(t.TempDir(), "fixture-bin")
+	name := "fixture-bin"
+	if runtime.GOOS == "windows" {
+		// See procmgr_test.go's buildFixture: Windows' exec.LookPath needs
+		// a PATHEXT-listed extension even for an absolute path.
+		name += ".exe"
+	}
+	out := filepath.Join(t.TempDir(), name)
 	cmd := exec.Command("go", "build", "-o", out, "snapshotd/internal/procmgr/testdata/fixture")
 	if outBytes, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building fixture: %v\n%s", err, outBytes)

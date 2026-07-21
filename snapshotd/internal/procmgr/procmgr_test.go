@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,15 @@ import (
 func buildFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	out := filepath.Join(dir, "fixture-bin")
+	name := "fixture-bin"
+	if runtime.GOOS == "windows" {
+		// Windows' exec.LookPath requires a PATHEXT-listed extension even
+		// for an absolute path -- without it, starting the built binary
+		// fails with "executable file not found in %PATH%" despite the
+		// file existing right there.
+		name += ".exe"
+	}
+	out := filepath.Join(dir, name)
 	cmd := exec.Command("go", "build", "-o", out, "snapshotd/internal/procmgr/testdata/fixture")
 	cmd.Env = os.Environ()
 	if outBytes, err := cmd.CombinedOutput(); err != nil {
