@@ -848,6 +848,26 @@ fn reserve_ephemeral_port() -> Option<(u16, File)> {
 ///    concrete "closing and relaunching reattaches" case -- a gateway
 ///    left running by a now-closed prior panel process*), it's reused
 ///    unchanged.
+///
+///    **This is also where `snapshotd`'s own bundled gateway lands**:
+///    `snapshotd`'s `AcpxEnabled` defaults ON whenever an `acpx-server`
+///    binary is discoverable (`SNAPSHOTD_ACPX_ENABLED` unset -- see
+///    `snapshotd/internal/config/config.go`), bound to this exact same
+///    default port 8790, and its own `AcpxBackendCmd` defaults to
+///    *empty*, which means the bundled `acpx-server` picks its own
+///    real, auth-requiring backend -- **not** a mock. So on a machine
+///    where snapshotd is running normally, step 2 above already reuses
+///    a real, production-backed gateway with zero extra configuration;
+///    there is no separate "production mode" switch to flip. Do not
+///    hand-launch a second ad hoc `acpx-server` (e.g. with
+///    `ACPX_BACKEND_CMD` forced to `rui-mock-agent`, the dev/test
+///    default below) for manual/live verification just because this is
+///    real-feeling infra -- that only shadows the real one and makes
+///    every thread look like it's talking to a fake backend. Only set
+///    `RUI_ACPX_<PROVIDER>_URL`/spawn a throwaway mock gateway for
+///    isolated automated tests (see `keyboard_shortcut_tests`'s
+///    `TestPanel`), never as a substitute for snapshotd's already-real
+///    default.
 /// 3. Else, spawns a fresh `acpx-server` child -- on the fixed default
 ///    port if nothing at all is listening there yet, or on a freshly
 ///    probed ephemeral port if something *is* listening but didn't pass
