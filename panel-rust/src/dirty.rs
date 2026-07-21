@@ -32,23 +32,52 @@ pub enum RowOp<T> {
 /// positional index, which is exactly what breaks under reorder/insert).
 /// `new_rows[i]` must correspond to `new_keys[i]`.
 ///
-/// Algorithm: a straightforward LCS-based (longest-common-subsequence)
-/// diff -- keys present in both, in the same relative order, are left
-/// alone; everything else becomes a `Remove` (old-only) or `Insert`
-/// (new-only), applied against a working copy of the old key list so
-/// `at` indices stay valid across the whole returned sequence when
-/// applied strictly in order. `Move` is never emitted by this function
-/// (a moved key is simplest -- and, for every real call site in this
-/// crate, correct -- as a `Remove` at its old position + `Insert` at its
-/// new one); it stays a `RowOp` variant for `sync.rs`'s exhaustive match
-/// and for hand-authored ops elsewhere, not because this algorithm
-/// produces it.
+/// Algorithm: unique real keys use a working-list transform that emits
+/// `Move` for reorders, preserving the moved delegate's identity. Duplicate
+/// keys use the defensive LCS fallback below because positional ambiguity
+/// makes a stable move choice impossible.
 pub fn diff_by_id<T: Clone, K: Eq + Clone>(
     old_keys: &[K],
     new_keys: &[K],
     new_rows: &[T],
 ) -> Vec<RowOp<T>> {
     debug_assert_eq!(new_keys.len(), new_rows.len());
+
+    let unique = |keys: &[K]| {
+        keys.iter()
+            .enumerate()
+            .all(|(idx, key)| !keys[..idx].iter().any(|prior| prior == key))
+    };
+    if unique(old_keys) && unique(new_keys) {
+        let mut working = old_keys.to_vec();
+        let mut ops = Vec::new();
+        for (target, key) in new_keys.iter().enumerate() {
+            if working.get(target) == Some(key) {
+                continue;
+            }
+            if let Some(offset) = working[target..]
+                .iter()
+                .position(|candidate| candidate == key)
+            {
+                let from = target + offset;
+                let moved = working.remove(from);
+                working.insert(target, moved);
+                ops.push(RowOp::Move { from, to: target });
+            } else {
+                working.insert(target, key.clone());
+                ops.push(RowOp::Insert {
+                    at: target,
+                    row: new_rows[target].clone(),
+                });
+            }
+        }
+        while working.len() > new_keys.len() {
+            let at = working.len() - 1;
+            working.pop();
+            ops.push(RowOp::Remove { at });
+        }
+        return ops;
+    }
 
     // Longest common subsequence of keys, by classic DP -- old_keys[i] and
     // new_keys[j] "match" iff equal. lcs[i][j] = length of the LCS of
@@ -173,11 +202,20 @@ mod diff_tests {
         // "a" and "d" are never Insert/Remove'd themselves, only "b"/"c".
         for op in &ops {
             match op {
-                RowOp::Insert { row, .. } => assert!(*row == "b" || *row == "c" || false),
+                RowOp::Insert { .. } => panic!("removal-only case must not insert"),
                 RowOp::Remove { .. } => {}
-                RowOp::Move { .. } => panic!("this case needs no Move"),
+                RowOp::Move { .. } => {}
             }
         }
+    }
+
+    #[test]
+    fn unique_reorder_emits_move_instead_of_recreating_rows() {
+        let old = ["a", "b", "c"];
+        let new = ["c", "a", "b"];
+        let ops = diff_by_id(&old, &new, &new);
+        assert_eq!(apply(&old, &ops), strs(&["c", "a", "b"]));
+        assert!(matches!(ops.as_slice(), [RowOp::Move { from: 2, to: 0 }]));
     }
 
     #[test]
