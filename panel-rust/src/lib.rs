@@ -1268,7 +1268,36 @@ impl PanelSingleton {
     /// with a concrete one-of option id (Zed flat permission model), then
     /// immediately re-renders the request card (which will hide it, since
     /// `AgentBridge::respond_to_request` removes the entry synchronously).
-    fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
+    /// `dispatch.rs`'s Request-domain wrapper (tea-slint-model Phase 4)
+    /// calls this -- extracted verbatim from the former
+    /// `on_load_older_requested` closure's `PANEL.with` body.
+    pub(crate) fn dispatch_load_older_requested(&self) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.displayed_thread.get() else {
+            return;
+        };
+        let before_len = bridge.transcript(real_idx).len();
+        if bridge.load_older_page(real_idx) {
+            let after_len = bridge.transcript(real_idx).len();
+            // The new rows were prepended at the *front* -- grow
+            // `expanded` from the front too, so every pre-existing
+            // collapse-state entry stays attached to the same logical
+            // message it described before this reload, not silently
+            // shifted onto whatever now occupies its old index.
+            let grown_by = after_len.saturating_sub(before_len);
+            if grown_by > 0 {
+                let mut expanded = self.expanded.borrow_mut();
+                let mut prefixed = vec![false; grown_by];
+                prefixed.append(&mut expanded);
+                *expanded = prefixed;
+            }
+            self.render_messages(real_idx);
+        }
+    }
+
+    // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
+    // call this directly.
+    pub(crate) fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
         let Some(bridge) = &self.bridge else { return };
         let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
             return;
@@ -1287,7 +1316,9 @@ impl PanelSingleton {
     /// Keyboard convenience: approve/reject maps to the first allow_* /
     /// reject_* option on the live request (same fallback as
     /// [`permission::build_response`]).
-    fn answer_pending_request(&self, component: &ChatPanel, approved: bool) {
+    // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
+    // call this directly.
+    pub(crate) fn answer_pending_request(&self, component: &ChatPanel, approved: bool) {
         let Some(bridge) = &self.bridge else { return };
         let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
             return;
@@ -2713,6 +2744,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // `raw_request` needed to build a native `session/request_
         // permission` reply -- the Slint struct only carries a
         // human-readable summary, not the full JSON.
+        // tea-slint-model Phase 4 (Request domain): routed through
+        // Msg::Ui(UiMsg::Request(..)) -> update() -> dispatch's bridge
+        // into answer_pending_request/answer_pending_request_option/
+        // dispatch_load_older_requested (unchanged, now pub(crate)) --
+        // see dispatch.rs's doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_approve_request(move || {
             let Some(component) = component_weak.upgrade() else {
@@ -2720,7 +2756,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    panel.answer_pending_request(&component, true);
+                    dispatch::dispatch_request_approve(panel, &component);
                 }
             });
         });
@@ -2732,7 +2768,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    panel.answer_pending_request(&component, false);
+                    dispatch::dispatch_request_reject(panel, &component);
                 }
             });
         });
@@ -2748,7 +2784,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 PANEL.with(|cell| {
                     if let Some(panel) = cell.borrow().as_ref() {
-                        panel.answer_pending_request_option(&component, option_id.as_str());
+                        dispatch::dispatch_request_permission_option(
+                            panel,
+                            &component,
+                            option_id.to_string(),
+                        );
                     }
                 });
             });
@@ -3047,29 +3087,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.displayed_thread.get() else {
-                        return;
-                    };
-                    let before_len = bridge.transcript(real_idx).len();
-                    if bridge.load_older_page(real_idx) {
-                        let after_len = bridge.transcript(real_idx).len();
-                        // The new rows were prepended at the *front* --
-                        // grow `expanded` from the front too, so every
-                        // pre-existing collapse-state entry stays
-                        // attached to the same logical message it
-                        // described before this reload, not silently
-                        // shifted onto whatever now occupies its old
-                        // index.
-                        let grown_by = after_len.saturating_sub(before_len);
-                        if grown_by > 0 {
-                            let mut expanded = panel.expanded.borrow_mut();
-                            let mut prefixed = vec![false; grown_by];
-                            prefixed.append(&mut expanded);
-                            *expanded = prefixed;
-                        }
-                        panel.render_messages(real_idx);
-                    }
+                    dispatch::dispatch_request_load_older(panel);
                 }
             });
             component.set_loading_older_messages(false);

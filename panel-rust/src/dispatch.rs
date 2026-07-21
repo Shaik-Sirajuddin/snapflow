@@ -26,8 +26,9 @@
 
 use crate::dirty::{Dirty, ScalarField};
 use crate::model::{Model, ThreadModel};
-use crate::msg::{ComposeMsg, Msg, ThreadMsg, UiMsg};
+use crate::msg::{ComposeMsg, Msg, RequestMsg, ThreadMsg, UiMsg};
 use crate::update::update;
+use crate::ChatPanel;
 use crate::PanelSingleton;
 
 /// Builds the transient stand-in `Model` `update()` needs for a
@@ -137,6 +138,86 @@ pub(crate) fn dispatch_compose_stop(panel: &PanelSingleton) {
         "Compose::StopRequested must produce zero (no selected thread) or one CancelGeneration effect"
     );
     panel.dispatch_stop_requested();
+}
+
+/// Wired from `component.on_approve_request` (tea-slint-model Phase 4,
+/// Request domain). The real request id isn't known until
+/// `answer_pending_request` looks up the live pending-request list
+/// itself (same as before this cutover) -- `update()` is still genuinely
+/// called with a decorative id to prove `Msg::Ui(Request(Approve))`
+/// routes and produces the expected `Effect::RespondAgentRequest`, then
+/// the actual answer is delegated to the existing, unchanged
+/// `answer_pending_request`.
+pub(crate) fn dispatch_request_approve(panel: &PanelSingleton, component: &ChatPanel) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(
+        &mut model,
+        Msg::Ui(UiMsg::Request(RequestMsg::Approve(String::new()))),
+    );
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::RespondAgentRequest { .. }]),
+        "Request::Approve must produce zero (no selected thread) or one RespondAgentRequest effect"
+    );
+    panel.answer_pending_request(component, true);
+}
+
+/// See `dispatch_request_approve`'s doc comment -- same bridge shape.
+pub(crate) fn dispatch_request_reject(panel: &PanelSingleton, component: &ChatPanel) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(
+        &mut model,
+        Msg::Ui(UiMsg::Request(RequestMsg::Reject(String::new()))),
+    );
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::RespondAgentRequest { .. }]),
+        "Request::Reject must produce zero (no selected thread) or one RespondAgentRequest effect"
+    );
+    panel.answer_pending_request(component, false);
+}
+
+/// Wired from `component.on_permission_option_selected` (tea-slint-model
+/// Phase 4, Request domain). See `dispatch_request_approve`'s doc
+/// comment -- same bridge shape, delegating to the existing
+/// `answer_pending_request_option`.
+pub(crate) fn dispatch_request_permission_option(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    option_id: String,
+) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(
+        &mut model,
+        Msg::Ui(UiMsg::Request(RequestMsg::PermissionOptionSelected(
+            String::new(),
+            option_id.clone(),
+        ))),
+    );
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::PermissionOptionSelected { .. }]),
+        "Request::PermissionOptionSelected must produce zero (no selected thread) or one PermissionOptionSelected effect"
+    );
+    panel.answer_pending_request_option(component, &option_id);
+}
+
+/// Wired from `component.on_load_older_requested` (tea-slint-model Phase
+/// 4, Request domain). See `dispatch_request_approve`'s doc comment --
+/// same bridge shape, delegating to the existing (moved, not rewritten)
+/// `dispatch_load_older_requested`.
+pub(crate) fn dispatch_request_load_older(panel: &PanelSingleton) {
+    let mut model = thread_selection_model(panel);
+    let (effects, _dirty) = update(
+        &mut model,
+        Msg::Ui(UiMsg::Request(RequestMsg::LoadOlderRequested(String::new()))),
+    );
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::LoadOlderMessages { .. }]),
+        "Request::LoadOlderRequested must produce zero (no selected thread) or one LoadOlderMessages effect"
+    );
+    panel.dispatch_load_older_requested();
 }
 
 #[cfg(test)]
