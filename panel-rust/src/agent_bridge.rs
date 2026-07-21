@@ -766,10 +766,28 @@ fn probe_acpx_gateway_once(port: u16, expected_agent: Option<&str>) -> bool {
         // so we can actually verify provider identity instead of treating
         // any "ready" gateway as reusable regardless of which provider was
         // requested.
+        //
+        // `defaultAgentId == "default"` (acpx-server's own compiled-in
+        // default, unless `ACPX_DEFAULT_AGENT_ID` overrides it -- see
+        // `acpx-server/src/config.rs`) means the gateway was never told
+        // it's provider-specific: this is exactly the shape of
+        // snapshotd's bundled gateway (`AcpxEnabled`, see
+        // `provision_gateway`'s doc comment), which fronts one real
+        // backend shared across every provider rather than one gateway
+        // per provider. Rejecting that as a mismatch just because its id
+        // says "default" instead of "codex"/"claude" was the actual bug:
+        // it silently fell through to auto-spawning a second, separate
+        // `acpx-server`, which then failed outright on any checkout that
+        // hasn't built its own local acpx binary (this worktree
+        // included) instead of just reusing the perfectly good shared
+        // gateway that was already answering.
         matches!(
             envelope.get("status").and_then(|s| s.as_str()),
             Some("ready") | Some("recovering")
-        ) && envelope.get("defaultAgentId").and_then(|id| id.as_str()) == Some(expected_agent)
+        ) && envelope
+            .get("defaultAgentId")
+            .and_then(|id| id.as_str())
+            .is_some_and(|id| id == expected_agent || id == "default")
     } else {
         envelope
             .get("result")
@@ -3754,6 +3772,28 @@ done
             .expect("parse port from base_url");
         assert!(probe_acpx_gateway_for_agent(port, Some("codex")));
         assert!(!probe_acpx_gateway_for_agent(port, Some("claude")));
+    }
+
+    /// Regression guard: a gateway whose `defaultAgentId` is still
+    /// `"default"` (acpx-server's own compiled-in default, unmodified --
+    /// exactly the shape of snapshotd's bundled gateway, which is shared
+    /// across every provider rather than spun up per-provider) must be
+    /// treated as reusable for *any* requested provider, not rejected as
+    /// an identity mismatch. Before this fix, `provision_gateway` would
+    /// silently ignore a perfectly good already-running shared gateway
+    /// and fall through to auto-spawning a second one, which then failed
+    /// outright wherever a local acpx binary hadn't been built.
+    #[test]
+    fn probe_acpx_gateway_treats_a_default_agent_id_as_matching_any_provider() {
+        let gateway = TestGateway::spawn_with_persona("default");
+        let port: u16 = gateway
+            .base_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("parse port from base_url");
+        assert!(probe_acpx_gateway_for_agent(port, Some("codex")));
+        assert!(probe_acpx_gateway_for_agent(port, Some("claude")));
     }
 
     /// End-to-end: a jsonl cache file seeded up front with a varied mix
