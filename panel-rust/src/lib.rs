@@ -2211,11 +2211,6 @@ pub extern "C" fn panel_rust_input_key(
         let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
         std::str::from_utf8(bytes).unwrap_or("")
     };
-    PANEL.with(|cell| {
-        if let Some(panel) = cell.borrow().as_ref() {
-            dispatch::dispatch_host_input_key(panel, text.to_owned(), modifiers as u32);
-        }
-    });
     // The host must not consume editor shortcuts unless an editable Slint
     // surface owns focus. Besides the composer, a local PTY terminal is a
     // genuine keyboard target and must receive printable keys, editing keys,

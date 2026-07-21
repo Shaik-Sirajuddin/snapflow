@@ -183,17 +183,12 @@ pub enum ChromeMsg {
     ErrorBannerDismissed,
 }
 
-/// Direct C++ -> Rust FFI entry points that are *not* Slint callbacks and
-/// today mutate `PanelSingleton`/state directly -- see 00-plan.md's "Msg
-/// source coverage" point 3 for why these must route through `dispatch()`
-/// too, not just the 47 `on_*` closures.
+/// Direct C++ -> Rust FFI entry points that mutate panel state and are *not*
+/// Slint callbacks -- see 00-plan.md's "Msg source coverage" point 3 for why
+/// these must route through `dispatch()` too, not just the `on_*` closures.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostMsg {
     InvokeCommand(String),
-    InputKey {
-        key: String,
-        modifiers: u32,
-    },
     AppearanceChanged(crate::appearance::AppearanceState),
     ThemeChanged(String),
     ProjectPathChanged(Option<String>),

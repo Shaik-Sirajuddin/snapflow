@@ -1102,11 +1102,6 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
     true
 }
 
-pub(crate) fn dispatch_host_input_key(panel: &PanelSingleton, key: String, modifiers: u32) {
-    let _ = panel;
-    let _ = (key, modifiers);
-}
-
 pub(crate) fn dispatch_frame_input(panel: &PanelSingleton, frame: crate::msg::FrameInput) -> bool {
     let (effects, dirty) = update_persistent(panel, Msg::Frame(frame));
     execute_effects(panel, effects);

@@ -708,7 +708,6 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
             // the generated Slint function after this reducer pass.
             _ => (vec![], vec![]),
         },
-        HostMsg::InputKey { .. } => (vec![], vec![]),
         HostMsg::AppearanceChanged(state) => {
             let theme_variant = state
                 .current()
