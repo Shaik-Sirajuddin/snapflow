@@ -293,6 +293,11 @@ def open_second_thread(xdisplay, host_log):
     ]
     for x, y in candidates:
         if known_thread_indices(host_log) - baseline:
+            # New thread confirmed. Collapse the sidebar (it was expanded to
+            # reach "New thread") so the chat composer returns to its normal
+            # position for the caller's subsequent focus_compose/prompt.
+            dock_click(xdisplay, 12, 9)
+            time.sleep(0.3)
             return
         if time.monotonic() > deadline:
             break
@@ -302,6 +307,11 @@ def open_second_thread(xdisplay, host_log):
     settle_deadline = time.monotonic() + max(0.0, deadline - time.monotonic()) + 2
     while time.monotonic() < settle_deadline:
         if known_thread_indices(host_log) - baseline:
+            # New thread confirmed. Collapse the sidebar (it was expanded to
+            # reach "New thread") so the chat composer returns to its normal
+            # position for the caller's subsequent focus_compose/prompt.
+            dock_click(xdisplay, 12, 9)
+            time.sleep(0.3)
             return
         time.sleep(0.1)
     raise RuntimeError(
