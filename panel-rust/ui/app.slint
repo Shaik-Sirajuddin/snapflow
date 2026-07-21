@@ -34,6 +34,22 @@ export component ChatPanel inherits Window {
     // shortcuts work even when no TextInput currently owns focus.
     forward-focus: panel-keys;
     out property <bool> compose-has-focus: chat-area.compose-has-focus;
+    // Aggregates every editable Slint surface's own focus state besides
+    // compose/local-terminal (thread search, skill search -- both share
+    // Sidebar's one thread-search FilterSearchBar instance) -- see
+    // FilterSearchBar.input-has-focus's doc comment for why this chain
+    // exists: the host's panel_rust_input_key only forwards real
+    // keystrokes into Slint when *something* in this OR-chain reads true,
+    // so a field left out of it silently receives clicks but no typed
+    // text at all.
+    // settings-page-instance only exists while settings-open is true
+    // (conditional element); referencing its property outside that scope
+    // still resolves to false when absent, same as the other conditional
+    // refs in this OR-chain.
+    out property <bool> secondary-text-input-has-focus:
+        sidebar.search-has-focus
+        || chat-area.secondary-text-input-has-focus
+        || settings-page-instance.search-has-focus;
     out property <bool> local-terminal-has-focus:
         chat-area.local-terminal-has-focus
         || (local-terminal-overlay-open && local-terminal-overlay.has-focus);
@@ -524,48 +540,59 @@ export component ChatPanel inherits Window {
             background: #00000088;
             // Click-through guard on the dimmer (close is via X / Escape).
             TouchArea { }
+        }
 
-            SettingsPage {
-                x: 8px;
-                y: 8px;
-                width: parent.width - 16px;
-                height: parent.height - 16px;
-                active-section <=> root.settings-active-section;
-                scope <=> root.settings-scope;
-                sections-expanded <=> root.settings-sections-expanded;
-                default-profile <=> default-profile;
-                permission-profile <=> permission-profile;
-                background-default <=> background-default;
-                default-agent-id <=> root.default-agent-id;
-                background-override-set <=> background-override-set;
-                background-override <=> background-override;
-                available-profiles: available-profiles;
-                available-mcp-servers: available-mcp-servers;
-                agent-catalog: agent-catalog;
-                recoverable-sessions: recoverable-sessions;
-                available-skills: available-skills;
-                dev-mode: dev-mode;
-                save => { settings-save(); }
-                scope-changed(scope) => { root.settings-scope-changed(scope); }
-                close => {
-                    settings-open = false;
-                    settings-close();
-                    chat-area.restore-compose-focus();
-                }
-                mcp-server-create(name, command) => { mcp-server-create(name, command); }
-                mcp-server-delete(name) => { mcp-server-delete(name); }
-                mcp-server-enabled-changed(name, enabled) => {
-                    mcp-server-enabled-changed(name, enabled);
-                }
-                profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
-                    profile-create(name, agent-id, terminal-enabled, fs-enabled);
-                }
-                profile-delete(name) => { profile-delete(name); }
-                agent-install-requested(id) => { agent-install-requested(id); }
-                recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
-                skill-promote-to-global(path) => { skill-promote-to-global(path); }
-                dev-mode-toggled(enabled) => { dev-mode-toggled(enabled); }
+        // SettingsPage itself is a sibling of the dimmer above, not nested
+        // inside it: `secondary-text-input-has-focus` below needs to
+        // reference this element's id, which Slint doesn't allow for
+        // `if`-only elements ("Cannot access id"). Unconditionally mounted
+        // + `visible:` instead (Slint's `visible: false` also disables
+        // input handling, so this stays inert while settings is closed,
+        // same as the dimmer's own click-guard staying `if`-gated so it
+        // never blocks chat clicks when settings is closed). `parent` here
+        // is the same `width: root.width; height: root.height` Rectangle
+        // the dimmer above uses, so the x/y/width math is unchanged.
+        settings-page-instance := SettingsPage {
+            visible: root.settings-open;
+            x: 8px;
+            y: 8px;
+            width: parent.width - 16px;
+            height: parent.height - 16px;
+            active-section <=> root.settings-active-section;
+            scope <=> root.settings-scope;
+            sections-expanded <=> root.settings-sections-expanded;
+            default-profile <=> default-profile;
+            permission-profile <=> permission-profile;
+            background-default <=> background-default;
+            default-agent-id <=> root.default-agent-id;
+            background-override-set <=> background-override-set;
+            background-override <=> background-override;
+            available-profiles: available-profiles;
+            available-mcp-servers: available-mcp-servers;
+            agent-catalog: agent-catalog;
+            recoverable-sessions: recoverable-sessions;
+            available-skills: available-skills;
+            dev-mode: dev-mode;
+            save => { settings-save(); }
+            scope-changed(scope) => { root.settings-scope-changed(scope); }
+            close => {
+                settings-open = false;
+                settings-close();
+                chat-area.restore-compose-focus();
             }
+            mcp-server-create(name, command) => { mcp-server-create(name, command); }
+            mcp-server-delete(name) => { mcp-server-delete(name); }
+            mcp-server-enabled-changed(name, enabled) => {
+                mcp-server-enabled-changed(name, enabled);
+            }
+            profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
+                profile-create(name, agent-id, terminal-enabled, fs-enabled);
+            }
+            profile-delete(name) => { profile-delete(name); }
+            agent-install-requested(id) => { agent-install-requested(id); }
+            recover-session-attach(session-id, provider, title) => { recover-session-attach(session-id, provider, title); }
+            skill-promote-to-global(path) => { skill-promote-to-global(path); }
+            dev-mode-toggled(enabled) => { dev-mode-toggled(enabled); }
         }
     }
 }

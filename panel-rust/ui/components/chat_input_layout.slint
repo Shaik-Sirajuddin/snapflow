@@ -43,6 +43,15 @@ export component ChatInputLayout inherits Rectangle {
     callback panel-shortcut(KeyEvent) -> EventResult;
 
     out property <bool> compose-has-focus: compose.has-focus;
+    // Mode/model dropdown search fields and the /@# mention popup's own
+    // filter field -- see FilterSearchBar.input-has-focus's doc comment.
+    // mode-dropdown/config-dropdown only exist while their entry lists are
+    // non-empty (conditional elements); referencing their property outside
+    // that scope still resolves to false when absent.
+    out property <bool> secondary-text-input-has-focus:
+        mode-dropdown.search-has-focus
+        || config-dropdown.search-has-focus
+        || mention-search-bar.input-has-focus;
     callback focus-compose();
 
     // Local selection mirrors so dropdowns reflect the chosen option
@@ -488,7 +497,12 @@ export component ChatInputLayout inherits Rectangle {
             // Default vertical behavior for selects + ring.
             cross-axis-alignment: center;
 
-            if root.mode-dropdown-entries.length > 0 : SearchableDropdown {
+            // Unconditionally mounted (visible:, not if:) -- see
+            // FilterSearchBar.input-has-focus's doc comment: this
+            // component's own id needs to stay referenceable from
+            // secondary-text-input-has-focus below.
+            mode-dropdown := SearchableDropdown {
+                visible: root.mode-dropdown-entries.length > 0;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
                 height: root.row2-h;
@@ -504,7 +518,8 @@ export component ChatInputLayout inherits Rectangle {
                     root.mode-selected(id);
                 }
             }
-            if root.config-dropdown-entries.length > 0 : SearchableDropdown {
+            config-dropdown := SearchableDropdown {
+                visible: root.config-dropdown-entries.length > 0;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
                 height: root.row2-h;
@@ -538,7 +553,12 @@ export component ChatInputLayout inherits Rectangle {
 
     // / @ # suggestion popup — sibling of the main VerticalLayout so it
     // is not clipped by layout packing. Anchored just above this bar.
-    if root.mention-open : Rectangle {
+    // Unconditionally mounted (visible:, not if:) -- mention-search-bar's
+    // id needs to stay referenceable from secondary-text-input-has-focus
+    // above; positioned via explicit x/y (not in a layout flow), so
+    // staying mounted-but-hidden doesn't disturb sibling layout.
+    Rectangle {
+        visible: root.mention-open;
         x: Metrics.pad-2xl;
         y: -root.mention-popup-h - 6px;
         width: parent.width - 2 * Metrics.pad-2xl;

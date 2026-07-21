@@ -100,6 +100,10 @@ export component ChatArea inherits Rectangle {
     out property <bool> compose-has-focus: chat-input.compose-has-focus;
     out property <bool> local-terminal-has-focus:
         local-terminal.open && local-terminal-card.has-focus;
+    // Mode/model dropdown search + mention popup filter -- see
+    // FilterSearchBar.input-has-focus's doc comment.
+    out property <bool> secondary-text-input-has-focus:
+        chat-input.secondary-text-input-has-focus;
 
     // --- Demo approval (local one-of card, no ACP round-trip) ------------
     // Type one of these in the compose box and press Send / Enter:
@@ -494,6 +498,19 @@ export component ChatArea inherits Rectangle {
             message-scroll := Flickable {
                 width: 100%;
                 height: 100%;
+                // Was relying on Flickable's own auto-inference of
+                // viewport-height from its child, which -- per base/
+                // expandable_panel.slint's own documented fix for the
+                // identical symptom -- "doesn't reliably report its own
+                // preferred-height from arbitrary child content (it's a
+                // scroll viewport, not a layout)". Binding this explicitly
+                // is purely additive (computes the same value auto-
+                // inference should already produce when it works) and
+                // matches every other Flickable in this codebase, all of
+                // which already bind viewport-height/-width explicitly
+                // except this one and settings_page.slint's (fixed
+                // alongside this for the same reported "scroll issues").
+                viewport-height: message-col.preferred-height;
                 // Live updates grow `viewport-height`; snap back to the bottom
                 // only while the user is following the latest message, so a
                 // read-back-in-history scroll position is never stolen.
@@ -514,7 +531,7 @@ export component ChatArea inherits Rectangle {
                         load-older-requested();
                     }
                 }
-                VerticalLayout {
+                message-col := VerticalLayout {
                 // Match ChatInputLayout shell (pad-2xl H / pad-xl V) so the
                 // message column lines up with the compose bar.
                 padding-left: Metrics.pad-2xl;

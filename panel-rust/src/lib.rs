@@ -172,6 +172,30 @@ fn map_qt_key(qt_key: c_int, text: &str, shift: bool) -> Option<SharedString> {
     if let Some(k) = special {
         return Some(k.into());
     }
+    // Ctrl+<letter> delivers `QKeyEvent::text()` as the classic ASCII
+    // control character (Ctrl+A=0x01 .. Ctrl+Z=0x1A), not the letter
+    // itself -- confirmed live: a real Ctrl+B combo arrives with
+    // text="\u{2}". Every Ctrl+<letter> shortcut check in this UI
+    // (`handle-panel-shortcut`'s Ctrl+B/N/, branches, TextInput's own
+    // built-in Ctrl+A select-all) compares against the literal letter
+    // with `event.modifiers.control` already true (real modifier
+    // tracking -- see the bare-modifier-press mapping above), so those
+    // checks silently never matched through the real host bridge. Recover
+    // the letter here once, centrally, instead of needing every call site
+    // to know about raw control-character text. Case is unrecoverable
+    // from the control byte alone (Ctrl+B and Ctrl+Shift+B produce the
+    // same 0x02) -- lowercase is fine since every affected call site
+    // already checks both cases. Only single-char control-range text is
+    // affected; the qt_key codes already handled above (Escape/Tab/
+    // Backspace/Return/Delete/Home/End/arrows/bare modifiers) never reach
+    // this point, so a genuine Tab/Return press can't be misread as
+    // Ctrl+I/Ctrl+M here.
+    if let Some(ch) = text.chars().next() {
+        if text.chars().count() == 1 && ('\u{1}'..='\u{1a}').contains(&ch) {
+            let letter = (b'a' + (ch as u8 - 1)) as char;
+            return Some(letter.into());
+        }
+    }
     if text.is_empty() {
         // QQuickItem receives an empty `QKeyEvent::text()` for some printable
         // keys when the host also owns a shortcut for that key. Qt still
@@ -202,6 +226,63 @@ fn map_qt_key(qt_key: c_int, text: &str, shift: bool) -> Option<SharedString> {
         }
     } else {
         Some(SharedString::from(text))
+    }
+}
+
+#[cfg(test)]
+mod map_qt_key_tests {
+    use super::map_qt_key;
+    use slint::platform::Key;
+    use slint::SharedString;
+    use std::os::raw::c_int;
+
+    const QT_KEY_A: c_int = 0x41;
+    const QT_KEY_B: c_int = 0x42;
+    const QT_KEY_Z: c_int = 0x5a;
+    const QT_KEY_TAB: c_int = 0x0100_0001;
+    const QT_KEY_RETURN: c_int = 0x0100_0004;
+
+    #[test]
+    fn ctrl_letter_control_characters_recover_the_plain_letter() {
+        // Real Ctrl+A/B/Z combos deliver the classic ASCII control byte as
+        // QKeyEvent::text(), not the letter -- confirmed live.
+        assert_eq!(map_qt_key(QT_KEY_A, "\u{1}", false).unwrap(), "a");
+        assert_eq!(map_qt_key(QT_KEY_B, "\u{2}", false).unwrap(), "b");
+        assert_eq!(map_qt_key(QT_KEY_Z, "\u{1a}", false).unwrap(), "z");
+    }
+
+    #[test]
+    fn ctrl_shift_letter_still_recovers_the_letter_despite_lost_case() {
+        // Ctrl+B and Ctrl+Shift+B both produce the same 0x02 byte -- case
+        // is genuinely unrecoverable from the control character alone.
+        assert_eq!(map_qt_key(QT_KEY_B, "\u{2}", true).unwrap(), "b");
+    }
+
+    #[test]
+    fn plain_tab_and_return_are_unaffected() {
+        // Tab (0x09) and Return (0x0d) fall in the same 0x01..=0x1a
+        // control-character range as Ctrl+I/Ctrl+M, but a real Tab/Return
+        // press arrives via their own dedicated qt_key special case
+        // (checked first), never reaching the Ctrl+<letter> recovery path.
+        assert_eq!(
+            map_qt_key(QT_KEY_TAB, "\t", false).unwrap(),
+            SharedString::from(Key::Tab)
+        );
+        assert_eq!(
+            map_qt_key(QT_KEY_RETURN, "\r", false).unwrap(),
+            SharedString::from(Key::Return)
+        );
+    }
+
+    #[test]
+    fn regular_printable_text_passes_through_unchanged() {
+        assert_eq!(map_qt_key(QT_KEY_A, "a", false).unwrap(), "a");
+        assert_eq!(map_qt_key(QT_KEY_B, "B", false).unwrap(), "B");
+    }
+
+    #[test]
+    fn multi_char_text_is_not_treated_as_a_control_character() {
+        assert_eq!(map_qt_key(QT_KEY_A, "ab", false).unwrap(), "ab");
     }
 }
 
@@ -2984,6 +3065,32 @@ pub extern "C" fn panel_rust_destroy(_handle: *mut PanelHandle) {
     });
 }
 
+/// Whether *any* editable Slint surface currently owns focus -- the
+/// composer, a local PTY terminal, or a secondary text input (thread
+/// search, skill search, settings search, dropdown filters, the mention
+/// popup -- see `secondary_text_input_has_focus`'s doc comment above for
+/// the full OR-chain). Queryable independent of an actual key event, so
+/// the host can decide *before* Qt's shortcut dispatch runs (a
+/// `QEvent::ShortcutOverride` handler, see `RustPanelItem::event` in
+/// rustpanelitem.cpp) whether a single-key host shortcut (e.g. Shotcut's
+/// bare "A" for Append, "/" for its own binding) should be allowed to
+/// fire, or must be suppressed so the key reaches the focused Slint
+/// surface as ordinary typed text instead. Without this, a real, reported
+/// bug: typing "a" or "/" into the chat box (or, by the same mechanism,
+/// into thread search) instead triggered Shotcut's own action (observed
+/// live: bare "/" opened Shotcut's own Keyboard Shortcuts editor) and
+/// never reached the focused Slint TextInput at all.
+#[no_mangle]
+pub extern "C" fn panel_rust_has_text_focus(_handle: *mut PanelHandle) -> bool {
+    PANEL.with(|cell| {
+        cell.borrow().as_ref().is_some_and(|panel| {
+            panel.component.get_compose_has_focus()
+                || panel.component.get_local_terminal_has_focus()
+                || panel.component.get_secondary_text_input_has_focus()
+        })
+    })
+}
+
 /// Forward a click at physical pixel coordinates, as a press+release pair.
 #[no_mangle]
 pub extern "C" fn panel_rust_input_click(_handle: *mut PanelHandle, x: c_uint, y: c_uint) -> bool {
@@ -3086,18 +3193,30 @@ pub extern "C" fn panel_rust_input_key(
     // surface owns focus. Besides the composer, a local PTY terminal is a
     // genuine keyboard target and must receive printable keys, editing keys,
     // and arrows without Shotcut handling them as global shortcuts.
-    let (compose_has_focus, local_terminal_has_focus) = PANEL.with(|cell| {
-        cell.borrow().as_ref().map_or((false, false), |panel| {
-            (
-                panel.component.get_compose_has_focus(),
-                panel.component.get_local_terminal_has_focus(),
-            )
-        })
-    });
-    if !compose_has_focus && !local_terminal_has_focus {
+    let (compose_has_focus, local_terminal_has_focus, secondary_text_input_has_focus) =
+        PANEL.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map_or((false, false, false), |panel| {
+                    (
+                        panel.component.get_compose_has_focus(),
+                        panel.component.get_local_terminal_has_focus(),
+                        panel.component.get_secondary_text_input_has_focus(),
+                    )
+                })
+        });
+    // `secondary_text_input_has_focus` covers every editable Slint surface
+    // besides the composer/terminal (thread search, skill search -- see
+    // app.slint's own doc comment on that property for the full list and
+    // why a field left out of its OR-chain silently drops all keystrokes
+    // here). Without it, clicking into e.g. thread search focuses it fine
+    // (a real click) but every subsequent keystroke was dropped right here
+    // before ever reaching Slint -- the search box "didn't take input at
+    // all" despite compiling and rendering correctly.
+    if !compose_has_focus && !local_terminal_has_focus && !secondary_text_input_has_focus {
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed={pressed} text={text:?} \
-             compose_focus=false local_terminal_focus=false"
+             compose_focus=false local_terminal_focus=false secondary_focus=false"
         ));
         return false;
     }
@@ -3114,7 +3233,7 @@ pub extern "C" fn panel_rust_input_key(
         if let Some(key) = modifier_key_for_qt_key(qt_key) {
             trace_host_input(format_args!(
                 "key qt_key={qt_key:#x} pressed=false text={text:?} \
-                 compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+                 compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus} \
                  modifier_release={key:?}"
             ));
             window.window().dispatch_event(WindowEvent::KeyReleased {
@@ -3124,7 +3243,7 @@ pub extern "C" fn panel_rust_input_key(
         }
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed=false text={text:?} \
-             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus}"
+             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus}"
         ));
         return true;
     }
@@ -3133,14 +3252,14 @@ pub extern "C" fn panel_rust_input_key(
     let Some(key_text) = map_qt_key(qt_key, text, shift) else {
         trace_host_input(format_args!(
             "key qt_key={qt_key:#x} pressed=true text={text:?} \
-             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+             compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus} \
              mapped=false"
         ));
         return false;
     };
     trace_host_input(format_args!(
         "key qt_key={qt_key:#x} pressed=true text={text:?} \
-         compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} \
+         compose_focus={compose_has_focus} local_terminal_focus={local_terminal_has_focus} secondary_focus={secondary_text_input_has_focus} \
          mapped={key_text:?}"
     ));
     window
@@ -3921,5 +4040,86 @@ mod keyboard_shortcut_tests {
             PANEL_COMMAND_OPEN_THREAD_SEARCH
         ));
         assert!(component.get_sidebar_expanded());
+    }
+
+    /// `panel_rust_has_text_focus`'s OR-chain (compose / local terminal /
+    /// secondary text input) via the real click-focus path, not a direct
+    /// property poke -- covers the compose-box arm live and the other two
+    /// arms by construction (same `||` expression, already covered
+    /// individually by `secondary_text_input_has_focus`'s own OR-chain in
+    /// app.slint) plus the no-focus-at-all false case.
+    #[test]
+    fn has_text_focus_reflects_real_compose_focus_state() {
+        let panel = TestPanel::new();
+        let component = panel.component();
+
+        assert!(
+            !panel_rust_has_text_focus(panel.handle),
+            "no editable surface has been focused yet"
+        );
+
+        let compose = ElementHandle::find_by_accessible_label(&component, "Compose message")
+            .next()
+            .expect("compose input must be accessible");
+        let position = compose.absolute_position();
+        let size = compose.size();
+        assert!(panel_rust_input_click(
+            panel.handle,
+            (position.x + size.width / 2.0) as c_uint,
+            (position.y + size.height / 2.0) as c_uint,
+        ));
+        assert!(component.get_compose_has_focus());
+        assert!(
+            panel_rust_has_text_focus(panel.handle),
+            "compose focus must be reflected through the has-text-focus FFI"
+        );
+    }
+
+    /// Regression test for the confirmed bug where real Ctrl+<letter>
+    /// combos deliver `QKeyEvent::text()` as an ASCII control character
+    /// (e.g. Ctrl+B -> "\u{2}"), which `map_qt_key` must normalize back to
+    /// the plain letter -- otherwise `handle-panel-shortcut`'s `event.text
+    /// == "b"`-style checks (and TextInput's own built-in Ctrl+A
+    /// select-all) never match through the real host bridge. Drives the
+    /// actual control-character bytes through `panel_rust_input_key`, the
+    /// same call `RustPanelItem::keyPressEvent` makes, rather than passing
+    /// the already-normalized letter directly.
+    #[test]
+    fn ctrl_b_through_the_real_input_key_bridge_toggles_the_sidebar() {
+        const QT_KEY_B: c_int = 0x42;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        panel.set_threads(vec![thread_item("Fix timeline crash")]);
+        component.set_selected_thread(0);
+        component.set_sidebar_expanded(false);
+
+        // Unlike Ctrl+Alt+Up/Down and Ctrl+K, Ctrl+B/N/, aren't in C++'s
+        // `isThreadCommandChord` bypass list, so `panel_rust_input_key`'s
+        // own focus guard applies: an editable Slint surface must already
+        // own focus or the key never reaches Slint at all. Focus the
+        // composer first, exactly as the app's own click-to-focus path
+        // does, before sending the chord.
+        let compose = ElementHandle::find_by_accessible_label(&component, "Compose message")
+            .next()
+            .expect("compose input must be accessible");
+        let position = compose.absolute_position();
+        let size = compose.size();
+        assert!(panel_rust_input_click(
+            panel.handle,
+            (position.x + size.width / 2.0) as c_uint,
+            (position.y + size.height / 2.0) as c_uint,
+        ));
+        assert!(component.get_compose_has_focus());
+
+        panel.press_only(QT_KEY_CONTROL);
+        panel.press_and_release(QT_KEY_B, "\u{2}");
+        panel.release_only(QT_KEY_CONTROL);
+
+        assert!(
+            component.get_sidebar_expanded(),
+            "Ctrl+B's real control-character text (\\u{{2}}) must still toggle the sidebar \
+             once map_qt_key recovers the plain letter"
+        );
     }
 }
