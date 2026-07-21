@@ -1058,12 +1058,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     thread_id: thread.thread_id.clone(),
                 });
             }
-            crate::protocol_types::AgentEvent::TurnEnded(_) => {
+            crate::protocol_types::AgentEvent::TurnEnded(reason) => {
                 thread.state = ThreadState::Idle;
                 thread.error = None;
                 crate::trace_host_input(format_args!(
-                    "turn ended thread={} reason=frame",
-                    bridge_event.thread_index
+                    "turn ended thread={} reason={:?}",
+                    bridge_event.thread_index, reason
                 ));
                 if let Some(entry) = thread
                     .send_queue
@@ -1243,6 +1243,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             let terminals_changed = thread.terminals != snapshot.terminals
                 || thread.expanded_terminal != snapshot.expanded_terminal;
             let local_terminal_changed = thread.local_terminal != snapshot.local_terminal;
+            let local_terminal_output_changed =
+                thread.local_terminal.screen_text != snapshot.local_terminal.screen_text;
             let connection_changed = thread.connection_status != snapshot.connection_status;
             let capabilities_changed = thread.session_modes != snapshot.session_modes
                 || thread.config_options != snapshot.config_options;
@@ -1285,6 +1287,28 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             }
             if local_terminal_changed {
                 dirty.push(Dirty::LocalTerminal);
+            }
+            if local_terminal_output_changed {
+                // Coverage-matrix "client PTY" host scenario: a real shell's
+                // own screen buffer changing (not a UI flag flip) is the one
+                // observable signal a genuine PTY is running -- trace a tail
+                // preview so a host test can confirm it without a screenshot.
+                let screen_text = thread.local_terminal.screen_text.as_str();
+                if !screen_text.is_empty() {
+                    let tail: String = screen_text
+                        .chars()
+                        .rev()
+                        .take(80)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    let tail = tail.replace('\n', "\\n");
+                    crate::trace_host_input(format_args!(
+                        "local terminal output thread={} tail={:?}",
+                        snapshot.real_index, tail
+                    ));
+                }
             }
             if connection_changed {
                 dirty.push(Dirty::Connection {
