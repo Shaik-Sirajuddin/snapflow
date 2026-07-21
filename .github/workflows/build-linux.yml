@@ -31,6 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # yeslogic-fontconfig-sys (pulled in by slint's renderer chain) needs
+      # fontconfig's pkg-config file, which ubuntu-latest doesn't have by
+      # default.
+      - name: Install fontconfig dev headers
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
       # panel-rust's integration tests spawn a real acpx-server binary
       # (see agent_bridge.rs resolve_acpx_server_bin, defaults to
       # ../acpx/target/debug/acpx-server) -- build it first or the suite
@@ -117,6 +122,7 @@ jobs:
               # crate, see corrosion_import_crate) via Corrosion, which needs
               # a real Rust toolchain -- not present in this image by default.
               if [ ! -d /root/shotcut/src/sap-rust ]; then
+                mkdir -p /root/shotcut/src
                 cp -r /root/sap-rust-src /root/shotcut/src/sap-rust
               fi
               export PATH="/root/.cargo/bin:$PATH"
