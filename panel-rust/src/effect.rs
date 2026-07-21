@@ -88,7 +88,7 @@ pub enum Effect {
         bytes: Vec<u8>,
     },
     SaveSettings {
-        doc: String,
+        input: crate::msg::SettingsSaveInput,
     },
     SetConfigOption {
         real_index: usize,

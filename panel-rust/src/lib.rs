@@ -1082,27 +1082,24 @@ impl PanelSingleton {
         self.dispatch_frame_input(msg::FrameInput { settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(Some(scope))), ..msg::FrameInput::default() });
     }
 
-    pub(crate) fn dispatch_settings_save(&self, component: &ChatPanel) {
+    pub(crate) fn execute_settings_save(
+        &self,
+        input: msg::SettingsSaveInput,
+    ) -> Result<(), effect::EffectError> {
         let defaults = PanelDefaults {
-            profile_name: non_empty(component.get_default_profile().to_string()),
-            permission_profile: non_empty(component.get_permission_profile().to_string()),
-            background_session: component.get_background_default(),
-            selected_thread_id: self
-                .real_index(component.get_selected_thread() as usize)
-                .and_then(|idx| {
-                    self.bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_binding(idx))
-                        .map(|binding| binding.thread_id)
-                }),
+            profile_name: non_empty(input.default_profile),
+            permission_profile: non_empty(input.permission_profile),
+            background_session: input.background_default,
+            selected_thread_id: input.selected_thread_id.clone(),
         };
         if let Err(error) = save_panel_prefs_to_json(
-            component.get_settings_scope().as_str(),
+            input.scope.as_str(),
             &defaults,
-            non_empty(component.get_default_agent_id().to_string()),
+            non_empty(input.default_agent_id),
         ) {
-            eprintln!("panel-rust: failed to save panel settings JSON: {error}");
-            return;
+            return Err(effect::EffectError::new(format!(
+                "failed to save panel settings JSON: {error}"
+            )));
         }
         self.sync_runtime_defaults(&load_panel_prefs(None));
         self.settings_ignore_watch_until.set(Some(
@@ -1111,21 +1108,25 @@ impl PanelSingleton {
         if let Some(store) = self.panel_state.as_ref() {
             if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
                 if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
-                    eprintln!("panel-rust: failed to persist selected chat thread: {error}");
+                    return Err(effect::EffectError::new(format!(
+                        "failed to persist selected chat thread: {error}"
+                    )));
                 }
             }
             if let Some(thread_id) = defaults.selected_thread_id.as_deref() {
-                let override_value = component
-                    .get_background_override_set()
-                    .then_some(component.get_background_override());
+                let override_value = input
+                    .background_override_set
+                    .then_some(input.background_override);
                 if let Err(error) = store.set_background_override(thread_id, override_value) {
-                    eprintln!("panel-rust: failed to save background-session override: {error}");
+                    return Err(effect::EffectError::new(format!(
+                        "failed to save background-session override: {error}"
+                    )));
                 }
             }
         }
         self.dispatch_frame_input(msg::FrameInput { settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(None)), ..msg::FrameInput::default() });
-        crate::dispatch::dispatch_settings_close(self, component);
         self.dispatch_frame_input(msg::FrameInput { thread_list_snapshot: Some(self.collect_thread_list_snapshot()), ..msg::FrameInput::default() });
+        Ok(())
     }
 
     pub(crate) fn dispatch_mcp_server_create(

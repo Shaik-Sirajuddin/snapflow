@@ -98,7 +98,7 @@ pub enum TerminalMsg {
 pub enum SettingsMsg {
     Open,
     Close,
-    Save(String),
+    Save(SettingsSaveInput),
     ScopeChanged(String),
     ConfigOptionSelected {
         key: String,
@@ -129,6 +129,18 @@ pub enum SettingsMsg {
     AgentInstallRequested {
         agent_id: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsSaveInput {
+    pub scope: String,
+    pub default_profile: String,
+    pub permission_profile: String,
+    pub background_default: bool,
+    pub default_agent_id: String,
+    pub selected_thread_id: Option<String>,
+    pub background_override_set: bool,
+    pub background_override: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

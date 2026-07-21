@@ -486,7 +486,22 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.settings_open = false;
             (vec![], vec![Dirty::Scalar(ScalarField::SettingsOpen)])
         }
-        SettingsMsg::Save(doc) => (vec![Effect::SaveSettings { doc }], vec![Dirty::Settings]),
+        SettingsMsg::Save(input) => {
+            model.default_profile = input.default_profile.clone();
+            model.permission_profile = input.permission_profile.clone();
+            model.background_default = input.background_default;
+            model.default_agent_id = input.default_agent_id.clone();
+            model.background_override_set = input.background_override_set;
+            model.background_override = input.background_override;
+            model.settings_open = false;
+            (
+                vec![Effect::SaveSettings { input }],
+                vec![
+                    Dirty::Settings,
+                    Dirty::Scalar(ScalarField::SettingsOpen),
+                ],
+            )
+        }
         SettingsMsg::ScopeChanged(scope) => {
             model.settings_scope = scope;
             (
@@ -1602,6 +1617,7 @@ mod tests {
                 thread_record_snapshots: Vec::new(),
                 settings_reload_pending: true,
                 local_terminal_snapshot: Some("$ ".to_owned()),
+                prepend_expanded_rows: 0,
                 thread_list_snapshot: None,
                 selected_thread_snapshot: None,
                 clear_selected_thread: false,

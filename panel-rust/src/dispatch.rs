@@ -141,11 +141,20 @@ fn execute_effects(panel: &PanelSingleton, effects: Vec<crate::effect::Effect>) 
                 let text = String::from_utf8_lossy(&bytes);
                 panel.dispatch_local_terminal_key_input(&component, &text);
             }
-            crate::effect::Effect::SaveSettings { .. } => {
-                let Some(component) = panel.component.as_weak().upgrade() else {
-                    continue;
-                };
-                panel.dispatch_settings_save(&component);
+            crate::effect::Effect::SaveSettings { input } => {
+                let result = panel.execute_settings_save(input);
+                let _ = slint::invoke_from_event_loop(move || {
+                    crate::PANEL.with(|cell| {
+                        let slot = cell.borrow();
+                        let Some(panel) = slot.as_ref() else {
+                            return;
+                        };
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(crate::effect::EffectResultMsg::SettingsSaved(result)),
+                        );
+                    });
+                });
             }
             crate::effect::Effect::SetConfigOption { key, value, .. } => {
                 let Some(component) = panel.component.as_weak().upgrade() else {
@@ -933,11 +942,29 @@ pub(crate) fn dispatch_settings_scope_changed(
 }
 
 pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, component: &ChatPanel) {
+    let selected_thread_id = panel
+        .real_index(component.get_selected_thread().max(0) as usize)
+        .and_then(|idx| {
+            panel
+                .bridge
+                .as_ref()
+                .and_then(|bridge| bridge.thread_binding(idx))
+                .map(|binding| binding.thread_id)
+        });
+    let input = crate::msg::SettingsSaveInput {
+        scope: component.get_settings_scope().to_string(),
+        default_profile: component.get_default_profile().to_string(),
+        permission_profile: component.get_permission_profile().to_string(),
+        background_default: component.get_background_default(),
+        default_agent_id: component.get_default_agent_id().to_string(),
+        selected_thread_id,
+        background_override_set: component.get_background_override_set(),
+        background_override: component.get_background_override(),
+    };
     let (effects, _) = update_persistent(
         panel,
-        Msg::Ui(UiMsg::Settings(SettingsMsg::Save(String::new()))),
+        Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))),
     );
-    let _ = component;
     execute_effects(panel, effects);
 }
 
