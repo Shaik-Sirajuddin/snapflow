@@ -784,7 +784,22 @@ fn probe_http_endpoint(addr: &str, path: &str) -> bool {
 /// go through real acpx" symptom observed live. Now gated behind an
 /// explicit `RUI_USE_DEV_MOCK_AGENT=1` opt-in so the file's mere existence
 /// is never sufficient by itself.
+///
+/// `RUI_TEST_MODE=1` is the single source of truth gating this entire
+/// function: neither `RUI_ACP_AGENT_CMD` nor `RUI_USE_DEV_MOCK_AGENT` has
+/// any effect without it, even if set. Found live: an ordinary interactive
+/// dev launch (a person running `./snapflow` directly, not a test harness)
+/// has no reason to ever route a real chat session to a mock/overridden
+/// backend, and a leaked/inherited env var from an unrelated shell or CI
+/// context was enough to silently do exactly that with no error, no log,
+/// and no way to tell short of reading source -- the same class of bug as
+/// the dev_mock_agent-existence issue above, just one layer up. Automated
+/// tests and explicit local mock-agent workflows must set `RUI_TEST_MODE=1`
+/// themselves; a plain dev/production launch must never need to.
 fn resolve_backend_agent_command() -> Option<String> {
+    if std::env::var("RUI_TEST_MODE").as_deref() != Ok("1") {
+        return None;
+    }
     if let Ok(cmd) = std::env::var("RUI_ACP_AGENT_CMD") {
         return Some(cmd);
     }
@@ -3143,15 +3158,46 @@ mod tests {
         // convention for exactly this reason (see module doc references
         // elsewhere in this file to real-process serialization).
         let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
+        let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
         unsafe {
             std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
+            std::env::set_var("RUI_TEST_MODE", "1");
         }
         let resolved = resolve_backend_agent_command();
         match prior {
             Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
             None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
         }
+        match prior_test_mode {
+            Some(value) => unsafe { std::env::set_var("RUI_TEST_MODE", value) },
+            None => unsafe { std::env::remove_var("RUI_TEST_MODE") },
+        }
         assert_eq!(resolved.as_deref(), Some("/some/real/agent --flag"));
+    }
+
+    /// `RUI_TEST_MODE` is the sole gate for the whole function -- an
+    /// explicit `RUI_ACP_AGENT_CMD` override must be inert without it, so a
+    /// leaked/inherited env var from an unrelated shell or CI context can
+    /// never silently redirect a real interactive launch's chat sessions
+    /// to a mock or arbitrary command.
+    #[test]
+    fn resolve_backend_agent_command_ignores_override_without_test_mode() {
+        let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
+        let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
+        unsafe {
+            std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
+            std::env::remove_var("RUI_TEST_MODE");
+        }
+        let resolved = resolve_backend_agent_command();
+        match prior {
+            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
+            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
+        }
+        match prior_test_mode {
+            Some(value) => unsafe { std::env::set_var("RUI_TEST_MODE", value) },
+            None => unsafe { std::env::remove_var("RUI_TEST_MODE") },
+        }
+        assert_eq!(resolved, None);
     }
 
     /// The real bug found live this session: a debug build of
