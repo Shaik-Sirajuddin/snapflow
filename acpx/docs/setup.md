@@ -113,7 +113,7 @@ Only meaningful with `ACPX_DB_PATH` set -- see [`architecture.md`](./architectur
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ACPX_ACP_BRIDGE_ENABLED` | `0` | Mounts `/acp/rpc`, `/acp/ws`, `GET /acp/models` on the same HTTP/WS listener. Requires `ACPX_ACP_BRIDGE_CONFIG_FILE`. |
-| `ACPX_ACP_BRIDGE_CONFIG_FILE` | required when enabled | Path to the bridge's model list (below). |
+| `ACPX_ACP_BRIDGE_CONFIG_FILE` | required when enabled | Path to the bridge's config file (below) -- as of this file's `models`/`default_model` fields both becoming optional, this can now be `{}` (or omitted `models`/`default_model` entirely): the bridge's live model catalog is normally sourced from provisioned profiles (`ACPX_CONFIG_FILE`'s `profiles` array or a `profiles/create` call), not this file. |
 
 See "ACP compatibility bridge setup (OpenHands, Zed)" below for a full
 worked example.
@@ -172,7 +172,19 @@ of `acpx-server` directly. See [`architecture.md`](./architecture.md)'s
 sessions work; this section is the runnable version.
 
 1. **Bridge model config** (`acpx-bridge-config.json`) -- one entry per
-   selectable model, each naming a real registered/native `agent_id`:
+   selectable model. **This file is now optional content** -- both
+   `default_model` and `models` default to empty/unset. The normal shape
+   going forward is to leave `models` out entirely and instead
+   provision profiles (below), one per agent you want selectable; the
+   bridge probes each provisioned profile's `agent_id` and populates the
+   real model catalog live (`BridgeRuntime::refresh_models_with_config`,
+   `MODEL_REFRESH_COOLDOWN`-gated, `MODEL_PROBE_TIMEOUT`-bounded per
+   agent). A non-empty `models` array is still supported as an
+   operator-pinned override/fallback -- entries there are never pruned
+   by live discovery, and if `default_model` is left empty the bridge
+   falls back to the first live-discovered model
+   (`BridgeRuntime::effective_default_model`) rather than requiring one
+   to be named up front:
 
    ```json
    {
@@ -184,12 +196,44 @@ sessions work; this section is the runnable version.
    }
    ```
 
-2. **Start the shared daemon** with the bridge enabled:
+   Equivalently, with no static overrides at all -- everything comes
+   from provisioned profiles instead:
+
+   ```json
+   {}
+   ```
+
+   To provision the agents the bridge should probe, use the
+   `ACPX_CONFIG_FILE` provisioning file described above -- for example:
+
+   ```json
+   {
+     "providers": [{"name": "anthropic-default", "kind": "anthropic", "base_url": null}],
+     "profiles": [
+       {"name": "claude-acp", "agent_id": "claude-acp", "provider": "anthropic-default", "secret_env": "ANTHROPIC_API_KEY"}
+     ]
+   }
+   ```
+
+   Only *explicitly* provisioned profiles (this file, or a runtime
+   `profiles/create` call) seed the bridge's probe set --
+   `ensure_default_profiles_seeded`'s auto-filled, one-per-installed-CLI
+   profiles (what an unconfigured `_acpx.profile` resolves against) are
+   deliberately excluded, so installing a new agent binary on the host
+   never silently widens what a strict-ACP client can select without an
+   operator provisioning it. See
+   [`architecture.md`](./architecture.md)'s "The `/acp` compatibility
+   bridge" for the full mechanism.
+
+2. **Start the shared daemon** with the bridge enabled (`ACPX_CONFIG_FILE`
+   optional -- omit it entirely to use only the bridge's own
+   `default_model`/`models`, if any):
 
    ```sh
    ACPX_HTTP_BIND=127.0.0.1:8790 \
    ACPX_ACP_BRIDGE_ENABLED=1 \
    ACPX_ACP_BRIDGE_CONFIG_FILE=/path/to/acpx-bridge-config.json \
+   ACPX_CONFIG_FILE=/path/to/provisioning.json \
      target/release/acpx-server
    ```
 

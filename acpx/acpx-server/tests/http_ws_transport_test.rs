@@ -281,6 +281,12 @@ async fn strict_acp_http_bridge_lazily_binds_selected_models_without_profiles() 
                     model_id: "sonnet".to_string(),
                 },
                 BridgeModel {
+                    id: "claude/haiku".to_string(),
+                    name: Some("Claude Haiku".to_string()),
+                    agent_id: "claude-acp".to_string(),
+                    model_id: "haiku".to_string(),
+                },
+                BridgeModel {
                     id: "codex/gpt-5.5".to_string(),
                     name: Some("Codex GPT-5.5".to_string()),
                     agent_id: "codex-acp".to_string(),
@@ -339,6 +345,18 @@ async fn strict_acp_http_bridge_lazily_binds_selected_models_without_profiles() 
         .expect("bridge model select JSON");
     assert!(selected.get("error").is_none(), "{selected:?}");
     assert_eq!(selected["result"]["configOptions"][0]["id"], json!("model"));
+    // Regression: `set_config_option`'s response used to always report
+    // `self.config().default_model` ("codex/gpt-5.5" here) as
+    // `currentValue` regardless of what was just selected -- Zed's
+    // `AcpSessionConfigOptions::set_config_option` applies this response
+    // verbatim to its cached UI state, so the model picker would
+    // immediately snap back to the default the instant a different
+    // model was chosen. This is still an `Unbound` session at this
+    // point (no `session/prompt` sent yet).
+    assert_eq!(
+        selected["result"]["configOptions"][0]["currentValue"],
+        json!("claude/sonnet")
+    );
 
     let claude_prompt: serde_json::Value = client
         .post(format!("http://{addr}/acp/rpc"))
@@ -356,6 +374,29 @@ async fn strict_acp_http_bridge_lazily_binds_selected_models_without_profiles() 
         claude_prompt["result"]["agentTag"],
         json!("claude"),
         "unexpected bridged Claude response: {claude_prompt:?}"
+    );
+
+    // Same regression, now against a `Bound` session (the prompt above
+    // triggered lazy `bind()`): switching models within the same
+    // adapter after binding must also report the just-selected model as
+    // `currentValue`, not the global default.
+    let reselected: serde_json::Value = client
+        .post(format!("http://{addr}/acp/rpc"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 21, "method": "session/set_config_option",
+            "params": {"sessionId": claude_session, "configId": "model", "value": "claude/haiku"}
+        }))
+        .send()
+        .await
+        .expect("bridge bound model reselect")
+        .json()
+        .await
+        .expect("bridge bound model reselect JSON");
+    assert!(reselected.get("error").is_none(), "{reselected:?}");
+    assert_eq!(
+        reselected["result"]["configOptions"][0]["currentValue"],
+        json!("claude/haiku"),
+        "bound-session model reselect did not report the new current model: {reselected:?}"
     );
 
     let forked: serde_json::Value = client

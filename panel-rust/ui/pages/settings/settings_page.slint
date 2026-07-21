@@ -199,6 +199,19 @@ export component SettingsPage inherits Rectangle {
                     vertical-stretch: 1;
                     preferred-height: 0px;
                     min-height: 0px;
+                    // Was missing entirely (the actual reported "scroll
+                    // issues" bug) -- a bare Flickable doesn't reliably
+                    // report its own preferred-height from arbitrary child
+                    // content (it's a scroll viewport, not a layout), so
+                    // without this the Flickable had no real idea how tall
+                    // its content actually was and couldn't scroll far
+                    // enough (or at all) to reach content past the visible
+                    // area. Every other Flickable in this codebase already
+                    // binds this explicitly (confirmed by grepping every
+                    // Flickable site); this was the one exception. Same
+                    // fix `base/expandable_panel.slint`'s own Flickable
+                    // documents for the identical symptom.
+                    viewport-height: content.preferred-height;
                     content := VerticalLayout {
                         width: parent.width;
                         if root.active-section == "mcp_servers" : McpServersView {

@@ -1,0 +1,226 @@
+name: build-windows
+
+# Builds the three shippable pieces of the stack for Windows and bundles
+# them into one installable zip:
+#   - snapshotd   (Go MCP daemon, real standalone binary)
+#   - panel-rust  (Rust staticlib linked into the Shotcut/Snapflow GUI --
+#                  built + tested here as a correctness gate; not shipped
+#                  standalone since nothing links it yet)
+#   - shotcut-rebrand (the Snapflow GUI app, compiled via MSYS2/MinGW64
+#                  using scripts/build-snapflow-msys2.sh -- this uses a
+#                  prebuilt MLT downloaded from a public S3 bucket rather
+#                  than compiling MLT from source, unlike the Linux build)
+#
+# `panel-rust` and `snapshotd` are fast (minutes) and run on every push/PR.
+# `shotcut-rebrand` compiles FFmpeg/frei0r/etc from source (MLT itself is
+# prebuilt) and can take 30-60+ minutes, so it's workflow_dispatch/tag-only
+# to keep the ordinary push/PR loop fast.
+#
+# NOTE: this workflow has not been run end-to-end on a real windows-latest
+# runner yet (no Windows environment available to validate locally, unlike
+# build-linux.yml which was verified with a real from-source build). The
+# same class of bugs found and fixed in the Linux build script
+# (build-snapflow.sh) were also found and fixed by inspection in
+# build-snapflow-msys2.sh, but this workflow needs a real run to confirm.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  panel-rust:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: panel-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # See build-linux.yml: tests spawn a real acpx-server binary.
+      - name: Build acpx-server (test dependency)
+        working-directory: acpx
+        run: cargo build -p acpx-server
+      - run: cargo build --release
+      - run: cargo test --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel-rust-staticlib-windows
+          path: panel-rust/target/release/panel_rust.lib
+
+  snapshotd:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: snapshotd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: snapshotd/go.mod
+      - run: go build -o dist/snapshotd.exe ./cmd/snapshotd
+      # Windows AF_UNIX has a much shorter max socket path than Linux; the
+      # default runner %TEMP% path is too long once the tests' own random
+      # subdirectories are appended (snapshotd's daemon/procmgr/sapproxy
+      # tests bind real unix sockets under a temp RunDir).
+      - name: Set a short TEMP dir for AF_UNIX socket paths
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\st | Out-Null
+          echo "TEMP=C:\st" >> $env:GITHUB_ENV
+          echo "TMP=C:\st" >> $env:GITHUB_ENV
+      - run: go test ./...
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshotd-windows
+          path: snapshotd/dist/snapshotd.exe
+
+  shotcut-rebrand:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      # shotcut-rebrand isn't part of this repo's tree (no submodule entry
+      # -- pushed separately to Shaik-Sirajuddin/shotcut.git's
+      # rebrand/snapflow branch), so check it out on its own.
+      - uses: actions/checkout@v4
+        with:
+          repository: Shaik-Sirajuddin/shotcut
+          ref: rebrand/snapflow
+          path: shotcut-rebrand
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            autotools base-devel bzip2 coreutils git gzip tar xz zip
+            perl-List-MoreUtils perl-XML-Parser
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-yasm
+            mingw-w64-x86_64-cairo
+            mingw-w64-x86_64-eigen3
+            mingw-w64-x86_64-dlfcn
+            mingw-w64-x86_64-fftw
+            mingw-w64-x86_64-gcc-fortran
+            mingw-w64-x86_64-gettext-tools
+            mingw-w64-x86_64-harfbuzz
+            mingw-w64-x86_64-lame
+            mingw-w64-x86_64-libarchive
+            mingw-w64-x86_64-libepoxy
+            mingw-w64-x86_64-libexif
+            mingw-w64-x86_64-libimagequant
+            mingw-w64-x86_64-libsamplerate
+            mingw-w64-x86_64-libtheora
+            mingw-w64-x86_64-libvorbis
+            mingw-w64-x86_64-libvpx
+            mingw-w64-x86_64-libwebp
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-onevpl
+            mingw-w64-x86_64-openblas
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-opus
+            mingw-w64-x86_64-potrace
+            mingw-w64-x86_64-python-pip
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-charts
+            mingw-w64-x86_64-qt6-declarative
+            mingw-w64-x86_64-qt6-imageformats
+            mingw-w64-x86_64-qt6-multimedia
+            mingw-w64-x86_64-qt6-multimedia-wmf
+            mingw-w64-x86_64-qt6-svg
+            mingw-w64-x86_64-qt6-tools
+            mingw-w64-x86_64-qt6-translations
+            mingw-w64-x86_64-qt6-websockets
+            mingw-w64-x86_64-rubberband
+            mingw-w64-x86_64-sox
+            mingw-w64-x86_64-svt-av1
+            mingw-w64-x86_64-vid.stab
+            mingw-w64-x86_64-vulkan-headers
+            mingw-w64-x86_64-vulkan-loader
+            mingw-w64-x86_64-x264
+            mingw-w64-x86_64-x265
+            mingw-w64-x86_64-zimg
+
+      - name: Set version
+        id: set_version
+        shell: msys2 {0}
+        run: |
+          VERSION="$(date +"%y.%-m.%-d")"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install prebuilt MLT (public bucket, no MLT-from-source compile)
+        shell: msys2 {0}
+        run: |
+          pacman --noconfirm -Rdd mingw-w64-x86_64-aom
+          cd "$HOME"
+          curl -kLO --no-progress-meter https://s3.amazonaws.com/misc.meltymedia/snapflow-build/mlt-prebuilt-mingw64-v7.txz
+          tar -xJf mlt-prebuilt-mingw64-v7.txz
+          rm mlt-prebuilt-mingw64-v7.txz
+
+      - name: Build
+        shell: msys2 {0}
+        working-directory: shotcut-rebrand
+        run: |
+          echo "INSTALL_DIR=\"$(pwd)/build\"" > build-snapflow.conf
+          echo "SNAPFLOW_VERSION=\"$VERSION\"" >> build-snapflow.conf
+          echo "SNAPFLOW_HEAD=0" >> build-snapflow.conf
+          echo "SNAPFLOW_REVISION=origin/rebrand/snapflow" >> build-snapflow.conf
+          echo "SNAPFLOW_REPO=https://github.com/Shaik-Sirajuddin/shotcut.git" >> build-snapflow.conf
+          bash scripts/build-snapflow-msys2.sh
+
+      - name: Package the portable zip
+        shell: msys2 {0}
+        working-directory: shotcut-rebrand
+        run: |
+          cd build
+          zip -gr snapflow-win64-$VERSION.zip Snapflow
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shotcut-rebrand-windows
+          path: shotcut-rebrand/build/snapflow-win64-*.zip
+
+  package:
+    needs: [panel-rust, snapshotd, shotcut-rebrand]
+    if: always() && needs.panel-rust.result == 'success' && needs.snapshotd.result == 'success' && needs.shotcut-rebrand.result == 'success'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Assemble install bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(date +"%y.%-m.%-d")
+          OUT="snapflow-windows-x86_64-$VERSION"
+          mkdir -p "$OUT/bin"
+          cp dist/snapshotd-windows/snapshotd.exe "$OUT/bin/snapshotd.exe"
+          cp dist/panel-rust-staticlib-windows/panel_rust.lib "$OUT/bin/panel_rust.lib"
+          unzip -q dist/shotcut-rebrand-windows/snapflow-win64-*.zip -d "$OUT"
+          7z a -tzip "$OUT.zip" "$OUT" >/dev/null
+          sha256sum "$OUT.zip" > "$OUT.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapflow-windows-install-bundle
+          path: |
+            snapflow-windows-x86_64-*.zip
+            snapflow-windows-x86_64-*.zip.sha256
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            snapflow-windows-x86_64-*.zip
+            snapflow-windows-x86_64-*.zip.sha256

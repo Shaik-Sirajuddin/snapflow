@@ -261,14 +261,34 @@ impl BridgeRuntime {
             }
             *last_attempt = Some(now);
         }
-        let agent_ids: Vec<String> = self
-            .config()
+        // Seed set = operator-pinned static `models` entries (back-compat
+        // override/pin, never pruned below) UNION every explicitly
+        // *provisioned* profile's `agent_id` (`ACPX_CONFIG_FILE`'s
+        // `profiles` array or a runtime `profiles/create` call).
+        // Deliberately excludes `ensure_default_profiles_seeded`'s
+        // auto-seeded (one-per-installed-CLI) profiles -- probing, and
+        // implicitly spawning, every ACP agent binary this host happens
+        // to have installed would silently turn a curated model picker
+        // into "every CLI on this dev machine," defeating the reason the
+        // bridge has its own model catalog at all (see this crate's own
+        // module doc: "deliberately exposes models, never ACPX managed
+        // profiles" -- that boundary applies to auto-seeded profiles
+        // too, not just the hand-authored ones).
+        let static_config = self.config();
+        let mut agent_ids: HashSet<String> = static_config
             .agent_ids()
             .into_iter()
             .map(ToOwned::to_owned)
             .collect();
+        // A quick lock + synchronous in-memory read -- no registry
+        // fetch, no subprocess spawns (see
+        // `Router::provisioned_profile_agent_ids`'s own doc comment for
+        // why it must stay this cheap on a cooldown-gated hot path).
+        agent_ids.extend(router.lock().await.provisioned_profile_agent_ids());
+        let agent_ids: Vec<String> = agent_ids.into_iter().collect();
         let mut discovered = Vec::new();
         let mut discovered_options = Vec::new();
+        let mut succeeded_agent_ids: HashSet<String> = HashSet::new();
         for agent_id in agent_ids {
             let probe = async {
                 let mut router = router.lock().await;
@@ -295,6 +315,7 @@ impl BridgeRuntime {
             let Ok(capabilities) = capabilities else {
                 continue;
             };
+            succeeded_agent_ids.insert(agent_id.clone());
             let namespace = agent_id.strip_suffix("-acp").unwrap_or(&agent_id);
             discovered.extend(capabilities.models.into_iter().map(|model| BridgeModel {
                 id: format!("{namespace}/{}", model.value),
@@ -322,16 +343,16 @@ impl BridgeRuntime {
                     }),
             );
         }
-        if discovered.is_empty() {
+        if discovered.is_empty() && succeeded_agent_ids.is_empty() {
+            // No agent answered at all this cycle (every probe failed or
+            // timed out) -- keep serving whatever was previously known
+            // rather than pruning it away on a transient outage.
             return;
         }
         let mut models = self.models.write().await;
-        let mut seen: HashSet<String> = models.iter().map(|model| model.id.clone()).collect();
-        models.extend(
-            discovered
-                .into_iter()
-                .filter(|model| seen.insert(model.id.clone())),
-        );
+        let static_ids: HashSet<&str> =
+            static_config.models.iter().map(|model| model.id.as_str()).collect();
+        Self::merge_discovered_models(&mut models, &static_ids, &succeeded_agent_ids, discovered);
         drop(models);
         let mut options = self.config_options.write().await;
         for option in discovered_options {
@@ -343,6 +364,39 @@ impl BridgeRuntime {
         }
     }
 
+    /// Pure merge step behind [`Self::refresh_models_with_config`]'s
+    /// tail, split out so a test can exercise it directly without a
+    /// real/fake subprocess probe. Drops every previously-discovered
+    /// (non-static) entry belonging to an agent in `succeeded_agent_ids`,
+    /// then adds back exactly `discovered` -- a model its agent no
+    /// longer reports stops being served instead of staying available
+    /// forever (the live incident: a Bifrost catalog entry like
+    /// `claude/claude-fable-5[1m]` outliving its own upstream removal,
+    /// because the previous merge was an unconditional `Vec::extend`
+    /// that never dropped anything). Entries whose `id` is in
+    /// `static_ids` (operator-pinned overrides) are never touched here
+    /// regardless of `succeeded_agent_ids`, and an agent absent from
+    /// `succeeded_agent_ids` (its probe failed/timed out this cycle)
+    /// keeps its previous entries untouched -- better briefly-stale than
+    /// briefly-empty.
+    fn merge_discovered_models(
+        models: &mut Vec<BridgeModel>,
+        static_ids: &HashSet<&str>,
+        succeeded_agent_ids: &HashSet<String>,
+        discovered: Vec<BridgeModel>,
+    ) {
+        models.retain(|model| {
+            static_ids.contains(model.id.as_str())
+                || !succeeded_agent_ids.contains(&model.agent_id)
+        });
+        let mut seen: HashSet<String> = models.iter().map(|model| model.id.clone()).collect();
+        models.extend(
+            discovered
+                .into_iter()
+                .filter(|model| seen.insert(model.id.clone())),
+        );
+    }
+
     pub async fn resolve_model(&self, alias: &str) -> Option<BridgeModel> {
         self.models
             .read()
@@ -352,14 +406,65 @@ impl BridgeRuntime {
             .cloned()
     }
 
-    pub async fn model_config_options(&self) -> Value {
+    /// The model alias a session with no explicit selection resolves
+    /// against. Prefers `BridgeConfig::default_model` when the operator
+    /// pinned one; otherwise falls back to the first entry in the live
+    /// model list (whatever `refresh_models_with_config` has discovered
+    /// so far via provisioned profiles) so a bridge config with no
+    /// static `models`/`default_model` at all -- the normal shape now --
+    /// still has a usable default the moment discovery has found
+    /// anything. Returns an empty string only in the genuine edge case
+    /// of zero models discovered yet (e.g. process just started, no
+    /// provisioned profile has successfully probed) -- every caller of
+    /// this already handles an unresolvable alias as
+    /// `BridgeDispatchError::UnknownModel`, so this deliberately doesn't
+    /// invent a placeholder.
+    pub async fn effective_default_model(&self) -> String {
+        let configured = self.config().default_model.clone();
+        if !configured.is_empty() {
+            return configured;
+        }
+        self.models
+            .read()
+            .await
+            .first()
+            .map(|model| model.id.clone())
+            .unwrap_or_default()
+    }
+
+    /// `current_model_alias` is the bridge session's own
+    /// `selected_public_model_alias` (or `None` for a brand new,
+    /// never-configured session). Callers MUST pass the session's actual
+    /// current selection here -- this used to always stamp
+    /// `self.config().default_model`, so every `session/set_config_option`
+    /// response (bound or unbound) reported the global default as
+    /// `currentValue` regardless of what was just selected, and Zed's
+    /// `AcpSessionConfigOptions::set_config_option` applies that response
+    /// verbatim to its cached UI state -- so picking e.g. Haiku would
+    /// immediately snap the picker back to showing the default model.
+    pub async fn model_config_options(&self, current_model_alias: Option<&str>) -> Value {
         let models = self.models.read().await;
+        // Inlined rather than calling `Self::effective_default_model` --
+        // that method also takes `self.models.read()`, and
+        // `tokio::sync::RwLock` is explicitly documented as not
+        // reentrant: a second read acquisition from the same task while
+        // this `models` guard is still held can deadlock against a
+        // writer that queued in between (write-preferring fairness).
+        let configured_default = self.config().default_model.clone();
+        let current_value = match current_model_alias {
+            Some(alias) => alias.to_string(),
+            None if !configured_default.is_empty() => configured_default,
+            None => models
+                .first()
+                .map(|model| model.id.clone())
+                .unwrap_or_default(),
+        };
         let mut options = vec![json!({
             "id": "model",
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": self.config().default_model,
+            "currentValue": current_value,
             "options": models.iter().map(|model| json!({
                 "value": model.id,
                 "name": model.name.as_deref().unwrap_or(&model.id),
@@ -624,7 +729,7 @@ async fn new_session(
         "id": request.get("id").cloned().unwrap_or(Value::Null),
         "result": {
             "sessionId": session_id.0,
-            "configOptions": runtime.model_config_options().await,
+            "configOptions": runtime.model_config_options(None).await,
         }
     }))
 }
@@ -668,7 +773,9 @@ async fn set_config_option(
                 )?;
                 Ok(success(
                     &request,
-                    json!({"configOptions": runtime.model_config_options().await}),
+                    json!({"configOptions": runtime
+                        .model_config_options(session.selected_public_model_alias.as_deref())
+                        .await}),
                 ))
             }
             BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
@@ -705,17 +812,23 @@ async fn set_config_option(
                 .select_model(tenant_id, &session_id, selected.id.clone())?;
             Ok(success(
                 &request,
-                json!({"configOptions": runtime.model_config_options().await}),
+                json!({"configOptions": runtime.model_config_options(Some(&selected.id)).await}),
             ))
         }
         BridgeSessionState::Binding => Err(BridgeDispatchError::BindingInProgress),
         BridgeSessionState::Failed => Err(BridgeDispatchError::BindingFailed),
         BridgeSessionState::Bound => {
-            let config = runtime.config();
-            let current_alias = session
+            let current_alias_owned;
+            let current_alias = match session
                 .selected_public_model_alias
                 .as_deref()
-                .unwrap_or(&config.default_model);
+            {
+                Some(alias) => alias,
+                None => {
+                    current_alias_owned = runtime.effective_default_model().await;
+                    current_alias_owned.as_str()
+                }
+            };
             let current = runtime
                 .resolve_model(current_alias)
                 .await
@@ -736,9 +849,18 @@ async fn set_config_option(
                 )?;
                 persist_bridge_binding(router, runtime, &updated).await?;
                 if let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) {
-                    result
-                        .entry("configOptions".to_string())
-                        .or_insert(runtime.model_config_options().await);
+                    // Always overwrite rather than `.entry().or_insert()`: the
+                    // native backend's own response may carry its own
+                    // "configOptions" in terms of native model ids, which
+                    // would silently stick if we only filled in a missing
+                    // key -- Zed (talking to the bridge) needs the bridge's
+                    // public-alias view, stamped with the selection that
+                    // was just applied, not whatever the native adapter
+                    // happened to return.
+                    result.insert(
+                        "configOptions".to_string(),
+                        runtime.model_config_options(Some(&selected.id)).await,
+                    );
                 }
             }
             Ok(response)
@@ -1014,11 +1136,17 @@ async fn bind(
         }
     }
 
-    let config = runtime.config();
-    let model_alias = session
+    let model_alias_owned;
+    let model_alias = match session
         .selected_public_model_alias
         .as_deref()
-        .unwrap_or(&config.default_model);
+    {
+        Some(alias) => alias,
+        None => {
+            model_alias_owned = runtime.effective_default_model().await;
+            model_alias_owned.as_str()
+        }
+    };
     let model = match runtime.resolve_model(model_alias).await {
         Some(model) => model,
         None => {
@@ -1128,6 +1256,7 @@ async fn persist_bridge_binding(
     let Some(store) = router.lock().await.persistence_store() else {
         return Ok(());
     };
+    let fallback_default_model;
     store
         .update_bridge_binding(
             session
@@ -1135,10 +1264,13 @@ async fn persist_bridge_binding(
                 .clone()
                 .expect("bound bridge session has native id"),
             session.id.0.clone(),
-            session
-                .selected_public_model_alias
-                .clone()
-                .unwrap_or_else(|| runtime.config().default_model.clone()),
+            match session.selected_public_model_alias.clone() {
+                Some(alias) => alias,
+                None => {
+                    fallback_default_model = runtime.effective_default_model().await;
+                    fallback_default_model.clone()
+                }
+            },
             serde_json::to_value(&session.selected_adapter_config_options)
                 .expect("bridge adapter options serialize"),
         )
@@ -1940,6 +2072,135 @@ done
             matches!(post_failure_retry, Err(BridgeDispatchError::BindingFailed)),
             "expected BindingFailed once the handshake timeout has moved the session out of \
              Binding, got {post_failure_retry:?}"
+        );
+    }
+
+    /// **`bridge_no_static_models_required`.** With `models: vec![]` and
+    /// `default_model: String::new()` -- the normal shape now that the
+    /// bridge's model list comes from provisioned-profile-driven live
+    /// discovery rather than a static override -- a brand-new session
+    /// still needs *some* default to resolve against the moment
+    /// discovery has found anything. `effective_default_model` must
+    /// fall back to the first live-discovered entry rather than
+    /// resolving an empty alias (which every caller would otherwise
+    /// treat as `UnknownModel`).
+    #[tokio::test]
+    async fn effective_default_model_falls_back_to_first_discovered_model_when_unset() {
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: String::new(),
+            models: vec![],
+            max_virtual_sessions_per_tenant: None,
+        }));
+        assert_eq!(runtime.effective_default_model().await, "");
+
+        runtime.models.write().await.push(BridgeModel {
+            id: "claude/sonnet".to_string(),
+            name: Some("Claude Sonnet".to_string()),
+            agent_id: "claude-acp".to_string(),
+            model_id: "sonnet".to_string(),
+        });
+        assert_eq!(runtime.effective_default_model().await, "claude/sonnet");
+    }
+
+    /// An operator-pinned `default_model` must still win over whatever
+    /// discovery has found, even after live models exist -- this is the
+    /// "explicit override always wins" half of the same fallback.
+    #[tokio::test]
+    async fn effective_default_model_prefers_the_configured_pin_over_discovered_models() {
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: "claude/haiku".to_string(),
+            models: vec![BridgeModel {
+                id: "claude/haiku".to_string(),
+                name: None,
+                agent_id: "claude-acp".to_string(),
+                model_id: "haiku".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: None,
+        }));
+        runtime.models.write().await.push(BridgeModel {
+            id: "claude/opus".to_string(),
+            name: None,
+            agent_id: "claude-acp".to_string(),
+            model_id: "opus".to_string(),
+        });
+        assert_eq!(runtime.effective_default_model().await, "claude/haiku");
+    }
+
+    /// **`bridge_model_seed_pruning`.** A previously-discovered model must
+    /// disappear once a *successful* re-probe of its owning agent no
+    /// longer reports it -- the bug flagged live: Bifrost catalog
+    /// entries like `claude/claude-fable-5[1m]` staying `available: true`
+    /// forever even after the upstream catalog dropped them, because the
+    /// old merge logic only ever called `Vec::extend`. Exercised directly
+    /// against the private `models`/`config_options` state (this is an
+    /// invariant of `refresh_models_with_config`'s merge step, not of any
+    /// specific probe transport) rather than a real subprocess probe, to
+    /// stay fast and hermetic.
+    #[tokio::test]
+    async fn stale_discovered_models_are_pruned_when_their_agent_no_longer_reports_them() {
+        let runtime = BridgeRuntime::new(Arc::new(BridgeConfig {
+            default_model: String::new(),
+            models: vec![BridgeModel {
+                id: "pinned/model".to_string(),
+                name: None,
+                agent_id: "pinned-agent".to_string(),
+                model_id: "pinned".to_string(),
+            }],
+            max_virtual_sessions_per_tenant: None,
+        }));
+        {
+            let mut models = runtime.models.write().await;
+            models.push(BridgeModel {
+                id: "claude/claude-fable-5[1m]".to_string(),
+                name: Some("Fable".to_string()),
+                agent_id: "claude-acp".to_string(),
+                model_id: "claude-fable-5[1m]".to_string(),
+            });
+            models.push(BridgeModel {
+                id: "claude/sonnet".to_string(),
+                name: Some("Sonnet".to_string()),
+                agent_id: "claude-acp".to_string(),
+                model_id: "sonnet".to_string(),
+            });
+        }
+
+        // `claude-acp` answered again this cycle but its catalog shrank
+        // to just `sonnet` -- `claude-fable-5[1m]` is gone upstream.
+        let discovered = vec![BridgeModel {
+            id: "claude/sonnet".to_string(),
+            name: Some("Sonnet".to_string()),
+            agent_id: "claude-acp".to_string(),
+            model_id: "sonnet".to_string(),
+        }];
+        let succeeded_agent_ids: HashSet<String> = ["claude-acp".to_string()].into_iter().collect();
+        {
+            let mut models = runtime.models.write().await;
+            let static_config = runtime.config();
+            let static_ids: HashSet<&str> =
+                static_config.models.iter().map(|m| m.id.as_str()).collect();
+            BridgeRuntime::merge_discovered_models(
+                &mut models,
+                &static_ids,
+                &succeeded_agent_ids,
+                discovered,
+            );
+        }
+
+        let ids: Vec<String> = runtime
+            .models
+            .read()
+            .await
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert!(
+            !ids.contains(&"claude/claude-fable-5[1m]".to_string()),
+            "a model its agent no longer reports must be pruned, got {ids:?}"
+        );
+        assert!(ids.contains(&"claude/sonnet".to_string()), "still-reported model must remain");
+        assert!(
+            ids.contains(&"pinned/model".to_string()),
+            "a static/pinned model from a different, un-probed agent must never be pruned"
         );
     }
 }
