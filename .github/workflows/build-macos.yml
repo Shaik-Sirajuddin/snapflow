@@ -66,7 +66,16 @@ jobs:
       run:
         working-directory: shotcut-rebrand
     steps:
+      # shotcut-rebrand isn't part of this repo's tree (no submodule entry --
+      # it started life as a local-only git worktree on the dev machine, now
+      # pushed to Shaik-Sirajuddin/shotcut.git's rebrand/snapflow branch), so
+      # check it out separately rather than expecting it in this repo's own
+      # checkout.
       - uses: actions/checkout@v4
+        with:
+          repository: Shaik-Sirajuddin/shotcut
+          ref: rebrand/snapflow
+          path: shotcut-rebrand
 
       - name: Install build deps from Homebrew (prebuilt, no from-source ffmpeg/mlt compile)
         run: |
