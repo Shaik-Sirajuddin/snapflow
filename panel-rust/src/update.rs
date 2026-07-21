@@ -1317,6 +1317,31 @@ mod tests {
     }
 
     #[test]
+    fn host_project_path_change_emits_one_bridge_effect() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/tmp/project.mlt".to_owned(),
+            ))),
+        );
+        assert_eq!(model.active_project_path.as_deref(), Some("/tmp/project.mlt"));
+        assert_eq!(
+            effects,
+            vec![Effect::SetActiveProjectPath {
+                path: Some("/tmp/project.mlt".to_owned())
+            }]
+        );
+        assert_eq!(
+            dirty,
+            vec![
+                Dirty::ProjectPath,
+                Dirty::SkillsListDiff(Vec::new())
+            ]
+        );
+    }
+
+    #[test]
     fn thread_selected_out_of_range_clamps_to_the_last_thread() {
         // Matches the real select_visible_thread's own
         // `filtered_idx.min(visible_len - 1)` clamping -- not a no-op.

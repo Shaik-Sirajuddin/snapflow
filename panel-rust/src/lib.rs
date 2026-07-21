@@ -1430,12 +1430,10 @@ impl PanelSingleton {
         });
     }
 
-    /// `dispatch.rs`'s Host-domain wrapper (tea-slint-model Phase 4) calls
-    /// this -- extracted verbatim from the former `panel_rust_set_project_
-    /// path` FFI entry point's body (after its raw byte-buffer parsing,
-    /// which stays in `lib.rs` since it's genuinely FFI-boundary work, not
-    /// application logic).
-    pub(crate) fn dispatch_project_path_changed(&self, path: Option<String>) {
+    /// Executes the bridge-side half of `Effect::SetActiveProjectPath`.
+    /// This must stay separate from `dispatch_project_path_changed`, which
+    /// creates that effect; calling the dispatcher here would recurse forever.
+    pub(crate) fn apply_active_project_path(&self, path: Option<String>) {
         if let Some(bridge) = self.bridge.as_ref() {
             bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
         }

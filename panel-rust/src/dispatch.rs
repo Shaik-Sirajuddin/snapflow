@@ -225,7 +225,7 @@ fn execute_effects(panel: &PanelSingleton, effects: Vec<crate::effect::Effect>) 
                 execute_skill_effects(vec![effect]);
             }
             crate::effect::Effect::SetActiveProjectPath { path } => {
-                panel.dispatch_project_path_changed(path);
+                panel.apply_active_project_path(path);
             }
             crate::effect::Effect::PersistThreadRecord { record } => {
                 let result = panel
