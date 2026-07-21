@@ -172,6 +172,13 @@ jobs:
               if ! command -v rustc >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
               fi
+              # panel-rusts rusqlite needs SQLite3::SQLite3 linkable at the
+              # C++ level (src/CMakeLists.txt find_package(SQLite3)) --
+              # not present in this image by default (only needed since
+              # panel-rust got merged in).
+              if ! pkg-config --exists sqlite3 2>/dev/null; then
+                apt-get update -qq && apt-get install -y -qq libsqlite3-dev
+              fi
               exec /root/shotcut/build-shotcut.sh
             '
           mv snapflow.txz "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
