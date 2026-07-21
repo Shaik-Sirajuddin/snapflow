@@ -195,6 +195,7 @@ pub enum HostMsg {
         modifiers: u32,
     },
     AppearanceChanged(crate::appearance::AppearanceState),
+    ThemeChanged(String),
     ProjectPathChanged(Option<String>),
     /// Cold-start hydration trigger -- see 00-plan.md Phase 0. Carries
     /// whatever `panel_rust_create` already has in hand *before* any

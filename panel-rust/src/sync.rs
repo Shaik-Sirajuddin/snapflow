@@ -92,6 +92,8 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 model.active_project_path.clone().unwrap_or_default().into(),
             );
         }
+        Dirty::Appearance => sync_appearance(model, component),
+        Dirty::Theme => sync_theme_variant(component, &model.theme_variant),
         Dirty::Settings => {
             component.set_settings_scope(model.settings_scope.clone().into());
             component.set_default_profile(model.default_profile.clone().into());
@@ -441,6 +443,21 @@ pub(crate) fn sync_host_appearance(
     theme_global.set_host_font_sans(appearance.bundled_font.clone().into());
     theme_global.set_host_font_scale(appearance.font_scale);
     theme_global.set_host_density(appearance.density);
+}
+
+fn sync_appearance(model: &Model, component: &ChatPanel) {
+    let Some(appearance) = model.appearance.current() else {
+        return;
+    };
+    let theme = if matches!(
+        appearance.color_scheme,
+        crate::appearance::ColorScheme::Dark
+    ) {
+        "dark"
+    } else {
+        "light"
+    };
+    sync_host_appearance(component, appearance, theme);
 }
 
 pub(crate) fn sync_theme_variant(component: &ChatPanel, theme: &str) {

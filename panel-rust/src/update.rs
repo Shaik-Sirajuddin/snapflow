@@ -688,8 +688,24 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
         HostMsg::InvokeCommand(_cmd) => (vec![], vec![]),
         HostMsg::InputKey { .. } => (vec![], vec![]),
         HostMsg::AppearanceChanged(state) => {
+            let theme_variant = state
+                .current()
+                .map(|appearance| match appearance.color_scheme {
+                    crate::appearance::ColorScheme::Dark => "dark",
+                    crate::appearance::ColorScheme::Light => "light",
+                })
+                .unwrap_or("dark");
             model.appearance = state;
-            (vec![], vec![Dirty::Settings])
+            model.theme_variant = theme_variant.to_owned();
+            (vec![], vec![Dirty::Appearance])
+        }
+        HostMsg::ThemeChanged(theme) => {
+            model.theme_variant = if theme.eq_ignore_ascii_case("light") {
+                "light".to_owned()
+            } else {
+                "dark".to_owned()
+            };
+            (vec![], vec![Dirty::Theme])
         }
         HostMsg::ProjectPathChanged(path) => {
             model.active_project_path = path.clone();
@@ -1577,6 +1593,37 @@ mod tests {
         let (effects, dirty) = update(&mut model, Msg::Frame(FrameInput::default()));
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn host_theme_changes_are_reducer_owned() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Host(HostMsg::ThemeChanged("light".to_owned())),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(model.theme_variant, "light");
+        assert_eq!(dirty, vec![Dirty::Theme]);
+    }
+
+    #[test]
+    fn host_appearance_changes_mark_only_appearance_dirty() {
+        let mut model = Model::default();
+        let mut appearance = crate::appearance::AppearanceState::default();
+        assert!(appearance.apply(crate::appearance::HostAppearance {
+            generation: 1,
+            color_scheme: crate::appearance::ColorScheme::Light,
+            language_tag: "en-US".to_owned(),
+            bundled_font: "Test Sans".to_owned(),
+            font_scale: 1.25,
+            density: 1.1,
+        }));
+        let (effects, dirty) =
+            update(&mut model, Msg::Host(HostMsg::AppearanceChanged(appearance)));
+        assert!(effects.is_empty());
+        assert_eq!(model.theme_variant, "light");
+        assert_eq!(dirty, vec![Dirty::Appearance]);
     }
 
     #[test]

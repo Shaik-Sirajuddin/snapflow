@@ -84,6 +84,7 @@ pub struct Model {
     pub active_project_path: Option<String>,
     pub traced_attachment_threads: HashSet<String>,
     pub appearance: AppearanceState,
+    pub theme_variant: String,
     pub settings_open: bool,
     pub settings_scope: String,
     pub default_profile: String,

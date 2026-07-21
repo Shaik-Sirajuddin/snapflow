@@ -1442,31 +1442,6 @@ impl PanelSingleton {
         self.dispatch_frame_input(msg::FrameInput { skills_snapshot: Some(self.collect_skills_snapshot()), ..msg::FrameInput::default() });
     }
 
-    /// `dispatch.rs`'s Host-domain wrapper (tea-slint-model Phase 4) calls
-    /// this -- extracted verbatim from the former `panel_rust_apply_host_
-    /// appearance` FFI entry point's body (after its raw byte-buffer
-    /// decoding, which stays in `lib.rs`).
-    pub(crate) fn sync_host_appearance(&self) -> bool {
-        let appearance_state = self.model.borrow();
-        let appearance = appearance_state
-            .appearance
-            .current()
-            .expect("appearance was applied above");
-        let dark = matches!(appearance.color_scheme, ColorScheme::Dark);
-        crate::sync::sync_host_appearance(
-            &self.component,
-            &appearance,
-            if dark { "dark" } else { "light" },
-        );
-        self.window
-            .window()
-            .dispatch_event(WindowEvent::ScaleFactorChanged {
-                scale_factor: appearance.density,
-            });
-        self.window.window().request_redraw();
-        true
-    }
-
     /// Collects non-destructive external snapshots for one frame tick.
     /// Draining bridge events and consuming watcher flags happens only after
     /// this value has gone through `Msg::Frame`/`update()`.
@@ -2998,7 +2973,7 @@ pub extern "C" fn panel_rust_set_theme(
             let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
             std::str::from_utf8(bytes).unwrap_or("dark")
         };
-        crate::sync::sync_theme_variant(&panel.component, text);
+        dispatch::dispatch_theme_changed(panel, text.to_owned());
         true
     })
 }

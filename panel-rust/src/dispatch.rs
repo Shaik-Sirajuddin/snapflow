@@ -33,6 +33,7 @@ use crate::sync::sync;
 use crate::update::update;
 use crate::ChatPanel;
 use crate::PanelSingleton;
+use slint::platform::WindowAdapter;
 use slint::ComponentHandle;
 
 fn execute_skill_effects(effects: Vec<crate::effect::Effect>) {
@@ -1255,6 +1256,10 @@ pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option
     execute_effects(panel, effects);
 }
 
+pub(crate) fn dispatch_theme_changed(panel: &PanelSingleton, theme: String) {
+    let _ = update_persistent(panel, Msg::Host(HostMsg::ThemeChanged(theme)));
+}
+
 pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32) -> bool {
     let command_name = match command {
         crate::PANEL_COMMAND_PREVIOUS_THREAD => "previous-thread",
@@ -1311,7 +1316,14 @@ pub(crate) fn dispatch_apply_host_appearance(
         return false;
     }
     let _ = update_persistent(panel, Msg::Host(HostMsg::AppearanceChanged(state)));
-    panel.sync_host_appearance()
+    let current = panel.model.borrow().appearance.current().cloned();
+    if let Some(appearance) = current {
+        panel.window.window().dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged {
+            scale_factor: appearance.density,
+        });
+    }
+    panel.window.window().request_redraw();
+    true
 }
 
 #[cfg(test)]

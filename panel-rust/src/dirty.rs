@@ -267,6 +267,8 @@ pub enum Dirty {
     },
     LocalTerminal,
     ProjectPath,
+    Appearance,
+    Theme,
     /// Settings changed -- pushed into both the settings panel and chat
     /// view in one place (fixes "settings not propagated to chat view").
     Settings,
