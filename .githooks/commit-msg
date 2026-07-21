@@ -1,0 +1,16 @@
+#!/bin/sh
+# Reject Claude co-author / session trailers in commit messages.
+# Enable with: git config core.hooksPath .githooks
+
+msg_file="$1"
+if [ -z "$msg_file" ] || [ ! -f "$msg_file" ]; then
+  exit 0
+fi
+
+if grep -qiE 'Co-Authored-By:[[:space:]]*.*[Cc]laude|Co-Authored-By:.*noreply@anthropic\.com|Claude-Session:' "$msg_file"; then
+  echo "error: Claude co-author/session trailers are not allowed in this repo." >&2
+  echo "Remove any 'Co-Authored-By: Claude...' or 'Claude-Session:' lines and retry." >&2
+  exit 1
+fi
+
+exit 0

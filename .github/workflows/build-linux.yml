@@ -100,9 +100,14 @@ jobs:
     env:
       IMAGE_NAME: mltframework/shotcut-build:qt6.10.3-ubuntu22.04
     steps:
-      # This repo, for sap-rust -- shotcut-rebrand/CMakeLists.txt builds it
-      # via Corrosion at ${CMAKE_SOURCE_DIR}/../sap-rust (a sibling crate,
-      # not part of the shotcut-rebrand checkout itself).
+      # This repo, for sap-rust and panel-rust -- shotcut-rebrand/
+      # CMakeLists.txt builds both via Corrosion at
+      # ${CMAKE_SOURCE_DIR}/../sap-rust and .../../panel-rust (sibling
+      # crates, not part of the shotcut-rebrand checkout itself). Now that
+      # shotcut's sap-rust-mlt-backend branch (the panel-rust/AI chat-panel
+      # integration) is merged into rebrand/snapflow, panel-rust needs to
+      # be present too -- and panel-rust itself depends on
+      # ../acpx/acpx-client, so that whole workspace comes along as well.
       - uses: actions/checkout@v4
         with:
           path: multi-media-main
@@ -142,19 +147,37 @@ jobs:
           docker run \
             -v "$PWD:/root/shotcut" \
             -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/root/sap-rust-src:ro" \
+            -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/root/panel-rust-src:ro" \
+            -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/root/acpx-src:ro" \
             "$IMAGE_NAME" \
             -c '
               set -e
-              # shotcut-rebrand/CMakeLists.txt builds ../sap-rust (a sibling
-              # crate, see corrosion_import_crate) via Corrosion, which needs
-              # a real Rust toolchain -- not present in this image by default.
+              # shotcut-rebrand/CMakeLists.txt builds ../sap-rust and
+              # ../panel-rust (sibling crates, see corrosion_import_crate)
+              # via Corrosion, which needs a real Rust toolchain -- not
+              # present in this image by default. panel-rust itself
+              # depends on ../acpx/acpx-client, so that whole workspace
+              # needs to land at the same relative sibling position too.
+              mkdir -p /root/shotcut/src
               if [ ! -d /root/shotcut/src/sap-rust ]; then
-                mkdir -p /root/shotcut/src
                 cp -r /root/sap-rust-src /root/shotcut/src/sap-rust
+              fi
+              if [ ! -d /root/shotcut/src/panel-rust ]; then
+                cp -r /root/panel-rust-src /root/shotcut/src/panel-rust
+              fi
+              if [ ! -d /root/shotcut/src/acpx ]; then
+                cp -r /root/acpx-src /root/shotcut/src/acpx
               fi
               export PATH="/root/.cargo/bin:$PATH"
               if ! command -v rustc >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+              fi
+              # panel-rusts rusqlite needs SQLite3::SQLite3 linkable at the
+              # C++ level (src/CMakeLists.txt find_package(SQLite3)) --
+              # not present in this image by default (only needed since
+              # panel-rust got merged in).
+              if ! pkg-config --exists sqlite3 2>/dev/null; then
+                apt-get update -qq && apt-get install -y -qq libsqlite3-dev
               fi
               exec /root/shotcut/build-shotcut.sh
             '

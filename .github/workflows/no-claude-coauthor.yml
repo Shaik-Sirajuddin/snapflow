@@ -1,0 +1,50 @@
+name: no-claude-coauthor
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject Claude co-author / session trailers
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='Co-Authored-By:.*[Cc]laude|Co-Authored-By:.*noreply@anthropic|Claude-Session:'
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=0 2>/dev/null || true
+            range="origin/${{ github.base_ref }}...HEAD"
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              # new branch / first push: scan commits reachable from HEAD not on default main if possible
+              if git rev-parse --verify origin/main >/dev/null 2>&1; then
+                range="origin/main...HEAD"
+              else
+                range="HEAD"
+              fi
+            else
+              range="${before}..${{ github.sha }}"
+            fi
+          fi
+
+          if [ "$range" = "HEAD" ]; then
+            bodies=$(git log -1 --format=%B HEAD)
+          else
+            bodies=$(git log --format=%B "$range" 2>/dev/null || git log -1 --format=%B HEAD)
+          fi
+
+          if printf '%s\n' "$bodies" | grep -qiE "$pattern"; then
+            echo "Claude co-author/session trailers are not allowed:"
+            printf '%s\n' "$bodies" | grep -niE "$pattern" || true
+            exit 1
+          fi
+
+          echo "OK: no Claude co-author trailers in $range"
