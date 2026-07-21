@@ -3,7 +3,7 @@
 # .github/workflows/build-linux.yml / build-macos.yml and installs it.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/multi_media_main/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash
 #
 # Env overrides:
 #   SNAPFLOW_VERSION   release tag to install (default: latest)
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-REPO="Shaik-Sirajuddin/multi_media_main"
+REPO="Shaik-Sirajuddin/snapflow"
 VERSION="${SNAPFLOW_VERSION:-latest}"
 INSTALL_DIR="${SNAPFLOW_INSTALL_DIR:-$HOME/.local/share/snapflow}"
 BIN_DIR="${SNAPFLOW_BIN_DIR:-$HOME/.local/bin}"

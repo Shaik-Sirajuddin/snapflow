@@ -1,6 +1,6 @@
-[![build-linux](https://github.com/Shaik-Sirajuddin/multi_media_main/actions/workflows/build-linux.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/multi_media_main/actions/workflows/build-linux.yml)
-[![build-macos](https://github.com/Shaik-Sirajuddin/multi_media_main/actions/workflows/build-macos.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/multi_media_main/actions/workflows/build-macos.yml)
-[![build-windows](https://github.com/Shaik-Sirajuddin/multi_media_main/actions/workflows/build-windows.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/multi_media_main/actions/workflows/build-windows.yml)
+[![build-linux](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-linux.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-linux.yml)
+[![build-macos](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-macos.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-macos.yml)
+[![build-windows](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-windows.yml/badge.svg)](https://github.com/Shaik-Sirajuddin/snapflow/actions/workflows/build-windows.yml)
 
 # Snapflow
 
@@ -78,11 +78,11 @@ One command installs everything — the `snapflow` editor and the `snapshotd` ag
 daemon it talks to:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/multi_media_main/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash
 ```
 
 This detects your OS/arch, downloads the matching release bundle from
-[Releases](https://github.com/Shaik-Sirajuddin/multi_media_main/releases), verifies its
+[Releases](https://github.com/Shaik-Sirajuddin/snapflow/releases), verifies its
 checksum, and installs both `snapflow` and `snapshotd` (on macOS, `Snapflow.app` is also
 installed to `/Applications`). Linux and macOS (x86_64) are supported today; Windows
 builds are in progress. See [scripts/install.sh](scripts/install.sh) for details/env
