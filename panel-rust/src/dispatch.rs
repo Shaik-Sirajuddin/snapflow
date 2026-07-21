@@ -313,13 +313,19 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
         ..crate::msg::FrameInput::default()
     });
 
-    if let Some(filtered_idx) = panel
+    // Bind the lookup result to a local *before* the `if let` body so the
+    // `panel.model.borrow()` temporary is dropped here rather than being held
+    // for the whole block -- dispatch_thread_selected() re-enters via
+    // update_persistent()'s `borrow_mut()`, which would otherwise panic with
+    // "RefCell already borrowed" (only reachable once a prior thread exists,
+    // so the new row lands in visible_indices and this branch is taken).
+    let filtered_idx = panel
         .model
         .borrow()
         .visible_indices
         .iter()
-        .position(|idx| *idx == real_idx)
-    {
+        .position(|idx| *idx == real_idx);
+    if let Some(filtered_idx) = filtered_idx {
         dispatch_thread_selected(panel, filtered_idx);
     }
 }
