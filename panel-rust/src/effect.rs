@@ -46,6 +46,12 @@ pub enum Effect {
     CloseThread {
         real_index: usize,
     },
+    PersistSelectedThread {
+        thread_id: String,
+    },
+    ToggleBackground {
+        real_index: usize,
+    },
     DeleteThread {
         real_index: usize,
     },

@@ -21,6 +21,7 @@ mod dirty;
 mod dispatch;
 mod editor_detect;
 mod effect;
+mod effect_executor;
 mod external_snapshot;
 pub mod gateway_actor;
 pub mod jsonl_store;
@@ -82,59 +83,6 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
 /// work by the time `text()` is populated). Returns `None` for pure
 /// modifier presses (empty text, no special mapping) which Slint doesn't
 /// need forwarded as a `KeyPressed`/`KeyReleased` text event.
-/// Wraps `current + delta` into `0..visible_len`, both directions. Pulled
-/// out of `on_thread_navigation_requested` as a pure function so the
-/// clamp/wrap behavior (empty list, single-thread no-op, negative wrap,
-/// overflow wrap) is unit-testable without a full `PanelSingleton`. Returns
-/// `0` for `visible_len == 0` -- `rem_euclid` panics on a zero divisor, and
-/// a `debug_assert` alone would let that reach a release build, so this is
-/// a real guard, not just documentation, even though today's only caller
-/// already checks `visible_len` first.
-fn wrap_thread_index(current: usize, delta: i32, visible_len: usize) -> usize {
-    if visible_len == 0 {
-        return 0;
-    }
-    ((current as i64 + delta as i64).rem_euclid(visible_len as i64)) as usize
-}
-
-#[cfg(test)]
-mod thread_navigation_tests {
-    use super::wrap_thread_index;
-
-    #[test]
-    fn next_advances_by_one() {
-        assert_eq!(wrap_thread_index(0, 1, 3), 1);
-        assert_eq!(wrap_thread_index(1, 1, 3), 2);
-    }
-
-    #[test]
-    fn previous_retreats_by_one() {
-        assert_eq!(wrap_thread_index(2, -1, 3), 1);
-    }
-
-    #[test]
-    fn next_wraps_past_the_end() {
-        assert_eq!(wrap_thread_index(2, 1, 3), 0);
-    }
-
-    #[test]
-    fn previous_wraps_before_the_start() {
-        assert_eq!(wrap_thread_index(0, -1, 3), 2);
-    }
-
-    #[test]
-    fn single_thread_is_a_no_op_either_direction() {
-        assert_eq!(wrap_thread_index(0, 1, 1), 0);
-        assert_eq!(wrap_thread_index(0, -1, 1), 0);
-    }
-
-    #[test]
-    fn empty_list_does_not_panic() {
-        assert_eq!(wrap_thread_index(0, 1, 0), 0);
-        assert_eq!(wrap_thread_index(5, -1, 0), 0);
-    }
-}
-
 /// Maps a bare `Qt::Key_Shift/Control/Meta/Alt` code to Slint's matching
 /// `Key`. Shared between `map_qt_key`'s press-side special-case table and
 /// `panel_rust_input_key`'s release handling -- see the doc comments at
@@ -430,14 +378,6 @@ fn save_panel_prefs_to_json(
     doc.background_session_default = Some(defaults.background_session);
     doc.default_agent_id = default_agent_id;
     settings_file::save_document(path, &doc).map_err(|error| error.to_string())
-}
-
-fn provider_for_default_agent(agent_id: &str) -> Option<&str> {
-    match agent_id {
-        "codex" => Some("codex"),
-        "claude" | "claude-code" => Some("claude"),
-        _ => None,
-    }
 }
 
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
@@ -883,60 +823,6 @@ impl PanelSingleton {
             .copied()
     }
 
-    /// `dispatch.rs`'s Thread-domain wrappers use the current Slint-side
-    /// filtered selection before calling the persistent reducer.
-    /// Mirrors `real_idx`'s `thread_errors` slot (already populated by
-    /// `AgentEvent::Error` -- see that arm's own comment) into the
-    /// `last-error` property `chat_area.slint`'s banner reads, so a send/
-    /// session-attach failure becomes visible in the transcript itself,
-    /// not only as the sidebar's "Error: ..." subtitle in the thread-list
-    /// projection -- that subtitle is easy to miss
-    /// entirely while looking at the message view, which is exactly the
-    /// "sent a message, saw nothing happen" symptom this closes.
-    /// Single entry point for "make `filtered_idx` (a Slint filtered-list
-    /// index, same space as `thread-selected`/`get_selected_thread`) the
-    /// displayed thread": clamps against `visible_indices`, updates the
-    /// Slint `selected-thread` property, persists the choice, and refreshes
-    /// messages/capabilities/settings lists. Sidebar clicks (`on_thread_
-    /// selected` below) and keyboard cycling (`on_thread_navigation_
-    /// requested`) both call this so selection behavior can't drift between
-    /// the two entry points. No-op (returns `false`) when the visible list
-    /// is empty.
-    // `pub(crate)`, not private: `dispatch.rs`'s Thread-domain wrappers
-    // (tea-slint-model Phase 4) call this directly -- see that module's
-    // doc comment for why the actual persist+refresh cascade stays here
-    // rather than being reimplemented against `Model`, which doesn't yet
-    // own bridge/store data (that's Phase 5+ scope).
-    pub(crate) fn select_visible_thread(&self, filtered_idx: usize) -> bool {
-        let visible_len = self.model.borrow().visible_indices.len();
-        if visible_len == 0 {
-            return false;
-        }
-        let clamped_idx = filtered_idx.min(visible_len - 1);
-        let Some(real_idx) = self.real_index(clamped_idx) else {
-            return false;
-        };
-        if let (Some(store), Some(binding)) = (
-            self.panel_state.as_ref(),
-            self.bridge
-                .as_ref()
-                .and_then(|bridge| bridge.thread_binding(real_idx)),
-        ) {
-            if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
-                eprintln!("panel-rust: failed to persist selected chat thread: {error}");
-            }
-        }
-        self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
-            settings_gateway_snapshot: self
-                .component
-                .get_settings_open()
-                .then(|| self.collect_settings_gateway_snapshot()),
-            ..msg::FrameInput::default()
-        });
-        true
-    }
-
     /// `dispatch.rs`'s Compose-domain wrapper (tea-slint-model Phase 4)
     /// calls this -- extracted verbatim from the former
     /// `on_send_requested` closure body, see that module's doc comment
@@ -965,7 +851,10 @@ impl PanelSingleton {
                 raw_output: None,
             },
         );
-        self.dispatch_frame_input(msg::FrameInput { thread_list_snapshot: Some(self.collect_thread_list_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            thread_list_snapshot: Some(self.collect_thread_list_snapshot()),
+            ..msg::FrameInput::default()
+        });
         if Some(idx) == self.real_index(self.component.get_selected_thread() as usize) {
             self.dispatch_frame_input(msg::FrameInput {
                 selected_thread_snapshot: self.collect_thread_snapshot_for(idx),
@@ -979,7 +868,9 @@ impl PanelSingleton {
     /// Executes the bridge side of the cancellation effect. State
     /// transitions are owned by `update()`.
     pub(crate) fn execute_cancel_generation_real(&self, real_idx: usize) {
-        self.bridge.as_ref().map(|bridge| bridge.cancel_prompt(real_idx));
+        self.bridge
+            .as_ref()
+            .map(|bridge| bridge.cancel_prompt(real_idx));
     }
 
     /// Answers the currently-displayed thread's first pending request
@@ -1074,13 +965,24 @@ impl PanelSingleton {
     /// `on_dev_mode_toggled` closure bodies.
     pub(crate) fn dispatch_settings_requested(&self, component: &ChatPanel) {
         let _ = component;
-        self.dispatch_frame_input(msg::FrameInput { settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(None)), ..msg::FrameInput::default() });
-        self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(None)),
+            ..msg::FrameInput::default()
+        });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn dispatch_settings_scope_changed(&self, component: &ChatPanel, scope: &str) {
         let _ = component;
-        self.dispatch_frame_input(msg::FrameInput { settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(Some(scope))), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_preferences_snapshot: Some(
+                self.collect_settings_preferences_snapshot(Some(scope)),
+            ),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn execute_settings_save(
@@ -1125,8 +1027,14 @@ impl PanelSingleton {
                 }
             }
         }
-        self.dispatch_frame_input(msg::FrameInput { settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(None)), ..msg::FrameInput::default() });
-        self.dispatch_frame_input(msg::FrameInput { thread_list_snapshot: Some(self.collect_thread_list_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_preferences_snapshot: Some(self.collect_settings_preferences_snapshot(None)),
+            ..msg::FrameInput::default()
+        });
+        self.dispatch_frame_input(msg::FrameInput {
+            thread_list_snapshot: Some(self.collect_thread_list_snapshot()),
+            ..msg::FrameInput::default()
+        });
         Ok(())
     }
 
@@ -1144,14 +1052,20 @@ impl PanelSingleton {
         };
         let gw = self.settings_gateway_index();
         bridge.create_mcp_server(gw, entry);
-        self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn dispatch_mcp_server_delete(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         bridge.delete_mcp_server(gw, name);
-        self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn dispatch_mcp_server_enabled_changed(
@@ -1171,7 +1085,10 @@ impl PanelSingleton {
                 "panel-rust: MCP server {:?} disappeared before its enabled state could update",
                 name
             );
-            self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+            self.dispatch_frame_input(msg::FrameInput {
+                settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+                ..msg::FrameInput::default()
+            });
             return;
         };
         entry.extra["enabled"] = serde_json::Value::Bool(enabled);
@@ -1181,7 +1098,10 @@ impl PanelSingleton {
                 name
             );
         }
-        self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn dispatch_profile_create(
@@ -1203,21 +1123,30 @@ impl PanelSingleton {
         }
         let gw = self.settings_gateway_index();
         bridge.create_profile(gw, entry);
-        self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn dispatch_profile_delete(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         bridge.delete_profile(gw, name);
-        self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn dispatch_agent_install_requested(&self, _component: &ChatPanel, agent_id: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         bridge.install_agent(gw, agent_id);
-        self.dispatch_frame_input(msg::FrameInput { settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            settings_gateway_snapshot: Some(self.collect_settings_gateway_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
@@ -1230,7 +1159,10 @@ impl PanelSingleton {
             if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
                 eprintln!("panel-rust: failed to install bundled global skill: {error}");
             }
-            self.dispatch_frame_input(msg::FrameInput { skills_snapshot: Some(self.collect_skills_snapshot()), ..msg::FrameInput::default() });
+            self.dispatch_frame_input(msg::FrameInput {
+                skills_snapshot: Some(self.collect_skills_snapshot()),
+                ..msg::FrameInput::default()
+            });
         }
     }
 
@@ -1289,7 +1221,10 @@ impl PanelSingleton {
         match crate::skills_state::scaffold_new_skill(&dir, name) {
             Ok(skill_dir) => {
                 trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
-                self.dispatch_frame_input(msg::FrameInput { skills_snapshot: Some(self.collect_skills_snapshot()), ..msg::FrameInput::default() });
+                self.dispatch_frame_input(msg::FrameInput {
+                    skills_snapshot: Some(self.collect_skills_snapshot()),
+                    ..msg::FrameInput::default()
+                });
                 self.open_skill_editor(&skill_dir);
             }
             Err(error) => {
@@ -1325,110 +1260,34 @@ impl PanelSingleton {
         }
     }
 
-    /// `dispatch.rs`'s Chrome-domain wrappers (tea-slint-model Phase 4)
-    /// call these -- extracted verbatim from the former `on_error_
-    /// banner_dismissed`/`on_thread_toggle_background`/`on_search_*`/
-    /// `on_toggle_expanded` closure bodies.
-    pub(crate) fn dispatch_thread_toggle_background(&self, slint_index: usize) {
-        let Some(store) = self.panel_state.as_ref() else {
-            return;
+    pub(crate) fn open_skill_search_result(&self, query: &str, show_global: bool) {
+        let needle = query.trim().to_lowercase();
+        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        let mut entries = if show_global {
+            crate::skills_state::scan_skills_dir(
+                &global_dir,
+                crate::skills_state::SkillScope::Global,
+            )
+        } else {
+            Vec::new()
         };
-        let Some(thread_id) = self.real_index(slint_index).and_then(|idx| {
-            self.bridge
-                .as_ref()
-                .and_then(|bridge| bridge.thread_binding(idx))
-                .map(|binding| binding.thread_id)
-        }) else {
-            return;
-        };
-        let next = !store
-            .effective_background_session(&thread_id)
-            .unwrap_or(false);
-        if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
-            eprintln!("panel-rust: failed to toggle background-session override: {error}");
-            return;
-        }
-        self.dispatch_frame_input(msg::FrameInput { thread_list_snapshot: Some(self.collect_thread_list_snapshot()), ..msg::FrameInput::default() });
-    }
-
-    pub(crate) fn dispatch_search_changed(&self, _component: &ChatPanel, _query: &str) {
-        self.dispatch_frame_input(msg::FrameInput { thread_list_snapshot: Some(self.collect_thread_list_snapshot()), ..msg::FrameInput::default() });
-        match self.real_index(0) {
-            Some(real_idx) => {
-                self.dispatch_frame_input(msg::FrameInput {
-                    selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
-                    ..msg::FrameInput::default()
-                });
-            }
-            None => {
-                self.dispatch_frame_input(msg::FrameInput {
-                    clear_selected_thread: true,
-                    ..msg::FrameInput::default()
-                });
+        let active_project_path = self.model.borrow().active_project_path.clone();
+        if let Some(project_path) = active_project_path.as_ref() {
+            if let Some(project_dir) = std::path::Path::new(project_path).parent() {
+                entries.extend(crate::skills_state::scan_skills_dir(
+                    &crate::skills_state::project_skills_dir(project_dir),
+                    crate::skills_state::SkillScope::Project,
+                ));
             }
         }
-    }
-
-    pub(crate) fn dispatch_search_submitted(
-        &self,
-        _component: &ChatPanel,
-        query: &str,
-        search_skills: bool,
-        show_global: bool,
-    ) {
-        if search_skills {
-            let needle = query.trim().to_lowercase();
-            let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-            let mut entries = if show_global {
-                crate::skills_state::scan_skills_dir(
-                    &global_dir,
-                    crate::skills_state::SkillScope::Global,
-                )
-            } else {
-                Vec::new()
-            };
-            let active_project_path = self.model.borrow().active_project_path.clone();
-            if let Some(project_path) = active_project_path.as_ref() {
-                if let Some(project_dir) = std::path::Path::new(project_path).parent() {
-                    entries.extend(crate::skills_state::scan_skills_dir(
-                        &crate::skills_state::project_skills_dir(project_dir),
-                        crate::skills_state::SkillScope::Project,
-                    ));
-                }
-            }
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
-            if let Some(entry) = entries.into_iter().find(|entry| {
-                needle.is_empty()
-                    || entry.name.to_lowercase().contains(&needle)
-                    || entry.description.to_lowercase().contains(&needle)
-            }) {
-                self.open_skill_editor(&entry.path);
-            }
-            return;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(entry) = entries.into_iter().find(|entry| {
+            needle.is_empty()
+                || entry.name.to_lowercase().contains(&needle)
+                || entry.description.to_lowercase().contains(&needle)
+        }) {
+            self.open_skill_editor(&entry.path);
         }
-
-        self.dispatch_frame_input(msg::FrameInput { thread_list_snapshot: Some(self.collect_thread_list_snapshot()), ..msg::FrameInput::default() });
-        let Some(real_idx) = self.real_index(0) else {
-            self.dispatch_frame_input(msg::FrameInput {
-                clear_selected_thread: true,
-                ..msg::FrameInput::default()
-            });
-            return;
-        };
-        if let (Some(store), Some(binding)) = (
-            self.panel_state.as_ref(),
-            self.bridge
-                .as_ref()
-                .and_then(|bridge| bridge.thread_binding(real_idx)),
-        ) {
-            if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
-                eprintln!("panel-rust: failed to persist search-selected chat thread: {error}");
-            }
-        }
-        self.dispatch_frame_input(msg::FrameInput {
-            selected_thread_snapshot: self.collect_thread_snapshot_for(real_idx),
-            ..msg::FrameInput::default()
-        });
     }
 
     /// Executes the bridge-side half of `Effect::SetActiveProjectPath`.
@@ -1438,7 +1297,10 @@ impl PanelSingleton {
         if let Some(bridge) = self.bridge.as_ref() {
             bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
         }
-        self.dispatch_frame_input(msg::FrameInput { skills_snapshot: Some(self.collect_skills_snapshot()), ..msg::FrameInput::default() });
+        self.dispatch_frame_input(msg::FrameInput {
+            skills_snapshot: Some(self.collect_skills_snapshot()),
+            ..msg::FrameInput::default()
+        });
     }
 
     /// Collects non-destructive external snapshots for one frame tick.
@@ -1829,9 +1691,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             thread_ids: restored_records
                 .iter()
                 .map(|record| record.thread_id.clone())
-                .chain((restored_records.len()..initial_specs.len()).map(|idx| {
-                    format!("thread:{idx}")
-                }))
+                .chain(
+                    (restored_records.len()..initial_specs.len())
+                        .map(|idx| format!("thread:{idx}")),
+                )
                 .collect(),
             selected_thread_id: initial_selected_thread_id.clone(),
             permission_profiles: initial_permission_profiles.clone(),
@@ -1880,9 +1743,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 thread_ids: restored_records
                     .iter()
                     .map(|record| record.thread_id.clone())
-                    .chain((restored_records.len()..initial_specs.len()).map(|idx| {
-                        format!("thread:{idx}")
-                    }))
+                    .chain(
+                        (restored_records.len()..initial_specs.len())
+                            .map(|idx| format!("thread:{idx}")),
+                    )
                     .collect(),
                 selected_thread_id: initial_selected_thread_id.clone(),
                 permission_profiles: initial_permission_profiles.clone(),
@@ -1968,7 +1832,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
                 eprintln!("panel-rust: failed to install bundled global skill at startup: {error}");
             }
-            panel.dispatch_frame_input(crate::msg::FrameInput { skills_snapshot: Some(panel.collect_skills_snapshot()), ..crate::msg::FrameInput::default() });
+            panel.dispatch_frame_input(crate::msg::FrameInput {
+                skills_snapshot: Some(panel.collect_skills_snapshot()),
+                ..crate::msg::FrameInput::default()
+            });
         }
         if let Some(real_idx) = panel.real_index(panel.component.get_selected_thread() as usize) {
             panel.dispatch_frame_input(crate::msg::FrameInput {
@@ -1982,11 +1849,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         }
 
-        // tea-slint-model Phase 4 (Thread domain, first live cutover):
-        // routed through Msg::Ui(UiMsg::Thread(..)) -> update() ->
-        // dispatch's bridge into the existing select_visible_thread
-        // cascade -- see dispatch.rs's doc comment for why this is a
-        // bridge rather than a full Model-owned rewrite yet.
+        // Thread callbacks enter through Msg::Ui(UiMsg::Thread(..)).
         let component_weak = panel.component.as_weak();
         panel.component.on_thread_selected(move |idx| {
             let Some(_component) = component_weak.upgrade() else {
@@ -3350,8 +3213,8 @@ mod keyboard_shortcut_tests {
         /// Sets the Slint `threads` model *and* the Rust-side `visible_
         /// indices` it's paired with in real production code (the model
         /// projection updates both together next
-        /// to its own `set_threads` call) -- `select_visible_thread` clamps
-        /// against `visible_indices`, not the Slint model, so setting only
+        /// to its own `set_threads` call) -- the dispatcher clamps against
+        /// `visible_indices`, not the Slint model, so setting only
         /// `threads` directly (bypassing the real bridge-driven population
         /// pipeline this test doesn't spin up) would leave it stale/empty
         /// and silently break navigation.
@@ -3450,7 +3313,7 @@ mod keyboard_shortcut_tests {
     /// -> `panel-keys`/composer `panel-shortcut` re-dispatch ->
     /// `handle-panel-shortcut` -> `thread-navigation-requested`/`open-
     /// thread-search` -> the real `on_thread_navigation_requested`/`on_
-    /// thread_selected` Rust handlers -> `select_visible_thread`.
+    /// thread_selected` Rust handlers -> reducer/dispatcher selection.
     #[test]
     fn ctrl_alt_arrows_and_ctrl_k_work_through_the_real_input_key_bridge() {
         let panel = TestPanel::new();

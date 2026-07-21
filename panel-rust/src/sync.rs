@@ -601,17 +601,9 @@ mod tests {
         });
         *model.message_model_keys.borrow_mut() = vec!["assistant:shared-id".to_owned()];
 
-        apply_message_streaming(
-            &model,
-            "background-thread",
-            "shared-id",
-            " must not appear",
-        );
+        apply_message_streaming(&model, "background-thread", "shared-id", " must not appear");
 
-        assert_eq!(
-            model.messages_model.row_data(0).unwrap().text,
-            "displayed"
-        );
+        assert_eq!(model.messages_model.row_data(0).unwrap().text, "displayed");
     }
 
     #[test]

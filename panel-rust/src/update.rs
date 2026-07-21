@@ -4,8 +4,7 @@
 //!
 //! **Status: live through dispatchers.** Slint callbacks, selected FFI entry
 //! points, cold-start hydration, and the frame tick call this reducer.
-//! Returned effects are still delegated synchronously to proven bridge
-//! methods while the standalone effect executor is completed.
+//! Returned effects are executed by the dedicated effect executor.
 //!
 //! The top-level `match` below is intentionally exhaustive with **no
 //! wildcard arm** -- see 00-plan.md's "Exhaustiveness requirement": a
@@ -42,13 +41,8 @@ fn update_ui(model: &mut Model, msg: UiMsg) -> (Vec<Effect>, Vec<Dirty>) {
     }
 }
 
-/// Ported verbatim from `lib.rs`'s pre-existing `wrap_thread_index` (kept
-/// there too, unchanged, for the not-yet-migrated closure that still
-/// calls it directly -- see that function's own doc comment). Duplicated
-/// rather than `pub(crate) use`d across the module boundary for now to
-/// avoid widening `lib.rs`'s private surface before Phase 4 actually
-/// deletes the original call site; Phase 7 (`remove_superseded_code`)
-/// collapses this back to one definition once the old closure is gone.
+/// Wrap a visible-list selection using the same behavior as the original
+/// keyboard navigation path.
 fn wrap_thread_index(current: usize, delta: i32, visible_len: usize) -> usize {
     if visible_len == 0 {
         return 0;
@@ -211,10 +205,8 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             )
         }
         ThreadMsg::Selected(idx) => {
-            // Clamp, don't no-op, to match the real
-            // `select_visible_thread`'s own `filtered_idx.min(visible_len
-            // - 1)` -- an out-of-range idx still selects the last thread
-            // rather than being silently ignored.
+            // Clamp, don't no-op: an out-of-range index still selects the
+            // last thread rather than being silently ignored.
             let visible_len = if model.visible_indices.is_empty() {
                 model.threads.len()
             } else {
@@ -224,7 +216,21 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 return (vec![], vec![]);
             }
             model.selected_thread = idx.min(visible_len - 1);
-            (vec![], vec![Dirty::Scalar(ScalarField::SelectedThread)])
+            let real_idx = model
+                .visible_indices
+                .get(model.selected_thread)
+                .copied()
+                .unwrap_or(model.selected_thread);
+            let thread_id = model
+                .threads
+                .get(real_idx)
+                .map(|thread| thread.thread_id.clone());
+            (
+                thread_id
+                    .map(|thread_id| vec![Effect::PersistSelectedThread { thread_id }])
+                    .unwrap_or_default(),
+                vec![Dirty::Scalar(ScalarField::SelectedThread)],
+            )
         }
         ThreadMsg::NavigateDelta(delta) => {
             let visible_len = if model.visible_indices.is_empty() {
@@ -237,7 +243,21 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             }
             let next = wrap_thread_index(model.selected_thread, delta, visible_len);
             model.selected_thread = next;
-            (vec![], vec![Dirty::Scalar(ScalarField::SelectedThread)])
+            let real_idx = model
+                .visible_indices
+                .get(model.selected_thread)
+                .copied()
+                .unwrap_or(model.selected_thread);
+            let thread_id = model
+                .threads
+                .get(real_idx)
+                .map(|thread| thread.thread_id.clone());
+            (
+                thread_id
+                    .map(|thread_id| vec![Effect::PersistSelectedThread { thread_id }])
+                    .unwrap_or_default(),
+                vec![Dirty::Scalar(ScalarField::SelectedThread)],
+            )
         }
         ThreadMsg::CloseRequested(idx) => {
             let Some(thread) = model.threads.get_mut(idx) else {
@@ -288,7 +308,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 return (vec![], vec![]);
             }
             (
-                vec![Effect::PersistThread { real_index: idx }],
+                vec![Effect::ToggleBackground { real_index: idx }],
                 vec![Dirty::ThreadRow(idx)],
             )
         }
@@ -365,9 +385,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     text,
                 }],
                 vec![
-                    Dirty::Connection {
-                        thread_id,
-                    },
+                    Dirty::Connection { thread_id },
                     Dirty::Scalar(ScalarField::ComposeText),
                 ],
             )
@@ -496,10 +514,7 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.settings_open = false;
             (
                 vec![Effect::SaveSettings { input }],
-                vec![
-                    Dirty::Settings,
-                    Dirty::Scalar(ScalarField::SettingsOpen),
-                ],
+                vec![Dirty::Settings, Dirty::Scalar(ScalarField::SettingsOpen)],
             )
         }
         SettingsMsg::ScopeChanged(scope) => {
@@ -1069,11 +1084,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         if model.displayed_thread.take().is_some() || !old_keys.is_empty() {
             dirty.push(Dirty::MessagesDiff {
                 thread_id: String::new(),
-                ops: crate::dirty::diff_by_id(
-                    &old_keys,
-                    &[],
-                    &Vec::<crate::MessageItem>::new(),
-                ),
+                ops: crate::dirty::diff_by_id(&old_keys, &[], &Vec::<crate::MessageItem>::new()),
             });
         }
     }
@@ -1168,8 +1179,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             model.displayed_thread = Some(target_index);
         }
         let transcript_row_count =
-            crate::models::to_message_rows_from_transcript(snapshot.transcript.clone(), &[])
-                .len();
+            crate::models::to_message_rows_from_transcript(snapshot.transcript.clone(), &[]).len();
         if model.expanded.len() < transcript_row_count {
             model.expanded.resize(transcript_row_count, false);
         }
@@ -1343,7 +1353,10 @@ mod tests {
                 "/tmp/project.mlt".to_owned(),
             ))),
         );
-        assert_eq!(model.active_project_path.as_deref(), Some("/tmp/project.mlt"));
+        assert_eq!(
+            model.active_project_path.as_deref(),
+            Some("/tmp/project.mlt")
+        );
         assert_eq!(
             effects,
             vec![Effect::SetActiveProjectPath {
@@ -1352,21 +1365,23 @@ mod tests {
         );
         assert_eq!(
             dirty,
-            vec![
-                Dirty::ProjectPath,
-                Dirty::SkillsListDiff(Vec::new())
-            ]
+            vec![Dirty::ProjectPath, Dirty::SkillsListDiff(Vec::new())]
         );
     }
 
     #[test]
     fn thread_selected_out_of_range_clamps_to_the_last_thread() {
-        // Matches the real select_visible_thread's own
-        // `filtered_idx.min(visible_len - 1)` clamping -- not a no-op.
+        // Matches the dispatcher contract: out-of-range selection clamps
+        // to the last visible thread rather than becoming a no-op.
         let mut model = model_with_threads(&["a", "b"]);
         let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(5))));
         assert_eq!(model.selected_thread, 1);
-        assert!(effects.is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::PersistSelectedThread {
+                thread_id: "thread-1".to_owned()
+            }]
+        );
         assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
     }
 
@@ -1404,6 +1419,19 @@ mod tests {
         assert!(model.threads[0].closed);
         assert_eq!(effects, vec![Effect::CloseThread { real_index: 0 }]);
         assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
+    }
+
+    #[test]
+    fn selecting_a_thread_emits_one_persistence_effect() {
+        let mut model = model_with_threads(&["a", "b"]);
+        let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+        assert_eq!(
+            effects,
+            vec![Effect::PersistSelectedThread {
+                thread_id: "thread-1".to_owned()
+            }]
+        );
+        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
     }
 
     #[test]
@@ -1729,8 +1757,10 @@ mod tests {
             font_scale: 1.25,
             density: 1.1,
         }));
-        let (effects, dirty) =
-            update(&mut model, Msg::Host(HostMsg::AppearanceChanged(appearance)));
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Host(HostMsg::AppearanceChanged(appearance)),
+        );
         assert!(effects.is_empty());
         assert_eq!(model.theme_variant, "light");
         assert_eq!(dirty, vec![Dirty::Appearance]);
