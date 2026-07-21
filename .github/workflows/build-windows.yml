@@ -73,7 +73,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: snapshotd/go.mod
-      - run: go build -o dist/snapshotd.exe ./cmd/snapshotd
+      # Binary is named snapflowd (not snapshotd) for the installed
+      # product -- avoids colliding with the snapflow editor binary while
+      # keeping the brand name; the Go module/source tree keeps its
+      # existing snapshotd name internally (not a full repo-wide rename).
+      - run: go build -o dist/snapflowd.exe ./cmd/snapshotd
       # Windows AF_UNIX has a much shorter max socket path than Linux; the
       # default runner %TEMP% path is too long once the tests' own random
       # subdirectories are appended (snapshotd's daemon/procmgr/sapproxy
@@ -89,8 +93,8 @@ jobs:
         run: go test ./...
       - uses: actions/upload-artifact@v4
         with:
-          name: snapshotd-windows
-          path: snapshotd/dist/snapshotd.exe
+          name: snapflowd-windows
+          path: snapshotd/dist/snapflowd.exe
 
   shotcut-rebrand:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
@@ -247,7 +251,7 @@ jobs:
           VERSION=$(date +"%y.%-m.%-d")
           OUT="snapflow-windows-x86_64-$VERSION"
           mkdir -p "$OUT/bin"
-          cp dist/snapshotd-windows/snapshotd.exe "$OUT/bin/snapshotd.exe"
+          cp dist/snapflowd-windows/snapflowd.exe "$OUT/bin/snapflowd.exe"
           cp dist/panel-rust-staticlib-windows/panel_rust.lib "$OUT/bin/panel_rust.lib"
           unzip -q dist/shotcut-rebrand-windows/snapflow-win64-*.zip -d "$OUT"
           7z a -tzip "$OUT.zip" "$OUT" >/dev/null

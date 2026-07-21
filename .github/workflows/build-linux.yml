@@ -76,14 +76,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: snapshotd/go.mod
-      - run: go build -o dist/snapshotd ./cmd/snapshotd
+      # Binary is named snapflowd (not snapshotd) for the installed
+      # product -- avoids colliding with the snapflow editor binary while
+      # keeping the brand name; the Go module/source tree keeps its
+      # existing snapshotd name internally (not a full repo-wide rename).
+      - run: go build -o dist/snapflowd ./cmd/snapshotd
       - name: Run go test ./... (advisory -- known flaky/pre-existing failures, see workflow header)
         continue-on-error: true
         run: go test ./...
       - uses: actions/upload-artifact@v4
         with:
-          name: snapshotd-linux-x86_64
-          path: snapshotd/dist/snapshotd
+          name: snapflowd-linux-x86_64
+          path: snapshotd/dist/snapflowd
 
   shotcut-rebrand:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
@@ -165,16 +169,29 @@ jobs:
         with:
           path: dist
 
+      # Desktop-launcher assets (icon + .desktop file) aren't produced by
+      # the shotcut-rebrand build itself -- pull them from source so
+      # install.sh can set up a real application-menu entry.
+      - uses: actions/checkout@v4
+        with:
+          repository: Shaik-Sirajuddin/shotcut
+          ref: rebrand/snapflow
+          path: shotcut-rebrand
+          sparse-checkout: |
+            packaging/linux
+
       - name: Assemble install bundle
         run: |
           set -euo pipefail
           VERSION=$(date +"%y.%-m.%-d")
           OUT="snapflow-linux-x86_64-$VERSION"
-          mkdir -p "$OUT/bin"
-          cp dist/snapshotd-linux-x86_64/snapshotd "$OUT/bin/snapshotd"
-          chmod +x "$OUT/bin/snapshotd"
+          mkdir -p "$OUT/bin" "$OUT/share/applications" "$OUT/share/icons"
+          cp dist/snapflowd-linux-x86_64/snapflowd "$OUT/bin/snapflowd"
+          chmod +x "$OUT/bin/snapflowd"
           tar -xJf dist/shotcut-rebrand-linux-x86_64/snapflow-linux-x86_64-*.txz -C "$OUT"
           cp dist/panel-rust-staticlib/libpanel_rust.a "$OUT/bin/libpanel_rust.a"
+          cp shotcut-rebrand/packaging/linux/org.snapflow.Snapflow.desktop "$OUT/share/applications/"
+          cp shotcut-rebrand/packaging/linux/icons/128x128/org.snapflow.Snapflow.png "$OUT/share/icons/"
           tar -czf "$OUT.tar.gz" "$OUT"
           sha256sum "$OUT.tar.gz" > "$OUT.tar.gz.sha256"
 

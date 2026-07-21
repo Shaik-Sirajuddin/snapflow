@@ -74,7 +74,7 @@ Use Snapflow itself as an MCP server so other agents/tools can drive the editor:
 
 ## Install
 
-One command installs everything — the `snapflow` editor and the `snapshotd` agent
+One command installs everything — the `snapflow` editor and the `snapflowd` agent
 daemon it talks to:
 
 ```sh
@@ -82,11 +82,12 @@ curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scri
 ```
 
 This detects your OS/arch, downloads the matching release bundle from
-[Releases](https://github.com/Shaik-Sirajuddin/snapflow/releases), verifies its
-checksum, and installs both `snapflow` and `snapshotd` (on macOS, `Snapflow.app` is also
-installed to `/Applications`). Linux and macOS (x86_64) are supported today; Windows
-builds are in progress. See [scripts/install.sh](scripts/install.sh) for details/env
-overrides, or grab a release archive manually from the Releases page.
+[Releases](https://github.com/Shaik-Sirajuddin/snapflow/releases) with a live progress
+bar, verifies its checksum, and installs both `snapflow` and `snapflowd` (on Linux, a
+desktop launcher entry is also added to your applications menu; on macOS,
+`Snapflow.app` is installed to `/Applications`). Linux and macOS (x86_64) are supported
+today; Windows builds are in progress. See [scripts/install.sh](scripts/install.sh) for
+details/env overrides, or grab a release archive manually from the Releases page.
 
 To build from source instead, see "How to build" below.
 

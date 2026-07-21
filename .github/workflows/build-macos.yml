@@ -65,7 +65,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: snapshotd/go.mod
-      - run: go build -o dist/snapshotd ./cmd/snapshotd
+      # Binary is named snapflowd (not snapshotd) for the installed
+      # product -- avoids colliding with the snapflow editor binary while
+      # keeping the brand name; the Go module/source tree keeps its
+      # existing snapshotd name internally (not a full repo-wide rename).
+      - run: go build -o dist/snapflowd ./cmd/snapshotd
       # macOS's default TMPDIR (/var/folders/<xx>/<hash>/T/) is long enough
       # that once the tests' own random subdirectories are appended, real
       # AF_UNIX sockets bound under a temp RunDir (daemon/procmgr/sapproxy
@@ -80,8 +84,8 @@ jobs:
         run: go test ./...
       - uses: actions/upload-artifact@v4
         with:
-          name: snapshotd-macos
-          path: snapshotd/dist/snapshotd
+          name: snapflowd-macos
+          path: snapshotd/dist/snapflowd
 
   shotcut-rebrand:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
@@ -173,8 +177,8 @@ jobs:
           VERSION=$(date +"%y.%-m.%-d")
           OUT="snapflow-macos-$VERSION"
           mkdir -p "$OUT/bin"
-          cp dist/snapshotd-macos/snapshotd "$OUT/bin/snapshotd"
-          chmod +x "$OUT/bin/snapshotd"
+          cp dist/snapflowd-macos/snapflowd "$OUT/bin/snapflowd"
+          chmod +x "$OUT/bin/snapflowd"
           cp dist/panel-rust-staticlib-macos/libpanel_rust.a "$OUT/bin/libpanel_rust.a"
           cp dist/shotcut-rebrand-macos/snapflow-macos-unsigned-*.dmg "$OUT/"
           tar -czf "$OUT.tar.gz" "$OUT"

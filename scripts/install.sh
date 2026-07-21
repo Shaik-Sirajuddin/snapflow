@@ -8,7 +8,7 @@
 # Env overrides:
 #   SNAPFLOW_VERSION   release tag to install (default: latest)
 #   SNAPFLOW_INSTALL_DIR  where the bundle is unpacked (default: ~/.local/share/snapflow)
-#   SNAPFLOW_BIN_DIR      where `snapshotd` is symlinked (default: ~/.local/bin)
+#   SNAPFLOW_BIN_DIR      where `snapflowd`/`snapflow` are symlinked (default: ~/.local/bin)
 
 set -euo pipefail
 
@@ -65,7 +65,11 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 archive="$tmp_dir/$(basename "$asset_url")"
 info "Downloading $(basename "$asset_url")..."
-curl -fsSL "$asset_url" -o "$archive"
+# --progress-bar (not -s) so a live download percentage shows -- this is
+# a multi-hundred-MB bundle (bundled video editor + all its libs), silent
+# felt like a hang. The earlier metadata/API calls above stay silent
+# (-s), they're small and fast.
+curl -fL --progress-bar "$asset_url" -o "$archive"
 
 if curl -fsSL "$sha_url" -o "$archive.sha256" 2>/dev/null; then
   info "Verifying checksum..."
@@ -81,8 +85,10 @@ mkdir -p "$INSTALL_DIR"
 tar -xzf "$archive" -C "$INSTALL_DIR" --strip-components=1
 
 mkdir -p "$BIN_DIR"
-ln -sf "$INSTALL_DIR/bin/snapshotd" "$BIN_DIR/snapshotd"
-info "Linked snapshotd -> $BIN_DIR/snapshotd"
+# Renamed from snapshotd -> snapflowd (the video editor binary is itself
+# named snapflow, so the daemon needed a distinct name).
+ln -sf "$INSTALL_DIR/bin/snapflowd" "$BIN_DIR/snapflowd"
+info "Linked snapflowd -> $BIN_DIR/snapflowd"
 
 case "$platform" in
   linux)
@@ -90,6 +96,31 @@ case "$platform" in
     if [ -n "$app_dir" ] && [ -x "$app_dir/bin/snapflow" ]; then
       ln -sf "$app_dir/bin/snapflow" "$BIN_DIR/snapflow"
       info "Linked snapflow -> $BIN_DIR/snapflow"
+    fi
+
+    # Desktop-menu launcher (Applications grid / app search), not just a
+    # CLI symlink. share/applications/*.desktop and share/icons/*.png are
+    # bundled by build-linux.yml's package job.
+    desktop_src="$(find "$INSTALL_DIR/share/applications" -maxdepth 1 -iname '*.desktop' 2>/dev/null | head -n1)"
+    icon_src="$(find "$INSTALL_DIR/share/icons" -maxdepth 1 -iname '*.png' 2>/dev/null | head -n1)"
+    if [ -n "$desktop_src" ]; then
+      apps_dir="$HOME/.local/share/applications"
+      icons_dir="$HOME/.local/share/icons/hicolor/128x128/apps"
+      mkdir -p "$apps_dir" "$icons_dir"
+      icon_name="snapflow"
+      if [ -n "$icon_src" ]; then
+        cp "$icon_src" "$icons_dir/$icon_name.png"
+      fi
+      # Exec= in the shipped .desktop file just says "snapflow" (relies on
+      # PATH); point it at the real installed binary so the launcher works
+      # even if $BIN_DIR isn't on PATH, and Icon= at the name we just
+      # installed under the icon theme dir.
+      sed -e "s|^Exec=.*|Exec=$BIN_DIR/snapflow %F|" \
+          -e "s|^Icon=.*|Icon=$icon_name|" \
+          "$desktop_src" > "$apps_dir/org.snapflow.Snapflow.desktop"
+      info "Installed desktop launcher -> $apps_dir/org.snapflow.Snapflow.desktop"
+      command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
+      command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
     fi
     ;;
   macos)
@@ -110,8 +141,8 @@ case "$platform" in
     ;;
 esac
 
-if ! command -v snapshotd >/dev/null 2>&1; then
-  echo "note: add $BIN_DIR to your PATH to use snapshotd/snapflow from anywhere:" >&2
+if ! command -v snapflowd >/dev/null 2>&1; then
+  echo "note: add $BIN_DIR to your PATH to use snapflowd/snapflow from anywhere:" >&2
   echo "  export PATH=\"$BIN_DIR:\$PATH\"" >&2
 fi
 
