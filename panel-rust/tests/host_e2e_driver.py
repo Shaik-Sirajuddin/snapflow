@@ -195,10 +195,38 @@ def wait_for_attachment(host_log, thread_index=0):
 ATTACHMENT_RE = re.compile(r"panel-rust attachment: thread=([^ ]+) ")
 
 
-def attachment_names(host_log):
-    if host_log is None or not host_log.exists():
+def attachment_log_paths(host_log):
+    """Return the selected host trace and its sibling stdout/stderr log.
+
+    Qt/plugin builds have routed the same panel diagnostics to different
+    streams. The smoke script supplies one stream as --host-log, while the
+    other is retained beside it; attachment readiness must not depend on
+    that implementation detail.
+    """
+    if host_log is None:
         return []
-    return ATTACHMENT_RE.findall(host_log.read_text(errors="replace"))
+    paths = [host_log]
+    suffix_pairs = (
+        (".stdout.log", ".stderr.log"),
+        (".stderr.log", ".stdout.log"),
+    )
+    for source_suffix, sibling_suffix in suffix_pairs:
+        if host_log.name.endswith(source_suffix):
+            sibling = host_log.with_name(
+                host_log.name[: -len(source_suffix)] + sibling_suffix
+            )
+            if sibling != host_log:
+                paths.append(sibling)
+            break
+    return paths
+
+
+def attachment_names(host_log):
+    names = []
+    for path in attachment_log_paths(host_log):
+        if path.exists():
+            names.extend(ATTACHMENT_RE.findall(path.read_text(errors="replace")))
+    return names
 
 
 def known_thread_indices(host_log):
