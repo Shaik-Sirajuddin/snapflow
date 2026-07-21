@@ -36,8 +36,13 @@ jobs:
         working-directory: acpx
         run: cargo build -p acpx-server
       - run: cargo build --release
+      # See build-linux.yml's identical step for why RUST_TEST_THREADS is
+      # capped here (agent_bridge's real-subprocess tests flake under high
+      # test parallelism).
       - name: Run cargo test --release (advisory -- known flaky tests, see workflow header)
         continue-on-error: true
+        env:
+          RUST_TEST_THREADS: "4"
         run: cargo test --release
       - uses: actions/upload-artifact@v4
         with:
