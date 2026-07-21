@@ -123,7 +123,23 @@ jobs:
           ref: rebrand/snapflow
           path: shotcut-rebrand
 
+      # Caches build-shotcut.sh's vendored dependencies (FFmpeg/x264/x265/
+      # libvpx/MLT/movit/etc, compiled from source -- this is the 45-90 min
+      # part) separately from snapflow itself. The cache key is the script's
+      # own hash: any change to it (including a pinned REPOLOCS/*_REVISION
+      # bump) invalidates the cache, so a stale build is never restored --
+      # we just don't pay the vendor-compile cost again when only our own
+      # C++/panel-rust/sap-rust source changed, which is nearly every commit.
+      - name: Cache shotcut-rebrand vendored dependency build
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: shotcut-rebrand/scripts/Snapflow
+          key: shotcut-deps-linux-${{ hashFiles('shotcut-rebrand/scripts/build-snapflow.sh') }}
+
       - name: Build snapflow (from this fork's rebrand/snapflow branch)
+        env:
+          DEPS_CACHE_HIT: ${{ steps.cache-deps.outputs.cache-hit }}
         run: |
           VERSION=$(date +"%y.%-m.%-d")
           echo VERSION=$VERSION
@@ -149,6 +165,7 @@ jobs:
             -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/root/sap-rust-src:ro" \
             -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/root/panel-rust-src:ro" \
             -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/root/acpx-src:ro" \
+            -e "DEPS_CACHE_HIT=$DEPS_CACHE_HIT" \
             "$IMAGE_NAME" \
             -c '
               set -e
@@ -158,6 +175,8 @@ jobs:
               # present in this image by default. panel-rust itself
               # depends on ../acpx/acpx-client, so that whole workspace
               # needs to land at the same relative sibling position too.
+              # Unconditional (cheap local copies) regardless of dep-cache
+              # state, since snapflow itself always needs these siblings.
               mkdir -p /root/shotcut/src
               if [ ! -d /root/shotcut/src/sap-rust ]; then
                 cp -r /root/sap-rust-src /root/shotcut/src/sap-rust
@@ -179,7 +198,16 @@ jobs:
               if ! pkg-config --exists sqlite3 2>/dev/null; then
                 apt-get update -qq && apt-get install -y -qq libsqlite3-dev
               fi
-              exec /root/shotcut/build-shotcut.sh
+              # Vendored deps (FFmpeg/x264/x265/libvpx/MLT/movit/etc) are
+              # the 45-90 min part and rarely change -- skip rebuilding them
+              # entirely on a cache hit (see the actions/cache step above).
+              # snapflow itself is our own source (this checkout + the
+              # sap-rust/panel-rust siblings just copied in) and always
+              # changes, so it always builds fresh, every run, cached or not.
+              if [ "$DEPS_CACHE_HIT" != "true" ]; then
+                SNAPFLOW_DEPS_ONLY=1 /root/shotcut/build-shotcut.sh
+              fi
+              SNAPFLOW_ONLY=1 /root/shotcut/build-shotcut.sh
             '
           mv snapflow.txz "snapflow-linux-x86_64-$FILENAME_VERSION.txz"
 
