@@ -274,6 +274,7 @@ pub enum Dirty {
     Settings,
     SkillsListDiff(Vec<RowOp<crate::SkillOption>>),
     SkillRow(usize),
+    SkillEditor,
     Capabilities {
         thread_id: String,
     },

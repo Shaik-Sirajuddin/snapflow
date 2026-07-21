@@ -71,6 +71,14 @@ pub struct ThreadModel {
     pub config_options: Vec<ConfigOptionInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkillEditorState {
+    pub name: String,
+    pub path: String,
+    pub content: String,
+    pub detected_editors: Vec<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct Model {
     pub threads: Vec<ThreadModel>,
@@ -100,6 +108,11 @@ pub struct Model {
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
+    pub active_skill_name: String,
+    pub active_skill_path: String,
+    pub active_skill_content: String,
+    pub detected_editors: Vec<String>,
+    pub active_pane: String,
     pub skills: Vec<crate::skills_state::SkillEntry>,
     pub thread_rows: Vec<crate::models::VisibleThreadItem>,
     /// Persistent Slint models. `sync()` mutates these in place so row

@@ -606,9 +606,10 @@ fn update_skill(_model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) 
             vec![Dirty::SkillsListDiff(vec![])],
         ),
         SkillMsg::CopyPathRequested { .. } => (vec![], vec![]),
-        SkillMsg::EditorOpenRequested { .. }
-        | SkillMsg::OpenInEditorRequested { .. }
-        | SkillMsg::OpenWithOsDefaultRequested { .. } => (vec![], vec![]),
+        SkillMsg::EditorOpenRequested { path } => (vec![Effect::OpenSkillEditor { path }], vec![]),
+        SkillMsg::OpenInEditorRequested { .. } | SkillMsg::OpenWithOsDefaultRequested { .. } => {
+            (vec![], vec![])
+        }
         SkillMsg::PromoteToGlobal { path } => (
             vec![Effect::SkillPromoteToGlobal { path }],
             vec![Dirty::SkillsListDiff(vec![])],
@@ -862,6 +863,23 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         EffectResultMsg::SkillWritten(Ok(())) | EffectResultMsg::SkillPromoted(Ok(())) => {
             (vec![], vec![])
         }
+        EffectResultMsg::SkillEditorLoaded(Ok(state)) => {
+            model.active_skill_name = state.name;
+            model.active_skill_path = state.path;
+            model.active_skill_content = state.content;
+            model.detected_editors = state.detected_editors;
+            model.active_pane = "skill".to_owned();
+            (vec![], vec![Dirty::SkillEditor])
+        }
+        EffectResultMsg::SkillEditorLoaded(Err(err)) => (
+            vec![],
+            vec![Dirty::Error {
+                thread_id: String::new(),
+                detail: ErrorDetail {
+                    message: err.message,
+                },
+            }],
+        ),
         EffectResultMsg::SkillWritten(Err(err)) | EffectResultMsg::SkillPromoted(Err(err)) => (
             vec![],
             vec![Dirty::Error {

@@ -794,28 +794,6 @@ impl PanelSingleton {
         entries
     }
 
-    /// Loads a discovered skill directory into the editor surface. New skill
-    /// creation and list-row selection share this so a successful scaffold
-    /// always opens the exact file that was written.
-    fn open_skill_editor(&self, skill_dir: &std::path::Path) {
-        let name = skill_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
-        let detected: Vec<slint::SharedString> = crate::editor_detect::detect_installed_editors()
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        crate::sync::sync_skill_editor(
-            &self.component,
-            name.into(),
-            skill_dir.to_string_lossy().into_owned().into(),
-            content.into(),
-            ModelRc::new(VecModel::from(detected)),
-        );
-    }
-
     /// Translates a Slint-side filtered-list index (what `thread-selected`
     /// callbacks and `get_selected_thread()` hand back) into the real
     /// index the agent bridge/`thread_state` use. `None` if out of range
@@ -1231,16 +1209,15 @@ impl PanelSingleton {
                     skills_snapshot: Some(self.collect_skills_snapshot()),
                     ..msg::FrameInput::default()
                 });
-                self.open_skill_editor(&skill_dir);
+                crate::dispatch::dispatch_skill_editor_open_requested(
+                    self,
+                    skill_dir.to_string_lossy().into_owned(),
+                );
             }
             Err(error) => {
                 eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
             }
         }
-    }
-
-    pub(crate) fn dispatch_skill_editor_open_requested(&self, path: &str) {
-        self.open_skill_editor(std::path::Path::new(path));
     }
 
     pub(crate) fn dispatch_skill_copy_path_requested(&self, path: &str) {
@@ -1292,7 +1269,10 @@ impl PanelSingleton {
                 || entry.name.to_lowercase().contains(&needle)
                 || entry.description.to_lowercase().contains(&needle)
         }) {
-            self.open_skill_editor(&entry.path);
+            crate::dispatch::dispatch_skill_editor_open_requested(
+                self,
+                entry.path.to_string_lossy().into_owned(),
+            );
         }
     }
 

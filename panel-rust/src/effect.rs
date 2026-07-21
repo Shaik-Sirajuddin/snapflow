@@ -150,6 +150,9 @@ pub enum Effect {
     SkillPromoteToGlobal {
         path: std::path::PathBuf,
     },
+    OpenSkillEditor {
+        path: std::path::PathBuf,
+    },
     /// Non-Slint-callback: propagate a Shotcut project-path change to the
     /// bridge (`AgentBridge::set_active_project_path` today), then produce
     /// a fresh skills list diff.
@@ -176,6 +179,7 @@ pub enum EffectResultMsg {
     },
     SkillWritten(Result<(), EffectError>),
     SkillPromoted(Result<(), EffectError>),
+    SkillEditorLoaded(Result<crate::model::SkillEditorState, EffectError>),
     /// A streamed token/chunk arriving mid-generation -- not a
     /// completion. See 00-plan.md's stale-target no-op contract: if
     /// `thread_id` no longer exists in `Model`, `update()` must no-op.

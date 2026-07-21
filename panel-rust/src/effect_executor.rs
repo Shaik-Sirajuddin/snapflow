@@ -35,6 +35,38 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                     });
                 });
             }
+            Effect::OpenSkillEditor { path } => {
+                let result = (|| {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let content = std::fs::read_to_string(path.join("SKILL.md"))
+                        .map_err(|error| EffectError::new(error.to_string()))?;
+                    let detected_editors = crate::editor_detect::detect_installed_editors()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect();
+                    Ok(crate::model::SkillEditorState {
+                        name,
+                        path: path.to_string_lossy().into_owned(),
+                        content,
+                        detected_editors,
+                    })
+                })();
+                let _ = slint::invoke_from_event_loop(move || {
+                    crate::PANEL.with(|cell| {
+                        let slot = cell.borrow();
+                        let Some(panel) = slot.as_ref() else {
+                            return;
+                        };
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::SkillEditorLoaded(result)),
+                        );
+                    });
+                });
+            }
             Effect::SkillPromoteToGlobal { path } => {
                 std::thread::spawn(move || {
                     let cache_dir = crate::resolve_cache_dir();
@@ -195,7 +227,9 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 };
                 panel.dispatch_agent_install_requested(&component, &agent_id);
             }
-            Effect::SkillWrite { .. } | Effect::SkillPromoteToGlobal { .. } => {
+            Effect::SkillWrite { .. }
+            | Effect::SkillPromoteToGlobal { .. }
+            | Effect::OpenSkillEditor { .. } => {
                 execute_skill_effects(vec![effect]);
             }
             Effect::SetActiveProjectPath { path } => {

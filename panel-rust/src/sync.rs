@@ -148,6 +148,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 }
             }
         }
+        Dirty::SkillEditor => sync_skill_editor_state(model, component),
         Dirty::Capabilities { thread_id } => {
             if let Some(thread) = thread_for_id(model, thread_id) {
                 component.set_mode_trigger_label(
@@ -165,6 +166,20 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             }
         }
     }
+}
+
+fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
+    component.set_active_skill_name(model.active_skill_name.clone().into());
+    component.set_active_skill_path(model.active_skill_path.clone().into());
+    component.set_active_skill_content(model.active_skill_content.clone().into());
+    let editors = model
+        .detected_editors
+        .iter()
+        .cloned()
+        .map(Into::into)
+        .collect::<Vec<slint::SharedString>>();
+    component.set_detected_editors(slint::ModelRc::new(slint::VecModel::from(editors)));
+    component.set_active_pane(model.active_pane.clone().into());
 }
 
 fn apply_thread_row(model: &Model, real_index: usize) {
@@ -446,20 +461,6 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
 pub(crate) fn sync_geometry(component: &ChatPanel, compact: bool, narrow: bool) {
     component.set_compact(compact);
     component.set_narrow(narrow);
-}
-
-pub(crate) fn sync_skill_editor(
-    component: &ChatPanel,
-    name: slint::SharedString,
-    path: slint::SharedString,
-    content: slint::SharedString,
-    detected_editors: slint::ModelRc<slint::SharedString>,
-) {
-    component.set_active_skill_name(name);
-    component.set_active_skill_path(path);
-    component.set_active_skill_content(content);
-    component.set_detected_editors(detected_editors);
-    component.set_active_pane("skill".into());
 }
 
 pub(crate) fn sync_loading_older(component: &ChatPanel, loading: bool) {

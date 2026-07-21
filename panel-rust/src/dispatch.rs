@@ -849,13 +849,13 @@ pub(crate) fn dispatch_skill_promote_to_global(panel: &PanelSingleton, path: Str
 }
 
 pub(crate) fn dispatch_skill_editor_open_requested(panel: &PanelSingleton, path: String) {
-    let _ = update_persistent(
+    let (effects, _) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::EditorOpenRequested {
             path: path.clone().into(),
         })),
     );
-    panel.dispatch_skill_editor_open_requested(&path);
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_skill_content_edited(panel: &PanelSingleton, path: String, content: String) {
