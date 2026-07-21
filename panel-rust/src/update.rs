@@ -79,10 +79,15 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             )
         }
         ThreadMsg::Selected(idx) => {
-            if idx >= model.threads.len() {
+            // Clamp, don't no-op, to match the real
+            // `select_visible_thread`'s own `filtered_idx.min(visible_len
+            // - 1)` -- an out-of-range idx still selects the last thread
+            // rather than being silently ignored.
+            let visible_len = model.threads.len();
+            if visible_len == 0 {
                 return (vec![], vec![]);
             }
-            model.selected_thread = idx;
+            model.selected_thread = idx.min(visible_len - 1);
             (vec![], vec![Dirty::Scalar(ScalarField::SelectedThread)])
         }
         ThreadMsg::NavigateDelta(delta) => {
@@ -594,10 +599,22 @@ mod tests {
     }
 
     #[test]
-    fn thread_selected_out_of_range_is_a_no_op() {
-        let mut model = model_with_threads(&["a"]);
+    fn thread_selected_out_of_range_clamps_to_the_last_thread() {
+        // Matches the real select_visible_thread's own
+        // `filtered_idx.min(visible_len - 1)` clamping -- not a no-op.
+        let mut model = model_with_threads(&["a", "b"]);
         let (effects, dirty) =
             update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(5))));
+        assert_eq!(model.selected_thread, 1);
+        assert!(effects.is_empty());
+        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+    }
+
+    #[test]
+    fn thread_selected_on_empty_list_is_a_no_op() {
+        let mut model = Model::default();
+        let (effects, dirty) =
+            update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(0))));
         assert_eq!(model.selected_thread, 0);
         assert!(effects.is_empty());
         assert!(dirty.is_empty());

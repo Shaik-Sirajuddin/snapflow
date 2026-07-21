@@ -18,6 +18,7 @@ mod agent_bridge;
 mod appearance;
 mod conversation;
 mod dirty;
+mod dispatch;
 mod editor_detect;
 mod effect;
 pub mod gateway_actor;
@@ -852,6 +853,18 @@ impl PanelSingleton {
         self.visible_indices.borrow().get(filtered_idx).copied()
     }
 
+    /// `dispatch.rs`'s Thread-domain wrappers (tea-slint-model Phase 4)
+    /// need this to build the transient stand-in `Model` `update()`
+    /// operates on -- see that module's doc comment.
+    pub(crate) fn visible_thread_count(&self) -> usize {
+        self.visible_indices.borrow().len()
+    }
+
+    /// See `visible_thread_count`'s doc comment -- same purpose.
+    pub(crate) fn selected_thread_index(&self) -> usize {
+        self.component.get_selected_thread().max(0) as usize
+    }
+
     /// Rebuilds the `messages` model for `real_idx` from the agent
     /// bridge's current history plus whatever `expanded` state already
     /// exists -- does not touch `expanded`/`displayed_thread` itself
@@ -968,7 +981,12 @@ impl PanelSingleton {
     /// requested`) both call this so selection behavior can't drift between
     /// the two entry points. No-op (returns `false`) when the visible list
     /// is empty.
-    fn select_visible_thread(&self, filtered_idx: usize) -> bool {
+    // `pub(crate)`, not private: `dispatch.rs`'s Thread-domain wrappers
+    // (tea-slint-model Phase 4) call this directly -- see that module's
+    // doc comment for why the actual persist+refresh cascade stays here
+    // rather than being reimplemented against `Model`, which doesn't yet
+    // own bridge/store data (that's Phase 5+ scope).
+    pub(crate) fn select_visible_thread(&self, filtered_idx: usize) -> bool {
         let visible_len = self.visible_indices.borrow().len();
         if visible_len == 0 {
             return false;
@@ -1681,6 +1699,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             panel.refresh_messages_for(real_idx);
         }
 
+        // tea-slint-model Phase 4 (Thread domain, first live cutover):
+        // routed through Msg::Ui(UiMsg::Thread(..)) -> update() ->
+        // dispatch's bridge into the existing select_visible_thread
+        // cascade -- see dispatch.rs's doc comment for why this is a
+        // bridge rather than a full Model-owned rewrite yet.
         let component_weak = panel.component.as_weak();
         panel.component.on_thread_selected(move |idx| {
             let Some(_component) = component_weak.upgrade() else {
@@ -1689,7 +1712,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     // `idx` is a filtered-list index (Phase 2).
-                    panel.select_visible_thread(idx as usize);
+                    dispatch::dispatch_thread_selected(panel, idx as usize);
                 }
             });
         });
@@ -1701,13 +1724,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let visible_len = panel.visible_indices.borrow().len();
-                    if visible_len == 0 {
-                        return;
-                    }
-                    let current = panel.component.get_selected_thread().max(0) as usize;
-                    let next = wrap_thread_index(current, delta, visible_len);
-                    panel.select_visible_thread(next);
+                    dispatch::dispatch_thread_navigate(panel, delta);
                 }
             });
         });
