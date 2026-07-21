@@ -203,7 +203,14 @@ pub fn to_pending_request_view(event: &AgentRequestEvent) -> PendingRequestView 
 pub fn to_permission_option_model(
     options: Vec<PermissionOptionView>,
 ) -> ModelRc<crate::PermissionOptionItem> {
-    let items: Vec<crate::PermissionOptionItem> = options
+    ModelRc::new(VecModel::from(to_permission_option_rows(options)))
+}
+
+/// Builds concrete rows for a reducer-owned pending-request snapshot.
+pub fn to_permission_option_rows(
+    options: Vec<PermissionOptionView>,
+) -> Vec<crate::PermissionOptionItem> {
+    options
         .into_iter()
         .map(|o| crate::PermissionOptionItem {
             option_id: o.option_id.into(),
@@ -211,8 +218,7 @@ pub fn to_permission_option_model(
             kind: o.kind.into(),
             is_allow: o.is_allow,
         })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+        .collect()
 }
 
 /// First allow_* (or synthetic approve) option id — used by Ctrl+Enter.

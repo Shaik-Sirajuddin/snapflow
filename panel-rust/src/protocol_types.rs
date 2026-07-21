@@ -71,7 +71,7 @@ pub struct ChatMessage {
 
 /// Events flowing out of a bound thread's gateway actor, consumed from
 /// `AcpxThreadHandle::take_events`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     Message(ChatMessage),
     /// A prompt turn finished; carries the ACP stop reason as a

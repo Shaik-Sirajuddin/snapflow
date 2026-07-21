@@ -8,7 +8,7 @@
 //! `sync/*.rs`'s id-keyed diffing lands for real. Reimplementing
 //! `PanelSingleton::select_visible_thread`'s full persist+refresh cascade
 //! (filtered->real index translation, `PanelStateStore` write,
-//! `refresh_messages_for`'s seven-function fan-out) against `Model` right
+//! `collect_thread_snapshot_for`'s bridge-backed projection) against `Model` right
 //! now would mean duplicating all of that state with no working
 //! bridge-aware equivalent yet -- a real regression risk in a live app,
 //! not an abstraction nicety. So this phase's first domain cutover is
@@ -25,86 +25,651 @@
 //! state.
 
 use crate::dirty::{Dirty, ScalarField};
-use crate::model::{Model, ThreadModel};
 use crate::msg::{
     ChromeMsg, ComposeMsg, HostMsg, Msg, RequestMsg, SettingsMsg, SkillMsg, TerminalMsg, ThreadMsg,
     UiMsg,
 };
+use crate::sync::sync;
 use crate::update::update;
 use crate::ChatPanel;
 use crate::PanelSingleton;
+use slint::ComponentHandle;
 
-/// Builds the transient stand-in `Model` `update()` needs for a
-/// Thread-domain selection message: just enough shape (thread count,
-/// current selection) for `update()`'s `wrap_thread_index`/bounds-check
-/// logic to produce the correct new index, matching
-/// `select_visible_thread`'s own clamping semantics exactly (both use the
-/// same `visible_len`).
-fn thread_selection_model(panel: &PanelSingleton) -> Model {
-    let visible_len = panel.visible_thread_count();
-    Model {
-        threads: (0..visible_len).map(|_| ThreadModel::default()).collect(),
-        selected_thread: panel.selected_thread_index(),
-        ..Model::default()
-    }
-}
-
-/// Applies whatever `Dirty` markers `update()` returned for a
-/// Thread-selection `Msg`, using `model`'s **already-computed** new
-/// selection -- not a fresh re-read from `panel` (a first draft of this
-/// function did that and silently discarded `update()`'s own result,
-/// found live via `keyboard_shortcut_tests::
-/// invoke_command_switches_threads_and_opens_search_without_any_focus`
-/// regressing: `component.get_selected_thread()` stayed `0` after a
-/// simulated "next thread" command because the real work was thrown away
-/// and `select_visible_thread` got called with the *old* index again).
-/// Only `Dirty::Scalar(SelectedThread)` is possible from the two call
-/// sites below (see `update::update_thread`'s `Selected`/`NavigateDelta`
-/// arms) -- an exhaustive match here still costs nothing and stays
-/// honest about what this bridge function does and does not handle yet.
-fn apply_thread_selection_dirty(panel: &PanelSingleton, model: &Model, dirty: Vec<Dirty>) {
-    for d in dirty {
-        match d {
-            Dirty::Scalar(ScalarField::SelectedThread) => {
-                panel.select_visible_thread(model.selected_thread);
+fn execute_skill_effects(effects: Vec<crate::effect::Effect>) {
+    for effect in effects {
+        match effect {
+            crate::effect::Effect::SkillWrite { path, content } => {
+                std::thread::spawn(move || {
+                    let result = std::fs::write(path, content)
+                        .map_err(|error| crate::effect::EffectError::new(error.to_string()));
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(crate::effect::EffectResultMsg::SkillWritten(result)),
+                            );
+                            panel.dispatch_frame_input(crate::msg::FrameInput { skills_snapshot: Some(panel.collect_skills_snapshot()), ..crate::msg::FrameInput::default() });
+                        });
+                    });
+                });
+            }
+            crate::effect::Effect::SkillPromoteToGlobal { path } => {
+                std::thread::spawn(move || {
+                    let cache_dir = crate::resolve_cache_dir();
+                    let global_dir = crate::skills_state::global_skills_dir(&cache_dir);
+                    let result = crate::skills_state::promote_skill_to_global(&path, &global_dir)
+                        .map(|_| ())
+                        .map_err(|error| crate::effect::EffectError::new(error.to_string()));
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(crate::effect::EffectResultMsg::SkillPromoted(result)),
+                            );
+                            panel.dispatch_frame_input(crate::msg::FrameInput { skills_snapshot: Some(panel.collect_skills_snapshot()), ..crate::msg::FrameInput::default() });
+                        });
+                    });
+                });
             }
             other => {
-                // No other Dirty variant is reachable from
-                // ThreadMsg::Selected/NavigateDelta today -- see
-                // update::update_thread. Not a silent no-op: surfaces
-                // loudly in debug builds if that ever changes without
-                // this bridge being updated too.
                 debug_assert!(
                     false,
-                    "thread-selection dispatch got an unexpected Dirty variant: {other:?}"
+                    "skill effect executor received non-skill effect: {other:?}"
                 );
             }
         }
     }
 }
 
+/// Execute bridge-backed effects emitted by `update()`.
+///
+/// Effects that arrive through the bridge event queue are fire-and-forget:
+/// the next frame folds those events through `Msg::Frame`. Filesystem
+/// effects remain asynchronous and re-enter through `Msg::Effect`.
+fn execute_effects(panel: &PanelSingleton, effects: Vec<crate::effect::Effect>) {
+    for effect in effects {
+        match effect {
+            crate::effect::Effect::LoadInitialState => {
+                // Cold-start hydration is completed synchronously during
+                // panel construction after the store snapshot is collected.
+            }
+            crate::effect::Effect::SendPrompt { real_index, text } => {
+                panel.execute_send_prompt_real(real_index, &text);
+            }
+            crate::effect::Effect::CancelGeneration { real_index } => {
+                panel.execute_cancel_generation_real(real_index);
+            }
+            crate::effect::Effect::RespondAgentRequest { approve, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.answer_pending_request(&component, approve);
+            }
+            crate::effect::Effect::PermissionOptionSelected { option, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.answer_pending_request_option(&component, &option);
+            }
+            crate::effect::Effect::LoadOlderMessages { .. } => {
+                panel.dispatch_load_older_requested();
+            }
+            crate::effect::Effect::LocalTerminalSpawn => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_local_terminal_toggle(&component);
+            }
+            crate::effect::Effect::LocalTerminalKill => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_local_terminal_close(&component);
+            }
+            crate::effect::Effect::LocalTerminalWrite { bytes } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                panel.dispatch_local_terminal_key_input(&component, &text);
+            }
+            crate::effect::Effect::SaveSettings { .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_settings_save(&component);
+            }
+            crate::effect::Effect::SetConfigOption { key, value, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_config_option_selected(&component, &key, &value);
+            }
+            crate::effect::Effect::SetMode { mode, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mode_selected(&component, &mode);
+            }
+            crate::effect::Effect::SaveDevMode { enabled } => {
+                panel.dispatch_dev_mode_toggled(enabled);
+            }
+            crate::effect::Effect::McpServerCreate { name, command, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_create(&component, &name, &command);
+            }
+            crate::effect::Effect::McpServerDelete { name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_delete(&component, &name);
+            }
+            crate::effect::Effect::McpServerEnabledChanged { name, enabled, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_enabled_changed(&component, &name, enabled);
+            }
+            crate::effect::Effect::ProfileCreate {
+                name,
+                agent_id,
+                terminal_enabled,
+                fs_enabled,
+                ..
+            } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_profile_create(
+                    &component,
+                    &name,
+                    agent_id.as_deref(),
+                    terminal_enabled,
+                    fs_enabled,
+                );
+            }
+            crate::effect::Effect::ProfileDelete { name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_profile_delete(&component, &name);
+            }
+            crate::effect::Effect::AgentInstallRequested { agent_id, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_agent_install_requested(&component, &agent_id);
+            }
+            crate::effect::Effect::SkillWrite { .. }
+            | crate::effect::Effect::SkillPromoteToGlobal { .. } => {
+                execute_skill_effects(vec![effect]);
+            }
+            crate::effect::Effect::SetActiveProjectPath { path } => {
+                panel.dispatch_project_path_changed(path);
+            }
+            crate::effect::Effect::PersistThreadRecord { record } => {
+                let result = panel
+                    .panel_state
+                    .as_ref()
+                    .map(|store| {
+                        store
+                            .save_thread_record(&record)
+                            .map_err(|error| crate::effect::EffectError::new(error.to_string()))
+                    })
+                    .unwrap_or(Ok(()));
+                let _ = slint::invoke_from_event_loop(move || {
+                    crate::PANEL.with(|cell| {
+                        let slot = cell.borrow();
+                        let Some(panel) = slot.as_ref() else {
+                            return;
+                        };
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(crate::effect::EffectResultMsg::ThreadRecordPersisted(
+                                result,
+                            )),
+                        );
+                    });
+                });
+            }
+            crate::effect::Effect::PersistThread { real_index } => {
+                let result = panel.collect_thread_record(real_index).map(|record| {
+                    panel
+                        .panel_state
+                        .as_ref()
+                        .map(|store| {
+                            store
+                                .save_thread_record(&record)
+                                .map_err(|error| crate::effect::EffectError::new(error.to_string()))
+                        })
+                        .unwrap_or(Ok(()))
+                });
+                let result = result.unwrap_or(Ok(()));
+                let _ = slint::invoke_from_event_loop(move || {
+                    crate::PANEL.with(|cell| {
+                        let slot = cell.borrow();
+                        let Some(panel) = slot.as_ref() else {
+                            return;
+                        };
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(crate::effect::EffectResultMsg::ThreadPersisted {
+                                real_index,
+                                result,
+                            }),
+                        );
+                    });
+                });
+            }
+            crate::effect::Effect::RenameThread { real_index, name } => {
+                if let (Some(store), Some(thread_id)) = (
+                    panel.panel_state.as_ref(),
+                    panel
+                        .model
+                        .borrow()
+                        .threads
+                        .get(real_index)
+                        .map(|thread| thread.thread_id.clone()),
+                ) {
+                    if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
+                        eprintln!("panel-rust: failed to persist renamed chat thread: {error}");
+                    }
+                }
+            }
+            crate::effect::Effect::DeleteThread { real_index } => {
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    let _ = bridge.delete_thread(real_index);
+                }
+            }
+            crate::effect::Effect::SkillDelete { path } => {
+                if let Err(error) = std::fs::remove_dir_all(path) {
+                    eprintln!("panel-rust: failed to delete skill: {error}");
+                }
+            }
+            crate::effect::Effect::NewThread { .. }
+            | crate::effect::Effect::RecoverSessionAttach { .. } => {
+                debug_assert!(
+                    false,
+                    "thread lifecycle effects must use execute_thread_lifecycle_effect"
+                );
+            }
+        }
+    }
+}
+
+/// Execute the two effects that append an `AgentBridge` slot. The bridge's
+/// slot vector is intentionally append-only, so these effects need exclusive
+/// access to the live panel and must re-enter through `SessionAttached` with
+/// the durable binding returned by the bridge.
+fn execute_thread_lifecycle_effect(
+    panel: &mut PanelSingleton,
+    effect: crate::effect::Effect,
+) -> crate::effect::EffectResultMsg {
+    match effect {
+        crate::effect::Effect::NewThread {
+            real_index,
+            display_name,
+            provider,
+            profile_name,
+            ..
+        } => {
+            let result = panel
+                .bridge
+                .as_mut()
+                .ok_or_else(|| crate::effect::EffectError::new("agent bridge unavailable"))
+                .and_then(|bridge| {
+                    bridge
+                        .add_thread_with_profile_and_provider(
+                            &display_name,
+                            profile_name.as_deref(),
+                            Some(&provider),
+                        )
+                        .map_err(|error| crate::effect::EffectError::new(error.to_string()))
+                });
+            let (thread_id, actual_provider, result) = match result {
+                Ok(real_idx) => {
+                    let binding = panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_binding(real_idx));
+                    let actual_provider = panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_provider(real_idx));
+                    match binding {
+                        Some(binding) => (
+                            Some(binding.thread_id),
+                            actual_provider,
+                            Ok(binding.session_id),
+                        ),
+                        None => (
+                            None,
+                            actual_provider,
+                            Err(crate::effect::EffectError::new(
+                                "bridge created a thread without a session binding",
+                            )),
+                        ),
+                    }
+                }
+                Err(error) => (None, None, Err(error)),
+            };
+            let result = result.map_err(|error| {
+                crate::effect::EffectError::new(format!("thread {real_index}: {error}"))
+            });
+            crate::effect::EffectResultMsg::SessionAttached {
+                real_index,
+                thread_id,
+                provider: actual_provider,
+                result,
+            }
+        }
+        crate::effect::Effect::RecoverSessionAttach {
+            real_index,
+            session_id,
+            provider,
+            title,
+        } => {
+            let result = panel
+                .bridge
+                .as_mut()
+                .ok_or_else(|| crate::effect::EffectError::new("agent bridge unavailable"))
+                .and_then(|bridge| {
+                    bridge
+                        .add_thread_recovering_session(&title, &provider, &session_id)
+                        .map_err(|error| crate::effect::EffectError::new(error.to_string()))
+                });
+            let (thread_id, actual_provider, result) = match result {
+                Ok(real_idx) => {
+                    let binding = panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_binding(real_idx));
+                    let actual_provider = panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_provider(real_idx));
+                    match binding {
+                        Some(binding) => (
+                            Some(binding.thread_id),
+                            actual_provider,
+                            Ok(binding.session_id),
+                        ),
+                        None => (
+                            None,
+                            actual_provider,
+                            Err(crate::effect::EffectError::new(
+                                "bridge created a recovery slot without a session binding",
+                            )),
+                        ),
+                    }
+                }
+                Err(error) => (None, None, Err(error)),
+            };
+            let result = result.map_err(|error| {
+                crate::effect::EffectError::new(format!("recovery thread {real_index}: {error}"))
+            });
+            crate::effect::EffectResultMsg::SessionAttached {
+                real_index,
+                thread_id,
+                provider: actual_provider,
+                result,
+            }
+        }
+        other => panic!("unexpected lifecycle effect: {other:?}"),
+    }
+}
+
+/// Borrow the one live TEA model owned by `PanelSingleton`.
+///
+/// This used to construct a fresh stand-in model for every callback. That
+/// made `update()`'s state transitions disappear as soon as the callback
+/// returned, so a later effect result could not validate against the same
+/// thread/message state. The model is now persistent for the lifetime of the
+/// panel.
+/// Fold a message into the live model and immediately apply only the dirty
+/// fields it returned. Effects are still handed to the existing bridge
+/// methods by the domain-specific wrappers below; keeping that execution
+/// boundary separate means `update()` remains Slint-free and testable.
+fn update_persistent(panel: &PanelSingleton, msg: Msg) -> (Vec<crate::effect::Effect>, Vec<Dirty>) {
+    let mut model = panel.model.borrow_mut();
+    let result = update(&mut model, msg);
+    if !result.1.is_empty() {
+        sync(&model, &panel.component, &result.1);
+    }
+    result
+}
+
 /// Wired from `component.on_thread_selected` (tea-slint-model Phase 4,
 /// Thread domain). `filtered_idx` is a Slint filtered-list index, same
 /// space as `select_visible_thread` already expects.
 pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usize) {
-    let mut model = thread_selection_model(panel);
-    let (_effects, dirty) = update(
-        &mut model,
-        Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(filtered_idx))),
-    );
-    apply_thread_selection_dirty(panel, &model, dirty);
+    let (model_selected, dirty) = {
+        let mut model = panel.model.borrow_mut();
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(filtered_idx))),
+        );
+        sync(&model, &panel.component, &dirty);
+        (model.selected_thread, dirty)
+    };
+    panel.select_visible_thread(model_selected);
+    debug_assert!(dirty
+        .iter()
+        .all(|d| matches!(d, Dirty::Scalar(ScalarField::SelectedThread))));
 }
 
 /// Wired from `component.on_thread_navigation_requested` (tea-slint-model
 /// Phase 4, Thread domain). `delta` is `+1`/`-1` exactly like the
 /// original closure's `wrap_thread_index` call.
 pub(crate) fn dispatch_thread_navigate(panel: &PanelSingleton, delta: i32) {
-    let mut model = thread_selection_model(panel);
-    let (_effects, dirty) = update(
-        &mut model,
-        Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(delta))),
+    let (model_selected, dirty) = {
+        let mut model = panel.model.borrow_mut();
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(delta))),
+        );
+        sync(&model, &panel.component, &dirty);
+        (model.selected_thread, dirty)
+    };
+    panel.select_visible_thread(model_selected);
+    debug_assert!(dirty
+        .iter()
+        .all(|d| matches!(d, Dirty::Scalar(ScalarField::SelectedThread))));
+}
+
+pub(crate) fn dispatch_thread_recover_session_attach(
+    panel: &mut PanelSingleton,
+    _component: &ChatPanel,
+    session_id: String,
+    provider: String,
+    title: String,
+) {
+    let base_name = if title.trim().is_empty() {
+        format!(
+            "Recovered {}",
+            session_id.chars().take(8).collect::<String>()
+        )
+    } else {
+        title
+    };
+    let mut name = base_name.clone();
+    let mut suffix = 2;
+    while panel
+        .model
+        .borrow()
+        .threads
+        .iter()
+        .any(|thread| thread.display_name == name)
+    {
+        name = format!("{base_name} ({suffix})");
+        suffix += 1;
+    }
+
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Thread(ThreadMsg::RecoverSessionAttach {
+            session_id: session_id.clone(),
+            provider: provider.clone(),
+            title: name.clone(),
+            thread_id: None,
+        })),
     );
-    apply_thread_selection_dirty(panel, &model, dirty);
+    let Some(effect) = effects.into_iter().next() else {
+        return;
+    };
+    let real_idx = match &effect {
+        crate::effect::Effect::RecoverSessionAttach { real_index, .. } => *real_index,
+        _ => return,
+    };
+    let result = execute_thread_lifecycle_effect(panel, effect);
+    let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
+    execute_effects(panel, follow_up);
+    panel.dispatch_frame_input(crate::msg::FrameInput { thread_list_snapshot: Some(panel.collect_thread_list_snapshot()), ..crate::msg::FrameInput::default() });
+    panel.dispatch_frame_input(crate::msg::FrameInput { settings_gateway_snapshot: Some(panel.collect_settings_gateway_snapshot()), ..crate::msg::FrameInput::default() });
+    let filtered_idx = panel
+        .model
+        .borrow()
+        .visible_indices
+        .iter()
+        .position(|idx| *idx == real_idx);
+    if let Some(filtered_idx) = filtered_idx {
+        dispatch_thread_selected(panel, filtered_idx);
+    }
+}
+
+pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatPanel) {
+    let (effects, _) = update_persistent(panel, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+    let Some(effect) = effects.into_iter().next() else {
+        return;
+    };
+    let real_idx = match &effect {
+        crate::effect::Effect::NewThread { real_index, .. } => *real_index,
+        _ => return,
+    };
+    let result = execute_thread_lifecycle_effect(panel, effect);
+    let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
+    execute_effects(panel, follow_up);
+    panel.dispatch_frame_input(crate::msg::FrameInput { thread_list_snapshot: Some(panel.collect_thread_list_snapshot()), ..crate::msg::FrameInput::default() });
+
+    if let Some(filtered_idx) = panel
+        .model
+        .borrow()
+        .visible_indices
+        .iter()
+        .position(|idx| *idx == real_idx)
+    {
+        dispatch_thread_selected(panel, filtered_idx);
+    }
+}
+
+pub(crate) fn dispatch_thread_rename(
+    panel: &PanelSingleton,
+    _component: &ChatPanel,
+    filtered_idx: usize,
+    name: String,
+) {
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        return;
+    }
+    let Some(real_idx) = panel.real_index(filtered_idx) else {
+        return;
+    };
+    let Some(current_name) = panel
+        .model
+        .borrow()
+        .threads
+        .get(real_idx)
+        .map(|thread| thread.display_name.clone())
+    else {
+        return;
+    };
+    if current_name == name {
+        return;
+    }
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Thread(ThreadMsg::RenameRequested(real_idx, name))),
+    );
+    execute_effects(panel, effects);
+    panel.dispatch_frame_input(crate::msg::FrameInput { thread_list_snapshot: Some(panel.collect_thread_list_snapshot()), ..crate::msg::FrameInput::default() });
+    let updated_filtered_idx = panel
+        .model
+        .borrow()
+        .visible_indices
+        .iter()
+        .position(|idx| *idx == real_idx);
+    let has_visible_threads = !panel.model.borrow().visible_indices.is_empty();
+    if let Some(updated_filtered_idx) = updated_filtered_idx {
+        dispatch_thread_selected(panel, updated_filtered_idx);
+    } else if has_visible_threads {
+        dispatch_thread_selected(panel, 0);
+    }
+}
+
+pub(crate) fn dispatch_thread_close(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    filtered_idx: usize,
+) {
+    let Some(idx) = panel.real_index(filtered_idx) else {
+        return;
+    };
+    let Some(bridge) = &panel.bridge else {
+        return;
+    };
+    if !bridge.close_thread(idx) {
+        return;
+    }
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Thread(ThreadMsg::CloseRequested(idx))),
+    );
+    execute_effects(panel, effects);
+    panel.dispatch_frame_input(crate::msg::FrameInput { thread_list_snapshot: Some(panel.collect_thread_list_snapshot()), ..crate::msg::FrameInput::default() });
+    if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
+        panel.dispatch_frame_input(crate::msg::FrameInput {
+            selected_thread_snapshot: panel.collect_thread_snapshot_for(idx),
+            ..crate::msg::FrameInput::default()
+        });
+    }
+}
+
+pub(crate) fn dispatch_thread_delete(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    filtered_idx: usize,
+) {
+    let Some(idx) = panel.real_index(filtered_idx) else {
+        return;
+    };
+    let Some(bridge) = &panel.bridge else {
+        return;
+    };
+    if !bridge.delete_thread(idx) {
+        return;
+    }
+    let _ = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Thread(ThreadMsg::DeleteRequested(idx))),
+    );
+    panel.dispatch_frame_input(crate::msg::FrameInput { thread_list_snapshot: Some(panel.collect_thread_list_snapshot()), ..crate::msg::FrameInput::default() });
+    if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
+        panel.dispatch_frame_input(crate::msg::FrameInput {
+            selected_thread_snapshot: panel.collect_thread_snapshot_for(idx),
+            ..crate::msg::FrameInput::default()
+        });
+    }
 }
 
 /// Wired from `component.on_send_requested` (tea-slint-model Phase 4,
@@ -112,35 +677,47 @@ pub(crate) fn dispatch_thread_navigate(panel: &PanelSingleton, delta: i32) {
 /// `update()` is genuinely called (proving `Msg::Ui(Compose(SendRequested))`
 /// routes and produces the expected `Effect::SendPrompt`), then the real
 /// queue/bridge-aware cascade is delegated to
-/// `PanelSingleton::dispatch_send_requested` (moved, not rewritten, from
-/// the former `on_send_requested` closure body) since `Model` doesn't yet
-/// own send-queue/bridge state.
+/// the bridge send effect executor; the queue/state transition itself is
+/// owned by `update()`.
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(
-        &mut model,
+    let real_idx = panel.real_index(filtered_idx);
+    let (effects, _dirty) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
     );
     debug_assert!(
         effects.is_empty()
-            || matches!(effects.as_slice(), [crate::effect::Effect::SendPrompt { .. }]),
+            || matches!(
+                effects.as_slice(),
+                [crate::effect::Effect::SendPrompt { .. }]
+            ),
         "Compose::SendRequested must produce zero (no selected thread) or one SendPrompt effect"
     );
-    panel.dispatch_send_requested(filtered_idx, &text);
+    debug_assert!(
+        effects.iter().all(|effect| {
+            matches!(
+                effect,
+                crate::effect::Effect::SendPrompt { real_index, .. }
+                    if Some(*real_index) == real_idx
+            )
+        }),
+        "send effect must target the selected filtered index"
+    );
+    execute_effects(panel, effects);
 }
 
 /// Wired from `component.on_stop_requested` (tea-slint-model Phase 4,
-/// Compose domain). See `dispatch_compose_send`'s doc comment -- same
-/// bridge shape, delegating to `PanelSingleton::dispatch_stop_requested`.
+/// Compose domain). The bridge cancellation is performed by the effect
+/// executor after `update()` owns the state transition.
 pub(crate) fn dispatch_compose_stop(panel: &PanelSingleton) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Compose(ComposeMsg::StopRequested)));
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::StopRequested)));
     debug_assert!(
         effects.is_empty()
             || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
         "Compose::StopRequested must produce zero (no selected thread) or one CancelGeneration effect"
     );
-    panel.dispatch_stop_requested();
+    execute_effects(panel, effects);
 }
 
 /// Wired from `component.on_approve_request` (tea-slint-model Phase 4,
@@ -152,32 +729,38 @@ pub(crate) fn dispatch_compose_stop(panel: &PanelSingleton) {
 /// the actual answer is delegated to the existing, unchanged
 /// `answer_pending_request`.
 pub(crate) fn dispatch_request_approve(panel: &PanelSingleton, component: &ChatPanel) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(
-        &mut model,
+    let (effects, _dirty) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Request(RequestMsg::Approve(String::new()))),
     );
     debug_assert!(
         effects.is_empty()
-            || matches!(effects.as_slice(), [crate::effect::Effect::RespondAgentRequest { .. }]),
+            || matches!(
+                effects.as_slice(),
+                [crate::effect::Effect::RespondAgentRequest { .. }]
+            ),
         "Request::Approve must produce zero (no selected thread) or one RespondAgentRequest effect"
     );
-    panel.answer_pending_request(component, true);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 /// See `dispatch_request_approve`'s doc comment -- same bridge shape.
 pub(crate) fn dispatch_request_reject(panel: &PanelSingleton, component: &ChatPanel) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(
-        &mut model,
+    let (effects, _dirty) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Request(RequestMsg::Reject(String::new()))),
     );
     debug_assert!(
         effects.is_empty()
-            || matches!(effects.as_slice(), [crate::effect::Effect::RespondAgentRequest { .. }]),
+            || matches!(
+                effects.as_slice(),
+                [crate::effect::Effect::RespondAgentRequest { .. }]
+            ),
         "Request::Reject must produce zero (no selected thread) or one RespondAgentRequest effect"
     );
-    panel.answer_pending_request(component, false);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 /// Wired from `component.on_permission_option_selected` (tea-slint-model
@@ -189,9 +772,8 @@ pub(crate) fn dispatch_request_permission_option(
     component: &ChatPanel,
     option_id: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(
-        &mut model,
+    let (effects, _dirty) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Request(RequestMsg::PermissionOptionSelected(
             String::new(),
             option_id.clone(),
@@ -202,68 +784,81 @@ pub(crate) fn dispatch_request_permission_option(
             || matches!(effects.as_slice(), [crate::effect::Effect::PermissionOptionSelected { .. }]),
         "Request::PermissionOptionSelected must produce zero (no selected thread) or one PermissionOptionSelected effect"
     );
-    panel.answer_pending_request_option(component, &option_id);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 /// Wired from `component.on_load_older_requested` (tea-slint-model Phase
 /// 4, Request domain). See `dispatch_request_approve`'s doc comment --
 /// same bridge shape, delegating to the existing (moved, not rewritten)
 /// `dispatch_load_older_requested`.
-pub(crate) fn dispatch_request_load_older(panel: &PanelSingleton) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(
-        &mut model,
-        Msg::Ui(UiMsg::Request(RequestMsg::LoadOlderRequested(String::new()))),
+pub(crate) fn dispatch_request_load_older(panel: &PanelSingleton, component: &ChatPanel) {
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Request(
+            RequestMsg::LoadOlderRequested(String::new()),
+        )),
     );
     debug_assert!(
         effects.is_empty()
             || matches!(effects.as_slice(), [crate::effect::Effect::LoadOlderMessages { .. }]),
         "Request::LoadOlderRequested must produce zero (no selected thread) or one LoadOlderMessages effect"
     );
-    panel.dispatch_load_older_requested();
+    execute_effects(panel, effects);
+    crate::sync::sync_loading_older(component, false);
 }
 
 /// Wired from `component.on_expand_terminal` (tea-slint-model Phase 4,
 /// Terminal domain). See `dispatch_request_approve`'s doc comment for
 /// the shared bridge shape -- `update()` runs for real, then the actual
-/// cascade is delegated to the existing `dispatch_expand_terminal`.
+/// selected-thread `FrameInput` snapshot.
 pub(crate) fn dispatch_terminal_expand(
     panel: &PanelSingleton,
     component: &ChatPanel,
     terminal_id: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let (_effects, dirty) = update(
-        &mut model,
+    let (_effects, dirty) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand(terminal_id.clone()))),
     );
     debug_assert!(
         matches!(dirty.as_slice(), [Dirty::Terminal { .. }]),
         "Terminal::Expand must always produce exactly one Dirty::Terminal"
     );
-    panel.dispatch_expand_terminal(component, &terminal_id);
+    let _ = component;
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        selected_thread_snapshot: panel.collect_selected_thread_snapshot(),
+        ..crate::msg::FrameInput::default()
+    });
 }
 
 /// Wired from `component.on_close_terminal_overlay` (tea-slint-model
 /// Phase 4, Terminal domain). See `dispatch_terminal_expand`'s doc
 /// comment -- same bridge shape.
 pub(crate) fn dispatch_terminal_close_overlay(panel: &PanelSingleton) {
-    let mut model = thread_selection_model(panel);
-    let (_effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseOverlay)));
-    panel.dispatch_close_terminal_overlay();
+    let (_effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseOverlay)));
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        selected_thread_snapshot: panel.collect_selected_thread_snapshot(),
+        ..crate::msg::FrameInput::default()
+    });
 }
 
 /// Wired from `component.on_local_terminal_toggle_requested`
 /// (tea-slint-model Phase 4, Terminal domain). See
 /// `dispatch_terminal_expand`'s doc comment -- same bridge shape.
 pub(crate) fn dispatch_terminal_local_toggle(panel: &PanelSingleton, component: &ChatPanel) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalToggle)));
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalToggle)));
     debug_assert!(
-        matches!(effects.as_slice(), [crate::effect::Effect::LocalTerminalSpawn]),
+        matches!(
+            effects.as_slice(),
+            [crate::effect::Effect::LocalTerminalSpawn]
+        ),
         "Terminal::LocalToggle must always produce exactly one LocalTerminalSpawn effect"
     );
-    panel.dispatch_local_terminal_toggle(component);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 /// Wired from `component.on_local_terminal_key_input` (tea-slint-model
@@ -274,31 +869,38 @@ pub(crate) fn dispatch_terminal_local_key_input(
     component: &ChatPanel,
     text: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(
-        &mut model,
+    let (effects, _dirty) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalKeyInput(
             text.clone().into_bytes(),
         ))),
     );
     debug_assert!(
-        matches!(effects.as_slice(), [crate::effect::Effect::LocalTerminalWrite { .. }]),
+        matches!(
+            effects.as_slice(),
+            [crate::effect::Effect::LocalTerminalWrite { .. }]
+        ),
         "Terminal::LocalKeyInput must always produce exactly one LocalTerminalWrite effect"
     );
-    panel.dispatch_local_terminal_key_input(component, &text);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 /// Wired from `component.on_local_terminal_close_requested`
 /// (tea-slint-model Phase 4, Terminal domain). See
 /// `dispatch_terminal_expand`'s doc comment -- same bridge shape.
 pub(crate) fn dispatch_terminal_local_close(panel: &PanelSingleton, component: &ChatPanel) {
-    let mut model = thread_selection_model(panel);
-    let (effects, _dirty) = update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalClose)));
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::LocalClose)));
     debug_assert!(
-        matches!(effects.as_slice(), [crate::effect::Effect::LocalTerminalKill]),
+        matches!(
+            effects.as_slice(),
+            [crate::effect::Effect::LocalTerminalKill]
+        ),
         "Terminal::LocalClose must always produce exactly one LocalTerminalKill effect"
     );
-    panel.dispatch_local_terminal_close(component);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 // Settings-domain wrappers (tea-slint-model Phase 4). Same bridge shape
@@ -311,8 +913,10 @@ pub(crate) fn dispatch_terminal_local_close(panel: &PanelSingleton, component: &
 // for the fuller-commented version of the same shape.
 
 pub(crate) fn dispatch_settings_open(panel: &PanelSingleton, component: &ChatPanel) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(crate::msg::SettingsMsg::Open)));
+    let _ = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(crate::msg::SettingsMsg::Open)),
+    );
     panel.dispatch_settings_requested(component);
 }
 
@@ -321,22 +925,24 @@ pub(crate) fn dispatch_settings_scope_changed(
     component: &ChatPanel,
     scope: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let _ = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ScopeChanged(scope.clone()))),
     );
     panel.dispatch_settings_scope_changed(component, &scope);
 }
 
 pub(crate) fn dispatch_settings_save(panel: &PanelSingleton, component: &ChatPanel) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(SettingsMsg::Save(String::new()))));
-    panel.dispatch_settings_save(component);
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::Save(String::new()))),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
-pub(crate) fn dispatch_settings_close(_panel: &PanelSingleton, component: &ChatPanel) {
-    component.set_settings_open(false);
+pub(crate) fn dispatch_settings_close(panel: &PanelSingleton, _component: &ChatPanel) {
+    let _ = update_persistent(panel, Msg::Ui(UiMsg::Settings(SettingsMsg::Close)));
 }
 
 pub(crate) fn dispatch_mcp_server_create(
@@ -345,24 +951,30 @@ pub(crate) fn dispatch_mcp_server_create(
     name: String,
     command: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let (effects, _) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
             name: name.clone(),
             command: command.clone(),
         })),
     );
-    panel.dispatch_mcp_server_create(component, &name, &command);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
-pub(crate) fn dispatch_mcp_server_delete(panel: &PanelSingleton, component: &ChatPanel, name: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
-        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerDelete { name: name.clone() })),
+pub(crate) fn dispatch_mcp_server_delete(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    name: String,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerDelete {
+            name: name.clone(),
+        })),
     );
-    panel.dispatch_mcp_server_delete(component, &name);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_mcp_server_enabled_changed(
@@ -371,15 +983,15 @@ pub(crate) fn dispatch_mcp_server_enabled_changed(
     name: String,
     enabled: bool,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let (effects, _) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
             name: name.clone(),
             enabled,
         })),
     );
-    panel.dispatch_mcp_server_enabled_changed(component, &name, enabled);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_profile_create(
@@ -390,9 +1002,8 @@ pub(crate) fn dispatch_profile_create(
     terminal_enabled: bool,
     fs_enabled: bool,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let (effects, _) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileCreate {
             name: name.clone(),
             agent_id: agent_id.clone(),
@@ -400,16 +1011,19 @@ pub(crate) fn dispatch_profile_create(
             fs_enabled,
         })),
     );
-    panel.dispatch_profile_create(component, &name, agent_id.as_deref(), terminal_enabled, fs_enabled);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_profile_delete(panel: &PanelSingleton, component: &ChatPanel, name: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
-        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileDelete { name: name.clone() })),
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileDelete {
+            name: name.clone(),
+        })),
     );
-    panel.dispatch_profile_delete(component, &name);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_agent_install_requested(
@@ -417,26 +1031,35 @@ pub(crate) fn dispatch_agent_install_requested(
     component: &ChatPanel,
     agent_id: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let (effects, _) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::AgentInstallRequested {
             agent_id: agent_id.clone(),
         })),
     );
-    panel.dispatch_agent_install_requested(component, &agent_id);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_dev_mode_toggled(panel: &PanelSingleton, enabled: bool) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(SettingsMsg::DevModeToggled(enabled))));
-    panel.dispatch_dev_mode_toggled(enabled);
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::DevModeToggled(enabled))),
+    );
+    execute_effects(panel, effects);
 }
 
-pub(crate) fn dispatch_mode_selected(panel: &PanelSingleton, component: &ChatPanel, mode_id: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Ui(UiMsg::Settings(SettingsMsg::ModeSelected(mode_id.clone()))));
-    panel.dispatch_mode_selected(component, &mode_id);
+pub(crate) fn dispatch_mode_selected(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    mode_id: String,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ModeSelected(mode_id.clone()))),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_config_option_selected(
@@ -445,24 +1068,23 @@ pub(crate) fn dispatch_config_option_selected(
     key: String,
     value: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let (effects, _) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::ConfigOptionSelected {
             key: key.clone(),
             value: value.clone(),
         })),
     );
-    panel.dispatch_config_option_selected(component, &key, &value);
+    let _ = component;
+    execute_effects(panel, effects);
 }
 
 // Skill-domain wrappers (tea-slint-model Phase 4). Same bridge shape as
 // Settings above.
 
 pub(crate) fn dispatch_new_skill_requested(panel: &PanelSingleton, name: String, scope: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let _ = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::NewSkillRequested {
             name: name.clone(),
             scope: scope.clone(),
@@ -472,40 +1094,42 @@ pub(crate) fn dispatch_new_skill_requested(panel: &PanelSingleton, name: String,
 }
 
 pub(crate) fn dispatch_skill_promote_to_global(panel: &PanelSingleton, path: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
-        Msg::Ui(UiMsg::Skill(SkillMsg::PromoteToGlobal { path: path.clone().into() })),
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Skill(SkillMsg::PromoteToGlobal {
+            path: path.clone().into(),
+        })),
     );
-    panel.dispatch_skill_promote_to_global(&path);
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_skill_editor_open_requested(panel: &PanelSingleton, path: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
-        Msg::Ui(UiMsg::Skill(SkillMsg::EditorOpenRequested { path: path.clone().into() })),
+    let _ = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Skill(SkillMsg::EditorOpenRequested {
+            path: path.clone().into(),
+        })),
     );
     panel.dispatch_skill_editor_open_requested(&path);
 }
 
 pub(crate) fn dispatch_skill_content_edited(panel: &PanelSingleton, path: String, content: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let (effects, _) = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::ContentEdited {
             path: path.clone().into(),
             content: content.clone(),
         })),
     );
-    panel.dispatch_skill_content_edited(&path, &content);
+    execute_effects(panel, effects);
 }
 
 pub(crate) fn dispatch_skill_copy_path_requested(panel: &PanelSingleton, path: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
-        Msg::Ui(UiMsg::Skill(SkillMsg::CopyPathRequested { path: path.clone().into() })),
+    let _ = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Skill(SkillMsg::CopyPathRequested {
+            path: path.clone().into(),
+        })),
     );
     panel.dispatch_skill_copy_path_requested(&path);
 }
@@ -515,9 +1139,8 @@ pub(crate) fn dispatch_skill_open_in_editor_requested(
     editor_name: String,
     path: String,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let _ = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::OpenInEditorRequested {
             editor_name: editor_name.clone(),
             path: path.clone().into(),
@@ -527,9 +1150,8 @@ pub(crate) fn dispatch_skill_open_in_editor_requested(
 }
 
 pub(crate) fn dispatch_skill_open_with_os_default_requested(panel: &PanelSingleton, path: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let _ = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Skill(SkillMsg::OpenWithOsDefaultRequested {
             path: path.clone().into(),
         })),
@@ -543,23 +1165,30 @@ pub(crate) fn dispatch_skill_open_with_os_default_requested(panel: &PanelSinglet
 // as Settings/Skill above.
 
 pub(crate) fn dispatch_error_banner_dismissed(panel: &PanelSingleton) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Ui(UiMsg::Chrome(ChromeMsg::ErrorBannerDismissed)));
-    panel.dispatch_error_banner_dismissed();
+    let (_, dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Chrome(ChromeMsg::ErrorBannerDismissed)),
+    );
+    debug_assert!(dirty.iter().any(|item| matches!(item, Dirty::Error { .. })));
 }
 
 pub(crate) fn dispatch_thread_toggle_background(panel: &PanelSingleton, slint_index: usize) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let _ = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Thread(ThreadMsg::ToggleBackground(slint_index))),
     );
     panel.dispatch_thread_toggle_background(slint_index);
 }
 
-pub(crate) fn dispatch_search_changed(panel: &PanelSingleton, component: &ChatPanel, query: String) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Ui(UiMsg::Chrome(ChromeMsg::SearchChanged(query.clone()))));
+pub(crate) fn dispatch_search_changed(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    query: String,
+) {
+    let _ = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Chrome(ChromeMsg::SearchChanged(query.clone()))),
+    );
     panel.dispatch_search_changed(component, &query);
 }
 
@@ -570,9 +1199,8 @@ pub(crate) fn dispatch_search_submitted(
     search_skills: bool,
     show_global: bool,
 ) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(
-        &mut model,
+    let _ = update_persistent(
+        panel,
         Msg::Ui(UiMsg::Chrome(ChromeMsg::SearchSubmitted {
             query: query.clone(),
             search_skills,
@@ -583,9 +1211,11 @@ pub(crate) fn dispatch_search_submitted(
 }
 
 pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(index))));
-    panel.dispatch_toggle_expanded(index);
+    let (_, dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(index))),
+    );
+    debug_assert!(dirty.iter().any(|item| matches!(item, Dirty::MessagesDiff { .. })));
 }
 
 // Host-domain wrapper (tea-slint-model Phase 4, non-Slint-callback FFI
@@ -593,44 +1223,73 @@ pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
 // bridge shape as every UI domain above.
 
 pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option<String>) {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Host(HostMsg::ProjectPathChanged(path.clone())));
-    panel.dispatch_project_path_changed(path);
+    let (effects, _) =
+        update_persistent(panel, Msg::Host(HostMsg::ProjectPathChanged(path.clone())));
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32) -> bool {
+    let command_name = match command {
+        crate::PANEL_COMMAND_PREVIOUS_THREAD => "previous-thread",
+        crate::PANEL_COMMAND_NEXT_THREAD => "next-thread",
+        crate::PANEL_COMMAND_OPEN_THREAD_SEARCH => "open-thread-search",
+        _ => return false,
+    };
+    let _ = update_persistent(
+        panel,
+        Msg::Host(HostMsg::InvokeCommand(command_name.to_owned())),
+    );
+    let component_weak = panel.component.as_weak();
+    let Some(component) = component_weak.upgrade() else {
+        return false;
+    };
+    match command {
+        crate::PANEL_COMMAND_PREVIOUS_THREAD => component.invoke_thread_navigation_requested(-1),
+        crate::PANEL_COMMAND_NEXT_THREAD => component.invoke_thread_navigation_requested(1),
+        crate::PANEL_COMMAND_OPEN_THREAD_SEARCH => component.invoke_open_thread_search(),
+        _ => return false,
+    }
+    true
+}
+
+pub(crate) fn dispatch_host_input_key(panel: &PanelSingleton, key: String, modifiers: u32) {
+    let _ = update_persistent(panel, Msg::Host(HostMsg::InputKey { key, modifiers }));
+}
+
+pub(crate) fn dispatch_frame_input(
+    panel: &PanelSingleton,
+    frame: crate::msg::FrameInput,
+) -> bool {
+    let (effects, dirty) = update_persistent(panel, Msg::Frame(frame));
+    execute_effects(panel, effects);
+    !dirty.is_empty()
 }
 
 /// Wired from `panel_rust_poll` (tea-slint-model Phase 4b -- the 60-90fps
-/// poll tick, migrated last per 00-plan.md's own ordering rationale).
-/// Same bridge shape as every domain above: `update()`'s `Frame` arm is
-/// still a no-op stub (see `update::update_frame`'s doc comment) --
-/// `FrameInput` here is decorative, proving the tick is nominally routed
-/// through `Msg::Frame`, while the real per-tick work stays in the
-/// existing, unchanged `dispatch_poll_tick` (moved verbatim from
-/// `panel_rust_poll`'s own body). Full real `FrameInput` collection +
-/// `update()`/`sync()` taking over this tick's actual work is Phase 5+
-/// scope, once `Model` owns enough state for `sync()`'s Dirty-gated push
-/// to meaningfully replace this cascade -- see 00-plan.md's own note that
-/// a `Vec::new()` here doesn't allocate, so this decorative call costs
-/// nothing measurable relative to the real work `dispatch_poll_tick` does.
+/// poll tick). Bridge events are applied first so queued turns and thread
+/// state transitions are settled; the selected thread is then snapshotted
+/// and folded through `Msg::Frame` so `sync()` owns its transcript,
+/// connection, request, terminal, PTY, and capability projections.
 pub(crate) fn dispatch_frame_poll(panel: &PanelSingleton) -> bool {
-    let mut model = thread_selection_model(panel);
-    let _ = update(&mut model, Msg::Frame(crate::msg::FrameInput::default()));
-    panel.dispatch_poll_tick()
+    let frame = panel.collect_frame_input();
+    dispatch_frame_input(panel, frame)
 }
 
 pub(crate) fn dispatch_apply_host_appearance(
     panel: &PanelSingleton,
     appearance: crate::appearance::HostAppearance,
 ) -> bool {
-    let mut model = thread_selection_model(panel);
-    let mut state = crate::appearance::AppearanceState::default();
-    state.apply(appearance.clone());
-    let _ = update(&mut model, Msg::Host(HostMsg::AppearanceChanged(state)));
-    panel.dispatch_apply_host_appearance(appearance)
+    let mut state = panel.model.borrow().appearance.clone();
+    if !state.apply(appearance) {
+        return false;
+    }
+    let _ = update_persistent(panel, Msg::Host(HostMsg::AppearanceChanged(state)));
+    panel.sync_host_appearance()
 }
 
 #[cfg(test)]
 mod tests {
-    //! These exercise `thread_selection_model` + `update()`'s pure
+//! These exercise the persistent model + `update()`'s pure
     //! decision logic without a live `PanelSingleton`/`ChatPanel`
     //! (constructing either requires the real Slint platform setup --
     //! see `sync.rs`'s doc comment for the same constraint). The
@@ -640,6 +1299,8 @@ mod tests {
     //! `update()` logic, and by real-host VNC click-through for the full
     //! wire (see this phase's meta.json `verified` entry).
     use super::*;
+    use crate::model::Model;
+    use crate::model::ThreadModel;
 
     #[test]
     fn navigate_delta_wraps_the_same_way_select_visible_thread_would_clamp() {

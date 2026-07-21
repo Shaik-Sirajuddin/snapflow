@@ -231,12 +231,14 @@ pub enum Dirty {
     ThreadListDiff(Vec<RowOp<crate::models::VisibleThreadItem>>),
     /// A message was appended to `thread_id`'s history in a
     /// shape-preserving way (single push, no reshuffle upstream).
-    MessageAppended { thread_id: String },
+    MessageAppended {
+        thread_id: String,
+    },
     /// `thread_id`'s message list shape changed (older page loaded,
     /// message removed) -- id-keyed diff ops.
     MessagesDiff {
         thread_id: String,
-        ops: Vec<RowOp<crate::protocol_types::ChatMessage>>,
+        ops: Vec<RowOp<crate::MessageItem>>,
     },
     /// An in-progress streamed token/chunk for one message -- resolved by
     /// id at apply time in `sync/messages.rs`, never a cached row index
@@ -250,17 +252,29 @@ pub enum Dirty {
     /// `thread_id`'s connection/reconnect status changed -- updates the
     /// *existing* status row in place (fixes
     /// `reconnecting_message_and_acpx_settings_propagation`).
-    Connection { thread_id: String },
-    Error { thread_id: String, detail: ErrorDetail },
-    PendingRequest { thread_id: String },
-    Terminal { id: String },
+    Connection {
+        thread_id: String,
+    },
+    Error {
+        thread_id: String,
+        detail: ErrorDetail,
+    },
+    PendingRequest {
+        thread_id: String,
+    },
+    Terminal {
+        id: String,
+    },
     LocalTerminal,
+    ProjectPath,
     /// Settings changed -- pushed into both the settings panel and chat
     /// view in one place (fixes "settings not propagated to chat view").
     Settings,
-    SkillsListDiff(Vec<RowOp<crate::skills_state::SkillEntry>>),
+    SkillsListDiff(Vec<RowOp<crate::SkillOption>>),
     SkillRow(usize),
-    Capabilities { thread_id: String },
+    Capabilities {
+        thread_id: String,
+    },
 }
 
 /// Scalar/global properties that can be marked dirty without a dedicated

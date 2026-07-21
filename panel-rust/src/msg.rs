@@ -27,6 +27,14 @@ pub enum UiMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadMsg {
     New,
+    NewResolved {
+        display_name: String,
+        provider: String,
+        profile_name: Option<String>,
+        permission_profile: Option<String>,
+        session_id: Option<String>,
+        thread_id: Option<String>,
+    },
     Selected(usize),
     NavigateDelta(i32),
     CloseRequested(usize),
@@ -37,6 +45,7 @@ pub enum ThreadMsg {
         session_id: String,
         provider: String,
         title: String,
+        thread_id: Option<String>,
     },
 }
 
@@ -45,11 +54,27 @@ pub enum ComposeMsg {
     SendRequested(String),
     StopRequested,
     GenerationStopped,
-    MentionTokenPrefix { text: String, cursor: i32 },
-    MentionTokenQuery { text: String, cursor: i32 },
-    MentionTokenReplace { text: String, cursor: i32, replacement: String },
-    WordBoundaryBefore { text: String, cursor: i32 },
-    ContainsCi { haystack: String, needle: String },
+    MentionTokenPrefix {
+        text: String,
+        cursor: i32,
+    },
+    MentionTokenQuery {
+        text: String,
+        cursor: i32,
+    },
+    MentionTokenReplace {
+        text: String,
+        cursor: i32,
+        replacement: String,
+    },
+    WordBoundaryBefore {
+        text: String,
+        cursor: i32,
+    },
+    ContainsCi {
+        haystack: String,
+        needle: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,31 +100,63 @@ pub enum SettingsMsg {
     Close,
     Save(String),
     ScopeChanged(String),
-    ConfigOptionSelected { key: String, value: String },
+    ConfigOptionSelected {
+        key: String,
+        value: String,
+    },
     ModeSelected(String),
     DevModeToggled(bool),
-    McpServerCreate { name: String, command: String },
-    McpServerDelete { name: String },
-    McpServerEnabledChanged { name: String, enabled: bool },
+    McpServerCreate {
+        name: String,
+        command: String,
+    },
+    McpServerDelete {
+        name: String,
+    },
+    McpServerEnabledChanged {
+        name: String,
+        enabled: bool,
+    },
     ProfileCreate {
         name: String,
         agent_id: Option<String>,
         terminal_enabled: bool,
         fs_enabled: bool,
     },
-    ProfileDelete { name: String },
-    AgentInstallRequested { agent_id: String },
+    ProfileDelete {
+        name: String,
+    },
+    AgentInstallRequested {
+        agent_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillMsg {
-    NewSkillRequested { name: String, scope: String },
-    ContentEdited { path: std::path::PathBuf, content: String },
-    CopyPathRequested { path: std::path::PathBuf },
-    EditorOpenRequested { path: std::path::PathBuf },
-    OpenInEditorRequested { editor_name: String, path: std::path::PathBuf },
-    OpenWithOsDefaultRequested { path: std::path::PathBuf },
-    PromoteToGlobal { path: std::path::PathBuf },
+    NewSkillRequested {
+        name: String,
+        scope: String,
+    },
+    ContentEdited {
+        path: std::path::PathBuf,
+        content: String,
+    },
+    CopyPathRequested {
+        path: std::path::PathBuf,
+    },
+    EditorOpenRequested {
+        path: std::path::PathBuf,
+    },
+    OpenInEditorRequested {
+        editor_name: String,
+        path: std::path::PathBuf,
+    },
+    OpenWithOsDefaultRequested {
+        path: std::path::PathBuf,
+    },
+    PromoteToGlobal {
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,7 +178,10 @@ pub enum ChromeMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostMsg {
     InvokeCommand(String),
-    InputKey { key: String, modifiers: u32 },
+    InputKey {
+        key: String,
+        modifiers: u32,
+    },
     AppearanceChanged(crate::appearance::AppearanceState),
     ProjectPathChanged(Option<String>),
     /// Cold-start hydration trigger -- see 00-plan.md Phase 0. Carries
@@ -138,10 +198,69 @@ pub enum HostMsg {
 /// path; `sync()` only runs when the returned `Dirty` set is nonempty.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FrameInput {
+    pub bridge_events: Vec<crate::agent_bridge::BridgeEvent>,
     pub bridge_events_pending: bool,
-    pub thread_records_dirty: bool,
+    pub thread_record_snapshots: Vec<crate::state_store::ThreadRecord>,
     pub settings_reload_pending: bool,
     pub local_terminal_snapshot: Option<String>,
+    pub prepend_expanded_rows: usize,
+    pub thread_list_snapshot: Option<ThreadListSnapshot>,
+    pub selected_thread_snapshot: Option<ThreadFrameSnapshot>,
+    pub clear_selected_thread: bool,
+    pub settings_preferences_snapshot: Option<SettingsPreferencesSnapshot>,
+    pub settings_gateway_snapshot: Option<SettingsGatewaySnapshot>,
+    pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
+}
+
+/// Read-only bridge/store data for the sidebar. The adapter owns collection;
+/// `update()` owns the projected rows after folding this snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadListSnapshot {
+    pub visible_indices: Vec<usize>,
+    pub visible_thread_ids: Vec<String>,
+    pub rows: Vec<crate::models::VisibleThreadItem>,
+}
+
+/// Read-only settings data collected from the selected gateway for one
+/// reducer turn. The gateway remains the source of truth; `update_frame`
+/// owns the projected values after folding this snapshot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsGatewaySnapshot {
+    pub profiles: Vec<crate::gateway_actor::ProfileSummary>,
+    pub mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
+    pub agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
+    pub recovery_provider: String,
+}
+
+/// Read-only JSON/SQLite preferences collected for one reducer turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsPreferencesSnapshot {
+    pub scope: String,
+    pub default_profile: String,
+    pub permission_profile: String,
+    pub background_default: bool,
+    pub default_agent_id: String,
+    pub dev_mode: bool,
+    pub background_override_set: bool,
+    pub background_override: bool,
+}
+
+/// Read-only bridge data collected for the currently displayed thread during
+/// one frame. The bridge owns the live connections; the reducer owns the
+/// resulting presentation state after this value is folded into `Model`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadFrameSnapshot {
+    pub real_index: usize,
+    pub transcript: Vec<crate::conversation::TranscriptItem>,
+    pub has_older_messages: bool,
+    pub pending_request: crate::PendingRequestItem,
+    pub terminals: Vec<crate::TerminalItem>,
+    pub expanded_terminal: Option<crate::TerminalItem>,
+    pub local_terminal: crate::LocalTerminalItem,
+    pub connection_status: String,
+    pub session_modes: Option<crate::protocol_types::SessionModesEvent>,
+    pub config_options: Vec<crate::protocol_types::ConfigOptionInfo>,
 }
 
 #[cfg(test)]
@@ -218,27 +337,58 @@ mod tests {
     /// forced through this function).
     fn closure_name_to_domain(name: &str) -> &'static str {
         match name {
-            "new_thread_requested" | "thread_selected" | "thread_navigation_requested"
-            | "thread_close_requested" | "thread_delete_requested" | "thread_rename_requested"
-            | "thread_toggle_background" | "recover_session_attach" => "thread",
-            "send_requested" | "stop_requested" | "generation_stopped"
-            | "active_token_prefix" | "active_token_query" | "replace_active_token"
-            | "word_boundary_before" | "contains_ci" => "compose",
-            "approve_request" | "reject_request" | "permission_option_selected"
+            "new_thread_requested"
+            | "thread_selected"
+            | "thread_navigation_requested"
+            | "thread_close_requested"
+            | "thread_delete_requested"
+            | "thread_rename_requested"
+            | "thread_toggle_background"
+            | "recover_session_attach" => "thread",
+            "send_requested"
+            | "stop_requested"
+            | "generation_stopped"
+            | "active_token_prefix"
+            | "active_token_query"
+            | "replace_active_token"
+            | "word_boundary_before"
+            | "contains_ci" => "compose",
+            "approve_request"
+            | "reject_request"
+            | "permission_option_selected"
             | "load_older_requested" => "request",
-            "expand_terminal" | "close_terminal_overlay" | "local_terminal_toggle_requested"
-            | "local_terminal_close_requested" | "local_terminal_key_input" => "terminal",
-            "settings_requested" | "settings_close" | "settings_save"
-            | "settings_scope_changed" | "config_option_selected" | "mode_selected"
-            | "dev_mode_toggled" | "mcp_server_create" | "mcp_server_delete"
-            | "mcp_server_enabled_changed" | "profile_create" | "profile_delete"
+            "expand_terminal"
+            | "close_terminal_overlay"
+            | "local_terminal_toggle_requested"
+            | "local_terminal_close_requested"
+            | "local_terminal_key_input" => "terminal",
+            "settings_requested"
+            | "settings_close"
+            | "settings_save"
+            | "settings_scope_changed"
+            | "config_option_selected"
+            | "mode_selected"
+            | "dev_mode_toggled"
+            | "mcp_server_create"
+            | "mcp_server_delete"
+            | "mcp_server_enabled_changed"
+            | "profile_create"
+            | "profile_delete"
             | "agent_install_requested" => "settings",
-            "new_skill_requested" | "skill_content_edited" | "skill_copy_path_requested"
-            | "skill_editor_open_requested" | "skill_open_in_editor_requested"
-            | "skill_open_with_os_default_requested" | "skill_promote_to_global" => "skill",
-            "search_changed" | "search_submitted" | "toggle_expanded"
+            "new_skill_requested"
+            | "skill_content_edited"
+            | "skill_copy_path_requested"
+            | "skill_editor_open_requested"
+            | "skill_open_in_editor_requested"
+            | "skill_open_with_os_default_requested"
+            | "skill_promote_to_global" => "skill",
+            "search_changed"
+            | "search_submitted"
+            | "toggle_expanded"
             | "error_banner_dismissed" => "chrome",
-            other => panic!("on_{other} has no UiMsg domain mapping -- add one to msg.rs and this test"),
+            other => {
+                panic!("on_{other} has no UiMsg domain mapping -- add one to msg.rs and this test")
+            }
         }
     }
 
