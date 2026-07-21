@@ -1793,6 +1793,49 @@ impl PanelSingleton {
         self.render_messages(real_idx);
     }
 
+    /// `dispatch.rs`'s Host-domain wrapper (tea-slint-model Phase 4) calls
+    /// this -- extracted verbatim from the former `panel_rust_set_project_
+    /// path` FFI entry point's body (after its raw byte-buffer parsing,
+    /// which stays in `lib.rs` since it's genuinely FFI-boundary work, not
+    /// application logic).
+    pub(crate) fn dispatch_project_path_changed(&self, path: Option<String>) {
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
+        }
+        self.component
+            .set_active_project_path(path.clone().unwrap_or_default().into());
+        *self.active_project_path.borrow_mut() = path;
+        self.refresh_skills_model();
+    }
+
+    /// `dispatch.rs`'s Host-domain wrapper (tea-slint-model Phase 4) calls
+    /// this -- extracted verbatim from the former `panel_rust_apply_host_
+    /// appearance` FFI entry point's body (after its raw byte-buffer
+    /// decoding, which stays in `lib.rs`).
+    pub(crate) fn dispatch_apply_host_appearance(&self, appearance: HostAppearance) -> bool {
+        let dark = matches!(appearance.color_scheme, ColorScheme::Dark);
+        if !self.appearance.borrow_mut().apply(appearance) {
+            return false;
+        }
+        let appearance_state = self.appearance.borrow();
+        let appearance = appearance_state
+            .current()
+            .expect("appearance was applied above");
+        let theme = Theme::get(&self.component);
+        theme.set_theme(if dark { "dark" } else { "light" }.into());
+        theme.set_host_language_tag(appearance.language_tag.clone().into());
+        theme.set_host_font_sans(appearance.bundled_font.clone().into());
+        theme.set_host_font_scale(appearance.font_scale);
+        theme.set_host_density(appearance.density);
+        self.window
+            .window()
+            .dispatch_event(WindowEvent::ScaleFactorChanged {
+                scale_factor: appearance.density,
+            });
+        self.window.window().request_redraw();
+        true
+    }
+
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
     pub(crate) fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
@@ -3567,31 +3610,18 @@ pub extern "C" fn panel_rust_set_project_path(
     path_ptr: *const c_uchar,
     path_len: usize,
 ) -> bool {
+    let path = if path_ptr.is_null() || path_len == 0 {
+        None
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+        std::str::from_utf8(bytes).ok().map(str::to_string)
+    };
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
             return false;
         };
-        let path = if path_ptr.is_null() || path_len == 0 {
-            None
-        } else {
-            let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
-            std::str::from_utf8(bytes).ok().map(str::to_string)
-        };
-        // `chat_sessions_project_path` phase: also propagate to the
-        // bridge, whose `cwd_for_session` reads this to scope every
-        // subsequently-opened ACP session to the active project instead
-        // of the process's own working directory.
-        if let Some(bridge) = panel.bridge.as_ref() {
-            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
-        }
-        panel
-            .component
-            .set_active_project_path(path.clone().unwrap_or_default().into());
-        *panel.active_project_path.borrow_mut() = path;
-        // `project_scoped_skill_isolation`: re-scan now that the active
-        // project (and therefore its `.skills/` directory) changed.
-        panel.refresh_skills_model();
+        dispatch::dispatch_project_path_changed(panel, path);
         true
     })
 }
@@ -3659,27 +3689,7 @@ pub extern "C" fn panel_rust_apply_host_appearance(
             font_scale,
             density,
         };
-        if !panel.appearance.borrow_mut().apply(appearance) {
-            return false;
-        }
-        let appearance_state = panel.appearance.borrow();
-        let appearance = appearance_state
-            .current()
-            .expect("appearance was applied above");
-        let theme = Theme::get(&panel.component);
-        theme.set_theme(if dark { "dark" } else { "light" }.into());
-        theme.set_host_language_tag(appearance.language_tag.clone().into());
-        theme.set_host_font_sans(appearance.bundled_font.clone().into());
-        theme.set_host_font_scale(appearance.font_scale);
-        theme.set_host_density(appearance.density);
-        panel
-            .window
-            .window()
-            .dispatch_event(WindowEvent::ScaleFactorChanged {
-                scale_factor: appearance.density,
-            });
-        panel.window.window().request_redraw();
-        true
+        dispatch::dispatch_apply_host_appearance(panel, appearance)
     })
 }
 

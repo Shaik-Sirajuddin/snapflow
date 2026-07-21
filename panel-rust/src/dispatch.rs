@@ -27,7 +27,8 @@
 use crate::dirty::{Dirty, ScalarField};
 use crate::model::{Model, ThreadModel};
 use crate::msg::{
-    ChromeMsg, ComposeMsg, Msg, RequestMsg, SettingsMsg, SkillMsg, TerminalMsg, ThreadMsg, UiMsg,
+    ChromeMsg, ComposeMsg, HostMsg, Msg, RequestMsg, SettingsMsg, SkillMsg, TerminalMsg, ThreadMsg,
+    UiMsg,
 };
 use crate::update::update;
 use crate::ChatPanel;
@@ -585,6 +586,27 @@ pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
     let mut model = thread_selection_model(panel);
     let _ = update(&mut model, Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(index))));
     panel.dispatch_toggle_expanded(index);
+}
+
+// Host-domain wrapper (tea-slint-model Phase 4, non-Slint-callback FFI
+// entry points -- see 00-plan.md's "Msg source coverage" point 3). Same
+// bridge shape as every UI domain above.
+
+pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option<String>) {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Host(HostMsg::ProjectPathChanged(path.clone())));
+    panel.dispatch_project_path_changed(path);
+}
+
+pub(crate) fn dispatch_apply_host_appearance(
+    panel: &PanelSingleton,
+    appearance: crate::appearance::HostAppearance,
+) -> bool {
+    let mut model = thread_selection_model(panel);
+    let mut state = crate::appearance::AppearanceState::default();
+    state.apply(appearance.clone());
+    let _ = update(&mut model, Msg::Host(HostMsg::AppearanceChanged(state)));
+    panel.dispatch_apply_host_appearance(appearance)
 }
 
 #[cfg(test)]
