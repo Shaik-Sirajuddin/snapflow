@@ -1011,6 +1011,27 @@ impl PanelSingleton {
         self.refresh_capabilities_for(real_idx);
         self.refresh_local_terminal_for(real_idx);
         self.refresh_connection_status_for(real_idx);
+        self.refresh_last_error_for(real_idx);
+    }
+
+    /// Mirrors `real_idx`'s `thread_errors` slot (already populated by
+    /// `AgentEvent::Error` -- see that arm's own comment) into the
+    /// `last-error` property `chat_area.slint`'s banner reads, so a send/
+    /// session-attach failure becomes visible in the transcript itself,
+    /// not only as the sidebar's "Error: ..." subtitle (`refresh_threads_
+    /// model`'s `errors` mapping) -- that subtitle is easy to miss
+    /// entirely while looking at the message view, which is exactly the
+    /// "sent a message, saw nothing happen" symptom this closes.
+    fn refresh_last_error_for(&self, real_idx: usize) {
+        let error = self
+            .thread_errors
+            .borrow()
+            .get(real_idx)
+            .cloned()
+            .unwrap_or_default();
+        if self.component.get_last_error().as_str() != error {
+            self.component.set_last_error(error.into());
+        }
     }
 
     /// Single entry point for "make `filtered_idx` (a Slint filtered-list
@@ -1415,15 +1436,36 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 existing
                     .window
                     .set_size(slint::PhysicalSize::new(width, height));
-                existing.buffer.replace(vec![
+                // `resize` in place, not `replace(vec![...])` -- a live
+                // window/dock drag fires this on every intermediate
+                // geometry step, and the previous full
+                // fresh-allocate-and-zero-every-pixel approach did real,
+                // avoidable work on every single one of those ticks (a
+                // full heap allocation plus writing every element to the
+                // same default color, discarding the old buffer's already-
+                // reserved capacity every time). `resize` reuses existing
+                // capacity when the new size fits (the common case for
+                // small drag deltas) and only initializes newly-added
+                // elements when growing -- correctness is unaffected by
+                // stale/reinterpreted content from a width change, since
+                // panel_rust_render always redraws every pixel of the
+                // buffer fresh on the next frame regardless (this is a
+                // full-buffer software renderer, not incremental), so
+                // nothing here is ever visible before that overwrite.
+                // Reported symptom this closes: "resize is not smooth,
+                // layout elements bump up and down a bit" -- the
+                // reallocation cost on every drag tick could fall behind
+                // Qt's own frame pacing, visibly desyncing the panel's
+                // content from the window chrome resizing around it.
+                existing.buffer.borrow_mut().resize(
+                    (width * height) as usize,
                     PremultipliedRgbaColor {
                         red: 0,
                         green: 0,
                         blue: 0,
-                        alpha: 0
-                    };
-                    (width * height) as usize
-                ]);
+                        alpha: 0,
+                    },
+                );
                 existing.width = width;
                 existing.height = height;
                 existing.component.set_compact(width < 320);
@@ -1605,7 +1647,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             thread_permission_profiles: RefCell::new(initial_permission_profiles),
             traced_attachment_threads: RefCell::new(HashSet::new()),
             thread_state: RefCell::new(initial_state),
-            thread_errors: RefCell::new(Vec::new()),
+            // Sized to match thread_state/thread_names from construction,
+            // not left empty -- an empty Vec here made every `.get_mut(idx)`
+            // in the `AgentEvent::Error` handler silently no-op for any
+            // thread that existed at startup (the whole bootstrap set),
+            // so neither the sidebar's "Error: ..." subtitle nor the
+            // transcript error banner ever recorded a real failure for
+            // them, only for threads created afterward via "New Thread"
+            // (whose creation path does push a matching entry). Found live
+            // against a real running instance: a bootstrap thread's
+            // AgentEvent::Error genuinely fired (confirmed via
+            // RUI_PANEL_INPUT_TRACE) and set ThreadState::Error, yet
+            // last-error stayed empty the whole time.
+            thread_errors: RefCell::new(vec![String::new(); initial_thread_count]),
             send_queues: RefCell::new(
                 (0..initial_thread_count)
                     .map(|_| crate::send_queue::SendQueue::new())
@@ -1868,6 +1922,25 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             if let Some(component) = component_weak.upgrade() {
                 component.set_settings_open(false);
             }
+        });
+
+        panel.component.on_error_banner_dismissed(move || {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let selected = panel.component.get_selected_thread();
+                    let Some(real_idx) = panel.real_index(selected.max(0) as usize) else {
+                        return;
+                    };
+                    if let Some(error) = panel.thread_errors.borrow_mut().get_mut(real_idx) {
+                        error.clear();
+                    }
+                    panel.refresh_last_error_for(real_idx);
+                    // Sidebar subtitle mirrors the same error string --
+                    // dismissing the banner should clear both, not leave
+                    // the sidebar still saying "Error: ...".
+                    panel.refresh_threads_model();
+                }
+            });
         });
 
         panel.component.on_thread_toggle_background(move |slint_index| {
@@ -3091,6 +3164,33 @@ pub extern "C" fn panel_rust_has_text_focus(_handle: *mut PanelHandle) -> bool {
     })
 }
 
+/// Maps a `CursorHost.kind` string (set declaratively by every interactive
+/// component's `has-hover`/`has-focus` change-handler -- see
+/// `ui/tokens/cursor_host.slint` for why this indirection exists instead of
+/// Slint's own internal cursor-shape tracking) to a `Qt::CursorShape` enum
+/// value, so `RustPanelItem::poll()` (rustpanelitem.cpp) can call
+/// `setCursor(static_cast<Qt::CursorShape>(shape))` directly -- the same
+/// "map Qt-specific values on the Rust side" convention `map_qt_key` already
+/// uses for keyboard input.
+fn qt_cursor_shape_for_kind(kind: &str) -> c_int {
+    match kind {
+        "pointer" => 13, // Qt::PointingHandCursor
+        "text" => 4,     // Qt::IBeamCursor
+        _ => 0,          // Qt::ArrowCursor
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn panel_rust_cursor_shape(_handle: *mut PanelHandle) -> c_int {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return 0; // Qt::ArrowCursor
+        };
+        qt_cursor_shape_for_kind(panel.component.global::<CursorHost>().get_kind().as_str())
+    })
+}
+
 /// Forward a click at physical pixel coordinates, as a press+release pair.
 #[no_mangle]
 pub extern "C" fn panel_rust_input_click(_handle: *mut PanelHandle, x: c_uint, y: c_uint) -> bool {
@@ -3129,6 +3229,45 @@ pub extern "C" fn panel_rust_input_click(_handle: *mut PanelHandle, x: c_uint, y
     trace_host_input(format_args!(
         "click x={x} y={y} compose_focus={compose_has_focus} selected_thread={selected_thread} state={selected_state}"
     ));
+    true
+}
+
+/// Forwards hover-only mouse movement (no button held) at physical pixel
+/// coordinates. Without this, a `TouchArea`'s `has-hover` (the shared
+/// `Button`/`IconButton` components' hover-tinted background, and any
+/// `mouse-cursor` binding) never updates at all outside of a
+/// press/release, since Slint only learns about pointer position via
+/// explicit `WindowEvent::PointerMoved` dispatches -- `panel_rust_input_click`
+/// already sends one immediately before its own Press, but that's the only
+/// place any `PointerMoved` was ever dispatched before this. Real bug this
+/// closes (tasks/v2/enhance.yaml#task-4): "hover effects... cursor change,
+/// the ui components picking hover... are not propagated" -- confirmed via
+/// direct inspection that `RustPanelItem` (rustpanelitem.cpp) never called
+/// `setAcceptHoverEvents(true)` nor overrode `hoverMoveEvent` at all, so Qt
+/// never even told this item about mouse movement without a button down.
+#[no_mangle]
+pub extern "C" fn panel_rust_input_hover(_handle: *mut PanelHandle, x: c_uint, y: c_uint) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window.window().dispatch_event(WindowEvent::PointerMoved {
+        position: slint::LogicalPosition::new(x as f32, y as f32),
+    });
+    true
+}
+
+/// Forwards the pointer leaving the panel's bounds entirely (Qt's
+/// `hoverLeaveEvent`), so any `has-hover` state correctly clears instead of
+/// staying stuck at whatever it was under the last position inside the
+/// panel that ever received a move event.
+#[no_mangle]
+pub extern "C" fn panel_rust_input_hover_exit(_handle: *mut PanelHandle) -> bool {
+    let window = PANEL.with(|cell| cell.borrow().as_ref().map(|panel| panel.window.clone()));
+    let Some(window) = window else {
+        return false;
+    };
+    window.window().dispatch_event(WindowEvent::PointerExited);
     true
 }
 
@@ -3654,6 +3793,19 @@ pub extern "C" fn panel_rust_height(_handle: *mut PanelHandle) -> c_uint {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn cursor_shape_maps_known_kinds_to_qt_enum_values() {
+        assert_eq!(qt_cursor_shape_for_kind("pointer"), 13); // Qt::PointingHandCursor
+        assert_eq!(qt_cursor_shape_for_kind("text"), 4); // Qt::IBeamCursor
+    }
+
+    #[test]
+    fn cursor_shape_defaults_to_arrow_for_default_and_unknown_kinds() {
+        assert_eq!(qt_cursor_shape_for_kind("default"), 0); // Qt::ArrowCursor
+        assert_eq!(qt_cursor_shape_for_kind(""), 0);
+        assert_eq!(qt_cursor_shape_for_kind("some-future-kind"), 0);
+    }
 
     #[test]
     fn panel_create_destroy_create_reuses_slint_platform() {

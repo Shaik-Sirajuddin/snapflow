@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Capped-height + scroll + expand-on-click shell -- chat-items-redesign.md
 // #7 ("execution-view"). Hidden/collapsed by default per the spec's
@@ -48,6 +49,7 @@ export component ExpandablePanel {
                     expanded = !expanded;
                     toggled(expanded);
                 }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             Text {
                 text: expanded ? "Show less" : "Open full view";

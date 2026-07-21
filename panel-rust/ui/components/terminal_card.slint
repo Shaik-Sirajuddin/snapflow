@@ -2,6 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { TerminalItem } from "../types.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Real embedded terminal view -- Phase 4 terminal-view addition. Two
 // components:
@@ -48,6 +49,7 @@ export component TerminalCard inherits Rectangle {
                 accessible-label: "Expand terminal " + item.terminal-id;
                 accessible-action-default => { expand(); }
                 clicked => { expand(); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             HorizontalLayout {
                 spacing: Metrics.space-3;

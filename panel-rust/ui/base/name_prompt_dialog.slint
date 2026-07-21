@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Shared small text-entry modal for naming user-created objects such as
 // skills and chat threads. Hosts own the actual create/rename operation.
@@ -84,6 +85,7 @@ export component NamePromptDialog inherits Rectangle {
                         }
                         return EventResult.reject;
                     }
+                    changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
                 }
             }
             HorizontalLayout {
@@ -97,6 +99,7 @@ export component NamePromptDialog inherits Rectangle {
                         root.open = false;
                         root.cancelled();
                     }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
                         text: "Cancel";
                         color: Theme.text-secondary;
@@ -112,6 +115,9 @@ export component NamePromptDialog inherits Rectangle {
                     clicked => {
                         root.confirmed(name-input.text);
                         root.open = false;
+                    }
+                    changed has-hover => {
+                        CursorHost.kind = (self.has-hover && name-input.text != "") ? "pointer" : "default";
                     }
                     Text {
                         text: root.confirm-label;

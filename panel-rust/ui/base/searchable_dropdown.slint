@@ -3,6 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { DropdownEntry } from "../types.slint";
 import { TextUtil } from "text_util.slint";
 import { FilterSearchBar } from "filter_search_bar.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- trigger + upward popup list of `DropdownEntry` rows.
 // Search UX mirrors the compose `/` skills popup:
@@ -241,6 +242,7 @@ export component SearchableDropdown inherits Rectangle {
         accessible-label: root.trigger-label;
         accessible-action-default => { root.toggle-popup(); }
         clicked => { root.toggle-popup(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
     HorizontalLayout {
         width: 100%;
@@ -312,6 +314,8 @@ export component SearchableDropdown inherits Rectangle {
             // VerticalLayout, which Slint doesn't allow for `if`-only
             // elements ("Cannot access id"). No live caller sets
             // `searchable: false` today, so this has no visible effect.
+            // Cursor-kind reporting (pointer/text) lives inside
+            // FilterSearchBar itself, so every call site inherits it.
             dd-search-bar := FilterSearchBar {
                 visible: root.show-search;
                 query <=> root.filter;
@@ -358,6 +362,9 @@ export component SearchableDropdown inherits Rectangle {
                                 root.kb-sel = i;
                                 root.entry-selected(entry.id, entry.value, entry.label);
                                 root.close();
+                            }
+                            changed has-hover => {
+                                CursorHost.kind = (self.has-hover && !entry.is-header) ? "pointer" : "default";
                             }
                         }
                         HorizontalLayout {

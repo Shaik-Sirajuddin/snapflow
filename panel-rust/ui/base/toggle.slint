@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- the "switch"-shaped on/off control. Until now every
 // toggle-shaped setting in this codebase was hand-rolled per call site
@@ -37,6 +38,7 @@ export component Toggle inherits Rectangle {
             root.checked = !root.checked;
             root.toggled(root.checked);
         }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
 
     knob := Rectangle {

@@ -1,6 +1,7 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "icon.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Shared filter/search field for the whole panel UI:
 //   - thread sidebar search
@@ -70,6 +71,7 @@ export component FilterSearchBar inherits Rectangle {
                 root.icon-clicked();
                 search-input.focus();
             }
+            changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             Icon {
                 source: @image-url("../assets/icons/search.svg");
                 size: Metrics.icon-sm;
@@ -118,6 +120,7 @@ export component FilterSearchBar inherits Rectangle {
                 key-pressed(event) => {
                     return root.key-pressed(event);
                 }
+                changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
             }
         }
         // Trailing icon (thread sidebar expanded row).
@@ -130,6 +133,7 @@ export component FilterSearchBar inherits Rectangle {
                 root.icon-clicked();
                 search-input.focus();
             }
+            changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             Icon {
                 source: @image-url("../assets/icons/search.svg");
                 size: Metrics.icon-sm;

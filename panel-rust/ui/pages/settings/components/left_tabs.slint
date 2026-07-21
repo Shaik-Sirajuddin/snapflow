@@ -1,6 +1,7 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
+import { CursorHost } from "../../../tokens/cursor_host.slint";
 
 // Settings page chrome -- the left-side section rail from the
 // settings-pane-redesign plan's "Component layout" section: `MCP Servers`
@@ -35,6 +36,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-action-default => { root.section-selected("mcp_servers"); }
                 clicked => { root.section-selected("mcp_servers"); }
                 double-clicked => { root.collapse-requested(); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             VerticalLayout {
                 width: parent.width;
@@ -80,6 +82,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-action-default => { root.section-selected("agents"); }
                 clicked => { root.section-selected("agents"); }
                 double-clicked => { root.collapse-requested(); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             VerticalLayout {
                 width: parent.width;
@@ -125,6 +128,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-action-default => { root.section-selected("harness"); }
                 clicked => { root.section-selected("harness"); }
                 double-clicked => { root.collapse-requested(); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             VerticalLayout {
                 width: parent.width;
@@ -170,6 +174,7 @@ export component SettingsLeftTabs inherits Rectangle {
                 accessible-action-default => { root.section-selected("skills"); }
                 clicked => { root.section-selected("skills"); }
                 double-clicked => { root.collapse-requested(); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             VerticalLayout {
                 width: parent.width;

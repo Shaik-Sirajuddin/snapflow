@@ -7,6 +7,7 @@ import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider 
 import { SettingsSearchBar } from "../components/search_bar.slint";
 import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
+import { CursorHost } from "../../../tokens/cursor_host.slint";
 
 // Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
 // former `components/settings_sheet.slint` that is agent/profile/session
@@ -114,6 +115,7 @@ export component AgentsView inherits Rectangle {
                                 accessible-label: "Select profile " + profile.name;
                                 accessible-action-default => { root.default-profile = profile.name; }
                                 clicked => { root.default-profile = profile.name; }
+                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                             }
                             profile-chip-label := Text {
                                 text: profile.name

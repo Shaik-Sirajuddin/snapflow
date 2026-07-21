@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- shared hover/cursor convention for clickable surfaces.
 // IconButton and Button already bake this in; HoverSurface is for free-form
@@ -35,6 +36,9 @@ export component HoverSurface inherits Rectangle {
         accessible-action-default => { root.clicked(); }
         clicked => { root.clicked(); }
         double-clicked => { root.double-clicked(); }
+        changed has-hover => {
+            CursorHost.kind = (self.has-hover && root.interactive) ? "pointer" : "default";
+        }
     }
     @children
 }

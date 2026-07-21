@@ -7,8 +7,9 @@ import { LocalTerminalOverlay } from "components/local_terminal_card.slint";
 import { SettingsPage } from "pages/settings/settings_page.slint";
 import { SkillEditorView } from "pages/skills/skill_view.slint";
 import { TextUtil } from "base/text_util.slint";
+import { CursorHost } from "tokens/cursor_host.slint";
 
-export { ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme }
+export { ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption, TextUtil, Theme, CursorHost }
 
 // Root window -- Rust-facing public API (property/callback names) is
 // unchanged from the pre-reskin inline-macro version so
@@ -75,6 +76,13 @@ export component ChatPanel inherits Window {
     in-out property <bool> background-override-set: false;
     in-out property <bool> background-override: false;
     in property <string> connection-status: "Connecting...";
+    // Non-empty when the currently-displayed thread's most recent send/
+    // session-attach failed (AgentEvent::Error) -- previously only
+    // surfaced as a sidebar subtitle ("Error: ..."), which was easy to
+    // miss entirely if you were looking at the message transcript, not
+    // the thread list. Rendered as a dismissible banner in chat_area.
+    in property <string> last-error: "";
+    callback error-banner-dismissed();
     in property <bool> compact: true;
     in-out property <bool> narrow: false;
     in-out property <bool> sidebar-expanded: false;
@@ -434,6 +442,8 @@ export component ChatPanel inherits Window {
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
                 connection-status: connection-status;
+                last-error: last-error;
+                error-banner-dismissed => { error-banner-dismissed(); }
                 sending: threads.length > 0
                     ? threads[selected-thread].status == "loading"
                         || threads[selected-thread].status == "cancelling"

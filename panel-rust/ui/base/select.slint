@@ -2,6 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "icon.slint";
 import { FilterSearchBar } from "filter_search_bar.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- generic single-select dropdown. Nothing in this
 // codebase had a reusable "pick one of a fixed list" control before this
@@ -84,6 +85,7 @@ export component Select inherits Rectangle {
         accessible-label: root.select-accessible-label;
         accessible-action-default => { root.query = ""; popup.show(); }
         clicked => { root.query = ""; popup.show(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
 
     Text {
@@ -129,7 +131,9 @@ export component Select inherits Rectangle {
             VerticalLayout {
                 // Shared FilterSearchBar — same chrome as settings / thread /
                 // mention search. Filtering still needs TextUtil when used
-                // against long lists (see component doc above).
+                // against long lists (see component doc above). Cursor-kind
+                // reporting (pointer/text) lives inside FilterSearchBar
+                // itself, so every call site inherits it.
                 if root.searchable : FilterSearchBar {
                     query <=> root.query;
                     placeholder: "Search...";

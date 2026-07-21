@@ -3,6 +3,7 @@ import { FilterSearchBar } from "../../../base/filter_search_bar.slint";
 
 // Settings page — thin wrap of shared FilterSearchBar with settings defaults.
 // All settings search sites should use this (or FilterSearchBar directly).
+// Cursor-kind reporting (pointer/text) lives inside FilterSearchBar itself.
 export component SettingsSearchBar inherits FilterSearchBar {
     show-icon: false;
     icon-trailing: false;
