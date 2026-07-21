@@ -1267,20 +1267,30 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
         crate::PANEL_COMMAND_OPEN_THREAD_SEARCH => "open-thread-search",
         _ => return false,
     };
-    let _ = update_persistent(
+    let (_, dirty) = update_persistent(
         panel,
         Msg::Host(HostMsg::InvokeCommand(command_name.to_owned())),
     );
-    let component_weak = panel.component.as_weak();
-    let Some(component) = component_weak.upgrade() else {
-        return false;
-    };
     match command {
-        crate::PANEL_COMMAND_PREVIOUS_THREAD => component.invoke_thread_navigation_requested(-1),
-        crate::PANEL_COMMAND_NEXT_THREAD => component.invoke_thread_navigation_requested(1),
-        crate::PANEL_COMMAND_OPEN_THREAD_SEARCH => component.invoke_open_thread_search(),
+        crate::PANEL_COMMAND_PREVIOUS_THREAD | crate::PANEL_COMMAND_NEXT_THREAD => {
+            let selected_thread = panel.model.borrow().selected_thread;
+            panel.select_visible_thread(selected_thread);
+        }
+        crate::PANEL_COMMAND_OPEN_THREAD_SEARCH => {
+            let component_weak = panel.component.as_weak();
+            let Some(component) = component_weak.upgrade() else {
+                return false;
+            };
+            component.invoke_open_thread_search();
+        }
         _ => return false,
     }
+    debug_assert!(
+        command == crate::PANEL_COMMAND_OPEN_THREAD_SEARCH
+            || dirty
+                .iter()
+                .all(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))
+    );
     true
 }
 

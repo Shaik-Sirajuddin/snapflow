@@ -685,7 +685,13 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
 
 fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
-        HostMsg::InvokeCommand(_cmd) => (vec![], vec![]),
+        HostMsg::InvokeCommand(command) => match command.as_str() {
+            "previous-thread" => update_thread(model, ThreadMsg::NavigateDelta(-1)),
+            "next-thread" => update_thread(model, ThreadMsg::NavigateDelta(1)),
+            // Opening search is presentation-only; the dispatcher invokes
+            // the generated Slint function after this reducer pass.
+            _ => (vec![], vec![]),
+        },
         HostMsg::InputKey { .. } => (vec![], vec![]),
         HostMsg::AppearanceChanged(state) => {
             let theme_variant = state
@@ -1284,6 +1290,30 @@ mod tests {
         assert_eq!(model.selected_thread, 0);
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn host_previous_thread_command_uses_reducer_navigation() {
+        let mut model = model_with_threads(&["a", "b", "c"]);
+        model.selected_thread = 1;
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Host(HostMsg::InvokeCommand("previous-thread".to_owned())),
+        );
+        assert_eq!(model.selected_thread, 0);
+        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+    }
+
+    #[test]
+    fn host_next_thread_command_uses_reducer_navigation() {
+        let mut model = model_with_threads(&["a", "b", "c"]);
+        model.selected_thread = 1;
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Host(HostMsg::InvokeCommand("next-thread".to_owned())),
+        );
+        assert_eq!(model.selected_thread, 2);
+        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
     }
 
     #[test]
