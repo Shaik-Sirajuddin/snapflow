@@ -364,6 +364,25 @@ availability only). A bridge session:
   *lazily* bound to a real native gateway session on first
   `session/prompt`, not at `session/new`, so a client that only ever
   lists models never spawns a backend process.
+- **Model catalog is live, not primarily config-file-driven.**
+  `ACPX_ACP_BRIDGE_CONFIG_FILE`'s `models`/`default_model` are both
+  optional now, and exist only as an operator-pinned override/fallback
+  (never pruned by discovery). The normal source is
+  `BridgeRuntime::refresh_models_with_config`: it probes every
+  *explicitly provisioned* profile's `agent_id` (`Router::
+  provisioned_profile_agent_ids` -- `ACPX_CONFIG_FILE`'s `profiles`
+  array or a `profiles/create` call; deliberately **excludes**
+  `ensure_default_profiles_seeded`'s auto-filled, one-per-installed-CLI
+  profiles, so installing a new agent binary on the host never silently
+  widens what a strict-ACP client can select), merges newly-discovered
+  models in, and **prunes** any previously-discovered (non-static)
+  model whose agent answered this cycle but no longer reports it (fixed
+  a real staleness bug: a Bifrost catalog entry disappearing upstream
+  used to keep being served, `available: true`, forever). An agent
+  whose probe fails/times out this cycle keeps its previous entries
+  rather than going empty. `BridgeRuntime::effective_default_model`
+  resolves an unset `default_model` to the first live-discovered entry
+  at read time, rather than requiring one to be pinned up front.
 - Is a **virtual session**: the client-visible id never equals the real
   gateway session id underneath it (see `bridge_sessions.rs`). An
   unbound virtual session (picked a model, or not, but never prompted)

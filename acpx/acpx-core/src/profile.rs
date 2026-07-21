@@ -19,6 +19,19 @@ pub struct Profile {
     /// Which registry-listed agent (e.g. `codex-acp`, `claude-agent-acp`)
     /// this profile launches.
     pub agent_id: String,
+    /// Where this profile came from -- see [`ProfileSource`]'s own doc
+    /// comment. Consulted by the `/acp` bridge's model-discovery seed
+    /// (`acpx-server`'s `refresh_models_with_config`) to decide whether
+    /// this profile's `agent_id` is eligible to be probed/exposed as a
+    /// selectable model: only [`ProfileSource::Provisioned`] profiles
+    /// are, so installing a new CLI agent on the host never silently
+    /// widens what a strict-ACP client like Zed can select without an
+    /// operator explicitly provisioning it (`ACPX_CONFIG_FILE` or
+    /// `profiles/create`). `#[serde(default)]` (defaulting to
+    /// `Provisioned`) so every pre-existing persisted/provisioned
+    /// `Profile` JSON that predates this field parses unchanged.
+    #[serde(default)]
+    pub source: ProfileSource,
     /// Provider name, resolved against `ProviderStore` at spawn time.
     /// `None` means "launch the agent with no provider env overrides" --
     /// still a distinct, explicitly-requested process from native mode
@@ -85,6 +98,27 @@ pub struct Profile {
     /// see `router::ensure_backend_initialized`'s doc comment.
     #[serde(default)]
     pub auth_method_id: Option<String>,
+}
+
+/// Distinguishes a profile an operator/client explicitly asked for from
+/// one `Router::ensure_default_profiles_seeded` auto-fills so every
+/// installed registry agent has *some* name to bind to. Both are equally
+/// valid for ACPX's own native protocol (that auto-fill exists precisely
+/// so `_acpx.profile` never requires setup for the common case) -- this
+/// distinction only matters to consumers, like the `/acp` bridge, that
+/// need a deliberately curated subset rather than "every CLI this host
+/// happens to have installed."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileSource {
+    /// Created via `profiles/create`/`profiles/update` (including
+    /// `ACPX_CONFIG_FILE` startup provisioning, which goes through the
+    /// same call).
+    #[default]
+    Provisioned,
+    /// Auto-filled by `ensure_default_profiles_seeded` for an installed
+    /// agent nobody has explicitly named a profile for yet.
+    AutoSeeded,
 }
 
 /// How `crate::router` answers a backend's `session/request_permission`
@@ -179,6 +213,7 @@ mod tests {
         Profile {
             name: "work-openai".to_string(),
             agent_id: "codex-acp".to_string(),
+            source: ProfileSource::Provisioned,
             provider: Some("openai-default".to_string()),
             key_ref: None,
             launch_overrides: HashMap::new(),

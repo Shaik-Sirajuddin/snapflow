@@ -20,6 +20,7 @@ fn litellm_profile(name: &str, key_ref: acpx_core::keystore::KeyRef) -> Profile 
     Profile {
         name: name.to_string(),
         agent_id: "codex-acp".to_string(),
+        source: acpx_core::profile::ProfileSource::Provisioned,
         provider: Some("litellm-proxy".to_string()),
         key_ref: Some(key_ref),
         launch_overrides,
@@ -116,6 +117,7 @@ fn multiple_profiles_can_share_one_provider_with_different_keys() {
         .create(Profile {
             name: "alice".to_string(),
             agent_id: "claude-agent-acp".to_string(),
+            source: acpx_core::profile::ProfileSource::Provisioned,
             provider: Some("shared-anthropic".to_string()),
             key_ref: Some(alice_key),
             launch_overrides: HashMap::new(),
@@ -130,6 +132,7 @@ fn multiple_profiles_can_share_one_provider_with_different_keys() {
         .create(Profile {
             name: "bob".to_string(),
             agent_id: "claude-agent-acp".to_string(),
+            source: acpx_core::profile::ProfileSource::Provisioned,
             provider: Some("shared-anthropic".to_string()),
             key_ref: Some(bob_key),
             launch_overrides: HashMap::new(),
@@ -166,6 +169,7 @@ fn create_profile_referencing_provider_that_does_not_exist_yet_still_succeeds() 
     let profile = Profile {
         name: "future-provider".to_string(),
         agent_id: "codex-acp".to_string(),
+        source: acpx_core::profile::ProfileSource::Provisioned,
         provider: Some("not-registered-yet".to_string()),
         key_ref: None,
         launch_overrides: HashMap::new(),
@@ -196,6 +200,7 @@ fn profile_store_error_variants_are_distinguishable() {
     let profile = Profile {
         name: "x".to_string(),
         agent_id: "codex-acp".to_string(),
+        source: acpx_core::profile::ProfileSource::Provisioned,
         provider: None,
         key_ref: None,
         launch_overrides: HashMap::new(),
