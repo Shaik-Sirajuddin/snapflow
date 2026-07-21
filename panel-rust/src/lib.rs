@@ -1836,6 +1836,63 @@ impl PanelSingleton {
         true
     }
 
+    /// `dispatch.rs`'s Frame wrapper (tea-slint-model Phase 4b) calls this
+    /// -- extracted verbatim from the former `panel_rust_poll` body (minus
+    /// `update_timers_and_animations()`, which stays unconditional and
+    /// outside dispatch per 00-plan.md's "poll tick is a 4th Msg source"
+    /// section: it's platform/frame work, not application state).
+    pub(crate) fn dispatch_poll_tick(&self) -> bool {
+        let bridge_changed = self.apply_bridge_events();
+        // `thread_new_loading_state` phase: a newly-created thread's
+        // attachment can resolve with no other AgentEvent arriving in the
+        // same tick -- refresh the sidebar so its row flips out of the
+        // "loading" placeholder as soon as that happens, not only on the
+        // next unrelated bridge event.
+        let attachment_changed = self.sync_thread_records();
+        if attachment_changed {
+            self.refresh_threads_model();
+        }
+        // Multi-process settings watch: reload prefs when another process
+        // rewrote the global/project JSON (skip during our own save window).
+        let mut settings_changed = false;
+        if self
+            .settings_reload_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let ignore = self
+                .settings_ignore_watch_until
+                .get()
+                .is_some_and(|until| std::time::Instant::now() < until);
+            if !ignore && self.component.get_settings_open() {
+                self.apply_json_prefs_to_component();
+                settings_changed = true;
+            } else if !ignore {
+                self.apply_json_prefs_to_component();
+                settings_changed = true;
+            }
+        }
+        // Client-local PTY terminal output arrives on its own background
+        // reader thread, never through `AgentBridge::poll()`'s event queue
+        // -- refresh it unconditionally on every tick, independent of
+        // whether any gateway activity happened this tick.
+        let selected = self.real_index(self.component.get_selected_thread() as usize);
+        let local_terminal_changed = selected
+            .map(|idx| self.refresh_local_terminal_for(idx))
+            .unwrap_or(false);
+        let connection_changed = selected
+            .map(|idx| self.refresh_connection_status_for(idx))
+            .unwrap_or(false);
+        // An in-flight `animate` is itself a reason to repaint even when
+        // nothing else above changed this tick.
+        let animating = self.window.window().has_active_animations();
+        bridge_changed
+            || local_terminal_changed
+            || connection_changed
+            || settings_changed
+            || attachment_changed
+            || animating
+    }
+
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
     pub(crate) fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
@@ -3724,68 +3781,7 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let Some(panel) = slot.as_ref() else {
             return false;
         };
-        let bridge_changed = panel.apply_bridge_events();
-        // `thread_new_loading_state` phase: a newly-created thread's
-        // attachment can resolve with no other AgentEvent arriving in the
-        // same tick -- refresh the sidebar so its row flips out of the
-        // "loading" placeholder as soon as that happens, not only on the
-        // next unrelated bridge event.
-        let attachment_changed = panel.sync_thread_records();
-        if attachment_changed {
-            panel.refresh_threads_model();
-        }
-        // Multi-process settings watch: reload prefs when another process
-        // rewrote the global/project JSON (skip during our own save window).
-        let mut settings_changed = false;
-        if panel
-            .settings_reload_pending
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let ignore = panel
-                .settings_ignore_watch_until
-                .get()
-                .is_some_and(|until| std::time::Instant::now() < until);
-            if !ignore && panel.component.get_settings_open() {
-                // v1 dirty policy: always refresh when settings open
-                // (operator multi-process sync wins over half-edited form).
-                panel.apply_json_prefs_to_component();
-                settings_changed = true;
-            } else if !ignore {
-                panel.apply_json_prefs_to_component();
-                settings_changed = true;
-            }
-        }
-        // Client-local PTY terminal output arrives on its own
-        // background reader thread, never through `AgentBridge::
-        // poll()`'s event queue -- refresh it unconditionally on every
-        // tick (not gated behind `apply_bridge_events`'s own "any
-        // gateway events at all" early return), independent of whether
-        // any gateway activity happened this tick.
-        let selected = panel.real_index(panel.component.get_selected_thread() as usize);
-        let local_terminal_changed = selected
-            .map(|idx| panel.refresh_local_terminal_for(idx))
-            .unwrap_or(false);
-        let connection_changed = selected
-            .map(|idx| panel.refresh_connection_status_for(idx))
-            .unwrap_or(false);
-        // An in-flight `animate` (or a Flickable's own interactive flick/
-        // momentum motion) is itself a reason to repaint even when nothing
-        // else above changed this tick -- update_timers_and_animations()
-        // above only advances the animation clock, it doesn't make the C++
-        // side (RustPanelItem::poll, which only calls update() when this
-        // function returns true) know a frame still needs painting. Without
-        // this, every animation was silently truncated to whichever single
-        // tick happened to coincide with an unrelated state change, which
-        // in practice meant "frozen" for anything driven purely by
-        // animation (the sidebar rail's `animate width`, a Flickable's
-        // drag-release momentum, hover fades, ...).
-        let animating = panel.window.window().has_active_animations();
-        bridge_changed
-            || local_terminal_changed
-            || connection_changed
-            || settings_changed
-            || attachment_changed
-            || animating
+        dispatch::dispatch_frame_poll(panel)
     })
 }
 

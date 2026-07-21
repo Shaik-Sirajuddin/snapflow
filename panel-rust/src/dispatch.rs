@@ -598,6 +598,25 @@ pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option
     panel.dispatch_project_path_changed(path);
 }
 
+/// Wired from `panel_rust_poll` (tea-slint-model Phase 4b -- the 60-90fps
+/// poll tick, migrated last per 00-plan.md's own ordering rationale).
+/// Same bridge shape as every domain above: `update()`'s `Frame` arm is
+/// still a no-op stub (see `update::update_frame`'s doc comment) --
+/// `FrameInput` here is decorative, proving the tick is nominally routed
+/// through `Msg::Frame`, while the real per-tick work stays in the
+/// existing, unchanged `dispatch_poll_tick` (moved verbatim from
+/// `panel_rust_poll`'s own body). Full real `FrameInput` collection +
+/// `update()`/`sync()` taking over this tick's actual work is Phase 5+
+/// scope, once `Model` owns enough state for `sync()`'s Dirty-gated push
+/// to meaningfully replace this cascade -- see 00-plan.md's own note that
+/// a `Vec::new()` here doesn't allocate, so this decorative call costs
+/// nothing measurable relative to the real work `dispatch_poll_tick` does.
+pub(crate) fn dispatch_frame_poll(panel: &PanelSingleton) -> bool {
+    let mut model = thread_selection_model(panel);
+    let _ = update(&mut model, Msg::Frame(crate::msg::FrameInput::default()));
+    panel.dispatch_poll_tick()
+}
+
 pub(crate) fn dispatch_apply_host_appearance(
     panel: &PanelSingleton,
     appearance: crate::appearance::HostAppearance,
