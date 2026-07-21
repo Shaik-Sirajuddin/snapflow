@@ -171,6 +171,12 @@ jobs:
         shell: msys2 {0}
         working-directory: shotcut-rebrand
         run: |
+          # Corrosion's cargo invocation fails with "error: failed to join
+          # paths from `$LD_LIBRARY_PATH` together" -- an MSYS2-inherited
+          # POSIX-style path list confuses cargo's native-Windows path
+          # joining. It's a Linux-ism with nothing to do with this
+          # Windows/MinGW build, so just drop it.
+          unset LD_LIBRARY_PATH
           cmake -B build -G Ninja \
             -D SNAPFLOW_VERSION="$VERSION" \
             -D CMAKE_BUILD_TYPE=Release \
