@@ -1924,8 +1924,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             );
             sync::sync(&model, &panel.component, &dirty);
         }
-        panel.dispatch_frame_input(crate::msg::FrameInput { thread_list_snapshot: Some(panel.collect_thread_list_snapshot()), ..crate::msg::FrameInput::default() });
-        panel.dispatch_frame_input(crate::msg::FrameInput { skills_snapshot: Some(panel.collect_skills_snapshot()), ..crate::msg::FrameInput::default() });
+        // Fold the first bridge/store-backed presentation snapshot as one
+        // Frame message. This makes cold start's first post-hydration sync a
+        // single reducer turn instead of several adapter-driven pushes.
+        panel.dispatch_frame_input(crate::msg::FrameInput {
+            thread_list_snapshot: Some(panel.collect_thread_list_snapshot()),
+            skills_snapshot: Some(panel.collect_skills_snapshot()),
+            ..crate::msg::FrameInput::default()
+        });
         // Multi-process prefs live in JSON; selected thread stays in SQLite.
         if let Some(store) = panel.panel_state.as_ref() {
             maybe_migrate_sqlite_defaults_to_json(store);
