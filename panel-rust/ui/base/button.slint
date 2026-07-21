@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- the repeated hand-rolled "small pill button" pattern
 // found across `components/`: a fixed-size `Rectangle` with a
@@ -53,6 +54,7 @@ export component Button inherits Rectangle {
         accessible-label: root.button-accessible-label;
         accessible-action-default => { root.clicked(); }
         clicked => { root.clicked(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
     Text {
         text: root.label;

@@ -3,6 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { DropdownEntry } from "../types.slint";
 import { TextUtil } from "text_util.slint";
 import { FilterSearchBar } from "filter_search_bar.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- trigger + upward popup list of `DropdownEntry` rows.
 // Search UX mirrors the compose `/` skills popup:
@@ -35,6 +36,12 @@ export component SearchableDropdown inherits Rectangle {
     property <bool> show-search: searchable;
     // Keyboard highlight index into `options` (skips headers + filtered-out).
     property <int> kb-sel: -1;
+    // See FilterSearchBar.input-has-focus's doc comment: re-exposed here so
+    // callers can OR it into the host input-key gate. `dd-search-bar` only
+    // exists while `show-search` is true (conditional element), but
+    // referencing its property outside that scope still resolves to false
+    // when absent, matching the intent here.
+    out property <bool> search-has-focus: dd-search-bar.input-has-focus;
 
     pure function row-current(entry: DropdownEntry) -> bool {
         if (entry.is-header) {
@@ -235,6 +242,7 @@ export component SearchableDropdown inherits Rectangle {
         accessible-label: root.trigger-label;
         accessible-action-default => { root.toggle-popup(); }
         clicked => { root.toggle-popup(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
     }
     HorizontalLayout {
         width: 100%;
@@ -262,7 +270,14 @@ export component SearchableDropdown inherits Rectangle {
         }
     }
 
-    if open : Rectangle {
+    // Unconditionally mounted (visible:, not if:) -- `search-has-focus`
+    // above needs to reference `dd-search-bar`'s id from outside this
+    // popup, which Slint doesn't allow for `if`-only elements ("Cannot
+    // access id"). Positioned via explicit x/y (not in a layout flow), so
+    // staying mounted-but-hidden doesn't disturb sibling layout the way it
+    // would for a normal in-flow element.
+    popup-panel := Rectangle {
+        visible: root.open;
         x: root.popup-align-end ? root.width - root.popup-width : 0px;
         y: -root.content-h - Metrics.space-2;
         width: root.popup-width;
@@ -276,9 +291,16 @@ export component SearchableDropdown inherits Rectangle {
         drop-shadow-color: #000000.with-alpha(0.4);
         drop-shadow-offset-y: 2px;
 
-        // Default keyboard highlight to the first selectable row.
-        init => {
-            root.reselect-closest();
+        // Was `init =>` when this Rectangle only existed while `open` --
+        // that only ever fires once now that it's permanently mounted, so
+        // this needs to re-run reselect-closest() on every open instead.
+        // `changed` only accepts a local property name (not a qualified
+        // `root.open` path), hence this reactive local mirror.
+        property <bool> local-open: root.open;
+        changed local-open => {
+            if (root.open) {
+                root.reselect-closest();
+            }
         }
 
         VerticalLayout {
@@ -286,7 +308,16 @@ export component SearchableDropdown inherits Rectangle {
             spacing: Metrics.space-1;
             // Always-on FilterSearchBar (when searchable) — same chrome as
             // / skills. Focus on open so type-to-filter works immediately.
-            if root.show-search : FilterSearchBar {
+            // Unconditionally mounted (visible:, not if:) -- same reasoning
+            // as sidebar.slint's thread-search: `search-has-focus` above
+            // needs to reference this element's id from outside this
+            // VerticalLayout, which Slint doesn't allow for `if`-only
+            // elements ("Cannot access id"). No live caller sets
+            // `searchable: false` today, so this has no visible effect.
+            // Cursor-kind reporting (pointer/text) lives inside
+            // FilterSearchBar itself, so every call site inherits it.
+            dd-search-bar := FilterSearchBar {
+                visible: root.show-search;
                 query <=> root.filter;
                 placeholder: root.placeholder;
                 bar-accessible-label: "Filter options";
@@ -331,6 +362,9 @@ export component SearchableDropdown inherits Rectangle {
                                 root.kb-sel = i;
                                 root.entry-selected(entry.id, entry.value, entry.label);
                                 root.close();
+                            }
+                            changed has-hover => {
+                                CursorHost.kind = (self.has-hover && !entry.is-header) ? "pointer" : "default";
                             }
                         }
                         HorizontalLayout {

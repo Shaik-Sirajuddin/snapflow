@@ -57,10 +57,10 @@ func realSapRustBinary(t *testing.T) string {
 // core (registry + process manager + generic SAP proxy) backed by the real
 // sap-rust binary, serves it over MCP/SSE exactly as `snapshotd serve`
 // does, connects a real MCP SSE client, and drives project.select then a
-// real mutation through the generic "sap.call" tool -- confirming the
-// result is real (mutated) MockBackend state, not a stub, and that the
-// resulting edit.changed notification is fanned out to the SSE client as a
-// real "sap.notification" MCP notification.
+// real mutation through the typed project.select/edit.addTrack tools --
+// confirming the result is real (mutated) MockBackend state, not a stub,
+// and that the resulting edit.changed notification is fanned out to the
+// SSE client as a real "sap.notification" MCP notification.
 func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 	binPath := realSapRustBinary(t)
 
@@ -123,16 +123,13 @@ func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 		t.Fatalf("initialize: %v", err)
 	}
 
-	// project.select over the real generic proxy.
+	// project.select via its own typed tool.
 	selectReq := mcp.CallToolRequest{}
-	selectReq.Params.Name = "sap.call"
-	selectReq.Params.Arguments = map[string]any{
-		"method": "project.select",
-		"params": map[string]any{"projectId": proj.ID},
-	}
+	selectReq.Params.Name = "project.select"
+	selectReq.Params.Arguments = map[string]any{"projectId": proj.ID}
 	selectRes, err := c.CallTool(ctx, selectReq)
 	if err != nil {
-		t.Fatalf("call sap.call(project.select): %v", err)
+		t.Fatalf("call project.select: %v", err)
 	}
 	if selectRes.IsError {
 		t.Fatalf("unexpected error result: %+v", toolResultText(selectRes))
@@ -144,14 +141,11 @@ func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 
 	// edit.addTrack -- a real mutation against the real (Mock) backend.
 	addReq := mcp.CallToolRequest{}
-	addReq.Params.Name = "sap.call"
-	addReq.Params.Arguments = map[string]any{
-		"method": "edit.addTrack",
-		"params": map[string]any{"kind": "video"},
-	}
+	addReq.Params.Name = "edit.addTrack"
+	addReq.Params.Arguments = map[string]any{"kind": "video"}
 	addRes, err := c.CallTool(ctx, addReq)
 	if err != nil {
-		t.Fatalf("call sap.call(edit.addTrack): %v", err)
+		t.Fatalf("call edit.addTrack: %v", err)
 	}
 	if addRes.IsError {
 		t.Fatalf("unexpected error result: %+v", toolResultText(addRes))
@@ -163,11 +157,11 @@ func TestMCPAdapter_SapCallTool_RealSapRust_EndToEnd(t *testing.T) {
 
 	// edit.listTracks -- read back the real, persisted mutation.
 	listReq := mcp.CallToolRequest{}
-	listReq.Params.Name = "sap.call"
-	listReq.Params.Arguments = map[string]any{"method": "edit.listTracks", "params": map[string]any{}}
+	listReq.Params.Name = "edit.listTracks"
+	listReq.Params.Arguments = map[string]any{}
 	listRes, err := c.CallTool(ctx, listReq)
 	if err != nil {
-		t.Fatalf("call sap.call(edit.listTracks): %v", err)
+		t.Fatalf("call edit.listTracks: %v", err)
 	}
 	if listRes.IsError {
 		t.Fatalf("unexpected error result: %+v", toolResultText(listRes))

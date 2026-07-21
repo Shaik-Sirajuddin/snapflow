@@ -1,5 +1,6 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
+import { CursorHost } from "../../../tokens/cursor_host.slint";
 
 // Settings page chrome -- the `[Project | Global]` scope switcher from the
 // settings-pane-redesign plan's "Component layout" section. Project is the
@@ -29,6 +30,7 @@ export component SettingsTopTabs inherits Rectangle {
                 accessible-label: "Show project settings";
                 accessible-action-default => { root.scope-selected("project"); }
                 clicked => { root.scope-selected("project"); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             Text {
                 text: "Project";
@@ -52,6 +54,7 @@ export component SettingsTopTabs inherits Rectangle {
                 accessible-label: "Show global settings";
                 accessible-action-default => { root.scope-selected("global"); }
                 clicked => { root.scope-selected("global"); }
+                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
             }
             Text {
                 text: "Global";

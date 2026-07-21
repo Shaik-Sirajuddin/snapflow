@@ -2,6 +2,7 @@ import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
 import { Icon } from "../../base/icon.slint";
 import { IconButton } from "../../base/icon_button.slint";
+import { CursorHost } from "../../tokens/cursor_host.slint";
 
 // Skill editor -- `active_pane_and_editor_view` phase. Replaces
 // `ChatArea` in the main content area (see `app.slint`'s `active-pane`
@@ -107,6 +108,7 @@ export component SkillEditorView inherits Rectangle {
                         accessible-role: button;
                         accessible-label: "Copy skill path";
                         clicked => { root.copy-path-requested(); }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                         Rectangle {
                             background: copy-path-touch.has-hover
                                 ? Theme.bg-primary-container
@@ -136,6 +138,7 @@ export component SkillEditorView inherits Rectangle {
                         accessible-role: button;
                         accessible-label: "Open in " + editor-name;
                         clicked => { root.open-in-editor-requested(editor-name); }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                         Rectangle {
                             background: ed-touch.has-hover
                                 ? Theme.bg-primary-container
@@ -165,6 +168,7 @@ export component SkillEditorView inherits Rectangle {
                         accessible-role: button;
                         accessible-label: "Open with OS default application";
                         clicked => { root.open-with-os-default-requested(); }
+                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                         Rectangle {
                             background: open-default-touch.has-hover
                                 ? Theme.bg-primary-container
@@ -215,6 +219,17 @@ export component SkillEditorView inherits Rectangle {
                 x: Metrics.pad-md;
                 y: Metrics.pad-sm;
                 width: parent.width - 2 * Metrics.pad-md;
+                // Explicit height -- without one, this multi-line
+                // TextInput's focusable/clickable hit-region collapsed to
+                // its own single-line preferred height at y:0, leaving
+                // everything below the first line visually part of the
+                // editor but not actually clickable/focusable (same bug
+                // class as chat_input_layout.slint's compose TextInput
+                // and ui/base/text_field.slint's shared component --
+                // found by this session's own /verify-impl pass against
+                // skill-manager-workspace/active_pane_and_editor_view's
+                // "live edit of skill files" claim).
+                height: max(self.preferred-height, parent.height);
                 color: Theme.text-primary;
                 font-family: Theme.font-mono;
                 font-size: 11px * Theme.font-scale;
@@ -222,6 +237,7 @@ export component SkillEditorView inherits Rectangle {
                 single-line: false;
                 text <=> root.skill-content;
                 edited => { root.content-edited(self.text); }
+                changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
             }
         }
     }

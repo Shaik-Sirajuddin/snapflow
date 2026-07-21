@@ -1,0 +1,33 @@
+// Layer 1 (tokens) -- shared channel every interactive component reports
+// its desired OS mouse-cursor kind through.
+//
+// Why this exists: Slint 1.17.1's own internal hit-testing already knows
+// exactly which cursor a hovered/focused element wants (that's what its
+// `mouse-cursor` property and `WindowAdapter::set_mouse_cursor` are for),
+// but `set_mouse_cursor` and its `MouseCursor` parameter type are NOT part
+// of the public `slint`/`slint::platform` API in this version (confirmed
+// directly from Slint's own source: i-slint-core-1.17.1/window.rs carries
+// a literal `// TODO: Make the enum public and make public` comment on
+// that exact method, and `platform.rs`'s own `pub use` list omits both).
+// This project's custom software-rendering platform (SpikePlatform /
+// MinimalSoftwareWindow, see lib.rs) is a third-party WindowAdapter from
+// Slint's own perspective, so it cannot observe that internal call at all
+// without depending on the private, explicitly-unstable `i-slint-core`
+// crate directly -- a real, ongoing maintenance risk this project
+// deliberately does not take on (see tasks/v2/enhance.yaml#task-4's
+// verification history for the full story).
+//
+// So instead of reading Slint's answer, every interactive component
+// computes and reports its OWN answer here, declaratively, the same way
+// `has-hover`-driven background tinting already works -- this global is
+// the one shared place the C++/Rust host reads a single current answer
+// from (`panel_rust_cursor_shape`), regardless of which one of
+// (potentially many, including dynamically-repeated) component instances
+// currently holds it.
+export global CursorHost {
+    // "default" | "pointer" | "text" -- deliberately a small, fixed,
+    // string-based enum rather than importing Slint's own (non-public)
+    // MouseCursor type. Extend this set only alongside a matching case in
+    // panel_rust_cursor_shape's Qt::CursorShape mapping (lib.rs).
+    in-out property <string> kind: "default";
+}

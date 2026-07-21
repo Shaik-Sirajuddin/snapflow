@@ -165,6 +165,11 @@ func TestMCPAdapter_PhaseB_SameProjectConcurrency(t *testing.T) {
 	// values below 60 are all valid per edit.trimClipIn's own
 	// validation).
 	appended := agent1.sapCall("playlist.append", map[string]any{"source": map[string]any{"path": source}})
+	// edit.appendClip needs a selected track -- an explicit trackIndex is
+	// never honored as an override (see the selection-state end-to-end
+	// test), so track.enter must be called first even though trackIndex
+	// is also passed below.
+	agent1.sapCall("track.enter", map[string]any{"trackIndex": 0})
 	clip := agent1.sapCall("edit.appendClip", map[string]any{
 		"trackIndex": float64(0),
 		"source":     map[string]any{"playlistIndex": appended["index"]},
@@ -173,6 +178,11 @@ func TestMCPAdapter_PhaseB_SameProjectConcurrency(t *testing.T) {
 	if clipID == "" {
 		t.Fatalf("expected a real clipId from edit.appendClip, got %+v", clip)
 	}
+	// filter.add/filter.setProperty need a selected clip -- an explicit
+	// clipId is never honored as an override, and each agent's selection
+	// is per-session, so agent2 (which never called clip.enter) needs its
+	// own call below too before its filter.setProperty.
+	agent1.sapCall("clip.enter", map[string]any{"clipId": clipID})
 	filter := agent1.sapCall("filter.add", map[string]any{
 		"clipId":     clipID,
 		"mltService": "brightness",
@@ -188,6 +198,7 @@ func TestMCPAdapter_PhaseB_SameProjectConcurrency(t *testing.T) {
 	// real MLT project state, which is the read-back proving B won.
 	const valueA = 0.25
 	const valueB = 0.75
+	agent2.sapCall("clip.enter", map[string]any{"clipId": clipID})
 	agent2.sapCall("filter.setProperty", map[string]any{
 		"clipId": clipID, "filterIndex": filterIndex, "property": "level", "value": valueA,
 	})

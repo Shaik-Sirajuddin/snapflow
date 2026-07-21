@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- the repeated "bordered box + inset TextInput" pattern
 // hand-rolled at every free-text input site across the settings page
@@ -39,5 +40,6 @@ export component TextField inherits Rectangle {
         width: parent.width - 2 * Metrics.pad-md;
         vertical-alignment: center;
         edited => { root.edited(); }
+        changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
     }
 }

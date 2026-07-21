@@ -42,7 +42,13 @@ func filterTools(s *server.MCPServer, h Handler) []server.ServerTool {
 			mcp.WithString("clipId", mcp.Required(), mcp.Description("Clip ID")),
 			mcp.WithInteger("filterIndex", mcp.Required(), mcp.Description("Filter index on the clip")),
 			mcp.WithString("property", mcp.Required(), mcp.Description("Filter property name")),
-			mcp.WithOutputSchema[KeyframeInfoList](),
+			// No mcp.WithOutputSchema[KeyframeInfoList]() -- see
+			// KeyframeInfo.Value's own doc comment (output_types.go) for
+			// why: its Value field is a genuine scalar-or-string union
+			// that can't be typed as map[string]any like this package's
+			// other loosely-typed output fields without misrepresenting
+			// real values, and the untyped-any encoding Claude Code's own
+			// MCP client was found to reject has no other fix here.
 		),
 		sapTool(s, h, "filter.removeKeyframe", "filter.removeKeyframe", "Remove a keyframe from a filter property.",
 			mcp.WithString("clipId", mcp.Required(), mcp.Description("Clip ID")),

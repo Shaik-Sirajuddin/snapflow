@@ -60,14 +60,13 @@ import (
 const serverInstructions = "Video/media editing MCP server. Typical flow: " +
 	"(1) use the daemon.* tools (createProject, listProjects, launch, list, health, close) " +
 	"to manage project folders and start a project's editing process; " +
-	"(2) call sap.call with method=\"project.select\" and params={\"projectId\": ...} to bind " +
-	"this session to one project (required before any other project-scoped call); " +
-	"(3) call sap.search, optionally with a text query, to discover the live SAP method " +
-	"surface for that project -- project.*, edit.*, playlist.*, filter.*, transitions.*, " +
-	"generator.*, file.*, jobs.*, playback.*, subtitles.*, and audio.* when that namespace is " +
-	"enabled; (4) call sap.call with any discovered method name and matching params to perform " +
-	"the edit. A session may only be bound to one project at a time: call sap.call with " +
-	"method=\"project.exit\" before selecting a different project, or project.select will be " +
+	"(2) call project.select with {\"projectId\": ...} to bind this session to one project " +
+	"(required before any other project-scoped tool call); " +
+	"(3) use the typed edit.*/playlist.*/filter.*/transitions.*/generator.*/file.*/jobs.*/" +
+	"playback.*/subtitles.*/markers.*/recent.*/notes.* tools (and audio.* when that namespace " +
+	"is enabled) to perform the edit -- each tool's own schema documents its parameters, no " +
+	"separate discovery call is needed. A session may only be bound to one project at a time: " +
+	"call project.exit before selecting a different project, or project.select will be " +
 	"rejected with an already-bound error."
 
 // Handler is the subset of internal/daemon.Daemon this adapter depends on --
@@ -147,8 +146,40 @@ func New(h Handler) *server.MCPServer {
 			h),
 	)
 
-	s.AddTools(sapCallTool(s, h))
-	s.AddTools(sapSearchTool(audioEnabled))
+	// Typed per-method tools, registered live in every environment (dev,
+	// prod, etc. -- not behind a flag): project.*/edit.*/playlist.*/
+	// filter.*/generator.*/subtitles.*/file.*/jobs.*/markers.*/recent.*/
+	// playback.*/notes.*. Supersedes the generic sap.call/sap.search
+	// passthrough this package used to rely on exclusively (see this
+	// file's own top-level doc comment for the original, context-cost-
+	// driven reasoning for NOT doing this -- deliberately reversed per
+	// explicit product decision: typed, individually discoverable/
+	// validated tools are preferred over one opaque passthrough plus a
+	// search tool, and sap.call/sap.search are dropped entirely from the
+	// live surface now that these are registered, since every method they
+	// could reach is now directly callable). project.select/project.exit
+	// (projectTools) exist specifically because they have no other typed
+	// tool: every other group here operates on "whichever project this
+	// session is bound to," and project.select/exit are that binding's
+	// only entry/exit points -- previously reachable only through
+	// sap.call, which no longer exists on this server. audio.* stays
+	// gated on the same daemon-wide AudioNamespaceEnabled capability
+	// sap.search used to filter by -- the underlying SAP audio methods
+	// may not function at all when this daemon's audio subsystem isn't
+	// enabled, so the tools themselves must not be advertised then
+	// either.
+	s.AddTools(projectTools(s, h)...)
+	s.AddTools(selectionTools(s, h)...)
+	s.AddTools(editTools(s, h)...)
+	s.AddTools(playlistTools(s, h)...)
+	s.AddTools(filterTools(s, h)...)
+	if audioEnabled {
+		s.AddTools(audioTools(s, h)...)
+	}
+	s.AddTools(generatorSubtitlesTools(s, h)...)
+	s.AddTools(fileJobsTools(s, h)...)
+	s.AddTools(markersRecentTools(s, h)...)
+	s.AddTools(playbackNotesTools(s, h)...)
 
 	return s
 }
@@ -238,6 +269,12 @@ var supportedSAPMethods = []sapMethodMetadata{
 	{Method: "recent.list", Description: "List recent paths (newest first).", Params: "{}"},
 }
 
+// sapSearchTool and sapCallTool (below) are no longer called from New() --
+// every method they used to reach is now a typed tool (project.*, edit.*,
+// playlist.*, etc.), see New()'s own doc comment. Kept defined rather than
+// deleted since supportedSAPMethods' method/description/params table is
+// still a useful reference for the typed tools' own descriptions and for
+// any future SAP method that doesn't yet have a typed tool.
 func sapSearchTool(audioEnabled bool) server.ServerTool {
 	return server.ServerTool{
 		Tool: mcp.NewTool("sap.search",

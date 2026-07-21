@@ -1,6 +1,7 @@
 import { Theme } from "./tokens/theme.slint";
 import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
+import { CursorHost } from "./tokens/cursor_host.slint";
 import { IconButton } from "./base/icon_button.slint";
 import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
@@ -38,6 +39,8 @@ export component ChatArea inherits Rectangle {
     callback load-older-requested();
     in property <string> agent-badge: "agent . ask";
     in property <string> connection-status: "Connecting...";
+    in property <string> last-error: "";
+    callback error-banner-dismissed();
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
@@ -100,6 +103,10 @@ export component ChatArea inherits Rectangle {
     out property <bool> compose-has-focus: chat-input.compose-has-focus;
     out property <bool> local-terminal-has-focus:
         local-terminal.open && local-terminal-card.has-focus;
+    // Mode/model dropdown search + mention popup filter -- see
+    // FilterSearchBar.input-has-focus's doc comment.
+    out property <bool> secondary-text-input-has-focus:
+        chat-input.secondary-text-input-has-focus;
 
     // --- Demo approval (local one-of card, no ACP round-trip) ------------
     // Type one of these in the compose box and press Send / Enter:
@@ -484,6 +491,52 @@ export component ChatArea inherits Rectangle {
             height: 1px;
             background: Theme.border-default;
         }
+        // Send/session-attach failure banner. Previously this only ever
+        // surfaced as a small "Error: ..." sidebar subtitle under the
+        // thread's name (models::describe_thread's error branch) --
+        // easy to miss entirely while looking at the transcript itself,
+        // which is exactly the "sent a message, got no visible response
+        // or explanation at all" symptom this closes. Dismissing just
+        // clears the Rust-side per-thread error string; a later real
+        // error re-shows it.
+        if root.last-error != "" : Rectangle {
+            height: error-banner-text.preferred-height + 2 * Metrics.space-3;
+            background: Theme.bg-card;
+            border-color: #b91c1c;
+            border-width: 1px;
+            HorizontalLayout {
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
+                padding-top: Metrics.space-3;
+                padding-bottom: Metrics.space-3;
+                spacing: Metrics.space-3;
+                error-banner-text := Text {
+                    text: "⚠ " + root.last-error;
+                    color: #ef4444;
+                    font-size: 10px * Theme.font-scale;
+                    font-family: Theme.font-mono;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                }
+                dismiss-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    width: 16px;
+                    accessible-role: button;
+                    accessible-label: "Dismiss error";
+                    clicked => { root.error-banner-dismissed(); }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                    Text {
+                        text: "\u{2715}";
+                        color: Theme.text-muted;
+                        font-size: 10px * Theme.font-scale;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
         message-area := Rectangle {
             // The one elastic region in the chat column: the Flickable fills
             // it and the floating jump-to-latest button overlays its
@@ -494,6 +547,19 @@ export component ChatArea inherits Rectangle {
             message-scroll := Flickable {
                 width: 100%;
                 height: 100%;
+                // Was relying on Flickable's own auto-inference of
+                // viewport-height from its child, which -- per base/
+                // expandable_panel.slint's own documented fix for the
+                // identical symptom -- "doesn't reliably report its own
+                // preferred-height from arbitrary child content (it's a
+                // scroll viewport, not a layout)". Binding this explicitly
+                // is purely additive (computes the same value auto-
+                // inference should already produce when it works) and
+                // matches every other Flickable in this codebase, all of
+                // which already bind viewport-height/-width explicitly
+                // except this one and settings_page.slint's (fixed
+                // alongside this for the same reported "scroll issues").
+                viewport-height: message-col.preferred-height;
                 // Live updates grow `viewport-height`; snap back to the bottom
                 // only while the user is following the latest message, so a
                 // read-back-in-history scroll position is never stolen.
@@ -514,7 +580,7 @@ export component ChatArea inherits Rectangle {
                         load-older-requested();
                     }
                 }
-                VerticalLayout {
+                message-col := VerticalLayout {
                 // Match ChatInputLayout shell (pad-2xl H / pad-xl V) so the
                 // message column lines up with the compose bar.
                 padding-left: Metrics.pad-2xl;
@@ -543,6 +609,9 @@ export component ChatArea inherits Rectangle {
                                 loading-older-messages = true;
                                 load-older-requested();
                             }
+                        }
+                        changed has-hover => {
+                            CursorHost.kind = (self.has-hover && !loading-older-messages) ? "pointer" : "default";
                         }
                     }
                     Text {
@@ -700,6 +769,7 @@ export component ChatArea inherits Rectangle {
                         root.stick-to-bottom = true;
                         message-scroll.viewport-y = -root.msg-max-scroll;
                     }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                 }
                 Icon {
                     source: root.shown-pending.active

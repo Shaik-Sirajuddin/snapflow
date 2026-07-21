@@ -69,19 +69,25 @@ func (a *mcpAgent) Close() {
 	_ = a.client.Close()
 }
 
-// sapCall drives the real "sap.call" generic passthrough tool and fails the
-// test on any transport or SAP-level error -- the happy-path helper.
+// sapCall drives the typed tool named after the given SAP method (e.g.
+// "edit.addTrack" calls the tool literally named "edit.addTrack") and
+// fails the test on any transport or SAP-level error -- the happy-path
+// helper. Named "sapCall" rather than renamed for the typed-tool era so
+// every existing call site (method name + params map) kept working
+// unchanged when the underlying generic "sap.call" passthrough tool was
+// dropped from the live server in favor of one tool per method (see
+// mcpadapter.go's New() doc comment).
 func (a *mcpAgent) sapCall(method string, params map[string]any) map[string]any {
 	a.t.Helper()
 	req := mcp.CallToolRequest{}
-	req.Params.Name = "sap.call"
-	req.Params.Arguments = map[string]any{"method": method, "params": params}
+	req.Params.Name = method
+	req.Params.Arguments = params
 	res, err := a.client.CallTool(a.ctx, req)
 	if err != nil {
-		a.t.Fatalf("sap.call(%s): transport error: %v", method, err)
+		a.t.Fatalf("%s: transport error: %v", method, err)
 	}
 	if res.IsError {
-		a.t.Fatalf("sap.call(%s) returned an error result: %s", method, toolResultText(res))
+		a.t.Fatalf("%s returned an error result: %s", method, toolResultText(res))
 	}
 	return decodeToolResultJSON(a.t, res)
 }
@@ -93,14 +99,14 @@ func (a *mcpAgent) sapCall(method string, params map[string]any) map[string]any 
 func (a *mcpAgent) sapCallExpectError(method string, params map[string]any) string {
 	a.t.Helper()
 	req := mcp.CallToolRequest{}
-	req.Params.Name = "sap.call"
-	req.Params.Arguments = map[string]any{"method": method, "params": params}
+	req.Params.Name = method
+	req.Params.Arguments = params
 	res, err := a.client.CallTool(a.ctx, req)
 	if err != nil {
-		a.t.Fatalf("sap.call(%s): transport error (expected a clean SAP error result instead): %v", method, err)
+		a.t.Fatalf("%s: transport error (expected a clean SAP error result instead): %v", method, err)
 	}
 	if !res.IsError {
-		a.t.Fatalf("sap.call(%s) expected an error result, got success: %s", method, toolResultText(res))
+		a.t.Fatalf("%s expected an error result, got success: %s", method, toolResultText(res))
 	}
 	return toolResultText(res)
 }
@@ -177,14 +183,14 @@ func decodeArrayResult(t *testing.T, raw string) []map[string]any {
 func (a *mcpAgent) sapCallList(method string, params map[string]any) []map[string]any {
 	a.t.Helper()
 	req := mcp.CallToolRequest{}
-	req.Params.Name = "sap.call"
-	req.Params.Arguments = map[string]any{"method": method, "params": params}
+	req.Params.Name = method
+	req.Params.Arguments = params
 	res, err := a.client.CallTool(a.ctx, req)
 	if err != nil {
-		a.t.Fatalf("sap.call(%s): transport error: %v", method, err)
+		a.t.Fatalf("%s: transport error: %v", method, err)
 	}
 	if res.IsError {
-		a.t.Fatalf("sap.call(%s) returned an error result: %s", method, toolResultText(res))
+		a.t.Fatalf("%s returned an error result: %s", method, toolResultText(res))
 	}
 	return decodeArrayResult(a.t, toolResultText(res))
 }

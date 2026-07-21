@@ -62,13 +62,28 @@ type TrackList struct {
 
 // Clip mirrors sap-rust's backend::Clip. Source is the same tagged-union
 // shape as the appendClip/insertClip/overwriteClip request's "source"
-// field (deliberately untyped on both the request and response side).
+// field (deliberately loosely-typed on both the request and response
+// side) -- typed map[string]any rather than bare any specifically for
+// mcp.WithOutputSchema[T]()'s benefit: jsonschema-go's reflection-based
+// schema generator encodes an any/interface{} field as the bare JSON
+// Schema boolean `true` ("matches anything"), which is spec-valid but was
+// found live to be rejected by Claude Code's own MCP client as an invalid
+// tool schema ("Invalid input (at tools.N.outputSchema.properties.source)")
+// the moment these typed tools were actually registered on a live server
+// for the first time. map[string]any instead produces a proper
+// {"type":"object","additionalProperties":true} sub-schema, which every
+// real sap-rust source/properties variant satisfies (all keyed objects,
+// e.g. {"path":...}/{"playlistIndex":...}/{"xml":...}), and which every
+// MCP client accepts. This has zero effect on the actual wire format: these
+// types exist purely for schema generation (see this file's own top-level
+// doc comment) -- sapTool forwards the real JSON response verbatim,
+// never marshaling/unmarshaling through these Go structs at runtime.
 type Clip struct {
-	ClipID   string `json:"clipId"`
-	Index    int    `json:"index"`
-	Source   any    `json:"source"`
-	InFrame  int64  `json:"inFrame"`
-	OutFrame int64  `json:"outFrame"`
+	ClipID   string         `json:"clipId"`
+	Index    int            `json:"index"`
+	Source   map[string]any `json:"source"`
+	InFrame  int64          `json:"inFrame"`
+	OutFrame int64          `json:"outFrame"`
 }
 
 // ClipList is the {"items": [...]} wrapper for Vec<Clip> (edit.listClips).
@@ -76,12 +91,13 @@ type ClipList struct {
 	Items []Clip `json:"items"`
 }
 
-// PlaylistEntry mirrors sap-rust's backend::PlaylistEntry.
+// PlaylistEntry mirrors sap-rust's backend::PlaylistEntry. Source is
+// map[string]any, not bare any -- see Clip.Source's doc comment for why.
 type PlaylistEntry struct {
-	Index          int    `json:"index"`
-	Name           string `json:"name"`
-	Source         any    `json:"source"`
-	DurationFrames int64  `json:"durationFrames"`
+	Index          int            `json:"index"`
+	Name           string         `json:"name"`
+	Source         map[string]any `json:"source"`
+	DurationFrames int64          `json:"durationFrames"`
 }
 
 // PlaylistEntryList is the {"items": [...]} wrapper for Vec<PlaylistEntry>
@@ -95,11 +111,11 @@ type PlaylistEntryList struct {
 // null) when unavailable -- serde's `skip_serializing_if = "Option::is_none"`
 // -- hence `omitempty` here rather than a plain pointer field.
 type PlaylistEntryDetail struct {
-	Index          int        `json:"index"`
-	Name           string     `json:"name"`
-	Source         any        `json:"source"`
-	DurationFrames int64      `json:"durationFrames"`
-	Probe          *FileProbe `json:"probe,omitempty"`
+	Index          int            `json:"index"`
+	Name           string         `json:"name"`
+	Source         map[string]any `json:"source"`
+	DurationFrames int64          `json:"durationFrames"`
+	Probe          *FileProbe     `json:"probe,omitempty"`
 }
 
 // TransitionInfo mirrors sap-rust's backend::TransitionInfo
@@ -122,12 +138,14 @@ type FilterInfo struct {
 
 // FilterListEntry mirrors sap-rust's backend::FilterListEntry (filter.list
 // entries). Properties is the filter's arbitrary MLT property map --
-// deliberately untyped, same reasoning as filter.add's request-side
-// "properties" field.
+// map[string]any rather than bare any; see Clip.Source's doc comment for
+// why (same fix, same reasoning as filter.add's request-side "properties"
+// field, which already used mcp.WithObject rather than mcp.WithAny for
+// the same "always an object" reason).
 type FilterListEntry struct {
-	Index      int    `json:"index"`
-	MltService string `json:"mltService"`
-	Properties any    `json:"properties"`
+	Index      int            `json:"index"`
+	MltService string         `json:"mltService"`
+	Properties map[string]any `json:"properties"`
 }
 
 // FilterListEntryList is the {"items": [...]} wrapper for
@@ -140,7 +158,19 @@ type FilterListEntryList struct {
 // (filter.listKeyframes entries). Value is the keyframed property's value,
 // whose type depends on which filter/property this keyframe belongs to --
 // deliberately untyped, same reasoning as filter.addKeyframe/setProperty's
-// request-side "value" field.
+// request-side "value" field. Unlike Clip.Source/PlaylistEntry.Source/
+// FilterListEntry.Properties (all always keyed objects, fixed to
+// map[string]any), Value is genuinely a scalar-or-string union depending
+// on the property (real examples seen live: bare floats like 1/0.25, and
+// strings like "0% 0% 100% 100% 1") -- map[string]any would misrepresent
+// real values as objects when they aren't. Left as bare any; instead,
+// filter.listKeyframes' own tool registration omits
+// mcp.WithOutputSchema[KeyframeInfoList]() entirely (see tools_filter.go),
+// since jsonschema-go's reflection-based generator would otherwise encode
+// this field as the bare JSON Schema boolean `true`, which Claude Code's
+// own MCP client was found live to reject as an invalid tool schema (see
+// Clip.Source's doc comment for the fuller story) -- no typed Go
+// replacement here can dodge that without misrepresenting the real shape.
 type KeyframeInfo struct {
 	Position      int64  `json:"position"`
 	Value         any    `json:"value"`
@@ -303,8 +333,14 @@ type StringList struct {
 	Items []string `json:"items"`
 }
 
-// markers.next/markers.prev return a bare JSON integer or a bare JSON null.
-// oneOf expresses that top-level union without using a JSON-Schema `type`
-// array, which would not round-trip through mcp-go v0.56.0's client-side
-// ToolOutputSchema.Type string field.
-const nullableFrameOutputSchema = `{"oneOf":[{"type":"integer"},{"type":"null"}]}`
+// markers.next/markers.prev return a bare JSON integer or a bare JSON
+// null. This used to be expressed as a top-level `oneOf` union (no longer
+// used, see tools_markers_recent.go): Claude Code's own MCP client was
+// found live to reject any tool outputSchema whose top-level "type" isn't
+// "object" ("Invalid input: expected \"object\" (at
+// tools.N.outputSchema.type)"), which a bare integer-or-null union can
+// never satisfy without misrepresenting the real (non-object) wire
+// response as something it isn't. No mcp.WithOutputSchema/
+// WithRawOutputSchema call is used for these two tools now -- same
+// resolution as KeyframeInfo.Value's own doc comment for the same class
+// of "real shape isn't a Claude-Code-acceptable schema" problem.

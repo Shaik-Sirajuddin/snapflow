@@ -7,6 +7,7 @@ import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider 
 import { SettingsSearchBar } from "../components/search_bar.slint";
 import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
+import { CursorHost } from "../../../tokens/cursor_host.slint";
 
 // Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
 // former `components/settings_sheet.slint` that is agent/profile/session
@@ -28,6 +29,8 @@ export component AgentsView inherits Rectangle {
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
+    // See FilterSearchBar.input-has-focus's doc comment.
+    out property <bool> search-has-focus: agent-search-bar.input-has-focus;
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -112,6 +115,7 @@ export component AgentsView inherits Rectangle {
                                 accessible-label: "Select profile " + profile.name;
                                 accessible-action-default => { root.default-profile = profile.name; }
                                 clicked => { root.default-profile = profile.name; }
+                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                             }
                             profile-chip-label := Text {
                                 text: profile.name
@@ -268,7 +272,7 @@ export component AgentsView inherits Rectangle {
 
         SettingsSectionHeader { text: "Agents"; subsection: true; }
 
-        SettingsSearchBar {
+        agent-search-bar := SettingsSearchBar {
             width: parent.width;
             query <=> root.agent-search-query;
         }

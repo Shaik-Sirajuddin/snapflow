@@ -6,6 +6,7 @@ import { HoverSurface } from "../base/hover.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { NamePromptDialog } from "../base/name_prompt_dialog.slint";
 import { TextUtil } from "../base/text_util.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
 import { ThreadItem, SkillOption } from "../types.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
@@ -21,6 +22,10 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
+    // Aggregates thread-search's own FilterSearchBar.input-has-focus --
+    // see that property's doc comment for why this needs re-exposing at
+    // every component boundary up to the root gate in app.slint.
+    out property <bool> search-has-focus: thread-search.input-has-focus;
     callback thread-selected(int);
     callback new-thread-requested();
     callback search-changed(string);
@@ -247,6 +252,7 @@ export component Sidebar inherits Rectangle {
                     accessible-role: button;
                     accessible-label: "Show threads";
                     clicked => { skill-mode = false; }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
                         text: "Threads";
                         color: !skill-mode ? Theme.bg-primary : Theme.text-muted;
@@ -260,6 +266,7 @@ export component Sidebar inherits Rectangle {
                     accessible-role: button;
                     accessible-label: "Show skills";
                     clicked => { skill-mode = true; }
+                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
                         text: "Skills";
                         color: skill-mode ? Theme.bg-primary : Theme.text-muted;
@@ -347,7 +354,8 @@ export component Sidebar inherits Rectangle {
 
             // Expanded: shared FilterSearchBar (same base as settings /
             // mention / dropdown). Always mounted so focus-search() works
-            // after expand; hidden when collapsed.
+            // after expand; hidden when collapsed. Cursor-kind reporting
+            // (pointer/text) lives inside FilterSearchBar itself.
             thread-search := FilterSearchBar {
                 x: Metrics.space-3;
                 y: (parent.height - self.height) / 2;
@@ -481,7 +489,7 @@ export component Sidebar inherits Rectangle {
             viewport-height: thread-list-col.preferred-height;
             thread-list-col := VerticalLayout {
                 spacing: Metrics.space-1;
-                for thread[i] in threads : HoverSurface {
+                for thread[i] in threads : thread-row := HoverSurface {
                     // Taller only when the model line is shown under the name.
                     height: expanded && thread.model != "" ? 52px : 44px;
                     // Fill the rail width so the left stick can pin to x=0
@@ -665,7 +673,7 @@ export component Sidebar inherits Rectangle {
                                     font-family: Theme.font-mono;
                                     vertical-alignment: center;
                                 }
-                                if expanded && root.rename-thread-index == -1 : IconButton {
+                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Rename thread " + thread.name;
@@ -710,7 +718,7 @@ export component Sidebar inherits Rectangle {
                                 // `settings_sheet.slint`'s profile
                                 // delete control.
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.closed && root.pending-close-index != i : IconButton {
+                                    && !thread.closed && root.pending-close-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Close thread " + thread.name;
@@ -751,7 +759,7 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && thread.closed && root.pending-delete-index != i : IconButton {
+                                    && thread.closed && root.pending-delete-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Delete thread " + thread.name;
@@ -791,7 +799,7 @@ export component Sidebar inherits Rectangle {
                                         }
                                     }
                                 }
-                                if expanded && root.rename-thread-index != i : IconButton {
+                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Archive thread " + thread.name;
@@ -951,6 +959,8 @@ export component Sidebar inherits Rectangle {
         }
     }
 
+    // Shared NamePromptDialog (base/) -- cursor-kind reporting (pointer/
+    // text) lives inside it, so this call site inherits it.
     NamePromptDialog {
         x: 0px;
         y: 0px;
