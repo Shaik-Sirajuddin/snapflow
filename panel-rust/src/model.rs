@@ -5,11 +5,10 @@
 //! ownership table: `Model` is mutated only inside `update()`, and
 //! nothing outside `sync()` reads it to push a Slint `set_*` setter.
 //!
-//! **Status: partially live.** `panel_rust_create` constructs this model and
-//! performs the cold-start `Init -> LoadInitialState` transition before
-//! callbacks are installed. Bridge-backed presentation data still uses the
-//! legacy refresh cascade while the effect executor and full `sync()` owner
-//! are migrated.
+//! `panel_rust_create` constructs this model and performs the cold-start
+//! `Init -> LoadInitialState` transition before callbacks are installed.
+//! Bridge-backed presentation data is collected externally, folded through
+//! `Msg::Frame`, and projected by `sync()`.
 
 use crate::agent_bridge::ThreadSpec;
 use crate::appearance::AppearanceState;

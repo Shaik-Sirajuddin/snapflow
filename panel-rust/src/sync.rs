@@ -2,11 +2,10 @@
 //! **sole** owner of pushing `Model` state into Slint `set_*` setters.
 //! See `memory/rui/gen/plans/tea-slint-model/00-plan.md`.
 //!
-//! **Status: partially live.** Dispatchers and cold-start hydration call
-//! `sync()` for their returned Dirty markers. Persistent row operations and
-//! error projection are live; bridge-backed messages, terminals, requests,
-//! capabilities, and settings gateway snapshots still use the legacy refresh
-//! cascade until those values are Model-owned.
+//! Dispatchers, effect completions, and cold-start/frame hydration call
+//! `sync()` for their returned Dirty markers. Bridge-backed messages,
+//! terminals, requests, capabilities, settings lists, skills, and host
+//! appearance are first folded into `Model` snapshots before projection.
 //!
 //! The match below is exhaustive with **no wildcard arm**, matching
 //! `update()`'s own requirement (00-plan.md's "Exhaustiveness
