@@ -46,12 +46,12 @@ jobs:
       - run: cargo build --release
       # panel-rust's agent_bridge tests spawn real acpx-server + mock-agent
       # subprocesses per test; at full default parallelism, concurrent spawn
-      # races cause spurious "crash backoff"/connection-refused failures
-      # (see run 29809532342, job 88567272281). Capping to 4 threads made
-      # the same suite pass reliably in local reruns; continue-on-error
-      # stays as a safety net for any residual flakiness, not a substitute.
-      - name: Run cargo test --release (advisory -- known flaky tests, see workflow header)
-        continue-on-error: true
+      # races caused spurious "crash backoff"/connection-refused failures
+      # (see run 29809532342, job 88567272281). Capping to 4 threads fixed
+      # it -- verified locally at 182/182 lib tests, 35/35 agent_bridge
+      # tests across repeated runs -- so this is required again (not
+      # advisory/continue-on-error) for packaging to proceed.
+      - name: Run cargo test --release
         env:
           RUST_TEST_THREADS: "4"
         run: cargo test --release
