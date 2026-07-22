@@ -623,7 +623,25 @@ export component Sidebar inherits Rectangle {
                                 }
                                 rename-editor := Rectangle {
                                     visible: expanded && root.rename-thread-index == i;
-                                    height: 24px;
+                                    // `visible:` (not `if:`) so rename-focus-delay's
+                                    // `rename-input.focus()` stays a valid id
+                                    // reference even outside rename mode -- but
+                                    // that means this element never leaves the
+                                    // layout tree, so a bare fixed `height: 24px`
+                                    // was silently forcing every row's icon-row
+                                    // HorizontalLayout to be at least 24px tall
+                                    // (a HorizontalLayout's cross-axis size is the
+                                    // max of ALL children's heights, regardless of
+                                    // whether a zero-width child is actually
+                                    // visible), pushing the status dot/other
+                                    // siblings off the row's true vertical center
+                                    // even when this row was never being renamed.
+                                    // Confirmed live: the collapsed rail's status
+                                    // dot rendered ~10px above row-center instead
+                                    // of centered. Zeroing height alongside the
+                                    // existing zero min/max-width when inactive
+                                    // removes that contribution entirely.
+                                    height: root.rename-thread-index == i ? 24px : 0px;
                                     // TextInput selection/caret painting may
                                     // extend past its visual box otherwise.
                                     clip: true;
