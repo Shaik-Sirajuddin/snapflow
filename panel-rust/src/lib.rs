@@ -2602,6 +2602,161 @@ mod lifecycle_tests {
             }
         }
     }
+
+    fn mock_agent_bin_for_lifecycle_test() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent")
+    }
+
+    fn acpx_server_bin_for_lifecycle_test() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
+    }
+
+    /// **`panel-rust-e2e-hardening`'s `messages_disappear_after_send`
+    /// phase.** Real, headless (no VNC) reproduction of the reported
+    /// "message disappears after send" bug, driving the exact same
+    /// `dispatch_thread_new` -> `dispatch_compose_send` ->
+    /// `panel_rust_poll` path the live app uses, against a real
+    /// `acpx-server` + the free `rui-mock-agent` backend (no network
+    /// auth needed, unlike the `ACPX_LIVE_TEST_AMBIENT`-gated codex
+    /// tests in `agent_bridge.rs`).
+    #[test]
+    fn a_sent_message_stays_visible_across_several_poll_ticks() {
+        use slint::Model as _;
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let mock_agent = mock_agent_bin_for_lifecycle_test();
+        assert!(
+            mock_agent.is_file(),
+            "target/debug/rui-mock-agent must exist -- run `cargo build --bin rui-mock-agent` first"
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+        let mut command = std::process::Command::new(acpx_server_bin_for_lifecycle_test());
+        command
+            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env("ACPX_BACKEND_CMD", mock_agent.to_string_lossy().into_owned())
+            .env("ACPX_DEFAULT_AGENT_ID", "codex")
+            .env("RUI_MOCK_AGENT_PERSONA", "codex")
+            .env("RUST_LOG", "error")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().expect("spawn real acpx-server for test");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+        let mut reachable = false;
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                reachable = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert!(reachable, "test acpx-server never became reachable");
+
+        let previous = [
+            (
+                "RUI_ACPX_CODEX_URL",
+                std::env::var("RUI_ACPX_CODEX_URL").ok(),
+            ),
+            ("RUI_ACP_CACHE_DIR", std::env::var("RUI_ACP_CACHE_DIR").ok()),
+        ];
+        std::env::set_var("RUI_ACPX_CODEX_URL", format!("http://127.0.0.1:{port}"));
+        std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+
+        let handle = panel_rust_create(96, 64);
+        assert!(!handle.is_null());
+
+        // `dispatch_thread_new`'s `_component` parameter is unused in its
+        // body (prefixed `_`) -- a throwaway instance sidesteps needing
+        // to simultaneously borrow `panel` mutably and `panel.component`
+        // (which isn't `Clone`) immutably.
+        let throwaway_component = ChatPanel::new().expect("construct throwaway chat panel");
+        PANEL.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let panel = slot.as_mut().expect("panel exists");
+            dispatch::dispatch_thread_new(panel, &throwaway_component);
+        });
+
+        // Wait for the new thread's session to attach (mirrors
+        // agent_bridge.rs's own wait_for_thread_ready, but through the
+        // real poll path since this test drives the full PanelSingleton,
+        // not a bare AgentBridge).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            panel_rust_poll(handle);
+            let attached = PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let panel = slot.as_ref().expect("panel exists");
+                panel
+                    .bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_binding(0))
+                    .is_some()
+            });
+            if attached {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "new thread never attached a real session"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        PANEL.with(|cell| {
+            let slot = cell.borrow();
+            let panel = slot.as_ref().expect("panel exists");
+            let selected_filtered_idx = panel.model.borrow().selected_thread;
+            dispatch::dispatch_compose_send(
+                panel,
+                selected_filtered_idx,
+                "does this survive".to_owned(),
+            );
+        });
+
+        // The actual regression check: poll several times (simulating
+        // several 60-90fps ticks) and confirm the just-sent message is
+        // visible in the shared messages_model on every single tick, not
+        // just some of them -- "disappears after send" would show up as
+        // present on tick 1 and gone on a later tick.
+        let mut seen_present = false;
+        for _ in 0..20 {
+            panel_rust_poll(handle);
+            let rows: Vec<String> = PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let panel = slot.as_ref().expect("panel exists");
+                (0..panel.component.get_messages().row_count())
+                    .filter_map(|i| panel.component.get_messages().row_data(i))
+                    .map(|row| row.text.to_string())
+                    .collect()
+            });
+            let present = rows.iter().any(|row| row.contains("does this survive"));
+            if present {
+                seen_present = true;
+            } else if seen_present {
+                panic!(
+                    "the sent message was visible on an earlier poll tick but disappeared \
+                     on a later one -- this is the reported live bug"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert!(
+            seen_present,
+            "the sent message never became visible in messages_model across 20 poll ticks"
+        );
+
+        panel_rust_destroy(handle);
+        let _ = child.kill();
+        let _ = child.wait();
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

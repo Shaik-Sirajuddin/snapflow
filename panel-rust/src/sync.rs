@@ -64,7 +64,30 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             trace_transcript_tail(model, thread_id);
         }
         Dirty::MessagesDiff { thread_id, ops } => {
-            apply_message_ops(model, thread_id, ops);
+            // `apply_message_ops` treats an empty `thread_id` as "no
+            // thread is selected" and force-converges the shared
+            // `messages_model` down to zero rows -- correct for
+            // `update_frame`'s `frame.clear_selected_thread` path (which
+            // always pairs an empty `thread_id` with real `Remove` ops
+            // from a genuine old-keys-to-empty diff). But
+            // `update_frame`'s `frame.bridge_events_pending` block pushes
+            // this exact same empty-`thread_id` sentinel with *empty*
+            // ops too, as a generic "some thread (don't know which) had
+            // background activity" no-op signal -- not "no thread is
+            // selected". Regression: a real thread IS displayed and has
+            // real messages on screen; routing that no-op signal through
+            // `apply_message_ops` anyway silently wiped every visible
+            // message the instant *any* thread's bridge activity
+            // (including an unrelated background thread) coincided with
+            // the selected thread's own content having already settled
+            // (no compensating non-empty diff that same tick to mask
+            // it) -- reproduced headlessly as "the sent message
+            // disappeared a few poll ticks after being sent". An empty
+            // `thread_id` with empty `ops` carries no actual instruction
+            // to apply; skip it entirely rather than let it fall through.
+            if !thread_id.is_empty() || !ops.is_empty() {
+                apply_message_ops(model, thread_id, ops);
+            }
             sync_has_older_messages(model, component, thread_id);
             if !thread_id.is_empty() {
                 trace_transcript_tail(model, thread_id);
