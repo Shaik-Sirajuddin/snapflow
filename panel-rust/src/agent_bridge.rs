@@ -3173,6 +3173,9 @@ mod tests {
     // `AgentBridge`.
     use crate::gateway_actor::spawn_acpx_thread;
     use crate::protocol_types::MessageKind;
+    // row_count()/row_data() on the persistent messages_model VecModel in
+    // the full-reducer real-backend tests below.
+    use slint::Model as _;
 
     /// Real, already-built `acpx-server` binary next to this crate's own
     /// checkout -- same dev-checkout-relative-path convention
@@ -3653,22 +3656,232 @@ mod tests {
         assert!(cache_dir.path().join("new-thread-1.jsonl").is_file());
     }
 
-    /// Real, live, billed reproduction of a bug found via a real VNC
-    /// interactive session, not from prior automated coverage: a cold
-    /// start with zero initial threads (the DEFAULT_THREAD_NAMES opt-in
-    /// fix, 830ec21) plus the gateway_urls-for-every-known-provider fix
-    /// (9b5fb03) plus RUI_TEST_MODE gating (76a1e16) together are supposed
-    /// to add up to "click + -> a real codex reply, no mock, no manual env
-    /// juggling" -- this proves that chain end to end against this
-    /// machine's own real, already-logged-in Codex CLI auth, exactly the
-    /// way `panel_rust_create`'s empty-cold-start path and
-    /// `on_new_thread_requested`'s click handler actually call these
-    /// functions, not a synthetic shortcut.
+    /// Real, live, billed "click + -> a real reply, rendered" chain,
+    /// parameterized by `provider`/`configure_env` so the same flow can be
+    /// pointed at any registered backend (`codex`, `claude`, ...) without
+    /// duplicating the logic per provider -- see the two thin `#[test]`
+    /// wrappers below for the actual provider/model choices.
     ///
-    /// `#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1`, matching
-    /// `acpx/acpx-server/tests/real_ambient_multi_agent_test.rs`'s own
-    /// convention -- makes a real, billed model call using whatever
-    /// account this machine's Codex CLI is logged into.
+    /// Covers strictly more than `AgentBridge::history()` alone: after
+    /// the real backend replies, the reply is driven through the exact
+    /// same `update()`/`sync::apply_message_ops` reducer path
+    /// `dispatch_frame_poll` uses in the live app. That reducer/sync
+    /// layer is where this session's real bugs lived (list_model/
+    /// apply_*_ops key-cache desync crashing the whole `panic = "abort"`
+    /// process, and the thread-switch "prefill" bug where a
+    /// coincidentally-unchanged transcript diff suppressed the shared
+    /// model's resync) -- `AgentBridge::history()` alone can't catch
+    /// either, since both are bugs in what happens *after* the bridge
+    /// already has the right data.
+    ///
+    /// `configure_env` mirrors `spawn_acpx_server_with_retry`'s own
+    /// closure shape -- each provider supplies whatever auth wiring
+    /// `spawn_gateway_process` uses for a real thread of that provider
+    /// (codex: `ACPX_NATIVE_AUTH_METHOD_ID` + `CODEX_API_KEY`; claude:
+    /// nothing extra, ambient OAuth). `model_config_value`, if set, is
+    /// applied via the real `session/set_config_option("model", ...)`
+    /// extension before prompting -- pass the cheapest/fastest model this
+    /// provider offers to keep the billed call negligible.
+    fn assert_new_thread_reaches_a_real_backend_and_renders_through_the_full_reducer(
+        provider: &str,
+        configure_env: impl Fn(&mut std::process::Command, u16),
+        model_config_value: Option<&str>,
+        prompt: &str,
+        expect_upper_contains: &str,
+    ) {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_DEFAULT_AGENT_ID", provider)
+                .env("RUST_LOG", "error");
+            configure_env(command, port);
+        });
+        let _gateway_guard = TestGateway {
+            child,
+            base_url: base_url.clone(),
+        };
+
+        // Empty initial thread_specs -- the exact cold-start shape
+        // panel_rust_create produces by default (830ec21), and what
+        // on_new_thread_requested's click handler drives.
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[],
+            move |_provider| Ok(base_url.clone()),
+            Some(cache_dir.path().to_path_buf()),
+        )
+        .expect("bridge with zero initial threads");
+
+        // Exactly what on_new_thread_requested calls.
+        let index = bridge
+            .add_thread_with_profile_and_provider(
+                &format!("Real {provider} smoke test"),
+                None,
+                Some(provider),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "add_thread_with_profile_and_provider must succeed against a real, \
+                     correctly-configured {provider} gateway: {error}"
+                )
+            });
+
+        if let Some(model_value) = model_config_value {
+            // Real session/set_config_option extension call, same as
+            // acpx/acpx-server/tests/real_ambient_multi_agent_test.rs's
+            // run_claude_conversation -- forces the cheap/fast model
+            // before prompting.
+            bridge.set_config_option(index, "model".to_owned(), serde_json::json!(model_value));
+            let config_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < config_deadline
+                && !bridge
+                    .config_options(index)
+                    .iter()
+                    .any(|opt| opt.current_value.as_deref() == Some(model_value))
+            {
+                bridge.poll();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        bridge.push_local(
+            index,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: prompt.to_owned(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+        bridge.send_prompt(index, prompt.to_owned());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline && !ended {
+            ended = bridge
+                .poll()
+                .into_iter()
+                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        assert!(
+            ended,
+            "real {provider}-acp turn did not finish within 60s"
+        );
+
+        // Bridge-layer check: proves the real backend round-trip alone
+        // works.
+        let history = bridge.history(index);
+        assert!(
+            history
+                .iter()
+                .any(|message| message.text.to_uppercase().contains(expect_upper_contains)),
+            "expected a real {provider} reply containing {expect_upper_contains}, got: {history:?}"
+        );
+
+        // Reducer/sync-layer check: the actual gap this helper closes.
+        // Build the Model the same shape lib.rs's cold start does, and
+        // feed it the bridge's *real* transcript/session data through the
+        // exact same reducer message dispatch_frame_poll uses in the live
+        // app -- proving a real reply doesn't just reach AgentBridge, but
+        // renders correctly into the shared Slint-facing model with no
+        // crash, no duplicate rows, and no stale "prefill" from a
+        // previous (nonexistent, here) thread.
+        let thread_id = bridge
+            .thread_binding(index)
+            .map(|binding| binding.thread_id)
+            .unwrap_or_else(|| format!("thread:{index}"));
+        let mut model = crate::model::Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: thread_id.clone(),
+            display_name: format!("Real {provider} smoke test"),
+            provider: provider.to_owned(),
+            ..crate::model::ThreadModel::default()
+        });
+        model.visible_indices = vec![0];
+        model.selected_thread = 0;
+        // displayed_thread starts at None (nothing shown yet) so the
+        // switch below exercises the exact "coincidentally unchanged
+        // transcript" gap the prefill-data regression test covers, but
+        // this time against a real transcript, not a fabricated one.
+        assert_eq!(model.displayed_thread, None);
+
+        let snapshot = crate::msg::ThreadFrameSnapshot {
+            thread_id: thread_id.clone(),
+            real_index: index,
+            transcript: bridge.transcript(index),
+            has_older_messages: bridge.has_older_page(index),
+            pending_request: crate::PendingRequestItem::default(),
+            terminals: vec![],
+            expanded_terminal: None,
+            local_terminal: crate::LocalTerminalItem::default(),
+            connection_status: bridge.transport_status(index),
+            session_modes: bridge.session_modes(index),
+            config_options: bridge.config_options(index),
+        };
+        let (_, dirty) = crate::update::update(
+            &mut model,
+            crate::msg::Msg::Frame(crate::msg::FrameInput {
+                selected_thread_snapshot: Some(snapshot),
+                ..crate::msg::FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.displayed_thread, Some(0));
+        let ops = dirty
+            .iter()
+            .find_map(|item| match item {
+                crate::dirty::Dirty::MessagesDiff { thread_id: id, ops } if id == &thread_id => {
+                    Some(ops.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "switching to this thread must produce a MessagesDiff for its real \
+                     transcript, got: {dirty:?}"
+                )
+            });
+
+        crate::sync::apply_message_ops(&model, &thread_id, &ops);
+
+        assert!(
+            model.messages_model.row_count() > 0,
+            "the real {provider} reply must render into the shared messages_model, not just \
+             AgentBridge::history()"
+        );
+        assert_eq!(
+            model.messages_model.row_count(),
+            model.message_model_keys.borrow().len(),
+            "messages_model and its key cache must stay aligned after a real reply renders \
+             (this exact desync used to abort the whole process)"
+        );
+        let rendered_text: String = (0..model.messages_model.row_count())
+            .filter_map(|i| model.messages_model.row_data(i))
+            .map(|row| row.text.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            rendered_text.to_uppercase().contains(expect_upper_contains),
+            "expected the real {provider} reply to render into messages_model, got: {rendered_text:?}"
+        );
+    }
+
+    /// `codex` instance of
+    /// `assert_new_thread_reaches_a_real_backend_and_renders_through_the_full_reducer`
+    /// -- ambient auth via this machine's already-logged-in Codex CLI
+    /// session (same mechanism `acpx/acpx-server/tests/
+    /// real_ambient_multi_agent_test.rs` uses), default model (no cheap
+    /// low-variant model convention established for codex the way
+    /// `real_claude_multi_agent_test.rs` established `haiku` for claude).
+    ///
+    /// `#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1` -- makes a
+    /// real, billed model call using whatever account this machine's
+    /// Codex CLI is logged into.
     ///
     /// Run with:
     /// ```text
@@ -3687,79 +3900,79 @@ mod tests {
             );
             return;
         }
-
-        let cache_dir = tempfile::tempdir().expect("tempdir");
-        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-            command
-                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_DEFAULT_AGENT_ID", "codex")
-                .env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key")
-                .env("RUST_LOG", "error");
-            // Same real-auth wiring spawn_gateway_process uses for a real
-            // "codex" thread -- no ACPX_BACKEND_CMD override, so
-            // acpx-server falls through to its own real default (real
-            // codex-acp via npx), not a mock.
-            if std::env::var_os("CODEX_API_KEY").is_none() {
-                if let Some(key) = read_codex_api_key_from_auth_file() {
-                    command.env("CODEX_API_KEY", key);
+        assert_new_thread_reaches_a_real_backend_and_renders_through_the_full_reducer(
+            "codex",
+            |command, _port| {
+                // Same real-auth wiring spawn_gateway_process uses for a
+                // real "codex" thread -- no ACPX_BACKEND_CMD override, so
+                // acpx-server falls through to its own real default (real
+                // codex-acp via npx), not a mock.
+                command.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+                if std::env::var_os("CODEX_API_KEY").is_none() {
+                    if let Some(key) = read_codex_api_key_from_auth_file() {
+                        command.env("CODEX_API_KEY", key);
+                    }
                 }
-            }
-        });
-        let _gateway_guard = TestGateway {
-            child,
-            base_url: base_url.clone(),
-        };
-
-        // Empty initial thread_specs -- the exact cold-start shape
-        // panel_rust_create now produces by default (830ec21), which is
-        // what exposed the gateway_urls regression this test chain fixes.
-        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
-            &[],
-            move |_provider| Ok(base_url.clone()),
-            Some(cache_dir.path().to_path_buf()),
-        )
-        .expect("bridge with zero initial threads");
-
-        // Exactly what on_new_thread_requested calls.
-        let index = bridge
-            .add_thread_with_profile_and_provider("Real codex smoke test", None, Some("codex"))
-            .expect("add_thread_with_profile_and_provider must succeed against a real, \
-                     correctly-configured codex gateway");
-
-        bridge.push_local(
-            index,
-            ChatMessage {
-                kind: MessageKind::User,
-                text: "Reply with exactly the single word PANG and nothing else.".into(),
-                status: None,
-                id: None,
-                raw_input: None,
-                raw_output: None,
             },
+            None,
+            "Reply with exactly the single word PANG and nothing else.",
+            "PANG",
         );
-        bridge.send_prompt(
-            index,
-            "Reply with exactly the single word PANG and nothing else.".into(),
-        );
+    }
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut ended = false;
-        while std::time::Instant::now() < deadline && !ended {
-            ended = bridge
-                .poll()
-                .into_iter()
-                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
-            if !ended {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+    /// `claude`/`haiku` instance of
+    /// `assert_new_thread_reaches_a_real_backend_and_renders_through_the_full_reducer`
+    /// -- ambient auth via this machine's already-logged-in Claude CLI
+    /// session, forced to the `haiku` model via the real
+    /// `session/set_config_option` extension (cheapest/fastest model
+    /// available, matching `real_claude_multi_agent_test.rs`'s own "use
+    /// only haiku or low-variant models for testing" convention).
+    ///
+    /// `#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1` -- makes a
+    /// real, billed model call using whatever account this machine's
+    /// Claude CLI is logged into (haiku keeps the cost negligible).
+    ///
+    /// Run with:
+    /// ```text
+    /// ACPX_LIVE_TEST_AMBIENT=1 cargo test --lib \
+    ///   agent_bridge::tests::add_thread_after_empty_cold_start_reaches_a_real_claude_haiku_backend \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn add_thread_after_empty_cold_start_reaches_a_real_claude_haiku_backend() {
+        if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
+                 machine's real, already-logged-in claude CLI session (makes a real, \
+                 haiku-model billed API call)"
+            );
+            return;
         }
-        assert!(ended, "real codex-acp turn did not finish within 60s");
-        let history = bridge.history(index);
-        assert!(
-            history
-                .iter()
-                .any(|message| message.text.to_uppercase().contains("PANG")),
-            "expected a real reply containing PANG, got: {history:?}"
+        assert_new_thread_reaches_a_real_backend_and_renders_through_the_full_reducer(
+            "claude",
+            |command, _port| {
+                // acpx-server's own bare default is codex-only
+                // (config.rs's `ACPX_BACKEND_CMD` fallback is literally
+                // `npx ... codex-acp`) -- exactly the real bug
+                // `default_backend_command_for_provider`/
+                // `spawn_gateway_process` exists to close. Without this
+                // override, a "claude" test/thread silently gets a real
+                // codex-acp reply instead (confirmed live: this test
+                // timed out because the spawned backend was codex-acp,
+                // which never received the config expected of it).
+                // No ACPX_NATIVE_AUTH_METHOD_ID: unlike codex-acp's
+                // explicit API-key exchange, claude-acp's ambient auth
+                // (~/.claude/.credentials.json) doesn't need one.
+                command.env(
+                    "ACPX_BACKEND_CMD",
+                    default_backend_command_for_provider("claude")
+                        .expect("claude must have a real backend command override"),
+                );
+            },
+            Some("haiku"),
+            "Reply with exactly the single word PANG and nothing else.",
+            "PANG",
         );
     }
 

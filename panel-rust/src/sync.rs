@@ -333,7 +333,7 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
     }
 }
 
-fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
+pub(crate) fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
     let (desired_keys, desired_rows) = if thread_id.is_empty() {
         (Vec::new(), Vec::new())
     } else {
