@@ -1324,10 +1324,20 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // another thread" bug). Any actual thread switch must always
             // resync the shared model, regardless of whether this thread's
             // own transcript happened to be unchanged since its last visit.
-            let transcript_changed = switched_thread
-                || old_keys != new_keys
-                || thread.message_rows != rows
-                || thread.transcript != snapshot.transcript;
+            // Deliberately not comparing `thread.message_rows != rows` here:
+            // `MessageItem.markdown_lines` is a `ModelRc<MarkdownLine>`,
+            // whose `PartialEq` (i-slint-core's `model.rs`) compares by
+            // `Rc` pointer identity, not content -- `to_message_rows_from_
+            // transcript` builds a brand-new `ModelRc` every call, so that
+            // comparison was true on *every* poll tick for any thread with
+            // an agent message, forcing a full resync at 60-90fps for no
+            // real reason. Real content changes are already caught by
+            // `thread.transcript != snapshot.transcript` (the raw,
+            // ModelRc-free transcript data), and expand/collapse already
+            // dispatches its own `Dirty::MessagesDiff` explicitly (see
+            // `ChromeMsg::ToggleExpanded`).
+            let transcript_changed =
+                switched_thread || old_keys != new_keys || thread.transcript != snapshot.transcript;
             // Same "own cache vs. what's actually still on screen" gap as
             // `transcript_changed` above applies to every other
             // per-thread view fragment: force a resync on switch even when
@@ -2132,6 +2142,67 @@ mod tests {
         let (effects, dirty) = update(&mut model, Msg::Frame(FrameInput::default()));
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn repeated_poll_ticks_for_an_unchanged_agent_transcript_stop_resyncing_after_the_first() {
+        // Regression test: `MessageItem.markdown_lines` is a
+        // `ModelRc<MarkdownLine>`, whose `PartialEq` (i-slint-core's
+        // `model.rs`) compares by `Rc` pointer identity, not content.
+        // `to_message_rows_from_transcript` builds a brand-new `ModelRc`
+        // every call, so comparing `thread.message_rows != rows` was true
+        // on *every* poll tick for any thread with an agent-kind message,
+        // even with byte-identical input -- forcing a full
+        // `Dirty::MessagesDiff` resync at the 60-90fps poll rate for no
+        // real reason. Two ticks with the exact same snapshot must settle:
+        // the first may resync (populating the shared model for the first
+        // time), the second must not.
+        let mut model = model_with_threads(&["only"]);
+        let snapshot = || crate::msg::ThreadFrameSnapshot {
+            thread_id: "thread-0".to_owned(),
+            real_index: 0,
+            transcript: vec![crate::conversation::TranscriptItem::Assistant {
+                message_id: "reply-1".to_owned(),
+                text: "a steady-state agent reply".to_owned(),
+                streaming: false,
+            }],
+            has_older_messages: false,
+            pending_request: crate::PendingRequestItem::default(),
+            terminals: vec![],
+            expanded_terminal: None,
+            local_terminal: crate::LocalTerminalItem::default(),
+            connection_status: String::new(),
+            session_modes: None,
+            config_options: vec![],
+        };
+
+        let (_, first_dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(snapshot()),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            first_dirty
+                .iter()
+                .any(|item| matches!(item, Dirty::MessagesDiff { .. })),
+            "first tick should populate the shared model: {first_dirty:?}"
+        );
+
+        let (_, second_dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(snapshot()),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            !second_dirty
+                .iter()
+                .any(|item| matches!(item, Dirty::MessagesDiff { .. })),
+            "second tick with an unchanged snapshot must not resync: {second_dirty:?}"
+        );
     }
 
     #[test]
