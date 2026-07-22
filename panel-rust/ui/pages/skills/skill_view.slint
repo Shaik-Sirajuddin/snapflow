@@ -29,6 +29,12 @@ export component SkillEditorView inherits Rectangle {
     callback open-with-os-default-requested();
     callback content-edited(string);
     callback close-requested();
+    // See FilterSearchBar.input-has-focus's doc comment / TextField.has-focus's
+    // own doc comment -- without this, app.slint's editable-surface
+    // OR-chain has no way to know the skill content editor is focused, so
+    // every keystroke typed while editing a skill would be silently
+    // dropped before reaching Slint.
+    out property <bool> has-focus: editor-input.has-focus;
 
     background: Theme.bg-chat;
 

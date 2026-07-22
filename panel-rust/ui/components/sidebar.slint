@@ -22,10 +22,24 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
-    // Aggregates thread-search's own FilterSearchBar.input-has-focus --
-    // see that property's doc comment for why this needs re-exposing at
-    // every component boundary up to the root gate in app.slint.
-    out property <bool> search-has-focus: thread-search.input-has-focus;
+    // Aggregates thread-search's own FilterSearchBar.input-has-focus, the
+    // per-row inline thread-rename TextInput, and the shared "new skill"
+    // NamePromptDialog -- see that property's doc comment for why this
+    // needs re-exposing at every component boundary up to the root gate
+    // in app.slint. Without rename-input-has-focus/new-skill-dialog.has-focus
+    // here, both renaming a thread and naming a new skill would silently
+    // drop every typed keystroke (TextField.has-focus's doc comment names
+    // the exact same failure mode).
+    out property <bool> search-has-focus:
+        thread-search.input-has-focus
+        || rename-input-has-focus
+        || new-skill-dialog.has-focus;
+    // rename-input lives inside a `for thread[i] in threads` repeater, so
+    // there's no single element id to reference from search-has-focus
+    // above -- only ever one row is in rename mode at a time
+    // (rename-thread-index gates it), so each row's own `changed
+    // has-focus` handler converging this property nets out correctly.
+    property <bool> rename-input-has-focus: false;
     callback thread-selected(int);
     callback new-thread-requested();
     callback search-changed(string);
@@ -644,6 +658,7 @@ export component Sidebar inherits Rectangle {
                                             }
                                             return EventResult.reject;
                                         }
+                                        changed has-focus => { root.rename-input-has-focus = self.has-focus; }
                                     }
                                 }
                                 rename-focus-delay := Timer {
@@ -974,7 +989,7 @@ export component Sidebar inherits Rectangle {
 
     // Shared NamePromptDialog (base/) -- cursor-kind reporting (pointer/
     // text) lives inside it, so this call site inherits it.
-    NamePromptDialog {
+    new-skill-dialog := NamePromptDialog {
         x: 0px;
         y: 0px;
         width: root.width;

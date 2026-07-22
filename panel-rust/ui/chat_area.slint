@@ -105,8 +105,12 @@ export component ChatArea inherits Rectangle {
         local-terminal.open && local-terminal-card.has-focus;
     // Mode/model dropdown search + mention popup filter -- see
     // FilterSearchBar.input-has-focus's doc comment.
+    // rename-input (the chat header's inline thread-rename field) was
+    // missing from this OR-chain entirely -- same silently-dropped-
+    // keystrokes failure class TextField.has-focus's doc comment names.
     out property <bool> secondary-text-input-has-focus:
-        chat-input.secondary-text-input-has-focus;
+        chat-input.secondary-text-input-has-focus
+        || rename-input.has-focus;
 
     // --- Demo approval (local one-of card, no ACP round-trip) ------------
     // Type one of these in the compose box and press Send / Enter:

@@ -47,10 +47,24 @@ export component ChatPanel inherits Window {
     // (conditional element); referencing its property outside that scope
     // still resolves to false when absent, same as the other conditional
     // refs in this OR-chain.
+    // SkillEditorView (`if root.active-pane == "skill"`) can't be
+    // referenced directly for the same reason -- mirrored into
+    // skill-editor-focus-mirror instead, same pattern settings_page.slint
+    // uses for its own conditional section views. Without this, every
+    // keystroke typed while editing a skill's content was silently
+    // dropped (TextField.has-focus's doc comment names the same failure
+    // class).
+    property <bool> skill-editor-focus-mirror: false;
+    changed active-pane => {
+        if (self.active-pane != "skill") {
+            self.skill-editor-focus-mirror = false;
+        }
+    }
     out property <bool> secondary-text-input-has-focus:
         sidebar.search-has-focus
         || chat-area.secondary-text-input-has-focus
-        || settings-page-instance.search-has-focus;
+        || settings-page-instance.search-has-focus
+        || skill-editor-focus-mirror;
     out property <bool> local-terminal-has-focus:
         chat-area.local-terminal-has-focus
         || (local-terminal-overlay-open && local-terminal-overlay.has-focus);
@@ -512,6 +526,9 @@ export component ChatPanel inherits Window {
                     root.skill-content-edited(root.active-skill-path, new-content);
                 }
                 close-requested => { root.active-pane = "chat"; }
+                changed has-focus => {
+                    root.skill-editor-focus-mirror = self.has-focus;
+                }
             }
         }
         if expanded-terminal.terminal-id != "" : TerminalOverlay {

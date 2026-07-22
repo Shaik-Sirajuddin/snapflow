@@ -13,6 +13,12 @@ export component NamePromptDialog inherits Rectangle {
     property <string> draft: "";
     callback confirmed(string);
     callback cancelled();
+    // See FilterSearchBar.input-has-focus's doc comment / TextField.has-focus's
+    // own doc comment -- without this, the host's editable-surface OR-chain
+    // has no way to know this modal's input is focused, so every keystroke
+    // typed into it (renaming a thread/skill, naming a new skill) would be
+    // silently dropped before reaching Slint.
+    out property <bool> has-focus: name-input.has-focus;
 
     visible: open;
     background: Theme.bg-canvas.with-alpha(0.85);
