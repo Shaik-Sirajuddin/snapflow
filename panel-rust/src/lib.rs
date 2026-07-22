@@ -1066,13 +1066,28 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     display_name: record.display_name.clone(),
                     provider: record.provider.clone(),
                     session_id: Some(record.session_id.clone()),
-                    profile_name: record.profile_name.clone(),
+                    // `update.rs`'s `ThreadMsg::New` and `settings_file.rs`'s
+                    // `resolved_to_panel_defaults` both guard against the
+                    // literal "default" sentinel (a reserved acpx-server
+                    // placeholder, never a real profile name) at their own
+                    // point of use/write -- but a thread record persisted
+                    // to panel-state.sqlite3 *before* either fix landed (or
+                    // written by some other path that predates them) still
+                    // carries that literal string forward untouched on cold
+                    // start, restoring straight into a real session/new
+                    // call and silently misrouting that thread's agent
+                    // forever ("the default thread's chat input isn't
+                    // linked to a real agent"). Guard here too, at this
+                    // third point of use.
+                    profile_name: settings_file::non_default_sentinel(
+                        record.profile_name.clone(),
+                    ),
                 })
                 .collect()
         };
         let initial_permission_profiles: Vec<Option<String>> = restored_records
             .iter()
-            .map(|record| record.permission_profile.clone())
+            .map(|record| settings_file::non_default_sentinel(record.permission_profile.clone()))
             .chain(std::iter::repeat(None))
             .take(initial_specs.len())
             .collect();
