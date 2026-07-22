@@ -16,8 +16,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -132,6 +134,60 @@ func McpHTTPURL(mcpBind string) string {
 	return "http://" + bind + "/mcp"
 }
 
+// pidFilePath is where Start/Stop record the running acpx-server's pid, so a
+// later Start (after this snapshotd process itself was hard-killed, leaving
+// no chance to run Stop's cleanup) can detect and reap the orphan before
+// spawning a fresh one. Lives alongside the generated config file rather
+// than needing a new Config field, since ConfigPath is always required.
+func pidFilePath(cfg Config) string {
+	return filepath.Join(filepath.Dir(cfg.ConfigPath), "acpx-server.pid")
+}
+
+func writePidFile(cfg Config, pid int) {
+	path := pidFilePath(cfg)
+	// Best-effort: a failure to write the pidfile only means a future
+	// unclean-shutdown won't be detected, not that this Start fails.
+	_ = os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o644)
+}
+
+func removePidFile(cfg Config) {
+	_ = os.Remove(pidFilePath(cfg))
+}
+
+// reapStalePidFile is the "daemon restarted after an unclean exit" half of
+// the orphan-process fix: if a pidfile survived from a prior run that never
+// reached a clean Stop() (snapshotd itself was SIGKILLed/OOM-killed, so its
+// own acpx-server child -- previously left in snapshotd's own process
+// group -- was never reaped), kill that process group now, before spawning
+// a fresh acpx-server. Guards against a pid-reuse false positive by
+// requiring the recorded pid's own cmdline to still reference cfg.BinPath.
+func reapStalePidFile(cfg Config, log *slog.Logger) {
+	path := pidFilePath(cfg)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return // no stale pidfile -- the common, clean-shutdown case.
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		_ = os.Remove(path)
+		return
+	}
+	if !isProcessAlive(pid) {
+		_ = os.Remove(path)
+		return
+	}
+	if !processCmdlineContains(pid, filepath.Base(cfg.BinPath)) {
+		// Alive, but not the process we think it is (pid reuse) --
+		// leave it alone, just drop the stale record.
+		log.Warn("acpxmgr: stale pidfile pid is alive but is not acpx-server; leaving it running", "pid", pid)
+		_ = os.Remove(path)
+		return
+	}
+	log.Warn("acpxmgr: reaping orphaned acpx-server process group from a prior unclean shutdown", "pid", pid)
+	_ = killProcessGroup(pid, syscall.SIGKILL)
+	_ = os.Remove(path)
+}
+
 // Start writes config, spawns acpx-server, and waits briefly for /health.
 func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	if cfg.BinPath == "" {
@@ -157,9 +213,19 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	if err := WriteConfig(cfg.ConfigPath, cfg.McpURL, agentID); err != nil {
 		return nil, fmt.Errorf("acpxmgr: write config: %w", err)
 	}
+	reapStalePidFile(cfg, log)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(runCtx, cfg.BinPath)
+	cmd.SysProcAttr = setpgidAttr()
+	// Overrides exec.CommandContext's default cancel behavior (a bare
+	// Process.Kill on just the one acpx-server pid) with a process-group
+	// SIGTERM, so this Stop()'s primary/common path -- not just the rare
+	// 5s-timeout escalation below -- gives acpx-server's own children a
+	// chance to shut down cleanly too, instead of leaving them orphaned.
+	cmd.Cancel = func() error {
+		return killProcessGroup(cmd.Process.Pid, syscall.SIGTERM)
+	}
 	cmd.Env = append(os.Environ(),
 		"ACPX_CONFIG_FILE="+cfg.ConfigPath,
 		"ACPX_HTTP_BIND="+cfg.HttpBind,
@@ -185,6 +251,7 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		cancel()
 		return nil, fmt.Errorf("acpxmgr: start %s: %w", cfg.BinPath, err)
 	}
+	writePidFile(cfg, cmd.Process.Pid)
 	m := &Manager{
 		cfg:    cfg,
 		log:    log,
@@ -197,6 +264,7 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		m.mu.Lock()
 		m.err = err
 		m.mu.Unlock()
+		removePidFile(cfg)
 		close(m.done)
 	}()
 
@@ -234,9 +302,14 @@ func (m *Manager) Stop() error {
 	select {
 	case <-m.done:
 	case <-time.After(5 * time.Second):
+		// The graceful SIGTERM (via context cancel) didn't finish in
+		// time -- escalate to killing the whole process group, not
+		// just the single acpx-server pid, so any of its own still-
+		// running child processes go down with it instead of being
+		// left as orphans.
 		m.mu.Lock()
 		if m.cmd != nil && m.cmd.Process != nil {
-			_ = m.cmd.Process.Kill()
+			_ = killProcessGroup(m.cmd.Process.Pid, syscall.SIGKILL)
 		}
 		m.mu.Unlock()
 		<-m.done
