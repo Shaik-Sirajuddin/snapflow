@@ -285,8 +285,15 @@ jobs:
           windeployqt --release --no-translations --qmldir src/qml "$APPDIR/snapflow.exe" || echo "windeployqt failed (see above) -- continuing anyway for diagnostics/artifact"
           cp /mingw64/bin/mlt*.dll "$APPDIR/" 2>/dev/null || true
           mkdir -p build/Snapflow/lib build/Snapflow/share
-          cp -r /mingw64/lib/mlt-7 build/Snapflow/lib/mlt-7
-          cp -r /mingw64/share/mlt-7 build/Snapflow/share/mlt-7
+          # TEMPORARY diagnostic (this plan's end-to-end verification
+          # only): /mingw64/lib/mlt-7 doesn't exist on a real
+          # windows-latest run ("cp: cannot stat ... No such file or
+          # directory") -- find the real installed path/name instead of
+          # guessing at it a second time.
+          echo "--- actual mlt paths under /mingw64 ---"
+          find /mingw64/lib /mingw64/share -maxdepth 1 -iname '*mlt*' 2>&1 || true
+          cp -r /mingw64/lib/mlt-7 build/Snapflow/lib/mlt-7 || true
+          cp -r /mingw64/share/mlt-7 build/Snapflow/share/mlt-7 || true
           ldd "$APPDIR/snapflow.exe" | awk '/mingw64/ {print $3}' | sort -u | xargs -I{} cp -n {} "$APPDIR/" 2>/dev/null || true
 
       - name: Package the portable zip
