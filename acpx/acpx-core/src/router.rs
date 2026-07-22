@@ -3030,6 +3030,13 @@ impl Router {
             .unwrap_or_else(|| serde_json::json!({ "sessions": [] }));
         if let Some(raw_sessions) = result.get("sessions").and_then(|s| s.as_array()) {
             let mut filtered = Vec::with_capacity(raw_sessions.len());
+            // **`bound_new_registrations_per_session_list_call`.** Tracks
+            // only genuinely *new* registrations made during this one
+            // call -- sessions already known to this tenant keep
+            // translating for free and never advance this counter. See
+            // `LifecycleConfig::max_new_sessions_per_list_call`'s doc
+            // comment for why this exists.
+            let mut new_registrations_used = 0usize;
             for session in raw_sessions.iter().cloned() {
                 let mut session = session;
                 let Some(backend_sid) = session
@@ -3050,13 +3057,16 @@ impl Router {
                 // comment) -- it is dropped from the response entirely,
                 // not just left untranslated, so the requesting tenant
                 // never learns the backend-native id or anything else
-                // about a session it doesn't own.
+                // about a session it doesn't own. `None` is also now
+                // returned once this call's new-registration budget is
+                // exhausted (see `max_new_sessions_per_list_call`).
                 let Some(gateway_id) = self.translate_or_register_backend_session(
                     tenant_id,
                     &agent_id,
                     &backend_sid,
                     profile_name.clone(),
                     session_cwd,
+                    &mut new_registrations_used,
                 ) else {
                     continue;
                 };
@@ -3119,6 +3129,7 @@ impl Router {
         backend_session_id: &str,
         profile_name: Option<String>,
         cwd: Option<String>,
+        new_registrations_used: &mut usize,
     ) -> Option<String> {
         if let Some(existing) =
             self.sessions
@@ -3131,6 +3142,16 @@ impl Router {
                 return None;
             }
         }
+        // **`bound_new_registrations_per_session_list_call`.** Only a
+        // genuinely first-seen backend session reaches this point, so
+        // this check gates exactly the case the cap exists for -- a
+        // backend reporting far more history than any single discovery
+        // call should be allowed to import at once.
+        if let Some(cap) = self.lifecycle.max_new_sessions_per_list_call {
+            if *new_registrations_used >= cap {
+                return None;
+            }
+        }
         let admission = self.admit_session(tenant_id).ok()?;
         let gateway_id = self.sessions.register(
             tenant_id,
@@ -3140,6 +3161,7 @@ impl Router {
             cwd,
         );
         admission.commit();
+        *new_registrations_used += 1;
         Some(gateway_id.0)
     }
 
@@ -7083,6 +7105,7 @@ async fn dispatch_session_list_real_shared(
     if let Some(raw_sessions) = result.get("sessions").and_then(|s| s.as_array()) {
         let mut r = router.lock().await;
         let mut filtered = Vec::with_capacity(raw_sessions.len());
+        let mut new_registrations_used = 0usize;
         for session in raw_sessions.iter().cloned() {
             let mut session = session;
             let Some(backend_sid) = session
@@ -7105,6 +7128,7 @@ async fn dispatch_session_list_real_shared(
                 &backend_sid,
                 profile_name.clone(),
                 session_cwd,
+                &mut new_registrations_used,
             ) else {
                 continue;
             };
