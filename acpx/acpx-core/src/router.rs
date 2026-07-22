@@ -2282,6 +2282,48 @@ impl Router {
     /// I/O so another reaper pass cannot race it.
     pub async fn reap_expired_sessions(&mut self, now: std::time::Instant) -> LifecycleReapReport {
         let candidates = self.sessions.reap_candidates(now, &self.lifecycle);
+        self.close_candidate_sessions(candidates).await
+    }
+
+    /// **`e2e_session_teardown_automation`.** Unconditionally closes every
+    /// unpinned, not-in-flight session for one tenant, regardless of idle
+    /// time -- for e2e/test-harness teardown that wants "everything this
+    /// run opened is gone now", not `reap_expired_sessions`'s idle-TTL
+    /// gate (which stays exactly as configured, 30 minutes by default,
+    /// for genuinely-idle-but-still-connected production sessions; this
+    /// method is deliberately a separate, explicit call so nothing here
+    /// changes that TTL's behavior). Shares the same hardened per-session
+    /// close path (backend timeout, demux/pending-request routing,
+    /// persistence-store bookkeeping) as the idle reaper via
+    /// [`Self::close_candidate_sessions`].
+    pub async fn close_all_sessions_for_tenant(&mut self, tenant_id: &TenantId) -> LifecycleReapReport {
+        let candidates: Vec<(TenantId, acpx_proto::session::GatewaySessionId)> = self
+            .sessions
+            .list_for_tenant(tenant_id)
+            .into_iter()
+            .map(|(gateway_id, _entry)| (tenant_id.clone(), gateway_id))
+            .collect();
+        self.close_candidate_sessions(candidates).await
+    }
+
+    /// **`e2e_session_teardown_automation`.** Live (not idle-filtered)
+    /// count of sessions currently registered for one tenant -- the
+    /// headless teardown-verification test's actual assertion target:
+    /// confirms teardown left the registry, not just each individual
+    /// `session/close` response, genuinely at zero.
+    pub fn session_count_for_tenant(&self, tenant_id: &TenantId) -> usize {
+        self.sessions.len_for_tenant(tenant_id)
+    }
+
+    /// Shared close path for both [`Self::reap_expired_sessions`] (idle-TTL
+    /// candidates) and [`Self::close_all_sessions_for_tenant`] (every live
+    /// session for one tenant, unconditionally) -- the two differ only in
+    /// how `candidates` is selected, not in how a selected session is
+    /// actually closed.
+    async fn close_candidate_sessions(
+        &mut self,
+        candidates: Vec<(TenantId, acpx_proto::session::GatewaySessionId)>,
+    ) -> LifecycleReapReport {
         let mut report = LifecycleReapReport::default();
 
         for (tenant_id, gateway_id) in candidates {
