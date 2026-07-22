@@ -701,19 +701,24 @@ fn snapflowd_mcp_servers_entry(
 /// actually answers there, so this stays silent instead of advertising a
 /// dead MCP server when no snapshotd daemon is running at all.
 ///
-/// **`"type": "http"`, not `"sse"`, even though the URL is the same `/sse`
-/// endpoint** -- found live, correcting this function's own first draft:
-/// an `sse`-typed entry made real `codex-acp` reject `session/new`
-/// outright (`Invalid request: Codex doesn't support MCP SSE transport
-/// protocol`; its own advertised `mcpCapabilities` are `{http: true, sse:
-/// false}`). Re-sending the *identical* URL as `"type": "http"` instead
-/// was accepted by both real adapters and confirmed live end-to-end on
-/// both: a real `session/prompt` on each backend discovered the
-/// `snapshotd` tools and completed a real tool call (`daemon_listProjects`
-/// on Codex, an attempted `daemon_list` on Claude) -- codex-acp's
-/// "http" transport client evidently tolerates this server's classic
-/// SSE-stream response shape in practice, so one entry shape now covers
-/// both providers instead of needing a provider-gated split.
+/// **`"type": "http"` pointed at `/mcp`, not `/sse`** -- found live,
+/// correcting this function's own second draft (which sent `"type":
+/// "http"` at the *same* `/sse` URL the legacy transport uses): a real
+/// `codex-acp` session against that shape failed its MCP handshake with
+/// `HTTP 405: Method Not Allowed` on the streamable-HTTP initialize
+/// request (`video-generation-e2e-harness` plan's `custom_mcp_and_
+/// skills_support` phase, 2026-07-22). Root cause: `snapshotd/internal/
+/// mcpadapter/sse.go`'s `SSEServer` deliberately serves *two* transports
+/// on the same addr for exactly this reason -- legacy HTTP+SSE at `/`
+/// (`/sse`, `/message`) for older clients, and the 2025-03-26 Streamable
+/// HTTP transport at `/mcp` for clients whose MCP library only
+/// implements that (its own doc comment names Codex CLI's `rmcp` client
+/// specifically). Pointing `"type": "http"` at `/sse` was never
+/// correct; `/mcp` is the endpoint that transport actually needs.
+/// codex-acp's own advertised `mcpCapabilities` are `{http: true, sse:
+/// false}`, consistent with it requiring the Streamable HTTP shape, not
+/// tolerating the classic SSE one as the previous doc comment's
+/// (unverified) claim asserted.
 fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
     let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
     let addr =
@@ -724,7 +729,7 @@ fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
     vec![serde_json::json!({
         "type": "http",
         "name": "snapshotd",
-        "url": format!("http://{addr}/sse"),
+        "url": format!("http://{addr}/mcp"),
         "headers": [],
     })]
 }
@@ -6739,6 +6744,43 @@ done
             );
         }
         std::env::remove_var("SNAPSHOTD_MCP_SSE_ADDR");
+    }
+
+    /// **Regression test for the real, live-found MCP transport bug**
+    /// (`video-generation-e2e-harness` plan's `custom_mcp_and_skills_
+    /// support` phase, 2026-07-22): a real `codex-acp` session given
+    /// this entry's *old* URL (`/sse`, even under `"type": "http"`)
+    /// failed its MCP handshake with `HTTP 405: Method Not Allowed`.
+    /// `snapshotd/internal/mcpadapter/sse.go`'s `SSEServer` serves the
+    /// Streamable HTTP transport at `/mcp`, not `/sse` -- this test
+    /// pins the entry to that endpoint so this exact regression can't
+    /// silently return.
+    #[test]
+    fn snapshotd_mcp_server_entry_points_at_the_streamable_http_endpoint_not_sse() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real loopback listener");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            use std::io::Write;
+            // A real, if minimal, listener: probe_http_endpoint only
+            // needs *some* bytes back to treat this as a live daemon.
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+            }
+        });
+
+        std::env::set_var("SNAPSHOTD_MCP_SSE_ADDR", addr.to_string());
+        let entries = snapshotd_mcp_server_entry("codex");
+        std::env::remove_var("SNAPSHOTD_MCP_SSE_ADDR");
+        handle.join().expect("listener thread");
+
+        assert_eq!(entries.len(), 1, "a live-answering daemon must produce exactly one entry");
+        assert_eq!(
+            entries[0]["url"],
+            serde_json::Value::String(format!("http://{addr}/mcp")),
+            "must point at the Streamable HTTP endpoint (/mcp), not the legacy SSE one (/sse) -- \
+             codex-acp's real MCP client requires this exact shape, confirmed live"
+        );
     }
 }
 /// Refreshes `slot`'s trailer (`acp_session_id`/`updated_at`), taking
