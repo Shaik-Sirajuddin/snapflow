@@ -1373,6 +1373,31 @@ fn spawn_gateway_process(
         )),
     };
     cmd.env("ACPX_DB_PATH", &db_path);
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: give every acpx-server this process spawns its own admin
+    // plane too (a fresh ephemeral admin port per instance, unlike the
+    // daemon's single fixed one -- this path can spawn several gateways
+    // in the same process), so `resolve_admin_creds` can find it via the
+    // in-memory registry below without needing the shared token file at
+    // all for a self-spawned instance.
+    if let (Some((admin_port, _admin_lock)), Some(token)) =
+        (reserve_ephemeral_port(), random_hex_token(32))
+    {
+        cmd.env("ACPX_ADMIN_TOKEN", &token)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"));
+        self_spawned_admin_creds()
+            .lock()
+            .expect("admin creds mutex poisoned")
+            .insert(
+                format!("http://127.0.0.1:{port}"),
+                (format!("http://127.0.0.1:{admin_port}"), token),
+            );
+        // _admin_lock is dropped here (its only job was reserving the
+        // port up to this point) -- acpx-server binds it next, same
+        // "reserve via a real listener, then hand the port to the child"
+        // TOCTOU-safe convention `reserve_ephemeral_port`'s own caller
+        // (the main HTTP port, `lock` above) already uses.
+    }
     let mut child = cmd.spawn().map_err(|e| {
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
@@ -1448,6 +1473,100 @@ pub fn resolve_cache_dir() -> PathBuf {
         std::env::var("HOME").ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
+}
+
+/// setup-followups plan, agent_settings_ordering_and_install_enable_flow:
+/// admin-plane bearer token + admin listener URL for whichever acpx-server
+/// this panel is talking to, so `AgentBridge::set_agent_enabled` can build
+/// a real `acpx_client::ext::admin::AdminClient`. There is no existing
+/// channel for two independent processes (snapshotd, panel-rust) to share
+/// a secret, so this establishes one: a token file written by whichever
+/// side actually spawned the gateway (`acpxmgr.ensureAdminToken` on the
+/// Go side, `spawn_gateway_process`'s own admin-token generation on this
+/// side), at the same path both sides derive independently from
+/// `SNAPSHOTD_HOME`/`HOME`
+/// (0600, since it grants gateway-wide agent enable/disable control).
+///
+/// Resolution order per call:
+/// 1. `RUI_ACPX_ADMIN_URL`/`RUI_ACPX_ADMIN_TOKEN` env override (tests, or
+///    an operator running acpx-server directly with a hand-picked token).
+/// 2. This process's own in-memory registry of admin creds for gateways
+///    *this* `spawn_gateway_process` call itself spawned (the per-provider
+///    dev-fallback path, which reserves a fresh ephemeral admin port per
+///    instance rather than the daemon's fixed one).
+/// 3. The shared token file, assuming the daemon's fixed admin bind
+///    (`acpxmgr.AdminBind` on the Go side) -- the real production path,
+///    where snapshotd (not this process) spawned the one shared gateway.
+fn admin_token_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SNAPSHOTD_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".snapshotd"))
+        .unwrap_or_else(|_| PathBuf::from(".snapshotd"))
+}
+
+fn read_shared_admin_token() -> Option<String> {
+    let raw = std::fs::read_to_string(admin_token_dir().join("admin-token")).ok()?;
+    let token = raw.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+/// Same fixed bind acpxmgr.go's `AdminBind` constant uses -- see that
+/// constant's own doc comment for why a fixed (not per-run-reserved) port
+/// is correct there (exactly one daemon-managed instance ever exists).
+const DAEMON_ADMIN_URL: &str = "http://127.0.0.1:8791";
+
+static SELF_SPAWNED_ADMIN_CREDS: std::sync::OnceLock<Mutex<HashMap<String, (String, String)>>> =
+    std::sync::OnceLock::new();
+
+fn self_spawned_admin_creds() -> &'static Mutex<HashMap<String, (String, String)>> {
+    SELF_SPAWNED_ADMIN_CREDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A random hex token from `/dev/urandom`, with no new crate dependency
+/// for what's otherwise a one-off local-loopback dev-fallback credential
+/// (the real production path's token comes from `acpxmgr.go`'s own
+/// `crypto/rand`-backed generator instead, via the shared file).
+fn random_hex_token(bytes: usize) -> Option<String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut buf)
+        .ok()?;
+    Some(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `AcpxThreadHandle` has no getter for the base_url it was created
+/// against (it's an opaque actor-command channel), so this can't key an
+/// exact per-gateway lookup the way `self_spawned_admin_creds` is keyed.
+/// In practice that's fine: production always has exactly one daemon-
+/// managed gateway (tier 3 below, base_url-independent by construction),
+/// and the self-spawn dev-fallback path realistically spawns one gateway
+/// per running panel-rust instance too -- so "the one self-spawned entry,
+/// if there's exactly one" is a correct, simple stand-in for a real
+/// per-base_url match.
+fn resolve_admin_creds() -> Option<(String, String)> {
+    if let (Ok(url), Ok(token)) = (
+        std::env::var("RUI_ACPX_ADMIN_URL"),
+        std::env::var("RUI_ACPX_ADMIN_TOKEN"),
+    ) {
+        if !url.is_empty() && !token.is_empty() {
+            return Some((url, token));
+        }
+    }
+    {
+        let creds = self_spawned_admin_creds()
+            .lock()
+            .expect("admin creds mutex poisoned");
+        if creds.len() == 1 {
+            return creds.values().next().cloned();
+        }
+    }
+    read_shared_admin_token().map(|token| (DAEMON_ADMIN_URL.to_owned(), token))
 }
 
 /// Opaque staleness token -- not a real RFC3339 timestamp (no chrono
@@ -2742,9 +2861,44 @@ impl AgentBridge {
             return Vec::new();
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let mut agents = self
+            .runtime
             .block_on(handle.list_agents())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: `agents/list` (the plain ACP-adjacent RPC above)
+        // carries no enablement concept at all -- that only exists on
+        // the admin plane. Merge it in here, once, so every caller of
+        // list_agents (settings view, tests) sees accurate enabled
+        // state without needing to know the admin plane exists. A
+        // completely absent admin plane (no token discoverable) leaves
+        // every entry at its `AgentCatalogEntry::from_json` default of
+        // `enabled: true` -- not a regression for the common case where
+        // this feature isn't configured at all.
+        if let Some(enablement) = self.agent_enablement_map() {
+            for agent in &mut agents {
+                if let Some(enabled) = enablement.get(&agent.id) {
+                    agent.enabled = *enabled;
+                }
+            }
+        }
+        agents
+    }
+
+    /// The admin plane's own view of every agent's `enabled` flag,
+    /// keyed by agent id. `None` if no admin plane is reachable at all
+    /// (see [`resolve_admin_creds`]) -- distinct from `Some(empty map)`,
+    /// which would incorrectly read as "every agent is unlisted".
+    fn agent_enablement_map(&self) -> Option<std::collections::HashMap<String, bool>> {
+        let (admin_url, admin_token) = resolve_admin_creds()?;
+        let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
+        let entries = self.runtime.block_on(client.list_agents()).ok()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|entry| (entry.id, entry.enabled))
+                .collect(),
+        )
     }
 
     /// `agents/install` -- client-initiated installer trigger. Returns
@@ -2760,6 +2914,32 @@ impl AgentBridge {
         self.runtime
             .block_on(handle.install_agent(agent_id.to_string()))
             .is_ok()
+    }
+
+    /// setup-followups plan, agent_settings_ordering_and_install_enable_
+    /// flow: the real "install > enable" second step -- distinct from
+    /// `install_agent` (which only ever registers/fetches the binary).
+    /// Uses the admin plane (`acpx_client::ext::admin::AdminClient`),
+    /// not a JSON-RPC method against `idx`'s thread gateway, since
+    /// enable/disable is gateway-wide administration, not a per-session
+    /// action -- see `resolve_admin_creds`'s own doc comment for how
+    /// panel-rust discovers admin credentials for whichever acpx-server
+    /// it's actually talking to. Returns `false` (not an error type) if
+    /// no admin plane is reachable at all -- a legitimate, expected state
+    /// when nothing generated a token yet -- exactly like every other
+    /// degrade-gracefully bridge call in this file.
+    pub fn set_agent_enabled(&self, agent_id: &str, enabled: bool) -> bool {
+        let Some((admin_url, admin_token)) = resolve_admin_creds() else {
+            return false;
+        };
+        let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
+        if enabled {
+            self.runtime.block_on(client.enable_agent(agent_id)).is_ok()
+        } else {
+            self.runtime
+                .block_on(client.disable_agent(agent_id))
+                .is_ok()
+        }
     }
 
     /// Opens (or returns the already-open) client-local PTY terminal
@@ -3961,6 +4141,46 @@ mod tests {
             bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
         assert!(!bridge.archive_thread(5));
         assert!(!bridge.thread_archived(5));
+    }
+
+    #[test]
+    fn set_agent_enabled_degrades_gracefully_with_no_admin_plane_reachable() {
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: with no RUI_ACPX_ADMIN_URL/TOKEN override, no
+        // self-spawned admin creds registered, and (in this test's own
+        // isolated env) no shared token file at the derived SNAPSHOTD_HOME,
+        // resolve_admin_creds must return None and set_agent_enabled must
+        // degrade to `false`, never panic.
+        // SAFETY: guarded by restoring prior values unconditionally, same
+        // convention as this file's other env-mutating tests -- serialized
+        // by this crate's own `--test-threads=1` convention.
+        let prior_home = std::env::var("SNAPSHOTD_HOME").ok();
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("SNAPSHOTD_HOME", empty_home.path());
+        let prior_url = std::env::var("RUI_ACPX_ADMIN_URL").ok();
+        let prior_token = std::env::var("RUI_ACPX_ADMIN_TOKEN").ok();
+        std::env::remove_var("RUI_ACPX_ADMIN_URL");
+        std::env::remove_var("RUI_ACPX_ADMIN_TOKEN");
+
+        let gateway = TestGateway::spawn();
+        let bridge =
+            bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
+        let result = bridge.set_agent_enabled("codex-acp", false);
+
+        match prior_home {
+            Some(v) => std::env::set_var("SNAPSHOTD_HOME", v),
+            None => std::env::remove_var("SNAPSHOTD_HOME"),
+        }
+        match prior_url {
+            Some(v) => std::env::set_var("RUI_ACPX_ADMIN_URL", v),
+            None => std::env::remove_var("RUI_ACPX_ADMIN_URL"),
+        }
+        match prior_token {
+            Some(v) => std::env::set_var("RUI_ACPX_ADMIN_TOKEN", v),
+            None => std::env::remove_var("RUI_ACPX_ADMIN_TOKEN"),
+        }
+
+        assert!(!result, "expected false (no admin plane reachable), not a panic");
     }
 
     #[test]

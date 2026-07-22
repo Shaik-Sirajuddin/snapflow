@@ -8,6 +8,8 @@ package acpxmgr
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +24,13 @@ import (
 	"syscall"
 	"time"
 )
+
+// AdminBind is the fixed loopback address acpx-server's admin plane binds
+// to when acpxmgr enables it -- fixed (not per-run-reserved) because
+// acpxmgr only ever spawns exactly one acpx-server instance at a time
+// (unlike panel-rust's own per-provider dev-fallback spawn path, which
+// does need a fresh port per instance).
+const AdminBind = "127.0.0.1:8791"
 
 // Config drives spawn + generated provisioning file.
 type Config struct {
@@ -143,6 +152,42 @@ func pidFilePath(cfg Config) string {
 	return filepath.Join(filepath.Dir(cfg.ConfigPath), "acpx-server.pid")
 }
 
+// adminTokenPath is the shared discovery location for acpx's admin-plane
+// bearer token -- panel-rust (a separate process from snapshotd, with no
+// other channel to learn credentials for a gateway it didn't spawn
+// itself) reads this same file. Sibling of ConfigPath for the same
+// reason pidFilePath is, and 0600 (readable by this user only, since it
+// grants gateway-wide admin control -- enable/disable any agent, edit
+// custom agent definitions).
+func adminTokenPath(cfg Config) string {
+	return filepath.Join(filepath.Dir(cfg.ConfigPath), "admin-token")
+}
+
+// ensureAdminToken returns a stable admin token for cfg's ConfigPath
+// directory, generating and persisting a new random one on first use so
+// the token survives daemon restarts (a client that cached it from the
+// shared file stays valid across a plain restart, not just one run).
+func ensureAdminToken(cfg Config) (string, error) {
+	path := adminTokenPath(cfg)
+	if raw, err := os.ReadFile(path); err == nil {
+		if token := strings.TrimSpace(string(raw)); token != "" {
+			return token, nil
+		}
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("acpxmgr: generate admin token: %w", err)
+	}
+	token := hex.EncodeToString(buf)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", fmt.Errorf("acpxmgr: create admin token dir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("acpxmgr: write admin token: %w", err)
+	}
+	return token, nil
+}
+
 func writePidFile(cfg Config, pid int) {
 	path := pidFilePath(cfg)
 	// Best-effort: a failure to write the pidfile only means a future
@@ -219,6 +264,22 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	}
 	reapStalePidFile(cfg, log)
 
+	// setup-followups plan, agent_settings_ordering_and_install_enable_
+	// flow: acpx-server's admin plane (agents/*/enable|disable) requires
+	// ACPX_ADMIN_TOKEN; without it the daemon-managed instance has no
+	// admin plane at all and panel-rust's Settings > Agents enable/
+	// disable action has nothing to call. cfg.DbPath is always set below
+	// (ACPX_ADMIN_TOKEN's own durable-state requirement), so this is
+	// always safe to enable here.
+	adminToken, err := ensureAdminToken(cfg)
+	if err != nil {
+		// Non-fatal: acpx-server itself still starts and serves ordinary
+		// sessions fine without an admin plane -- only enable/disable
+		// from panel-rust degrades, not the whole daemon.
+		log.Warn("acpxmgr: could not provision admin token; agent enable/disable will be unavailable", "error", err)
+		adminToken = ""
+	}
+
 	runCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(runCtx, cfg.BinPath)
 	cmd.SysProcAttr = setpgidAttr()
@@ -244,6 +305,12 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_AGENT_ID="+cfg.DefaultAgentID)
 	} else {
 		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_AGENT_ID="+agentID)
+	}
+	if adminToken != "" {
+		cmd.Env = append(cmd.Env,
+			"ACPX_ADMIN_TOKEN="+adminToken,
+			"ACPX_ADMIN_BIND="+AdminBind,
+		)
 	}
 	cmd.Env = append(cmd.Env, cfg.ExtraEnv...)
 	// Inherit stderr for operator logs; silence stdin.

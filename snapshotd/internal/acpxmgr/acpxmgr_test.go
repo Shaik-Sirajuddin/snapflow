@@ -30,6 +30,38 @@ func TestWriteConfig(t *testing.T) {
 	}
 }
 
+func TestEnsureAdminTokenIsStableAcrossCalls(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{ConfigPath: filepath.Join(dir, "acpx-config.json")}
+
+	first, err := ensureAdminToken(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) == 0 {
+		t.Fatal("expected a non-empty generated token")
+	}
+
+	second, err := ensureAdminToken(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("expected the same token on a second call (persisted, not regenerated), got %q then %q", first, second)
+	}
+
+	// A real client (panel-rust) reads this exact file independently --
+	// prove it round-trips through a plain file read too, not just
+	// through ensureAdminToken's own re-read path.
+	raw, err := os.ReadFile(adminTokenPath(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != first {
+		t.Fatalf("token file content %q does not match generated token %q", raw, first)
+	}
+}
+
 func TestMcpHTTPURL(t *testing.T) {
 	cases := map[string]string{
 		"127.0.0.1:7777":            "http://127.0.0.1:7777/mcp",

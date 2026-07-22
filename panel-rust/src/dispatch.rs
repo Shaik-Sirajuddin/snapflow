@@ -865,6 +865,19 @@ pub(crate) fn dispatch_agent_install_requested(
     execute_effects(panel, effects);
 }
 
+/// setup-followups plan, agent_settings_ordering_and_install_enable_
+/// flow: the real "install > enable" second step.
+pub(crate) fn dispatch_agent_set_enabled(panel: &PanelSingleton, agent_id: String, enabled: bool) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::AgentSetEnabled {
+            agent_id,
+            enabled,
+        })),
+    );
+    execute_effects(panel, effects);
+}
+
 pub(crate) fn dispatch_dev_mode_toggled(panel: &PanelSingleton, enabled: bool) {
     let (effects, _) = update_persistent(
         panel,

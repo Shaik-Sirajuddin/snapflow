@@ -630,6 +630,14 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             }],
             vec![Dirty::Settings],
         ),
+        SettingsMsg::AgentSetEnabled { agent_id, enabled } => (
+            vec![Effect::AgentSetEnabled {
+                real_index: idx,
+                agent_id,
+                enabled,
+            }],
+            vec![Dirty::Settings],
+        ),
     }
 }
 
@@ -1559,6 +1567,30 @@ mod tests {
         assert!(model.threads[0].closed);
         assert_eq!(effects, vec![Effect::CloseThread { real_index: 0 }]);
         assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
+    }
+
+    #[test]
+    fn agent_set_enabled_emits_one_admin_effect() {
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: the real "install > enable" second step's Msg ->
+        // Effect mapping.
+        let mut model = model_with_threads(&["a"]);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::AgentSetEnabled {
+                agent_id: "codex-acp".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::AgentSetEnabled {
+                real_index: 0,
+                agent_id: "codex-acp".to_owned(),
+                enabled: false,
+            }]
+        );
+        assert_eq!(dirty, vec![Dirty::Settings]);
     }
 
     #[test]

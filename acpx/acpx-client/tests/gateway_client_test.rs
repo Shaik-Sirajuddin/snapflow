@@ -443,6 +443,34 @@ async fn admin_client_uses_its_own_http_plane_for_enablement_and_custom_crud() {
     assert_eq!(disabled.id, "registry-agent");
     assert!(!disabled.enabled);
 
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: the read side (panel-rust's AgentBridge::agent_enablement_map
+    // uses this exact method) must reflect the disable above.
+    let listed_agents = client.list_agents().await.expect("list_agents");
+    let registry_agent = listed_agents
+        .iter()
+        .find(|a| a.id == "registry-agent")
+        .expect("registry-agent present in admin list_agents");
+    assert!(
+        !registry_agent.enabled,
+        "expected list_agents to reflect the disable_agent call above"
+    );
+
+    let reenabled = client
+        .enable_agent("registry-agent")
+        .await
+        .expect("re-enable registry agent");
+    assert!(reenabled.enabled);
+    let listed_agents = client.list_agents().await.expect("list_agents after re-enable");
+    assert!(
+        listed_agents
+            .iter()
+            .find(|a| a.id == "registry-agent")
+            .expect("registry-agent present")
+            .enabled,
+        "expected list_agents to reflect the re-enable"
+    );
+
     let created = client
         .create_custom_agent(&custom)
         .await

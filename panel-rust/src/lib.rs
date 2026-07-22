@@ -757,6 +757,22 @@ impl PanelSingleton {
         bridge.install_agent(gw, agent_id);
     }
 
+    /// setup-followups plan, agent_settings_ordering_and_install_enable_
+    /// flow: the real "install > enable" second step. `real_index`/
+    /// `_component` are unused (mirrors `dispatch_agent_install_
+    /// requested`'s own shape) -- enable/disable is admin-plane-wide,
+    /// not per-gateway-slot, so `AgentBridge::set_agent_enabled` doesn't
+    /// need an index at all.
+    pub(crate) fn dispatch_agent_set_enabled(&self, agent_id: &str, enabled: bool) {
+        let Some(bridge) = &self.bridge else { return };
+        if !bridge.set_agent_enabled(agent_id, enabled) {
+            eprintln!(
+                "panel-rust: set_agent_enabled({agent_id}, {enabled}) failed \
+                 (no admin plane reachable, or the request itself failed)"
+            );
+        }
+    }
+
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
         let paths = settings_file::SettingsPaths::from_env();
         if let Err(error) = paths.set_dev_mode(enabled) {
@@ -1437,6 +1453,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                         &component,
                         agent_id.to_string(),
                     );
+                }
+            });
+        });
+
+        panel.component.on_agent_set_enabled(move |agent_id, enabled| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_agent_set_enabled(panel, agent_id.to_string(), enabled);
                 }
             });
         });

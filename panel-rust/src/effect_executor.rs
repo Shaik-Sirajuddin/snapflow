@@ -302,6 +302,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 };
                 panel.dispatch_agent_install_requested(&component, &agent_id);
             }
+            Effect::AgentSetEnabled {
+                agent_id, enabled, ..
+            } => {
+                panel.dispatch_agent_set_enabled(&agent_id, enabled);
+            }
             Effect::SkillWrite { .. }
             | Effect::CreateSkill { .. }
             | Effect::SkillPromoteToGlobal { .. }

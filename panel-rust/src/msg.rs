@@ -133,6 +133,13 @@ pub enum SettingsMsg {
     AgentInstallRequested {
         agent_id: String,
     },
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: the real "install > enable" second step, via the admin
+    // plane (AgentBridge::set_agent_enabled) -- distinct from Install.
+    AgentSetEnabled {
+        agent_id: String,
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

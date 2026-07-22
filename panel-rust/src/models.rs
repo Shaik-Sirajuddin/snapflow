@@ -861,9 +861,29 @@ pub fn to_agent_catalog_entries(
     ModelRc::new(VecModel::from(to_agent_catalog_entry_rows(agents)))
 }
 
+/// setup-followups plan, agent_settings_ordering_and_install_enable_flow:
+/// detected/usable agents first, least-usable last. `agents/list`'s wire
+/// order reflects the registry's own listing order (alphabetical-ish,
+/// unrelated to detection), and Slint 1.17.1 has no array-sort primitive
+/// of its own -- the settings view's "connected-first" grouping only
+/// ever worked when the backend happened to already send rows in that
+/// order. This is the real Rust-side sort that was missing. A stable
+/// sort (Rust's `Vec::sort_by_key`) so agents sharing a status keep
+/// their original registry-relative order, not an arbitrary re-shuffle.
+fn agent_status_sort_priority(status: &crate::protocol_types::AgentStatus) -> u8 {
+    match status {
+        crate::protocol_types::AgentStatus::Installed
+        | crate::protocol_types::AgentStatus::InstalledNoSession => 0,
+        crate::protocol_types::AgentStatus::RuntimeMissing => 1,
+        crate::protocol_types::AgentStatus::NotInstalled => 2,
+        crate::protocol_types::AgentStatus::Unknown(_) => 3,
+    }
+}
+
 pub fn to_agent_catalog_entry_rows(
-    agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    mut agents: Vec<crate::protocol_types::AgentCatalogEntry>,
 ) -> Vec<AgentCatalogEntry> {
+    agents.sort_by_key(|entry| agent_status_sort_priority(&entry.status));
     agents
         .into_iter()
         .map(|entry| AgentCatalogEntry {
@@ -871,6 +891,7 @@ pub fn to_agent_catalog_entry_rows(
             name: entry.name.into(),
             version: entry.version.into(),
             status: entry.status.as_wire_str().into(),
+            enabled: entry.enabled,
         })
         .collect()
 }
@@ -1180,6 +1201,42 @@ mod tests {
         assert_eq!(entry.name, "Codex Agent");
         assert_eq!(entry.version, "1.0.0");
         assert_eq!(entry.status, "installed");
+    }
+
+    #[test]
+    fn agent_catalog_entries_sort_detected_before_undetected_stably() {
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: registry wire order is alphabetical-ish, unrelated
+        // to detection status -- this proves the Rust-side sort actually
+        // reorders to detected-first, and that agents sharing a status
+        // keep their original relative order (stable sort), not an
+        // arbitrary shuffle.
+        fn entry(id: &str, status: &str) -> crate::protocol_types::AgentCatalogEntry {
+            crate::protocol_types::AgentCatalogEntry::from_json(&serde_json::json!({
+                "id": id,
+                "name": id,
+                "version": "1.0.0",
+                "status": status,
+            }))
+            .unwrap()
+        }
+        let agents = vec![
+            entry("aardvark-acp", "not_installed"),
+            entry("codex-acp", "installed"),
+            entry("blocked-acp", "runtime_missing"),
+            entry("claude-acp", "installed_no_session"),
+            entry("zebra-acp", "not_installed"),
+        ];
+        let model = to_agent_catalog_entries(agents);
+        let ids: Vec<String> = (0..model.row_count())
+            .map(|i| model.row_data(i).unwrap().id.to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["codex-acp", "claude-acp", "blocked-acp", "aardvark-acp", "zebra-acp"],
+            "expected installed/installed_no_session first, then runtime_missing, then \
+             not_installed with original relative order preserved within each group"
+        );
     }
 
     #[test]

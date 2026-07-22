@@ -143,6 +143,11 @@ pub enum Effect {
         real_index: usize,
         agent_id: String,
     },
+    AgentSetEnabled {
+        real_index: usize,
+        agent_id: String,
+        enabled: bool,
+    },
     SkillWrite {
         path: std::path::PathBuf,
         content: String,
