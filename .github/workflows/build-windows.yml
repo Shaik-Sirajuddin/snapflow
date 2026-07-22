@@ -222,7 +222,13 @@ jobs:
             -D CMAKE_BUILD_TYPE=Release \
             -D CMAKE_INSTALL_PREFIX="$(pwd)/build/Snapflow" \
             -D BUILD_MINIMAL_MEDIA_BACKEND=ON
-          cmake --build build --parallel
+          # TEMPORARY diagnostic (this plan's end-to-end verification only):
+          # dump the snapflow.exe link response file on failure so the
+          # actual final link line (normally hidden behind Ninja's
+          # @file.rsp indirection, needed to dodge Windows' command-line
+          # length limit) is visible in CI logs for debugging a real
+          # BCryptGenRandom link failure.
+          cmake --build build --parallel || { echo "--- snapflow.rsp ---"; find build -iname 'snapflow.rsp' -exec cat {} \; ; exit 1; }
           cmake --install build
 
       # cmake --install only places snapflow.exe itself -- unlike macOS's
