@@ -1278,6 +1278,20 @@ fn spawn_gateway_process(
     cmd.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
         .env("ACPX_DEFAULT_AGENT_ID", provider)
         .env("RUI_MOCK_AGENT_PERSONA", provider)
+        // acpx-core's LifecycleConfig defaults (max_sessions_total: 128,
+        // max_sessions_per_tenant: 16) are sized for a real multi-tenant
+        // hosted deployment, where the per-tenant cap is a genuine
+        // fairness/safety limit. This gateway serves exactly one local
+        // user's own panel under the single "default" tenant, so that
+        // same cap does nothing but reject real work once enough
+        // threads/dev-session churn accumulates -- confirmed live:
+        // "session capacity reached for tenant default: 16/16 live
+        // gateway sessions" after normal repeated use, not a fairness
+        // violation. See snapshotd/internal/acpxmgr/acpxmgr.go's matching
+        // fix for its own bundled-instance spawn path -- this is the
+        // same override for panel-rust's own per-provider spawn path.
+        .env("ACPX_MAX_SESSIONS_PER_TENANT", "512")
+        .env("ACPX_MAX_SESSIONS_TOTAL", "2048")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
