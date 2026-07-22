@@ -106,6 +106,31 @@ pub struct LifecycleConfig {
     /// the next day" continuity case, short enough that this list can
     /// never again silently grow into the thousands.
     pub startup_recovery_max_age: Option<std::time::Duration>,
+
+    /// **`bound_new_registrations_per_session_list_call`.** Caps how many
+    /// *newly*-registered sessions a single selector-bearing `session/list`
+    /// call (`Router::dispatch_session_list_real`) may create via
+    /// `translate_or_register_backend_session`. Sessions this tenant
+    /// already owns keep translating for free and never count against
+    /// this limit -- only genuinely first-seen backend sessions do.
+    /// Without this, one `session/list` call proxies straight through to
+    /// whatever the real backend reports and registers *every* session it
+    /// names, with no bound beyond the tenant's total admission cap.
+    /// Confirmed live: `claude-agent-acp` (a globally-shared `npx` tool)
+    /// reports its entire session history across *every* project ever run
+    /// on the machine, so a single `session/list` call -- reachable from
+    /// panel-rust's own recoverable-sessions lookup whenever Settings is
+    /// opened -- bulk-imported hundreds of unrelated cross-project
+    /// sessions in one shot, saturating the shared per-tenant cap (this
+    /// is the second, independent root cause of the same "512/512"
+    /// symptom `startup_recovery_max_age` above was added for -- that fix
+    /// alone did not stop this). `None` disables the bound entirely
+    /// (unattenuated, pre-existing behavior); the default, `Some(50)`, is
+    /// generous for legitimate multi-project/many-thread use while
+    /// staying far below the total admission cap, so no single discovery
+    /// call can come close to exhausting the shared budget other
+    /// tenants/sessions depend on.
+    pub max_new_sessions_per_list_call: Option<usize>,
 }
 
 impl Default for LifecycleConfig {
@@ -121,6 +146,7 @@ impl Default for LifecycleConfig {
             active_turn_deadline: None,
             background_mode: false,
             startup_recovery_max_age: Some(std::time::Duration::from_secs(24 * 60 * 60)),
+            max_new_sessions_per_list_call: Some(50),
         }
     }
 }
@@ -166,6 +192,11 @@ impl LifecycleConfig {
         {
             return Err(LifecycleConfigError::ZeroDuration(
                 "startup_recovery_max_age",
+            ));
+        }
+        if self.max_new_sessions_per_list_call == Some(0) {
+            return Err(LifecycleConfigError::ZeroLimit(
+                "max_new_sessions_per_list_call",
             ));
         }
         Ok(())
