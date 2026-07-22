@@ -435,6 +435,59 @@ mod tests {
     }
 
     #[test]
+    fn resolved_to_panel_defaults_strips_the_literal_default_sentinel() {
+        // Regression test: "agent default is in crash backoff". merge_documents
+        // itself deliberately does NOT filter "default" (save_load_round_trip
+        // below documents that raw round-tripping) -- resolved_to_panel_defaults
+        // is the one place that must, since its output flows straight into
+        // _acpx.profile on session/new, and acpx-server has no real backend
+        // ever registered under the literal agent id "default" (see
+        // acpxmgr.go's WriteConfig doc comment).
+        let poisoned = ResolvedSettings {
+            default_profile: Some("default".to_owned()),
+            permission_profile: Some("default".to_owned()),
+            background_session_default: true,
+            default_agent_id: Some("codex".to_owned()),
+            harness: HarnessSettings::default(),
+        };
+        let defaults = resolved_to_panel_defaults(&poisoned, None);
+        assert_eq!(defaults.profile_name, None);
+        assert_eq!(defaults.permission_profile, None);
+
+        // A real, non-sentinel profile name must still pass through
+        // unchanged -- this isn't a blanket "always clear" fallback.
+        let real = ResolvedSettings {
+            default_profile: Some("my-real-profile".to_owned()),
+            permission_profile: Some("workspace".to_owned()),
+            ..poisoned.clone()
+        };
+        let defaults = resolved_to_panel_defaults(&real, None);
+        assert_eq!(defaults.profile_name.as_deref(), Some("my-real-profile"));
+        assert_eq!(defaults.permission_profile.as_deref(), Some("workspace"));
+    }
+
+    #[test]
+    fn a_fresh_install_with_no_settings_files_never_resolves_to_the_default_sentinel() {
+        // Regression test for the "does this trace back to the install
+        // path" question: a brand new user who has never touched Settings
+        // has no Global/Project settings.json at all. merge_documents with
+        // zero layers (mirroring `load_all`'s behavior when neither file
+        // exists) must resolve to ResolvedSettings::default() --
+        // default_profile: None -- not the literal "default" string. The
+        // poisoned value seen in the wild came from a settings *save*
+        // round-trip (now fixed at both the settings_file and update.rs
+        // layers), not from how a fresh install starts out.
+        let resolved = merge_documents(&[]);
+        assert_eq!(resolved.default_profile, None);
+        assert_eq!(resolved.permission_profile, None);
+        assert_eq!(resolved.default_agent_id, None);
+
+        let defaults = resolved_to_panel_defaults(&resolved, None);
+        assert_eq!(defaults.profile_name, None);
+        assert_eq!(defaults.permission_profile, None);
+    }
+
+    #[test]
     fn save_load_round_trip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("settings.global.json");
