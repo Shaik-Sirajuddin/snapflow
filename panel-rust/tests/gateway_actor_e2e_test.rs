@@ -511,7 +511,7 @@ async fn close_then_delete_session_round_trip_through_a_real_gateway() {
         .await
         .expect("open_session");
 
-    handle.close_session().await.expect("close_session");
+    handle.close_session(false).await.expect("close_session");
 
     // `session/close` evicts the in-memory registry entry -- proven at
     // the `acpx-core::router` unit-test layer already
