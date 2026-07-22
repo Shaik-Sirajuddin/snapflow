@@ -555,11 +555,23 @@ export component Sidebar inherits Rectangle {
                                 // the thread is actively fetching, a filled hand only
                                 // when an error requires user attention, otherwise a
                                 // plain status dot. Centered in the rail when collapsed.
-                                property <angle> load-spin: 0deg;
-                                load-spin-timer := Timer {
-                                    interval: 80ms;
-                                    running: thread.status == "loading";
-                                    triggered => { load-spin += 30deg; }
+                                // A real Slint animation (not a plain
+                                // `Timer` stepping this property by hand)
+                                // so the engine's own animation driver
+                                // drives it -- `has_active_animations()`
+                                // (panel_rust_poll's host-side repaint
+                                // trigger) only ever detected *this* kind
+                                // of animation, never a bare `Timer`, so
+                                // the old hand-rolled version silently
+                                // never repainted on its own and looked
+                                // frozen except when some unrelated
+                                // interaction (e.g. a mouse move) happened
+                                // to trigger a repaint anyway.
+                                property <angle> load-spin: thread.status == "loading" ? 360deg : 0deg;
+                                animate load-spin {
+                                    duration: 800ms;
+                                    iteration-count: thread.status == "loading" ? -1 : 1;
+                                    easing: linear;
                                 }
                                 if thread.status == "loading" : Rectangle {
                                     width: 14px;

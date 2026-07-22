@@ -3875,13 +3875,27 @@ mod tests {
     /// `assert_new_thread_reaches_a_real_backend_and_renders_through_the_full_reducer`
     /// -- ambient auth via this machine's already-logged-in Codex CLI
     /// session (same mechanism `acpx/acpx-server/tests/
-    /// real_ambient_multi_agent_test.rs` uses), default model (no cheap
-    /// low-variant model convention established for codex the way
-    /// `real_claude_multi_agent_test.rs` established `haiku` for claude).
+    /// real_ambient_multi_agent_test.rs` uses), forced to
+    /// `ollama/qwen2.5:0.5b` via the real `session/set_config_option`
+    /// extension. This machine's `codex-acp` is already configured
+    /// against a local Bifrost proxy (`OPENAI_API_KEY=sk-bf-...` in
+    /// `~/.config/acpx/acpx-server.env`) that exposes every locally
+    /// pulled Ollama model under an `ollama/<name>` id (confirmed live:
+    /// `curl http://bifrost.localdev.com/v1/models` lists
+    /// `ollama/qwen2.5:0.5b`) -- so this is a real `session/new` +
+    /// `session/prompt` round trip through the genuine adapter/gateway
+    /// stack, but the actual model call is free and local (a 494M-param
+    /// model via `ollama serve` on this machine), not a billed API call.
+    /// Verified suitable for this exact prompt: 3/3 direct
+    /// `ollama/api/chat`/`v1/chat/completions` calls with "Reply with
+    /// exactly the single word PANG and nothing else." returned exactly
+    /// `PANG`, in ~0.3s each.
     ///
-    /// `#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1` -- makes a
-    /// real, billed model call using whatever account this machine's
-    /// Codex CLI is logged into.
+    /// Still `#[ignore]`d and gated on `ACPX_LIVE_TEST_AMBIENT=1` --
+    /// unlike the model call, codex-acp's own ACP handshake still
+    /// requires this machine's real Codex CLI login (its `authenticate`
+    /// exchange, not the eventual model call, is what needs `api-key`
+    /// auth), so this still isn't safe to run unconditionally in CI.
     ///
     /// Run with:
     /// ```text
@@ -3895,8 +3909,8 @@ mod tests {
         if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
             eprintln!(
                 "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
-                 machine's real, already-logged-in codex CLI session (makes a real \
-                 billed API call)"
+                 machine's real, already-logged-in codex CLI session (free/local via Ollama, \
+                 but still needs a real codex-acp ACP handshake)"
             );
             return;
         }
@@ -3914,7 +3928,7 @@ mod tests {
                     }
                 }
             },
-            None,
+            Some("ollama/qwen2.5:0.5b"),
             "Reply with exactly the single word PANG and nothing else.",
             "PANG",
         );
