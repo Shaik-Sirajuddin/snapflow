@@ -119,17 +119,10 @@ jobs:
       # shotcut-rebrand isn't part of this repo's tree (no submodule entry
       # -- pushed separately to Shaik-Sirajuddin/shotcut.git's
       # rebrand/snapflow branch), so check it out on its own.
-      # TEMPORARY, for this plan's end-to-end verification only: pinned to
-      # the fix/sap-rust-corrosion-crate-types branch (CRATE_TYPES staticlib
-      # fix for the sap-rust bin-target link failure) instead of
-      # rebrand/snapflow, so this run actually verifies both that fix and
-      # sap-rust's Windows named-pipe/Job-Object changes together. Revert to
-      # rebrand/snapflow once fix/sap-rust-corrosion-crate-types is merged
-      # there.
       - uses: actions/checkout@v4
         with:
           repository: Shaik-Sirajuddin/shotcut
-          ref: fix/sap-rust-corrosion-crate-types
+          ref: rebrand/snapflow
           path: shotcut-rebrand
 
       - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
