@@ -728,7 +728,16 @@ export component Sidebar inherits Rectangle {
                                     font-family: Theme.font-mono;
                                     vertical-alignment: center;
                                 }
-                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
+                                // `|| i == selected-thread`: rename/close/
+                                // delete/archive were hover-only, meaning a
+                                // keyboard-only user (or a real e2e test) had no
+                                // way to ever reach any of them -- the currently
+                                // selected row's own actions now stay visible
+                                // without requiring a mouse hover, matching how
+                                // real file managers/mail clients keep the
+                                // selected row's actions visible alongside
+                                // hover-reveal for other rows.
+                                if expanded && root.rename-thread-index != i && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Rename thread " + thread.name;
@@ -773,7 +782,7 @@ export component Sidebar inherits Rectangle {
                                 // `settings_sheet.slint`'s profile
                                 // delete control.
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.closed && root.pending-close-index != i && thread-row.has-hover : IconButton {
+                                    && !thread.closed && root.pending-close-index != i && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Close thread " + thread.name;
@@ -814,7 +823,7 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && thread.closed && root.pending-delete-index != i && thread-row.has-hover : IconButton {
+                                    && thread.closed && root.pending-delete-index != i && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Delete thread " + thread.name;
@@ -855,7 +864,7 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.archived && thread-row.has-hover : IconButton {
+                                    && !thread.archived && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Archive thread " + thread.name;
