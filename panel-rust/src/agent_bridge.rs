@@ -4296,6 +4296,181 @@ mod tests {
         );
     }
 
+    /// **`acpx-reconnect-retry-duplicates-session-new`.** Real, no-mock
+    /// integration coverage requested directly by the user after the
+    /// live 512-session leak investigation: a real `acpx-server`, a real
+    /// codex-acp backend (this machine's real, already-logged-in codex
+    /// CLI session), forced to the free/local `ollama/qwen2.5:0.5b`
+    /// model -- not `rui-mock-agent`, not a shell-script stand-in. Opens
+    /// 6 real, concurrent conversations (not 1) on the *same* gateway
+    /// process, sends a distinct real prompt on each, and asserts every
+    /// single one completes cleanly with a real reply and zero errors
+    /// (no session-capacity rejection, no attachment failure) -- the
+    /// actual "test mode" scenario the 512-error investigation needed
+    /// but never had: real multi-conversation load against a real
+    /// backend, not a synthetic race against a shell-script mock.
+    ///
+    /// `#[ignore]`d and opt-in via `ACPX_LIVE_TEST_AMBIENT=1` -- needs a
+    /// real codex-acp ACP handshake (this machine's real Codex CLI
+    /// login), so not safe to run unconditionally in CI.
+    ///
+    /// Run with:
+    /// ```text
+    /// ACPX_LIVE_TEST_AMBIENT=1 cargo test --lib \
+    ///   agent_bridge::tests::six_real_concurrent_conversations_all_complete_with_zero_errors \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn six_real_concurrent_conversations_all_complete_with_zero_errors() {
+        if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
+                 machine's real, already-logged-in codex CLI session (free/local via Ollama, \
+                 but still needs a real codex-acp ACP handshake)"
+            );
+            return;
+        }
+
+        const CONVERSATION_COUNT: usize = 6;
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_DEFAULT_AGENT_ID", "codex")
+                .env("RUST_LOG", "error")
+                .env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+            if std::env::var_os("CODEX_API_KEY").is_none() {
+                if let Some(key) = read_codex_api_key_from_auth_file() {
+                    command.env("CODEX_API_KEY", key);
+                }
+            }
+        });
+        let _gateway_guard = TestGateway {
+            child,
+            base_url: base_url.clone(),
+        };
+
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[],
+            move |_provider| Ok(base_url.clone()),
+            Some(cache_dir.path().to_path_buf()),
+        )
+        .expect("bridge with zero initial threads");
+
+        // Open all 6 real conversations up front -- real session/new
+        // against the same gateway process for each, exactly like 6
+        // real user-initiated "New thread" clicks in a row.
+        let mut indices = Vec::with_capacity(CONVERSATION_COUNT);
+        for i in 0..CONVERSATION_COUNT {
+            let index = bridge
+                .add_thread_with_profile_and_provider(
+                    &format!("Real conversation {i}"),
+                    None,
+                    Some("codex"),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "add_thread_with_profile_and_provider #{i} must succeed against a \
+                         real, correctly-configured codex gateway: {error}"
+                    )
+                });
+            indices.push(index);
+        }
+
+        // Force every thread to the free/local model before prompting,
+        // same as the single-conversation smoke tests.
+        for &index in &indices {
+            bridge.set_config_option(
+                index,
+                "model".to_owned(),
+                serde_json::json!("ollama/qwen2.5:0.5b"),
+            );
+        }
+        let config_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < config_deadline
+            && !indices.iter().all(|&index| {
+                bridge
+                    .config_options(index)
+                    .iter()
+                    .any(|opt| opt.current_value.as_deref() == Some("ollama/qwen2.5:0.5b"))
+            })
+        {
+            bridge.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Send a distinct real prompt on every conversation.
+        for (i, &index) in indices.iter().enumerate() {
+            let prompt = format!("Reply with exactly the single word PANG{i} and nothing else.");
+            bridge.push_local(
+                index,
+                ChatMessage {
+                    kind: MessageKind::User,
+                    text: prompt.clone(),
+                    status: None,
+                    id: None,
+                    raw_input: None,
+                    raw_output: None,
+                },
+            );
+            bridge.send_prompt(index, prompt);
+        }
+
+        // Poll until every conversation has ended its turn, collecting
+        // every error event seen along the way (the actual thing this
+        // test exists to prove is zero of: no session-capacity
+        // rejection, no attachment failure, across all 6 real,
+        // concurrently-open conversations on one real gateway process).
+        let mut ended = vec![false; CONVERSATION_COUNT];
+        let mut errors: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while std::time::Instant::now() < deadline && !ended.iter().all(|&done| done) {
+            for event in bridge.poll() {
+                match &event.event {
+                    AgentEvent::TurnEnded(_) => {
+                        if let Some(slot) = ended.get_mut(event.thread_index) {
+                            *slot = true;
+                        }
+                    }
+                    AgentEvent::Error(message) => {
+                        errors.push(format!("thread {}: {message}", event.thread_index));
+                    }
+                    _ => {}
+                }
+            }
+            if !ended.iter().all(|&done| done) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "expected zero errors across {CONVERSATION_COUNT} real, concurrent \
+             conversations (no session-capacity rejection, no attachment failure), got: \
+             {errors:?}"
+        );
+        assert!(
+            ended.iter().all(|&done| done),
+            "all {CONVERSATION_COUNT} real conversations must finish their turn within 90s, \
+             got: {ended:?}"
+        );
+
+        // Every conversation must show a real, distinct reply -- not
+        // just "no error", but genuinely completed real backend work.
+        for (i, &index) in indices.iter().enumerate() {
+            let history = bridge.history(index);
+            let expect = format!("PANG{i}");
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.text.to_uppercase().contains(&expect)),
+                "expected conversation {i}'s real codex reply to contain {expect:?}, got: \
+                 {history:?}"
+            );
+        }
+    }
+
     /// `claude`/`haiku` instance of
     /// `assert_new_thread_reaches_a_real_backend_and_renders_through_the_full_reducer`
     /// -- ambient auth via this machine's already-logged-in Claude CLI
