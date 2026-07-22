@@ -1412,4 +1412,69 @@ mod transcript_model_tests {
         assert_eq!(cur.value.as_str(), "gpt-5-mini");
         assert_eq!(cur.id.as_str(), "model");
     }
+
+    #[test]
+    fn config_dropdown_entries_are_fully_generic_and_already_support_a_fast_mode_style_option() {
+        // setup-followups plan, provider_fastmode_profile_persistence:
+        // `configOptions[]` (real ACP session-config-options, see
+        // agentclientprotocol.com/protocol/session-config-options) is not
+        // hardcoded to "model" -- any option a connected backend
+        // advertises (any `id`, any `kind`) already renders and dispatches
+        // through this same generic pipeline. A "fast mode"-shaped select
+        // option (e.g. a real ACP agent advertising reasoning effort or
+        // a fast/quality tradeoff) needs zero new acpx-core/client/UI
+        // plumbing -- proven here with a second, independent option
+        // alongside "model", both surfacing correctly and independently
+        // selectable in the same dropdown model real ACP clients (Zed
+        // included) already use this exact mechanism for.
+        let options = vec![
+            ConfigOptionInfo {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: None,
+                kind: "select".into(),
+                current_value: Some("gpt-5".into()),
+                options: vec![ConfigOptionValue {
+                    value: "gpt-5".into(),
+                    name: "GPT-5".into(),
+                    description: None,
+                }],
+            },
+            ConfigOptionInfo {
+                id: "fastMode".into(),
+                name: "Fast Mode".into(),
+                description: Some("Trade quality for speed".into()),
+                category: None,
+                kind: "select".into(),
+                current_value: Some("off".into()),
+                options: vec![
+                    ConfigOptionValue {
+                        value: "off".into(),
+                        name: "Off".into(),
+                        description: None,
+                    },
+                    ConfigOptionValue {
+                        value: "on".into(),
+                        name: "On".into(),
+                        description: None,
+                    },
+                ],
+            },
+        ];
+
+        let entries = to_config_dropdown_entries(options);
+        // model header + 1 value, fastMode header + 2 values.
+        assert_eq!(entries.row_count(), 5);
+        let ids: Vec<String> = (0..entries.row_count())
+            .map(|i| entries.row_data(i).unwrap().id.to_string())
+            .collect();
+        assert_eq!(ids, vec!["model", "model", "fastMode", "fastMode", "fastMode"]);
+        let fast_mode_off = entries.row_data(3).expect("fast mode off row");
+        assert_eq!(fast_mode_off.label, "Off");
+        assert!(fast_mode_off.is_current);
+        let fast_mode_on = entries.row_data(4).expect("fast mode on row");
+        assert_eq!(fast_mode_on.label, "On");
+        assert!(!fast_mode_on.is_current);
+    }
 }
