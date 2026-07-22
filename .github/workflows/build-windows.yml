@@ -240,6 +240,7 @@ jobs:
         shell: msys2 {0}
         working-directory: shotcut-rebrand
         run: |
+          set -euo pipefail
           # shotcut-rebrand's CMakeLists.txt's WINDOWS_DEPLOY option
           # defaults ON, which installs snapflow.exe directly to
           # CMAKE_INSTALL_PREFIX (build/Snapflow) rather than a bin/
@@ -248,54 +249,82 @@ jobs:
           # right before this one having placed it at build/Snapflow/
           # snapflow.exe instead).
           APPDIR="build/Snapflow"
-          # windeployqt actually executes snapflow.exe (to detect QML
-          # imports) -- confirmed on a real windows-latest run via ldd
-          # that libCuteLogger.dll (a SHARED library built in-tree at
-          # build/CuteLogger/, no custom RUNTIME_OUTPUT_DIRECTORY) was
-          # the one genuinely missing dependency ("Process failed to
-          # start: The system cannot find the file specified"; ldd's
-          # other two "not found" entries, api-ms-win-core-winrt-error-*
-          # and api-ms-win-core-synch-*, are Windows API Set forwarders
-          # that ldd always misreports as missing on MSYS2 -- not real
-          # files, resolved by the OS loader at actual runtime). Copy it
-          # in before windeployqt runs, not after.
+          QTDIR="$(pkg-config --variable=prefix Qt6Core)"
+          QT_SHARE_DIR="$QTDIR/share/qt6"
+
+          # windeployqt tries to invoke qmlimportscanner to detect QML
+          # imports, which does not exist at all in this MSYS2 Qt6
+          # mingw64 package (confirmed directly: `/mingw64/bin/
+          # qmlimportscanner: No such file or directory`) -- so
+          # windeployqt can never work here. Instead, bundle exactly the
+          # way the real upstream mltframework/shotcut project's own
+          # production build script does (scripts/build-shotcut-msys2.sh,
+          # function bundle_dlls + its `deploy` step): recursively copy
+          # every mingw64 DLL dependency flat next to the exe, then copy
+          # a fixed, known list of Qt plugin directories and QML modules
+          # by name (Shotcut's own actual QML/plugin usage, not a dynamic
+          # scan) and point qt.conf at them. src/main.cpp's own
+          # Application constructor already expects Qt plugins at
+          # <appdir>/lib/qt6 (dir.cd("lib"); dir.cd("qt6");
+          # addLibraryPath(...)) -- this fix supplies exactly that
+          # directory instead of relying on windeployqt to create it.
           cp build/CuteLogger/libCuteLogger.dll "$APPDIR/"
-          # TEMPORARY diagnostic (this plan's end-to-end verification
-          # only): confirm whether qmlimportscanner (the helper --qmldir
-          # makes windeployqt invoke) actually exists and is runnable in
-          # this MSYS2 Qt6 install, before guessing at a fix again.
-          echo "--- qml tool binaries in /mingw64/bin ---"
-          ls -la /mingw64/bin/*qml* /mingw64/bin/*deployqt* 2>&1 || true
-          echo "--- qmlimportscanner --help (if it runs at all) ---"
-          /mingw64/bin/qmlimportscanner --help 2>&1 || true
-          # Still failed after the libCuteLogger.dll fix above, with the
-          # same "Process failed to start" error: windeployqt, on
-          # detecting a QML app ("[QML]" in its own banner), tries to
-          # actually execute snapflow.exe to introspect QML imports
-          # dynamically -- a documented chicken-and-egg in a minimal/
-          # fresh environment (it hasn't copied the Qt platform plugin
-          # the exe needs to even instantiate QGuiApplication yet).
-          # --qmldir makes it statically scan the QML source tree
-          # instead of relying on running the built binary at all.
-          # TEMPORARY (this plan's end-to-end verification only): don't
-          # let a windeployqt/qmlimportscanner failure abort the whole
-          # step -- continue so later diagnostics (and Package the
-          # portable zip) still run, giving a downloadable artifact to
-          # test on a real Windows machine even if QML plugin bundling
-          # itself is still broken.
-          windeployqt --release --no-translations --qmldir src/qml "$APPDIR/snapflow.exe" || echo "windeployqt failed (see above) -- continuing anyway for diagnostics/artifact"
-          cp /mingw64/bin/mlt*.dll "$APPDIR/" 2>/dev/null || true
-          mkdir -p build/Snapflow/lib build/Snapflow/share
-          # TEMPORARY diagnostic (this plan's end-to-end verification
-          # only): /mingw64/lib/mlt-7 doesn't exist on a real
-          # windows-latest run ("cp: cannot stat ... No such file or
-          # directory") -- find the real installed path/name instead of
-          # guessing at it a second time.
-          echo "--- actual mlt paths under /mingw64 ---"
-          find /mingw64/lib /mingw64/share -maxdepth 1 -iname '*mlt*' 2>&1 || true
-          cp -r /mingw64/lib/mlt-7 build/Snapflow/lib/mlt-7 || true
-          cp -r /mingw64/share/mlt-7 build/Snapflow/share/mlt-7 || true
-          ldd "$APPDIR/snapflow.exe" | awk '/mingw64/ {print $3}' | sort -u | xargs -I{} cp -n {} "$APPDIR/" 2>/dev/null || true
+
+          bundle_dlls() {
+            local target="$1"
+            local libs
+            libs=$(ldd "$target" | awk '($3 ~ /\/mingw64\/bin\//) {print $3}')
+            local lib basename_lib
+            for lib in $libs; do
+              basename_lib=$(basename "$lib")
+              [ -e "$APPDIR/$basename_lib" ] || cp -p "$lib" "$APPDIR/"
+            done
+            for lib in $libs; do
+              basename_lib=$(basename "$lib")
+              if [ ! -e "$APPDIR/${basename_lib}.bundled" ]; then
+                touch "$APPDIR/${basename_lib}.bundled"
+                bundle_dlls "$APPDIR/$basename_lib"
+              fi
+            done
+          }
+          bundle_dlls "$APPDIR/snapflow.exe"
+
+          # /mingw64/lib/mlt-7 does not exist -- confirmed via a real
+          # `find` on a windows-latest run; the MSYS2 mingw-w64-x86_64-mlt
+          # package installs its modules/data unversioned, at
+          # /mingw64/lib/mlt and /mingw64/share/mlt. The destination name
+          # (mlt-7) is still correct and must be kept: MLT's own compiled
+          # default module-repository lookup (Mlt::Factory::init() is
+          # called with no explicit path in mltcontroller.cpp, matching
+          # upstream shotcut's own main.cpp, which also never sets
+          # MLT_REPOSITORY/MLT_DATA) auto-detects lib/mlt-7 and
+          # share/mlt-7 relative to wherever libmlt-7.dll itself sits --
+          # a versioned name baked into libmlt-7.dll regardless of how
+          # MSYS2 happened to lay out its own system install.
+          mkdir -p "$APPDIR/lib" "$APPDIR/share"
+          cp -r /mingw64/lib/mlt "$APPDIR/lib/mlt-7"
+          cp -r /mingw64/share/mlt "$APPDIR/share/mlt-7"
+
+          # Qt plugins: fixed list matching what Shotcut (and this fork)
+          # actually use, identical to upstream's own build-shotcut-msys2.sh.
+          mkdir -p "$APPDIR/lib/qt6"
+          for plugin in generic iconengines imageformats multimedia platforms sqldrivers styles tls; do
+            cp -pr "$QT_SHARE_DIR/plugins/$plugin" "$APPDIR/lib/qt6/"
+            for lib in "$APPDIR/lib/qt6/$plugin"/*.dll; do
+              [ -e "$lib" ] && bundle_dlls "$lib"
+            done
+          done
+
+          # QML modules actually used by this app's own src/qml tree
+          # (Qt, QtCore, QtMultimedia, QtQml, QtQuick), same fixed list
+          # upstream's build script copies -- avoids ever needing
+          # qmlimportscanner's dynamic import detection at all.
+          mkdir -p "$APPDIR/lib/qml"
+          cp -pr "$QT_SHARE_DIR"/qml/{Qt,QtCore,QtMultimedia,QtQml,QtQuick} "$APPDIR/lib/qml/"
+
+          printf "[Paths]\nPlugins=lib/qt6\nQml2Imports=lib/qml\n" > "$APPDIR/qt.conf"
+
+          find "$APPDIR" -name '*.bundled' -delete
 
       - name: Package the portable zip
         shell: msys2 {0}
