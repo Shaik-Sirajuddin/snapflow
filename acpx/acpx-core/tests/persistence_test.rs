@@ -98,7 +98,7 @@ async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
         .expect("record non-recoverable session");
 
     let recoverable = store
-        .list_recoverable_sessions()
+        .list_recoverable_sessions(None)
         .await
         .expect("list recoverable sessions");
     assert_eq!(recoverable.len(), 1);
@@ -145,7 +145,7 @@ async fn recovery_metadata_round_trips_and_filters_startup_candidates() {
         .await
         .expect("close session");
     assert!(store
-        .list_recoverable_sessions()
+        .list_recoverable_sessions(None)
         .await
         .expect("list recoverable sessions")
         .is_empty());
@@ -185,7 +185,7 @@ async fn recovery_failed_rows_are_excluded_from_the_eager_startup_batch() {
 
     // First startup pass: the row is a genuine candidate.
     let candidates = store
-        .list_recoverable_sessions()
+        .list_recoverable_sessions(None)
         .await
         .expect("list recoverable sessions");
     assert_eq!(candidates.len(), 1);
@@ -212,7 +212,7 @@ async fn recovery_failed_rows_are_excluded_from_the_eager_startup_batch() {
     // again -- it stays durable (inspectable via `get_session`) but is no
     // longer an unattended-retry candidate.
     let candidates_after_failure = store
-        .list_recoverable_sessions()
+        .list_recoverable_sessions(None)
         .await
         .expect("list recoverable sessions");
     assert!(

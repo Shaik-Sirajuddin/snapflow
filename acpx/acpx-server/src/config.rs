@@ -352,6 +352,18 @@ impl ServerConfig {
                 )),
                 Err(_) => lifecycle.startup_recovery_max_age,
             };
+        lifecycle.max_new_sessions_per_list_call =
+            match std::env::var("ACPX_MAX_NEW_SESSIONS_PER_LIST_CALL") {
+                Ok(value)
+                    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") =>
+                {
+                    None
+                }
+                Ok(value) => Some(value.parse::<usize>().unwrap_or_else(|err| {
+                    panic!("ACPX_MAX_NEW_SESSIONS_PER_LIST_CALL={value:?} is not a positive integer: {err}")
+                })),
+                Err(_) => lifecycle.max_new_sessions_per_list_call,
+            };
         lifecycle
             .validate()
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));
