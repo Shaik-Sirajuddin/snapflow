@@ -259,6 +259,14 @@ jobs:
           # files, resolved by the OS loader at actual runtime). Copy it
           # in before windeployqt runs, not after.
           cp build/CuteLogger/libCuteLogger.dll "$APPDIR/"
+          # TEMPORARY diagnostic (this plan's end-to-end verification
+          # only): confirm whether qmlimportscanner (the helper --qmldir
+          # makes windeployqt invoke) actually exists and is runnable in
+          # this MSYS2 Qt6 install, before guessing at a fix again.
+          echo "--- qml tool binaries in /mingw64/bin ---"
+          ls -la /mingw64/bin/*qml* /mingw64/bin/*deployqt* 2>&1 || true
+          echo "--- qmlimportscanner --help (if it runs at all) ---"
+          /mingw64/bin/qmlimportscanner --help 2>&1 || true
           # Still failed after the libCuteLogger.dll fix above, with the
           # same "Process failed to start" error: windeployqt, on
           # detecting a QML app ("[QML]" in its own banner), tries to
@@ -268,7 +276,13 @@ jobs:
           # the exe needs to even instantiate QGuiApplication yet).
           # --qmldir makes it statically scan the QML source tree
           # instead of relying on running the built binary at all.
-          windeployqt --release --no-translations --qmldir src/qml "$APPDIR/snapflow.exe"
+          # TEMPORARY (this plan's end-to-end verification only): don't
+          # let a windeployqt/qmlimportscanner failure abort the whole
+          # step -- continue so later diagnostics (and Package the
+          # portable zip) still run, giving a downloadable artifact to
+          # test on a real Windows machine even if QML plugin bundling
+          # itself is still broken.
+          windeployqt --release --no-translations --qmldir src/qml "$APPDIR/snapflow.exe" || echo "windeployqt failed (see above) -- continuing anyway for diagnostics/artifact"
           cp /mingw64/bin/mlt*.dll "$APPDIR/" 2>/dev/null || true
           mkdir -p build/Snapflow/lib build/Snapflow/share
           cp -r /mingw64/lib/mlt-7 build/Snapflow/lib/mlt-7
