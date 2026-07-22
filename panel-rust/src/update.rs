@@ -133,9 +133,27 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let real_index = model.threads.len();
             let thread_id = format!("thread:{real_index}");
             let display_name = format!("New thread {}", real_index + 1);
-            let provider = match model.default_agent_id.as_str() {
-                "claude" | "claude-code" => "claude",
-                _ => "codex",
+            // Auto-detected by family rather than an enumerated literal
+            // list: `gateway_urls`/`spawn_gateway_process` only ever
+            // recognize two provider keys today ("codex"/"claude" --
+            // see AgentBridge's constructor, which resolves exactly
+            // these two), so any agent id naming the claude family (the
+            // short label "claude" this reducer's own gateway wiring
+            // uses elsewhere, the real registry id "claude-acp", a
+            // hypothetical "claude-code", ...) maps to it; anything else
+            // defaults to codex, same as before. Found live via a real
+            // settings.global.json with default_agent_id: "claude-acp"
+            // (plausibly persisted by a picker backed by the agent
+            // catalog's real registry ids, not the short label), which
+            // an exact-match list previously silently routed to codex.
+            let provider = if model
+                .default_agent_id
+                .to_ascii_lowercase()
+                .contains("claude")
+            {
+                "claude"
+            } else {
+                "codex"
             }
             .to_owned();
             // The literal string "default" is a reserved sentinel, never a
@@ -1571,6 +1589,39 @@ mod tests {
             }]
         );
         assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+    }
+
+    #[test]
+    fn new_thread_provider_matching_auto_detects_any_claude_family_agent_id() {
+        // Regression test: a real settings.global.json found live this
+        // session had default_agent_id: "claude-acp" (the real registry
+        // agent id, plausibly from a picker backed by the agent catalog)
+        // rather than the short "claude" label this reducer's own
+        // gateway wiring uses everywhere else -- an exact-match list only
+        // recognizing "claude"/"claude-code" silently routed everything
+        // else, including "claude-acp", to codex. Substring-matching the
+        // claude family instead of enumerating every literal variant
+        // means a *hypothetical future* id ("Claude-Opus-Next", picked
+        // case-insensitively) is covered automatically too, without this
+        // match needing to grow a new arm every time one shows up.
+        for agent_id in [
+            "claude",
+            "claude-code",
+            "claude-acp",
+            "Claude-Opus-Next", // not a real id -- proves this generalizes, not just today's known set
+        ] {
+            let mut model = model_with_threads(&[]);
+            model.default_agent_id = agent_id.to_owned();
+            let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+            assert!(
+                matches!(
+                    effects.as_slice(),
+                    [Effect::NewThread { provider, .. }] if provider == "claude"
+                ),
+                "default_agent_id {agent_id:?} must route new threads to the claude provider, \
+                 got: {effects:?}"
+            );
+        }
     }
 
     #[test]
