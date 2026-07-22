@@ -114,7 +114,9 @@ impl ServerConfig {
     /// Read the backend command from `ACPX_BACKEND_CMD` (space-separated
     /// program + args), defaulting to `codex-acp` via npx per the official
     /// registry (see `01-research.md`) if unset. `ACPX_HTTP_BIND` sets the
-    /// HTTP/WS bind address (default `127.0.0.1:8790` -- loopback only,
+    /// HTTP/WS bind address (default = `acpx_proto::DEFAULT_ACPX_HTTP_ADDR`,
+    /// the single source of truth panel-rust also dials, currently
+    /// `127.0.0.1:8790` -- loopback only,
     /// per `05-open-risks.md`'s unresolved transport-security note; do not
     /// point this at a public interface without adding auth/TLS first).
     /// `ACPX_HTTP_BIND=off` (or `none`, case-insensitive) disables the
@@ -165,7 +167,11 @@ impl ServerConfig {
             Ok(raw) => Some(raw.parse().unwrap_or_else(|err| {
                 panic!("ACPX_HTTP_BIND={raw:?} is not a valid socket address: {err}")
             })),
-            Err(_) => Some(([127, 0, 0, 1], 8790).into()),
+            Err(_) => Some(
+                acpx_proto::DEFAULT_ACPX_HTTP_ADDR
+                    .parse()
+                    .expect("DEFAULT_ACPX_HTTP_ADDR must be a valid socket address"),
+            ),
         };
         // Treat an empty string the same as unset -- an operator who sets
         // `ACPX_AUTH_TOKEN=""` (e.g. via a templated env file with an

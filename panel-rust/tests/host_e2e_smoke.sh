@@ -113,7 +113,7 @@ if [[ "${PANEL_HOST_E2E_DRIVE:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --exercise-backspace \
         --wait-for-attachment \
         --wait-for-turn
@@ -132,7 +132,7 @@ if [[ "${PANEL_HOST_E2E_NEW_THREAD:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --prompt "host e2e new thread prompt" \
         --new-thread-before \
         --wait-for-turn \
@@ -158,7 +158,7 @@ if [[ "${PANEL_HOST_E2E_PROVIDER_ISOLATION:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --prompt "host e2e provider isolation prompt" \
         --select-thread-row 1 \
         --wait-for-turn \
@@ -177,7 +177,7 @@ if [[ "${PANEL_HOST_E2E_CANCEL:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --prompt "slow host e2e cancel" \
         --wait-for-attachment \
         --cancel-after-send
@@ -195,7 +195,7 @@ if [[ "${PANEL_HOST_E2E_PERMISSION:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --prompt "permission host e2e run a risky command" \
         --wait-for-attachment \
         --permission-decision approve \
@@ -215,7 +215,7 @@ if [[ "${PANEL_HOST_E2E_TOOL_STREAM:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --prompt "host e2e tool stream" \
         --wait-for-attachment \
         --wait-for-turn \
@@ -238,7 +238,7 @@ if [[ "${PANEL_HOST_E2E_INPUT_MATRIX:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --exercise-input-matrix \
         --wait-for-attachment \
         --wait-for-turn
@@ -254,7 +254,7 @@ if [[ "${PANEL_HOST_E2E_LOCAL_TERMINAL:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --wait-for-attachment \
         --local-terminal-round-trip
 fi
@@ -271,7 +271,7 @@ if [[ "${PANEL_HOST_E2E_RESTART:-0}" == "1" ]]; then
     python3 "$repo_root/panel-rust/tests/host_e2e_driver.py" \
         --dock-width "$dock_width" \
         --event-log "$state_dir/acpx/backend-events.jsonl" \
-        --host-log "$state_dir/shotcut.$shotcut_run.stderr.log" \
+        --host-log "$state_dir/shotcut.$shotcut_run.stdout.log" \
         --prompt "host e2e after restart" \
         --wait-for-attachment \
         --same-session-as "host e2e prompt"

@@ -4,6 +4,22 @@ Automated host E2E drives Shotcut through XTEST on its Xvfb display and uses
 the mock ACP backend event log as its source of truth. Screenshots are not a
 test gate.
 
+## Gateway port: single source of truth
+
+The panel-rust ↔ acpx-server HTTP/WS port has one authority:
+`acpx_proto::DEFAULT_ACPX_HTTP_ADDR` (`acpx/acpx-proto/src/lib.rs`, currently
+`127.0.0.1:8790`). acpx-server uses it as its `ACPX_HTTP_BIND` default and
+panel-rust (via acpx-client's re-export) dials it as the default gateway URL
+for **every** provider when no `RUI_ACPX_DEFAULT_URL` / `RUI_ACPX_<PROVIDER>_URL`
+override is set — there is no longer a per-provider `8790`/`8791` default
+split. Genuine per-provider gateways are expressed only through the
+`RUI_ACPX_<PROVIDER>_URL` overrides. snapshotd's Go default mirrors the same
+value (cross-language, kept in sync by comment). This harness picks its own
+port from the single `PANEL_HOST_E2E_GATEWAY_PORT` variable (default `18790`)
+and points both `RUI_ACPX_CODEX_URL` and `RUI_ACPX_CLAUDE_URL` at it, so a
+non-default port works without editing any scattered `8790`/`8791`/`18790`
+literal.
+
 | Scenario | Parallelism | Event evidence | Status |
 | --- | --- | --- | --- |
 | Composer prompt | One focused compose field | `session/prompt` contains the exact typed text | Proven (`PANEL_HOST_E2E_DRIVE=1`) |
@@ -238,3 +254,48 @@ one live click" way `stop_button_dock_xy` was, or reuse this project's
 `i-slint-backend-testing` component-geometry-probe technique (see the
 permission-approval note above) after first fixing that harness to
 force the real 260px window-height floor.
+
+**Post-TEA re-verification (2026-07-21):** After the TEA (Msg/update/Dirty/
+sync) migration and a sync of `main`, the smoke gate was re-run against a
+freshly rebuilt real-FFI Shotcut (isolated Xvfb `:150`, gateway `28790`,
+per-run `mktemp` state). `PANEL_HOST_E2E_DRIVE=1` and
+`PANEL_HOST_E2E_TOOL_STREAM=1` both PASS (exit 0) at `DOCK_WIDTH=260` --
+composer prompt reaches the backend as `session/prompt`, and the tool-stream
+reducer transcript matches the mock agent's three per-turn emissions. This
+confirms the cold-start TEA hydration, the poll `Msg::Frame` tick, and
+compose/send/stream render are correct post-TEA.
+
+`PANEL_HOST_E2E_CANCEL=1` and `PANEL_HOST_E2E_LOCAL_TERMINAL=1` currently
+FAIL, but root-caused to test-harness drift, **not** a product/TEA
+regression (proven by direct screenshot inspection of a held session):
+
+1. `chatrustdock.cpp` no longer forces the dock width. It now only does
+   `view->setMinimumSize(240, 260)` -- the `PANEL_HOST_E2E_DOCK_WIDTH`
+   env-var override this file's coordinate helpers assume ("chatrustdock's
+   own env-var override", above) has been removed. With no forcing, the
+   dock renders at its layout-determined width (~395px against the
+   harness's 1280x800 Xvfb), so every *right-anchored* control (Send/Stop
+   button, header terminal-toggle) sits far to the right of where the
+   `dock_width=260` math clicks. The large, center-computed compose input
+   still lands (which is why DRIVE/TOOL_STREAM pass), masking the issue.
+2. The compose bar was extracted into `ChatInputLayout` and the header
+   into `IconButton`s, moving the Send/Stop button to row 1's right edge
+   (34x34) and making the terminal toggle the header's right-most child
+   (no trailing settings gear). `stop_button_dock_xy`,
+   `local_terminal_toggle_dock_xy`, and `local_terminal_focus_dock_xy`
+   were updated here to the new layout constants, but still assume the
+   dock is actually `dock_width` px wide.
+
+Screenshot evidence that the underlying behavior is correct: driving a
+`slow ` prompt in a held session showed the compose input placeholder flip
+to "Agent is working..." and the Send button render its square Stop icon
+(`root.sending` true) -- i.e. the loading state propagates through TEA and
+the Stop control is live; the automated click simply targets the wrong x
+for the unforced dock width.
+
+**To unblock CANCEL/LOCAL_TERMINAL (and the sidebar-coordinate scenarios):**
+restore a launch-time dock-width override in `chatrustdock.cpp` (read e.g.
+`PANEL_HOST_E2E_DOCK_WIDTH` and `setFixedWidth` on the QQuickWidget) so the
+rendered dock actually matches the `--dock-width` the driver computes
+against. This is a Shotcut (C++) change and was left for a deliberate pass
+rather than done as a side effect of the panel-rust TEA work.

@@ -17,12 +17,20 @@
 mod agent_bridge;
 mod appearance;
 mod conversation;
+mod dirty;
+mod dispatch;
 mod editor_detect;
+mod effect;
+mod effect_executor;
+mod external_snapshot;
 pub mod gateway_actor;
 pub mod jsonl_store;
+mod list_model;
 mod local_terminal;
 mod markdown;
+mod model;
 pub mod models;
+mod msg;
 mod permission;
 pub mod protocol_types;
 mod send_queue;
@@ -32,20 +40,21 @@ mod settings_file;
 // of duplicating the SKILL.md front-matter parsing logic.
 pub mod skills_state;
 mod state_store;
+mod sync;
 mod theme;
+mod update;
 
 use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec};
-use appearance::{AppearanceState, ColorScheme, HostAppearance};
-use models::{build_thread_items, describe_thread, to_message_model_from_transcript, ThreadState};
-use protocol_types::{AgentEvent, ChatMessage, MessageKind};
+use appearance::{ColorScheme, HostAppearance};
+use models::ThreadState;
+use protocol_types::{ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
 use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
-use slint::{ModelRc, SharedString, VecModel};
-use state_store::{PanelDefaults, PanelStateStore, ThreadRecord};
+use slint::{SharedString, VecModel};
+use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
 
@@ -74,59 +83,6 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
 /// work by the time `text()` is populated). Returns `None` for pure
 /// modifier presses (empty text, no special mapping) which Slint doesn't
 /// need forwarded as a `KeyPressed`/`KeyReleased` text event.
-/// Wraps `current + delta` into `0..visible_len`, both directions. Pulled
-/// out of `on_thread_navigation_requested` as a pure function so the
-/// clamp/wrap behavior (empty list, single-thread no-op, negative wrap,
-/// overflow wrap) is unit-testable without a full `PanelSingleton`. Returns
-/// `0` for `visible_len == 0` -- `rem_euclid` panics on a zero divisor, and
-/// a `debug_assert` alone would let that reach a release build, so this is
-/// a real guard, not just documentation, even though today's only caller
-/// already checks `visible_len` first.
-fn wrap_thread_index(current: usize, delta: i32, visible_len: usize) -> usize {
-    if visible_len == 0 {
-        return 0;
-    }
-    ((current as i64 + delta as i64).rem_euclid(visible_len as i64)) as usize
-}
-
-#[cfg(test)]
-mod thread_navigation_tests {
-    use super::wrap_thread_index;
-
-    #[test]
-    fn next_advances_by_one() {
-        assert_eq!(wrap_thread_index(0, 1, 3), 1);
-        assert_eq!(wrap_thread_index(1, 1, 3), 2);
-    }
-
-    #[test]
-    fn previous_retreats_by_one() {
-        assert_eq!(wrap_thread_index(2, -1, 3), 1);
-    }
-
-    #[test]
-    fn next_wraps_past_the_end() {
-        assert_eq!(wrap_thread_index(2, 1, 3), 0);
-    }
-
-    #[test]
-    fn previous_wraps_before_the_start() {
-        assert_eq!(wrap_thread_index(0, -1, 3), 2);
-    }
-
-    #[test]
-    fn single_thread_is_a_no_op_either_direction() {
-        assert_eq!(wrap_thread_index(0, 1, 1), 0);
-        assert_eq!(wrap_thread_index(0, -1, 1), 0);
-    }
-
-    #[test]
-    fn empty_list_does_not_panic() {
-        assert_eq!(wrap_thread_index(0, 1, 0), 0);
-        assert_eq!(wrap_thread_index(5, -1, 0), 0);
-    }
-}
-
 /// Maps a bare `Qt::Key_Shift/Control/Meta/Alt` code to Slint's matching
 /// `Key`. Shared between `map_qt_key`'s press-side special-case table and
 /// `panel_rust_input_key`'s release handling -- see the doc comments at
@@ -424,14 +380,6 @@ fn save_panel_prefs_to_json(
     settings_file::save_document(path, &doc).map_err(|error| error.to_string())
 }
 
-fn provider_for_default_agent(agent_id: &str) -> Option<&str> {
-    match agent_id {
-        "codex" => Some("codex"),
-        "claude" | "claude-code" => Some("claude"),
-        _ => None,
-    }
-}
-
 /// Opt-in host-event diagnostics for the real-process harness. Disabled by
 /// default because key text may be sensitive; when enabled, this writes only
 /// to Shotcut's stderr and never changes input routing.
@@ -462,87 +410,15 @@ impl Platform for SpikePlatform {
 struct PanelSingleton {
     window: Rc<MinimalSoftwareWindow>,
     component: ChatPanel,
+    /// Persistent TEA model. Dispatchers must fold every message into this
+    /// instance; constructing a stand-in model per callback loses state
+    /// between events and makes stale-result handling impossible.
+    model: RefCell<model::Model>,
     buffer: RefCell<Vec<PremultipliedRgbaColor>>,
     width: u32,
     height: u32,
     bridge: Option<AgentBridge>,
     panel_state: Option<PanelStateStore>,
-    appearance: RefCell<AppearanceState>,
-    /// `active_project_binding` phase: the currently-open Shotcut MLT
-    /// project's path, pushed in from the C++ host via
-    /// `panel_rust_set_project_path` (mirroring `panel_rust_set_theme`'s
-    /// byte-buffer FFI shape) whenever `MainWindow::producerOpened`
-    /// fires. `None` before the first project opens, or if Shotcut has
-    /// no project open. This is deliberately just storage for now --
-    /// `thread_item_project_context`/`chat_sessions_project_path`
-    /// consume it.
-    active_project_path: RefCell<Option<String>>,
-    thread_names: RefCell<Vec<String>>,
-    /// Immutable ACPX profile bindings, held alongside the display names so
-    /// a background session attachment can persist a complete `ThreadRecord`
-    /// as soon as its session ID becomes available.
-    thread_profiles: RefCell<Vec<Option<String>>>,
-    thread_permission_profiles: RefCell<Vec<Option<String>>>,
-    /// Host-test trace deduplication for asynchronous attachment readiness.
-    /// This never affects persistence or routing.
-    traced_attachment_threads: RefCell<HashSet<String>>,
-    /// Threads whose `save_thread_record` call hit a `SessionBindingConflict`
-    /// (this run's in-memory session id differs from an old, immutable
-    /// binding already on disk -- expected after a fresh gateway can't
-    /// resume a stale session and opens a new one instead). The write is
-    /// guaranteed to keep failing identically every tick, so this is
-    /// tracked to log and stop retrying once per thread instead of
-    /// spamming the same failure at the poll tick's 60-90fps forever.
-    binding_conflict_threads: RefCell<HashSet<String>>,
-    thread_state: RefCell<Vec<ThreadState>>,
-    thread_errors: RefCell<Vec<String>>,
-    /// `queued_send_queue_behavior` phase: one `SendQueue` per thread,
-    /// parallel to `thread_state`/`thread_names` (same real_index
-    /// convention, grown at exactly the two thread-creation call sites
-    /// that also grow those). In-memory only for now -- restart
-    /// persistence (`SendQueue::load`/JSONL) needs a real per-thread
-    /// identity available at construction time, which isn't wired up
-    /// yet; this still gets the core behavior (always-typeable input,
-    /// correct enqueue/drain) without gambling on that extra plumbing
-    /// in the same pass.
-    send_queues: RefCell<Vec<crate::send_queue::SendQueue>>,
-    /// Phase 2 (chat-panel-ui-theme-parity.md): current sidebar search
-    /// filter, empty means "show all".
-    search_query: RefCell<String>,
-    /// Maps each currently-*visible* (post-filter) row index back to its
-    /// real index into `thread_names`/`thread_state`/the agent bridge --
-    /// filtering means `threads[i]` in Slint is no longer the same `i` as
-    /// `bridge.history(i)`; every Rust-side handler that receives a
-    /// `selected-thread`/`thread-selected(i)` value from Slint must
-    /// translate it through this map first (`real_index`). Rebuilt by
-    /// `refresh_threads_model` every time the filter or thread_state
-    /// changes.
-    visible_indices: RefCell<Vec<usize>>,
-    /// Phase 3 (chat-panel-ui-theme-parity.md): UI-only collapse state
-    /// for tool-call log bodies, parallel to whichever thread's messages
-    /// are currently displayed -- see `refresh_messages_for`/
-    /// `render_messages` below. Does not persist across a thread switch
-    /// or a jsonl reload (render concern only, not part of
-    /// `ChatMessage`).
-    expanded: RefCell<Vec<bool>>,
-    /// The real thread index whose history `expanded` currently
-    /// describes -- `None` before the first message render. Used to
-    /// decide whether switching to `real_idx` should reset `expanded`
-    /// (different thread) or just grow it in place (same thread, new
-    /// streamed messages).
-    displayed_thread: Cell<Option<usize>>,
-    /// Terminal-view addition: which terminal id (if any) the floating
-    /// overlay is currently showing -- `None` means closed. Set by the
-    /// `expand-terminal` callback, cleared by `close-terminal-overlay`;
-    /// re-read every refresh so the overlay keeps showing live output
-    /// while open (same "Rust owns the source of truth, Slint property
-    /// is just a snapshot" convention `refresh_pending_request_for`
-    /// already follows).
-    expanded_terminal_id: RefCell<Option<String>>,
-    /// Last-rendered client-local terminal screen text, for `refresh_
-    /// local_terminal_for`'s change-detection -- see that method's doc
-    /// comment.
-    local_terminal_last_text: RefCell<String>,
     /// Set by [`settings_file::SettingsWatcher`]; drained on poll to
     /// refresh open settings fields without clobbering dirty edits.
     settings_reload_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -555,7 +431,8 @@ impl PanelSingleton {
     /// Gateway index for settings RPCs: selected real thread, else first
     /// bound thread, else `0` only as last resort when the bridge exists.
     fn settings_gateway_index(&self) -> usize {
-        if let Some(idx) = self.real_index(self.component.get_selected_thread() as usize) {
+        let selected_thread = self.model.borrow().selected_thread;
+        if let Some(idx) = self.real_index(selected_thread) {
             if self
                 .bridge
                 .as_ref()
@@ -565,7 +442,7 @@ impl PanelSingleton {
                 return idx;
             }
         }
-        let n = self.thread_names.borrow().len();
+        let n = self.model.borrow().threads.len();
         if let Some(bridge) = self.bridge.as_ref() {
             for idx in 0..n {
                 if bridge.thread_binding(idx).is_some() {
@@ -576,53 +453,8 @@ impl PanelSingleton {
         0
     }
 
-    /// Refresh gateway-backed settings lists (profiles / MCP / agents /
-    /// recoverable sessions) using [`Self::settings_gateway_index`].
-    fn refresh_settings_gateway_lists(&self) {
-        let Some(bridge) = &self.bridge else {
-            self.component
-                .set_available_profiles(models::to_profile_options(vec![]));
-            self.component
-                .set_available_mcp_servers(models::to_mcp_server_options(vec![]));
-            self.component
-                .set_agent_catalog(models::to_agent_catalog_entries(vec![]));
-            self.component
-                .set_recoverable_sessions(models::to_remote_session_options(vec![], ""));
-            return;
-        };
-        let gw = self.settings_gateway_index();
-        self.component
-            .set_available_profiles(models::to_profile_options(bridge.list_profiles(gw)));
-        self.component
-            .set_available_mcp_servers(models::to_mcp_server_options(bridge.list_mcp_servers(gw)));
-        self.component
-            .set_agent_catalog(models::to_agent_catalog_entries(bridge.list_agents(gw)));
-        let recovery_provider = bridge.thread_provider(gw).unwrap_or_default();
-        self.component
-            .set_recoverable_sessions(models::to_remote_session_options(
-                bridge.recoverable_sessions(gw),
-                &recovery_provider,
-            ));
-    }
-
-    fn apply_json_prefs_to_component(&self) {
-        let scope = self.component.get_settings_scope().to_string();
-        let Some(prefs) = load_scoped_panel_prefs(&scope, None) else {
-            return;
-        };
-        let defaults = prefs.defaults;
-        self.component
-            .set_default_profile(defaults.profile_name.unwrap_or_default().into());
-        self.component
-            .set_permission_profile(defaults.permission_profile.unwrap_or_default().into());
-        self.component
-            .set_background_default(defaults.background_session);
-        self.component
-            .set_default_agent_id(prefs.default_agent_id.unwrap_or_default().into());
-        // Thread presentation still resolves its per-thread override through
-        // the local store. Mirror the effective JSON default so an external
-        // settings write updates the active sidebar without a restart.
-        self.sync_runtime_defaults(&load_panel_prefs(None));
+    pub(crate) fn dispatch_frame_input(&self, frame: msg::FrameInput) -> bool {
+        crate::dispatch::dispatch_frame_input(self, frame)
     }
 
     fn sync_runtime_defaults(&self, effective: &PanelDefaults) {
@@ -657,289 +489,11 @@ impl PanelSingleton {
     fn resize_local_terminals_for_viewport(&self) {
         let Some(bridge) = &self.bridge else { return };
         let (cols, rows) = self.local_terminal_dimensions();
-        for idx in 0..self.thread_names.borrow().len() {
+        for idx in 0..self.model.borrow().threads.len() {
             if bridge.has_local_terminal(idx) {
                 bridge.resize_local_terminal(idx, cols, rows);
             }
         }
-    }
-
-    /// Persist thread identity only after the asynchronous ACPX attachment
-    /// has supplied a concrete session ID. Creation deliberately returns
-    /// before that attachment finishes so cached UI can render immediately;
-    /// attempting this work only during creation silently skipped every
-    /// initial record and made the next host process unable to reattach.
-    ///
-    /// Returns whether any thread's attachment newly resolved this tick
-    /// (`thread_new_loading_state` phase) -- `panel_rust_poll` uses this to
-    /// know when to call `refresh_threads_model` so a thread's sidebar row
-    /// flips from its "loading" placeholder to its real state even when no
-    /// other `AgentEvent` happens to arrive in the same tick.
-    fn sync_thread_records(&self) -> bool {
-        let (Some(store), Some(bridge)) = (&self.panel_state, &self.bridge) else {
-            return false;
-        };
-        let names = self.thread_names.borrow();
-        let profiles = self.thread_profiles.borrow();
-        let permission_profiles = self.thread_permission_profiles.borrow();
-        let mut newly_attached = false;
-        for idx in 0..names.len() {
-            let Some(binding) = bridge.thread_binding(idx) else {
-                continue;
-            };
-            let Some(provider) = bridge.thread_provider(idx) else {
-                continue;
-            };
-            if self
-                .binding_conflict_threads
-                .borrow()
-                .contains(&binding.thread_id)
-            {
-                continue;
-            }
-            let record = ThreadRecord {
-                thread_id: binding.thread_id,
-                display_name: names[idx].clone(),
-                provider,
-                session_id: binding.session_id,
-                profile_name: profiles.get(idx).cloned().flatten(),
-                permission_profile: permission_profiles.get(idx).cloned().flatten(),
-                background_session: None,
-            };
-            match store.save_thread_record(&record) {
-                Ok(()) => {
-                    if self
-                        .traced_attachment_threads
-                        .borrow_mut()
-                        .insert(record.thread_id.clone())
-                    {
-                        newly_attached = true;
-                        trace_host_input(format_args!(
-                            "attachment ready thread={idx} session={:?}",
-                            record.session_id
-                        ));
-                    }
-                }
-                Err(error) => {
-                    // A record may already have a deliberately immutable
-                    // profile/permission binding. Keep the live session usable
-                    // and leave that durable identity untouched. This write
-                    // will fail identically on every future tick (the on-disk
-                    // binding never changes), so log once and stop retrying
-                    // rather than spamming the same error at poll-tick rate.
-                    if self
-                        .binding_conflict_threads
-                        .borrow_mut()
-                        .insert(record.thread_id.clone())
-                    {
-                        eprintln!("panel-rust: failed to persist chat thread binding: {error}");
-                    }
-                }
-            }
-        }
-        newly_attached
-    }
-
-    /// Rebuilds and pushes the `threads` model from the dynamic thread list +
-    /// current `thread_state`, narrowed by `search_query` (Phase 2's
-    /// real client-side filter -- see `models::build_thread_items`).
-    /// Called any time a thread's status changes (send in flight, turn
-    /// ended, error) or the search box is edited.
-    fn refresh_threads_model(&self) {
-        let state = self.thread_state.borrow();
-        let query = self.search_query.borrow();
-        // Phase 3: sidebar description is synthesized from each
-        // thread's latest cached message (`models::describe_thread`) --
-        // recomputed here rather than cached, since it must track the
-        // live/bridge history, not just `thread_state`.
-        let names = self.thread_names.borrow();
-        let errors = self.thread_errors.borrow();
-        let descriptions: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                if let Some(error) = errors.get(i).filter(|error| !error.is_empty()) {
-                    return format!("Error: {error}");
-                }
-                match &self.bridge {
-                    Some(bridge) => {
-                        describe_thread(&bridge.history(i), THREAD_DESCRIPTION_MAX_CHARS)
-                    }
-                    None => String::new(),
-                }
-            })
-            .collect();
-        let background_sessions: Vec<bool> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                let Some(store) = self.panel_state.as_ref() else {
-                    return false;
-                };
-                let Some(thread_id) = self
-                    .bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_binding(idx))
-                    .map(|binding| binding.thread_id)
-                else {
-                    return false;
-                };
-                store
-                    .effective_background_session(&thread_id)
-                    .unwrap_or(false)
-            })
-            .collect();
-        let closed: Vec<bool> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .map(|bridge| bridge.thread_closed(idx))
-                    .unwrap_or(false)
-            })
-            .collect();
-        let providers: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_provider(idx))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let thread_models: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .map(|bridge| models::model_name_from_config(&bridge.config_options(idx)))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let thread_project_paths: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| {
-                self.bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_project_path(idx))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let items = build_thread_items(
-            &*names,
-            &state,
-            &descriptions,
-            &background_sessions,
-            &closed,
-            &query,
-        );
-        *self.visible_indices.borrow_mut() = items.iter().map(|i| i.real_index).collect();
-        let items: Vec<ThreadItem> = items
-            .into_iter()
-            .map(|i| {
-                let mut item = i.item;
-                item.provider = providers
-                    .get(i.real_index)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into();
-                item.model = thread_models
-                    .get(i.real_index)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into();
-                let project_path = thread_project_paths
-                    .get(i.real_index)
-                    .cloned()
-                    .unwrap_or_default();
-                item.project_name = std::path::Path::new(&project_path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-                    .into();
-                item.project_path = project_path.into();
-                // `thread_new_loading_state` phase: a thread whose ACP
-                // session hasn't resolved yet (`thread_binding` is only
-                // `None` before `spawn_background_attachment` completes --
-                // see `add_thread_with_profile`'s doc comment) shows as
-                // loading/busy instead of a misleadingly-idle empty chat
-                // view, from the moment "+" is clicked until attachment
-                // finishes. Closed threads are excluded since a closed
-                // session legitimately has no binding either.
-                if !item.closed
-                    && self
-                        .bridge
-                        .as_ref()
-                        .is_some_and(|bridge| bridge.thread_binding(i.real_index).is_none())
-                {
-                    item.status = "loading".into();
-                    item.busy = true;
-                }
-                item
-            })
-            .collect();
-        self.component
-            .set_threads(ModelRc::new(VecModel::from(items)));
-    }
-
-    /// Rebuilds the `skills` sidebar model from the global skills
-    /// directory (`skill_discovery_backend` phase). Project-local
-    /// scanning is deliberately not wired here yet -- it needs
-    /// `active_project_binding`'s active-project state, which doesn't
-    /// exist yet -- so this only ever reports global skills for now.
-    fn refresh_skills_model(&self) {
-        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-        let mut entries = crate::skills_state::scan_skills_dir(
-            &global_dir,
-            crate::skills_state::SkillScope::Global,
-        );
-        // `project_scoped_skill_isolation`: now that `active_project_binding`
-        // is real, also scan the active project's own `.skills/` directory
-        // -- entirely additive to the always-scanned global directory, and
-        // naturally empty (not an error) when no project is open or it has
-        // no `.skills/` yet, since `scan_skills_dir` already treats a
-        // missing directory as an empty result.
-        if let Some(project_path) = self.active_project_path.borrow().as_ref() {
-            // `active_project_path` is the open MLT *file*'s path
-            // (`MainWindow::fileName()`), not its containing directory --
-            // `.skills/` lives alongside the project file, so this needs
-            // the parent directory.
-            if let Some(project_dir) = std::path::Path::new(project_path).parent() {
-                let skills_dir = crate::skills_state::project_skills_dir(project_dir);
-                entries.extend(crate::skills_state::scan_skills_dir(
-                    &skills_dir,
-                    crate::skills_state::SkillScope::Project,
-                ));
-            }
-        }
-        self.component
-            .set_available_skills(crate::models::to_skill_options(entries));
-    }
-
-    /// Loads a discovered skill directory into the editor surface. New skill
-    /// creation and list-row selection share this so a successful scaffold
-    /// always opens the exact file that was written.
-    fn open_skill_editor(&self, skill_dir: &std::path::Path) {
-        let name = skill_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
-        self.component.set_active_skill_name(name.into());
-        self.component
-            .set_active_skill_path(skill_dir.to_string_lossy().into_owned().into());
-        self.component.set_active_skill_content(content.into());
-        let detected: Vec<slint::SharedString> = crate::editor_detect::detect_installed_editors()
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        self.component
-            .set_detected_editors(ModelRc::new(VecModel::from(detected)));
-        self.component.set_active_pane("skill".into());
     }
 
     /// Translates a Slint-side filtered-list index (what `thread-selected`
@@ -948,331 +502,341 @@ impl PanelSingleton {
     /// (e.g. the filter just emptied the list out from under a stale
     /// selection).
     fn real_index(&self, filtered_idx: usize) -> Option<usize> {
-        self.visible_indices.borrow().get(filtered_idx).copied()
-    }
-
-    /// Rebuilds the `messages` model for `real_idx` from the agent
-    /// bridge's current history plus whatever `expanded` state already
-    /// exists -- does not touch `expanded`/`displayed_thread` itself
-    /// (that's `refresh_messages_for`'s job). Used by the
-    /// `toggle-expanded` callback, which only flips one bool and must
-    /// not reset collapse state for every other message in the thread.
-    fn render_messages(&self, real_idx: usize) {
-        let Some(bridge) = &self.bridge else { return };
-        // Phase 2 step 3: render the *merged* transcript view
-        // (`AgentBridge::transcript`, streamed chunks/tool-status
-        // updates already merged by id), not the raw per-chunk
-        // `history` feed -- see `models::to_message_model_from_
-        // transcript`'s doc comment.
-        let transcript = bridge.transcript(real_idx);
-        // Coverage-matrix "tool stream" host scenario: a compact,
-        // opt-in trace of the *typed reducer transcript*'s own tail
-        // (kind + a truncated text preview per entry), so a host test
-        // can confirm the rendered thought/tool-call/message
-        // discriminator sequence and content without a screenshot --
-        // this is the same Slint model `to_message_model_from_
-        // transcript` below turns into `MessageItem`s, just observed
-        // from the Rust side instead of the render tree.
-        if std::env::var_os("RUI_PANEL_INPUT_TRACE").is_some() {
-            use crate::conversation::TranscriptItem;
-            let tail_start = transcript.len().saturating_sub(3);
-            for (offset, entry) in transcript[tail_start..].iter().enumerate() {
-                let (kind, raw_text) = match entry {
-                    TranscriptItem::User { text, .. } => ("user", text.as_str()),
-                    TranscriptItem::Assistant { text, .. } => ("agent", text.as_str()),
-                    TranscriptItem::Thought { text, .. } => ("thinking", text.as_str()),
-                    TranscriptItem::Tool { title, .. } => ("tool-call", title.as_str()),
-                    TranscriptItem::Terminal { title, .. } => ("terminal", title.as_str()),
-                    TranscriptItem::Notice { text, .. } => ("notice", text.as_str()),
-                };
-                let preview: String = raw_text.chars().take(60).collect();
-                let preview = preview.replace('\n', " ");
-                trace_host_input(format_args!(
-                    "transcript thread={real_idx} index={} kind={kind} text={preview:?}",
-                    tail_start + offset,
-                ));
-            }
-        }
-        let expanded = self.expanded.borrow();
-        self.component
-            .set_messages(to_message_model_from_transcript(transcript, &expanded));
-        // Phase 3 step 2: whether another predecessor page exists.
-        self.component
-            .set_has_older_messages(bridge.has_older_page(real_idx));
-    }
-
-    /// Displays `real_idx`'s messages, first reconciling `expanded`
-    /// against it: a genuine thread switch (different from
-    /// `displayed_thread`) resets collapse state to all-collapsed
-    /// (matches the HTML source's "new tool_use items default to
-    /// collapsed" convention); staying on the same thread (e.g. a
-    /// streamed message just arrived, growing history by one) only
-    /// grows the vec, preserving whatever the user already
-    /// expanded/collapsed. Every Rust-side call site that changes which
-    /// thread's messages are visible goes through this, not
-    /// `set_messages` directly.
-    fn refresh_messages_for(&self, real_idx: usize) {
-        let Some(bridge) = &self.bridge else { return };
-        // Sized against the *merged* transcript's row count, not raw
-        // `history`'s chunk count -- `toggle-expanded(index)` callbacks
-        // (see `on_toggle_expanded` below) index into this same vec by
-        // the row index `render_messages`'s `MessageItem::index` field
-        // assigns, which is a transcript row index post-merge.
-        let history_len = bridge.transcript(real_idx).len();
-        let is_thread_switch = self.displayed_thread.get() != Some(real_idx);
-        {
-            let mut expanded = self.expanded.borrow_mut();
-            if is_thread_switch {
-                *expanded = vec![false; history_len];
-            } else if expanded.len() < history_len {
-                expanded.resize(history_len, false);
-            }
-        }
-        self.displayed_thread.set(Some(real_idx));
-        self.render_messages(real_idx);
-        self.refresh_pending_request_for(real_idx);
-        self.refresh_terminals_for(real_idx);
-        self.refresh_capabilities_for(real_idx);
-        self.refresh_local_terminal_for(real_idx);
-        self.refresh_connection_status_for(real_idx);
-        self.refresh_last_error_for(real_idx);
-    }
-
-    /// Mirrors `real_idx`'s `thread_errors` slot (already populated by
-    /// `AgentEvent::Error` -- see that arm's own comment) into the
-    /// `last-error` property `chat_area.slint`'s banner reads, so a send/
-    /// session-attach failure becomes visible in the transcript itself,
-    /// not only as the sidebar's "Error: ..." subtitle (`refresh_threads_
-    /// model`'s `errors` mapping) -- that subtitle is easy to miss
-    /// entirely while looking at the message view, which is exactly the
-    /// "sent a message, saw nothing happen" symptom this closes.
-    fn refresh_last_error_for(&self, real_idx: usize) {
-        let error = self
-            .thread_errors
+        self.model
             .borrow()
-            .get(real_idx)
-            .cloned()
-            .unwrap_or_default();
-        if self.component.get_last_error().as_str() != error {
-            self.component.set_last_error(error.into());
-        }
+            .visible_indices
+            .get(filtered_idx)
+            .copied()
     }
 
-    /// Single entry point for "make `filtered_idx` (a Slint filtered-list
-    /// index, same space as `thread-selected`/`get_selected_thread`) the
-    /// displayed thread": clamps against `visible_indices`, updates the
-    /// Slint `selected-thread` property, persists the choice, and refreshes
-    /// messages/capabilities/settings lists. Sidebar clicks (`on_thread_
-    /// selected` below) and keyboard cycling (`on_thread_navigation_
-    /// requested`) both call this so selection behavior can't drift between
-    /// the two entry points. No-op (returns `false`) when the visible list
-    /// is empty.
-    fn select_visible_thread(&self, filtered_idx: usize) -> bool {
-        let visible_len = self.visible_indices.borrow().len();
-        if visible_len == 0 {
-            return false;
-        }
-        let clamped_idx = filtered_idx.min(visible_len - 1);
-        let Some(real_idx) = self.real_index(clamped_idx) else {
-            return false;
-        };
-        self.component.set_selected_thread(clamped_idx as i32);
-        if let (Some(store), Some(binding)) = (
-            self.panel_state.as_ref(),
-            self.bridge
-                .as_ref()
-                .and_then(|bridge| bridge.thread_binding(real_idx)),
-        ) {
-            if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
-                eprintln!("panel-rust: failed to persist selected chat thread: {error}");
-            }
-        }
-        self.refresh_messages_for(real_idx);
-        if self.component.get_settings_open() {
-            self.refresh_settings_gateway_lists();
-        }
-        true
-    }
-
-    fn refresh_connection_status_for(&self, real_idx: usize) -> bool {
-        let status = self
-            .bridge
-            .as_ref()
-            .map(|bridge| bridge.transport_status(real_idx))
-            .unwrap_or_else(|| "Unavailable".to_owned());
-        let changed = self.component.get_connection_status().as_str() != status;
-        if changed {
-            self.component.set_connection_status(status.into());
-        }
-        changed
-    }
-
-    /// Rebuilds the `available-modes`/`current-mode-id`/`config-option-
-    /// rows` properties for `real_idx` from `AgentBridge::session_modes`/
-    /// `config_options` -- see [`Self::refresh_terminals_for`]'s doc
-    /// comment for the shared "this thread became the displayed one"
-    /// hook convention this follows. Both a genuine `session/new`-time
-    /// advertisement and any later live `current_mode_update`/`config_
-    /// option_update` notification reach the UI purely by this being
-    /// re-called on every event that touches the selected thread (see
-    /// `apply_bridge_events`'s `AgentEvent::SessionModes`/`Current
-    /// ModeChanged`/`ConfigOptions` arms).
-    fn refresh_capabilities_for(&self, real_idx: usize) {
+    /// `dispatch.rs`'s Compose-domain wrapper (tea-slint-model Phase 4)
+    /// calls this -- extracted verbatim from the former
+    /// `on_send_requested` closure body, see that module's doc comment
+    /// for why the real bridge/queue-aware cascade stays here rather
+    /// than being reimplemented against `Model`.
+    pub(crate) fn execute_send_prompt_real(&self, real_idx: usize, text: &str) {
         let Some(bridge) = &self.bridge else { return };
-        let modes = bridge.session_modes(real_idx);
-        self.component
-            .set_mode_trigger_label(models::current_mode_name(&modes).into());
-        self.component
-            .set_mode_dropdown_entries(models::to_mode_dropdown_entries(modes));
-        let config_opts = bridge.config_options(real_idx);
-        self.component
-            .set_config_trigger_label(models::current_config_trigger_label(&config_opts).into());
-        self.component
-            .set_config_dropdown_entries(models::to_config_dropdown_entries(config_opts));
+        self.start_send_prompt(real_idx, text, bridge);
     }
 
-    /// Rebuilds the `pending-request` property for `real_idx` from the
-    /// agent bridge's current pending-request queue -- the request-card
-    /// component's whole visibility/content is driven from this, not a
-    /// separate boolean flag. Called from [`Self::refresh_messages_for`]
-    /// (the shared "this thread became the displayed one" hook, covering
-    /// both a genuine thread switch and a same-thread event refresh) so
-    /// there's exactly one place that decides which thread's request (if
-    /// any) is currently visible.
-    fn refresh_pending_request_for(&self, real_idx: usize) {
-        let Some(bridge) = &self.bridge else { return };
-        let pending = bridge.pending_requests(real_idx);
-        let item = match pending.first() {
-            Some(event) => {
-                let view = permission::to_pending_request_view(event);
-                let size = self.component.window().size();
-                let scale = self.component.window().scale_factor();
-                trace_host_input(format_args!(
-                    "pending request active thread={real_idx} method={} window_size={}x{} scale={scale} compact={} narrow={}",
-                    event.method,
-                    size.width,
-                    size.height,
-                    self.component.get_compact(),
-                    self.component.get_narrow()
-                ));
-                PendingRequestItem {
-                    active: true,
-                    relay_id: view.relay_id.into(),
-                    method: view.method.into(),
-                    title: view.title.into(),
-                    summary: view.summary.into(),
-                    supported: permission::is_supported_method(&event.method),
-                    options: permission::to_permission_option_model(view.options),
-                }
-            }
-            None => PendingRequestItem {
-                active: false,
-                relay_id: SharedString::default(),
-                method: SharedString::default(),
-                title: SharedString::default(),
-                summary: SharedString::default(),
-                supported: false,
-                options: permission::to_permission_option_model(Vec::new()),
-            },
-        };
-        self.component.set_pending_request(item);
-    }
-
-    /// Rebuilds the `terminals` row model for `real_idx` from the agent
-    /// bridge's current terminal registry (`active_terminals` +
-    /// `terminal_buffer`, see `agent_bridge.rs`) and, if the floating
-    /// overlay is currently showing one of this thread's terminals,
-    /// refreshes `expanded-terminal` too so live output keeps streaming
-    /// into an already-open overlay. Called from
-    /// [`Self::refresh_messages_for`] (the shared "this thread became
-    /// the displayed one" hook) so terminal cards stay in sync with
-    /// every event that touches the selected thread, same convention
-    /// [`Self::refresh_pending_request_for`] follows.
-    fn refresh_terminals_for(&self, real_idx: usize) {
-        let Some(bridge) = &self.bridge else { return };
-        let ids = bridge.active_terminals(real_idx);
-        let entries: Vec<(String, Option<agent_bridge::TerminalBuffer>)> = ids
-            .into_iter()
-            .map(|id| {
-                let buffer = bridge.terminal_buffer(real_idx, &id);
-                (id, buffer)
-            })
-            .collect();
-        let expanded_id = self.expanded_terminal_id.borrow().clone();
-        if let Some(expanded_id) = &expanded_id {
-            if let Some(buffer) = bridge.terminal_buffer(real_idx, expanded_id) {
-                self.component.set_expanded_terminal(TerminalItem {
-                    terminal_id: expanded_id.clone().into(),
-                    output: buffer.output.into(),
-                    truncated: buffer.truncated,
-                    has_exited: buffer.exit_status.is_some(),
-                    exit_code: buffer
-                        .exit_status
-                        .and_then(|(code, _signal)| code)
-                        .unwrap_or_default(),
-                });
-            }
-        }
-        self.component
-            .set_terminals(models::to_terminal_items(entries));
-    }
-
-    /// Rebuilds the `local-terminal` property for `real_idx` from
-    /// `AgentBridge::local_terminal_snapshot` -- same "this thread
-    /// became the displayed one" hook convention `refresh_terminals_for`
-    /// documents, plus called on every periodic poll tick (see
-    /// `panel_rust_poll`) regardless of whether any gateway event
-    /// arrived, since a client-local PTY's output changes purely from
-    /// its own background reader thread, never through `AgentBridge::
-    /// poll()`'s event queue at all. Returns whether the rendered
-    /// screen text actually changed, so the poll-tick caller only
-    /// requests a redraw when there was something new to show (typing
-    /// into an idle shell's prompt should not force a redraw every
-    /// tick).
-    fn refresh_local_terminal_for(&self, real_idx: usize) -> bool {
-        let Some(bridge) = &self.bridge else {
-            return false;
-        };
-        let snapshot = bridge.local_terminal_snapshot(real_idx);
-        let new_text = snapshot
-            .as_ref()
-            .map(|s| s.screen_text.clone())
-            .unwrap_or_default();
-        let changed = *self.local_terminal_last_text.borrow() != new_text;
-        *self.local_terminal_last_text.borrow_mut() = new_text;
-        if changed {
-            // Coverage-matrix "client PTY" host scenario: a real shell's
-            // own screen buffer changing (not a UI flag flip) is the one
-            // observable signal that a genuine PTY is running -- traces
-            // a tail preview so a host test can confirm it without a
-            // screenshot.
-            let preview: String = self
-                .local_terminal_last_text
-                .borrow()
-                .chars()
-                .rev()
-                .take(80)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let preview = preview.replace('\n', "\\n");
+    fn start_send_prompt(&self, idx: usize, text: &str, bridge: &AgentBridge) {
+        if bridge.thread_closed(idx) {
             trace_host_input(format_args!(
-                "local terminal output thread={real_idx} tail={preview:?}"
+                "send ignored real_thread={idx} because the thread is closed"
             ));
+            return;
         }
-        self.component
-            .set_local_terminal(models::to_local_terminal_item(snapshot));
-        changed
+        bridge.push_local(
+            idx,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: text.to_string(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+        bridge.send_prompt(idx, text.to_string());
+        trace_host_input(format_args!("send dispatched real_thread={idx}"));
+    }
+
+    /// Executes the bridge side of the cancellation effect. State
+    /// transitions are owned by `update()`.
+    pub(crate) fn execute_cancel_generation_real(&self, real_idx: usize) {
+        self.bridge
+            .as_ref()
+            .map(|bridge| bridge.cancel_prompt(real_idx));
     }
 
     /// Answers the currently-displayed thread's first pending request
     /// with a concrete one-of option id (Zed flat permission model), then
     /// immediately re-renders the request card (which will hide it, since
     /// `AgentBridge::respond_to_request` removes the entry synchronously).
-    fn answer_pending_request_option(&self, component: &ChatPanel, option_id: &str) {
+    /// `dispatch.rs`'s Request-domain wrapper (tea-slint-model Phase 4)
+    /// calls this -- extracted verbatim from the former
+    /// `on_load_older_requested` closure's `PANEL.with` body.
+    pub(crate) fn dispatch_load_older_requested(&self) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.model.borrow().displayed_thread else {
+            return;
+        };
+        let before_len = bridge.transcript(real_idx).len();
+        if bridge.load_older_page(real_idx) {
+            let after_len = bridge.transcript(real_idx).len();
+            // The new rows were prepended at the *front* -- grow
+            // `expanded` from the front too, so every pre-existing
+            // collapse-state entry stays attached to the same logical
+            // message it described before this reload, not silently
+            // shifted onto whatever now occupies its old index.
+            let grown_by = after_len.saturating_sub(before_len);
+            self.dispatch_frame_input(msg::FrameInput {
+                prepend_expanded_rows: grown_by,
+                selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
+                    self,
+                )
+                .collect_thread_snapshot_for(real_idx),
+                ..msg::FrameInput::default()
+            });
+        }
+    }
+
+    /// Extracted from the former `on_local_terminal_toggle_requested`
+    /// closure body.
+    pub(crate) fn dispatch_local_terminal_toggle(&self) {
+        trace_host_input("local terminal toggle callback invoked");
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
+            return;
+        };
+        if bridge.has_local_terminal(real_idx) {
+            bridge.close_local_terminal(real_idx);
+            trace_host_input(format_args!(
+                "local terminal toggled thread={real_idx} open=false"
+            ));
+        } else {
+            let (cols, rows) = self.local_terminal_dimensions();
+            bridge.open_local_terminal(real_idx, cols, rows);
+            trace_host_input(format_args!(
+                "local terminal toggled thread={real_idx} open=true cols={cols} rows={rows}"
+            ));
+        }
+    }
+
+    /// Extracted from the former `on_local_terminal_key_input` closure body.
+    pub(crate) fn dispatch_local_terminal_key_input(&self, text: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
+            return;
+        };
+        let bytes = models::translate_local_terminal_key(text);
+        if !bytes.is_empty() {
+            bridge.write_local_terminal_input(real_idx, &bytes);
+            trace_host_input(format_args!(
+                "local terminal key thread={real_idx} bytes={:?}",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+    }
+
+    /// Extracted from the former `on_local_terminal_close_requested`
+    /// closure body.
+    pub(crate) fn dispatch_local_terminal_close(&self) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
+            return;
+        };
+        bridge.close_local_terminal(real_idx);
+    }
+
+    pub(crate) fn execute_settings_save(
+        &self,
+        input: msg::SettingsSaveInput,
+    ) -> Result<(), effect::EffectError> {
+        let defaults = PanelDefaults {
+            profile_name: non_empty(input.default_profile),
+            permission_profile: non_empty(input.permission_profile),
+            background_session: input.background_default,
+            selected_thread_id: input.selected_thread_id.clone(),
+        };
+        if let Err(error) = save_panel_prefs_to_json(
+            input.scope.as_str(),
+            &defaults,
+            non_empty(input.default_agent_id),
+        ) {
+            return Err(effect::EffectError::new(format!(
+                "failed to save panel settings JSON: {error}"
+            )));
+        }
+        self.sync_runtime_defaults(&load_panel_prefs(None));
+        self.settings_ignore_watch_until.set(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        ));
+        if let Some(store) = self.panel_state.as_ref() {
+            if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
+                if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
+                    return Err(effect::EffectError::new(format!(
+                        "failed to persist selected chat thread: {error}"
+                    )));
+                }
+            }
+            if let Some(thread_id) = defaults.selected_thread_id.as_deref() {
+                let override_value = input
+                    .background_override_set
+                    .then_some(input.background_override);
+                if let Err(error) = store.set_background_override(thread_id, override_value) {
+                    return Err(effect::EffectError::new(format!(
+                        "failed to save background-session override: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_mcp_server_create(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+        command: &str,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let entry = if command.is_empty() {
+            serde_json::json!({ "name": name })
+        } else {
+            serde_json::json!({ "name": name, "command": command })
+        };
+        let gw = self.settings_gateway_index();
+        bridge.create_mcp_server(gw, entry);
+    }
+
+    pub(crate) fn dispatch_mcp_server_delete(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        bridge.delete_mcp_server(gw, name);
+    }
+
+    pub(crate) fn dispatch_mcp_server_enabled_changed(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+        enabled: bool,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        let Some(mut entry) = bridge
+            .list_mcp_servers(gw)
+            .into_iter()
+            .find(|entry| entry.name == name)
+        else {
+            eprintln!(
+                "panel-rust: MCP server {:?} disappeared before its enabled state could update",
+                name
+            );
+            return;
+        };
+        entry.extra["enabled"] = serde_json::Value::Bool(enabled);
+        if !bridge.update_mcp_server(gw, entry.extra) {
+            eprintln!(
+                "panel-rust: failed to update enabled state for MCP server {:?}",
+                name
+            );
+        }
+    }
+
+    pub(crate) fn dispatch_profile_create(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+        agent_id: Option<&str>,
+        terminal_enabled: bool,
+        fs_enabled: bool,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let mut entry = serde_json::json!({
+            "name": name,
+            "allow_terminal_access": terminal_enabled,
+            "allow_fs_access": fs_enabled,
+        });
+        if let Some(agent_id) = agent_id.filter(|s| !s.is_empty()) {
+            entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
+        }
+        let gw = self.settings_gateway_index();
+        bridge.create_profile(gw, entry);
+    }
+
+    pub(crate) fn dispatch_profile_delete(&self, _component: &ChatPanel, name: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        bridge.delete_profile(gw, name);
+    }
+
+    pub(crate) fn dispatch_agent_install_requested(&self, _component: &ChatPanel, agent_id: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        bridge.install_agent(gw, agent_id);
+    }
+
+    pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
+        let paths = settings_file::SettingsPaths::from_env();
+        if let Err(error) = paths.set_dev_mode(enabled) {
+            eprintln!("panel-rust: failed to persist dev mode: {error}");
+        }
+        if enabled {
+            let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+            if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
+                eprintln!("panel-rust: failed to install bundled global skill: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_mode_selected(&self, mode_id: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
+            return;
+        };
+        bridge.set_mode(real_idx, mode_id.to_string());
+    }
+
+    pub(crate) fn dispatch_config_option_selected(&self, option_id: &str, value: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
+            return;
+        };
+        bridge.set_config_option(
+            real_idx,
+            option_id.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+
+    pub(crate) fn open_skill_search_result(&self, query: &str, show_global: bool) {
+        let needle = query.trim().to_lowercase();
+        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        let mut entries = if show_global {
+            crate::skills_state::scan_skills_dir(
+                &global_dir,
+                crate::skills_state::SkillScope::Global,
+            )
+        } else {
+            Vec::new()
+        };
+        let active_project_path = self.model.borrow().active_project_path.clone();
+        if let Some(project_path) = active_project_path.as_ref() {
+            if let Some(project_dir) = std::path::Path::new(project_path).parent() {
+                entries.extend(crate::skills_state::scan_skills_dir(
+                    &crate::skills_state::project_skills_dir(project_dir),
+                    crate::skills_state::SkillScope::Project,
+                ));
+            }
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(entry) = entries.into_iter().find(|entry| {
+            needle.is_empty()
+                || entry.name.to_lowercase().contains(&needle)
+                || entry.description.to_lowercase().contains(&needle)
+        }) {
+            crate::dispatch::dispatch_skill_editor_open_requested(
+                self,
+                entry.path.to_string_lossy().into_owned(),
+            );
+        }
+    }
+
+    /// Executes the bridge-side half of `Effect::SetActiveProjectPath`.
+    /// This must stay separate from `dispatch_project_path_changed`, which
+    /// creates that effect; calling the dispatcher here would recurse forever.
+    pub(crate) fn apply_active_project_path(&self, path: Option<String>) {
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
+        }
+    }
+
+    // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
+    // call this directly.
+    pub(crate) fn answer_pending_request_option(&self, option_id: &str) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         let pending = bridge.pending_requests(real_idx);
@@ -1283,15 +847,16 @@ impl PanelSingleton {
         let Some(event) = pending.first() else { return };
         let response = permission::build_response_for_option(event, option_id);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
-        self.refresh_pending_request_for(real_idx);
     }
 
     /// Keyboard convenience: approve/reject maps to the first allow_* /
     /// reject_* option on the live request (same fallback as
     /// [`permission::build_response`]).
-    fn answer_pending_request(&self, component: &ChatPanel, approved: bool) {
+    // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
+    // call this directly.
+    pub(crate) fn answer_pending_request(&self, approved: bool) {
         let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.real_index(component.get_selected_thread() as usize) else {
+        let Some(real_idx) = self.real_index(self.model.borrow().selected_thread) else {
             return;
         };
         let pending = bridge.pending_requests(real_idx);
@@ -1303,134 +868,13 @@ impl PanelSingleton {
             permission::default_reject_option_id(&options)
         };
         if let Some(id) = option_id {
-            self.answer_pending_request_option(component, id);
+            self.answer_pending_request_option(id);
             return;
         }
         // No matching option (e.g. reject with only allow offered) —
         // fall through to build_response's cancel policy.
         let response = permission::build_response(event, approved);
         bridge.respond_to_request(real_idx, &event.relay_id, response);
-        self.refresh_pending_request_for(real_idx);
-    }
-
-    /// Applies queued agent-bridge events to `thread_state` and, if the
-    /// currently-selected thread is affected, refreshes the visible
-    /// `messages` model too. Returns whether anything visibly changed.
-    fn apply_bridge_events(&self) -> bool {
-        let Some(bridge) = &self.bridge else {
-            return false;
-        };
-        let events = bridge.poll();
-        if events.is_empty() {
-            return false;
-        }
-        // `selected-thread` is a *filtered-list* index (Phase 2) --
-        // translate to the real thread index before comparing against
-        // `ev.thread_index`, which always refers to the real index the
-        // agent bridge knows about.
-        let selected = self.real_index(self.component.get_selected_thread() as usize);
-        let mut selected_touched = false;
-        {
-            let mut state = self.thread_state.borrow_mut();
-            for ev in &events {
-                let idx = ev.thread_index;
-                if Some(idx) == selected {
-                    selected_touched = true;
-                }
-                if let Some(slot) = state.get_mut(idx) {
-                    match &ev.event {
-                        AgentEvent::Message(_) => {} // status unchanged while streaming
-                        AgentEvent::TurnEnded(reason) => {
-                            trace_host_input(format_args!(
-                                "turn ended thread={idx} reason={reason:?}"
-                            ));
-                            *slot = ThreadState::Idle;
-                            if let Some(error) = self.thread_errors.borrow_mut().get_mut(idx) {
-                                error.clear();
-                            }
-                            // queued_send_queue_behavior: auto-advance
-                            // this thread's send queue now that its turn
-                            // has genuinely ended. `is_compose_focused`
-                            // is always passed false here (a simplification
-                            // vs. Zed's precedent, which suppresses
-                            // auto-send while the user is actively
-                            // editing the *next* message) -- this
-                            // integration pass doesn't thread per-thread
-                            // compose-focus state down to this event
-                            // loop; documented, not silently dropped.
-                            let popped = self
-                                .send_queues
-                                .borrow_mut()
-                                .get_mut(idx)
-                                .and_then(|q| q.on_generation_stopped(false).ok().flatten());
-                            if let Some(entry) = popped {
-                                bridge.push_local(
-                                    idx,
-                                    ChatMessage {
-                                        kind: MessageKind::User,
-                                        text: entry.text.clone(),
-                                        status: None,
-                                        id: None,
-                                        raw_input: None,
-                                        raw_output: None,
-                                    },
-                                );
-                                *slot = ThreadState::Loading;
-                                bridge.send_prompt(idx, entry.text);
-                                trace_host_input(format_args!(
-                                    "queued message auto-sent real_thread={idx}"
-                                ));
-                            }
-                        }
-                        AgentEvent::Error(error) => {
-                            trace_host_input(format_args!(
-                                "bridge error thread={idx} error={error:?}"
-                            ));
-                            *slot = ThreadState::Error;
-                            if let Some(slot_error) = self.thread_errors.borrow_mut().get_mut(idx) {
-                                *slot_error = error.clone();
-                            }
-                        }
-                        // Rendering itself is driven by re-reading
-                        // `AgentBridge::pending_requests(idx)` below (see
-                        // `refresh_pending_request_for`), same
-                        // "event just signals staleness, state is
-                        // re-read from the bridge's own source of
-                        // truth" convention `Message` already follows
-                        // for history -- this arm only needs to make
-                        // sure `selected_touched` covers a request
-                        // arriving on the currently-selected thread,
-                        // which the loop above already does via `idx`.
-                        AgentEvent::PermissionRequest(_) => {}
-                        // Same "re-read the bridge's own source of
-                        // truth" convention -- `AgentBridge::
-                        // terminal_buffer` is what a future terminal
-                        // view component would poll; this arm exists
-                        // only so the match stays exhaustive and
-                        // `selected_touched` covers a terminal thread's
-                        // events like every other variant.
-                        AgentEvent::TerminalOutput(_) => {}
-                        // Same "re-read the bridge's own source of
-                        // truth" convention -- `AgentBridge::
-                        // session_modes`/`config_options` are what the
-                        // settings-sheet mode/config selector polls;
-                        // these arms exist only so the match stays
-                        // exhaustive and `selected_touched` covers a
-                        // capability-advertisement event on the
-                        // currently-selected thread like every other
-                        // variant.
-                        AgentEvent::SessionModes(_)
-                        | AgentEvent::CurrentModeChanged(_)
-                        | AgentEvent::ConfigOptions(_) => {}
-                    }
-                }
-            }
-        }
-        self.refresh_threads_model();
-        if let (true, Some(selected)) = (selected_touched, selected) {
-            self.refresh_messages_for(selected);
-        }
-        true
     }
 }
 
@@ -1492,8 +936,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 );
                 existing.width = width;
                 existing.height = height;
-                existing.component.set_compact(width < 320);
-                existing.component.set_narrow(width < 220);
+                crate::sync::sync_geometry(&existing.component, width < 320, width < 220);
                 existing.resize_local_terminals_for_viewport();
                 existing.window.window().request_redraw();
             }
@@ -1556,8 +999,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .on_replace_active_token(|text, cursor, replacement| {
                 models::replace_active_token(text.as_str(), cursor, replacement.as_str()).into()
             });
-        component.set_compact(width < 320);
-        component.set_narrow(width < 220);
+        crate::sync::sync_geometry(&component, width < 320, width < 220);
         window.window().request_redraw();
 
         // Bridge init failure degrades gracefully rather than aborting
@@ -1591,28 +1033,16 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             })
             .unwrap_or_default();
         let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
-            // DEFAULT_THREAD_NAMES was v1 scaffolding from before dynamic
-            // thread create/rename/delete existed (see its own doc comment)
-            // -- a real cold start today should just start with zero
-            // threads, same as any other empty-DB state. Only seed the
-            // fixed demo set when a test suite explicitly opts in, so
-            // these stale placeholder threads (with real, network-reaching
-            // agent bindings) don't leak into ordinary dev or production
-            // launches.
-            if std::env::var("RUI_SEED_DEMO_THREADS").as_deref() == Ok("1") {
-                DEFAULT_THREAD_NAMES
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, name)| ThreadSpec {
-                        display_name: (*name).to_owned(),
-                        provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
-                        session_id: None,
-                        profile_name: None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }
+            DEFAULT_THREAD_NAMES
+                .iter()
+                .enumerate()
+                .map(|(idx, name)| ThreadSpec {
+                    display_name: (*name).to_owned(),
+                    provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
+                    session_id: None,
+                    profile_name: None,
+                })
+                .collect()
         } else {
             restored_records
                 .iter()
@@ -1624,31 +1054,25 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 })
                 .collect()
         };
-        let initial_names: Vec<String> = initial_specs
-            .iter()
-            .map(|spec| spec.display_name.clone())
-            .collect();
-        let initial_profiles: Vec<Option<String>> = initial_specs
-            .iter()
-            .map(|spec| spec.profile_name.clone())
-            .collect();
         let initial_permission_profiles: Vec<Option<String>> = restored_records
             .iter()
             .map(|record| record.permission_profile.clone())
             .chain(std::iter::repeat(None))
-            .take(initial_names.len())
+            .take(initial_specs.len())
             .collect();
-        let initial_thread_count = initial_names.len();
-        let (bridge, initial_state) = match AgentBridge::new_with_thread_specs(&initial_specs) {
-            Ok(b) => (Some(b), vec![ThreadState::Idle; initial_names.len()]),
+        let (bridge, bridge_available) = match AgentBridge::new_with_thread_specs(&initial_specs) {
+            Ok(b) => (Some(b), true),
             Err(e) => {
                 eprintln!("panel-rust: agent bridge unavailable, chat panel is display-only: {e}");
-                (None, vec![ThreadState::Error; initial_names.len()])
+                (None, false)
             }
         };
-        let settings_reload_pending = std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(false),
-        );
+        let initial_selected_thread_id = panel_state
+            .as_ref()
+            .and_then(|store| store.defaults().ok())
+            .and_then(|defaults| defaults.selected_thread_id);
+        let settings_reload_pending =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let settings_watcher = {
             let pending = settings_reload_pending.clone();
             let paths = settings_file::SettingsPaths::from_env();
@@ -1660,9 +1084,38 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 })),
             ))
         };
+        // Cold-start payload is collected once, then folded only through
+        // Init -> InitialStateLoaded. The shell Model starts empty so the
+        // TEA path owns the first real hydration (no pre-seed + replace).
+        let initial = model::InitialState {
+            threads: initial_specs.clone(),
+            thread_ids: restored_records
+                .iter()
+                .map(|record| record.thread_id.clone())
+                .chain(
+                    (restored_records.len()..initial_specs.len())
+                        .map(|idx| format!("thread:{idx}")),
+                )
+                .collect(),
+            selected_thread_id: initial_selected_thread_id.clone(),
+            permission_profiles: initial_permission_profiles.clone(),
+            thread_states: if bridge_available {
+                vec![ThreadState::Idle; initial_specs.len()]
+            } else {
+                vec![ThreadState::Error; initial_specs.len()]
+            },
+        };
+        let mut model = model::Model::default();
+        let thread_model = Rc::new(VecModel::default());
+        let messages_model = Rc::new(VecModel::default());
+        let skills_model = Rc::new(VecModel::default());
+        model.thread_model = thread_model.clone();
+        model.messages_model = messages_model.clone();
+        model.skills_model = skills_model.clone();
         let panel = PanelSingleton {
             window,
             component,
+            model: RefCell::new(model),
             buffer: RefCell::new(vec![
                 PremultipliedRgbaColor {
                     red: 0,
@@ -1676,44 +1129,40 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             height,
             bridge,
             panel_state,
-            appearance: RefCell::new(AppearanceState::default()),
-            active_project_path: RefCell::new(None),
-            thread_names: RefCell::new(initial_names),
-            thread_profiles: RefCell::new(initial_profiles),
-            thread_permission_profiles: RefCell::new(initial_permission_profiles),
-            traced_attachment_threads: RefCell::new(HashSet::new()),
-            binding_conflict_threads: RefCell::new(HashSet::new()),
-            thread_state: RefCell::new(initial_state),
-            // Sized to match thread_state/thread_names from construction,
-            // not left empty -- an empty Vec here made every `.get_mut(idx)`
-            // in the `AgentEvent::Error` handler silently no-op for any
-            // thread that existed at startup (the whole bootstrap set),
-            // so neither the sidebar's "Error: ..." subtitle nor the
-            // transcript error banner ever recorded a real failure for
-            // them, only for threads created afterward via "New Thread"
-            // (whose creation path does push a matching entry). Found live
-            // against a real running instance: a bootstrap thread's
-            // AgentEvent::Error genuinely fired (confirmed via
-            // RUI_PANEL_INPUT_TRACE) and set ThreadState::Error, yet
-            // last-error stayed empty the whole time.
-            thread_errors: RefCell::new(vec![String::new(); initial_thread_count]),
-            send_queues: RefCell::new(
-                (0..initial_thread_count)
-                    .map(|_| crate::send_queue::SendQueue::new())
-                    .collect(),
-            ),
-            search_query: RefCell::new(String::new()),
-            visible_indices: RefCell::new(Vec::new()),
-            expanded: RefCell::new(Vec::new()),
-            displayed_thread: Cell::new(None),
-            expanded_terminal_id: RefCell::new(None),
-            local_terminal_last_text: RefCell::new(String::new()),
             settings_reload_pending,
             settings_ignore_watch_until: Cell::new(None),
             _settings_watcher: settings_watcher,
         };
-        panel.refresh_threads_model();
-        panel.refresh_skills_model();
+        // Bind persistent VecModels before any callback can fire; content
+        // arrives from the Init hydration + first Frame snapshot below.
+        crate::sync::sync_initial_models(&panel.model.borrow(), &panel.component);
+        {
+            let mut model = panel.model.borrow_mut();
+            let (effects, _) = update::update(&mut model, msg::Msg::Host(msg::HostMsg::Init));
+            debug_assert!(matches!(
+                effects.as_slice(),
+                [effect::Effect::LoadInitialState]
+            ));
+            let (_, dirty) = update::update(
+                &mut model,
+                msg::Msg::Effect(effect::EffectResultMsg::InitialStateLoaded(Ok(initial))),
+            );
+            sync::sync(&model, &panel.component, &dirty);
+        }
+        // Fold the first bridge/store-backed presentation snapshot as one
+        // Frame message. This makes cold start's first post-hydration sync a
+        // single reducer turn instead of several adapter-driven pushes.
+        panel.dispatch_frame_input(crate::msg::FrameInput {
+            thread_list_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                    .collect_thread_list_snapshot(),
+            ),
+            skills_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                    .collect_skills_snapshot(),
+            ),
+            ..crate::msg::FrameInput::default()
+        });
         // Multi-process prefs live in JSON; selected thread stays in SQLite.
         if let Some(store) = panel.panel_state.as_ref() {
             maybe_migrate_sqlite_defaults_to_json(store);
@@ -1723,42 +1172,46 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .as_ref()
             .and_then(|store| store.defaults().ok())
             .and_then(|d| d.selected_thread_id);
-        let settings_scope = if settings_file::SettingsPaths::from_env()
-            .project
-            .is_some()
-        {
+        let settings_scope = if settings_file::SettingsPaths::from_env().project.is_some() {
             "project"
         } else {
             "global"
         };
-        panel.component.set_settings_scope(settings_scope.into());
         let scoped_prefs = load_scoped_panel_prefs(settings_scope, selected_from_sqlite.clone());
         let defaults = scoped_prefs
             .as_ref()
             .map(|prefs| prefs.defaults.clone())
             .unwrap_or_else(|| load_panel_prefs(selected_from_sqlite));
-        panel.component.set_default_profile(
-            defaults.profile_name.clone().unwrap_or_default().into(),
-        );
-        panel.component.set_permission_profile(
-            defaults
-                .permission_profile
-                .clone()
-                .unwrap_or_default()
-                .into(),
-        );
-        panel
-            .component
-            .set_background_default(defaults.background_session);
-        panel.component.set_default_agent_id(
-            scoped_prefs
-                .and_then(|prefs| prefs.default_agent_id)
-                .unwrap_or_default()
-                .into(),
-        );
         panel.sync_runtime_defaults(&defaults);
-        let dev_mode_at_startup = settings_file::SettingsPaths::from_env().dev_mode();
-        panel.component.set_dev_mode(dev_mode_at_startup);
+        if let Some(selected_thread_id) = defaults.selected_thread_id {
+            if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
+                (0..panel.model.borrow().threads.len()).find(|idx| {
+                    bridge
+                        .thread_binding(*idx)
+                        .is_some_and(|binding| binding.thread_id == selected_thread_id)
+                })
+            }) {
+                let filtered_idx = {
+                    panel
+                        .model
+                        .borrow()
+                        .visible_indices
+                        .iter()
+                        .position(|idx| *idx == real_idx)
+                };
+                if let Some(filtered_idx) = filtered_idx {
+                    dispatch::dispatch_thread_selected(&panel, filtered_idx);
+                }
+            }
+        }
+        panel.dispatch_frame_input(crate::msg::FrameInput {
+            settings_preferences_snapshot: Some(
+                crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                    .collect_settings_preferences_snapshot(Some(settings_scope)),
+            ),
+            ..crate::msg::FrameInput::default()
+        });
+        let dev_mode_at_startup = panel.model.borrow().dev_mode;
         if dev_mode_at_startup {
             // Mirrors on_dev_mode_toggled's install-on-enable behavior --
             // that callback only fires on the OFF->ON transition, so a
@@ -1769,30 +1222,31 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
                 eprintln!("panel-rust: failed to install bundled global skill at startup: {error}");
             }
-            panel.refresh_skills_model();
+            panel.dispatch_frame_input(crate::msg::FrameInput {
+                skills_snapshot: Some(
+                    crate::external_snapshot::ExternalSnapshotSource::new(&panel)
+                        .collect_skills_snapshot(),
+                ),
+                ..crate::msg::FrameInput::default()
+            });
         }
-        if let Some(selected_thread_id) = defaults.selected_thread_id {
-            if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
-                (0..panel.thread_names.borrow().len()).find(|idx| {
-                    bridge
-                        .thread_binding(*idx)
-                        .is_some_and(|binding| binding.thread_id == selected_thread_id)
-                })
-            }) {
-                if let Some(filtered_idx) = panel
-                    .visible_indices
-                    .borrow()
-                    .iter()
-                    .position(|idx| *idx == real_idx)
-                {
-                    panel.component.set_selected_thread(filtered_idx as i32);
-                }
-            }
-        }
-        if let Some(real_idx) = panel.real_index(panel.component.get_selected_thread() as usize) {
-            panel.refresh_messages_for(real_idx);
+        let selected_thread = { panel.model.borrow().selected_thread };
+        if let Some(real_idx) = panel.real_index(selected_thread) {
+            panel.dispatch_frame_input(crate::msg::FrameInput {
+                selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(
+                    &panel,
+                )
+                .collect_thread_snapshot_for(real_idx),
+                ..crate::msg::FrameInput::default()
+            });
+        } else {
+            panel.dispatch_frame_input(crate::msg::FrameInput {
+                clear_selected_thread: true,
+                ..crate::msg::FrameInput::default()
+            });
         }
 
+        // Thread callbacks enter through Msg::Ui(UiMsg::Thread(..)).
         let component_weak = panel.component.as_weak();
         panel.component.on_thread_selected(move |idx| {
             let Some(_component) = component_weak.upgrade() else {
@@ -1801,29 +1255,29 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     // `idx` is a filtered-list index (Phase 2).
-                    panel.select_visible_thread(idx as usize);
+                    dispatch::dispatch_thread_selected(panel, idx as usize);
                 }
             });
         });
 
         let component_weak = panel.component.as_weak();
-        panel.component.on_thread_navigation_requested(move |delta| {
-            let Some(_component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    let visible_len = panel.visible_indices.borrow().len();
-                    if visible_len == 0 {
-                        return;
+        panel
+            .component
+            .on_thread_navigation_requested(move |delta| {
+                let Some(_component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_thread_navigate(panel, delta);
                     }
-                    let current = panel.component.get_selected_thread().max(0) as usize;
-                    let next = wrap_thread_index(current, delta, visible_len);
-                    panel.select_visible_thread(next);
-                }
+                });
             });
-        });
 
+        // tea-slint-model Phase 4 (Settings domain): routed through
+        // Msg::Ui(UiMsg::Settings(..)) -> update() -> dispatch's bridge
+        // into the settings, MCP, profile, and agent dispatch methods
+        // (unchanged, now pub(crate)) -- see dispatch.rs's doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_settings_requested(move || {
             let Some(component) = component_weak.upgrade() else {
@@ -1831,40 +1285,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    // Open immediately so a slow/failed gateway list cannot
-                    // leave the user thinking Settings is dead.
-                    component.set_settings_open(true);
-                    let scope = if settings_file::SettingsPaths::from_env()
-                        .project
-                        .is_some()
-                    {
-                        "project"
-                    } else {
-                        "global"
-                    };
-                    component.set_settings_scope(scope.into());
-                    panel.apply_json_prefs_to_component();
-                    if let Some(store) = panel.panel_state.as_ref() {
-                        let selected_override = panel
-                            .real_index(component.get_selected_thread() as usize)
-                            .and_then(|idx| {
-                                panel
-                                    .bridge
-                                    .as_ref()
-                                    .and_then(|bridge| bridge.thread_binding(idx))
-                                    .map(|binding| binding.thread_id)
-                            })
-                            .and_then(|thread_id| {
-                                store
-                                    .thread_settings(&thread_id)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|settings| settings.background_session)
-                            });
-                        component.set_background_override_set(selected_override.is_some());
-                        component.set_background_override(selected_override.unwrap_or(false));
-                    }
-                    panel.refresh_settings_gateway_lists();
+                    dispatch::dispatch_settings_open(panel, &component);
                 }
             });
         });
@@ -1875,14 +1296,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 return;
             };
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                if load_scoped_panel_prefs(scope.as_str(), None).is_none() {
-                    component.set_settings_scope("global".into());
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_settings_scope_changed(panel, &component, scope.to_string());
                 }
-                panel.apply_json_prefs_to_component();
             });
         });
 
@@ -1893,126 +1309,40 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let defaults = PanelDefaults {
-                        profile_name: non_empty(component.get_default_profile().to_string()),
-                        permission_profile: non_empty(
-                            component.get_permission_profile().to_string(),
-                        ),
-                        background_session: component.get_background_default(),
-                        selected_thread_id: panel
-                            .real_index(component.get_selected_thread() as usize)
-                            .and_then(|idx| {
-                                panel
-                                    .bridge
-                                    .as_ref()
-                                    .and_then(|bridge| bridge.thread_binding(idx))
-                                    .map(|binding| binding.thread_id)
-                            }),
-                    };
-                    // JSON is the multi-process source of truth for prefs.
-                    if let Err(error) = save_panel_prefs_to_json(
-                        component.get_settings_scope().as_str(),
-                        &defaults,
-                        non_empty(component.get_default_agent_id().to_string()),
-                    ) {
-                        eprintln!("panel-rust: failed to save panel settings JSON: {error}");
-                        return;
-                    }
-                    // JSON remains the cross-process source of truth. The
-                    // SQLite mirror exists solely for immediate thread-level
-                    // background-session resolution in this panel process.
-                    panel.sync_runtime_defaults(&load_panel_prefs(None));
-                    // Mark self-write so the file watcher does not bounce UI.
-                    panel.settings_ignore_watch_until.set(Some(
-                        std::time::Instant::now() + std::time::Duration::from_millis(500),
-                    ));
-                    if let Some(store) = panel.panel_state.as_ref() {
-                        // Selected thread stays process-local SQLite only.
-                        if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
-                            if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
-                                eprintln!(
-                                    "panel-rust: failed to persist selected chat thread: {error}"
-                                );
-                            }
-                        }
-                        if let Some(thread_id) = defaults.selected_thread_id.as_deref() {
-                            let override_value = component
-                                .get_background_override_set()
-                                .then_some(component.get_background_override());
-                            if let Err(error) =
-                                store.set_background_override(thread_id, override_value)
-                            {
-                                eprintln!(
-                                    "panel-rust: failed to save background-session override: {error}"
-                                );
-                            }
-                        }
-                    }
-                    panel.refresh_threads_model();
-                    component.set_settings_open(false);
+                    dispatch::dispatch_settings_save(panel, &component);
                 }
             });
         });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_settings_close(move || {
-            if let Some(component) = component_weak.upgrade() {
-                component.set_settings_open(false);
-            }
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_settings_close(panel, &component);
+                }
+            });
         });
 
         panel.component.on_error_banner_dismissed(move || {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let selected = panel.component.get_selected_thread();
-                    let Some(real_idx) = panel.real_index(selected.max(0) as usize) else {
-                        return;
-                    };
-                    if let Some(error) = panel.thread_errors.borrow_mut().get_mut(real_idx) {
-                        error.clear();
-                    }
-                    panel.refresh_last_error_for(real_idx);
-                    // Sidebar subtitle mirrors the same error string --
-                    // dismissing the banner should clear both, not leave
-                    // the sidebar still saying "Error: ...".
-                    panel.refresh_threads_model();
+                    dispatch::dispatch_error_banner_dismissed(panel);
                 }
             });
         });
 
-        panel.component.on_thread_toggle_background(move |slint_index| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(store) = panel.panel_state.as_ref() else {
-                        return;
-                    };
-                    let Some(thread_id) = panel
-                        .real_index(slint_index as usize)
-                        .and_then(|idx| {
-                            panel
-                                .bridge
-                                .as_ref()
-                                .and_then(|bridge| bridge.thread_binding(idx))
-                                .map(|binding| binding.thread_id)
-                        })
-                    else {
-                        return;
-                    };
-                    let next = !store
-                        .effective_background_session(&thread_id)
-                        .unwrap_or(false);
-                    if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
-                        eprintln!(
-                            "panel-rust: failed to toggle background-session override: {error}"
-                        );
-                        return;
+        panel
+            .component
+            .on_thread_toggle_background(move |slint_index| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_thread_toggle_background(panel, slint_index as usize);
                     }
-                    // Threads model feeds sidebar moon + ChatArea
-                    // active-thread-background binding.
-                    panel.refresh_threads_model();
-                }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_mcp_server_create(move |name, command| {
@@ -2021,25 +1351,12 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let entry = if command.is_empty() {
-                        serde_json::json!({ "name": name.to_string() })
-                    } else {
-                        serde_json::json!({ "name": name.to_string(), "command": command.to_string() })
-                    };
-                    // Don't optimistically append -- re-list from the
-                    // gateway's own state either way, same posture as
-                    // the mode/config selector's `refresh_capabilities_
-                    // for`. A failed create still triggers a re-list so
-                    // the sheet reflects reality (e.g. a duplicate name
-                    // the gateway rejected).
-                    let gw = panel.settings_gateway_index();
-                    bridge.create_mcp_server(gw, entry);
-                    component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(gw),
-                    ));
+                    dispatch::dispatch_mcp_server_create(
+                        panel,
+                        &component,
+                        name.to_string(),
+                        command.to_string(),
+                    );
                 }
             });
         });
@@ -2051,14 +1368,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let gw = panel.settings_gateway_index();
-                    bridge.delete_mcp_server(gw, &name);
-                    component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(gw),
-                    ));
+                    dispatch::dispatch_mcp_server_delete(panel, &component, name.to_string());
                 }
             });
         });
@@ -2068,43 +1378,17 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .component
             .on_mcp_server_enabled_changed(move |name, enabled| {
                 let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                    let slot = cell.borrow();
-                    let Some(panel) = slot.as_ref() else {
-                        return;
-                    };
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let gw = panel.settings_gateway_index();
-                    let Some(mut entry) = bridge
-                        .list_mcp_servers(gw)
-                        .into_iter()
-                        .find(|entry| entry.name == name.as_str())
-                    else {
-                        eprintln!(
-                            "panel-rust: MCP server {:?} disappeared before its enabled state could update",
-                            name
-                        );
-                        component.set_available_mcp_servers(models::to_mcp_server_options(
-                            bridge.list_mcp_servers(gw),
-                        ));
-                        return;
-                    };
-                    entry.extra["enabled"] = serde_json::Value::Bool(enabled);
-                    if !bridge.update_mcp_server(gw, entry.extra) {
-                        eprintln!(
-                            "panel-rust: failed to update enabled state for MCP server {:?}",
-                            name
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_enabled_changed(
+                            panel,
+                            &component,
+                            name.to_string(),
+                            enabled,
                         );
                     }
-                    // The gateway is authoritative. Re-list after either
-                    // outcome rather than leaving an optimistic UI value.
-                    component.set_available_mcp_servers(models::to_mcp_server_options(
-                        bridge.list_mcp_servers(gw),
-                    ));
                 });
             });
 
@@ -2117,28 +1401,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 PANEL.with(|cell| {
                     if let Some(panel) = cell.borrow().as_ref() {
-                        let Some(bridge) = &panel.bridge else {
-                            return;
-                        };
-                        let mut entry = serde_json::json!({
-                            "name": name.to_string(),
-                            "allow_terminal_access": terminal_enabled,
-                            "allow_fs_access": fs_enabled,
-                        });
-                        if !agent_id.is_empty() {
-                            entry["agent_id"] = serde_json::Value::String(agent_id.to_string());
-                        }
-                        // Don't optimistically append -- re-list from
-                        // the gateway's own state either way, same
-                        // posture as `on_mcp_server_create` above. A
-                        // failed create still triggers a re-list so the
-                        // sheet reflects reality (e.g. a duplicate name
-                        // the gateway rejected).
-                        let gw = panel.settings_gateway_index();
-                        bridge.create_profile(gw, entry);
-                        component.set_available_profiles(models::to_profile_options(
-                            bridge.list_profiles(gw),
-                        ));
+                        dispatch::dispatch_profile_create(
+                            panel,
+                            &component,
+                            name.to_string(),
+                            (!agent_id.is_empty()).then(|| agent_id.to_string()),
+                            terminal_enabled,
+                            fs_enabled,
+                        );
                     }
                 });
             });
@@ -2150,14 +1420,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    let gw = panel.settings_gateway_index();
-                    bridge.delete_profile(gw, &name);
-                    component.set_available_profiles(models::to_profile_options(
-                        bridge.list_profiles(gw),
-                    ));
+                    dispatch::dispatch_profile_delete(panel, &component, name.to_string());
                 }
             });
         });
@@ -2169,25 +1432,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else {
-                        return;
-                    };
-                    // Blocking, same posture as `add_thread_with_
-                    // profile`'s own gateway calls -- `agents/install`
-                    // is a low-frequency settings-sheet action, and
-                    // this call can be genuinely slow (a real first-time
-                    // npx/binary install). A future progress/job model
-                    // is an explicitly open, undecided item (see acpx-
-                    // client::ext::registry::install's own doc comment)
-                    // -- not addressed by this call site.
-                   let gw = panel.settings_gateway_index();
-                   bridge.install_agent(gw, &agent_id);
-                   component.set_agent_catalog(models::to_agent_catalog_entries(
-                       bridge.list_agents(gw),
-                   ));
-               }
-           });
-       });
+                    dispatch::dispatch_agent_install_requested(
+                        panel,
+                        &component,
+                        agent_id.to_string(),
+                    );
+                }
+            });
+        });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2198,441 +1450,174 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 PANEL.with(|cell| {
                     let mut slot = cell.borrow_mut();
-                    let Some(panel) = slot.as_mut() else {
-                        return;
-                    };
-                    // Recovery/import (Coverage Matrix `session/list`
-                    // row): a brand-new local thread row, bound via
-                    // `session/load` to a pre-existing remote session --
-                    // explicitly never `session/new`. Name derives from
-                    // the backend's own `title` when it has one (real
-                    // ACP metadata), falling back to a short, still-
-                    // unique session-id-derived label otherwise, same
-                    // "always produce a valid slug" posture `on_new_
-                    // thread_requested`'s own `format!("New thread
-                    // {next_number}")` fallback establishes for its own
-                    // case.
-                    let title = title.to_string();
-                    let base_name = if title.trim().is_empty() {
-                        format!(
-                            "Recovered {}",
-                            session_id.chars().take(8).collect::<String>()
-                        )
-                    } else {
-                        title
-                    };
-                    let mut name = base_name.clone();
-                    let mut suffix = 2;
-                    while panel
-                        .thread_names
-                        .borrow()
-                        .iter()
-                        .any(|existing| existing == &name)
-                    {
-                        name = format!("{base_name} ({suffix})");
-                        suffix += 1;
-                    }
-                    let (real_idx, binding, thread_provider) = {
-                        let Some(bridge) = panel.bridge.as_mut() else {
-                            return;
-                        };
-                        let Ok(real_idx) = bridge.add_thread_recovering_session(
-                            &name,
-                            provider.as_str(),
-                            session_id.as_str(),
-                        ) else {
-                            return;
-                        };
-                        (
-                            real_idx,
-                            bridge.thread_binding(real_idx),
-                            bridge.thread_provider(real_idx),
-                        )
-                    };
-                    if let (Some(store), Some(binding), Some(thread_provider)) = (
-                        panel.panel_state.as_ref(),
-                        binding.as_ref(),
-                        thread_provider.as_ref(),
-                    ) {
-                        let record = ThreadRecord {
-                            thread_id: binding.thread_id.clone(),
-                            display_name: name.clone(),
-                            provider: thread_provider.clone(),
-                            session_id: binding.session_id.clone(),
-                            profile_name: None,
-                            permission_profile: None,
-                            background_session: None,
-                        };
-                        if let Err(error) = store.save_thread_record(&record) {
-                            eprintln!(
-                                "panel-rust: failed to persist recovered chat thread: {error}"
-                            );
-                        }
-                    }
-                    panel.thread_names.borrow_mut().push(name);
-                    panel.thread_profiles.borrow_mut().push(None);
-                    panel.thread_permission_profiles.borrow_mut().push(None);
-                    panel.thread_state.borrow_mut().push(ThreadState::Idle);
-                    panel.thread_errors.borrow_mut().push(String::new());
-                    panel
-                        .send_queues
-                        .borrow_mut()
-                        .push(crate::send_queue::SendQueue::new());
-                    panel.search_query.borrow_mut().clear();
-                    panel.refresh_threads_model();
-                    // The recovered session is now bound locally --
-                    // refresh the sheet's own list so it no longer
-                    // shows as recoverable (matches `recoverable_
-                    // sessions`'s own "already bound" exclusion).
-                    if let Some(bridge) = panel.bridge.as_ref() {
-                        let recovery_provider = bridge.thread_provider(real_idx).unwrap_or_default();
-                        component.set_recoverable_sessions(models::to_remote_session_options(
-                            bridge.recoverable_sessions(real_idx),
-                            &recovery_provider,
-                        ));
-                    }
-                    let filtered_idx = {
-                        let visible_indices = panel.visible_indices.borrow();
-                        visible_indices.iter().position(|idx| *idx == real_idx)
-                    };
-                    if let Some(filtered_idx) = filtered_idx {
-                        component.set_selected_thread(filtered_idx as i32);
-                        if let (Some(store), Some(binding)) = (panel.panel_state.as_ref(), binding)
-                        {
-                            if let Err(error) =
-                                store.set_selected_thread_id(Some(&binding.thread_id))
-                            {
-                                eprintln!(
-                                    "panel-rust: failed to persist selected chat thread: {error}"
-                                );
-                            }
-                        }
-                        panel.refresh_messages_for(real_idx);
+                    if let Some(panel) = slot.as_mut() {
+                        dispatch::dispatch_thread_recover_session_attach(
+                            panel,
+                            &component,
+                            session_id.to_string(),
+                            provider.to_string(),
+                            title.to_string(),
+                        );
                     }
                 });
             });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_new_thread_requested(move || {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
             PANEL.with(|cell| {
                 let mut slot = cell.borrow_mut();
-                let Some(panel) = slot.as_mut() else {
-                    return;
-                };
-                let next_number = panel.thread_names.borrow().len() + 1;
-                let name = format!("New thread {next_number}");
-                // Profile-picker addition: a new thread opens with
-                // whichever profile is currently set as the settings
-                // sheet's default (empty means native/unmanaged mode,
-                // matching `add_thread`'s prior always-`None` behavior).
-                // Prefer resolved JSON prefs (multi-process) then UI field.
-                let prefs = load_panel_prefs(None);
-                let default_profile = non_empty(component.get_default_profile().to_string())
-                    .or(prefs.profile_name);
-                let default_agent_id = non_empty(component.get_default_agent_id().to_string())
-                    .or_else(|| {
-                        settings_file::SettingsPaths::from_env()
-                            .load_resolved()
-                            .ok()
-                            .and_then(|resolved| resolved.default_agent_id)
-                    });
-                let mut profile = default_profile;
-                // Resolve gateway index before mutably borrowing the bridge.
-                let gw = panel.settings_gateway_index();
-                let (real_idx, binding, provider) = {
-                    let Some(bridge) = panel.bridge.as_mut() else {
-                        eprintln!(
-                            "panel-rust: new-thread-requested ignored, agent bridge unavailable"
-                        );
+                if let Some(panel) = slot.as_mut() {
+                    let Some(component) = component_weak.upgrade() else {
                         return;
                     };
-                    // Validate profile name against gateway list when set.
-                    if let Some(ref p) = profile {
-                        let names: Vec<String> = bridge
-                            .list_profiles(gw)
-                            .into_iter()
-                            .map(|s| s.name)
-                            .collect();
-                        if !names.is_empty() && !names.iter().any(|n| n == p) {
-                            eprintln!(
-                                "panel-rust: default profile {p:?} not in gateway list {names:?}; opening unmanaged"
-                            );
-                            profile = None;
-                        }
-                    }
-                    let preferred_provider = default_agent_id
-                        .as_deref()
-                        .and_then(provider_for_default_agent);
-                    let real_idx = match bridge.add_thread_with_profile_and_provider(
-                        &name,
-                        profile.as_deref(),
-                        preferred_provider,
-                    ) {
-                        Ok(idx) => idx,
-                        Err(error) => {
-                            eprintln!(
-                                "panel-rust: new-thread-requested failed to add thread {name:?}: {error}"
-                            );
-                            return;
-                        }
-                    };
-                    (
-                        real_idx,
-                        bridge.thread_binding(real_idx),
-                        bridge.thread_provider(real_idx),
-                    )
-                };
-                if let (Some(store), Some(binding), Some(provider)) = (
-                    panel.panel_state.as_ref(),
-                    binding.as_ref(),
-                    provider.as_ref(),
-                ) {
-                    let record = ThreadRecord {
-                        thread_id: binding.thread_id.clone(),
-                        display_name: name.clone(),
-                        provider: provider.clone(),
-                        session_id: binding.session_id.clone(),
-                        profile_name: profile.clone(),
-                        permission_profile: non_empty(
-                            component.get_permission_profile().to_string(),
-                        ),
-                        background_session: None,
-                    };
-                    if let Err(error) = store.save_thread_record(&record) {
-                        eprintln!("panel-rust: failed to persist new chat thread: {error}");
-                    }
-                }
-                panel.thread_names.borrow_mut().push(name);
-                panel.thread_profiles.borrow_mut().push(profile);
-                panel
-                    .thread_permission_profiles
-                    .borrow_mut()
-                    .push(non_empty(component.get_permission_profile().to_string()));
-                panel.thread_state.borrow_mut().push(ThreadState::Idle);
-                panel.thread_errors.borrow_mut().push(String::new());
-                panel
-                    .send_queues
-                    .borrow_mut()
-                    .push(crate::send_queue::SendQueue::new());
-                panel.search_query.borrow_mut().clear();
-                // New session: clear compose so it never carries over.
-                component.set_compose_text("".into());
-                panel.refresh_threads_model();
-                let filtered_idx = {
-                    let visible_indices = panel.visible_indices.borrow();
-                    visible_indices.iter().position(|idx| *idx == real_idx)
-                };
-                if let Some(filtered_idx) = filtered_idx {
-                    component.set_selected_thread(filtered_idx as i32);
-                    if let (Some(store), Some(binding)) = (panel.panel_state.as_ref(), binding) {
-                        if let Err(error) =
-                            store.set_selected_thread_id(Some(&binding.thread_id))
-                        {
-                            eprintln!("panel-rust: failed to persist selected chat thread: {error}");
-                        }
-                    }
-                    // Fresh empty transcript for the new session row.
-                    panel.refresh_messages_for(real_idx);
+                    dispatch::dispatch_thread_new(panel, &component);
                 }
             });
         });
 
-        panel.component.on_thread_rename_requested(move |filtered_idx, name| {
-            let name = name.trim().to_owned();
-            if name.is_empty() {
-                return;
-            }
-            PANEL.with(|cell| {
-                let panel_slot = cell.borrow();
-                let Some(panel) = panel_slot.as_ref() else {
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_thread_rename_requested(move |filtered_idx, name| {
+                let Some(component) = component_weak.upgrade() else {
                     return;
                 };
-                let Some(real_idx) = panel.real_index(filtered_idx as usize) else {
-                    return;
-                };
-                let thread_id = panel
-                    .bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_binding(real_idx))
-                    .map(|binding| binding.thread_id);
-
-                let Some(current_name) = panel.thread_names.borrow().get(real_idx).cloned() else {
-                    return;
-                };
-                if current_name == name {
-                    return;
-                }
-                if let Some(slot) = panel.thread_names.borrow_mut().get_mut(real_idx) {
-                    *slot = name.clone();
-                }
-                if let (Some(store), Some(thread_id)) = (panel.panel_state.as_ref(), thread_id) {
-                    if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
-                        eprintln!("panel-rust: failed to persist renamed chat thread: {error}");
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_thread_rename(
+                            panel,
+                            &component,
+                            filtered_idx as usize,
+                            name.to_string(),
+                        );
                     }
-                }
-
-                panel.refresh_threads_model();
-                let updated_filtered_idx = {
-                    panel
-                        .visible_indices
-                        .borrow()
-                        .iter()
-                        .position(|idx| *idx == real_idx)
-                };
-                let has_visible_threads = !panel.visible_indices.borrow().is_empty();
-                if let Some(updated_filtered_idx) = updated_filtered_idx {
-                    panel.component.set_selected_thread(updated_filtered_idx as i32);
-                    panel.refresh_messages_for(real_idx);
-                } else if has_visible_threads {
-                    panel.component.set_selected_thread(0);
-                }
+                });
             });
-        });
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_thread_close_requested(move |filtered_idx| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_thread_close(panel, &component, filtered_idx as usize);
+                    }
+                });
+            });
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
+            .on_thread_delete_requested(move |filtered_idx| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_thread_delete(panel, &component, filtered_idx as usize);
+                    }
+                });
+            });
 
         panel.component.on_new_skill_requested(move |name, scope| {
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                let skill_scope = match scope.as_str() {
-                    "global" => crate::skills_state::SkillScope::Global,
-                    "project" => crate::skills_state::SkillScope::Project,
-                    other => {
-                        eprintln!("panel-rust: invalid new skill scope {other:?}");
-                        return;
-                    }
-                };
-                let active_project_path = panel.active_project_path.borrow().clone();
-                let active_project_file = active_project_path.as_deref().map(std::path::Path::new);
-                let dir = match crate::skills_state::skill_creation_dir(
-                    skill_scope,
-                    &resolve_cache_dir(),
-                    active_project_file,
-                ) {
-                    Ok(dir) => dir,
-                    Err(error) => {
-                        eprintln!(
-                            "panel-rust: failed to resolve {scope} skill storage for {name:?}: {error}"
-                        );
-                        return;
-                    }
-                };
-                match crate::skills_state::scaffold_new_skill(&dir, name.as_str()) {
-                    Ok(skill_dir) => {
-                        trace_host_input(format_args!("new skill scaffolded at {skill_dir:?}"));
-                        panel.refresh_skills_model();
-                        panel.open_skill_editor(&skill_dir);
-                    }
-                    Err(error) => {
-                        eprintln!("panel-rust: failed to create new skill {name:?}: {error}");
-                    }
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_new_skill_requested(
+                        panel,
+                        name.to_string(),
+                        scope.to_string(),
+                    );
                 }
             });
         });
 
         panel.component.on_skill_promote_to_global(move |path| {
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                let skill_dir = std::path::PathBuf::from(path.as_str());
-                let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-                match crate::skills_state::promote_skill_to_global(&skill_dir, &global_dir) {
-                    Ok(destination) => {
-                        trace_host_input(format_args!("skill promoted to global at {destination:?}"));
-                        panel.refresh_skills_model();
-                    }
-                    Err(error) => {
-                        eprintln!("panel-rust: failed to promote skill {path:?} to global: {error}");
-                    }
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_promote_to_global(panel, path.to_string());
                 }
             });
         });
 
         panel.component.on_dev_mode_toggled(move |enabled| {
-            let paths = settings_file::SettingsPaths::from_env();
-            if let Err(error) = paths.set_dev_mode(enabled) {
-                eprintln!("panel-rust: failed to persist dev mode: {error}");
-            }
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                panel.component.set_dev_mode(enabled);
-                if enabled {
-                    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-                    if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
-                        eprintln!("panel-rust: failed to install bundled global skill: {error}");
-                    }
-                    panel.refresh_skills_model();
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_dev_mode_toggled(panel, enabled);
                 }
             });
         });
 
         panel.component.on_skill_editor_open_requested(move |path| {
             PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let Some(panel) = slot.as_ref() else {
-                    return;
-                };
-                panel.open_skill_editor(std::path::Path::new(path.as_str()));
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_editor_open_requested(panel, path.to_string());
+                }
             });
         });
 
-        panel.component.on_skill_content_edited(move |path, content| {
-            let skill_md = std::path::Path::new(path.as_str()).join("SKILL.md");
-            if let Err(error) = std::fs::write(&skill_md, content.as_str()) {
-                eprintln!("panel-rust: failed to save skill {path:?}: {error}");
-            }
-        });
+        panel
+            .component
+            .on_skill_content_edited(move |path, content| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_skill_content_edited(
+                            panel,
+                            path.to_string(),
+                            content.to_string(),
+                        );
+                    }
+                });
+            });
 
         panel.component.on_skill_copy_path_requested(move |path| {
-            trace_host_input(format_args!("skill copy-path requested for {path:?}"));
-            // No system clipboard dependency in this crate today -- see
-            // panel-rust/Cargo.lock check in skill-manager-workspace's
-            // 03-open-risks.md for the same "no new dependency without a
-            // concrete need" stance applied to the opener crate. Logged
-            // for now; a real clipboard write is a small, separate
-            // addition once a clipboard crate is actually needed
-            // elsewhere too.
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_skill_copy_path_requested(panel, path.to_string());
+                }
+            });
         });
 
-        panel.component.on_skill_open_in_editor_requested(move |editor_name, path| {
-            let Some((bin, _)) = crate::editor_detect::EDITOR_CANDIDATES
-                .iter()
-                .find(|(_, name)| *name == editor_name.as_str())
-            else {
-                eprintln!("panel-rust: unknown editor {editor_name:?}");
-                return;
-            };
-            if let Err(error) =
-                crate::editor_detect::open_in_editor(bin, std::path::Path::new(path.as_str()))
-            {
-                eprintln!("panel-rust: failed to open skill in {editor_name:?}: {error}");
-            }
-        });
+        panel
+            .component
+            .on_skill_open_in_editor_requested(move |editor_name, path| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_skill_open_in_editor_requested(
+                            panel,
+                            editor_name.to_string(),
+                            path.to_string(),
+                        );
+                    }
+                });
+            });
 
-        panel.component.on_skill_open_with_os_default_requested(move |path| {
-            if let Err(error) =
-                crate::editor_detect::open_with_os_default(std::path::Path::new(path.as_str()))
-            {
-                eprintln!("panel-rust: failed to open skill with OS default: {error}");
-            }
-        });
+        panel
+            .component
+            .on_skill_open_with_os_default_requested(move |path| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_skill_open_with_os_default_requested(
+                            panel,
+                            path.to_string(),
+                        );
+                    }
+                });
+            });
 
+        // tea-slint-model Phase 4 (Compose domain): routed through
+        // Msg::Ui(UiMsg::Compose(..)) -> update() -> dispatch's bridge
+        // into the reducer and effect executor -- see dispatch.rs's
+        // doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_send_requested(move || {
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
             let text = component.get_compose_text().to_string();
-            let text = text.trim();
+            let text = text.trim().to_owned();
             if text.is_empty() {
                 trace_host_input("send requested with empty composer");
                 return;
@@ -2641,171 +1626,39 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             trace_host_input(format_args!(
                 "send requested selected_thread={filtered_idx} text={text:?}"
             ));
-            component.set_compose_text("".into());
-            PANEL.with(|cell| {
+            PANEL.with(move |cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(idx) = panel.real_index(filtered_idx) else {
-                        return;
-                    };
-                    let Some(bridge) = &panel.bridge else { return };
-                    if panel
-                        .thread_state
-                        .borrow()
-                        .get(idx)
-                        .is_some_and(|state| *state == ThreadState::Loading)
-                    {
-                        // queued_send_queue_behavior: a turn is already
-                        // in flight, so this message goes on the queue
-                        // instead of being silently dropped (compose is
-                        // no longer disabled while sending -- see
-                        // chat_input_layout.slint's `enabled: true` --
-                        // so this branch is reachable for real now,
-                        // unlike before this phase).
-                        if let Some(queue) = panel.send_queues.borrow_mut().get_mut(idx) {
-                            match queue.enqueue(text.to_string(), false) {
-                                Ok(_) => trace_host_input(format_args!(
-                                    "send queued real_thread={idx} (turn in flight)"
-                                )),
-                                Err(error) => eprintln!(
-                                    "panel-rust: failed to enqueue message for thread {idx}: {error}"
-                                ),
-                            }
-                        }
-                        return;
-                    }
-                    if bridge.thread_closed(idx) {
-                        trace_host_input(format_args!(
-                            "send ignored real_thread={idx} because the thread is closed"
-                        ));
-                        return;
-                    }
-                    if let Some(error) = panel.thread_errors.borrow_mut().get_mut(idx) {
-                        error.clear();
-                    }
-                    bridge.push_local(
-                        idx,
-                        ChatMessage {
-                            kind: MessageKind::User,
-                            text: text.to_string(),
-                            status: None,
-                            id: None,
-                            raw_input: None,
-                            raw_output: None,
-                        },
-                    );
-                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
-                        *slot = ThreadState::Loading;
-                    }
-                    panel.refresh_threads_model();
-                    if Some(idx) == panel.real_index(component.get_selected_thread() as usize) {
-                        panel.refresh_messages_for(idx);
-                    }
-                    bridge.send_prompt(idx, text.to_string());
-                    trace_host_input(format_args!("send dispatched real_thread={idx}"));
+                    dispatch::dispatch_compose_send(panel, filtered_idx, text);
                 }
             });
         });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_stop_requested(move || {
-            let Some(component) = component_weak.upgrade() else {
+            let Some(_component) = component_weak.upgrade() else {
                 return;
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    if !matches!(
-                        panel.thread_state.borrow().get(idx),
-                        Some(ThreadState::Loading)
-                    ) {
-                        return;
-                    }
-                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
-                        *slot = ThreadState::Cancelling;
-                    }
-                    panel.refresh_threads_model();
-                    panel
-                        .bridge
-                        .as_ref()
-                        .map(|bridge| bridge.cancel_prompt(idx));
-                }
-            });
-        });
-
-        // Coverage Matrix `session/close`/`session/delete` row --
-        // explicit, opt-in-only thread lifecycle controls, gated by the
-        // sidebar row's own two-step arm/confirm UI. `filtered_idx` is
-        // the Slint-side (possibly search-filtered) row index, same
-        // "translate through `real_index` before touching the bridge"
-        // convention every other sidebar-row callback here uses.
-        let component_weak = panel.component.as_weak();
-        panel.component.on_thread_close_requested(move |filtered_idx| {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(idx) = panel.real_index(filtered_idx as usize) else {
-                        return;
-                    };
-                    let Some(bridge) = &panel.bridge else { return };
-                    if !bridge.close_thread(idx) {
-                        return;
-                    }
-                    // Stop treating a closed session as in-flight.
-                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
-                        if *slot == ThreadState::Loading || *slot == ThreadState::Cancelling {
-                            *slot = ThreadState::Idle;
-                        }
-                    }
-                    panel.refresh_threads_model();
-                    // If the closed row is still selected, re-project history
-                    // (read-only) so the UI reflects closed without a blank
-                    // reload race; send path already rejects closed threads.
-                    if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
-                        panel.refresh_messages_for(idx);
-                    }
-                }
-            });
-        });
-
-        let component_weak = panel.component.as_weak();
-        panel.component.on_thread_delete_requested(move |filtered_idx| {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(idx) = panel.real_index(filtered_idx as usize) else {
-                        return;
-                    };
-                    let Some(bridge) = &panel.bridge else { return };
-                    if !bridge.delete_thread(idx) {
-                        return;
-                    }
-                    if let Some(slot) = panel.thread_state.borrow_mut().get_mut(idx) {
-                        *slot = ThreadState::Idle;
-                    }
-                    panel.refresh_threads_model();
-                    if panel.real_index(component.get_selected_thread() as usize) == Some(idx) {
-                        panel.refresh_messages_for(idx);
-                    }
+                    dispatch::dispatch_compose_stop(panel);
                 }
             });
         });
 
         // Interactive agent-request relay addition: approve/reject
-        // buttons on the request card built by `refresh_pending_request_
-        // for`. Both handlers re-read the exact `AgentRequestEvent` from
+        // buttons on the request card. Both handlers re-read the exact
+        // `AgentRequestEvent` from
         // `AgentBridge::pending_requests` (rather than trusting only the
         // Slint-side `PendingRequestItem` snapshot's `relay-id` string)
         // so `permission::build_response` gets the real, untruncated
         // `raw_request` needed to build a native `session/request_
         // permission` reply -- the Slint struct only carries a
         // human-readable summary, not the full JSON.
+        // tea-slint-model Phase 4 (Request domain): routed through
+        // Msg::Ui(UiMsg::Request(..)) -> update() -> dispatch's bridge
+        // into answer_pending_request/answer_pending_request_option/
+        // dispatch_load_older_requested (unchanged, now pub(crate)) --
+        // see dispatch.rs's doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_approve_request(move || {
             let Some(component) = component_weak.upgrade() else {
@@ -2813,7 +1666,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    panel.answer_pending_request(&component, true);
+                    dispatch::dispatch_request_approve(panel, &component);
                 }
             });
         });
@@ -2825,7 +1678,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    panel.answer_pending_request(&component, false);
+                    dispatch::dispatch_request_reject(panel, &component);
                 }
             });
         });
@@ -2841,16 +1694,26 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 PANEL.with(|cell| {
                     if let Some(panel) = cell.borrow().as_ref() {
-                        panel.answer_pending_request_option(&component, option_id.as_str());
+                        dispatch::dispatch_request_permission_option(
+                            panel,
+                            &component,
+                            option_id.to_string(),
+                        );
                     }
                 });
             });
 
         // Terminal-view addition: expand a card into the floating
-        // overlay, and close it. `refresh_terminals_for` (called from
-        // every `refresh_messages_for`) keeps whichever terminal is
+        // overlay, and close it. Selected-thread `FrameInput` snapshots keep
+        // whichever terminal is
         // currently expanded live-updating; these two callbacks only
         // own which id (if any) is expanded.
+        // tea-slint-model Phase 4 (Terminal domain): routed through
+        // Msg::Ui(UiMsg::Terminal(..)) -> update() -> dispatch's bridge
+        // into the dispatch_expand_terminal/dispatch_close_terminal_overlay/
+        // dispatch_local_terminal_toggle/dispatch_local_terminal_key_input/
+        // dispatch_local_terminal_close methods (unchanged, now
+        // pub(crate)) -- see dispatch.rs's doc comment.
         let component_weak = panel.component.as_weak();
         panel.component.on_expand_terminal(move |terminal_id| {
             let Some(component) = component_weak.upgrade() else {
@@ -2858,12 +1721,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    *panel.expanded_terminal_id.borrow_mut() = Some(terminal_id.to_string());
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    panel.refresh_terminals_for(real_idx);
+                    dispatch::dispatch_terminal_expand(panel, &component, terminal_id.to_string());
                 }
             });
         });
@@ -2875,7 +1733,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    *panel.expanded_terminal_id.borrow_mut() = None;
+                    dispatch::dispatch_terminal_close_overlay(panel);
                 }
             });
         });
@@ -2889,27 +1747,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             let Some(component) = component_weak.upgrade() else {
                 return;
             };
-            trace_host_input("local terminal toggle callback invoked");
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    if bridge.has_local_terminal(real_idx) {
-                        bridge.close_local_terminal(real_idx);
-                        trace_host_input(format_args!(
-                            "local terminal toggled thread={real_idx} open=false"
-                        ));
-                    } else {
-                        let (cols, rows) = panel.local_terminal_dimensions();
-                        bridge.open_local_terminal(real_idx, cols, rows);
-                        trace_host_input(format_args!(
-                            "local terminal toggled thread={real_idx} open=true cols={cols} rows={rows}"
-                        ));
-                    }
-                    panel.refresh_local_terminal_for(real_idx);
+                    dispatch::dispatch_terminal_local_toggle(panel, &component);
                 }
             });
         });
@@ -2921,19 +1761,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    let bytes = models::translate_local_terminal_key(text.as_str());
-                    if !bytes.is_empty() {
-                        bridge.write_local_terminal_input(real_idx, &bytes);
-                        trace_host_input(format_args!(
-                            "local terminal key thread={real_idx} bytes={:?}",
-                            String::from_utf8_lossy(&bytes)
-                        ));
-                    }
+                    dispatch::dispatch_terminal_local_key_input(
+                        panel,
+                        &component,
+                        text.to_string(),
+                    );
                 }
             });
         });
@@ -2945,13 +1777,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    bridge.close_local_terminal(real_idx);
-                    panel.refresh_local_terminal_for(real_idx);
+                    dispatch::dispatch_terminal_local_close(panel, &component);
                 }
             });
         });
@@ -2962,7 +1788,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // mode-id`/`config-option-rows` itself -- both wait for the
         // real backend's own confirmation (`AgentEvent::
         // CurrentModeChanged`/`ConfigOptions`, applied by `apply_bridge_
-        // events` -> `refresh_capabilities_for`), matching `AgentBridge::
+        // events` -> the FrameInput capability projection), matching `AgentBridge::
         // set_mode`/`set_config_option`'s own "requested, not applied"
         // doc comment -- a backend can reject/ignore the request or
         // resolve to a different value than requested (config options
@@ -2976,13 +1802,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) =
-                        panel.real_index(component.get_selected_thread() as usize)
-                    else {
-                        return;
-                    };
-                    bridge.set_mode(real_idx, mode_id.to_string());
+                    dispatch::dispatch_mode_selected(panel, &component, mode_id.to_string());
                 }
             });
         });
@@ -2996,16 +1816,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 };
                 PANEL.with(|cell| {
                     if let Some(panel) = cell.borrow().as_ref() {
-                        let Some(bridge) = &panel.bridge else { return };
-                        let Some(real_idx) =
-                            panel.real_index(component.get_selected_thread() as usize)
-                        else {
-                            return;
-                        };
-                        bridge.set_config_option(
-                            real_idx,
+                        dispatch::dispatch_config_option_selected(
+                            panel,
+                            &component,
                             option_id.to_string(),
-                            serde_json::Value::String(value.to_string()),
+                            value.to_string(),
                         );
                     }
                 });
@@ -3018,19 +1833,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    *panel.search_query.borrow_mut() = query.to_string();
-                    panel.refresh_threads_model();
-                    // The filter can move/remove the previously-selected
-                    // row entirely -- reset to the first still-visible
-                    // thread (Phase 2 UX decision, documented in the
-                    // theme-parity plan's Phase 2 section) rather than
-                    // leaving a stale/out-of-range selection.
-                    component.set_selected_thread(0);
-                    match panel.real_index(0) {
-                        Some(real_idx) => panel.refresh_messages_for(real_idx),
-                        None => component
-                            .set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new()))),
-                    }
+                    dispatch::dispatch_search_changed(panel, &component, query.to_string());
                 }
             });
         });
@@ -3043,69 +1846,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     return;
                 };
                 PANEL.with(|cell| {
-                    let slot = cell.borrow();
-                    let Some(panel) = slot.as_ref() else {
-                        return;
-                    };
-                    if search_skills {
-                        let needle = query.trim().to_lowercase();
-                        let global_dir =
-                            crate::skills_state::global_skills_dir(&resolve_cache_dir());
-                        let mut entries = if show_global {
-                            crate::skills_state::scan_skills_dir(
-                                &global_dir,
-                                crate::skills_state::SkillScope::Global,
-                            )
-                        } else {
-                            Vec::new()
-                        };
-                        if let Some(project_path) = panel.active_project_path.borrow().as_ref() {
-                            if let Some(project_dir) =
-                                std::path::Path::new(project_path).parent()
-                            {
-                                entries.extend(crate::skills_state::scan_skills_dir(
-                                    &crate::skills_state::project_skills_dir(project_dir),
-                                    crate::skills_state::SkillScope::Project,
-                                ));
-                            }
-                        }
-                        entries.sort_by(|a, b| a.name.cmp(&b.name));
-                        if let Some(entry) = entries.into_iter().find(|entry| {
-                            needle.is_empty()
-                                || entry.name.to_lowercase().contains(&needle)
-                                || entry.description.to_lowercase().contains(&needle)
-                        }) {
-                            panel.open_skill_editor(&entry.path);
-                        }
-                        return;
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_search_submitted(
+                            panel,
+                            &component,
+                            query.to_string(),
+                            search_skills,
+                            show_global,
+                        );
                     }
-
-                    // Reapply the host-side filter immediately before
-                    // activation so Enter always opens the first current
-                    // result, even when the key arrives with the final edit
-                    // event still queued by the platform.
-                    *panel.search_query.borrow_mut() = query.to_string();
-                    panel.refresh_threads_model();
-                    let Some(real_idx) = panel.real_index(0) else {
-                        component
-                            .set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
-                        return;
-                    };
-                    component.set_selected_thread(0);
-                    if let (Some(store), Some(binding)) = (
-                        panel.panel_state.as_ref(),
-                        panel
-                            .bridge
-                            .as_ref()
-                            .and_then(|bridge| bridge.thread_binding(real_idx)),
-                    ) {
-                        if let Err(error) = store.set_selected_thread_id(Some(&binding.thread_id)) {
-                            eprintln!(
-                                "panel-rust: failed to persist search-selected chat thread: {error}"
-                            );
-                        }
-                    }
-                    panel.refresh_messages_for(real_idx);
                 });
             });
 
@@ -3116,16 +1865,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(real_idx) = panel.displayed_thread.get() else {
-                        return;
-                    };
-                    let idx = index as usize;
-                    let mut expanded = panel.expanded.borrow_mut();
-                    if let Some(slot) = expanded.get_mut(idx) {
-                        *slot = !*slot;
-                    }
-                    drop(expanded);
-                    panel.render_messages(real_idx);
+                    dispatch::dispatch_toggle_expanded(panel, index as usize);
                 }
             });
         });
@@ -3140,32 +1880,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    let Some(bridge) = &panel.bridge else { return };
-                    let Some(real_idx) = panel.displayed_thread.get() else {
-                        return;
-                    };
-                    let before_len = bridge.transcript(real_idx).len();
-                    if bridge.load_older_page(real_idx) {
-                        let after_len = bridge.transcript(real_idx).len();
-                        // The new rows were prepended at the *front* --
-                        // grow `expanded` from the front too, so every
-                        // pre-existing collapse-state entry stays
-                        // attached to the same logical message it
-                        // described before this reload, not silently
-                        // shifted onto whatever now occupies its old
-                        // index.
-                        let grown_by = after_len.saturating_sub(before_len);
-                        if grown_by > 0 {
-                            let mut expanded = panel.expanded.borrow_mut();
-                            let mut prefixed = vec![false; grown_by];
-                            prefixed.append(&mut expanded);
-                            *expanded = prefixed;
-                        }
-                        panel.render_messages(real_idx);
-                    }
+                    dispatch::dispatch_request_load_older(panel, &component);
                 }
             });
-            component.set_loading_older_messages(false);
         });
 
         *slot = Some(panel);
@@ -3262,7 +1979,14 @@ pub extern "C" fn panel_rust_input_click(_handle: *mut PanelHandle, x: c_uint, y
         let selected_thread = panel.component.get_selected_thread();
         let selected_state = panel
             .real_index(selected_thread.max(0) as usize)
-            .and_then(|idx| panel.thread_state.borrow().get(idx).cloned())
+            .and_then(|idx| {
+                panel
+                    .model
+                    .borrow()
+                    .threads
+                    .get(idx)
+                    .map(|thread| thread.state.clone())
+            })
             .map(|state| format!("{state:?}"))
             .unwrap_or_else(|| String::from("no-thread"));
         (
@@ -3473,38 +2197,11 @@ const PANEL_COMMAND_OPEN_THREAD_SEARCH: c_int = 2;
 /// regardless of which input path triggered it.
 #[no_mangle]
 pub extern "C" fn panel_rust_invoke_command(_handle: *mut PanelHandle, command: c_int) -> bool {
-    // Clone the (cheap, Weak-backed) Slint component handle and drop the
-    // `PANEL` borrow before invoking anything on it. `invoke_*` calls run
-    // their Rust callback synchronously and in-stack -- `on_thread_
-    // navigation_requested`'s own handler re-enters `PANEL.with(|cell| cell.
-    // borrow() ...)`, which is harmless while this borrow is also a shared
-    // `Ref` (RefCell allows many), but would panic the moment either side
-    // ever needed `borrow_mut()`. Not holding the guard across the call
-    // removes that landmine instead of relying on both sides staying
-    // read-only forever.
-    let component_weak = PANEL.with(|cell| {
+    PANEL.with(|cell| {
         cell.borrow()
             .as_ref()
-            .map(|panel| panel.component.as_weak())
-    });
-    let Some(component) = component_weak.and_then(|weak| weak.upgrade()) else {
-        return false;
-    };
-    match command {
-        PANEL_COMMAND_PREVIOUS_THREAD => {
-            component.invoke_thread_navigation_requested(-1);
-            true
-        }
-        PANEL_COMMAND_NEXT_THREAD => {
-            component.invoke_thread_navigation_requested(1);
-            true
-        }
-        PANEL_COMMAND_OPEN_THREAD_SEARCH => {
-            component.invoke_open_thread_search();
-            true
-        }
-        _ => false,
-    }
+            .is_some_and(|panel| dispatch::dispatch_host_invoke_command(panel, command))
+    })
 }
 
 /// Sets the theme variant ("dark"/"light"/anything else treated as dark),
@@ -3528,7 +2225,7 @@ pub extern "C" fn panel_rust_set_theme(
             let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
             std::str::from_utf8(bytes).unwrap_or("dark")
         };
-        Theme::get(&panel.component).set_theme(text.into());
+        dispatch::dispatch_theme_changed(panel, text.to_owned());
         true
     })
 }
@@ -3548,31 +2245,18 @@ pub extern "C" fn panel_rust_set_project_path(
     path_ptr: *const c_uchar,
     path_len: usize,
 ) -> bool {
+    let path = if path_ptr.is_null() || path_len == 0 {
+        None
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+        std::str::from_utf8(bytes).ok().map(str::to_string)
+    };
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
             return false;
         };
-        let path = if path_ptr.is_null() || path_len == 0 {
-            None
-        } else {
-            let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
-            std::str::from_utf8(bytes).ok().map(str::to_string)
-        };
-        // `chat_sessions_project_path` phase: also propagate to the
-        // bridge, whose `cwd_for_session` reads this to scope every
-        // subsequently-opened ACP session to the active project instead
-        // of the process's own working directory.
-        if let Some(bridge) = panel.bridge.as_ref() {
-            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
-        }
-        panel
-            .component
-            .set_active_project_path(path.clone().unwrap_or_default().into());
-        *panel.active_project_path.borrow_mut() = path;
-        // `project_scoped_skill_isolation`: re-scan now that the active
-        // project (and therefore its `.skills/` directory) changed.
-        panel.refresh_skills_model();
+        dispatch::dispatch_project_path_changed(panel, path);
         true
     })
 }
@@ -3640,27 +2324,7 @@ pub extern "C" fn panel_rust_apply_host_appearance(
             font_scale,
             density,
         };
-        if !panel.appearance.borrow_mut().apply(appearance) {
-            return false;
-        }
-        let appearance_state = panel.appearance.borrow();
-        let appearance = appearance_state
-            .current()
-            .expect("appearance was applied above");
-        let theme = Theme::get(&panel.component);
-        theme.set_theme(if dark { "dark" } else { "light" }.into());
-        theme.set_host_language_tag(appearance.language_tag.clone().into());
-        theme.set_host_font_sans(appearance.bundled_font.clone().into());
-        theme.set_host_font_scale(appearance.font_scale);
-        theme.set_host_density(appearance.density);
-        panel
-            .window
-            .window()
-            .dispatch_event(WindowEvent::ScaleFactorChanged {
-                scale_factor: appearance.density,
-            });
-        panel.window.window().request_redraw();
-        true
+        dispatch::dispatch_apply_host_appearance(panel, appearance)
     })
 }
 
@@ -3695,89 +2359,25 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         let Some(panel) = slot.as_ref() else {
             return false;
         };
-        let bridge_changed = panel.apply_bridge_events();
-        // `thread_new_loading_state` phase: a newly-created thread's
-        // attachment can resolve with no other AgentEvent arriving in the
-        // same tick -- refresh the sidebar so its row flips out of the
-        // "loading" placeholder as soon as that happens, not only on the
-        // next unrelated bridge event.
-        let attachment_changed = panel.sync_thread_records();
-        if attachment_changed {
-            panel.refresh_threads_model();
-        }
-        // Multi-process settings watch: reload prefs when another process
-        // rewrote the global/project JSON (skip during our own save window).
-        let mut settings_changed = false;
-        if panel
-            .settings_reload_pending
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            let ignore = panel
-                .settings_ignore_watch_until
-                .get()
-                .is_some_and(|until| std::time::Instant::now() < until);
-            if !ignore && panel.component.get_settings_open() {
-                // v1 dirty policy: always refresh when settings open
-                // (operator multi-process sync wins over half-edited form).
-                panel.apply_json_prefs_to_component();
-                settings_changed = true;
-            } else if !ignore {
-                panel.apply_json_prefs_to_component();
-                settings_changed = true;
-            }
-        }
-        // Client-local PTY terminal output arrives on its own
-        // background reader thread, never through `AgentBridge::
-        // poll()`'s event queue -- refresh it unconditionally on every
-        // tick (not gated behind `apply_bridge_events`'s own "any
-        // gateway events at all" early return), independent of whether
-        // any gateway activity happened this tick.
-        let selected = panel.real_index(panel.component.get_selected_thread() as usize);
-        let local_terminal_changed = selected
-            .map(|idx| panel.refresh_local_terminal_for(idx))
-            .unwrap_or(false);
-        let connection_changed = selected
-            .map(|idx| panel.refresh_connection_status_for(idx))
-            .unwrap_or(false);
-        // An in-flight `animate` (or a Flickable's own interactive flick/
-        // momentum motion) is itself a reason to repaint even when nothing
-        // else above changed this tick -- update_timers_and_animations()
-        // above only advances the animation clock, it doesn't make the C++
-        // side (RustPanelItem::poll, which only calls update() when this
-        // function returns true) know a frame still needs painting. Without
-        // this, every animation was silently truncated to whichever single
-        // tick happened to coincide with an unrelated state change, which
-        // in practice meant "frozen" for anything driven purely by
-        // animation (the sidebar rail's `animate width`, a Flickable's
-        // drag-release momentum, hover fades, ...).
+        let frame_changed = dispatch::dispatch_frame_poll(panel);
         let animating = panel.window.window().has_active_animations();
         // chat_area.slint's `live-flow-timer` (the traveling pulse on the
-        // last row of a streaming/cancelling thread, `is-live-tail`) is a
-        // plain `Timer` manually mutating `flow-t` every 40ms, not a Slint
-        // `animate`/`@keyframes` block -- so `has_active_animations()`
-        // above never sees it as "active" even though
-        // update_timers_and_animations() (top of this fn) is ticking it
-        // correctly every poll. The property value keeps advancing
-        // in-memory, but nothing told Qt a frame still needs painting, so
-        // the pulse only ever became visible on some unrelated repaint
-        // (e.g. a mouse move triggering RustPanelItem::hoverMoveEvent) --
-        // with zero mouse/keyboard activity it looked completely frozen.
-        // Mirrors is-live-tail's own condition (app.slint's `sending`
-        // binding) directly off `thread_state` instead of reading back
-        // through the Slint model.
-        let live_tail_pulsing = selected.is_some_and(|idx| {
-            matches!(
-                panel.thread_state.borrow().get(idx),
-                Some(ThreadState::Loading) | Some(ThreadState::Cancelling)
-            )
-        });
-        bridge_changed
-            || local_terminal_changed
-            || connection_changed
-            || settings_changed
-            || attachment_changed
-            || animating
-            || live_tail_pulsing
+        // last row of a streaming/cancelling thread) is a plain `Timer`
+        // mutating `flow-t`, not a Slint `animate`/`@keyframes` block, so
+        // `has_active_animations()` never reports it active even though
+        // `update_timers_and_animations()` above ticks it every poll.
+        // Without repainting on that condition the pulse only advanced on
+        // some unrelated repaint (a mouse move), looking frozen otherwise.
+        let live_tail_pulsing = {
+            let model = panel.model.borrow();
+            model
+                .displayed_thread
+                .and_then(|idx| model.threads.get(idx))
+                .is_some_and(|thread| {
+                    matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                })
+        };
+        frame_changed || animating || live_tail_pulsing
     })
 }
 
@@ -3921,7 +2521,8 @@ mod lifecycle_tests {
         PANEL.with(|cell| {
             let panel = cell.borrow();
             let panel = panel.as_ref().expect("panel exists");
-            let appearance = panel.appearance.borrow();
+            let model = panel.model.borrow();
+            let appearance = &model.appearance;
             assert_eq!(appearance.current().unwrap().language_tag, "fr-FR");
             assert_eq!(appearance.current().unwrap().bundled_font, "Noto Sans");
             assert_eq!(panel.component.get_compose_text(), "preserve this draft");
@@ -4020,10 +2621,10 @@ mod keyboard_shortcut_tests {
         }
 
         /// Sets the Slint `threads` model *and* the Rust-side `visible_
-        /// indices` it's paired with in real production code (see `refresh_
-        /// thread_items`'s `*self.visible_indices.borrow_mut() = ...` next
-        /// to its own `set_threads` call) -- `select_visible_thread` clamps
-        /// against `visible_indices`, not the Slint model, so setting only
+        /// indices` it's paired with in real production code (the model
+        /// projection updates both together next
+        /// to its own `set_threads` call) -- the dispatcher clamps against
+        /// `visible_indices`, not the Slint model, so setting only
         /// `threads` directly (bypassing the real bridge-driven population
         /// pipeline this test doesn't spin up) would leave it stale/empty
         /// and silently break navigation.
@@ -4032,8 +2633,14 @@ mod keyboard_shortcut_tests {
             PANEL.with(|cell| {
                 let slot = cell.borrow();
                 let panel = slot.as_ref().expect("panel exists");
-                panel.component.set_threads(ModelRc::new(VecModel::from(threads)));
-                *panel.visible_indices.borrow_mut() = (0..count).collect();
+                let keys: Vec<String> = (0..count).map(|idx| format!("thread:{idx}")).collect();
+                crate::list_model::reconcile(
+                    &panel.model.borrow().thread_model,
+                    &mut panel.model.borrow().thread_model_keys.borrow_mut(),
+                    &keys,
+                    &threads,
+                );
+                panel.model.borrow_mut().visible_indices = (0..count).collect();
             });
         }
 
@@ -4116,7 +2723,7 @@ mod keyboard_shortcut_tests {
     /// -> `panel-keys`/composer `panel-shortcut` re-dispatch ->
     /// `handle-panel-shortcut` -> `thread-navigation-requested`/`open-
     /// thread-search` -> the real `on_thread_navigation_requested`/`on_
-    /// thread_selected` Rust handlers -> `select_visible_thread`.
+    /// thread_selected` Rust handlers -> reducer/dispatcher selection.
     #[test]
     fn ctrl_alt_arrows_and_ctrl_k_work_through_the_real_input_key_bridge() {
         let panel = TestPanel::new();
