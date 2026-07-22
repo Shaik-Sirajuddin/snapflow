@@ -43,13 +43,22 @@ export component SettingsPage inherits Rectangle {
     // handler -- gets torn down on tab switch, so nothing else would ever
     // clear a stale `true` left over from switching away mid-focus).
     property <bool> agents-search-focus-mirror: false;
+    // Same mirror pattern as agents-search-focus-mirror, for
+    // McpServersView's own add-server name/command TextField fields (see
+    // TextField.has-focus's doc comment) -- McpServersView is likewise a
+    // conditional element (`if root.active-section == "mcp_servers"`)
+    // that can't be referenced directly outside its own scope.
+    property <bool> mcp-servers-focus-mirror: false;
     changed active-section => {
         if (self.active-section != "agents") {
             self.agents-search-focus-mirror = false;
         }
+        if (self.active-section != "mcp_servers") {
+            self.mcp-servers-focus-mirror = false;
+        }
     }
     out property <bool> search-has-focus:
-        top-search-bar.input-has-focus || agents-search-focus-mirror;
+        top-search-bar.input-has-focus || agents-search-focus-mirror || mcp-servers-focus-mirror;
 
     // Same public API `SettingsSheet` exposed -- unchanged so `app.slint`'s
     // call site only needs its component name + import swapped.
@@ -222,6 +231,9 @@ export component SettingsPage inherits Rectangle {
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }
                             mcp-server-enabled-changed(name, enabled) => {
                                 root.mcp-server-enabled-changed(name, enabled);
+                            }
+                            changed search-has-focus => {
+                                root.mcp-servers-focus-mirror = self.search-has-focus;
                             }
                         }
                         // Stays `if` (unlike the other visible:-conversion

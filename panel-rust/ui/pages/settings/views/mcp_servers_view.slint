@@ -43,6 +43,12 @@ export component McpServersView inherits Rectangle {
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
+    // See FilterSearchBar.input-has-focus's doc comment / TextField.has-focus's
+    // own doc comment: this view's add-server name/command fields never had
+    // any focus state to aggregate up into settings_page.slint's OR-chain,
+    // so every keystroke typed into either field was silently dropped.
+    out property <bool> search-has-focus:
+        new-mcp-name-field.has-focus || new-mcp-command-field.has-focus;
 
     property <string> new-mcp-name: "";
     property <string> new-mcp-command: "";
@@ -142,12 +148,12 @@ export component McpServersView inherits Rectangle {
             // `gap-sm` (6px) -- gap between the two add-server fields and
             // the Add button.
             spacing: Metrics.gap-sm;
-            TextField {
+            new-mcp-name-field := TextField {
                 horizontal-stretch: 1;
                 text <=> root.new-mcp-name;
                 field-accessible-label: "New MCP server name";
             }
-            TextField {
+            new-mcp-command-field := TextField {
                 horizontal-stretch: 1;
                 text <=> root.new-mcp-command;
                 field-accessible-label: "New MCP server command or URL";

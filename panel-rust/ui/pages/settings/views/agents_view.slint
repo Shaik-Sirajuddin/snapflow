@@ -29,8 +29,15 @@ export component AgentsView inherits Rectangle {
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
-    // See FilterSearchBar.input-has-focus's doc comment.
-    out property <bool> search-has-focus: agent-search-bar.input-has-focus;
+    // See FilterSearchBar.input-has-focus's doc comment. Also covers the
+    // plain TextField instances below (default-profile/permission-profile)
+    // -- those never had any focus state to aggregate here at all until
+    // TextField.has-focus was added (see its own doc comment), which had
+    // silently dropped every keystroke typed into either field.
+    out property <bool> search-has-focus:
+        agent-search-bar.input-has-focus
+        || default-profile-field.has-focus
+        || permission-profile-field.has-focus;
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -78,7 +85,7 @@ export component AgentsView inherits Rectangle {
         SettingsField {
             width: parent.width;
             label: "Profile";
-            TextField {
+            default-profile-field := TextField {
                 text <=> root.default-profile;
                 field-accessible-label: "Default profile";
                 field-font-size: 12px;
@@ -266,7 +273,7 @@ export component AgentsView inherits Rectangle {
         SettingsField {
             width: parent.width;
             label: "Permission profile";
-            TextField {
+            permission-profile-field := TextField {
                 text <=> root.permission-profile;
                 field-accessible-label: "Permission profile";
                 field-font-size: 12px;

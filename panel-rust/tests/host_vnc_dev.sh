@@ -19,7 +19,12 @@ display="${PANEL_VNC_DEV_DISPLAY:-:110}"
 screen="${PANEL_VNC_DEV_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_VNC_DEV_GATEWAY_PORT:-18791}"
 vnc_port="${PANEL_VNC_DEV_VNC_PORT:-5910}"
-dock_width="${PANEL_VNC_DEV_DOCK_WIDTH:-320}"
+# Empty by default -- unlike host_e2e_smoke.sh's deterministic XTEST
+# harness, a human on VNC wants the dock's normal drag-resize splitter
+# behavior, not chatrustdock.cpp's `setFixedWidth` test-only pin (see its
+# `PANEL_HOST_E2E_DOCK_WIDTH` doc comment: "Never set in production").
+# Set PANEL_VNC_DEV_DOCK_WIDTH explicitly if you actually want it pinned.
+dock_width="${PANEL_VNC_DEV_DOCK_WIDTH:-}"
 # Real registry agent id to default new sessions to (ambient-auth backed,
 # e.g. "codex-acp" or "claude-acp") -- never the mock's fake "codex" id.
 default_agent_id="${PANEL_VNC_DEV_AGENT_ID:-codex-acp}"
@@ -75,9 +80,14 @@ for _ in $(seq 1 80); do
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
 
+if [ -n "$dock_width" ]; then
+    export PANEL_HOST_E2E_DOCK_WIDTH="$dock_width"
+else
+    unset PANEL_HOST_E2E_DOCK_WIDTH || true
+fi
+
 QSG_RENDER_LOOP=basic \
 RUI_PANEL_INPUT_TRACE=1 \
-PANEL_HOST_E2E_DOCK_WIDTH="$dock_width" \
 RUI_ACP_CACHE_DIR="$state_dir/panel" \
 RUI_ACPX_CODEX_URL="http://127.0.0.1:$gateway_port" \
 RUI_ACPX_CLAUDE_URL="http://127.0.0.1:$gateway_port" \
