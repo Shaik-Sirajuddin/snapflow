@@ -374,7 +374,13 @@ export component ChatInputLayout inherits Rectangle {
                 background: Theme.bg-tertiary;
                 border-radius: Theme.radius-md;
                 Text {
-                    text: root.sending ? "Agent is working..." : "Ask the agent…  / skills  @ mcp  # files";
+                    // setup-followups plan, chat_input_placeholder_copy:
+                    // keep a single placeholder regardless of `sending`
+                    // state -- the composer's own spinning-ring/stop-icon
+                    // (see in_flight_turn_loading_indicator) is already
+                    // the in-progress signal; the placeholder itself
+                    // doesn't need a second one.
+                    text: "Ask the agent…  / skills  @ mcp  # files";
                     color: Theme.text-muted;
                     font-size: 11px * Theme.font-scale;
                     font-family: Theme.font-sans;
