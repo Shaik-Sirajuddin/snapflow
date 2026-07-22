@@ -147,6 +147,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]

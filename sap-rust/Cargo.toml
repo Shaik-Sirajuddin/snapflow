@@ -12,6 +12,14 @@ thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Job Object bindings for the melt-child cleanup Windows arm in
+# ffi_backend.rs's spawn_melt_draining_stderr -- already pulled in
+# transitively by tokio's Windows named-pipe support, pinned here directly
+# since we call CreateJobObjectW/SetInformationJobObject/
+# AssignProcessToJobObject ourselves rather than through tokio.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "io-util", "time", "test-util"] }
 
