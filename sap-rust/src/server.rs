@@ -25,9 +25,11 @@ use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::BufReader;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::backend::{Backend, BackendError};
@@ -37,6 +39,15 @@ use crate::protocol::{error_codes, RpcError, RpcNotification, RpcRequest, RpcRes
 /// Configuration handed to [`serve`]: where to listen, and the token
 /// `sap.hello` must present before a connection is allowed to do anything
 /// else, per `01-jsonrpc-spec.md`'s session-binding model.
+///
+/// On Unix, `socket_path` is a filesystem path bound as a Unix domain
+/// socket. On Windows there is no domain-socket equivalent, so the same
+/// field is instead the name of a named pipe and must take the form
+/// `\\.\pipe\<name>` (callers building this path from a bare name, e.g.
+/// the FFI/daemon launch path, are responsible for adding that prefix on
+/// Windows) -- it is never treated as a real filesystem path there (no
+/// `create_dir_all`/`remove_file` against it), since named pipes are not
+/// backed by a directory entry.
 pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub token: String,
@@ -2281,7 +2292,7 @@ async fn recv_notification(rx: &mut Option<broadcast::Receiver<RpcNotification>>
 /// Dedicated writer task: owns the write half and serializes all outbound
 /// frames (responses interleaved with notifications) onto the wire for this
 /// one connection.
-async fn writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Value>) {
+async fn writer_loop<W: AsyncWrite + Unpin>(mut write_half: W, mut rx: mpsc::UnboundedReceiver<Value>) {
     while let Some(value) = rx.recv().await {
         if framing::write_message(&mut write_half, &value).await.is_err() {
             break;
@@ -2295,7 +2306,7 @@ async fn writer_loop(mut write_half: OwnedWriteHalf, mut rx: mpsc::UnboundedRece
 /// receives — `framing::read_message` itself is not cancel-safe (a
 /// `select!` cancellation mid-read would silently drop already-consumed
 /// bytes), so it must not be raced directly against another future.
-async fn reader_loop(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<Result<Value, FramingError>>) {
+async fn reader_loop<R: AsyncRead + Unpin>(read_half: R, tx: mpsc::UnboundedSender<Result<Value, FramingError>>) {
     let mut reader = BufReader::new(read_half);
     loop {
         let msg = framing::read_message(&mut reader).await;
@@ -2306,15 +2317,17 @@ async fn reader_loop(read_half: OwnedReadHalf, tx: mpsc::UnboundedSender<Result<
     }
 }
 
-async fn handle_connection(
-    stream: UnixStream,
+async fn handle_connection<R, W>(
+    read_half: R,
+    write_half: W,
     dispatch_tx: DispatchSender,
     channels: ProjectChannels,
     token: String,
     audio_enabled: bool,
-) {
-    let (read_half, write_half) = stream.into_split();
-
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Result<Value, FramingError>>();
     tokio::spawn(reader_loop(read_half, in_tx));
 
@@ -2389,13 +2402,20 @@ pub async fn serve<B: Backend + 'static>(
     backend: B,
     external_notify_rx: Option<mpsc::UnboundedReceiver<RpcNotification>>,
 ) -> std::io::Result<()> {
-    // A stale socket file from a previous run would otherwise make bind()
-    // fail with AddrInUse.
-    let _ = std::fs::remove_file(&config.socket_path);
-    if let Some(parent) = config.socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let listener = UnixListener::bind(&config.socket_path)?;
+    #[cfg(unix)]
+    let listener = {
+        // A stale socket file from a previous run would otherwise make
+        // bind() fail with AddrInUse. Unix-only: a named pipe path has no
+        // real filesystem parent directory to create, nor a stale file to
+        // remove.
+        let _ = std::fs::remove_file(&config.socket_path);
+        if let Some(parent) = config.socket_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        UnixListener::bind(&config.socket_path)?
+    };
+    #[cfg(windows)]
+    let pipe_name = config.socket_path.to_string_lossy().into_owned();
 
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel::<DispatchMsg>();
     tokio::spawn(run_dispatcher(backend, dispatch_rx));
@@ -2419,11 +2439,37 @@ pub async fn serve<B: Backend + 'static>(
         });
     }
 
+    #[cfg(unix)]
     loop {
         let (stream, _addr) = listener.accept().await?;
+        let (read_half, write_half) = stream.into_split();
         let dispatch_tx = dispatch_tx.clone();
         let channels = channels.clone();
         let token = token.clone();
-        tokio::spawn(handle_connection(stream, dispatch_tx, channels, token, audio_enabled));
+        tokio::spawn(handle_connection(read_half, write_half, dispatch_tx, channels, token, audio_enabled));
+    }
+
+    // Named pipes have no single long-lived listener object: each waiting
+    // connection is its own server-end instance that must be created
+    // *before* the next client can connect to it, then handed off to its
+    // own connection task once a client attaches, with a fresh instance
+    // immediately created to keep accepting. `first_pipe_instance(true)` on
+    // only the very first instance is required by the Win32 API so the
+    // pipe name doesn't collide with a pre-existing instance of the same
+    // name from another process.
+    #[cfg(windows)]
+    {
+        let mut server = ServerOptions::new().first_pipe_instance(true).create(&pipe_name)?;
+        loop {
+            server.connect().await?;
+            let connected = server;
+            server = ServerOptions::new().create(&pipe_name)?;
+
+            let (read_half, write_half) = tokio::io::split(connected);
+            let dispatch_tx = dispatch_tx.clone();
+            let channels = channels.clone();
+            let token = token.clone();
+            tokio::spawn(handle_connection(read_half, write_half, dispatch_tx, channels, token, audio_enabled));
+        }
     }
 }
