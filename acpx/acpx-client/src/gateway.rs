@@ -7,7 +7,8 @@
 
 use crate::raw::{ClientError, GatewayClient};
 use crate::ws::{GatewayNotification, GatewayWsClient};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,10 +17,33 @@ pub enum TransportMode {
     HttpDegraded,
 }
 
+/// Bound on how many times [`Gateway::reconnect`] retries a dropped
+/// WebSocket connection (e.g. the gateway process died, or the panel's
+/// own machine's network blipped) before giving up and falling back to
+/// HTTP-degraded mode for that call. Chosen to recover from a brief
+/// hiccup (a gateway restart typically completes in well under this
+/// window) without hanging a user-initiated send/subscribe indefinitely
+/// against a genuinely dead gateway.
+const RECONNECT_MAX_ATTEMPTS: u32 = 3;
+/// Hard ceiling on any single reconnect attempt -- a `connect_async` that
+/// hangs (host unreachable, firewall silently dropping SYN, ...) would
+/// otherwise stall this attempt indefinitely instead of moving on to the
+/// next one.
+const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Linear backoff between attempts (attempt N waits `N *` this), so a
+/// gateway that's mid-restart gets a little more time on each retry
+/// rather than being hammered at a fixed interval.
+const RECONNECT_BACKOFF_STEP: Duration = Duration::from_millis(500);
+
 pub struct Gateway {
-    mode: TransportMode,
+    base_url: String,
     http: GatewayClient,
-    websocket: Option<Arc<GatewayWsClient>>,
+    // A plain (non-async) RwLock: every access here is a quick clone of
+    // the `Arc` followed immediately by dropping the guard, never held
+    // across an `.await`, so there's no risk of blocking the async
+    // runtime -- and it lets `mode()`/`subscribe()` stay synchronous
+    // (matching their existing signatures; no ripple to every caller).
+    websocket: RwLock<Option<Arc<GatewayWsClient>>>,
 }
 
 /// A live agent-initiated request relayed from the gateway (see
@@ -72,38 +96,94 @@ impl Gateway {
     pub async fn connect(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         let http = GatewayClient::new(base_url.clone());
-        match GatewayWsClient::connect(&base_url).await {
-            Ok(websocket) => Self {
-                mode: TransportMode::WebSocketInteractive,
-                http,
-                websocket: Some(websocket),
-            },
-            Err(_) => Self {
-                mode: TransportMode::HttpDegraded,
-                http,
-                websocket: None,
-            },
+        let websocket = GatewayWsClient::connect(&base_url).await.ok();
+        Self {
+            base_url,
+            http,
+            websocket: RwLock::new(websocket),
         }
     }
 
     pub fn http_degraded(base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into();
         Self {
-            mode: TransportMode::HttpDegraded,
-            http: GatewayClient::new(base_url),
-            websocket: None,
+            http: GatewayClient::new(base_url.clone()),
+            base_url,
+            websocket: RwLock::new(None),
         }
     }
 
+    /// Derived from whether a live WebSocket client is currently
+    /// installed, not a separately-tracked flag -- so a successful
+    /// `reconnect()` (or the initial degraded connect never having one)
+    /// is always reflected immediately, with no separate field to drift
+    /// out of sync.
     pub fn mode(&self) -> TransportMode {
-        self.mode
+        if self.current_websocket().is_some() {
+            TransportMode::WebSocketInteractive
+        } else {
+            TransportMode::HttpDegraded
+        }
     }
 
     pub fn supports_interactive_requests(&self) -> bool {
-        matches!(self.mode, TransportMode::WebSocketInteractive)
+        matches!(self.mode(), TransportMode::WebSocketInteractive)
+    }
+
+    fn current_websocket(&self) -> Option<Arc<GatewayWsClient>> {
+        self.websocket
+            .read()
+            .expect("gateway websocket lock poisoned")
+            .clone()
+    }
+
+    /// Attempts to (re)establish the WebSocket connection, up to
+    /// [`RECONNECT_MAX_ATTEMPTS`] times, each bounded by
+    /// [`RECONNECT_ATTEMPT_TIMEOUT`] and separated by a linear backoff.
+    /// On success, atomically swaps the fresh client in so every
+    /// subsequent `call()`/`subscribe()` -- including a long-lived
+    /// subscriber that re-subscribes after noticing its receiver has
+    /// gone dead -- picks it up without any other code needing to know a
+    /// reconnect happened. Returns whether a live connection exists
+    /// afterward (`false` leaves this `Gateway` in HTTP-degraded mode,
+    /// same as a fresh `connect()` whose initial handshake failed).
+    pub async fn reconnect(&self) -> bool {
+        for attempt in 1..=RECONNECT_MAX_ATTEMPTS {
+            let attempt_result = tokio::time::timeout(
+                RECONNECT_ATTEMPT_TIMEOUT,
+                GatewayWsClient::connect(&self.base_url),
+            )
+            .await;
+            if let Ok(Ok(client)) = attempt_result {
+                *self.websocket.write().expect("gateway websocket lock poisoned") = Some(client);
+                return true;
+            }
+            if attempt < RECONNECT_MAX_ATTEMPTS {
+                tokio::time::sleep(RECONNECT_BACKOFF_STEP * attempt).await;
+            }
+        }
+        *self.websocket.write().expect("gateway websocket lock poisoned") = None;
+        false
     }
 
     pub fn subscribe(&self) -> Option<broadcast::Receiver<GatewayNotification>> {
-        self.websocket.as_ref().map(|client| client.subscribe())
+        self.current_websocket().map(|client| client.subscribe())
+    }
+
+    /// Resolves when the *current* WebSocket connection dies, or
+    /// immediately if there isn't one right now (HTTP-degraded mode --
+    /// nothing further to wait for). A long-lived live-notification
+    /// forwarding loop should race this (via `tokio::select!`) against
+    /// its `Receiver::recv()` so it notices a dead connection even
+    /// during a quiet period with no notifications and no `call()` in
+    /// flight to otherwise trigger a reconnect -- see
+    /// `GatewayWsClient::wait_for_disconnect`'s doc comment for why a
+    /// bare `Receiver` alone can't signal this on its own.
+    pub async fn wait_for_disconnect(&self) {
+        match self.current_websocket() {
+            Some(client) => client.wait_for_disconnect().await,
+            None => {}
+        }
     }
 
     pub async fn call(
@@ -112,15 +192,53 @@ impl Gateway {
         params: serde_json::Value,
         profile: Option<&str>,
     ) -> Result<serde_json::Value, ClientError> {
-        match &self.websocket {
+        match self.current_websocket() {
             Some(websocket) => {
                 // The WS transport binds profile selection into session/new
                 // parameters. Header-only profile selection is HTTP-specific.
-                let params = with_profile(params, profile);
-                websocket.call(method, params).await
+                let full_params = with_profile(params.clone(), profile);
+                match websocket.call(method, full_params).await {
+                    // `ClientError::WebSocket` covers a dead/dropped
+                    // connection (send failure, response channel closed,
+                    // send/response timeout -- see ws.rs's `request()`), the
+                    // signal that reconnecting is worth trying. A
+                    // `ClientError::Rpc` is the gateway alive and
+                    // answering with a real JSON-RPC error; retrying on a
+                    // fresh connection wouldn't change that, so it's
+                    // returned as-is.
+                    Err(ClientError::WebSocket(_)) => {
+                        self.call_after_reconnect(method, params, profile).await
+                    }
+                    other => other,
+                }
             }
-            None => self.http.call(method, params, profile).await,
+            None => self.call_after_reconnect(method, params, profile).await,
         }
+    }
+
+    /// Shared retry tail for `call()`/`call_with_updates()`: attempt
+    /// [`Self::reconnect`] (its own bounded retries/timeouts), then
+    /// replay the request exactly once more on the fresh connection.
+    /// Falls back to the stateless HTTP transport if reconnecting never
+    /// succeeds, so a caller still gets a real answer (just without live
+    /// notifications) rather than an error a healthy-but-slow gateway
+    /// would otherwise turn into a spurious failure. Takes the original
+    /// `params`/`profile` (not the WS-shaped `with_profile` embedding),
+    /// so the HTTP fallback still gets `profile` the way it actually
+    /// expects it -- as a header, not a body field.
+    async fn call_after_reconnect(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        profile: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        if self.reconnect().await {
+            if let Some(client) = self.current_websocket() {
+                let full_params = with_profile(params, profile);
+                return client.call(method, full_params).await;
+            }
+        }
+        self.http.call(method, params, profile).await
     }
 
     /// HTTP returns buffered updates with the response. WebSocket callers
@@ -131,14 +249,40 @@ impl Gateway {
         params: serde_json::Value,
         profile: Option<&str>,
     ) -> Result<(serde_json::Value, Vec<serde_json::Value>), ClientError> {
-        match &self.websocket {
+        match self.current_websocket() {
             Some(websocket) => {
-                websocket
-                    .call_with_updates(method, with_profile(params, profile))
+                let full_params = with_profile(params.clone(), profile);
+                match websocket.call_with_updates(method, full_params).await {
+                    Err(ClientError::WebSocket(_)) => {
+                        self.call_with_updates_after_reconnect(method, params, profile)
+                            .await
+                    }
+                    other => other,
+                }
+            }
+            None => {
+                self.call_with_updates_after_reconnect(method, params, profile)
                     .await
             }
-            None => self.http.call_with_updates(method, params, profile).await,
         }
+    }
+
+    /// See [`Self::call_after_reconnect`] -- same retry/fallback shape
+    /// (and same reason it takes the original `params`/`profile`), for
+    /// the `_acpx.updates`-returning variant.
+    async fn call_with_updates_after_reconnect(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        profile: Option<&str>,
+    ) -> Result<(serde_json::Value, Vec<serde_json::Value>), ClientError> {
+        if self.reconnect().await {
+            if let Some(client) = self.current_websocket() {
+                let full_params = with_profile(params, profile);
+                return client.call_with_updates(method, full_params).await;
+            }
+        }
+        self.http.call_with_updates(method, params, profile).await
     }
 
     /// Answer a relayed [`AgentRequest`] by sending its `relay_id` and a
@@ -161,19 +305,41 @@ impl Gateway {
         relay_id: &str,
         response: serde_json::Value,
     ) -> Result<bool, ClientError> {
-        let Some(websocket) = &self.websocket else {
-            return Err(ClientError::WebSocket(
+        let params = serde_json::json!({"relayId": relay_id, "response": response});
+        let no_interactive_connection = || {
+            ClientError::WebSocket(
                 "acpx/agent_response requires an interactive WebSocket connection; this \
                  Gateway is running in HTTP degraded mode with no live relay to answer"
                     .to_string(),
-            ));
-        };
-        let result = websocket
-            .call(
-                "acpx/agent_response",
-                serde_json::json!({"relayId": relay_id, "response": response}),
             )
-            .await?;
+        };
+        let result = match self.current_websocket() {
+            Some(websocket) => {
+                match websocket.call("acpx/agent_response", params.clone()).await {
+                    Err(ClientError::WebSocket(_)) => {
+                        if self.reconnect().await {
+                            match self.current_websocket() {
+                                Some(client) => client.call("acpx/agent_response", params).await?,
+                                None => return Err(no_interactive_connection()),
+                            }
+                        } else {
+                            return Err(no_interactive_connection());
+                        }
+                    }
+                    other => other?,
+                }
+            }
+            None => {
+                if self.reconnect().await {
+                    match self.current_websocket() {
+                        Some(client) => client.call("acpx/agent_response", params).await?,
+                        None => return Err(no_interactive_connection()),
+                    }
+                } else {
+                    return Err(no_interactive_connection());
+                }
+            }
+        };
         Ok(result
             .get("delivered")
             .and_then(|v| v.as_bool())

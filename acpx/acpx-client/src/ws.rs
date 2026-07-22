@@ -55,6 +55,15 @@ pub struct GatewayWsClient {
     next_id: AtomicI64,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<serde_json::Value, ClientError>>>>,
     notifications: broadcast::Sender<GatewayNotification>,
+    // Fired once the reader task's frame loop exits (peer closed the
+    // socket, a read errored, ...) -- lets a long-lived subscriber (a
+    // live-notification forwarding task with no in-flight `call()` to
+    // otherwise notice the drop) detect the connection died even with no
+    // traffic at all, instead of silently sitting on a `broadcast::
+    // Receiver` that will simply never receive anything again. See
+    // `wait_for_disconnect`.
+    disconnected: tokio::sync::Notify,
+    is_disconnected: std::sync::atomic::AtomicBool,
 }
 
 impl GatewayWsClient {
@@ -71,6 +80,8 @@ impl GatewayWsClient {
             next_id: AtomicI64::new(1),
             pending: Mutex::new(HashMap::new()),
             notifications,
+            disconnected: tokio::sync::Notify::new(),
+            is_disconnected: std::sync::atomic::AtomicBool::new(false),
         });
         let reader = Arc::clone(&client);
         tokio::spawn(async move {
@@ -89,12 +100,38 @@ impl GatewayWsClient {
             reader
                 .fail_pending("gateway WebSocket connection closed")
                 .await;
+            reader
+                .is_disconnected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            reader.disconnected.notify_waiters();
         });
         Ok(client)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<GatewayNotification> {
         self.notifications.subscribe()
+    }
+
+    /// Resolves once this connection's reader loop has exited (peer
+    /// closed it, a read errored, ...) -- or immediately, if that already
+    /// happened before this call. A long-lived subscriber can race this
+    /// against `Receiver::recv()` (via `tokio::select!`) to notice the
+    /// connection died even during a quiet period with no notifications
+    /// in flight, rather than only finding out the next time it happens
+    /// to call something.
+    pub async fn wait_for_disconnect(&self) {
+        // Register as a waiter *before* checking the flag: `Notify`
+        // only wakes tasks already waiting when `notify_waiters()` is
+        // called, so checking the flag first and creating the
+        // `Notified` future second would miss a disconnect that lands
+        // in between (classic check-then-wait race). Creating the
+        // future first means a `notify_waiters()` from this point
+        // onward is guaranteed to be observed by this specific await.
+        let notified = self.disconnected.notified();
+        if self.is_disconnected.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
     }
 
     pub async fn call(

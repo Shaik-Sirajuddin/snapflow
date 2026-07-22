@@ -74,6 +74,52 @@ async fn spawn_server_with_auth(router: SharedRouter, auth_token: Option<String>
     addr
 }
 
+/// Same as [`spawn_server`], but also returns the server's own
+/// `JoinHandle` so a test can `.abort()` it -- simulating a real gateway
+/// process dying underneath a live connection, for the reconnect
+/// regression test below.
+async fn spawn_server_with_handle(router: SharedRouter) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = probe.local_addr().expect("local_addr");
+    drop(probe);
+    let handle = tokio::spawn(async move {
+        // Deliberately not `.expect(...)`: the reconnect test aborts
+        // this task while `serve` is still running, which would
+        // otherwise print a spurious "future dropped" panic-looking
+        // line on an intentional abort. Errors, if any, are dropped;
+        // the caller observes success/failure through real network
+        // calls instead.
+        let _ = http::serve(router, addr, None).await;
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    (addr, handle)
+}
+
+/// Binds a server on a *specific* address (rather than an ephemeral
+/// port) -- used to rebind the exact address a previous server on this
+/// same address was just killed on, for the reconnect regression test.
+async fn spawn_server_on(addr: SocketAddr, router: SharedRouter) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
+        http::serve(router, addr, None)
+            .await
+            .expect("transport::serve");
+    });
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    handle
+}
+
 fn admin_registry() -> Registry {
     Registry {
         version: "test".to_owned(),
@@ -150,6 +196,68 @@ async fn gateway_facade_prefers_websocket_and_round_trips_rpc() {
         .await
         .expect("session/list over WebSocket");
     assert_eq!(result["sessions"], serde_json::json!([]));
+}
+
+/// Regression test: "websocket request to acpx gateway failed" with no
+/// recovery -- `Gateway` used to connect exactly once at construction
+/// and never retry, so a gateway process dying (killed, crashed,
+/// restarted) permanently broke every thread bound to that connection
+/// for the rest of the app's lifetime, no matter how long the user then
+/// waited or how many messages they sent (this is exactly what happened
+/// live this session: killing a stray gateway process left the panel
+/// stuck against a dead socket with no way to recover short of
+/// restarting the whole app).
+///
+/// Proves the real fix end to end, not just that `reconnect()` exists in
+/// isolation: kill the real server process this `Gateway`'s WebSocket is
+/// connected to, rebind a *second*, independent server on the exact same
+/// address, and confirm a subsequent `call()` on the *same* `Gateway`
+/// instance (same `base_url`, no test-only backdoor) transparently
+/// reconnects and completes -- the actual "message send hits a dead
+/// socket -> Gateway reconnects -> the request actually completes" path
+/// a real `AgentBridge` call goes through.
+#[tokio::test]
+async fn gateway_call_survives_the_server_dying_and_restarting_by_reconnecting() {
+    let mut router = Router::new("stand-in-agent");
+    router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let router: SharedRouter = Arc::new(Mutex::new(router));
+    let (addr, server_task) = spawn_server_with_handle(router).await;
+
+    let client = Gateway::connect(format!("http://{addr}")).await;
+    assert_eq!(client.mode(), TransportMode::WebSocketInteractive);
+    client
+        .call("session/list", serde_json::json!({}), None)
+        .await
+        .expect("session/list must succeed against the live server");
+
+    // Kill the server task -- the test-harness equivalent of the real
+    // gateway process dying underneath a live connection. This drops
+    // the listening socket and every accepted connection, so the
+    // client's existing WebSocket stream observes a close/read error.
+    server_task.abort();
+    // Let the abort actually land and the port free up before rebinding
+    // it -- best-effort; spawn_server_with_handle's own connect-retry
+    // loop below still tolerates a slightly slow bind.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut second_router = Router::new("stand-in-agent");
+    second_router.register_agent("stand-in-agent", stand_in_backend_spec());
+    let second_router: SharedRouter = Arc::new(Mutex::new(second_router));
+    let _second_server_task = spawn_server_on(addr, second_router).await;
+
+    // No manual reconnect() call here -- call() itself must notice the
+    // dead connection and recover on its own, exactly as a live
+    // AgentBridge send would.
+    let result = client
+        .call("session/list", serde_json::json!({}), None)
+        .await
+        .expect("call must transparently reconnect and succeed against the restarted server");
+    assert_eq!(result["sessions"], serde_json::json!([]));
+    assert_eq!(
+        client.mode(),
+        TransportMode::WebSocketInteractive,
+        "mode() must reflect the freshly reconnected WebSocket, not the dead one"
+    );
 }
 
 #[tokio::test]
