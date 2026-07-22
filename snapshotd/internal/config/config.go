@@ -137,6 +137,9 @@ func Default() Config {
 	}
 	acpxBind := os.Getenv("SNAPSHOTD_ACPX_HTTP_BIND")
 	if acpxBind == "" {
+		// Must mirror acpx-proto's DEFAULT_ACPX_HTTP_ADDR (the Rust single
+		// source of truth acpx-server and panel-rust share) -- cross-language,
+		// so keep this literal in sync with that constant.
 		acpxBind = "127.0.0.1:8790"
 	}
 	acpxConfig := os.Getenv("SNAPSHOTD_ACPX_CONFIG")

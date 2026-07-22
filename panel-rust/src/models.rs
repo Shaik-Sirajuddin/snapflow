@@ -287,6 +287,46 @@ pub fn to_message_model_from_transcript(
     items: Vec<crate::conversation::TranscriptItem>,
     expanded: &[bool],
 ) -> ModelRc<MessageItem> {
+    ModelRc::new(VecModel::from(to_message_rows_from_transcript(
+        items, expanded,
+    )))
+}
+
+/// Stable identity for a rendered transcript row. Include the row kind
+/// namespace because different reducer row kinds can carry related ids.
+pub fn transcript_row_key(item: &crate::conversation::TranscriptItem) -> String {
+    use crate::conversation::TranscriptItem;
+    match item {
+        TranscriptItem::User { message_id, .. } => format!("user:{message_id}"),
+        TranscriptItem::Assistant { message_id, .. } => format!("assistant:{message_id}"),
+        TranscriptItem::Thought { message_id, .. } => format!("thought:{message_id}"),
+        TranscriptItem::Tool { tool_call_id, .. } => format!("tool:{tool_call_id}"),
+        TranscriptItem::Terminal { terminal_id, .. } => format!("terminal:{terminal_id}"),
+        TranscriptItem::Notice { text } => format!("notice:{text}"),
+    }
+}
+
+/// Returns stable keys for the rows the Slint message projection renders.
+/// Terminal and notice items are omitted, matching the existing projection.
+pub fn transcript_row_keys(items: &[crate::conversation::TranscriptItem]) -> Vec<String> {
+    use crate::conversation::TranscriptItem;
+    items
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item,
+                TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. }
+            )
+        })
+        .map(transcript_row_key)
+        .collect()
+}
+
+/// Builds concrete message rows for the persistent message `VecModel`.
+pub fn to_message_rows_from_transcript(
+    items: Vec<crate::conversation::TranscriptItem>,
+    expanded: &[bool],
+) -> Vec<MessageItem> {
     use crate::conversation::TranscriptItem;
 
     let mut index = 0i32;
@@ -364,7 +404,7 @@ pub fn to_message_model_from_transcript(
             Some(row)
         })
         .collect();
-    ModelRc::new(VecModel::from(rows))
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -559,8 +599,11 @@ pub fn describe_thread(msgs: &[ChatMessage], max_chars: usize) -> String {
 /// (`thread-selected(filtered_idx)`) can be translated back to the
 /// actual thread the bridge/`thread_state` know about. See
 /// `PanelSingleton::visible_indices`/`real_index` in `lib.rs`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct VisibleThreadItem {
     pub real_index: usize,
+    /// Durable panel-local identity used for list reconciliation.
+    pub thread_id: String,
     pub item: ThreadItem,
 }
 
@@ -592,6 +635,7 @@ pub fn build_thread_items<N: AsRef<str>>(
         })
         .map(|((real_index, name), st)| VisibleThreadItem {
             real_index,
+            thread_id: format!("thread:{real_index}"),
             item: ThreadItem {
                 name: name.as_ref().into(),
                 // Archived takes precedence over closed: it is the final,
@@ -671,7 +715,12 @@ pub fn current_config_trigger_label(options: &[ConfigOptionInfo]) -> String {
 /// so the card appears the moment the terminal is created, not only
 /// once output exists).
 pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> ModelRc<TerminalItem> {
-    let items: Vec<TerminalItem> = entries
+    ModelRc::new(VecModel::from(to_terminal_item_rows(entries)))
+}
+
+/// Builds concrete terminal rows for a reducer-owned thread snapshot.
+pub fn to_terminal_item_rows(entries: Vec<(String, Option<TerminalBuffer>)>) -> Vec<TerminalItem> {
+    entries
         .into_iter()
         .map(|(terminal_id, buffer)| match buffer {
             Some(buffer) => TerminalItem {
@@ -692,8 +741,7 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
                 exit_code: 0,
             },
         })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+        .collect()
 }
 
 /// Builds the settings sheet's profile-picker row model from a real
@@ -701,7 +749,13 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
 pub fn to_profile_options(
     profiles: Vec<crate::gateway_actor::ProfileSummary>,
 ) -> ModelRc<ProfileOption> {
-    let items: Vec<ProfileOption> = profiles
+    ModelRc::new(VecModel::from(to_profile_option_rows(profiles)))
+}
+
+pub fn to_profile_option_rows(
+    profiles: Vec<crate::gateway_actor::ProfileSummary>,
+) -> Vec<ProfileOption> {
+    profiles
         .into_iter()
         .map(|p| ProfileOption {
             name: p.name.into(),
@@ -709,8 +763,7 @@ pub fn to_profile_options(
             terminal_enabled: p.allow_terminal_access,
             fs_enabled: p.allow_fs_access,
         })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+        .collect()
 }
 
 /// Builds the settings sheet's MCP-server list row model from a real
@@ -724,7 +777,13 @@ pub fn to_profile_options(
 pub fn to_mcp_server_options(
     servers: Vec<crate::protocol_types::McpServerEntry>,
 ) -> ModelRc<McpServerOption> {
-    let items: Vec<McpServerOption> = servers
+    ModelRc::new(VecModel::from(to_mcp_server_option_rows(servers)))
+}
+
+pub fn to_mcp_server_option_rows(
+    servers: Vec<crate::protocol_types::McpServerEntry>,
+) -> Vec<McpServerOption> {
+    servers
         .into_iter()
         .map(|entry| McpServerOption {
             name: entry.name.into(),
@@ -739,15 +798,19 @@ pub fn to_mcp_server_options(
                 .unwrap_or(true),
             ..Default::default()
         })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+        .collect()
 }
 
 /// Builds the skill-manager sidebar/settings row model from discovered
 /// `skills_state::SkillEntry` values (both global and project-local
 /// scans, already merged/sorted by the caller).
 pub fn to_skill_options(entries: Vec<SkillEntry>) -> ModelRc<SkillOption> {
-    let items: Vec<SkillOption> = entries
+    ModelRc::new(VecModel::from(to_skill_option_rows(entries)))
+}
+
+/// Builds concrete skill rows for the persistent skill `VecModel`.
+pub fn to_skill_option_rows(entries: Vec<SkillEntry>) -> Vec<SkillOption> {
+    entries
         .into_iter()
         .map(|entry| SkillOption {
             name: entry.name.into(),
@@ -756,8 +819,7 @@ pub fn to_skill_options(entries: Vec<SkillEntry>) -> ModelRc<SkillOption> {
             path: entry.path.to_string_lossy().into_owned().into(),
             started_from: entry.started_from.unwrap_or_default().into(),
         })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+        .collect()
 }
 
 /// Builds the recovery/import sheet's row model from a real
@@ -767,7 +829,16 @@ pub fn to_remote_session_options(
     sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     provider: &str,
 ) -> ModelRc<crate::RemoteSessionOption> {
-    let items: Vec<crate::RemoteSessionOption> = sessions
+    ModelRc::new(VecModel::from(to_remote_session_option_rows(
+        sessions, provider,
+    )))
+}
+
+pub fn to_remote_session_option_rows(
+    sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
+    provider: &str,
+) -> Vec<crate::RemoteSessionOption> {
+    sessions
         .into_iter()
         .map(|session| crate::RemoteSessionOption {
             session_id: session.acp_session_id.into(),
@@ -775,8 +846,7 @@ pub fn to_remote_session_options(
             title: session.title.unwrap_or_default().into(),
             updated_at: session.updated_at.unwrap_or_default().into(),
         })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+        .collect()
 }
 
 /// Builds the settings sheet's agent-catalog row model from a real
@@ -788,7 +858,13 @@ pub fn to_remote_session_options(
 pub fn to_agent_catalog_entries(
     agents: Vec<crate::protocol_types::AgentCatalogEntry>,
 ) -> ModelRc<AgentCatalogEntry> {
-    let items: Vec<AgentCatalogEntry> = agents
+    ModelRc::new(VecModel::from(to_agent_catalog_entry_rows(agents)))
+}
+
+pub fn to_agent_catalog_entry_rows(
+    agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+) -> Vec<AgentCatalogEntry> {
+    agents
         .into_iter()
         .map(|entry| AgentCatalogEntry {
             id: entry.id.into(),
@@ -796,8 +872,7 @@ pub fn to_agent_catalog_entries(
             version: entry.version.into(),
             status: entry.status.as_wire_str().into(),
         })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+        .collect()
 }
 
 /// Builds the `LocalTerminalItem` Slint property from a real
@@ -1203,6 +1278,29 @@ mod transcript_model_tests {
         assert!(row.first_use);
         assert_eq!(row.raw_input.as_str(), r#"{"skill":"artifact-design"}"#);
         assert_eq!(row.raw_output.as_str(), r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn transcript_row_keys_are_stable_and_omit_non_message_rows() {
+        let items = vec![
+            crate::conversation::TranscriptItem::User {
+                message_id: "u1".to_owned(),
+                text: "hello".to_owned(),
+            },
+            crate::conversation::TranscriptItem::Assistant {
+                message_id: "a1".to_owned(),
+                text: "world".to_owned(),
+                streaming: true,
+            },
+            crate::conversation::TranscriptItem::Notice {
+                text: "ignored".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            transcript_row_keys(&items),
+            vec!["user:u1".to_owned(), "assistant:a1".to_owned()]
+        );
     }
 
     #[test]

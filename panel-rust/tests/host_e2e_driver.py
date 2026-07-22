@@ -182,10 +182,9 @@ def wait_for_pending_request(host_log, thread_index=0, timeout=10):
 def wait_for_attachment(host_log, thread_index=0):
     if host_log is None:
         raise RuntimeError("--wait-for-attachment requires --host-log")
-    marker = "panel-rust input: attachment ready thread={} ".format(thread_index)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        if host_log.exists() and marker in host_log.read_text(errors="replace"):
+        if len(attachment_names(host_log)) > thread_index:
             return
         time.sleep(0.1)
     raise RuntimeError(
@@ -193,16 +192,47 @@ def wait_for_attachment(host_log, thread_index=0):
     )
 
 
-ATTACHMENT_RE = re.compile(r"panel-rust input: attachment ready thread=(\d+) ")
+ATTACHMENT_RE = re.compile(r"panel-rust attachment: thread=([^ ]+) ")
+
+
+def attachment_log_paths(host_log):
+    """Return the selected host trace and its sibling stdout/stderr log.
+
+    Qt/plugin builds have routed the same panel diagnostics to different
+    streams. The smoke script supplies one stream as --host-log, while the
+    other is retained beside it; attachment readiness must not depend on
+    that implementation detail.
+    """
+    if host_log is None:
+        return []
+    paths = [host_log]
+    suffix_pairs = (
+        (".stdout.log", ".stderr.log"),
+        (".stderr.log", ".stdout.log"),
+    )
+    for source_suffix, sibling_suffix in suffix_pairs:
+        if host_log.name.endswith(source_suffix):
+            sibling = host_log.with_name(
+                host_log.name[: -len(source_suffix)] + sibling_suffix
+            )
+            if sibling != host_log:
+                paths.append(sibling)
+            break
+    return paths
+
+
+def attachment_names(host_log):
+    names = []
+    for path in attachment_log_paths(host_log):
+        if path.exists():
+            names.extend(ATTACHMENT_RE.findall(path.read_text(errors="replace")))
+    return names
 
 
 def known_thread_indices(host_log):
-    if host_log is None or not host_log.exists():
-        return set()
-    return {
-        int(match)
-        for match in ATTACHMENT_RE.findall(host_log.read_text(errors="replace"))
-    }
+    """Compatibility name retained for the driver callers; the host trace
+    records durable thread names, not bridge indices."""
+    return set(attachment_names(host_log))
 
 
 def open_second_thread(xdisplay, host_log):
@@ -237,24 +267,37 @@ def open_second_thread(xdisplay, host_log):
 
     baseline = known_thread_indices(host_log)
 
-    # `sidebar-toggle` is the leftmost 24x24 control in the 36px header
-    # row, at `padding` (4px while compact) from the left edge.
-    dock_click(xdisplay, 16, 18)
-    time.sleep(0.3)
+    # Collapsed expand-toggle: the panel-left IconButton at the top of the
+    # 48px collapsed rail. Ground-truthed visually (scrot of a held session)
+    # to dock ~ (12, 9), not the geometric header center -- the icon sits
+    # tight to the top-left. A single click toggles `sidebar-expanded`
+    # (app.slint), so do NOT click it more than once or it re-collapses. The
+    # New-thread scan below stays far right (x>=145), clear of this toggle,
+    # so it can never re-close the rail.
+    dock_click(xdisplay, 12, 9)
+    time.sleep(0.4)
 
     deadline = time.monotonic() + 20
-    # "New thread" sits after a stretching filler, just left of the
-    # trailing gear glyph, inside the now-144px-wide expanded header --
-    # scan the right two thirds of the header row so real glyph-width
-    # variance in the preceding "Chats" label/filler cannot make a single
-    # fixed pixel miss the control.
+    # "New thread" (`sidebar.slint`) is the right-most control in the 36px
+    # header of the expanded sidebar -- after the collapse toggle, the
+    # "Chats" label, and a stretching filler. While compact the expanded
+    # sidebar is 200px wide (`expanded ? (compact ? 200px : 260px) : 48px`),
+    # so the plus button sits near x~182 (200 - space-2 padding - a ~24px
+    # IconButton), well right of the driver's old 60-142 assumption. Scan
+    # the right edge band; the left toggle (which would re-collapse) is far
+    # left of this range so the scan cannot accidentally close the sidebar.
     candidates = [
         (x, y)
-        for y in range(6, 32, 4)
-        for x in range(60, 142, 4)
+        for y in range(4, 34, 3)
+        for x in range(145, 201, 3)
     ]
     for x, y in candidates:
         if known_thread_indices(host_log) - baseline:
+            # New thread confirmed. Collapse the sidebar (it was expanded to
+            # reach "New thread") so the chat composer returns to its normal
+            # position for the caller's subsequent focus_compose/prompt.
+            dock_click(xdisplay, 12, 9)
+            time.sleep(0.3)
             return
         if time.monotonic() > deadline:
             break
@@ -264,6 +307,11 @@ def open_second_thread(xdisplay, host_log):
     settle_deadline = time.monotonic() + max(0.0, deadline - time.monotonic()) + 2
     while time.monotonic() < settle_deadline:
         if known_thread_indices(host_log) - baseline:
+            # New thread confirmed. Collapse the sidebar (it was expanded to
+            # reach "New thread") so the chat composer returns to its normal
+            # position for the caller's subsequent focus_compose/prompt.
+            dock_click(xdisplay, 12, 9)
+            time.sleep(0.3)
             return
         time.sleep(0.1)
     raise RuntimeError(
@@ -276,30 +324,42 @@ def open_second_thread(xdisplay, host_log):
 
 
 def select_thread_row(xdisplay, index, host_log):
-    """Click an existing sidebar thread row by index. Rows are 48px tall,
-    stacked below the 36px header, and their `TouchArea` covers the full
-    row regardless of `expanded` (only the row's text label is gated on
-    that -- see `sidebar.slint`), so this works against the default
-    collapsed 48px-wide sidebar with no toggle needed. Confirms success
-    from the click's own host trace, which reports the *post-click*
-    `selected_thread` synchronously (Slint's `clicked` callback runs
-    inside the same `dispatch_event` call the click handler makes).
+    """Click an existing sidebar thread row by index. In the default
+    collapsed 48px-wide sidebar the vertical stack (`sidebar.slint`) is:
+    36px header, ~2px inter-child spacing (Metrics.space-1), 32px search
+    rail, ~2px, then the thread list -- collapsed rows are 44px tall
+    (`expanded ? 52px : 44px`) separated by 2px. Each row's `TouchArea`
+    covers the full row, so no toggle is needed. Because the software
+    renderer accumulates a little per-widget spacing/rounding slack, scan
+    a small vertical band around the computed row center instead of one
+    fixed pixel. Success is confirmed from the click's own host trace,
+    which reports the *post-click* `selected_thread` synchronously (Slint's
+    `clicked` callback runs inside the same `dispatch_event` call).
     """
     if host_log is None:
         raise RuntimeError("select_thread_row requires --host-log")
-    row_y = 36 + index * 48 + 24
-    offset = host_log.stat().st_size if host_log.exists() else 0
-    dock_click(xdisplay, 20, row_y)
-    deadline = time.monotonic() + 2
+    # 36px header + 2px + 32px search rail + 2px = top of the thread list.
+    list_top = 36 + 2 + 32 + 2
+    row_pitch = 44 + 2
+    row_center = list_top + index * row_pitch + 22
     marker = "selected_thread={}".format(index)
-    while time.monotonic() < deadline:
-        if host_log.exists() and marker in host_log.read_text(errors="replace")[offset:]:
-            return
-        time.sleep(0.05)
+    deadline = time.monotonic() + 6
+    last_y = row_center
+    for dy in (0, 4, -4, 8, -8, 12, -12, 16, -16):
+        last_y = row_center + dy
+        offset = host_log.stat().st_size if host_log.exists() else 0
+        dock_click(xdisplay, 20, last_y)
+        inner_deadline = time.monotonic() + 0.4
+        while time.monotonic() < inner_deadline:
+            if host_log.exists() and marker in host_log.read_text(errors="replace")[offset:]:
+                return
+            time.sleep(0.05)
+        if time.monotonic() > deadline:
+            break
     raise RuntimeError(
-        "clicking sidebar row {} at y={} did not select it (host trace never "
-        "reported {!r}; screen click was ({}, {}))".format(
-            index, row_y, marker, DOCK_X_OFFSET + 20, DOCK_Y_OFFSET + row_y
+        "clicking sidebar row {} near y={} did not select it (host trace never "
+        "reported {!r}; last screen click was ({}, {}))".format(
+            index, row_center, marker, DOCK_X_OFFSET + 20, DOCK_Y_OFFSET + last_y
         )
     )
 
@@ -333,39 +393,39 @@ def wait_for_cancel_record(event_log, session_id, deadline):
 
 def stop_button_dock_xy(dock_width):
     """Computes the Send/Stop `TouchArea`'s dock-relative center pixel
-    straight from `chat_area.slint`'s own fixed layout constants (no
-    text-metrics dependency the way the sidebar's "New thread" label
-    scan needed one -- this button's hit area is a fixed-size
-    `Rectangle`, not text-width-driven), rather than a blind screen
-    scan:
+    straight from `chat_input_layout.slint`'s own fixed layout constants
+    (no text-metrics dependency -- the button's hit area is a fixed 34x34
+    `Rectangle`, not text-width-driven), rather than a blind screen scan.
+
+    Since the compose bar was extracted into `ChatInputLayout` the
+    Send/Stop control is no longer a separate second button row: it is a
+    fixed 34x34 button at the *right end of row 1* (the input row),
+    bottom-aligned to it, mirroring `compose_input_dock_xy`'s own updated
+    shell math:
 
     - The dock's own top-level window is pinned to a 260px floor
       (`container->setMinimumSize(180, 260)` in `chatrustdock.cpp`,
       ground-truthed via `xwininfo -root -tree`; see this module's
       `DOCK_Y_OFFSET` doc comment) regardless of forced width, and
       `ChatArea`'s own vertical layout only stretches the message list,
-      not the header or `compose-shell` -- so `compose-shell` is always
-      pinned to the dock's bottom edge.
-    - `compact` (true for every dock width this harness uses -- see
-      `lib.rs`'s `compact: width < 320`) sets `compose-shell`'s own
-      height (72px) and the button `Rectangle`'s width (44px); the
-      button height (26px) and the row's fixed paddings/spacing are not
-      compact-gated.
+      not the header or the compose bar -- so `ChatInputLayout` is
+      always pinned to the dock's bottom edge.
+    - `ChatInputLayout`'s `VerticalLayout` has 12px (`pad-md`) top/bottom
+      padding and 32px (`pad-2xl`) horizontal padding; row 1 is the 34px
+      input row, with the 34x34 send button as its right-most item.
     """
     dock_height = 260
-    compact = dock_width < 320
-    shell_height = 72 if compact else 78
-    button_width = 44 if compact else 116
-    button_height = 26
-    shell_top = dock_height - shell_height
-    row1_height = 34
-    pad_top = 8
-    row_spacing = 5
-    pad_right = 10
-    x2 = dock_width - pad_right
-    x1 = x2 - button_width
-    y1 = shell_top + pad_top + row1_height + row_spacing
-    y2 = y1 + button_height
+    pad_2xl = 32
+    pad_top = 12
+    button_size = 34
+    # Same shell height compose_input_dock_xy uses: pad(12) + input(34) +
+    # gap(8) + selector row(24) + pad(12).
+    shell_height = 12 + 34 + 8 + 24 + 12
+    input_top = dock_height - shell_height + pad_top
+    x2 = dock_width - pad_2xl
+    x1 = x2 - button_size
+    y1 = input_top
+    y2 = y1 + button_size
     return (x1 + x2) // 2, (y1 + y2) // 2, (x1, y1, x2, y2)
 
 
@@ -444,7 +504,12 @@ def permission_button_dock_xy(dock_width, approve):
     """
     dock_height = 260
     compact = dock_width < 320
-    shell_height = 72 if compact else 78
+    # Compose shell height, matching compose_input_dock_xy /
+    # local_terminal_focus_dock_xy exactly: pad(12) + input(34) + spacing(8)
+    # + row-2 mode/model triggers(24) + pad(12) = 90px. This was re-grounded
+    # to 90 for the other bottom-anchored controls (commit 0877782) but this
+    # function kept the stale 72, putting the card's buttons ~18px too low.
+    shell_height = 12 + 34 + 8 + 24 + 12
     separator_height = 1
     outer_pad = 6 if compact else 10
     card_pad = 10
@@ -560,22 +625,19 @@ def local_terminal_toggle_dock_xy(dock_width):
     `Rectangle` is always present (unlike the conditionally-rendered
     permission card), so this reuses the same right-anchored reasoning
     `stop_button_dock_xy` already proved live across four dock widths:
-    the header row's visible (compact, non-narrow) children are the
-    thread icon (fixed 22px), a stretching spacer, the toggle (fixed
-    24px), and -- easy to miss on a first read, confirmed the hard way
-    against a live session where (242, 22) landed on this button
-    instead -- a trailing settings-gear button (also fixed 24px) after
-    it. Both trailing buttons are right-anchored, so the toggle sits
-    one 24px-button-plus-5px-spacing left of the dock's right edge, not
-    flush against it.
+    the header `right-cluster` (`chat_area.slint`, `alignment: end`) ends
+    with the toggle `IconButton` (fixed 24x24) as its right-most child:
+    the agent badge and the `narrow`-only "New thread" button both sit to
+    its left, so the toggle is right-anchored flush against the header's
+    own `padding-right` (`compact ? space-3 (6px) : space-6 (12px)`), with
+    no trailing settings gear (that control is no longer in this cluster).
+    Header height is `compact ? 48 : 56`.
     """
     compact = dock_width < 320
-    header_height = 44 if compact else 52
+    header_height = 48 if compact else 56
     pad = 6 if compact else 12
-    spacing = 5
     toggle_size = 24
-    settings_size = 24
-    x2 = dock_width - pad - settings_size - spacing
+    x2 = dock_width - pad
     x1 = x2 - toggle_size
     return (x1 + x2) // 2, header_height // 2
 
@@ -593,7 +655,8 @@ def local_terminal_focus_dock_xy(dock_width):
     """
     dock_height = 260
     compact = dock_width < 320
-    shell_height = 72 if compact else 78
+    # ChatInputLayout compose bar: pad(12)+input(34)+gap(8)+selector(24)+pad(12).
+    shell_height = 12 + 34 + 8 + 24 + 12
     separator_height = 1
     outer_pad = 6 if compact else 10
     card_height = 120 if compact else 180
@@ -607,6 +670,20 @@ def local_terminal_focus_dock_xy(dock_width):
     row_y2 = row_y1 + row_height
     center_x = dock_width // 2
     return center_x, (row_y1 + row_y2) // 2
+
+
+def compose_input_dock_xy(dock_width):
+    """Return the center of the ChatInputLayout text input.
+
+    ChatArea's bottom layout is: separator, ChatInputLayout, with the
+    message stream taking the remaining height. ChatInputLayout's compact
+    layout has 12px top/bottom padding, an input row clamped to 34px, an
+    8px row gap, and a 24px selector row.
+    """
+    dock_height = 260
+    shell_height = 12 + 34 + 8 + 24 + 12
+    input_top = dock_height - shell_height + 12
+    return max(12, dock_width // 2), input_top + 17
 
 
 def local_terminal_events(host_log, thread_index=0):
@@ -650,17 +727,17 @@ def focus_compose(xdisplay, x, y, host_log):
         click(xdisplay, x, y)
         return
 
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         # Dock restoration is allowed to change the vertical split. Probe a
         # compact band in the chat column, but do not type until Rust confirms
         # a click reached the actual TextInput.
-        for candidate_y in (y, y + 60, y - 60, y + 120, y - 120, y + 180, y - 180):
+        for candidate_y in (y, y + 12, y - 12, y + 24, y - 24):
             if candidate_y < 0:
                 continue
             offset = host_log.stat().st_size if host_log.exists() else 0
             click(xdisplay, x, candidate_y)
-            focus_deadline = time.monotonic() + 0.5
+            focus_deadline = time.monotonic() + 0.25
             while time.monotonic() < focus_deadline:
                 if host_log.exists():
                     recent = host_log.read_text(errors="replace")[offset:]
@@ -791,8 +868,9 @@ def main():
     # compose control sits in the chat dock's lower half. This gate drives
     # only the deterministic compose coordinate; multi-session routing is
     # covered by the real gateway actor suite, where sessions have stable IDs.
-    compose_x = max(12, args.dock_width - 92)
-    compose_y = 520
+    compose_x, compose_y = compose_input_dock_xy(args.dock_width)
+    compose_x += DOCK_X_OFFSET
+    compose_y += DOCK_Y_OFFSET
     expected_prompt = INPUT_MATRIX_EXPECTED if args.exercise_input_matrix else args.prompt
 
     if args.wait_for_attachment:

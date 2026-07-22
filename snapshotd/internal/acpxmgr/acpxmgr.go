@@ -197,6 +197,10 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		return nil, fmt.Errorf("acpxmgr: empty ConfigPath")
 	}
 	if cfg.HttpBind == "" {
+		// Must mirror acpx-proto's DEFAULT_ACPX_HTTP_ADDR (the Rust single
+		// source of truth acpx-server and panel-rust share) -- cross-language,
+		// so keep this literal in sync with that constant if the default port
+		// ever changes.
 		cfg.HttpBind = "127.0.0.1:8790"
 	}
 	if cfg.McpURL == "" {

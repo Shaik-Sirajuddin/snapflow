@@ -88,10 +88,11 @@ pub enum BridgeError {
 }
 
 /// One agent-bridge event, tagged with which UI thread index it belongs
-/// to. `panel-rust`'s `PanelSingleton::apply_bridge_events` matches on
-/// `event` for thread-status transitions and, for `Message`, re-reads
-/// `AgentBridge::history` rather than trusting text carried here --
-/// single source of truth is the mutex-guarded history, not the event.
+/// to. The TEA frame reducer matches on `event` for thread-status
+/// transitions and, for `Message`, re-reads `AgentBridge::history` via
+/// the next selected-thread snapshot rather than trusting text carried
+/// here.
+#[derive(Clone, Debug, PartialEq)]
 pub struct BridgeEvent {
     pub thread_index: usize,
     pub event: AgentEvent,
@@ -274,7 +275,7 @@ pub struct AgentBridge {
     // `&self` -- matches every other per-thread read accessor in this
     // impl block (`history`/`active_terminals`/`terminal_buffer`/etc.),
     // which `PanelSingleton`'s own `&self` refresh methods
-    // (`refresh_terminals_for` and friends) rely on being able to call
+    // (`dispatch_terminal_snapshot` and friends) rely on being able to call
     // without needing `&mut self.bridge` threaded through.
     local_terminals:
         std::cell::RefCell<std::collections::HashMap<usize, crate::local_terminal::LocalTerminal>>,
@@ -661,7 +662,8 @@ fn resolve_snapflowd_mcp_bin() -> PathBuf {
 /// active MLT project's *file* path (`PanelSingleton::active_project_path`
 /// as threaded through `AgentBridge::session_cwd_override`) -- passed
 /// through as-is; `snapflowd-mcp` itself derives the project's
-/// `.skills/` directory from its parent, same as `refresh_skills_model`
+/// `.skills/` directory from its parent, same as
+/// `PanelSingleton::collect_skills_snapshot`
 /// (lib.rs) already does.
 fn snapflowd_mcp_servers_entry(
     project_path: Option<&std::path::Path>,
@@ -714,7 +716,8 @@ fn snapflowd_mcp_servers_entry(
 /// both providers instead of needing a provider-gated split.
 fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
     let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
-    let addr = std::env::var("SNAPSHOTD_MCP_SSE_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string());
+    let addr =
+        std::env::var("SNAPSHOTD_MCP_SSE_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string());
     if !probe_http_endpoint(&addr, "/sse") {
         return Vec::new();
     }
@@ -742,8 +745,7 @@ fn probe_http_endpoint(addr: &str, path: &str) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
@@ -814,8 +816,8 @@ fn resolve_backend_agent_command() -> Option<String> {
     if std::env::var("RUI_USE_DEV_MOCK_AGENT").as_deref() != Ok("1") {
         return None;
     }
-    let dev_mock_agent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/rui-mock-agent");
+    let dev_mock_agent =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent");
     if dev_mock_agent.is_file() {
         return Some(dev_mock_agent.to_string_lossy().into_owned());
     }
@@ -1145,8 +1147,10 @@ fn reserve_ephemeral_port() -> Option<(u16, File)> {
 ///    already-running acpx-server this process should just dial,
 ///    trusted as-is with no liveness probe, matching
 ///    `RUI_ACP_AGENT_CMD`'s established override-precedence convention).
-/// 2. Else, a fixed per-provider loopback default port (8790 codex /
-///    8791 claude) is probed with [`probe_acpx_gateway`] -- if a real
+/// 2. Else, the single shared loopback default bind
+///    (`acpx_client::DEFAULT_ACPX_HTTP_ADDR`, one place, same value
+///    acpx-server itself defaults `ACPX_HTTP_BIND` to) is probed with
+///    [`probe_acpx_gateway`] for every provider -- if a real
 ///    acpx-server is already answering there (an operator-started one,
 ///    *or this same panel process's own gateway surviving a prior
 ///    thread's earlier call in this same construction loop, or -- the
@@ -1204,15 +1208,21 @@ fn provision_gateway(provider: &str, cache_dir: Option<&PathBuf>) -> Result<Stri
         return Ok(url);
     }
 
-    let default_port: u16 = if provider == "codex" { 8790 } else { 8791 };
-    if probe_acpx_gateway_for_agent(default_port, Some(provider)) {
-        return Ok(format!("http://127.0.0.1:{default_port}"));
-    }
-    // Healthy gateway on default codex port may still serve both providers
-    // when snapshotd bundles one acpx-server — reuse if any acpx answers.
-    // Any acpx on the shared default port (snapshotd single gateway).
-    if provider != "codex" && probe_acpx_gateway_once(default_port, None) {
-        return Ok(format!("http://127.0.0.1:{default_port}"));
+    // One shared default bind for every provider -- the single source of
+    // truth is acpx_client::DEFAULT_ACPX_HTTP_ADDR, which acpx-server also
+    // uses for its own ACPX_HTTP_BIND default. snapshotd ships exactly one
+    // acpx-server serving all agents; genuine per-provider gateways remain
+    // expressible via the RUI_ACPX_<PROVIDER>_URL overrides above. (The old
+    // codex=8790 / claude=8791 split assumed one acpx-server per provider,
+    // which no live deployment uses -- confirmed against the running system.)
+    let default_port: u16 = acpx_client::default_acpx_http_port();
+    // Prefer an agent-specific health match, but reuse any acpx answering the
+    // shared port (a single bundled gateway may advertise a different default
+    // agent-id than this provider while still serving it).
+    if probe_acpx_gateway_for_agent(default_port, Some(provider))
+        || probe_acpx_gateway_once(default_port, None)
+    {
+        return Ok(acpx_client::default_acpx_http_url());
     }
 
     // When snapshotd (or an operator) owns acpx, do not auto-spawn a second
@@ -2090,10 +2100,9 @@ impl AgentBridge {
         // the actual session resolution to `spawn_background_attachment`
         // (the exact function the constructor's own per-thread loop already
         // uses for this), which sets `attachment`/notifies waiters and
-        // persists the thread record once the session id is known --
-        // `sync_thread_records` (lib.rs) already polls for that and was
-        // written specifically to support creation returning before
-        // attachment finishes.
+        // persists the thread record once the session id is known; the
+        // frame input collector observes that binding and the reducer
+        // emits the persistence effect.
         let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
             spawn_acpx_thread_with_delayed_gateway()
@@ -2413,6 +2422,17 @@ impl AgentBridge {
             .expect("event queue mutex poisoned")
             .drain(..)
             .collect()
+    }
+
+    /// Non-destructive frame-loop probe. The UI dispatcher uses this to
+    /// decide whether a `FrameInput` should carry bridge work without
+    /// draining the queue before `update()` sees the message.
+    pub fn has_pending_events(&self) -> bool {
+        !self
+            .events
+            .lock()
+            .expect("event queue mutex poisoned")
+            .is_empty()
     }
 
     /// Presentation-safe transport state for one thread's shared gateway.
@@ -3300,7 +3320,10 @@ mod tests {
             Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1")
         );
         assert_eq!(default_backend_command_for_provider("codex"), None);
-        assert_eq!(default_backend_command_for_provider("unknown-provider"), None);
+        assert_eq!(
+            default_backend_command_for_provider("unknown-provider"),
+            None
+        );
     }
 
     /// read_codex_api_key_from_auth_file's real, only call site
