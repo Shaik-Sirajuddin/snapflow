@@ -239,7 +239,14 @@ jobs:
         shell: msys2 {0}
         working-directory: shotcut-rebrand
         run: |
-          APPDIR="build/Snapflow/bin"
+          # shotcut-rebrand's CMakeLists.txt's WINDOWS_DEPLOY option
+          # defaults ON, which installs snapflow.exe directly to
+          # CMAKE_INSTALL_PREFIX (build/Snapflow) rather than a bin/
+          # subdir -- confirmed on a real windows-latest run ("build\
+          # Snapflow\bin\snapflow.exe does not exist", the install step
+          # right before this one having placed it at build/Snapflow/
+          # snapflow.exe instead).
+          APPDIR="build/Snapflow"
           windeployqt --release --no-translations "$APPDIR/snapflow.exe"
           cp /mingw64/bin/mlt*.dll "$APPDIR/" 2>/dev/null || true
           mkdir -p build/Snapflow/lib build/Snapflow/share
