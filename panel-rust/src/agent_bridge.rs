@@ -3358,6 +3358,50 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
+        // Defensive validation, not a normal-path check: session/set_
+        // config_option is scoped entirely to whichever one backend
+        // process is already attached to this thread -- ACP has no
+        // primitive for switching a live session to a different
+        // provider/agent (confirmed against Zed's own AgentSessionConfig
+        // Options::set_config_option, which is likewise per-connection
+        // only; Zed's own answer for changing providers is client-side,
+        // entirely outside ACP: free agent choice on an empty draft
+        // thread, a brand-new thread once real content exists). A normal
+        // UI flow can't actually construct a cross-provider selection
+        // today (config_dropdown_entries only ever lists this thread's
+        // own advertised options), but nothing enforced that -- calling
+        // this with a value this thread never advertised would have
+        // silently forwarded the RPC to the (wrong) attached backend
+        // and surfaced whatever confusing native error it happened to
+        // produce. Reject it here instead, with a clear message, until
+        // real provider-switching (restart-under-a-new-agent) exists.
+        let is_known_value = {
+            let config_options = slot
+                .config_options
+                .lock()
+                .expect("config_options mutex poisoned");
+            config_options.iter().any(|option| {
+                option.id == config_id
+                    && option
+                        .options
+                        .iter()
+                        .any(|v| serde_json::Value::String(v.value.clone()) == value)
+            })
+        };
+        if !is_known_value {
+            self.events
+                .lock()
+                .expect("event queue mutex poisoned")
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::Error(format!(
+                        "config option {config_id:?}={value} is not one this thread's \
+                         attached backend advertised -- switching a live session to a \
+                         different provider is not supported yet"
+                    )),
+                });
+            return;
+        }
         let slot = slot.clone();
         let handle = slot.handle.clone();
         let events = self.events.clone();
@@ -6051,6 +6095,40 @@ done
             Some("gpt-5-mini"),
             "config_options(0) should reflect the backend's own updated currentValue \
              after session/set_config_option resolves"
+        );
+
+        // setup-followups plan: a value this thread's attached backend
+        // never advertised (the cross-provider case ACP has no
+        // primitive for -- see set_config_option's own doc comment)
+        // must be rejected before ever reaching the backend, not
+        // silently forwarded to whatever process happens to be
+        // attached. Overwrite the marker file first so its continued
+        // absence-of-a-*new*-write is a real signal, not just "the
+        // earlier real call already wrote it".
+        std::fs::write(&set_config_marker, "UNTOUCHED\n").expect("reset marker");
+        bridge.set_config_option(
+            0,
+            "model".to_string(),
+            serde_json::json!("claude-opus-not-a-real-codex-model"),
+        );
+        // No deadline-poll here on purpose: this must resolve
+        // synchronously (the validation runs before the async task is
+        // even spawned) or not at all -- a fixed settle time is the
+        // right tool for asserting an absence, unlike the real round
+        // trips above which need to poll for a positive result.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            std::fs::read_to_string(&set_config_marker).unwrap_or_default(),
+            "UNTOUCHED\n",
+            "an unadvertised config value must never reach the backend"
+        );
+        let events = bridge.poll();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::Error(message) if message.contains("is not one this thread's attached backend advertised")
+            )),
+            "expected a rejection AgentEvent::Error, got: {events:?}"
         );
     }
 

@@ -770,6 +770,8 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         model: "".into(),
         project_name: "".into(),
         project_path: "".into(),
+        profile_name: "".into(),
+        has_session: false,
     }])));
 
     let closed_index = Rc::new(Cell::new(-1i32));
@@ -875,6 +877,8 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         model: "".into(),
         project_name: "".into(),
         project_path: "".into(),
+        profile_name: "".into(),
+        has_session: false,
     }])));
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
@@ -1000,6 +1004,8 @@ fn thread_search_box_accepts_real_typed_keystrokes_and_dispatches_search_changed
         model: "".into(),
         project_name: "".into(),
         project_path: "".into(),
+        profile_name: "".into(),
+        has_session: false,
     }])));
 
     let search_changes = Rc::new(RefCell::new(Vec::<String>::new()));
@@ -1122,5 +1128,79 @@ fn skill_selection_opens_the_editor_and_close_returns_to_chat() {
         panel.get_active_pane(),
         "chat",
         "closing the skill editor must return to the chat pane"
+    );
+}
+
+/// setup-followups plan, provider_fastmode_profile_persistence: the
+/// compose-bar profile picker is only ever interactive while the active
+/// thread has no attached session yet (ThreadItem.has-session) -- ACP has
+/// no primitive for moving a live session to a different backend
+/// (confirmed against Zed's own AgentSessionConfigOptions::
+/// set_config_option, which is likewise per-connection only; Zed's own
+/// answer for changing providers is entirely client-side: free agent
+/// choice on an empty draft thread, a new thread once real content
+/// exists). This proves both halves through the real UI: enabled ->
+/// selectable and dispatches profile-selected; locked -> not just hidden
+/// but genuinely inert (SearchableDropdown.enabled: false), matching the
+/// "dimmed, not vanished" convention this file's other disabled-state
+/// tests already use.
+#[test]
+fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    let profile_selection = Rc::new(RefCell::new(Vec::<String>::new()));
+    {
+        let profile_selection = profile_selection.clone();
+        panel.on_profile_selected(move |id| profile_selection.borrow_mut().push(id.to_string()));
+    }
+
+    panel.set_profile_dropdown_entries(ModelRc::new(VecModel::from(vec![
+        DropdownEntry {
+            id: "codex-tools".into(),
+            label: "codex-tools".into(),
+            value: "".into(),
+            is_header: false,
+            is_current: false,
+        },
+        DropdownEntry {
+            id: "balanced".into(),
+            label: "balanced".into(),
+            value: "".into(),
+            is_header: false,
+            is_current: false,
+        },
+    ])));
+    panel.set_active_thread_has_session(false);
+
+    let profile_trigger = ElementHandle::find_by_accessible_label(&panel, "Profile")
+        .next()
+        .expect("profile selector trigger must be accessible even before any profile is chosen");
+    profile_trigger.invoke_accessible_default_action();
+    let select_profile = ElementHandle::find_by_accessible_label(&panel, "codex-tools")
+        .next()
+        .expect("profile option must be accessible once the dropdown is open");
+    select_profile.invoke_accessible_default_action();
+    assert_eq!(&*profile_selection.borrow(), &["codex-tools"]);
+
+    // Once a session attaches, the picker must be genuinely locked, not
+    // merely re-labelled -- SearchableDropdown.enabled: false disables
+    // its own accessible-action-default, so invoking it must not open
+    // the popup at all.
+    panel.set_active_thread_has_session(true);
+    let profile_trigger_locked = ElementHandle::find_by_accessible_label(&panel, "codex-tools")
+        .next()
+        .expect("locked trigger must still show the already-chosen profile as its label");
+    profile_trigger_locked.invoke_accessible_default_action();
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "balanced")
+            .next()
+            .is_none(),
+        "the popup must not open while the picker is locked (has-session: true)"
+    );
+    assert_eq!(
+        &*profile_selection.borrow(),
+        &["codex-tools"],
+        "no further profile-selected calls once locked"
     );
 }

@@ -45,6 +45,21 @@ export struct ThreadItem {
     // primitive to derive this itself), e.g. "/a/b/foo.mlt" -> "foo.mlt".
     // Empty exactly when project-path is empty.
     project-name: string,
+    // setup-followups plan, provider_fastmode_profile_persistence: the
+    // profile (agent/provider + terminal/fs policy) this thread will use
+    // (or already uses). Empty means "no profile chosen, backend
+    // default". Free to change while `has-session` is false; once a real
+    // ACP session has attached (open_session_maybe_profiled already only
+    // ever reads this once, at session creation -- ACP itself has no
+    // primitive for moving a live session to a different backend), the
+    // choice is locked, matching Zed's own AgentSessionConfigOptions
+    // precedent (free agent choice on an empty draft thread, a new
+    // thread once real content exists).
+    profile-name: string,
+    // True once this thread has a real attached ACP session (a session
+    // id is known) -- the profile picker is only interactive while this
+    // is false.
+    has-session: bool,
 }
 
 

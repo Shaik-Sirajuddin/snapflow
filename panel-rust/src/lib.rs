@@ -1846,6 +1846,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        panel.component.on_profile_selected(move |profile_name| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_profile_selected(panel, profile_name.to_string());
+                }
+            });
+        });
+
         let component_weak = panel.component.as_weak();
         panel
             .component
@@ -2752,6 +2760,8 @@ mod keyboard_shortcut_tests {
             model: "".into(),
             project_name: "".into(),
             project_path: "".into(),
+            profile_name: "".into(),
+            has_session: false,
         }
     }
 

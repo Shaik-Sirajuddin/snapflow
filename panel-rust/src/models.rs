@@ -671,6 +671,8 @@ pub fn build_thread_items<N: AsRef<str>>(
                 // as provider/model above.
                 project_path: String::new().into(),
                 project_name: String::new().into(),
+                profile_name: String::new().into(),
+                has_session: false,
             },
         })
         .collect()
@@ -764,6 +766,28 @@ pub fn to_profile_option_rows(
             fs_enabled: p.allow_fs_access,
         })
         .collect()
+}
+
+/// setup-followups plan, provider_fastmode_profile_persistence: the
+/// compose-bar profile-picker's dropdown model -- one flat row per known
+/// profile (no header rows, unlike `to_config_dropdown_entries`, since
+/// there's only ever this one flat list, not several grouped options).
+/// `current` is the thread's own `profile_name` (empty when unset).
+pub fn to_profile_dropdown_entries(
+    profiles: &[ProfileOption],
+    current: &str,
+) -> ModelRc<DropdownEntry> {
+    let items: Vec<DropdownEntry> = profiles
+        .iter()
+        .map(|p| DropdownEntry {
+            is_current: !current.is_empty() && p.name.as_str() == current,
+            id: p.name.clone(),
+            label: p.name.clone(),
+            value: String::new().into(),
+            is_header: false,
+        })
+        .collect();
+    ModelRc::new(VecModel::from(items))
 }
 
 /// Builds the settings sheet's MCP-server list row model from a real

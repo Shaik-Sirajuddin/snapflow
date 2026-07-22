@@ -83,7 +83,12 @@ fn current_visible_keys(model: &Model) -> Vec<String> {
         .collect()
 }
 
-fn selected_real_index(model: &Model) -> usize {
+// setup-followups plan, provider_fastmode_profile_persistence: pub(crate)
+// so sync.rs can resolve the same real index a Msg-level dispatch would,
+// instead of hand-rolling the visible_indices-empty-fallback logic
+// (current_visible_indices' own reason for existing) a second time and
+// risking it drifting out of sync with this one.
+pub(crate) fn selected_real_index(model: &Model) -> usize {
     current_visible_indices(model)
         .get(model.selected_thread)
         .copied()
@@ -109,6 +114,15 @@ pub(crate) fn visible_thread_row(
             open: true,
             closed: thread.closed,
             archived: thread.archived,
+            profile_name: thread.profile_name.clone().unwrap_or_default().into(),
+            // Once a real ACP session has attached, profile_name is
+            // locked -- open_session_maybe_profiled only ever reads it
+            // once, at session creation, and ACP itself has no
+            // primitive for moving a live session to a different
+            // backend (confirmed against Zed's own
+            // AgentSessionConfigOptions::set_config_option, which is
+            // likewise per-connection only).
+            has_session: thread.session_id.is_some(),
             ..crate::ThreadItem::default()
         },
     })
@@ -604,6 +618,28 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             }],
             vec![Dirty::Settings],
         ),
+        SettingsMsg::ProfileSelected(profile_name) => {
+            let Some(thread) = model.threads.get_mut(idx) else {
+                return (vec![], vec![]);
+            };
+            // Silently ignored, not an error: the picker itself is only
+            // ever interactive while has-session is false (see
+            // ThreadItem.has-session's doc comment), so reaching this
+            // with an already-attached thread means the UI raced a
+            // session attach completing -- the picker will disable
+            // itself on the very next Dirty::ThreadRow either way. No
+            // Effect (unlike ModeSelected/ConfigOptionSelected): nothing
+            // to tell the backend yet, since there's no session to send
+            // it to -- open_session_maybe_profiled reads this straight
+            // from the model once the thread actually opens.
+            if thread.session_id.is_some() {
+                return (vec![], vec![]);
+            }
+            thread.profile_name = Some(profile_name);
+            (vec![], vec![Dirty::ThreadRow(idx), Dirty::Capabilities {
+                thread_id: thread.thread_id.clone(),
+            }])
+        }
         SettingsMsg::DevModeToggled(enabled) => {
             model.dev_mode = enabled;
             (vec![Effect::SaveDevMode { enabled }], vec![Dirty::Settings])
@@ -1636,6 +1672,52 @@ mod tests {
             }]
         );
         assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+    }
+
+    /// setup-followups plan, provider_fastmode_profile_persistence: the
+    /// compose-bar profile picker is only ever meant to be interactive
+    /// (per ThreadItem.has-session) while the selected thread has no
+    /// attached session yet -- this proves the reducer itself enforces
+    /// that, not just the Slint-side `enabled:` gate (a UI-only lock
+    /// would still let a stale/racing dispatch mutate the model).
+    #[test]
+    fn profile_selected_updates_the_thread_only_while_it_has_no_session() {
+        let mut model = model_with_threads(&["a"]);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(
+                "codex-tools".to_owned(),
+            ))),
+        );
+        assert_eq!(model.threads[0].profile_name.as_deref(), Some("codex-tools"));
+        assert!(effects.is_empty(), "no backend to notify yet -- nothing to send");
+        assert_eq!(
+            dirty,
+            vec![
+                Dirty::ThreadRow(0),
+                Dirty::Capabilities {
+                    thread_id: "thread-0".to_owned()
+                }
+            ]
+        );
+
+        // Once a real session has attached, the same message must be a
+        // pure no-op -- ACP has no primitive for moving a live session
+        // to a different backend.
+        model.threads[0].session_id = Some("real-session-1".to_owned());
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(
+                "balanced".to_owned(),
+            ))),
+        );
+        assert_eq!(
+            model.threads[0].profile_name.as_deref(),
+            Some("codex-tools"),
+            "profile must stay locked once a session has attached"
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
     }
 
     #[test]

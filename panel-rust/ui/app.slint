@@ -160,6 +160,10 @@ export component ChatPanel inherits Window {
     // Active model/config display name for the compose-bar trigger
     // (host: models::current_config_trigger_label). Empty → "Model".
     in-out property <string> config-trigger-label: "";
+    // setup-followups plan, provider_fastmode_profile_persistence.
+    in-out property <[DropdownEntry]> profile-dropdown-entries: [];
+    in-out property <string> profile-trigger-label: "";
+    in property <bool> active-thread-has-session: false;
     // Session context ring (ui.yaml chat-view-input). Host fills real
     // numbers when available; defaults stay at zero until then.
     in property <float> context-ratio: 0.0;
@@ -216,6 +220,7 @@ export component ChatPanel inherits Window {
     callback local-terminal-close-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback profile-selected(string);
     callback thread-toggle-background(int);
     property <int> rename-thread-index: -1;
     property <string> rename-thread-draft: "";
@@ -491,6 +496,9 @@ export component ChatPanel inherits Window {
                 config-dropdown-entries: config-dropdown-entries;
                 mode-trigger-label: mode-trigger-label;
                 config-trigger-label: config-trigger-label;
+                profile-dropdown-entries: profile-dropdown-entries;
+                profile-trigger-label: profile-trigger-label;
+                active-thread-has-session: active-thread-has-session;
                 context-ratio: context-ratio;
                 context-used-tokens: context-used-tokens;
                 context-limit-tokens: context-limit-tokens;
@@ -499,6 +507,7 @@ export component ChatPanel inherits Window {
                 file-options: file-options;
                 mode-selected(id) => { mode-selected(id); }
                 config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+                profile-selected(id) => { profile-selected(id); }
                 context-view-requested => { context-view-requested(); }
                 // Compose owns focus for typing -- re-dispatch panel chords
                 // so Ctrl+B/N/K/, and Escape still work while composing.

@@ -65,6 +65,10 @@ export component ChatArea inherits Rectangle {
     // Active model/config option display name for the model trigger
     // (empty until advertised; trigger falls back to "Model").
     in property <string> config-trigger-label: "";
+    // setup-followups plan, provider_fastmode_profile_persistence.
+    in property <[DropdownEntry]> profile-dropdown-entries: [];
+    in property <string> profile-trigger-label: "";
+    in property <bool> active-thread-has-session: false;
     // Session context usage for the compose-bar context ring (ui.yaml).
     in property <float> context-ratio: 0.0;
     in property <int> context-used-tokens: 0;
@@ -75,6 +79,7 @@ export component ChatArea inherits Rectangle {
     in property <[string]> file-options: [];
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback profile-selected(string);
     callback context-view-requested();
     callback send-requested();
     callback stop-requested();
@@ -887,6 +892,9 @@ export component ChatArea inherits Rectangle {
             config-dropdown-entries: config-dropdown-entries;
             mode-trigger-label: mode-trigger-label;
             config-trigger-label: config-trigger-label;
+            profile-dropdown-entries: profile-dropdown-entries;
+            profile-trigger-label: profile-trigger-label;
+            active-thread-has-session: active-thread-has-session;
             context-ratio: context-ratio;
             context-used-tokens: context-used-tokens;
             context-limit-tokens: context-limit-tokens;
@@ -897,6 +905,7 @@ export component ChatArea inherits Rectangle {
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+            profile-selected(id) => { profile-selected(id); }
             context-view-requested => { context-view-requested(); }
             panel-shortcut(event) => { return panel-shortcut(event); }
         }

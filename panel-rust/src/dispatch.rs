@@ -899,6 +899,14 @@ pub(crate) fn dispatch_mode_selected(
     execute_effects(panel, effects);
 }
 
+pub(crate) fn dispatch_profile_selected(panel: &PanelSingleton, profile_name: String) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(profile_name))),
+    );
+    execute_effects(panel, effects);
+}
+
 pub(crate) fn dispatch_config_option_selected(
     panel: &PanelSingleton,
     component: &ChatPanel,

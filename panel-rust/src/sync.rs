@@ -140,6 +140,18 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_background_override_set(model.background_override_set);
             component.set_background_override(model.background_override);
             reconcile_settings_models(model, component);
+            // model.available_profiles (the compose-bar profile picker's
+            // own data source) is refreshed here, via the periodic
+            // settings-gateway snapshot poll -- not tied to the
+            // currently-selected thread's own Dirty::Capabilities at
+            // all. Without this, a picker whose profile list was still
+            // empty at startup would never pick up the real list once it
+            // arrived until some unrelated capability change or thread
+            // switch happened to also fire.
+            let real_idx = crate::update::selected_real_index(model);
+            if let Some(thread) = model.threads.get(real_idx) {
+                sync_profile_picker(model, component, thread);
+            }
         }
         Dirty::SkillsListDiff(ops) => {
             apply_skill_ops(model, ops);
@@ -167,6 +179,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 component.set_config_dropdown_entries(crate::models::to_config_dropdown_entries(
                     thread.config_options.clone(),
                 ));
+                sync_profile_picker(model, component, thread);
             }
         }
     }
@@ -502,6 +515,24 @@ fn reconcile_terminals(model: &Model, terminals: &[crate::TerminalItem]) {
     );
 }
 
+/// setup-followups plan, provider_fastmode_profile_persistence: refreshes
+/// the compose-bar profile picker for `thread` -- its dropdown model
+/// (`model.available_profiles`, the same data Settings > Agents' profile
+/// chips already fetch), its trigger label (the thread's own
+/// `profile_name`, empty until chosen), and whether it's interactive at
+/// all (`has-session`: false only until a real ACP session attaches,
+/// per ThreadItem.has-session's doc comment).
+fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::model::ThreadModel) {
+    let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
+    let current = thread.profile_name.as_deref().unwrap_or("");
+    component.set_profile_dropdown_entries(crate::models::to_profile_dropdown_entries(
+        &profile_rows,
+        current,
+    ));
+    component.set_profile_trigger_label(current.into());
+    component.set_active_thread_has_session(thread.session_id.is_some());
+}
+
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
     let profile_keys: Vec<String> = model
@@ -571,6 +602,16 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
     match field {
         ScalarField::SelectedThread => {
             component.set_selected_thread(model.selected_thread as i32);
+            // Dirty::Capabilities only fires when session_modes/
+            // config_options actually change, which a brand-new empty
+            // thread (no capabilities either before or after selecting
+            // it) never does -- sync the profile picker here too so its
+            // enabled/current state is correct immediately on switching,
+            // not just eventually via the next capability event.
+            let real_idx = crate::update::selected_real_index(model);
+            if let Some(thread) = model.threads.get(real_idx) {
+                sync_profile_picker(model, component, thread);
+            }
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());

@@ -24,6 +24,16 @@ export component ChatInputLayout inherits Rectangle {
     in property <string> mode-trigger-label: "";
     // Host-supplied current model/config label (ACP configOptions).
     in property <string> config-trigger-label: "";
+    // setup-followups plan, provider_fastmode_profile_persistence:
+    // profile/provider picker. Only ever interactive while the active
+    // thread has no attached session yet (ThreadItem.has-session) --
+    // ACP has no primitive for moving a live session to a different
+    // backend, matching Zed's own AgentSessionConfigOptions precedent
+    // (free agent choice on an empty draft, a new thread once real
+    // content exists).
+    in property <[DropdownEntry]> profile-dropdown-entries: [];
+    in property <string> profile-trigger-label: "";
+    in property <bool> active-thread-has-session: false;
     // Session context (ui.yaml chat-view-input). Host pushes real numbers
     // when available; defaults keep the ring useful in pure viewers.
     in property <float> context-ratio: 0.0;
@@ -38,6 +48,7 @@ export component ChatInputLayout inherits Rectangle {
     callback stop-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback profile-selected(string);
     callback context-view-requested();
     // Panel chords (Ctrl+B/N/K/,, Escape, Ctrl+Enter approve) re-dispatched
     // while the composer owns focus — wired by ChatArea → ChatPanel.
@@ -52,6 +63,7 @@ export component ChatInputLayout inherits Rectangle {
     out property <bool> secondary-text-input-has-focus:
         mode-dropdown.search-has-focus
         || config-dropdown.search-has-focus
+        || profile-dropdown.search-has-focus
         || mention-search-bar.input-has-focus;
     callback focus-compose();
 
@@ -63,6 +75,12 @@ export component ChatInputLayout inherits Rectangle {
     property <string> local-config-id: "";
     property <string> local-config-value: "";
     property <string> local-config-label: "";
+    property <string> local-profile-id: "";
+    property <string> local-profile-label: "";
+
+    property <string> profile-label-shown:
+        local-profile-label != "" ? local-profile-label
+        : (root.profile-trigger-label != "" ? root.profile-trigger-label : "Profile");
 
     property <string> mode-label-shown:
         local-mode-label != "" ? local-mode-label
@@ -345,6 +363,19 @@ export component ChatInputLayout inherits Rectangle {
     // drop the least essential item (the context ring) first so the two
     // selects stay reachable.
     property <bool> row2-compact: root.width < 280px;
+    // setup-followups plan, provider_fastmode_profile_persistence: the
+    // profile picker is a 3rd SearchableDropdown (also min-width 72px)
+    // added to a row whose own doc comment above already documents
+    // mode+model+ring as sitting right at the edge of a compact dock's
+    // width budget (~180px available at ~230px total width) -- adding a
+    // 3rd 72px-min dropdown unconditionally would have pushed mode/model
+    // off-panel-edge (invisible, not clipped -- this component's own
+    // `clip: false`) in exactly the docks that threshold was built to
+    // protect. Same "drop the least essential item first" strategy as
+    // row2-compact's own context-ring: only show the profile picker once
+    // there's real room for all three dropdowns together, not just
+    // mode+model+ring's original budget.
+    property <bool> row2-has-room-for-profile: root.width >= 360px;
 
     width: 100%;
     horizontal-stretch: 1;
@@ -572,6 +603,24 @@ export component ChatInputLayout inherits Rectangle {
             // FilterSearchBar.input-has-focus's doc comment: this
             // component's own id needs to stay referenceable from
             // secondary-text-input-has-focus below.
+            profile-dropdown := SearchableDropdown {
+                visible: root.profile-dropdown-entries.length > 0 && root.row2-has-room-for-profile;
+                enabled: !root.active-thread-has-session;
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                height: root.row2-h;
+                preferred-height: root.row2-h;
+                trigger-label: root.profile-label-shown;
+                options: root.profile-dropdown-entries;
+                selected-id: root.local-profile-id;
+                placeholder: "Search profiles...";
+                popup-width: 200px;
+                entry-selected(id, value, label) => {
+                    root.local-profile-id = id;
+                    root.local-profile-label = label;
+                    root.profile-selected(id);
+                }
+            }
             mode-dropdown := SearchableDropdown {
                 visible: root.mode-dropdown-entries.length > 0;
                 horizontal-stretch: 0;

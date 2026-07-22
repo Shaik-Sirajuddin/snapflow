@@ -25,6 +25,12 @@ export component SearchableDropdown inherits Rectangle {
     // mode matches `id` when value is empty.
     in property <string> selected-id: "";
     in property <string> selected-value: "";
+    // False renders the trigger dimmed and read-only (no popup, no
+    // accessible action) instead of hiding it outright -- for a control
+    // that's contextually locked (e.g. the profile picker after a
+    // session has attached) rather than simply absent, so the user sees
+    // *why* it's inert instead of it vanishing.
+    in property <bool> enabled: true;
     // id, value, label — label lets callers update the trigger without
     // re-scanning the model.
     callback entry-selected(string /* id */, string /* value */, string /* label */);
@@ -211,6 +217,9 @@ export component SearchableDropdown inherits Rectangle {
     }
 
     function toggle-popup() {
+        if (!root.enabled) {
+            return;
+        }
         if (open) {
             close();
         } else {
@@ -232,17 +241,20 @@ export component SearchableDropdown inherits Rectangle {
     max-width: 140px;
     background: trigger-touch.has-hover || open ? Theme.bg-primary-container : Theme.bg-canvas;
     animate background { duration: 100ms; }
+    opacity: root.enabled ? 1.0 : 0.5;
     border-color: Theme.border-default;
     border-width: 1px;
     border-radius: Theme.radius-sm;
 
     trigger-touch := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         accessible-role: button;
         accessible-label: root.trigger-label;
+        accessible-enabled: root.enabled;
         accessible-action-default => { root.toggle-popup(); }
         clicked => { root.toggle-popup(); }
-        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+        changed has-hover => { CursorHost.kind = (self.has-hover && root.enabled) ? "pointer" : "default"; }
     }
     HorizontalLayout {
         width: 100%;

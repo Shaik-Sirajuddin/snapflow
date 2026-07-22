@@ -109,6 +109,12 @@ pub enum SettingsMsg {
         value: String,
     },
     ModeSelected(String),
+    // setup-followups plan, provider_fastmode_profile_persistence: only
+    // meaningful while the currently selected thread has no attached
+    // session yet (see ThreadItem.has-session's doc comment) -- update()
+    // is a no-op if it already has one, since ACP has no primitive for
+    // moving a live session to a different backend.
+    ProfileSelected(String),
     DevModeToggled(bool),
     McpServerCreate {
         name: String,
