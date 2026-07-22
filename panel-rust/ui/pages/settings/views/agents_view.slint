@@ -391,5 +391,56 @@ export component AgentsView inherits Rectangle {
                 }
             }
         }
+
+        SettingsDivider { width: parent.width; }
+
+        // Recovery/import section (Coverage Matrix `session/list` row):
+        // real remote gateway sessions not currently bound to any local
+        // thread row, for the active thread's own provider. Ported from
+        // the dead components/settings_sheet.slint -- the
+        // recoverable-sessions property and recover-session-attach
+        // callback were already fully plumbed through this view (and
+        // down into lib.rs/dispatch.rs) but never actually rendered here
+        // after the settings-pane-redesign migration, so this whole
+        // feature was silently unreachable from the live UI despite
+        // looking fully wired at the Msg/Effect level (found via a real
+        // e2e test's "Attach recovered session" assertion never matching
+        // anything). Attaching binds via `session/load`, never
+        // `session/new` (`AgentBridge::add_thread_recovering_session`).
+        SettingsSectionHeader { text: "Recoverable Sessions"; subsection: true; }
+        if root.recoverable-sessions.length == 0 : Text {
+            text: "No orphaned sessions for this provider.";
+            color: Theme.text-muted;
+            font-size: 10px * Theme.font-scale;
+        }
+        for session in root.recoverable-sessions : Rectangle {
+            height: 26px;
+            background: Theme.bg-sidebar;
+            border-radius: Theme.radius-sm;
+            HorizontalLayout {
+                padding-left: Metrics.space-4;
+                padding-right: Metrics.space-4;
+                spacing: Metrics.space-4;
+                Text {
+                    text: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
+                    color: Theme.text-primary;
+                    font-size: 11px * Theme.font-scale;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+                Button {
+                    label: "Attach";
+                    button-accessible-label: "Attach recovered session " + session.session-id;
+                    btn-width: 52px;
+                    btn-height: 20px;
+                    font-size: 9px;
+                    font-weight: 400;
+                    bg: Theme.bg-card;
+                    fg: Theme.text-secondary;
+                    clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
+                }
+            }
+        }
     }
 }

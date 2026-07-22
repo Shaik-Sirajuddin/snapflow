@@ -327,35 +327,44 @@ export component ChatArea inherits Rectangle {
                     }
                     // Status icon — Metrics.icon-md (16px), same as sidebar title icons.
                     // No height: parent.height (binding loop with layoutinfo-v).
-                    if root.sending || connection-status == "Connecting..." : Rectangle {
-                        width: Metrics.icon-md;
-                        height: Metrics.icon-md;
+                    //
+                    // Wrapped in one persistent accessible-role: text element
+                    // so connection-status is exposed to accessibility
+                    // regardless of which of the 3 visual variants below is
+                    // showing -- accessible-role: text doesn't support
+                    // accessible-value, so the status is folded into
+                    // accessible-label itself, matching the convention this
+                    // codebase already uses elsewhere for non-interactive
+                    // status indicators.
+                    connection-status-indicator := Rectangle {
                         horizontal-stretch: 0;
                         vertical-stretch: 0;
-                        Icon {
+                        width: Metrics.icon-md;
+                        height: Metrics.icon-md;
+                        accessible-role: text;
+                        accessible-label: "Connection status: " + connection-status;
+                        if root.sending || connection-status == "Connecting..." : Icon {
                             source: @image-url("./assets/icons/loader-circle.svg");
                             size: Metrics.icon-md;
                             color: Theme.bg-primary;
                             transform-rotation: header-spin;
                             transform-origin: { x: 8px, y: 8px };
                         }
-                    }
-                    if !(root.sending || connection-status == "Connecting...")
-                        && root.status-needs-attention : Icon {
-                        source: @image-url("./assets/icons/hand-filled.svg");
-                        size: Metrics.icon-md;
-                        color: Theme.bg-primary;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 0;
-                    }
-                    if !(root.sending || connection-status == "Connecting...")
-                        && !root.status-needs-attention : Rectangle {
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: Theme.text-muted;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 0;
+                        if !(root.sending || connection-status == "Connecting...")
+                            && root.status-needs-attention : Icon {
+                            source: @image-url("./assets/icons/hand-filled.svg");
+                            size: Metrics.icon-md;
+                            color: Theme.bg-primary;
+                        }
+                        if !(root.sending || connection-status == "Connecting...")
+                            && !root.status-needs-attention : Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.text-muted;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
                     }
                     if !root.rename-editing : Text {
                         text: active-thread-name != "" ? active-thread-name : "No thread";

@@ -97,9 +97,17 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         ElementHandle::find_by_accessible_label(&panel, "Expand thread sidebar")
             .next()
             .expect("sidebar expansion control must be accessible");
+    // This button is built on the shared IconButton primitive
+    // (icon_button.slint), whose own `touch := TouchArea` (with
+    // accessible-role/label) is what's actually exposed to accessibility
+    // -- the reported id is always "IconButton::touch" regardless of the
+    // outer instance's own name (sidebar.slint's sidebar-toggle), since
+    // that's the element that actually declares accessible-role. This
+    // assertion previously expected "Sidebar::sidebar-toggle", stale from
+    // before this button was refactored onto IconButton.
     assert_eq!(
         expand_sidebar.id().as_deref(),
-        Some("Sidebar::sidebar-toggle")
+        Some("IconButton::touch")
     );
     expand_sidebar.invoke_accessible_default_action();
     assert!(panel.get_sidebar_expanded());
@@ -107,14 +115,19 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     let new_thread = ElementHandle::find_by_accessible_label(&panel, "New thread")
         .next()
         .expect("new-thread control must be accessible");
-    assert_eq!(new_thread.id().as_deref(), Some("Sidebar::new-thread-touch"));
+    // Same IconButton-based reporting as the sidebar-toggle assertion above.
+    assert_eq!(new_thread.id().as_deref(), Some("IconButton::touch"));
     new_thread.invoke_accessible_default_action();
     assert_eq!(new_thread_count.get(), 1);
 
-    let settings = ElementHandle::find_by_accessible_label(&panel, "Open chat settings")
+    // Label/component both moved since this assertion was written: the
+    // settings entry point lives in sidebar.slint now (a HoverSurface,
+    // whose own accessible touch area reports "HoverSurface::touch"), not
+    // a bespoke ChatArea button, and its label is "Open settings".
+    let settings = ElementHandle::find_by_accessible_label(&panel, "Open settings")
         .next()
         .expect("settings control must be accessible");
-    assert_eq!(settings.id().as_deref(), Some("ChatArea::settings-button"));
+    assert_eq!(settings.id().as_deref(), Some("HoverSurface::touch"));
     settings.invoke_accessible_default_action();
     assert_eq!(settings_count.get(), 1);
 
@@ -133,10 +146,13 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     let save_settings = ElementHandle::find_by_accessible_label(&panel, "Save chat settings")
         .next()
         .expect("settings save control must be accessible");
-    assert_eq!(
-        save_settings.id().as_deref(),
-        Some("SettingsSheet::save-settings-button")
-    );
+    // Migrated from the dead components/settings_sheet.slint to
+    // settings_page.slint's shared Button component -- id updated to
+    // match ("Button::touch", same convention Button/Toggle/IconButton/
+    // HoverSurface all follow: the reported id names whichever shared
+    // primitive's own internal touch area actually declares
+    // accessible-role, not the call site's instance name).
+    assert_eq!(save_settings.id().as_deref(), Some("Button::touch"));
     save_settings.invoke_accessible_default_action();
     assert_eq!(settings_save_count.get(), 1);
 
@@ -147,15 +163,16 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     assert_eq!(settings_close_count.get(), 1);
 
     panel.set_settings_open(true);
+    // Background session controls live under the Harness tab now
+    // (harness_view.slint), not directly on the sheet -- select it.
+    panel.set_settings_active_section("harness".into());
     assert!(!panel.get_background_default());
     let background_default =
         ElementHandle::find_by_accessible_label(&panel, "Toggle background session default")
             .next()
             .expect("background default control must be accessible");
-    assert_eq!(
-        background_default.id().as_deref(),
-        Some("SettingsSheet::background-default-toggle")
-    );
+    // Migrated to the shared Toggle component ("Toggle::touch").
+    assert_eq!(background_default.id().as_deref(), Some("Toggle::touch"));
     background_default.invoke_accessible_default_action();
     assert!(panel.get_background_default());
 
@@ -163,10 +180,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         ElementHandle::find_by_accessible_label(&panel, "Toggle background session override")
             .next()
             .expect("background override control must be accessible");
-    assert_eq!(
-        background_override.id().as_deref(),
-        Some("SettingsSheet::background-override-toggle")
-    );
+    assert_eq!(background_override.id().as_deref(), Some("Toggle::touch"));
     background_override.invoke_accessible_default_action();
     assert!(panel.get_background_override_set());
     assert!(panel.get_background_override());
@@ -179,7 +193,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     .expect("background override value control must be accessible");
     assert_eq!(
         background_override_value.id().as_deref(),
-        Some("SettingsSheet::background-override-value-toggle")
+        Some("Toggle::touch")
     );
     background_override_value.invoke_accessible_default_action();
     assert!(!panel.get_background_override());
@@ -189,14 +203,16 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     let send = ElementHandle::find_by_accessible_label(&panel, "Send message")
         .next()
         .expect("send control must be accessible");
-    assert_eq!(send.id().as_deref(), Some("ChatArea::send-stop-button"));
+    // compose/send-stop-button moved into their own ChatInputLayout
+    // component since this assertion was written.
+    assert_eq!(send.id().as_deref(), Some("ChatInputLayout::send-stop-button"));
     send.invoke_accessible_default_action();
     assert_eq!(sent_text.take(), "render a title card");
 
     let compose = ElementHandle::find_by_accessible_label(&panel, "Compose message")
         .next()
         .expect("compose input must be accessible");
-    assert_eq!(compose.id().as_deref(), Some("ChatArea::compose"));
+    assert_eq!(compose.id().as_deref(), Some("ChatInputLayout::compose"));
     compose.invoke_accessible_default_action();
     assert!(panel.get_compose_has_focus(), "composer should accept focus");
 
@@ -296,10 +312,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         ElementHandle::find_by_accessible_label(&panel, "Close terminal overlay")
             .next()
             .expect("terminal overlay close control must be accessible");
-    assert_eq!(
-        close_terminal_overlay.id().as_deref(),
-        Some("TerminalOverlay::terminal-overlay-close")
-    );
+    assert_eq!(close_terminal_overlay.id().as_deref(), Some("Button::touch"));
     close_terminal_overlay.invoke_accessible_default_action();
     assert_eq!(terminal_overlay_close_count.get(), 1);
     assert!(
@@ -320,20 +333,14 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         ElementHandle::find_by_accessible_label(&panel, "Expand local terminal")
             .next()
             .expect("local terminal expand control must be accessible");
-    assert_eq!(
-        expand_local_terminal.id().as_deref(),
-        Some("LocalTerminalCard::local-terminal-expand")
-    );
+    assert_eq!(expand_local_terminal.id().as_deref(), Some("IconButton::touch"));
     expand_local_terminal.invoke_accessible_default_action();
     assert!(panel.get_local_terminal_overlay_open());
     let close_local_overlay =
         ElementHandle::find_by_accessible_label(&panel, "Close local terminal overlay")
             .next()
             .expect("local terminal overlay close control must be accessible");
-    assert_eq!(
-        close_local_overlay.id().as_deref(),
-        Some("LocalTerminalOverlay::local-terminal-overlay-close")
-    );
+    assert_eq!(close_local_overlay.id().as_deref(), Some("Button::touch"));
     close_local_overlay.invoke_accessible_default_action();
     assert!(!panel.get_local_terminal_overlay_open());
     assert!(
@@ -345,10 +352,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         ElementHandle::find_by_accessible_label(&panel, "Close local terminal")
             .next()
             .expect("local terminal close control must be accessible");
-    assert_eq!(
-        close_local_terminal.id().as_deref(),
-        Some("LocalTerminalCard::local-terminal-kill")
-    );
+    assert_eq!(close_local_terminal.id().as_deref(), Some("Button::touch"));
     close_local_terminal.invoke_accessible_default_action();
     assert_eq!(closed_local_terminal_count.get(), 1);
 }
@@ -516,9 +520,12 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     select_mode.invoke_accessible_default_action();
     assert_eq!(&*mode_selection.borrow(), &["plan"]);
 
-    // Same for the model/config selector -- open the "Config" trigger, then
-    // pick the "High" value row.
-    let config_trigger = ElementHandle::find_by_accessible_label(&panel, "Config")
+    // Same for the model/config selector -- open the "Model" trigger (the
+    // test never sets config_trigger_label, so chat_input_layout.slint's
+    // config-label-shown falls back to its default "Model", not "Config" --
+    // this test's own literal string was stale), then pick the "High" value
+    // row.
+    let config_trigger = ElementHandle::find_by_accessible_label(&panel, "Model")
         .next()
         .expect("model selector trigger must be accessible");
     config_trigger.invoke_accessible_default_action();
@@ -572,11 +579,20 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     // here to fit everything without needing to also simulate scrolling
     // partway through the assertions below.
     panel.window().set_size(slint::LogicalSize::new(900.0, 1600.0));
+    // Profile chips/MCP servers/agent-install all moved into their own
+    // tabbed views (agents_view.slint / mcp_servers_view.slint) since
+    // this test was written against the single-scroll settings_sheet.slint
+    // -- select each section before looking for its controls.
+    panel.set_settings_active_section("agents".into());
 
     let profile = ElementHandle::find_by_accessible_label(&panel, "Select profile codex-tools")
         .next()
         .expect("profile chip must be accessible");
-    assert_eq!(profile.id().as_deref(), Some("SettingsSheet::profile-chip"));
+    // Raw, unnamed TouchArea declared directly in agents_view.slint (no
+    // shared-component wrapper), so its id is whatever Slint assigns an
+    // anonymous element -- just confirm it resolves, don't pin the exact
+    // generated string.
+    assert!(profile.id().is_some(), "profile chip element must have an id");
     profile.invoke_accessible_default_action();
     assert_eq!(panel.get_default_profile(), "codex-tools");
 
@@ -588,10 +604,7 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         ElementHandle::find_by_accessible_label(&panel, "Remove profile codex-tools")
             .next()
             .expect("profile remove control must be accessible");
-    assert_eq!(
-        remove_profile.id().as_deref(),
-        Some("SettingsSheet::profile-delete-button")
-    );
+    assert_eq!(remove_profile.id().as_deref(), Some("Button::touch"));
     remove_profile.invoke_accessible_default_action();
     assert!(deleted_profile.borrow().is_empty());
 
@@ -617,68 +630,46 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         ElementHandle::find_by_accessible_label(&panel, "Confirm delete profile codex-tools")
             .next()
             .expect("profile delete-confirm control must be accessible once armed");
-    assert_eq!(
-        confirm_profile_delete.id().as_deref(),
-        Some("SettingsSheet::profile-delete-confirm-button")
-    );
+    assert_eq!(confirm_profile_delete.id().as_deref(), Some("Button::touch"));
     confirm_profile_delete.invoke_accessible_default_action();
     assert_eq!(&*deleted_profile.borrow(), &["codex-tools".to_owned()]);
 
-    let profile_name_input = ElementHandle::find_by_accessible_label(&panel, "New profile name")
-        .next()
-        .expect("profile name input must be accessible");
-    profile_name_input.invoke_accessible_default_action();
-    for key in "media-agent".chars() {
-        panel
-            .window()
-            .dispatch_event(WindowEvent::KeyPressed { text: key.to_string().into() });
-    }
-    let profile_terminal_toggle =
-        ElementHandle::find_by_accessible_label(&panel, "Toggle new profile terminal access")
-            .next()
-            .expect("profile terminal-access toggle must be accessible");
-    profile_terminal_toggle.invoke_accessible_default_action();
-    let profile_add_button = ElementHandle::find_by_accessible_label(&panel, "Add profile")
-        .next()
-        .expect("profile add control must be accessible");
-    assert_eq!(
-        profile_add_button.id().as_deref(),
-        Some("SettingsSheet::profile-add-button")
-    );
-    profile_add_button.invoke_accessible_default_action();
-    assert_eq!(
-        &*created_profile.borrow(),
-        &[("media-agent".to_owned(), String::new(), true, false)]
-    );
+    // "Add Profile" is intentionally commented out of agents_view.slint
+    // right now (its own comment: "kept in source, not deleted, per
+    // request while the Agents view is being reworked into a grid
+    // layout... Re-enable once the redesign settles"), so there is no
+    // live UI to exercise here -- this differs from every other stale-id
+    // fix above (a real control that just moved/renamed): this control
+    // genuinely does not exist in the current UI. Not asserting on it
+    // rather than faking a pass; on_profile_create above stays wired for
+    // whenever that control is re-enabled.
+    let _ = &created_profile;
 
+    panel.set_settings_active_section("mcp_servers".into());
     let remove_mcp =
         ElementHandle::find_by_accessible_label(&panel, "Remove MCP server media-fs")
             .next()
             .expect("MCP delete must be accessible");
-    assert_eq!(
-        remove_mcp.id().as_deref(),
-        Some("SettingsSheet::mcp-server-delete-button")
-    );
+    assert_eq!(remove_mcp.id().as_deref(), Some("Button::touch"));
     remove_mcp.invoke_accessible_default_action();
     assert_eq!(&*removed_mcp.borrow(), &["media-fs"]);
 
+    panel.set_settings_active_section("agents".into());
     let install_agent = ElementHandle::find_by_accessible_label(&panel, "Install agent Claude")
         .next()
         .expect("agent install must be accessible");
-    assert_eq!(
-        install_agent.id().as_deref(),
-        Some("SettingsSheet::agent-install-button")
-    );
+    assert_eq!(install_agent.id().as_deref(), Some("Button::touch"));
     install_agent.invoke_accessible_default_action();
     assert_eq!(&*installed_agents.borrow(), &["claude"]);
 
+    panel.set_settings_active_section("mcp_servers".into());
     let mcp_name = ElementHandle::find_by_accessible_label(&panel, "New MCP server name")
         .next()
         .expect("MCP name input must be accessible");
-    assert_eq!(
-        mcp_name.id().as_deref(),
-        Some("SettingsSheet::new-mcp-name-input")
-    );
+    // Migrated to the shared TextField component; its own inner
+    // `field-input` is what carries accessible-label (see
+    // text_field.slint), reported as "TextField::field-input".
+    assert_eq!(mcp_name.id().as_deref(), Some("TextField::field-input"));
     mcp_name.invoke_accessible_default_action();
     for key in "review".chars() {
         panel
@@ -686,10 +677,14 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
             .dispatch_event(WindowEvent::KeyPressed { text: key.to_string().into() });
     }
 
-    let mcp_command =
-        ElementHandle::find_by_accessible_label(&panel, "New MCP server command")
-            .next()
-            .expect("MCP command input must be accessible");
+    // Label gained an " or URL" suffix since this assertion was written
+    // (mcp_servers_view.slint now supports remote/URL-based servers too).
+    let mcp_command = ElementHandle::find_by_accessible_label(
+        &panel,
+        "New MCP server command or URL",
+    )
+        .next()
+        .expect("MCP command input must be accessible");
     mcp_command.invoke_accessible_default_action();
     for key in "node server.js".chars() {
         panel
@@ -700,26 +695,21 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     let add_mcp = ElementHandle::find_by_accessible_label(&panel, "Add MCP server")
         .next()
         .expect("MCP create control must be accessible");
-    assert_eq!(
-        add_mcp.id().as_deref(),
-        Some("SettingsSheet::mcp-server-add-button")
-    );
+    assert_eq!(add_mcp.id().as_deref(), Some("Button::touch"));
     add_mcp.invoke_accessible_default_action();
     assert_eq!(
         &*created_mcp.borrow(),
         &[("review".to_owned(), "node server.js".to_owned())]
     );
 
+    panel.set_settings_active_section("agents".into());
     let recover_attach = ElementHandle::find_by_accessible_label(
         &panel,
         "Attach recovered session orphan-session-1",
     )
     .next()
     .expect("recovery attach control must be accessible");
-    assert_eq!(
-        recover_attach.id().as_deref(),
-        Some("SettingsSheet::recover-session-button")
-    );
+    assert_eq!(recover_attach.id().as_deref(), Some("Button::touch"));
     recover_attach.invoke_accessible_default_action();
     assert_eq!(
         &*attached_recovery.borrow(),
@@ -765,6 +755,7 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
+    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
     panel.set_sidebar_expanded(true);
     panel.set_threads(ModelRc::new(VecModel::from(vec![ThreadItem {
         name: "Fix timeline crash".into(),
@@ -791,6 +782,24 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         let deleted_index = deleted_index.clone();
         panel.on_thread_delete_requested(move |i| deleted_index.set(i));
     }
+
+    // KNOWN GAP (setup-followups plan, existing_slint_e2e_tests_currently_
+    // failing): the rename/close/delete/archive controls are all gated on
+    // `thread-row.has-hover` (sidebar.slint) -- real mouse-only chrome. A
+    // real `WindowEvent::PointerMoved` dispatched at the row's own
+    // reported geometry (position via `ElementHandle::absolute_position`/
+    // `size`) does not flip `has-hover` to true in this headless test
+    // harness (`i_slint_backend_testing::init_no_event_loop`) by the time
+    // these assertions run, despite matching the exact pattern the
+    // crate's own `pointer_pressed`/`pointer_released` helpers use
+    // internally. Root cause not found -- tried: centering on the
+    // touch-area's own reported bounds, an out-of-bounds-then-in-bounds
+    // two-step move, explicit window sizing, and `mock_elapsed_time`
+    // between dispatch and assertion. This is a real, separate
+    // accessibility concern independent of the test itself: these
+    // controls are unreachable to a keyboard-only user (no hover) with no
+    // apparent keyboard-accessible equivalent action. Left failing rather
+    // than papering over it with a fake pass.
 
     // An open thread shows only the close (arm) control -- no delete
     // control, and no confirm/cancel pair, until armed.
