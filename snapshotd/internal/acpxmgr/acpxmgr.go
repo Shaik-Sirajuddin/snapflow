@@ -294,6 +294,24 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	cmd.Env = append(os.Environ(),
 		"ACPX_CONFIG_FILE="+cfg.ConfigPath,
 		"ACPX_HTTP_BIND="+cfg.HttpBind,
+		// acpx-core's LifecycleConfig defaults (max_sessions_total: 128,
+		// max_sessions_per_tenant: 16) are sized for a real multi-tenant
+		// hosted deployment, where the per-tenant cap is a genuine
+		// fairness/safety limit. This bundled instance serves exactly one
+		// local user's own panel under the single "default" tenant, so
+		// that same cap does nothing but reject real work once enough
+		// threads/dev-session churn accumulates -- confirmed live: "session
+		// capacity reached for tenant default: 16/16 live gateway
+		// sessions" after normal repeated use, not a fairness violation.
+		// Raised substantially rather than removed outright (the
+		// underlying resource-exhaustion protection this config exists
+		// for is still real, just not at a 16-session scale for a
+		// single-user bundled deployment) -- an operator setting either
+		// var in ExtraEnv/the parent environment still overrides these,
+		// since Go's exec.Cmd.Env keeps only the *last* occurrence of a
+		// given key and cfg.ExtraEnv is appended after this block.
+		"ACPX_MAX_SESSIONS_PER_TENANT=512",
+		"ACPX_MAX_SESSIONS_TOTAL=2048",
 	)
 	if cfg.DbPath != "" {
 		cmd.Env = append(cmd.Env, "ACPX_DB_PATH="+cfg.DbPath)

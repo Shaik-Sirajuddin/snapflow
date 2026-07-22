@@ -478,25 +478,47 @@ export component ChatInputLayout inherits Rectangle {
                     // the composer previously gave zero animated feedback
                     // during an in-flight turn -- the button just went
                     // static-stop-icon and sat there. Same spinning-ring
-                    // motif + Timer pattern as sidebar.slint's own
-                    // load-spin-timer (thread.status == "loading"), so a
-                    // user watching only the composer (not the sidebar) can
-                    // still see the turn is actively in progress.
-                    property <angle> load-spin: 0deg;
-                    load-spin-timer := Timer {
-                        interval: 80ms;
-                        running: root.sending;
-                        triggered => { load-spin += 30deg; }
+                    // motif as sidebar.slint's own load-spin (thread.status
+                    // == "loading"), so a user watching only the composer
+                    // (not the sidebar) can still see the turn is actively
+                    // in progress.
+                    //
+                    // A real Slint animation (not a plain `Timer` stepping
+                    // this property by hand) so the engine's own animation
+                    // driver drives it -- `has_active_animations()`
+                    // (panel_rust_poll's host-side repaint trigger) only
+                    // ever detected *this* kind of animation, never a bare
+                    // `Timer`, so the old hand-rolled version silently
+                    // never repainted on its own and looked frozen except
+                    // when some unrelated interaction happened to repaint
+                    // anyway.
+                    property <angle> load-spin: root.sending ? 360deg : 0deg;
+                    animate load-spin {
+                        duration: 800ms;
+                        iteration-count: root.sending ? -1 : 1;
+                        easing: linear;
                     }
-                    if root.sending : Icon {
-                        // Larger than the stop icon (icon-sm, 12px) so it
-                        // reads as a ring around it, not an overlapping
-                        // duplicate at the same size.
-                        source: @image-url("../assets/icons/loader-circle.svg");
-                        size: 26px;
-                        color: Theme.text-secondary.with-alpha(0.55);
-                        transform-rotation: load-spin;
-                        transform-origin: { x: self.width / 2, y: self.height / 2 };
+                    if root.sending : VerticalLayout {
+                        // Without this wrapper the ring rendered pinned to
+                        // this Rectangle's top-left corner (a plain child
+                        // Item with no layout defaults to (0,0)), not
+                        // centered behind the stop icon -- unlike the stop/
+                        // send Icon just below, which already has this same
+                        // centering wrapper.
+                        alignment: center;
+                        HorizontalLayout {
+                            alignment: center;
+                            Icon {
+                                // Larger than the stop icon (icon-sm, 12px)
+                                // so it reads as a ring around it, not an
+                                // overlapping duplicate at the same size.
+                                source: @image-url("../assets/icons/loader-circle.svg");
+                                size: 26px;
+                                color: Theme.text-secondary.with-alpha(0.55);
+                                transform-rotation: load-spin;
+                                transform-origin: { x: self.width / 2, y: self.height / 2 };
+                            }
+                        }
                     }
                     send-stop-button := TouchArea {
                         mouse-cursor: pointer;
