@@ -3,9 +3,11 @@ name: build-windows
 # Builds the three shippable pieces of the stack for Windows and bundles
 # them into one installable zip:
 #   - snapshotd   (Go MCP daemon, real standalone binary)
-#   - panel-rust  (Rust staticlib linked into the Shotcut/Snapflow GUI --
-#                  built + tested here as a correctness gate; not shipped
-#                  standalone since nothing links it yet)
+#   - panel-rust  (Rust staticlib linked into the Shotcut/Snapflow GUI via
+#                  Corrosion, alongside sap-rust, in shotcut-rebrand's own
+#                  CMakeLists.txt -- built + tested standalone here too as a
+#                  faster correctness gate than waiting on the full
+#                  shotcut-rebrand job)
 #   - shotcut-rebrand (the Snapflow GUI app, compiled via MSYS2/MinGW64
 #                  using scripts/build-snapflow-msys2.sh -- this uses a
 #                  prebuilt MLT downloaded from a public S3 bucket rather
@@ -101,10 +103,15 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
-      # This repo, for sap-rust -- shotcut-rebrand/CMakeLists.txt builds it
-      # via Corrosion at ${CMAKE_SOURCE_DIR}/../sap-rust (a sibling crate,
-      # not part of the shotcut-rebrand checkout itself), so it needs to
-      # land as a sibling of the shotcut-rebrand checkout below.
+      # This repo, for sap-rust and panel-rust -- shotcut-rebrand/
+      # CMakeLists.txt builds both via Corrosion at
+      # ${CMAKE_SOURCE_DIR}/../sap-rust and ${CMAKE_SOURCE_DIR}/../panel-rust
+      # (sibling crates, not part of the shotcut-rebrand checkout itself),
+      # so both need to land as siblings of the shotcut-rebrand checkout
+      # below. panel-rust in turn depends on acpx-client via a `../acpx/
+      # acpx-client` path dependency (panel-rust/Cargo.toml), so acpx must
+      # land as a sibling of panel-rust too -- i.e. at the same top level as
+      # sap-rust/panel-rust/shotcut-rebrand.
       - uses: actions/checkout@v4
         with:
           path: multi-media-main
@@ -118,9 +125,12 @@ jobs:
           ref: rebrand/snapflow
           path: shotcut-rebrand
 
-      - name: Place sap-rust as a sibling of shotcut-rebrand
+      - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
         shell: bash
-        run: cp -r multi-media-main/sap-rust sap-rust
+        run: |
+          cp -r multi-media-main/sap-rust sap-rust
+          cp -r multi-media-main/panel-rust panel-rust
+          cp -r multi-media-main/acpx acpx
 
       # Set up the base MSYS2 environment only -- packages are installed as
       # a separate step below so the pacman package-download cache
