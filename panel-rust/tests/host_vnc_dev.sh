@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
 # Manual interactive dev harness -- NOT part of the automated test suite.
-# Starts a real acpx-server (real rui-mock-agent backend) and a real
+# Starts a real acpx-server (a REAL agent backend, e.g. codex-acp via its
+# ambient CLI auth -- never the rui-mock-agent stub; per this repo's
+# test-mode/dev-mode/prod convention, only test-mode's automated harness
+# (host_e2e_smoke.sh) is allowed to use the mock backend) and a real
 # Shotcut process under Xvfb, then binds x11vnc to that display so a
 # human can connect a VNC client and click around the real embedded
 # ChatRustDock directly. Mirrors host_e2e_smoke.sh's process wiring
@@ -17,12 +20,14 @@ screen="${PANEL_VNC_DEV_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_VNC_DEV_GATEWAY_PORT:-18791}"
 vnc_port="${PANEL_VNC_DEV_VNC_PORT:-5910}"
 dock_width="${PANEL_VNC_DEV_DOCK_WIDTH:-320}"
+# Real registry agent id to default new sessions to (ambient-auth backed,
+# e.g. "codex-acp" or "claude-acp") -- never the mock's fake "codex" id.
+default_agent_id="${PANEL_VNC_DEV_AGENT_ID:-codex-acp}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
-agent_bin="${RUI_MOCK_AGENT_BIN:-$repo_root/panel-rust/target/debug/rui-mock-agent}"
 shotcut_bin="${SHOTCUT_BIN:-$repo_root/shotcut/build/src/shotcut}"
 
-for binary in "$server_bin" "$agent_bin" "$shotcut_bin" Xvfb x11vnc curl xdpyinfo; do
+for binary in "$server_bin" "$shotcut_bin" Xvfb x11vnc curl xdpyinfo; do
     if ! command -v "$binary" >/dev/null 2>&1 && [[ ! -x "$binary" ]]; then
         printf 'required executable is unavailable: %s\n' "$binary" >&2
         exit 1
@@ -52,11 +57,13 @@ x11vnc -display "$display" -rfbport "$vnc_port" -forever -shared -nopw \
     -bg -o "$state_dir/x11vnc.log"
 vnc_pid="$(pgrep -f "x11vnc -display $display -rfbport $vnc_port" | head -1)"
 
+# No ACPX_BACKEND_CMD override -- real agent ids (codex-acp, claude-acp,
+# ...) resolve through acpx-registry's real fallback registry (npx-spawned,
+# ambient CLI auth), the same real-process path this repo's own
+# real-backend tests use (see ACPX_LIVE_TEST_AMBIENT-gated tests).
 ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
-ACPX_BACKEND_CMD="$agent_bin" \
-ACPX_DEFAULT_AGENT_ID="codex" \
+ACPX_DEFAULT_AGENT_ID="$default_agent_id" \
 ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
-RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
 "$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
 server_pid="$!"
 
