@@ -799,7 +799,8 @@ export component Sidebar inherits Rectangle {
                                         }
                                     }
                                 }
-                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
+                                if expanded && root.rename-thread-index != i
+                                    && !thread.archived && thread-row.has-hover : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Archive thread " + thread.name;

@@ -214,6 +214,13 @@ struct ThreadSlot {
     /// of every thread until a caller explicitly closes it (never set
     /// implicitly by window/process teardown).
     closed: Mutex<bool>,
+    /// setup-followups plan, archive_thread_backend_verify: set once
+    /// [`AgentBridge::archive_thread`] has been called for this thread.
+    /// Purely local -- no ACP request is involved -- but unlike `closed`
+    /// this one IS persisted (see [`persist_runtime_snapshot`] and
+    /// [`ThreadRuntimeSnapshot::archived`]), since the whole point of an
+    /// archive action is that it survives a restart.
+    archived: Mutex<bool>,
     /// `thread_item_project_context` phase: the project directory this
     /// thread's session was actually opened/resumed/reattached against
     /// (the `cwd` passed to ACP at creation time -- see `cwd_for_session`),
@@ -434,6 +441,7 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
             .lock()
             .expect("config_options mutex poisoned")
             .clone(),
+        archived: *slot.archived.lock().expect("archived mutex poisoned"),
     };
     if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
         eprintln!(
@@ -616,11 +624,11 @@ fn resolve_acpx_server_bin() -> PathBuf {
     )
 }
 
-/// Resolves the `skills-mcp-server` binary path (`skill_injection_
-/// verification` phase): `RUI_SKILLS_MCP_SERVER_BIN` env override, else a
+/// Resolves the `snapflowd-mcp` binary path (`skill_injection_
+/// verification` phase): `RUI_SNAPFLOWD_MCP_BIN` env override, else a
 /// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
 /// convention as [`resolve_acpx_server_bin`].
-fn resolve_skills_mcp_server_bin_from(
+fn resolve_snapflowd_mcp_bin_from(
     override_bin: Option<&str>,
     current_exe: Option<&Path>,
     manifest_dir: &Path,
@@ -629,17 +637,17 @@ fn resolve_skills_mcp_server_bin_from(
         return PathBuf::from(bin);
     }
     if let Some(parent) = current_exe.and_then(Path::parent) {
-        let candidate = parent.join("skills-mcp-server");
+        let candidate = parent.join("snapflowd-mcp");
         if candidate.is_file() {
             return candidate;
         }
     }
-    manifest_dir.join("target/debug/skills-mcp-server")
+    manifest_dir.join("target/debug/snapflowd-mcp")
 }
 
-fn resolve_skills_mcp_server_bin() -> PathBuf {
-    resolve_skills_mcp_server_bin_from(
-        std::env::var("RUI_SKILLS_MCP_SERVER_BIN").ok().as_deref(),
+fn resolve_snapflowd_mcp_bin() -> PathBuf {
+    resolve_snapflowd_mcp_bin_from(
+        std::env::var("RUI_SNAPFLOWD_MCP_BIN").ok().as_deref(),
         std::env::current_exe().ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
@@ -648,14 +656,14 @@ fn resolve_skills_mcp_server_bin() -> PathBuf {
 /// Builds the `mcpServers` array `session/new`/`session/load` now send
 /// (previously always `[]`, see `gateway_actor::thread_actor`'s doc
 /// comments on `Command::OpenSession`/`Command::ResumeSession`) -- one
-/// entry pointing at `skills-mcp-server`, always present regardless of
+/// entry pointing at `snapflowd-mcp`, always present regardless of
 /// which ACPX profile (if any) the session uses. `project_path` is the
 /// active MLT project's *file* path (`PanelSingleton::active_project_path`
 /// as threaded through `AgentBridge::session_cwd_override`) -- passed
-/// through as-is; `skills-mcp-server` itself derives the project's
+/// through as-is; `snapflowd-mcp` itself derives the project's
 /// `.skills/` directory from its parent, same as `refresh_skills_model`
 /// (lib.rs) already does.
-fn skills_mcp_servers_entry(
+fn snapflowd_mcp_servers_entry(
     project_path: Option<&std::path::Path>,
     provider: &str,
 ) -> Vec<serde_json::Value> {
@@ -670,7 +678,7 @@ fn skills_mcp_servers_entry(
     }
     let mut entries = vec![serde_json::json!({
         "name": "skills",
-        "command": resolve_skills_mcp_server_bin().to_string_lossy(),
+        "command": resolve_snapflowd_mcp_bin().to_string_lossy(),
         "args": args,
     })];
     entries.extend(snapshotd_mcp_server_entry(provider));
@@ -1592,7 +1600,7 @@ fn spawn_background_attachment(
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
 ) {
     // Resolved synchronously, before the async task below, not inside it:
-    // skills_mcp_servers_entry now transitively probes snapshotd's MCP
+    // snapflowd_mcp_servers_entry now transitively probes snapshotd's MCP
     // liveness over a real (blocking std::net::TcpStream) connection --
     // rust-audit's "blocking calls inside async fn" anti-pattern would
     // otherwise apply here, tying up a tokio worker thread (and holding
@@ -1600,7 +1608,7 @@ fn spawn_background_attachment(
     // timeouts. This function itself is a plain sync fn, so the blocking
     // call here is no different from provision_gateway's own pre-existing
     // synchronous network probes at construction time.
-    let mcp_servers = skills_mcp_servers_entry(
+    let mcp_servers = snapflowd_mcp_servers_entry(
         session_cwd_override
             .lock()
             .expect("session cwd override mutex poisoned")
@@ -1950,6 +1958,7 @@ impl AgentBridge {
                 attachment: Mutex::new(AttachmentState::default()),
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
+                archived: Mutex::new(runtime_snapshot.archived),
                 // No project can be active yet at construction time --
                 // `session_cwd_override` was just created above, unset.
                 project_path: None,
@@ -2169,6 +2178,7 @@ impl AgentBridge {
             attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            archived: Mutex::new(runtime_snapshot.archived),
             project_path: project_path_for_slot,
         });
         self.slots.push(slot.clone());
@@ -2332,11 +2342,12 @@ impl AgentBridge {
             }),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            archived: Mutex::new(false),
             project_path: project_path_for_slot,
         });
 
         let cwd = cwd_for_session(&self.session_cwd_override);
-        let mcp_servers = skills_mcp_servers_entry(
+        let mcp_servers = snapflowd_mcp_servers_entry(
             self.session_cwd_override
                 .lock()
                 .expect("session cwd override mutex poisoned")
@@ -2619,6 +2630,33 @@ impl AgentBridge {
         self.slots
             .get(idx)
             .map(|slot| *slot.closed.lock().expect("closed mutex poisoned"))
+            .unwrap_or(false)
+    }
+
+    /// setup-followups plan, archive_thread_backend_verify: the sidebar's
+    /// Archive control. Unlike [`Self::close_thread`]/[`Self::delete_
+    /// thread`], this sends no ACP request at all -- archiving is a
+    /// purely local/organizational flag, not a session lifecycle
+    /// operation, so it never touches the backend session. It IS
+    /// persisted (via [`persist_runtime_snapshot`]) so it survives a
+    /// restart. Returns `false` for an out-of-range `idx` (nothing to
+    /// archive); otherwise always succeeds and is idempotent.
+    pub fn archive_thread(&self, idx: usize) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        *slot.archived.lock().expect("archived mutex poisoned") = true;
+        persist_runtime_snapshot(self.store.as_ref(), slot);
+        true
+    }
+
+    /// Whether thread `idx` has been archived via [`Self::archive_
+    /// thread`]. `false` for any out-of-range index or a thread that has
+    /// never been archived.
+    pub fn thread_archived(&self, idx: usize) -> bool {
+        self.slots
+            .get(idx)
+            .map(|slot| *slot.archived.lock().expect("archived mutex poisoned"))
             .unwrap_or(false)
     }
 
@@ -3864,6 +3902,45 @@ mod tests {
     }
 
     #[test]
+    fn archived_thread_survives_bridge_restart_via_jsonl_cache() {
+        // setup-followups plan, archive_thread_backend_verify: proves
+        // archive_thread's flag is real durable state (not just an
+        // in-memory Mutex that a restart would silently drop), same
+        // "restart the whole bridge, load from the same cache dir"
+        // convention as history_persists_across_bridge_restarts above.
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
+        let names = ["Thread One", "Thread Two"];
+
+        {
+            let bridge =
+                bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                    .expect("first bridge");
+            assert!(!bridge.thread_archived(0));
+            assert!(bridge.archive_thread(0));
+            assert!(bridge.thread_archived(0));
+            // Only thread 0 was archived -- thread 1 must be unaffected,
+            // both now and after the restart below.
+            assert!(!bridge.thread_archived(1));
+        }
+
+        let bridge2 =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("second bridge");
+        assert!(bridge2.thread_archived(0));
+        assert!(!bridge2.thread_archived(1));
+    }
+
+    #[test]
+    fn archive_thread_on_out_of_range_index_returns_false() {
+        let gateway = TestGateway::spawn();
+        let bridge =
+            bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
+        assert!(!bridge.archive_thread(5));
+        assert!(!bridge.thread_archived(5));
+    }
+
+    #[test]
     fn restored_interaction_snapshot_is_available_before_gateway_events_arrive() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let gateway = TestGateway::spawn();
@@ -3904,6 +3981,7 @@ mod tests {
                         current_value: Some("fast".into()),
                         options: vec![],
                     }],
+                    archived: false,
                 },
             )
             .expect("seed interaction snapshot");
@@ -5625,7 +5703,7 @@ done
         assert_eq!(bridge.transcript(0).len(), total_messages);
     }
 
-    /// `skill_injection_verification` phase: `skills_mcp_servers_entry`'s
+    /// `skill_injection_verification` phase: `snapflowd_mcp_servers_entry`'s
     /// output shape -- the actual client-supplied `mcpServers` entry every
     /// `session/new`/`session/load` now sends (see `Command::OpenSession`/
     /// `Command::ResumeSession`'s doc comments), verified directly rather
@@ -5635,20 +5713,20 @@ done
     /// inspecting its own startup log -- making real round-trip tests here
     /// flaky on network latency, unrelated to this logic itself).
     #[test]
-    fn skills_mcp_servers_entry_always_includes_the_skills_server() {
+    fn snapflowd_mcp_servers_entry_always_includes_the_skills_server() {
         // Not asserting entries.len() == 1: a real snapshotd daemon
         // happening to run on the test host makes snapshotd_mcp_server_
         // entry's liveness probe legitimately append a second "snapshotd"
         // entry (see that function's own doc comment) regardless of
         // provider -- this test only cares that "skills" is always
         // present, first, and correctly shaped.
-        let entries = skills_mcp_servers_entry(None, "codex");
+        let entries = snapflowd_mcp_servers_entry(None, "codex");
         assert!(!entries.is_empty());
         assert_eq!(entries[0]["name"], "skills");
         assert!(entries[0]["command"]
             .as_str()
             .unwrap()
-            .contains("skills-mcp-server"));
+            .contains("snapflowd-mcp"));
         let args = entries[0]["args"].as_array().expect("args is an array");
         assert!(args.contains(&serde_json::Value::String("--global-dir".to_string())));
         assert!(
@@ -5658,9 +5736,9 @@ done
     }
 
     #[test]
-    fn skills_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
+    fn snapflowd_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
         let project_file = std::path::Path::new("/tmp/my-project/timeline.mlt");
-        let entries = skills_mcp_servers_entry(Some(project_file), "codex");
+        let entries = snapflowd_mcp_servers_entry(Some(project_file), "codex");
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()

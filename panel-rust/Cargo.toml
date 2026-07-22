@@ -87,8 +87,8 @@ path = "src/bin/chat_init_verify.rs"
 # session's client-supplied `mcpServers` array at. See the binary's own
 # module doc comment for the full mechanism.
 [[bin]]
-name = "skills-mcp-server"
-path = "src/bin/skills_mcp_server.rs"
+name = "snapflowd-mcp"
+path = "src/bin/snapflowd_mcp.rs"
 
 # Dev UI viewer with TextUtil installed (live / @ # filter). Not shipped.
 [[bin]]

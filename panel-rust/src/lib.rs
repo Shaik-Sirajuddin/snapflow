@@ -27,7 +27,7 @@ mod permission;
 pub mod protocol_types;
 mod send_queue;
 mod settings_file;
-// `pub` (not just `mod`) so the new `skills-mcp-server` bin target can
+// `pub` (not just `mod`) so the `snapflowd-mcp` bin target can
 // reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
 // of duplicating the SKILL.md front-matter parsing logic.
 pub mod skills_state;
@@ -799,6 +799,16 @@ impl PanelSingleton {
                     .unwrap_or(false)
             })
             .collect();
+        let archived: Vec<bool> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                self.bridge
+                    .as_ref()
+                    .map(|bridge| bridge.thread_archived(idx))
+                    .unwrap_or(false)
+            })
+            .collect();
         let providers: Vec<String> = names
             .iter()
             .enumerate()
@@ -835,6 +845,7 @@ impl PanelSingleton {
             &descriptions,
             &background_sessions,
             &closed,
+            &archived,
             &query,
         );
         *self.visible_indices.borrow_mut() = items.iter().map(|i| i.real_index).collect();
@@ -2797,6 +2808,32 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        // setup-followups plan, archive_thread_backend_verify: the
+        // sidebar's Archive control was previously a UI-only stub with
+        // no Rust-side wiring at all. Same "translate through real_
+        // index before touching the bridge" convention as close/delete
+        // above, but archive_thread never sends an ACP request -- it is
+        // a purely local, durable (see AgentBridge::archive_thread's
+        // doc comment) presentation flag.
+        let component_weak = panel.component.as_weak();
+        panel.component.on_thread_archive_requested(move |filtered_idx| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    let Some(idx) = panel.real_index(filtered_idx as usize) else {
+                        return;
+                    };
+                    let Some(bridge) = &panel.bridge else { return };
+                    if !bridge.archive_thread(idx) {
+                        return;
+                    }
+                    panel.refresh_threads_model();
+                }
+            });
+        });
+
         // Interactive agent-request relay addition: approve/reject
         // buttons on the request card built by `refresh_pending_request_
         // for`. Both handlers re-read the exact `AgentRequestEvent` from
@@ -4101,6 +4138,7 @@ mod keyboard_shortcut_tests {
             background: false,
             description: "".into(),
             closed: false,
+            archived: false,
             provider: "".into(),
             model: "".into(),
             project_name: "".into(),

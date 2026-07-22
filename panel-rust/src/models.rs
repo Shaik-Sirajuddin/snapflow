@@ -579,6 +579,7 @@ pub fn build_thread_items<N: AsRef<str>>(
     descriptions: &[String],
     background_sessions: &[bool],
     closed: &[bool],
+    archived: &[bool],
     query: &str,
 ) -> Vec<VisibleThreadItem> {
     let query_lower = query.trim().to_lowercase();
@@ -593,7 +594,12 @@ pub fn build_thread_items<N: AsRef<str>>(
             real_index,
             item: ThreadItem {
                 name: name.as_ref().into(),
-                status: if closed.get(real_index).copied().unwrap_or(false) {
+                // Archived takes precedence over closed: it is the final,
+                // explicitly-chosen state, whereas closed can still precede
+                // an archive action on the same thread.
+                status: if archived.get(real_index).copied().unwrap_or(false) {
+                    "archived"
+                } else if closed.get(real_index).copied().unwrap_or(false) {
                     "closed"
                 } else {
                     st.as_str()
@@ -611,6 +617,7 @@ pub fn build_thread_items<N: AsRef<str>>(
                     .unwrap_or_default()
                     .into(),
                 closed: closed.get(real_index).copied().unwrap_or(false),
+                archived: archived.get(real_index).copied().unwrap_or(false),
                 // Provider/model are not part of the name/state slices this
                 // filter operates on -- `lib.rs` post-populates them by
                 // `real_index` after filtering, so they default empty here.
@@ -869,10 +876,11 @@ mod tests {
     const NO_DESCRIPTIONS: &[String] = &[];
     const BACKGROUND: &[bool] = &[false, true, false, false];
     const NO_CLOSED: &[bool] = &[false, false, false, false];
+    const NO_ARCHIVED: &[bool] = &[false, false, false, false];
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].item.name, "Fix timeline crash");
         assert_eq!(items[0].real_index, 0);
@@ -883,7 +891,7 @@ mod tests {
     #[test]
     fn substring_match_is_case_insensitive() {
         let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "FADE");
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "FADE");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
         // Real index must survive filtering -- "Add fade transition" is
@@ -892,7 +900,7 @@ mod tests {
         assert_eq!(items[0].real_index, 1);
 
         let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
     }
@@ -902,7 +910,7 @@ mod tests {
         // "x" appears in 2 non-adjacent names (index 0 and 3); must come
         // back in the same relative order as NAMES, not re-sorted, and
         // must skip the non-matching ones in between.
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "x");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "x");
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
         assert_eq!(
             matched_names,
@@ -920,6 +928,7 @@ mod tests {
             NO_DESCRIPTIONS,
             BACKGROUND,
             NO_CLOSED,
+            NO_ARCHIVED,
             "zzz-no-such-thread",
         );
         assert!(items.is_empty());
@@ -927,13 +936,13 @@ mod tests {
 
     #[test]
     fn whitespace_only_query_behaves_like_empty() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "   ");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "   ");
         assert_eq!(items.len(), 4);
     }
 
     #[test]
     fn status_is_carried_through_unfiltered() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
         assert_eq!(items[1].item.status, "loading");
         assert_eq!(items[2].item.status, "error");
     }
@@ -945,11 +954,28 @@ mod tests {
         // whatever transient `ThreadState` it was last in -- STATE[1]
         // is `Loading` here, proving the override wins even over that.
         let closed: &[bool] = &[false, true, false, false];
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, NO_ARCHIVED, "");
         assert_eq!(items[1].item.status, "closed");
         assert!(items[1].item.closed);
         assert_eq!(items[0].item.status, "idle");
         assert!(!items[0].item.closed);
+    }
+
+    #[test]
+    fn archived_thread_reports_archived_status_even_when_also_closed() {
+        // setup-followups plan, archive_thread_backend_verify: archived
+        // must win over both the transient ThreadState (STATE[1] is
+        // Loading) and over closed (also true here), since archiving is
+        // the final, explicitly-chosen state a user picks after a thread
+        // may already be closed.
+        let closed: &[bool] = &[false, true, false, false];
+        let archived: &[bool] = &[false, true, false, false];
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, archived, "");
+        assert_eq!(items[1].item.status, "archived");
+        assert!(items[1].item.archived);
+        assert!(items[1].item.closed);
+        assert_eq!(items[0].item.status, "idle");
+        assert!(!items[0].item.archived);
     }
 
     #[test]
@@ -960,21 +986,21 @@ mod tests {
             "".into(),
             "Bug still open".into(),
         ];
-        let items = build_thread_items(NAMES, STATE, &descriptions, BACKGROUND, NO_CLOSED, "fade");
+        let items = build_thread_items(NAMES, STATE, &descriptions, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.description, "Added a fade");
     }
 
     #[test]
     fn description_defaults_to_empty_when_shorter_than_names() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
         assert!(items.iter().all(|i| i.item.description.is_empty()));
     }
 
     #[test]
     fn background_policy_is_preserved_after_filtering() {
         let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
         assert!(items[0].item.background);
     }
 
