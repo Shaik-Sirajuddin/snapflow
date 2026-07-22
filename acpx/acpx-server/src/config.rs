@@ -487,6 +487,63 @@ fn parse_positive_duration(name: &str, value: &str) -> std::time::Duration {
 mod tests {
     use super::*;
 
+    /// Both `default_codex_native_auth_method_*` tests below mutate the
+    /// same process-global `CODEX_API_KEY`/`ACPX_CODEX_AUTH_FILE` env vars;
+    /// `cargo test` runs tests on multiple threads by default, so without
+    /// serializing them a genuine data race is possible -- e.g. one test's
+    /// guard restoring/removing `ACPX_CODEX_AUTH_FILE` at `Drop` while the
+    /// other test's `read_codex_api_key_from_auth_file` call is in flight,
+    /// which then falls through to the real `$HOME/.codex/auth.json`
+    /// instead of the test's own fake one (observed in practice: the
+    /// "finds a real key" test's assert failed with this machine's actual
+    /// ambient Codex API key rather than the fixture's `"sk-test-key"`).
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds `ENV_TEST_LOCK` for its whole lifetime (serializing this test
+    /// against the other `default_codex_native_auth_method_*` test) and,
+    /// on `Drop`, restores mutated process-global env vars and removes a
+    /// temp dir -- so a panicking `assert!` mid-test still runs cleanup
+    /// instead of leaking the temp dir and leaving the env corrupted for
+    /// whichever test runs next. Mirrors `startup_recovery_test.rs`'s
+    /// `BinaryGuard` Drop-cleanup shape.
+    struct EnvRestoreGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        vars: Vec<(&'static str, Option<String>)>,
+        temp_dir: std::path::PathBuf,
+    }
+
+    impl EnvRestoreGuard {
+        /// Acquires `ENV_TEST_LOCK` *before* snapshotting `vars`' current
+        /// values, so the snapshot can't itself race with the other
+        /// test's mutation -- only the value from either true ambient
+        /// state or the other test's own already-completed (lock
+        /// released) restore is ever captured as "prior".
+        fn new(vars: &[&'static str], temp_dir: std::path::PathBuf) -> Self {
+            let lock = ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let vars = vars
+                .iter()
+                .map(|&key| (key, std::env::var(key).ok()))
+                .collect();
+            Self { _lock: lock, vars, temp_dir }
+        }
+    }
+
+    impl Drop for EnvRestoreGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (key, prior) in &self.vars {
+                    match prior {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_dir);
+        }
+    }
+
     #[test]
     fn parses_positive_lifecycle_duration() {
         assert_eq!(
@@ -528,8 +585,8 @@ mod tests {
         std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": "sk-test-key"}"#)
             .expect("write temp auth file");
 
-        let prior_auth_file = std::env::var("ACPX_CODEX_AUTH_FILE").ok();
-        let prior_key = std::env::var("CODEX_API_KEY").ok();
+        let _guard =
+            EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE", "CODEX_API_KEY"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
             std::env::remove_var("CODEX_API_KEY");
@@ -542,18 +599,6 @@ mod tests {
 
         assert_eq!(result.as_deref(), Some("api-key"));
         assert_eq!(std::env::var("CODEX_API_KEY").as_deref(), Ok("sk-test-key"));
-
-        unsafe {
-            match prior_auth_file {
-                Some(value) => std::env::set_var("ACPX_CODEX_AUTH_FILE", value),
-                None => std::env::remove_var("ACPX_CODEX_AUTH_FILE"),
-            }
-            match prior_key {
-                Some(value) => std::env::set_var("CODEX_API_KEY", value),
-                None => std::env::remove_var("CODEX_API_KEY"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -571,7 +616,7 @@ mod tests {
         std::fs::write(&auth_file, r#"{"OPENAI_API_KEY": "sk-test-key"}"#)
             .expect("write temp auth file");
 
-        let prior_auth_file = std::env::var("ACPX_CODEX_AUTH_FILE").ok();
+        let _guard = EnvRestoreGuard::new(&["ACPX_CODEX_AUTH_FILE"], dir.clone());
         unsafe {
             std::env::set_var("ACPX_CODEX_AUTH_FILE", &auth_file);
         }
@@ -582,14 +627,6 @@ mod tests {
         // happens to exist on this machine.
         let result = default_codex_native_auth_method("sh", &["./stand-in-agent.sh".to_string()]);
         assert_eq!(result, None);
-
-        unsafe {
-            match prior_auth_file {
-                Some(value) => std::env::set_var("ACPX_CODEX_AUTH_FILE", value),
-                None => std::env::remove_var("ACPX_CODEX_AUTH_FILE"),
-            }
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
