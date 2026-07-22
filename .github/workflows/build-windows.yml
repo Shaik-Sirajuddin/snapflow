@@ -259,7 +259,16 @@ jobs:
           # files, resolved by the OS loader at actual runtime). Copy it
           # in before windeployqt runs, not after.
           cp build/CuteLogger/libCuteLogger.dll "$APPDIR/"
-          windeployqt --release --no-translations "$APPDIR/snapflow.exe"
+          # Still failed after the libCuteLogger.dll fix above, with the
+          # same "Process failed to start" error: windeployqt, on
+          # detecting a QML app ("[QML]" in its own banner), tries to
+          # actually execute snapflow.exe to introspect QML imports
+          # dynamically -- a documented chicken-and-egg in a minimal/
+          # fresh environment (it hasn't copied the Qt platform plugin
+          # the exe needs to even instantiate QGuiApplication yet).
+          # --qmldir makes it statically scan the QML source tree
+          # instead of relying on running the built binary at all.
+          windeployqt --release --no-translations --qmldir src/qml "$APPDIR/snapflow.exe"
           cp /mingw64/bin/mlt*.dll "$APPDIR/" 2>/dev/null || true
           mkdir -p build/Snapflow/lib build/Snapflow/share
           cp -r /mingw64/lib/mlt-7 build/Snapflow/lib/mlt-7
