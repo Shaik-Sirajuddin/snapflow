@@ -292,11 +292,23 @@ export component ChatArea inherits Rectangle {
                 : (compact ? 48px : 56px);
             // Match sidebar title strip surface when collapsed.
             background: root.match-title-bar ? Theme.bg-card : Theme.bg-chat;
-            property <angle> header-spin: 0deg;
-            header-spin-timer := Timer {
-                interval: 80ms;
-                running: root.sending || connection-status == "Connecting...";
-                triggered => { header-spin += 30deg; }
+            // A real Slint animation (not a plain `Timer` stepping this
+            // property by hand, the way this element itself used to) so
+            // the engine's own animation driver runs it --
+            // `has_active_animations()` (panel_rust_poll's host-side
+            // repaint trigger) only ever detects *this* kind of
+            // animation, never a bare `Timer`, so the old hand-rolled
+            // version silently stopped repainting itself except when
+            // some unrelated interaction happened to force a repaint
+            // anyway. Same fix already applied to sidebar.slint's own
+            // load-spin and chat_input_layout.slint's composer spinner
+            // (commit 800bd65) -- this header spinner was the one
+            // instance of the same bug class left unmigrated.
+            property <angle> header-spin: (root.sending || connection-status == "Connecting...") ? 360deg : 0deg;
+            animate header-spin {
+                duration: 800ms;
+                iteration-count: (root.sending || connection-status == "Connecting...") ? -1 : 1;
+                easing: linear;
             }
             HorizontalLayout {
                 width: 100%;
