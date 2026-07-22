@@ -265,6 +265,14 @@ export component Sidebar inherits Rectangle {
                     mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Show threads";
+                    // Every other interactive control in this file (HoverSurface,
+                    // IconButton, Button) wires accessible-action-default
+                    // alongside clicked -- this TouchArea and skills-tab below
+                    // were missing it, so a keyboard/screen-reader "activate"
+                    // was a silent no-op despite both being fully labelled and
+                    // roled as buttons (found via a real e2e test never
+                    // switching skill-mode).
+                    accessible-action-default => { skill-mode = false; }
                     clicked => { skill-mode = false; }
                     changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
@@ -279,6 +287,7 @@ export component Sidebar inherits Rectangle {
                     mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Show skills";
+                    accessible-action-default => { skill-mode = true; }
                     clicked => { skill-mode = true; }
                     changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
@@ -307,6 +316,7 @@ export component Sidebar inherits Rectangle {
                     accessible-label: root.show-global-skills
                         ? "Hide global skills"
                         : "Show global skills";
+                    accessible-action-default => { root.show-global-skills = !root.show-global-skills; }
                     clicked => { root.show-global-skills = !root.show-global-skills; }
                     Rectangle {
                         height: 24px;

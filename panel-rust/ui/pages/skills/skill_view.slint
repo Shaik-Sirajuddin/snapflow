@@ -113,6 +113,7 @@ export component SkillEditorView inherits Rectangle {
                         horizontal-stretch: 0;
                         accessible-role: button;
                         accessible-label: "Copy skill path";
+                        accessible-action-default => { root.copy-path-requested(); }
                         clicked => { root.copy-path-requested(); }
                         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                         Rectangle {
@@ -143,6 +144,7 @@ export component SkillEditorView inherits Rectangle {
                         horizontal-stretch: 0;
                         accessible-role: button;
                         accessible-label: "Open in " + editor-name;
+                        accessible-action-default => { root.open-in-editor-requested(editor-name); }
                         clicked => { root.open-in-editor-requested(editor-name); }
                         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                         Rectangle {
@@ -173,6 +175,7 @@ export component SkillEditorView inherits Rectangle {
                         horizontal-stretch: 0;
                         accessible-role: button;
                         accessible-label: "Open with OS default application";
+                        accessible-action-default => { root.open-with-os-default-requested(); }
                         clicked => { root.open-with-os-default-requested(); }
                         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                         Rectangle {

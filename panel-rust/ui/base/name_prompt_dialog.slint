@@ -101,6 +101,10 @@ export component NamePromptDialog inherits Rectangle {
                     mouse-cursor: pointer;
                     accessible-role: button;
                     accessible-label: "Cancel";
+                    accessible-action-default => {
+                        root.open = false;
+                        root.cancelled();
+                    }
                     clicked => {
                         root.open = false;
                         root.cancelled();
@@ -118,6 +122,10 @@ export component NamePromptDialog inherits Rectangle {
                     accessible-role: button;
                     accessible-label: root.confirm-label;
                     enabled: name-input.text != "";
+                    accessible-action-default => {
+                        root.confirmed(name-input.text);
+                        root.open = false;
+                    }
                     clicked => {
                         root.confirmed(name-input.text);
                         root.open = false;

@@ -538,6 +538,7 @@ export component ChatArea inherits Rectangle {
                     width: 16px;
                     accessible-role: button;
                     accessible-label: "Dismiss error";
+                    accessible-action-default => { root.error-banner-dismissed(); }
                     clicked => { root.error-banner-dismissed(); }
                     changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
