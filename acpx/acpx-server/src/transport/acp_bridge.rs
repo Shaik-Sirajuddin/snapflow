@@ -524,7 +524,15 @@ impl BridgeRuntime {
         store: &PersistenceStore,
     ) -> Result<usize, BridgeDispatchError> {
         let mut restored = 0;
-        for record in store.list_recoverable_sessions().await? {
+        // `None` (unbounded) here is safe, not a reintroduction of
+        // acpx-startup-recovery-unbounded's bug: this only rebuilds
+        // bridge-visible mappings for records the *native* recovery pass
+        // (bounded by LifecycleConfig::startup_recovery_max_age) already
+        // restored -- the immediately-following `status != Restored`
+        // filter means an age-excluded row can never reach here, since
+        // it was never attempted (and so never marked `Restored`) in the
+        // first place.
+        for record in store.list_recoverable_sessions(None).await? {
             if record.status != RecoveryStatus::Restored {
                 continue;
             }

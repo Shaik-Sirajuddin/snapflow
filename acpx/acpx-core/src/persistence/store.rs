@@ -253,7 +253,30 @@ impl PersistenceStore {
     /// / `rehydrate_session`, which deliberately applies no such filter --
     /// see that method's own doc comment) -- it just never gets
     /// automatically retried again by the unattended eager batch.
-    pub async fn list_recoverable_sessions(&self) -> Result<Vec<SessionRecord>, PersistenceError> {
+    /// `max_age` bounds candidacy by recency: a row whose most recent
+    /// known activity (`last_activity_at_unix_nanos`, falling back to
+    /// `created_at_unix_nanos`) is older than `now - max_age` is excluded
+    /// regardless of `status`/`recovery_method` -- see `LifecycleConfig::
+    /// startup_recovery_max_age`'s doc comment for why this bound exists
+    /// at all (without it, this list only ever grows: a desktop client is
+    /// almost always killed rather than shut down cleanly, so `closed_at`
+    /// never gets set). `None` disables the bound entirely (every prior
+    /// caller's exact pre-existing unbounded behavior). A row with neither
+    /// timestamp column populated (a genuinely pre-lifecycle row, from
+    /// before either column existed) is treated as maximally old --
+    /// conservatively excluded whenever a bound is active, rather than
+    /// assumed recent.
+    pub async fn list_recoverable_sessions(
+        &self,
+        max_age: Option<std::time::Duration>,
+    ) -> Result<Vec<SessionRecord>, PersistenceError> {
+        let cutoff_nanos = max_age.map(|age| {
+            let now_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            now_nanos.saturating_sub(age.as_nanos() as i64)
+        });
         let conn = self.conn.clone();
         run_blocking(move || {
             let conn = lock(&conn)?;
@@ -268,9 +291,10 @@ impl PersistenceStore {
                    AND status != 'closed' \
                    AND status != 'recovery_failed' \
                    AND recovery_method IN ('load', 'resume') \
+                   AND (?1 IS NULL OR COALESCE(last_activity_at_unix_nanos, created_at_unix_nanos, 0) >= ?1) \
                  ORDER BY created_at ASC",
             )?;
-            let rows = stmt.query_map([], row_to_session_record)?;
+            let rows = stmt.query_map(params![cutoff_nanos], row_to_session_record)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
         .await
@@ -1181,5 +1205,94 @@ mod tests {
             .transcript_state_changed("session-1")
             .await
             .expect("new baseline is acknowledged once"));
+    }
+
+    /// **`acpx-startup-recovery-unbounded`.** Without a `max_age` bound,
+    /// `list_recoverable_sessions` returns every session ever opened and
+    /// never gracefully closed -- confirmed live against a real,
+    /// accumulated-over-~28-hours database with 4367 such rows, all
+    /// recovered on every single fresh startup. Proves the fix: an old
+    /// row is excluded once a bound is supplied, a recent row is not, and
+    /// `None` preserves the original unbounded behavior exactly.
+    #[tokio::test]
+    async fn list_recoverable_sessions_excludes_rows_older_than_max_age() {
+        use super::super::sessions::RecoveryMethod;
+
+        let store = PersistenceStore::open_in_memory().expect("in-memory store");
+        let now_nanos = unix_time_nanos();
+        let one_day_nanos: i64 = 24 * 60 * 60 * 1_000_000_000;
+
+        store
+            .record_session_with_recovery(
+                "old-session",
+                "codex-acp",
+                "backend-old",
+                None,
+                "2026-07-21T00:00:00Z",
+                "default",
+                RecoveryMetadata {
+                    cwd: None,
+                    recovery_params: None,
+                    status: RecoveryStatus::Active,
+                    recovery_method: RecoveryMethod::Load,
+                    last_recovery_error: None,
+                    created_at_unix_nanos: Some(now_nanos - (2 * one_day_nanos)),
+                    last_activity_at_unix_nanos: Some(now_nanos - (2 * one_day_nanos)),
+                    pinned: false,
+                    bridge_session_id: None,
+                    bridge_model_alias: None,
+                    bridge_config_options: None,
+                },
+            )
+            .await
+            .expect("seed old session");
+        store
+            .record_session_with_recovery(
+                "recent-session",
+                "codex-acp",
+                "backend-recent",
+                None,
+                "2026-07-22T00:00:00Z",
+                "default",
+                RecoveryMetadata {
+                    cwd: None,
+                    recovery_params: None,
+                    status: RecoveryStatus::Active,
+                    recovery_method: RecoveryMethod::Load,
+                    last_recovery_error: None,
+                    created_at_unix_nanos: Some(now_nanos - (5 * 60 * 1_000_000_000)),
+                    last_activity_at_unix_nanos: Some(now_nanos - (5 * 60 * 1_000_000_000)),
+                    pinned: false,
+                    bridge_session_id: None,
+                    bridge_model_alias: None,
+                    bridge_config_options: None,
+                },
+            )
+            .await
+            .expect("seed recent session");
+
+        // Unbounded (None) -- the original, pre-fix behavior: both rows
+        // are recovery candidates.
+        let unbounded = store
+            .list_recoverable_sessions(None)
+            .await
+            .expect("unbounded list");
+        assert_eq!(unbounded.len(), 2, "None must preserve the original unbounded behavior");
+
+        // Bounded to 24h: the 2-day-old row must be excluded, the
+        // 5-minute-old row must still be included.
+        let bounded = store
+            .list_recoverable_sessions(Some(std::time::Duration::from_secs(24 * 60 * 60)))
+            .await
+            .expect("bounded list");
+        let ids: Vec<&str> = bounded
+            .iter()
+            .map(|record| record.gateway_session_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["recent-session"],
+            "a 24h bound must exclude the 2-day-old row and keep the 5-minute-old one"
+        );
     }
 }

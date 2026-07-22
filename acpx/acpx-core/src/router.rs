@@ -2215,7 +2215,10 @@ impl Router {
         };
         let mut report = StartupRecoveryReport::default();
 
-        for record in store.list_recoverable_sessions().await? {
+        for record in store
+            .list_recoverable_sessions(self.lifecycle.startup_recovery_max_age)
+            .await?
+        {
             if record.recovery_method == RecoveryMethod::None {
                 report.skipped += 1;
                 continue;
@@ -6462,9 +6465,12 @@ pub async fn recover_open_sessions_shared(
     policy: StartupRecoveryPolicy,
 ) -> Result<StartupRecoveryReport, RouterError> {
     policy.validate()?;
-    let store = {
+    let (store, startup_recovery_max_age) = {
         let router = router.lock().await;
-        router.persistence.clone()
+        (
+            router.persistence.clone(),
+            router.lifecycle.startup_recovery_max_age,
+        )
     };
     let Some(store) = store else {
         return Ok(StartupRecoveryReport::default());
@@ -6472,7 +6478,10 @@ pub async fn recover_open_sessions_shared(
 
     let mut report = StartupRecoveryReport::default();
     let mut candidates = std::collections::VecDeque::new();
-    for record in store.list_recoverable_sessions().await? {
+    for record in store
+        .list_recoverable_sessions(startup_recovery_max_age)
+        .await?
+    {
         if record.recovery_method == RecoveryMethod::None {
             report.skipped += 1;
             continue;
