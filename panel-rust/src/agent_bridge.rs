@@ -2763,12 +2763,22 @@ impl AgentBridge {
     /// controls without a second round trip. Blocking, same convention
     /// as [`Self::list_profiles`]/[`Self::create_profile`] -- called
     /// synchronously from a Slint button-click handler.
-    pub fn close_thread(&self, idx: usize) -> bool {
+    /// `background`: forwards acpx-core's `_acpx.bg` `session/close`
+    /// override (see `LifecycleConfig::background_mode`'s doc comment)
+    /// when true, so this explicit close is a soft no-op that keeps the
+    /// session alive for a later resume -- the actual wiring for
+    /// panel-rust's own per-thread "background" toggle
+    /// (`PanelStateStore::effective_background_session`), which
+    /// previously had no connection to any real runtime behavior at all.
+    pub fn close_thread(&self, idx: usize, background: bool) -> bool {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
         let handle = slot.handle.clone();
-        let ok = self.runtime.block_on(handle.close_session()).is_ok();
+        let ok = self
+            .runtime
+            .block_on(handle.close_session(background))
+            .is_ok();
         if ok {
             *slot.closed.lock().expect("closed mutex poisoned") = true;
         }
@@ -3837,6 +3847,33 @@ mod tests {
             });
             TestGateway { child, base_url }
         }
+
+        /// Same as [`Self::spawn_with_persona_and_db`], but also points
+        /// `rui-mock-agent` at `event_log_path` (`RUI_MOCK_AGENT_EVENT_LOG`)
+        /// so a test can inspect exactly which real ACP methods actually
+        /// reached the backend -- used to prove acpx-core's `_acpx.bg`
+        /// `session/close` override genuinely suppresses the backend call
+        /// (rather than just not erroring).
+        fn spawn_with_persona_db_and_event_log(
+            persona: &str,
+            db_path: Option<&std::path::Path>,
+            event_log_path: &std::path::Path,
+        ) -> Self {
+            let backend_cmd = mock_agent_bin().to_string_lossy().into_owned();
+            let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+                command
+                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                    .env("ACPX_BACKEND_CMD", &backend_cmd)
+                    .env("ACPX_DEFAULT_AGENT_ID", persona)
+                    .env("RUI_MOCK_AGENT_PERSONA", persona)
+                    .env("RUI_MOCK_AGENT_EVENT_LOG", event_log_path)
+                    .env("RUST_LOG", "error");
+                if let Some(db_path) = db_path {
+                    command.env("ACPX_DB_PATH", db_path);
+                }
+            });
+            TestGateway { child, base_url }
+        }
     }
 
     impl Drop for TestGateway {
@@ -3863,6 +3900,78 @@ mod tests {
             move |_provider| Ok(base_url.clone()),
             cache_dir,
         )
+    }
+
+    fn read_event_log(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// **`acpx-startup-recovery-unbounded`'s `investigate_background_mode_
+    /// functionality` phase.** `close_thread`'s `background` parameter had
+    /// no wiring at all before this fix -- `AcpxThreadHandle::
+    /// close_session` took no arguments and the request it built never
+    /// carried acpx-core's `_acpx.bg` extension field, so panel-rust's own
+    /// per-thread "background" toggle (`PanelStateStore::
+    /// effective_background_session`) was purely a stored/displayed
+    /// boolean with zero effect on any real `session/close` call.
+    ///
+    /// Proves the fix reaches the real wire, not just that
+    /// `close_thread` returns `true` either way: acpx-core's
+    /// `maybe_suppress_close` intercepts a `background: true` close
+    /// *before* it ever reaches the backend, so `rui-mock-agent`'s own
+    /// `session/close` handler (which unconditionally logs a
+    /// `RUI_MOCK_AGENT_EVENT_LOG` entry when it's actually invoked) must
+    /// see zero such entries for a background close, and exactly one for
+    /// a normal one.
+    #[test]
+    fn close_thread_background_flag_reaches_the_real_acpx_bg_override() {
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let event_log = tempfile::NamedTempFile::new().expect("event log tempfile");
+        let gateway = TestGateway::spawn_with_persona_db_and_event_log(
+            "test",
+            None,
+            event_log.path(),
+        );
+        let names = ["background-thread", "normal-thread"];
+        let bridge =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("bridge");
+        wait_for_thread_ready(&bridge, 0);
+        wait_for_thread_ready(&bridge, 1);
+
+        assert!(
+            bridge.close_thread(0, true),
+            "a background close must still report success to the caller"
+        );
+        let after_background_close = read_event_log(event_log.path());
+        assert!(
+            !after_background_close
+                .iter()
+                .any(|event| event["method"] == "session/close"),
+            "a background=true close must never reach the real backend at all \
+             (acpx-core's _acpx.bg override must intercept it first), got: \
+             {after_background_close:?}"
+        );
+
+        assert!(
+            bridge.close_thread(1, false),
+            "a normal close must still succeed"
+        );
+        let after_normal_close = read_event_log(event_log.path());
+        let normal_close_events: Vec<_> = after_normal_close
+            .iter()
+            .filter(|event| event["method"] == "session/close")
+            .collect();
+        assert_eq!(
+            normal_close_events.len(),
+            1,
+            "a background=false close must reach the real backend exactly once, got: \
+             {after_normal_close:?}"
+        );
     }
 
     #[test]
