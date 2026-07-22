@@ -104,6 +104,16 @@ export component MarkdownView inherits VerticalLayout {
 
             if !is-hr : HorizontalLayout {
                 horizontal-stretch: 1;
+                // Without this, Slint's default `stretch` alignment
+                // packs this row's (non-stretching) run `Text`s as a
+                // group centered/distributed across the full stretched
+                // width of this layout, not left-packed -- each run's own
+                // `horizontal-alignment: left` below only controls glyph
+                // alignment *inside* that run's own box, which doesn't
+                // matter if the box itself already sits mid-row. Visible
+                // live as agent replies rendering centered instead of
+                // left-aligned.
+                alignment: start;
                 for run[ri] in line.runs : Text {
                     text: run.text;
                     font-family: (run.code || is-code) ? Theme.font-mono : Theme.font-sans;

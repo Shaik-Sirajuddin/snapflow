@@ -642,20 +642,25 @@ export component ChatArea inherits Rectangle {
                     property <length> rail-w: 3px;
                     property <length> rail-gap: Metrics.space-3;
                     property <length> user-indent: 8px;
-                    // 0..1 progress of the traveling highlight.
-                    property <float> flow-t: 0.0;
-                    property <length> flow-blob: 36px;
-                    live-flow-timer := Timer {
-                        interval: 40ms;
-                        running: is-live-tail;
-                        triggered => {
-                            // ~1.2s full trip (30 × 40ms), then loop.
-                            flow-t = flow-t + 0.033;
-                            if (flow-t > 1.0) {
-                                flow-t = 0.0;
-                            }
-                        }
+                    // 0..1 progress of the traveling highlight. A real
+                    // Slint animation (not a plain `Timer` stepping this
+                    // property by hand) so the engine's own animation
+                    // driver drives it -- `has_active_animations()`
+                    // (panel_rust_poll's host-side repaint trigger) only
+                    // ever detected *this* kind of animation, never a bare
+                    // `Timer`, so the old hand-rolled version silently
+                    // never repainted on its own and looked frozen except
+                    // when some unrelated interaction (e.g. a mouse move)
+                    // happened to trigger a repaint anyway.
+                    property <float> flow-t: is-live-tail ? 1.0 : 0.0;
+                    animate flow-t {
+                        // ~1.2s full trip, matching the original timer's
+                        // 30 × 40ms cadence, then loop.
+                        duration: 1200ms;
+                        iteration-count: is-live-tail ? -1 : 1;
+                        easing: linear;
                     }
+                    property <length> flow-blob: 36px;
 
                     // Left rail track — always reserved for non-user rows
                     // so agent/tool width is stable when is-live-tail flips.

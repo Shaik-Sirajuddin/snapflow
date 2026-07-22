@@ -201,8 +201,19 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
     let Some(row_index) = keys.iter().position(|key| key == thread_id) else {
         return;
     };
-    if let Some(row) = model.thread_rows.get(row_index) {
-        model.thread_model.set_row_data(row_index, row.item.clone());
+    // Recompute fresh from `model.threads[real_index]`'s *current* state,
+    // not `model.thread_rows[row_index]` -- that cache is only refreshed
+    // by a full `thread_list_dirty_with_keys` pass (thread create/select/
+    // close/...), so re-pushing it here just re-renders whatever it
+    // already held. `Dirty::ThreadRow` fires for exactly the "this one
+    // row's state changed in place" case (a thread starting to load on
+    // send, a turn ending, ...), so its handler must read the live
+    // source of truth, not a snapshot that hasn't caught up yet -- this
+    // was why the sidebar spinner/"sending" pulse didn't start
+    // immediately on a real send, only whenever some unrelated event
+    // later forced a full list rebuild.
+    if let Some(row) = crate::update::visible_thread_row(model, real_index) {
+        model.thread_model.set_row_data(row_index, row.item);
     }
 }
 
@@ -336,7 +347,7 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
     }
 }
 
-fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
+pub(crate) fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::MessageItem>]) {
     let (desired_keys, desired_rows) = if thread_id.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -729,20 +740,20 @@ mod tests {
                 ..crate::model::ThreadModel::default()
             })
             .collect();
+        // apply_thread_row recomputes fresh from `model.threads[real_index]`
+        // (the live source of truth), not from `model.thread_rows` -- a
+        // cache that's only ever refreshed by a full thread-list rebuild
+        // (see its own doc comment: this is exactly the "loading doesn't
+        // start immediately on send" regression, since Dirty::ThreadRow
+        // fires for in-place row changes that a full rebuild hasn't
+        // caught up to yet). So the row's *live* display_name is what
+        // must change here, not a manually pre-seeded `thread_rows` entry.
+        model.threads[7].display_name = "new".to_owned();
         model.thread_model.push(crate::ThreadItem {
             name: "old".into(),
             ..crate::ThreadItem::default()
         });
         *model.thread_model_keys.borrow_mut() = vec!["thread-7".to_owned()];
-        let row = crate::models::VisibleThreadItem {
-            real_index: 7,
-            thread_id: "thread-7".to_owned(),
-            item: crate::ThreadItem {
-                name: "new".into(),
-                ..crate::ThreadItem::default()
-            },
-        };
-        model.thread_rows.push(row.clone());
 
         apply_thread_row(&model, 7);
         assert_eq!(model.thread_model.row_data(0).unwrap().name, "new");
@@ -822,6 +833,44 @@ mod tests {
             model.message_model_keys.borrow().is_empty(),
             "message_model_keys must converge to empty alongside the model"
         );
+    }
+
+    #[test]
+    fn thread_row_reflects_a_just_started_loading_state_even_with_a_stale_thread_rows_cache() {
+        // Regression test: "loading should start immediately on send".
+        // Models the exact real sequence -- ComposeMsg::SendRequested
+        // flips `model.threads[idx].state` to `Loading` and returns
+        // `Dirty::ThreadRow(idx)` in the *same* reducer call, before
+        // anything has refreshed `model.thread_rows` (that only happens
+        // on a full thread-list rebuild, e.g. create/select/close). If
+        // apply_thread_row trusted that stale cache instead of the live
+        // `model.threads` state, the sidebar spinner and the chat area's
+        // `sending`-derived pulse would both stay frozen on "idle" until
+        // some unrelated later event forced a full rebuild.
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-0".to_owned(),
+            state: crate::models::ThreadState::Idle,
+            ..crate::model::ThreadModel::default()
+        });
+        model.thread_model.push(crate::ThreadItem {
+            status: "idle".into(),
+            busy: false,
+            ..crate::ThreadItem::default()
+        });
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned()];
+        // thread_rows deliberately left empty/stale -- nothing has
+        // rebuilt it since cold start, same as a real live app between
+        // list rebuilds.
+        assert!(model.thread_rows.is_empty());
+
+        model.threads[0].state = crate::models::ThreadState::Loading;
+        apply_thread_row(&model, 0);
+
+        let row = model.thread_model.row_data(0).unwrap();
+        assert_eq!(row.status, "loading");
+        assert!(row.busy, "the sidebar spinner's busy flag must flip immediately, not on the \
+                           next unrelated thread-list rebuild");
     }
 
     #[test]

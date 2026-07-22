@@ -138,9 +138,27 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let real_index = model.threads.len();
             let thread_id = format!("thread:{real_index}");
             let display_name = format!("New thread {}", real_index + 1);
-            let provider = match model.default_agent_id.as_str() {
-                "claude" | "claude-code" => "claude",
-                _ => "codex",
+            // Auto-detected by family rather than an enumerated literal
+            // list: `gateway_urls`/`spawn_gateway_process` only ever
+            // recognize two provider keys today ("codex"/"claude" --
+            // see AgentBridge's constructor, which resolves exactly
+            // these two), so any agent id naming the claude family (the
+            // short label "claude" this reducer's own gateway wiring
+            // uses elsewhere, the real registry id "claude-acp", a
+            // hypothetical "claude-code", ...) maps to it; anything else
+            // defaults to codex, same as before. Found live via a real
+            // settings.global.json with default_agent_id: "claude-acp"
+            // (plausibly persisted by a picker backed by the agent
+            // catalog's real registry ids, not the short label), which
+            // an exact-match list previously silently routed to codex.
+            let provider = if model
+                .default_agent_id
+                .to_ascii_lowercase()
+                .contains("claude")
+            {
+                "claude"
+            } else {
+                "codex"
             }
             .to_owned();
             // The literal string "default" is a reserved sentinel, never a
@@ -411,6 +429,14 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     text,
                 }],
                 vec![
+                    // Without this, the sidebar spinner and the chat
+                    // area's live-tail pulse (both driven by this row's
+                    // rendered `status`/`busy`) didn't start until some
+                    // unrelated event later forced a full thread-list
+                    // rebuild -- "loading should start immediately on
+                    // send" was true in `model.threads[idx].state` above,
+                    // just not yet visible.
+                    Dirty::ThreadRow(idx),
                     Dirty::Connection { thread_id },
                     Dirty::Scalar(ScalarField::ComposeText),
                 ],
@@ -1420,6 +1446,8 @@ mod tests {
     use super::*;
     use crate::dirty::RowOp;
     use crate::msg::FrameInput;
+    // row_count()/row_data() on the persistent messages_model VecModel.
+    use slint::Model as _;
 
     fn model_with_threads(names: &[&str]) -> Model {
         let threads = names
@@ -1611,6 +1639,39 @@ mod tests {
     }
 
     #[test]
+    fn new_thread_provider_matching_auto_detects_any_claude_family_agent_id() {
+        // Regression test: a real settings.global.json found live this
+        // session had default_agent_id: "claude-acp" (the real registry
+        // agent id, plausibly from a picker backed by the agent catalog)
+        // rather than the short "claude" label this reducer's own
+        // gateway wiring uses everywhere else -- an exact-match list only
+        // recognizing "claude"/"claude-code" silently routed everything
+        // else, including "claude-acp", to codex. Substring-matching the
+        // claude family instead of enumerating every literal variant
+        // means a *hypothetical future* id ("Claude-Opus-Next", picked
+        // case-insensitively) is covered automatically too, without this
+        // match needing to grow a new arm every time one shows up.
+        for agent_id in [
+            "claude",
+            "claude-code",
+            "claude-acp",
+            "Claude-Opus-Next", // not a real id -- proves this generalizes, not just today's known set
+        ] {
+            let mut model = model_with_threads(&[]);
+            model.default_agent_id = agent_id.to_owned();
+            let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+            assert!(
+                matches!(
+                    effects.as_slice(),
+                    [Effect::NewThread { provider, .. }] if provider == "claude"
+                ),
+                "default_agent_id {agent_id:?} must route new threads to the claude provider, \
+                 got: {effects:?}"
+            );
+        }
+    }
+
+    #[test]
     fn new_thread_is_pending_until_attach_result_resolves_its_binding() {
         let mut model = model_with_threads(&["existing"]);
         model.default_profile = "safe".to_owned();
@@ -1723,7 +1784,7 @@ mod tests {
     #[test]
     fn compose_send_requested_sets_loading_and_returns_send_prompt_effect() {
         let mut model = model_with_threads(&["a"]);
-        let (effects, _) = update(
+        let (effects, dirty) = update(
             &mut model,
             Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("hi".to_owned()))),
         );
@@ -1734,6 +1795,18 @@ mod tests {
                 real_index: 0,
                 text: "hi".to_owned()
             }]
+        );
+        // Regression test: "loading should start immediately on send".
+        // Without `Dirty::ThreadRow(0)` here, `model.threads[0].state`
+        // flips to `Loading` above, but nothing tells the sidebar's
+        // `thread_model` (which the sidebar spinner and the chat area's
+        // `sending`-derived live-tail pulse both read from) to actually
+        // re-render that row -- it only caught up whenever some
+        // unrelated event later forced a full thread-list rebuild.
+        assert!(
+            dirty.contains(&Dirty::ThreadRow(0)),
+            "sending a message must immediately dirty this thread's row so the loading \
+             spinner/pulse starts right away, got: {dirty:?}"
         );
     }
 
@@ -2223,6 +2296,21 @@ mod tests {
         model.threads[0].transcript_keys = vec!["assistant:old-message".to_owned()];
         model.displayed_thread = Some(0);
         model.selected_thread = 1;
+        // The bug this test is actually about lives in the *shared*,
+        // UI-facing `messages_model`/`message_model_keys` -- not in
+        // per-thread state (`model.threads[0].transcript` above is real,
+        // but asserting only against the returned `Dirty` marker (as this
+        // test originally did) proves the reducer *decided* to resync,
+        // not that the shared model actually ends up empty. Seed it with
+        // thread-0's stale row directly, matching what would genuinely be
+        // on screen while thread 0 was displayed, so the assertions below
+        // can catch it surviving the switch.
+        model.messages_model.push(crate::MessageItem {
+            text: "leftover from the previous thread".into(),
+            kind: "agent".into(),
+            ..crate::MessageItem::default()
+        });
+        *model.message_model_keys.borrow_mut() = vec!["assistant:old-message".to_owned()];
 
         // Thread 1 is brand new: its own cached transcript is empty both
         // before and after this snapshot -- the exact "coincidentally
@@ -2248,14 +2336,34 @@ mod tests {
         );
 
         assert_eq!(model.displayed_thread, Some(1));
+        let ops = dirty
+            .iter()
+            .find_map(|item| match item {
+                Dirty::MessagesDiff { thread_id, ops } if thread_id == "thread-1" => {
+                    Some(ops.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "switching to the new thread must resync the shared messages model even \
+                     though thread-1's own transcript diff is a no-op -- otherwise thread-0's \
+                     messages stay on screen as bogus 'prefill' data: {dirty:?}"
+                )
+            });
+
+        // The marker alone doesn't prove anything ends up on screen --
+        // actually apply it, the same way sync() would, and check the
+        // *shared* model, not per-thread state.
+        crate::sync::apply_message_ops(&model, "thread-1", &ops);
+        assert_eq!(
+            model.messages_model.row_count(),
+            0,
+            "thread-0's stale message must not survive switching to the new, empty thread-1"
+        );
         assert!(
-            dirty.iter().any(|item| matches!(
-                item,
-                Dirty::MessagesDiff { thread_id, .. } if thread_id == "thread-1"
-            )),
-            "switching to the new thread must resync the shared messages model even though \
-             thread-1's own transcript diff is a no-op -- otherwise thread-0's messages stay \
-             on screen as bogus 'prefill' data: {dirty:?}"
+            model.message_model_keys.borrow().is_empty(),
+            "the shared message key cache must also clear, not just the visible row count"
         );
     }
 

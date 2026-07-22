@@ -940,24 +940,57 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
 /// from `client.subscribe()` (HTTP degraded mode -- no live push channel
 /// at all) makes this a no-op, matching every other live-only code path
 /// in this crate.
-fn spawn_out_of_band_notification_forwarder(
-    client: &Gateway,
-    event_tx: mpsc::UnboundedSender<AgentEvent>,
-) {
-    let Some(mut notifications) = client.subscribe() else {
+fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc::UnboundedSender<AgentEvent>) {
+    if client.subscribe().is_none() {
+        // HTTP-degraded mode with no live push channel at all -- matches
+        // every other live-only code path in this crate; there is no
+        // connection to reconnect either, so this stays a no-op rather
+        // than looping on a `reconnect()` that has nothing to recover.
         return;
-    };
+    }
     tokio::spawn(async move {
-        while let Ok(update) = notifications.recv().await {
-            if let Some(request) = AgentRequest::from_notification(&update) {
-                let method = request.method().unwrap_or_default().to_string();
-                let _ = event_tx.send(AgentEvent::PermissionRequest(AgentRequestEvent {
-                    relay_id: request.relay_id,
-                    method,
-                    raw_request: request.request,
-                }));
-            } else if let Some(term_ev) = parse_terminal_output(&update) {
-                let _ = event_tx.send(AgentEvent::TerminalOutput(term_ev));
+        // Outer loop: (re-)subscribe against whatever `Gateway` connection
+        // is currently live, forward from it until it dies, then attempt
+        // to reconnect (Gateway::reconnect's own bounded retries/timeouts)
+        // and resubscribe -- rather than the task silently ending forever
+        // the first time the connection drops (this exact gap is why a
+        // killed/restarted gateway process used to permanently strand a
+        // live thread with no recovery short of restarting the whole app).
+        loop {
+            let Some(mut notifications) = client.subscribe() else {
+                if !client.reconnect().await {
+                    return;
+                }
+                continue;
+            };
+            loop {
+                tokio::select! {
+                    update = notifications.recv() => {
+                        match update {
+                            Ok(update) => {
+                                if let Some(request) = AgentRequest::from_notification(&update) {
+                                    let method = request.method().unwrap_or_default().to_string();
+                                    let _ = event_tx.send(AgentEvent::PermissionRequest(AgentRequestEvent {
+                                        relay_id: request.relay_id,
+                                        method,
+                                        raw_request: request.request,
+                                    }));
+                                } else if let Some(term_ev) = parse_terminal_output(&update) {
+                                    let _ = event_tx.send(AgentEvent::TerminalOutput(term_ev));
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    // Notices the connection dying even during a quiet
+                    // period with no notifications in flight to
+                    // otherwise trigger this via `recv()`'s own Closed.
+                    _ = client.wait_for_disconnect() => break,
+                }
+            }
+            if !client.reconnect().await {
+                return;
             }
         }
     });
@@ -1011,12 +1044,37 @@ async fn run_thread_actor(
     session_tx: watch::Sender<Option<String>>,
 ) {
     let client = await_gateway(&mut gateway_rx).await;
-    spawn_out_of_band_notification_forwarder(&client, event_tx.clone());
+    spawn_out_of_band_notification_forwarder(Arc::clone(&client), event_tx.clone());
     let (live_tx, mut live_rx) = mpsc::unbounded_channel();
-    if let Some(mut live_notifications) = client.subscribe() {
+    if client.subscribe().is_some() {
+        // See spawn_out_of_band_notification_forwarder's doc comment --
+        // same "reconnect and resubscribe rather than die forever on the
+        // first disconnect" shape, for this actor's own live_rx feed
+        // (session/update frames `forward_updates` below drains).
+        let live_client = Arc::clone(&client);
         tokio::spawn(async move {
-            while let Ok(update) = live_notifications.recv().await {
-                let _ = live_tx.send(update);
+            loop {
+                let Some(mut live_notifications) = live_client.subscribe() else {
+                    if !live_client.reconnect().await {
+                        return;
+                    }
+                    continue;
+                };
+                loop {
+                    tokio::select! {
+                        update = live_notifications.recv() => {
+                            match update {
+                                Ok(update) => { let _ = live_tx.send(update); }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                        _ = live_client.wait_for_disconnect() => break,
+                    }
+                }
+                if !live_client.reconnect().await {
+                    return;
+                }
             }
         });
     }
