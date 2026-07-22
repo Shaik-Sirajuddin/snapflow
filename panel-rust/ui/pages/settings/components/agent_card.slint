@@ -42,6 +42,13 @@ export component AgentCard inherits Rectangle {
     // status->presentation mapping in one place.
     in property <string> status: "";
     in property <bool> is-default: false;
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: the real "install > enable" second step -- distinct from
+    // is-present/is-connected (registry detection), this is the admin-
+    // plane's own durable per-agent gate on session/new. Defaults true
+    // (see AgentCatalogEntry's own doc comment) so a card never looks
+    // disabled before the admin plane's real state has loaded.
+    in property <bool> enabled: true;
     // Set by AgentsView so narrow settings panes can use a full-width
     // single-column card instead of overflowing the two-column grid.
     in property <length> card-width: 260px;
@@ -49,6 +56,7 @@ export component AgentCard inherits Rectangle {
     callback install-requested();
     callback connect-requested();
     callback disconnect-requested();
+    callback set-enabled(bool);
 
     // "installed" is the registry's "present with a live session" state --
     // treat as connected. "installed_no_session" is present-but-not-running.
@@ -58,7 +66,10 @@ export component AgentCard inherits Rectangle {
     property <bool> is-present: root.status == "installed" || root.status == "installed_no_session";
 
     width: card-width;
-    height: 136px;
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: +16px over the original 136px for the new Enabled toggle
+    // row (only present once installed).
+    height: 152px;
     // Same tertiary tone the search box uses so cards read as one
     // consistent surface with the rest of this page's chrome; the default
     // card gets the primary-container tint to stand out. No hover tint on
@@ -66,6 +77,16 @@ export component AgentCard inherits Rectangle {
     // feedback.
     background: is-default ? Theme.bg-primary-container : Theme.bg-tertiary;
     animate background { duration: 100ms; }
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: not-installed/runtime-missing agents previously looked
+    // identical to installed ones (background only ever varied by
+    // is-default) -- dim the whole card for a subtle disabled-looking
+    // affordance instead. Same 0.7 opacity chat_input_layout.slint's
+    // send button already uses for its own disabled state, keeping this
+    // consistent with the app's established "no status-color language"
+    // convention (dimming, not a new color).
+    opacity: is-present ? 1.0 : 0.7;
+    animate opacity { duration: 100ms; }
     border-radius: Theme.radius-md;
     // Defensive: contain any future internal overflow at this card's own
     // boundary instead of letting it bleed into the neighboring grid
@@ -158,6 +179,29 @@ export component AgentCard inherits Rectangle {
                 checked: false;
                 toggle-accessible-label: "Set " + root.agent-name + " as default agent";
                 toggled(new-checked) => { root.set-default(new-checked); }
+            }
+        }
+
+        // Row 2b: install > enable. Only meaningful once installed --
+        // an agent that isn't present yet has nothing to enable/disable.
+        if root.is-present : HorizontalLayout {
+            spacing: Metrics.space-2;
+            Text {
+                text: "Enabled";
+                color: Theme.text-secondary;
+                font-size: 10px * Theme.font-scale;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            if root.enabled : Toggle {
+                checked: true;
+                toggle-accessible-label: "Disable " + root.agent-name;
+                toggled(new-checked) => { root.set-enabled(new-checked); }
+            }
+            if !root.enabled : Toggle {
+                checked: false;
+                toggle-accessible-label: "Enable " + root.agent-name;
+                toggled(new-checked) => { root.set-enabled(new-checked); }
             }
         }
 

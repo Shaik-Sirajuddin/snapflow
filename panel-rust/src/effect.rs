@@ -55,6 +55,9 @@ pub enum Effect {
     DeleteThread {
         real_index: usize,
     },
+    ArchiveThread {
+        real_index: usize,
+    },
     RenameThread {
         real_index: usize,
         name: String,
@@ -139,6 +142,11 @@ pub enum Effect {
     AgentInstallRequested {
         real_index: usize,
         agent_id: String,
+    },
+    AgentSetEnabled {
+        real_index: usize,
+        agent_id: String,
+        enabled: bool,
     },
     SkillWrite {
         path: std::path::PathBuf,

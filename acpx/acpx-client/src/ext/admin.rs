@@ -43,6 +43,27 @@ impl AdminClient {
         }
     }
 
+    /// setup-followups plan, agent_settings_ordering_and_install_enable_
+    /// flow: the read side of enable/disable -- every registry + custom
+    /// agent with its current `enabled` flag (and status/source), so a
+    /// client can render an accurate toggle instead of a blind one.
+    pub async fn list_agents(
+        &self,
+    ) -> Result<Vec<acpx_proto::agent::AgentListEntry>, AdminClientError> {
+        #[derive(serde::Deserialize)]
+        struct ListAgentsResponse {
+            agents: Vec<acpx_proto::agent::AgentListEntry>,
+        }
+        let response = self
+            .http
+            .get(self.endpoint("admin/agents"))
+            .bearer_auth(&self.admin_token)
+            .send()
+            .await?;
+        let parsed: ListAgentsResponse = self.json(response).await?;
+        Ok(parsed.agents)
+    }
+
     /// Enable one registry or custom agent.
     pub async fn enable_agent(&self, agent_id: &str) -> Result<AgentEnablement, AdminClientError> {
         self.set_enabled(agent_id, true).await

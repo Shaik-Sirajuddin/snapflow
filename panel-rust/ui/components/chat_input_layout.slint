@@ -374,7 +374,13 @@ export component ChatInputLayout inherits Rectangle {
                 background: Theme.bg-tertiary;
                 border-radius: Theme.radius-md;
                 Text {
-                    text: root.sending ? "Agent is working..." : "Ask the agent…  / skills  @ mcp  # files";
+                    // setup-followups plan, chat_input_placeholder_copy:
+                    // keep a single placeholder regardless of `sending`
+                    // state -- the composer's own spinning-ring/stop-icon
+                    // (see in_flight_turn_loading_indicator) is already
+                    // the in-progress signal; the placeholder itself
+                    // doesn't need a second one.
+                    text: "Ask the agent…  / skills  @ mcp  # files";
                     color: Theme.text-muted;
                     font-size: 11px * Theme.font-scale;
                     font-family: Theme.font-sans;
@@ -468,6 +474,30 @@ export component ChatInputLayout inherits Rectangle {
                     animate background { duration: 100ms; }
                     border-radius: Theme.radius-md;
                     opacity: (root.sending || compose.text != "") ? 1.0 : 0.7;
+                    // setup-followups plan, in_flight_turn_loading_indicator:
+                    // the composer previously gave zero animated feedback
+                    // during an in-flight turn -- the button just went
+                    // static-stop-icon and sat there. Same spinning-ring
+                    // motif + Timer pattern as sidebar.slint's own
+                    // load-spin-timer (thread.status == "loading"), so a
+                    // user watching only the composer (not the sidebar) can
+                    // still see the turn is actively in progress.
+                    property <angle> load-spin: 0deg;
+                    load-spin-timer := Timer {
+                        interval: 80ms;
+                        running: root.sending;
+                        triggered => { load-spin += 30deg; }
+                    }
+                    if root.sending : Icon {
+                        // Larger than the stop icon (icon-sm, 12px) so it
+                        // reads as a ring around it, not an overlapping
+                        // duplicate at the same size.
+                        source: @image-url("../assets/icons/loader-circle.svg");
+                        size: 26px;
+                        color: Theme.text-secondary.with-alpha(0.55);
+                        transform-rotation: load-spin;
+                        transform-origin: { x: self.width / 2, y: self.height / 2 };
+                    }
                     send-stop-button := TouchArea {
                         mouse-cursor: pointer;
                         accessible-role: button;
@@ -487,6 +517,9 @@ export component ChatInputLayout inherits Rectangle {
                         alignment: center;
                         HorizontalLayout {
                             alignment: center;
+                            // Stop icon still renders on top so click-to-
+                            // stop stays visually obvious; the spinning
+                            // ring behind it is the new in-progress signal.
                             Icon {
                                 source: root.sending
                                     ? @image-url("../assets/icons/square.svg")

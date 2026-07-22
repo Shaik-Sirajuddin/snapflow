@@ -215,6 +215,13 @@ struct ThreadSlot {
     /// of every thread until a caller explicitly closes it (never set
     /// implicitly by window/process teardown).
     closed: Mutex<bool>,
+    /// setup-followups plan, archive_thread_backend_verify: set once
+    /// [`AgentBridge::archive_thread`] has been called for this thread.
+    /// Purely local -- no ACP request is involved -- but unlike `closed`
+    /// this one IS persisted (see [`persist_runtime_snapshot`] and
+    /// [`ThreadRuntimeSnapshot::archived`]), since the whole point of an
+    /// archive action is that it survives a restart.
+    archived: Mutex<bool>,
     /// `thread_item_project_context` phase: the project directory this
     /// thread's session was actually opened/resumed/reattached against
     /// (the `cwd` passed to ACP at creation time -- see `cwd_for_session`),
@@ -435,6 +442,7 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
             .lock()
             .expect("config_options mutex poisoned")
             .clone(),
+        archived: *slot.archived.lock().expect("archived mutex poisoned"),
     };
     if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
         eprintln!(
@@ -617,11 +625,11 @@ fn resolve_acpx_server_bin() -> PathBuf {
     )
 }
 
-/// Resolves the `skills-mcp-server` binary path (`skill_injection_
-/// verification` phase): `RUI_SKILLS_MCP_SERVER_BIN` env override, else a
+/// Resolves the `snapflowd-mcp` binary path (`skill_injection_
+/// verification` phase): `RUI_SNAPFLOWD_MCP_BIN` env override, else a
 /// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
 /// convention as [`resolve_acpx_server_bin`].
-fn resolve_skills_mcp_server_bin_from(
+fn resolve_snapflowd_mcp_bin_from(
     override_bin: Option<&str>,
     current_exe: Option<&Path>,
     manifest_dir: &Path,
@@ -630,17 +638,17 @@ fn resolve_skills_mcp_server_bin_from(
         return PathBuf::from(bin);
     }
     if let Some(parent) = current_exe.and_then(Path::parent) {
-        let candidate = parent.join("skills-mcp-server");
+        let candidate = parent.join("snapflowd-mcp");
         if candidate.is_file() {
             return candidate;
         }
     }
-    manifest_dir.join("target/debug/skills-mcp-server")
+    manifest_dir.join("target/debug/snapflowd-mcp")
 }
 
-fn resolve_skills_mcp_server_bin() -> PathBuf {
-    resolve_skills_mcp_server_bin_from(
-        std::env::var("RUI_SKILLS_MCP_SERVER_BIN").ok().as_deref(),
+fn resolve_snapflowd_mcp_bin() -> PathBuf {
+    resolve_snapflowd_mcp_bin_from(
+        std::env::var("RUI_SNAPFLOWD_MCP_BIN").ok().as_deref(),
         std::env::current_exe().ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
@@ -649,15 +657,15 @@ fn resolve_skills_mcp_server_bin() -> PathBuf {
 /// Builds the `mcpServers` array `session/new`/`session/load` now send
 /// (previously always `[]`, see `gateway_actor::thread_actor`'s doc
 /// comments on `Command::OpenSession`/`Command::ResumeSession`) -- one
-/// entry pointing at `skills-mcp-server`, always present regardless of
+/// entry pointing at `snapflowd-mcp`, always present regardless of
 /// which ACPX profile (if any) the session uses. `project_path` is the
 /// active MLT project's *file* path (`PanelSingleton::active_project_path`
 /// as threaded through `AgentBridge::session_cwd_override`) -- passed
-/// through as-is; `skills-mcp-server` itself derives the project's
+/// through as-is; `snapflowd-mcp` itself derives the project's
 /// `.skills/` directory from its parent, same as
 /// `PanelSingleton::collect_skills_snapshot`
 /// (lib.rs) already does.
-fn skills_mcp_servers_entry(
+fn snapflowd_mcp_servers_entry(
     project_path: Option<&std::path::Path>,
     provider: &str,
 ) -> Vec<serde_json::Value> {
@@ -672,7 +680,7 @@ fn skills_mcp_servers_entry(
     }
     let mut entries = vec![serde_json::json!({
         "name": "skills",
-        "command": resolve_skills_mcp_server_bin().to_string_lossy(),
+        "command": resolve_snapflowd_mcp_bin().to_string_lossy(),
         "args": args,
     })];
     entries.extend(snapshotd_mcp_server_entry(provider));
@@ -1365,6 +1373,31 @@ fn spawn_gateway_process(
         )),
     };
     cmd.env("ACPX_DB_PATH", &db_path);
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: give every acpx-server this process spawns its own admin
+    // plane too (a fresh ephemeral admin port per instance, unlike the
+    // daemon's single fixed one -- this path can spawn several gateways
+    // in the same process), so `resolve_admin_creds` can find it via the
+    // in-memory registry below without needing the shared token file at
+    // all for a self-spawned instance.
+    if let (Some((admin_port, _admin_lock)), Some(token)) =
+        (reserve_ephemeral_port(), random_hex_token(32))
+    {
+        cmd.env("ACPX_ADMIN_TOKEN", &token)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"));
+        self_spawned_admin_creds()
+            .lock()
+            .expect("admin creds mutex poisoned")
+            .insert(
+                format!("http://127.0.0.1:{port}"),
+                (format!("http://127.0.0.1:{admin_port}"), token),
+            );
+        // _admin_lock is dropped here (its only job was reserving the
+        // port up to this point) -- acpx-server binds it next, same
+        // "reserve via a real listener, then hand the port to the child"
+        // TOCTOU-safe convention `reserve_ephemeral_port`'s own caller
+        // (the main HTTP port, `lock` above) already uses.
+    }
     let mut child = cmd.spawn().map_err(|e| {
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")));
@@ -1440,6 +1473,100 @@ pub fn resolve_cache_dir() -> PathBuf {
         std::env::var("HOME").ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     )
+}
+
+/// setup-followups plan, agent_settings_ordering_and_install_enable_flow:
+/// admin-plane bearer token + admin listener URL for whichever acpx-server
+/// this panel is talking to, so `AgentBridge::set_agent_enabled` can build
+/// a real `acpx_client::ext::admin::AdminClient`. There is no existing
+/// channel for two independent processes (snapshotd, panel-rust) to share
+/// a secret, so this establishes one: a token file written by whichever
+/// side actually spawned the gateway (`acpxmgr.ensureAdminToken` on the
+/// Go side, `spawn_gateway_process`'s own admin-token generation on this
+/// side), at the same path both sides derive independently from
+/// `SNAPSHOTD_HOME`/`HOME`
+/// (0600, since it grants gateway-wide agent enable/disable control).
+///
+/// Resolution order per call:
+/// 1. `RUI_ACPX_ADMIN_URL`/`RUI_ACPX_ADMIN_TOKEN` env override (tests, or
+///    an operator running acpx-server directly with a hand-picked token).
+/// 2. This process's own in-memory registry of admin creds for gateways
+///    *this* `spawn_gateway_process` call itself spawned (the per-provider
+///    dev-fallback path, which reserves a fresh ephemeral admin port per
+///    instance rather than the daemon's fixed one).
+/// 3. The shared token file, assuming the daemon's fixed admin bind
+///    (`acpxmgr.AdminBind` on the Go side) -- the real production path,
+///    where snapshotd (not this process) spawned the one shared gateway.
+fn admin_token_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SNAPSHOTD_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".snapshotd"))
+        .unwrap_or_else(|_| PathBuf::from(".snapshotd"))
+}
+
+fn read_shared_admin_token() -> Option<String> {
+    let raw = std::fs::read_to_string(admin_token_dir().join("admin-token")).ok()?;
+    let token = raw.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+/// Same fixed bind acpxmgr.go's `AdminBind` constant uses -- see that
+/// constant's own doc comment for why a fixed (not per-run-reserved) port
+/// is correct there (exactly one daemon-managed instance ever exists).
+const DAEMON_ADMIN_URL: &str = "http://127.0.0.1:8791";
+
+static SELF_SPAWNED_ADMIN_CREDS: std::sync::OnceLock<Mutex<HashMap<String, (String, String)>>> =
+    std::sync::OnceLock::new();
+
+fn self_spawned_admin_creds() -> &'static Mutex<HashMap<String, (String, String)>> {
+    SELF_SPAWNED_ADMIN_CREDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A random hex token from `/dev/urandom`, with no new crate dependency
+/// for what's otherwise a one-off local-loopback dev-fallback credential
+/// (the real production path's token comes from `acpxmgr.go`'s own
+/// `crypto/rand`-backed generator instead, via the shared file).
+fn random_hex_token(bytes: usize) -> Option<String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut buf)
+        .ok()?;
+    Some(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// `AcpxThreadHandle` has no getter for the base_url it was created
+/// against (it's an opaque actor-command channel), so this can't key an
+/// exact per-gateway lookup the way `self_spawned_admin_creds` is keyed.
+/// In practice that's fine: production always has exactly one daemon-
+/// managed gateway (tier 3 below, base_url-independent by construction),
+/// and the self-spawn dev-fallback path realistically spawns one gateway
+/// per running panel-rust instance too -- so "the one self-spawned entry,
+/// if there's exactly one" is a correct, simple stand-in for a real
+/// per-base_url match.
+fn resolve_admin_creds() -> Option<(String, String)> {
+    if let (Ok(url), Ok(token)) = (
+        std::env::var("RUI_ACPX_ADMIN_URL"),
+        std::env::var("RUI_ACPX_ADMIN_TOKEN"),
+    ) {
+        if !url.is_empty() && !token.is_empty() {
+            return Some((url, token));
+        }
+    }
+    {
+        let creds = self_spawned_admin_creds()
+            .lock()
+            .expect("admin creds mutex poisoned");
+        if creds.len() == 1 {
+            return creds.values().next().cloned();
+        }
+    }
+    read_shared_admin_token().map(|token| (DAEMON_ADMIN_URL.to_owned(), token))
 }
 
 /// Opaque staleness token -- not a real RFC3339 timestamp (no chrono
@@ -1602,7 +1729,7 @@ fn spawn_background_attachment(
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
 ) {
     // Resolved synchronously, before the async task below, not inside it:
-    // skills_mcp_servers_entry now transitively probes snapshotd's MCP
+    // snapflowd_mcp_servers_entry now transitively probes snapshotd's MCP
     // liveness over a real (blocking std::net::TcpStream) connection --
     // rust-audit's "blocking calls inside async fn" anti-pattern would
     // otherwise apply here, tying up a tokio worker thread (and holding
@@ -1610,7 +1737,7 @@ fn spawn_background_attachment(
     // timeouts. This function itself is a plain sync fn, so the blocking
     // call here is no different from provision_gateway's own pre-existing
     // synchronous network probes at construction time.
-    let mcp_servers = skills_mcp_servers_entry(
+    let mcp_servers = snapflowd_mcp_servers_entry(
         session_cwd_override
             .lock()
             .expect("session cwd override mutex poisoned")
@@ -1960,6 +2087,7 @@ impl AgentBridge {
                 attachment: Mutex::new(AttachmentState::default()),
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
+                archived: Mutex::new(runtime_snapshot.archived),
                 // No project can be active yet at construction time --
                 // `session_cwd_override` was just created above, unset.
                 project_path: None,
@@ -2178,6 +2306,7 @@ impl AgentBridge {
             attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            archived: Mutex::new(runtime_snapshot.archived),
             project_path: project_path_for_slot,
         });
         self.slots.push(slot.clone());
@@ -2341,11 +2470,12 @@ impl AgentBridge {
             }),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
+            archived: Mutex::new(false),
             project_path: project_path_for_slot,
         });
 
         let cwd = cwd_for_session(&self.session_cwd_override);
-        let mcp_servers = skills_mcp_servers_entry(
+        let mcp_servers = snapflowd_mcp_servers_entry(
             self.session_cwd_override
                 .lock()
                 .expect("session cwd override mutex poisoned")
@@ -2642,6 +2772,33 @@ impl AgentBridge {
             .unwrap_or(false)
     }
 
+    /// setup-followups plan, archive_thread_backend_verify: the sidebar's
+    /// Archive control. Unlike [`Self::close_thread`]/[`Self::delete_
+    /// thread`], this sends no ACP request at all -- archiving is a
+    /// purely local/organizational flag, not a session lifecycle
+    /// operation, so it never touches the backend session. It IS
+    /// persisted (via [`persist_runtime_snapshot`]) so it survives a
+    /// restart. Returns `false` for an out-of-range `idx` (nothing to
+    /// archive); otherwise always succeeds and is idempotent.
+    pub fn archive_thread(&self, idx: usize) -> bool {
+        let Some(slot) = self.slots.get(idx) else {
+            return false;
+        };
+        *slot.archived.lock().expect("archived mutex poisoned") = true;
+        persist_runtime_snapshot(self.store.as_ref(), slot);
+        true
+    }
+
+    /// Whether thread `idx` has been archived via [`Self::archive_
+    /// thread`]. `false` for any out-of-range index or a thread that has
+    /// never been archived.
+    pub fn thread_archived(&self, idx: usize) -> bool {
+        self.slots
+            .get(idx)
+            .map(|slot| *slot.archived.lock().expect("archived mutex poisoned"))
+            .unwrap_or(false)
+    }
+
     /// `mcp_servers/list` against thread `idx`'s bound gateway -- what
     /// the settings sheet's MCP-server list populates from. Same
     /// blocking/degrade-gracefully-on-error convention as
@@ -2704,9 +2861,44 @@ impl AgentBridge {
             return Vec::new();
         };
         let handle = slot.handle.clone();
-        self.runtime
+        let mut agents = self
+            .runtime
             .block_on(handle.list_agents())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: `agents/list` (the plain ACP-adjacent RPC above)
+        // carries no enablement concept at all -- that only exists on
+        // the admin plane. Merge it in here, once, so every caller of
+        // list_agents (settings view, tests) sees accurate enabled
+        // state without needing to know the admin plane exists. A
+        // completely absent admin plane (no token discoverable) leaves
+        // every entry at its `AgentCatalogEntry::from_json` default of
+        // `enabled: true` -- not a regression for the common case where
+        // this feature isn't configured at all.
+        if let Some(enablement) = self.agent_enablement_map() {
+            for agent in &mut agents {
+                if let Some(enabled) = enablement.get(&agent.id) {
+                    agent.enabled = *enabled;
+                }
+            }
+        }
+        agents
+    }
+
+    /// The admin plane's own view of every agent's `enabled` flag,
+    /// keyed by agent id. `None` if no admin plane is reachable at all
+    /// (see [`resolve_admin_creds`]) -- distinct from `Some(empty map)`,
+    /// which would incorrectly read as "every agent is unlisted".
+    fn agent_enablement_map(&self) -> Option<std::collections::HashMap<String, bool>> {
+        let (admin_url, admin_token) = resolve_admin_creds()?;
+        let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
+        let entries = self.runtime.block_on(client.list_agents()).ok()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|entry| (entry.id, entry.enabled))
+                .collect(),
+        )
     }
 
     /// `agents/install` -- client-initiated installer trigger. Returns
@@ -2722,6 +2914,32 @@ impl AgentBridge {
         self.runtime
             .block_on(handle.install_agent(agent_id.to_string()))
             .is_ok()
+    }
+
+    /// setup-followups plan, agent_settings_ordering_and_install_enable_
+    /// flow: the real "install > enable" second step -- distinct from
+    /// `install_agent` (which only ever registers/fetches the binary).
+    /// Uses the admin plane (`acpx_client::ext::admin::AdminClient`),
+    /// not a JSON-RPC method against `idx`'s thread gateway, since
+    /// enable/disable is gateway-wide administration, not a per-session
+    /// action -- see `resolve_admin_creds`'s own doc comment for how
+    /// panel-rust discovers admin credentials for whichever acpx-server
+    /// it's actually talking to. Returns `false` (not an error type) if
+    /// no admin plane is reachable at all -- a legitimate, expected state
+    /// when nothing generated a token yet -- exactly like every other
+    /// degrade-gracefully bridge call in this file.
+    pub fn set_agent_enabled(&self, agent_id: &str, enabled: bool) -> bool {
+        let Some((admin_url, admin_token)) = resolve_admin_creds() else {
+            return false;
+        };
+        let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
+        if enabled {
+            self.runtime.block_on(client.enable_agent(agent_id)).is_ok()
+        } else {
+            self.runtime
+                .block_on(client.disable_agent(agent_id))
+                .is_ok()
+        }
     }
 
     /// Opens (or returns the already-open) client-local PTY terminal
@@ -4114,6 +4332,262 @@ mod tests {
     }
 
     #[test]
+    fn archived_thread_survives_bridge_restart_via_jsonl_cache() {
+        // setup-followups plan, archive_thread_backend_verify: proves
+        // archive_thread's flag is real durable state (not just an
+        // in-memory Mutex that a restart would silently drop), same
+        // "restart the whole bridge, load from the same cache dir"
+        // convention as history_persists_across_bridge_restarts above.
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let gateway = TestGateway::spawn();
+        let names = ["Thread One", "Thread Two"];
+
+        {
+            let bridge =
+                bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                    .expect("first bridge");
+            assert!(!bridge.thread_archived(0));
+            assert!(bridge.archive_thread(0));
+            assert!(bridge.thread_archived(0));
+            // Only thread 0 was archived -- thread 1 must be unaffected,
+            // both now and after the restart below.
+            assert!(!bridge.thread_archived(1));
+        }
+
+        let bridge2 =
+            bridge_with_single_gateway(&names, &gateway, Some(cache_dir.path().to_path_buf()))
+                .expect("second bridge");
+        assert!(bridge2.thread_archived(0));
+        assert!(!bridge2.thread_archived(1));
+    }
+
+    /// setup-followups plan, archive_thread_backend_verify: real-backend
+    /// counterpart to `archived_thread_survives_bridge_restart_via_jsonl_
+    /// cache` above, following the exact real/opt-in/free-model
+    /// convention `add_thread_after_empty_cold_start_reaches_a_real_
+    /// codex_backend` established (this machine's real, already-
+    /// logged-in Codex CLI session via `ACPX_NATIVE_AUTH_METHOD_ID=
+    /// api-key` + `CODEX_API_KEY` from the auth file; `session/new` +
+    /// `session/prompt` are real ACP round trips through the genuine
+    /// codex-acp adapter, but the actual model call is forced to
+    /// `ollama/qwen2.5:0.5b` via the real `session/set_config_option`
+    /// extension -- free and local, not a billed API call).
+    ///
+    /// Where the unit test above only proves `archive_thread`'s flag
+    /// itself survives a bridge restart, this proves the *full* pipeline
+    /// a user actually exercises: create a thread against a real
+    /// backend, get a real reply, archive it, and drive that archived
+    /// state through the exact same `update()`/`sync::apply_thread_row`
+    /// reducer path `dispatch_frame_poll` uses in the live app -- the
+    /// layer `archived_thread_survives_bridge_restart_via_jsonl_cache`
+    /// cannot reach, since it only calls `AgentBridge` methods directly.
+    ///
+    /// `#[ignore]`d and gated on `ACPX_LIVE_TEST_AMBIENT=1` -- still
+    /// needs a real codex-acp ACP handshake (this machine's real Codex
+    /// CLI login), so not safe to run unconditionally in CI.
+    ///
+    /// Run with:
+    /// ```text
+    /// ACPX_LIVE_TEST_AMBIENT=1 cargo test --lib \
+    ///   agent_bridge::tests::archiving_a_real_backend_thread_renders_through_the_full_reducer \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn archiving_a_real_backend_thread_renders_through_the_full_reducer() {
+        use slint::Model as _;
+        if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
+                 machine's real, already-logged-in codex CLI session (free/local via Ollama, \
+                 but still needs a real codex-acp ACP handshake)"
+            );
+            return;
+        }
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_DEFAULT_AGENT_ID", "codex")
+                .env("RUST_LOG", "error")
+                .env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+            if std::env::var_os("CODEX_API_KEY").is_none() {
+                if let Some(key) = read_codex_api_key_from_auth_file() {
+                    command.env("CODEX_API_KEY", key);
+                }
+            }
+        });
+        let _gateway_guard = TestGateway {
+            child,
+            base_url: base_url.clone(),
+        };
+
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[],
+            move |_provider| Ok(base_url.clone()),
+            Some(cache_dir.path().to_path_buf()),
+        )
+        .expect("bridge with zero initial threads");
+
+        let index = bridge
+            .add_thread_with_profile_and_provider("Real archive smoke test", None, Some("codex"))
+            .unwrap_or_else(|error| {
+                panic!("add_thread_with_profile_and_provider must succeed against a real, correctly-configured codex gateway: {error}")
+            });
+
+        // Force the free/local model before prompting, same as
+        // add_thread_after_empty_cold_start_reaches_a_real_codex_backend.
+        bridge.set_config_option(index, "model".to_owned(), serde_json::json!("ollama/qwen2.5:0.5b"));
+        let config_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < config_deadline
+            && !bridge
+                .config_options(index)
+                .iter()
+                .any(|opt| opt.current_value.as_deref() == Some("ollama/qwen2.5:0.5b"))
+        {
+            bridge.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let prompt = "Reply with exactly the single word PANG and nothing else.";
+        bridge.push_local(
+            index,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: prompt.to_owned(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+        bridge.send_prompt(index, prompt.to_owned());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline && !ended {
+            ended = bridge
+                .poll()
+                .into_iter()
+                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        assert!(ended, "real codex-acp turn did not finish within 60s");
+        assert!(
+            !bridge.thread_archived(index),
+            "thread must not be archived yet"
+        );
+
+        // The actual feature under test: archive the real, now-populated
+        // thread, then render it through the exact same reducer path
+        // dispatch_frame_poll uses live.
+        assert!(bridge.archive_thread(index), "archive_thread must succeed");
+        assert!(bridge.thread_archived(index));
+
+        let thread_id = bridge
+            .thread_binding(index)
+            .map(|binding| binding.thread_id)
+            .unwrap_or_else(|| format!("thread:{index}"));
+        let mut model = crate::model::Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: thread_id.clone(),
+            display_name: "Real archive smoke test".to_owned(),
+            provider: "codex".to_owned(),
+            archived: bridge.thread_archived(index),
+            ..crate::model::ThreadModel::default()
+        });
+        model.visible_indices = vec![0];
+        // Build model.thread_rows via the exact same private row-builder
+        // production's thread_list_dirty_with_keys calls, rather than
+        // hand-crafting a fixture that risks silently drifting from what
+        // that function really outputs.
+        model.thread_rows = vec![crate::update::visible_thread_row(&model, 0)
+            .expect("visible_thread_row for a real, archived thread")];
+
+        // apply_thread_row only ever *updates* an existing thread_model
+        // row (set_row_data by key lookup) -- it doesn't insert one, same
+        // as the real live app: this row already exists (pushed when the
+        // thread was first created), and the archive click is an
+        // in-place Dirty::ThreadRow update to that same row. Seed the
+        // pre-archive state exactly like a real cold render would.
+        model.thread_model.push(crate::ThreadItem {
+            name: "Real archive smoke test".into(),
+            archived: false,
+            ..crate::ThreadItem::default()
+        });
+        model.thread_model_keys.borrow_mut().push(thread_id.clone());
+
+        // Same Dirty::ThreadRow -> apply_thread_row path
+        // ThreadMsg::ArchiveRequested's handler in update.rs queues, and
+        // dispatch_thread_archive drives after the real archive_thread
+        // effect completes.
+        crate::sync::apply_thread_row(&model, 0);
+
+        assert_eq!(
+            model.thread_model.row_count(),
+            1,
+            "the archived real thread must render into the shared thread_model"
+        );
+        let row = model.thread_model.row_data(0).expect("archived row");
+        assert!(
+            row.archived,
+            "the real, archived thread's row must render archived: true, got {row:?}"
+        );
+    }
+
+    #[test]
+    fn archive_thread_on_out_of_range_index_returns_false() {
+        let gateway = TestGateway::spawn();
+        let bridge =
+            bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
+        assert!(!bridge.archive_thread(5));
+        assert!(!bridge.thread_archived(5));
+    }
+
+    #[test]
+    fn set_agent_enabled_degrades_gracefully_with_no_admin_plane_reachable() {
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: with no RUI_ACPX_ADMIN_URL/TOKEN override, no
+        // self-spawned admin creds registered, and (in this test's own
+        // isolated env) no shared token file at the derived SNAPSHOTD_HOME,
+        // resolve_admin_creds must return None and set_agent_enabled must
+        // degrade to `false`, never panic.
+        // SAFETY: guarded by restoring prior values unconditionally, same
+        // convention as this file's other env-mutating tests -- serialized
+        // by this crate's own `--test-threads=1` convention.
+        let prior_home = std::env::var("SNAPSHOTD_HOME").ok();
+        let empty_home = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("SNAPSHOTD_HOME", empty_home.path());
+        let prior_url = std::env::var("RUI_ACPX_ADMIN_URL").ok();
+        let prior_token = std::env::var("RUI_ACPX_ADMIN_TOKEN").ok();
+        std::env::remove_var("RUI_ACPX_ADMIN_URL");
+        std::env::remove_var("RUI_ACPX_ADMIN_TOKEN");
+
+        let gateway = TestGateway::spawn();
+        let bridge =
+            bridge_with_single_gateway(&["Only Thread"], &gateway, None).expect("bridge");
+        let result = bridge.set_agent_enabled("codex-acp", false);
+
+        match prior_home {
+            Some(v) => std::env::set_var("SNAPSHOTD_HOME", v),
+            None => std::env::remove_var("SNAPSHOTD_HOME"),
+        }
+        match prior_url {
+            Some(v) => std::env::set_var("RUI_ACPX_ADMIN_URL", v),
+            None => std::env::remove_var("RUI_ACPX_ADMIN_URL"),
+        }
+        match prior_token {
+            Some(v) => std::env::set_var("RUI_ACPX_ADMIN_TOKEN", v),
+            None => std::env::remove_var("RUI_ACPX_ADMIN_TOKEN"),
+        }
+
+        assert!(!result, "expected false (no admin plane reachable), not a panic");
+    }
+
+    #[test]
     fn restored_interaction_snapshot_is_available_before_gateway_events_arrive() {
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let gateway = TestGateway::spawn();
@@ -4154,6 +4628,7 @@ mod tests {
                         current_value: Some("fast".into()),
                         options: vec![],
                     }],
+                    archived: false,
                 },
             )
             .expect("seed interaction snapshot");
@@ -5875,7 +6350,7 @@ done
         assert_eq!(bridge.transcript(0).len(), total_messages);
     }
 
-    /// `skill_injection_verification` phase: `skills_mcp_servers_entry`'s
+    /// `skill_injection_verification` phase: `snapflowd_mcp_servers_entry`'s
     /// output shape -- the actual client-supplied `mcpServers` entry every
     /// `session/new`/`session/load` now sends (see `Command::OpenSession`/
     /// `Command::ResumeSession`'s doc comments), verified directly rather
@@ -5885,20 +6360,20 @@ done
     /// inspecting its own startup log -- making real round-trip tests here
     /// flaky on network latency, unrelated to this logic itself).
     #[test]
-    fn skills_mcp_servers_entry_always_includes_the_skills_server() {
+    fn snapflowd_mcp_servers_entry_always_includes_the_skills_server() {
         // Not asserting entries.len() == 1: a real snapshotd daemon
         // happening to run on the test host makes snapshotd_mcp_server_
         // entry's liveness probe legitimately append a second "snapshotd"
         // entry (see that function's own doc comment) regardless of
         // provider -- this test only cares that "skills" is always
         // present, first, and correctly shaped.
-        let entries = skills_mcp_servers_entry(None, "codex");
+        let entries = snapflowd_mcp_servers_entry(None, "codex");
         assert!(!entries.is_empty());
         assert_eq!(entries[0]["name"], "skills");
         assert!(entries[0]["command"]
             .as_str()
             .unwrap()
-            .contains("skills-mcp-server"));
+            .contains("snapflowd-mcp"));
         let args = entries[0]["args"].as_array().expect("args is an array");
         assert!(args.contains(&serde_json::Value::String("--global-dir".to_string())));
         assert!(
@@ -5908,9 +6383,9 @@ done
     }
 
     #[test]
-    fn skills_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
+    fn snapflowd_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
         let project_file = std::path::Path::new("/tmp/my-project/timeline.mlt");
-        let entries = skills_mcp_servers_entry(Some(project_file), "codex");
+        let entries = snapflowd_mcp_servers_entry(Some(project_file), "codex");
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()

@@ -410,6 +410,28 @@ pub(crate) fn dispatch_thread_close(
     }
 }
 
+/// setup-followups plan, archive_thread_backend_verify: same shape as
+/// `dispatch_thread_close`/`dispatch_thread_delete` above, minus their
+/// message-view resnapshot -- archiving is a pure sidebar-list flag, it
+/// doesn't change what messages are visible for the selected thread.
+pub(crate) fn dispatch_thread_archive(panel: &PanelSingleton, filtered_idx: usize) {
+    let Some(idx) = panel.real_index(filtered_idx) else {
+        return;
+    };
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Thread(ThreadMsg::ArchiveRequested(idx))),
+    );
+    execute_effects(panel, effects);
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        thread_list_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_thread_list_snapshot(),
+        ),
+        ..crate::msg::FrameInput::default()
+    });
+}
+
 pub(crate) fn dispatch_thread_delete(
     panel: &PanelSingleton,
     component: &ChatPanel,
@@ -840,6 +862,19 @@ pub(crate) fn dispatch_agent_install_requested(
         })),
     );
     let _ = component;
+    execute_effects(panel, effects);
+}
+
+/// setup-followups plan, agent_settings_ordering_and_install_enable_
+/// flow: the real "install > enable" second step.
+pub(crate) fn dispatch_agent_set_enabled(panel: &PanelSingleton, agent_id: String, enabled: bool) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::AgentSetEnabled {
+            agent_id,
+            enabled,
+        })),
+    );
     execute_effects(panel, effects);
 }
 

@@ -252,6 +252,20 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .unwrap_or(false)
             })
             .collect();
+        // setup-followups plan, archive_thread_backend_verify: re-homed
+        // here from the pre-TEA `refresh_threads_model` this module
+        // replaced -- see AgentBridge::thread_archived's doc comment.
+        let archived: Vec<bool> = names
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                self.panel
+                    .bridge
+                    .as_ref()
+                    .map(|bridge| bridge.thread_archived(idx))
+                    .unwrap_or(false)
+            })
+            .collect();
         let providers: Vec<String> = names
             .iter()
             .enumerate()
@@ -291,6 +305,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             &descriptions,
             &background_sessions,
             &closed,
+            &archived,
             &query,
         );
         let visible_indices: Vec<usize> = items.iter().map(|item| item.real_index).collect();

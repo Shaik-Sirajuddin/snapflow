@@ -24,8 +24,20 @@
 //!    `acpx-registry` catalogue (fallback-bundled `claude-acp`/
 //!    `codex-acp`/`gemini` entries, each carrying a real
 //!    `acpx-core::detect::detect` status, not a client-side default).
+//! 4. setup-followups plan, e2e_mcp_availability_during_turn: MCP
+//!    availability is not an ACP-level concept -- acpx/panel-rust never
+//!    mediate the MCP subprocess's lifecycle, only forward the
+//!    `mcpServers` config to the backend agent, which spawns and speaks
+//!    to it directly. So the only honest, real (not invented) way to
+//!    prove "available, then flips to unavailable mid-turn" is to spawn
+//!    the exact `snapflowd-mcp` binary `agent_bridge.rs` places in that
+//!    config, drive real MCP JSON-RPC (`initialize`/`tools/list`) over
+//!    its actual stdio, then kill it and prove the same live connection
+//!    now fails -- see
+//!    `snapflowd_mcp_availability_flips_when_the_process_is_killed_mid_turn`.
 
 use panel_rust::gateway_actor::spawn_acpx_thread;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -33,6 +45,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 fn acpx_server_bin() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
+}
+
+fn snapflowd_mcp_bin() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/snapflowd-mcp")
 }
 
 fn free_port() -> u16 {
@@ -375,5 +391,96 @@ async fn profiles_crud_round_trips_through_the_thread_actor() {
     assert!(
         !after_delete.iter().any(|p| p.name == "crud-test-profile"),
         "expected the profile to be gone after delete, got {after_delete:?}"
+    );
+}
+
+/// setup-followups plan, e2e_mcp_availability_during_turn: real proof
+/// that the exact `snapflowd-mcp` binary `agent_bridge.rs` puts in every
+/// session's `mcpServers` array is genuinely available (answers real MCP
+/// JSON-RPC over its real stdio, not a stub), and that killing it mid-
+/// turn is a real, observable transition to unavailable -- not a status
+/// this test invents, since acpx/panel-rust have no mechanism to mediate
+/// or report on the MCP subprocess's lifecycle at all (only the backend
+/// agent spawns and speaks to it, per `mcpServers` config forwarding
+/// already proven by `profile_referencing_a_central_mcp_server_reaches_
+/// the_real_backend_session_new` above). A real backend agent facing
+/// this same failure would see exactly what this test sees: the pipe
+/// goes silent.
+#[test]
+fn snapflowd_mcp_availability_flips_when_the_process_is_killed_mid_turn() {
+    let global_dir = tempfile::tempdir().expect("global dir tempdir");
+    std::fs::create_dir_all(global_dir.path().join("release")).expect("skill dir");
+    std::fs::write(
+        global_dir.path().join("release").join("SKILL.md"),
+        "---\nname: release\ndescription: release process\n---\n",
+    )
+    .expect("write SKILL.md");
+
+    let mut child = Command::new(snapflowd_mcp_bin())
+        .arg("--global-dir")
+        .arg(global_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn real snapflowd-mcp binary for test");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout"));
+
+    let send = |stdin: &mut std::process::ChildStdin, id: i64, method: &str| {
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method})
+        )
+        .and_then(|_| stdin.flush())
+    };
+    let recv = |stdout: &mut BufReader<std::process::ChildStdout>| -> Option<serde_json::Value> {
+        let mut line = String::new();
+        match stdout.read_line(&mut line) {
+            Ok(0) => None, // EOF -- the process is gone, nothing left to read.
+            Ok(_) => serde_json::from_str(line.trim()).ok(),
+            Err(_) => None,
+        }
+    };
+
+    // Available: a real `initialize` round trip against the real binary.
+    send(&mut stdin, 1, "initialize").expect("send initialize");
+    let init_reply = recv(&mut stdout).expect("initialize reply while the process is alive");
+    assert_eq!(
+        init_reply["result"]["serverInfo"]["name"], "snapflowd-mcp",
+        "expected a real initialize response from the real binary, got {init_reply:?}"
+    );
+
+    // Available (functional, not just transport-level): tools/list must
+    // report the real tool surface this binary actually implements.
+    send(&mut stdin, 2, "tools/list").expect("send tools/list");
+    let tools_reply = recv(&mut stdout).expect("tools/list reply while the process is alive");
+    let tool_names: Vec<&str> = tools_reply["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(
+        tool_names.contains(&"list_skills"),
+        "expected the real tool list to include list_skills, got {tool_names:?}"
+    );
+
+    // A real mid-turn crash: kill the process the same way an OOM/crash
+    // would end it, not a graceful shutdown request.
+    child.kill().expect("kill the real snapflowd-mcp process");
+    child.wait().expect("wait for the killed process to exit");
+
+    // Unavailable: writing to the now-dead process's stdin either fails
+    // outright (broken pipe) or is silently buffered by the OS with no
+    // process left to read it -- either way, no further response ever
+    // arrives, which `recv` observes as an immediate EOF.
+    let _ = send(&mut stdin, 3, "tools/list");
+    let post_kill_reply = recv(&mut stdout);
+    assert!(
+        post_kill_reply.is_none(),
+        "expected no reply once the MCP process was killed mid-turn (availability must \
+         flip to unavailable), got {post_kill_reply:?}"
     );
 }

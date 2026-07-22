@@ -83,6 +83,13 @@ pub struct ThreadRuntimeSnapshot {
     pub session_modes: Option<SessionModesEvent>,
     #[serde(default)]
     pub config_options: Vec<ConfigOptionInfo>,
+    // setup-followups plan, archive_thread_backend_verify: whether the
+    // sidebar's Archive control has been used on this thread. Local-only
+    // (no ACP request involved), but must survive a restart the same way
+    // pending_requests/terminals/session_modes do -- hence living here
+    // rather than as a purely in-memory ThreadSlot flag.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -903,6 +910,7 @@ mod tests {
                     description: None,
                 }],
             }],
+            archived: true,
         };
         store
             .write_runtime_snapshot("t1", &snapshot)

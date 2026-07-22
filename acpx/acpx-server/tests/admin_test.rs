@@ -400,3 +400,133 @@ async fn real_binary_starts_the_loopback_admin_listener() {
         reqwest::StatusCode::UNAUTHORIZED
     );
 }
+
+/// setup-followups plan, agent_settings_ordering_and_install_enable_
+/// flow: this test's own real-binary + both-transports setup already
+/// proved the two transports/tokens are correctly separated; this proves
+/// the actual feature they exist for -- disabling an agent through the
+/// real admin HTTP boundary really blocks a subsequent real
+/// `session/new` on the real client transport, all against one genuinely
+/// spawned `acpx-server` process (not the in-process `Router`/
+/// `dispatch_shared_for_tenant` calls `client_and_admin_tokens_are_not_
+/// interchangeable`'s sibling tests use). This is the exact combination
+/// `acpxmgr.go`'s and `panel-rust::agent_bridge::spawn_gateway_process`'s
+/// new `ACPX_ADMIN_TOKEN` generation/wiring exists to make possible in
+/// production -- proving it here closes the loop on that work.
+#[tokio::test]
+async fn disabling_an_agent_over_the_real_admin_http_blocks_a_real_session_new() {
+    let client_address = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind client probe");
+        let address = listener.local_addr().expect("client probe address");
+        drop(listener);
+        address
+    };
+    let admin_address = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind admin probe");
+        let address = listener.local_addr().expect("admin probe address");
+        drop(listener);
+        address
+    };
+    let database = unique_temp_path("acpx-admin-enable-test.sqlite");
+    // A minimal stand-in ACP backend over stdio -- same "read the id out
+    // of the request line, reply with a bare sessionId" shape
+    // deleting_a_custom_agent_stops_its_live_backend's custom-agent
+    // command above uses, registered here as the *default* agent instead
+    // so a plain, unmanaged session/new (no _acpx.profile/agentId)
+    // reaches it. Written to a script file (not an inline ACPX_BACKEND_CMD
+    // string) since that env var is parsed as plain space-separated
+    // program+args, not passed through a shell -- see
+    // ServerConfig::from_env's own doc comment.
+    let script_path = unique_temp_path("acpx-admin-enable-backend.sh");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(echo \"$line\" | grep -o '\"id\":[0-9]*' | head -1 | cut -d: -f2)\n  printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"sessionId\":\"live\"}}\\n' \"$id\"\ndone\n",
+    )
+    .expect("write stand-in backend script");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    command
+        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
+        .env("ACPX_HTTP_BIND", client_address.to_string())
+        .env("ACPX_ADMIN_TOKEN", "admin-secret")
+        .env("ACPX_ADMIN_BIND", admin_address.to_string())
+        .env("ACPX_DB_PATH", database.display().to_string())
+        .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let child = command.spawn().expect("spawn real acpx-server");
+    let _server = BinaryGuard { child, database };
+
+    for _ in 0..160 {
+        if tokio::net::TcpStream::connect(admin_address).await.is_ok()
+            && tokio::net::TcpStream::connect(client_address).await.is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let client = reqwest::Client::new();
+    let session_new = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "session/new",
+        "params": {"cwd": "/tmp", "mcpServers": []}
+    });
+
+    // Enabled by default (AgentEnablement::is_enabled's documented
+    // default) -- a real session/new against the real stand-in backend
+    // must succeed before any disable call.
+    let before = client
+        .post(format!("http://{client_address}/rpc"))
+        .json(&session_new)
+        .send()
+        .await
+        .expect("POST session/new before disable")
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse session/new response");
+    assert!(
+        before.get("result").is_some(),
+        "expected session/new to succeed while the agent is enabled, got: {before:?}"
+    );
+
+    // The real admin HTTP call this session's acpxmgr.go/spawn_gateway_
+    // process wiring exists to make reachable in production.
+    let disable = client
+        .post(format!(
+            "http://{admin_address}/admin/agents/codex-acp/disable"
+        ))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .expect("POST disable over the real admin transport");
+    assert_eq!(disable.status(), reqwest::StatusCode::OK);
+
+    let after = client
+        .post(format!("http://{client_address}/rpc"))
+        .json(&session_new)
+        .send()
+        .await
+        .expect("POST session/new after disable")
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse session/new response");
+    assert!(
+        after.get("error").is_some(),
+        "expected session/new to fail once the agent is disabled via the real admin HTTP \
+         boundary, got: {after:?}"
+    );
+    assert!(
+        after["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("disabled"),
+        "expected a real AgentDisabled error message, got: {after:?}"
+    );
+}

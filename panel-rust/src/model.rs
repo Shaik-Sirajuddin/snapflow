@@ -53,6 +53,10 @@ pub struct ThreadModel {
     pub error: Option<String>,
     pub send_queue: SendQueue,
     pub closed: bool,
+    // setup-followups plan, archive_thread_backend_verify: purely local
+    // presentation flag (see AgentBridge::archive_thread's doc comment) --
+    // never sends an ACP request, unlike `closed`.
+    pub archived: bool,
     /// Stable message identities currently known to the TEA model. Streaming
     /// effect results must resolve against this list, never a cached row
     /// index, before producing a `Dirty::MessageStreamingDelta`.
@@ -149,6 +153,7 @@ impl Default for ThreadModel {
             error: None,
             send_queue: SendQueue::default(),
             closed: false,
+            archived: false,
             message_ids: Vec::new(),
             transcript: Vec::new(),
             transcript_keys: Vec::new(),

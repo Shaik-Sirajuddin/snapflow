@@ -186,7 +186,10 @@ fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
     component.set_active_pane(model.active_pane.clone().into());
 }
 
-fn apply_thread_row(model: &Model, real_index: usize) {
+// setup-followups plan, archive_thread_backend_verify: pub(crate), same
+// reasoning as apply_message_ops -- lets agent_bridge.rs's real-backend
+// test drive this exact reducer/sync path directly.
+pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
     let keys = model.thread_model_keys.borrow();
     let Some(thread_id) = model
         .threads
@@ -754,6 +757,82 @@ mod tests {
 
         apply_thread_row(&model, 7);
         assert_eq!(model.thread_model.row_data(0).unwrap().name, "new");
+    }
+
+    #[test]
+    fn switching_to_a_brand_new_empty_thread_clears_stale_messages_from_the_shared_model() {
+        // setup-followups plan follow-up: closes the loop on update.rs's
+        // `switching_to_a_thread_with_a_coincidentally_unchanged_transcript_
+        // still_resyncs_the_shared_model` regression test (commit
+        // ba6a9d2's "new chat shows prefill data" fix) -- that test only
+        // proves the reducer *emits* `Dirty::MessagesDiff`; this one
+        // drives the real `update()` -> `apply_message_ops()` pipeline
+        // end to end and asserts the shared `messages_model` (what's
+        // actually on screen) truly no longer holds thread-0's leftover
+        // row after switching to a brand new, empty thread-1.
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("thread-0-session".to_owned()),
+            transcript: vec![crate::conversation::TranscriptItem::Assistant {
+                message_id: "old-message".to_owned(),
+                text: "leftover from the previous thread".to_owned(),
+                streaming: false,
+            }],
+            transcript_keys: vec!["assistant:old-message".to_owned()],
+            ..crate::model::ThreadModel::default()
+        });
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "thread-1".to_owned(),
+            ..crate::model::ThreadModel::default()
+        });
+        model.displayed_thread = Some(0);
+        model.selected_thread = 1;
+        // What's actually on screen right now, mirroring thread-0's
+        // content -- this is the shared VecModel a stale-data bug would
+        // leave untouched.
+        model.messages_model.push(crate::MessageItem {
+            text: "leftover from the previous thread".into(),
+            ..crate::MessageItem::default()
+        });
+        *model.message_model_keys.borrow_mut() = vec!["assistant:old-message".to_owned()];
+
+        let (_, dirty) = crate::update::update(
+            &mut model,
+            crate::msg::Msg::Frame(crate::msg::FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
+                    real_index: 1,
+                    transcript: vec![],
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                }),
+                ..crate::msg::FrameInput::default()
+            }),
+        );
+
+        for d in &dirty {
+            if let crate::dirty::Dirty::MessagesDiff { thread_id, ops } = d {
+                apply_message_ops(&model, thread_id, ops);
+            }
+        }
+
+        assert_eq!(
+            model.messages_model.row_count(),
+            0,
+            "expected thread-1 (brand new, no messages) to leave the shared messages_model \
+             empty, but thread-0's leftover row is still there"
+        );
+        assert!(
+            model.message_model_keys.borrow().is_empty(),
+            "message_model_keys must converge to empty alongside the model"
+        );
     }
 
     #[test]

@@ -622,6 +622,7 @@ pub fn build_thread_items<N: AsRef<str>>(
     descriptions: &[String],
     background_sessions: &[bool],
     closed: &[bool],
+    archived: &[bool],
     query: &str,
 ) -> Vec<VisibleThreadItem> {
     let query_lower = query.trim().to_lowercase();
@@ -637,7 +638,12 @@ pub fn build_thread_items<N: AsRef<str>>(
             thread_id: format!("thread:{real_index}"),
             item: ThreadItem {
                 name: name.as_ref().into(),
-                status: if closed.get(real_index).copied().unwrap_or(false) {
+                // Archived takes precedence over closed: it is the final,
+                // explicitly-chosen state, whereas closed can still precede
+                // an archive action on the same thread.
+                status: if archived.get(real_index).copied().unwrap_or(false) {
+                    "archived"
+                } else if closed.get(real_index).copied().unwrap_or(false) {
                     "closed"
                 } else {
                     st.as_str()
@@ -655,6 +661,7 @@ pub fn build_thread_items<N: AsRef<str>>(
                     .unwrap_or_default()
                     .into(),
                 closed: closed.get(real_index).copied().unwrap_or(false),
+                archived: archived.get(real_index).copied().unwrap_or(false),
                 // Provider/model are not part of the name/state slices this
                 // filter operates on -- `lib.rs` post-populates them by
                 // `real_index` after filtering, so they default empty here.
@@ -854,9 +861,29 @@ pub fn to_agent_catalog_entries(
     ModelRc::new(VecModel::from(to_agent_catalog_entry_rows(agents)))
 }
 
+/// setup-followups plan, agent_settings_ordering_and_install_enable_flow:
+/// detected/usable agents first, least-usable last. `agents/list`'s wire
+/// order reflects the registry's own listing order (alphabetical-ish,
+/// unrelated to detection), and Slint 1.17.1 has no array-sort primitive
+/// of its own -- the settings view's "connected-first" grouping only
+/// ever worked when the backend happened to already send rows in that
+/// order. This is the real Rust-side sort that was missing. A stable
+/// sort (Rust's `Vec::sort_by_key`) so agents sharing a status keep
+/// their original registry-relative order, not an arbitrary re-shuffle.
+fn agent_status_sort_priority(status: &crate::protocol_types::AgentStatus) -> u8 {
+    match status {
+        crate::protocol_types::AgentStatus::Installed
+        | crate::protocol_types::AgentStatus::InstalledNoSession => 0,
+        crate::protocol_types::AgentStatus::RuntimeMissing => 1,
+        crate::protocol_types::AgentStatus::NotInstalled => 2,
+        crate::protocol_types::AgentStatus::Unknown(_) => 3,
+    }
+}
+
 pub fn to_agent_catalog_entry_rows(
-    agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    mut agents: Vec<crate::protocol_types::AgentCatalogEntry>,
 ) -> Vec<AgentCatalogEntry> {
+    agents.sort_by_key(|entry| agent_status_sort_priority(&entry.status));
     agents
         .into_iter()
         .map(|entry| AgentCatalogEntry {
@@ -864,6 +891,7 @@ pub fn to_agent_catalog_entry_rows(
             name: entry.name.into(),
             version: entry.version.into(),
             status: entry.status.as_wire_str().into(),
+            enabled: entry.enabled,
         })
         .collect()
 }
@@ -944,10 +972,11 @@ mod tests {
     const NO_DESCRIPTIONS: &[String] = &[];
     const BACKGROUND: &[bool] = &[false, true, false, false];
     const NO_CLOSED: &[bool] = &[false, false, false, false];
+    const NO_ARCHIVED: &[bool] = &[false, false, false, false];
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].item.name, "Fix timeline crash");
         assert_eq!(items[0].real_index, 0);
@@ -958,7 +987,7 @@ mod tests {
     #[test]
     fn substring_match_is_case_insensitive() {
         let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "FADE");
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "FADE");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
         // Real index must survive filtering -- "Add fade transition" is
@@ -967,7 +996,7 @@ mod tests {
         assert_eq!(items[0].real_index, 1);
 
         let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
     }
@@ -977,7 +1006,7 @@ mod tests {
         // "x" appears in 2 non-adjacent names (index 0 and 3); must come
         // back in the same relative order as NAMES, not re-sorted, and
         // must skip the non-matching ones in between.
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "x");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "x");
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
         assert_eq!(
             matched_names,
@@ -995,6 +1024,7 @@ mod tests {
             NO_DESCRIPTIONS,
             BACKGROUND,
             NO_CLOSED,
+            NO_ARCHIVED,
             "zzz-no-such-thread",
         );
         assert!(items.is_empty());
@@ -1002,13 +1032,13 @@ mod tests {
 
     #[test]
     fn whitespace_only_query_behaves_like_empty() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "   ");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "   ");
         assert_eq!(items.len(), 4);
     }
 
     #[test]
     fn status_is_carried_through_unfiltered() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
         assert_eq!(items[1].item.status, "loading");
         assert_eq!(items[2].item.status, "error");
     }
@@ -1020,11 +1050,28 @@ mod tests {
         // whatever transient `ThreadState` it was last in -- STATE[1]
         // is `Loading` here, proving the override wins even over that.
         let closed: &[bool] = &[false, true, false, false];
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, NO_ARCHIVED, "");
         assert_eq!(items[1].item.status, "closed");
         assert!(items[1].item.closed);
         assert_eq!(items[0].item.status, "idle");
         assert!(!items[0].item.closed);
+    }
+
+    #[test]
+    fn archived_thread_reports_archived_status_even_when_also_closed() {
+        // setup-followups plan, archive_thread_backend_verify: archived
+        // must win over both the transient ThreadState (STATE[1] is
+        // Loading) and over closed (also true here), since archiving is
+        // the final, explicitly-chosen state a user picks after a thread
+        // may already be closed.
+        let closed: &[bool] = &[false, true, false, false];
+        let archived: &[bool] = &[false, true, false, false];
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, archived, "");
+        assert_eq!(items[1].item.status, "archived");
+        assert!(items[1].item.archived);
+        assert!(items[1].item.closed);
+        assert_eq!(items[0].item.status, "idle");
+        assert!(!items[0].item.archived);
     }
 
     #[test]
@@ -1035,21 +1082,21 @@ mod tests {
             "".into(),
             "Bug still open".into(),
         ];
-        let items = build_thread_items(NAMES, STATE, &descriptions, BACKGROUND, NO_CLOSED, "fade");
+        let items = build_thread_items(NAMES, STATE, &descriptions, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.description, "Added a fade");
     }
 
     #[test]
     fn description_defaults_to_empty_when_shorter_than_names() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "");
+        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
         assert!(items.iter().all(|i| i.item.description.is_empty()));
     }
 
     #[test]
     fn background_policy_is_preserved_after_filtering() {
         let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, "fade");
+            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
         assert!(items[0].item.background);
     }
 
@@ -1154,6 +1201,42 @@ mod tests {
         assert_eq!(entry.name, "Codex Agent");
         assert_eq!(entry.version, "1.0.0");
         assert_eq!(entry.status, "installed");
+    }
+
+    #[test]
+    fn agent_catalog_entries_sort_detected_before_undetected_stably() {
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: registry wire order is alphabetical-ish, unrelated
+        // to detection status -- this proves the Rust-side sort actually
+        // reorders to detected-first, and that agents sharing a status
+        // keep their original relative order (stable sort), not an
+        // arbitrary shuffle.
+        fn entry(id: &str, status: &str) -> crate::protocol_types::AgentCatalogEntry {
+            crate::protocol_types::AgentCatalogEntry::from_json(&serde_json::json!({
+                "id": id,
+                "name": id,
+                "version": "1.0.0",
+                "status": status,
+            }))
+            .unwrap()
+        }
+        let agents = vec![
+            entry("aardvark-acp", "not_installed"),
+            entry("codex-acp", "installed"),
+            entry("blocked-acp", "runtime_missing"),
+            entry("claude-acp", "installed_no_session"),
+            entry("zebra-acp", "not_installed"),
+        ];
+        let model = to_agent_catalog_entries(agents);
+        let ids: Vec<String> = (0..model.row_count())
+            .map(|i| model.row_data(i).unwrap().id.to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["codex-acp", "claude-acp", "blocked-acp", "aardvark-acp", "zebra-acp"],
+            "expected installed/installed_no_session first, then runtime_missing, then \
+             not_installed with original relative order preserved within each group"
+        );
     }
 
     #[test]
@@ -1328,5 +1411,70 @@ mod transcript_model_tests {
         assert!(cur.is_current);
         assert_eq!(cur.value.as_str(), "gpt-5-mini");
         assert_eq!(cur.id.as_str(), "model");
+    }
+
+    #[test]
+    fn config_dropdown_entries_are_fully_generic_and_already_support_a_fast_mode_style_option() {
+        // setup-followups plan, provider_fastmode_profile_persistence:
+        // `configOptions[]` (real ACP session-config-options, see
+        // agentclientprotocol.com/protocol/session-config-options) is not
+        // hardcoded to "model" -- any option a connected backend
+        // advertises (any `id`, any `kind`) already renders and dispatches
+        // through this same generic pipeline. A "fast mode"-shaped select
+        // option (e.g. a real ACP agent advertising reasoning effort or
+        // a fast/quality tradeoff) needs zero new acpx-core/client/UI
+        // plumbing -- proven here with a second, independent option
+        // alongside "model", both surfacing correctly and independently
+        // selectable in the same dropdown model real ACP clients (Zed
+        // included) already use this exact mechanism for.
+        let options = vec![
+            ConfigOptionInfo {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: None,
+                kind: "select".into(),
+                current_value: Some("gpt-5".into()),
+                options: vec![ConfigOptionValue {
+                    value: "gpt-5".into(),
+                    name: "GPT-5".into(),
+                    description: None,
+                }],
+            },
+            ConfigOptionInfo {
+                id: "fastMode".into(),
+                name: "Fast Mode".into(),
+                description: Some("Trade quality for speed".into()),
+                category: None,
+                kind: "select".into(),
+                current_value: Some("off".into()),
+                options: vec![
+                    ConfigOptionValue {
+                        value: "off".into(),
+                        name: "Off".into(),
+                        description: None,
+                    },
+                    ConfigOptionValue {
+                        value: "on".into(),
+                        name: "On".into(),
+                        description: None,
+                    },
+                ],
+            },
+        ];
+
+        let entries = to_config_dropdown_entries(options);
+        // model header + 1 value, fastMode header + 2 values.
+        assert_eq!(entries.row_count(), 5);
+        let ids: Vec<String> = (0..entries.row_count())
+            .map(|i| entries.row_data(i).unwrap().id.to_string())
+            .collect();
+        assert_eq!(ids, vec!["model", "model", "fastMode", "fastMode", "fastMode"]);
+        let fast_mode_off = entries.row_data(3).expect("fast mode off row");
+        assert_eq!(fast_mode_off.label, "Off");
+        assert!(fast_mode_off.is_current);
+        let fast_mode_on = entries.row_data(4).expect("fast mode on row");
+        assert_eq!(fast_mode_on.label, "On");
+        assert!(!fast_mode_on.is_current);
     }
 }

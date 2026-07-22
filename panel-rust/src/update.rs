@@ -90,6 +90,10 @@ fn selected_real_index(model: &Model) -> usize {
         .unwrap_or(model.selected_thread)
 }
 
+// setup-followups plan, archive_thread_backend_verify: pub(crate) so a
+// real-backend test can build the exact row shape production actually
+// produces, rather than hand-crafting a fixture that risks silently
+// drifting from what this function really outputs.
 pub(crate) fn visible_thread_row(
     model: &Model,
     real_index: usize,
@@ -104,6 +108,7 @@ pub(crate) fn visible_thread_row(
             busy: matches!(thread.state, ThreadState::Loading),
             open: true,
             closed: thread.closed,
+            archived: thread.archived,
             ..crate::ThreadItem::default()
         },
     })
@@ -315,6 +320,16 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             (
                 vec![Effect::DeleteThread { real_index: idx }],
                 vec![list_dirty],
+            )
+        }
+        ThreadMsg::ArchiveRequested(idx) => {
+            let Some(thread) = model.threads.get_mut(idx) else {
+                return (vec![], vec![]);
+            };
+            thread.archived = true;
+            (
+                vec![Effect::ArchiveThread { real_index: idx }],
+                vec![Dirty::ThreadRow(idx)],
             )
         }
         ThreadMsg::RenameRequested(idx, name) => {
@@ -642,6 +657,14 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             vec![Effect::AgentInstallRequested {
                 real_index: idx,
                 agent_id,
+            }],
+            vec![Dirty::Settings],
+        ),
+        SettingsMsg::AgentSetEnabled { agent_id, enabled } => (
+            vec![Effect::AgentSetEnabled {
+                real_index: idx,
+                agent_id,
+                enabled,
             }],
             vec![Dirty::Settings],
         ),
@@ -1576,6 +1599,30 @@ mod tests {
         assert!(model.threads[0].closed);
         assert_eq!(effects, vec![Effect::CloseThread { real_index: 0 }]);
         assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
+    }
+
+    #[test]
+    fn agent_set_enabled_emits_one_admin_effect() {
+        // setup-followups plan, agent_settings_ordering_and_install_
+        // enable_flow: the real "install > enable" second step's Msg ->
+        // Effect mapping.
+        let mut model = model_with_threads(&["a"]);
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::AgentSetEnabled {
+                agent_id: "codex-acp".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::AgentSetEnabled {
+                real_index: 0,
+                agent_id: "codex-acp".to_owned(),
+                enabled: false,
+            }]
+        );
+        assert_eq!(dirty, vec![Dirty::Settings]);
     }
 
     #[test]

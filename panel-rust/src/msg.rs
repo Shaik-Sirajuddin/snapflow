@@ -39,6 +39,10 @@ pub enum ThreadMsg {
     NavigateDelta(i32),
     CloseRequested(usize),
     DeleteRequested(usize),
+    // setup-followups plan, archive_thread_backend_verify: purely a local
+    // presentation flag (see AgentBridge::archive_thread's doc comment) --
+    // no ACP request is involved, unlike Close/Delete above.
+    ArchiveRequested(usize),
     RenameRequested(usize, String),
     ToggleBackground(usize),
     RecoverSessionAttach {
@@ -128,6 +132,13 @@ pub enum SettingsMsg {
     },
     AgentInstallRequested {
         agent_id: String,
+    },
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: the real "install > enable" second step, via the admin
+    // plane (AgentBridge::set_agent_enabled) -- distinct from Install.
+    AgentSetEnabled {
+        agent_id: String,
+        enabled: bool,
     },
 }
 

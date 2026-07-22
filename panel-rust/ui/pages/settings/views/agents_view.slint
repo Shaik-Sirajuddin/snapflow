@@ -43,6 +43,11 @@ export component AgentsView inherits Rectangle {
     // exists when a real `agents/connect` round trip lands.
     callback agent-connect-requested(string);
     callback agent-disconnect-requested(string);
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: the real "install > enable" second step, distinct from
+    // connect/disconnect above -- routes through the admin plane
+    // (AgentBridge::set_agent_enabled), not agents/connect.
+    callback agent-set-enabled(string, bool);
 
     property <string> new-profile-name: "";
     property <string> new-profile-agent-id: "";
@@ -350,12 +355,14 @@ export component AgentsView inherits Rectangle {
                         status: root.agent-catalog[first-agent-index].status;
                         card-width: cards-per-row == 1 ? root.width : 260px;
                         is-default: root.agent-catalog[first-agent-index].id == root.default-agent-id;
+                        enabled: root.agent-catalog[first-agent-index].enabled;
                         set-default(new-default) => {
                             root.default-agent-id = new-default ? root.agent-catalog[first-agent-index].id : "";
                         }
                         install-requested => { root.agent-install-requested(root.agent-catalog[first-agent-index].id); }
                         connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index].id); }
                         disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index].id); }
+                        set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index].id, new-enabled); }
                     }
 
                     if cards-per-row == 2 && first-agent-index + 1 < root.agent-catalog.length : AgentCard {
@@ -365,12 +372,14 @@ export component AgentsView inherits Rectangle {
                         status: root.agent-catalog[first-agent-index + 1].status;
                         card-width: 260px;
                         is-default: root.agent-catalog[first-agent-index + 1].id == root.default-agent-id;
+                        enabled: root.agent-catalog[first-agent-index + 1].enabled;
                         set-default(new-default) => {
                             root.default-agent-id = new-default ? root.agent-catalog[first-agent-index + 1].id : "";
                         }
                         install-requested => { root.agent-install-requested(root.agent-catalog[first-agent-index + 1].id); }
                         connect-requested => { root.agent-connect-requested(root.agent-catalog[first-agent-index + 1].id); }
                         disconnect-requested => { root.agent-disconnect-requested(root.agent-catalog[first-agent-index + 1].id); }
+                        set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index + 1].id, new-enabled); }
                     }
                 }
             }

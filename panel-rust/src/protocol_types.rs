@@ -299,6 +299,14 @@ pub struct AgentCatalogEntry {
     pub name: String,
     pub version: String,
     pub status: AgentStatus,
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: `agents/list` itself carries no enablement info (that's an
+    // admin-plane-only concept, see `AgentBridge::agent_enablement_map`);
+    // this is merged in client-side afterward. Defaults `true` (assume
+    // enabled) rather than `false` so a panel with no admin token
+    // configured at all -- the common case today -- never looks like
+    // every agent is silently disabled.
+    pub enabled: bool,
 }
 
 impl AgentCatalogEntry {
@@ -329,6 +337,7 @@ impl AgentCatalogEntry {
             name,
             version,
             status,
+            enabled: true,
         })
     }
 }

@@ -20,6 +20,13 @@ export struct ThreadItem {
     // `"closed"` and swaps the sidebar row's close control for a
     // delete control. Never set implicitly by window/process teardown.
     closed: bool,
+    // setup-followups plan, archive_thread_backend_verify: true once the
+    // sidebar's Archive control has been used on this thread. Durable
+    // (survives restart, see AgentBridge::archive_thread /
+    // ThreadRuntimeSnapshot::archived) and purely a local presentation
+    // flag -- archiving does not send any ACP request, it just hides the
+    // Archive control and swaps the row's status label to "archived".
+    archived: bool,
     // layout-redesign.md Phase 8: the thread's real provider (persisted
     // `AgentBridge::thread_provider`) and active model (the `"model"`
     // config option's current value, the same `configOptions[]` feed the
@@ -344,6 +351,11 @@ export struct AgentCatalogEntry {
     name: string,
     version: string,
     status: string,
+    // setup-followups plan, agent_settings_ordering_and_install_enable_
+    // flow: current admin-plane enablement, merged in client-side (see
+    // AgentBridge::agent_enablement_map's doc comment) since agents/list
+    // itself carries no enablement concept. Defaults true.
+    enabled: bool,
 }
 
 // Client-local PTY terminal addition: a snapshot of the currently

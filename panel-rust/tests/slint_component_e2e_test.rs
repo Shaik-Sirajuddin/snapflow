@@ -553,6 +553,7 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         name: "Claude".into(),
         version: "1.0".into(),
         status: "not installed".into(),
+        enabled: true,
     }])));
     panel.set_recoverable_sessions(ModelRc::new(VecModel::from(vec![RemoteSessionOption {
         session_id: "orphan-session-1".into(),
@@ -773,6 +774,7 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         background: false,
         description: "".into(),
         closed: false,
+        archived: false,
         provider: "".into(),
         model: "".into(),
         project_name: "".into(),
@@ -857,6 +859,7 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         background: false,
         description: "".into(),
         closed: true,
+        archived: false,
         provider: "".into(),
         model: "".into(),
         project_name: "".into(),

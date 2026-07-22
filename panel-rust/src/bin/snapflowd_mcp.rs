@@ -1,4 +1,4 @@
-//! `skills-mcp-server`: a minimal, real MCP (Model Context Protocol)
+//! `snapflowd-mcp`: a minimal, real MCP (Model Context Protocol)
 //! server, spoken to over stdio, exposing panel-rust's discovered skills
 //! (`skills_state::scan_skills_dir`) as tools an ACP-side agent can call
 //! mid-session: `list_skills`, `read_skill`, `list_skill_files`, and
@@ -285,7 +285,7 @@ fn handle_request(args: &Args, method: &str, params: Option<&Value>) -> Result<V
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "skills-mcp-server", "version": "0.1.0"},
+            "serverInfo": {"name": "snapflowd-mcp", "version": "0.1.0"},
         })),
         "tools/list" => Ok(tools_list_result()),
         "tools/call" => {

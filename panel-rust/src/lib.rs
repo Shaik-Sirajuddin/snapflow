@@ -35,7 +35,7 @@ mod permission;
 pub mod protocol_types;
 mod send_queue;
 mod settings_file;
-// `pub` (not just `mod`) so the new `skills-mcp-server` bin target can
+// `pub` (not just `mod`) so the `snapflowd-mcp` bin target can
 // reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
 // of duplicating the SKILL.md front-matter parsing logic.
 pub mod skills_state;
@@ -757,6 +757,22 @@ impl PanelSingleton {
         bridge.install_agent(gw, agent_id);
     }
 
+    /// setup-followups plan, agent_settings_ordering_and_install_enable_
+    /// flow: the real "install > enable" second step. `real_index`/
+    /// `_component` are unused (mirrors `dispatch_agent_install_
+    /// requested`'s own shape) -- enable/disable is admin-plane-wide,
+    /// not per-gateway-slot, so `AgentBridge::set_agent_enabled` doesn't
+    /// need an index at all.
+    pub(crate) fn dispatch_agent_set_enabled(&self, agent_id: &str, enabled: bool) {
+        let Some(bridge) = &self.bridge else { return };
+        if !bridge.set_agent_enabled(agent_id, enabled) {
+            eprintln!(
+                "panel-rust: set_agent_enabled({agent_id}, {enabled}) failed \
+                 (no admin plane reachable, or the request itself failed)"
+            );
+        }
+    }
+
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
         let paths = settings_file::SettingsPaths::from_env();
         if let Err(error) = paths.set_dev_mode(enabled) {
@@ -1441,6 +1457,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        panel.component.on_agent_set_enabled(move |agent_id, enabled| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_agent_set_enabled(panel, agent_id.to_string(), enabled);
+                }
+            });
+        });
+
         let component_weak = panel.component.as_weak();
         panel
             .component
@@ -1641,6 +1665,21 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_compose_stop(panel);
+                }
+            });
+        });
+
+        // setup-followups plan, archive_thread_backend_verify: the
+        // sidebar's Archive control was previously a UI-only stub with
+        // no Rust-side wiring at all. Routed through the TEA dispatcher
+        // (dispatch::dispatch_thread_archive), same as thread close/
+        // delete above -- archive_thread itself never sends an ACP
+        // request, it's a purely local, durable (see AgentBridge::
+        // archive_thread's doc comment) presentation flag.
+        panel.component.on_thread_archive_requested(move |filtered_idx| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_thread_archive(panel, filtered_idx as usize);
                 }
             });
         });
@@ -2708,6 +2747,7 @@ mod keyboard_shortcut_tests {
             background: false,
             description: "".into(),
             closed: false,
+            archived: false,
             provider: "".into(),
             model: "".into(),
             project_name: "".into(),

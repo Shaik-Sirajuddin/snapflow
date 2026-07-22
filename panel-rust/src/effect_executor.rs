@@ -302,6 +302,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 };
                 panel.dispatch_agent_install_requested(&component, &agent_id);
             }
+            Effect::AgentSetEnabled {
+                agent_id, enabled, ..
+            } => {
+                panel.dispatch_agent_set_enabled(&agent_id, enabled);
+            }
             Effect::SkillWrite { .. }
             | Effect::CreateSkill { .. }
             | Effect::SkillPromoteToGlobal { .. }
@@ -317,6 +322,13 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     if !bridge.close_thread(real_index) {
                         eprintln!("panel-rust: close_thread({real_index}) returned false");
+                    }
+                }
+            }
+            Effect::ArchiveThread { real_index } => {
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    if !bridge.archive_thread(real_index) {
+                        eprintln!("panel-rust: archive_thread({real_index}) returned false");
                     }
                 }
             }
