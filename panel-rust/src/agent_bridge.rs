@@ -1292,6 +1292,27 @@ fn spawn_gateway_process(
         // same override for panel-rust's own per-provider spawn path.
         .env("ACPX_MAX_SESSIONS_PER_TENANT", "512")
         .env("ACPX_MAX_SESSIONS_TOTAL", "2048")
+        // acpx-server auto-enables bulk startup session recovery whenever
+        // ACPX_DB_PATH is set (config.rs's ServerConfig::from_env), which
+        // this function always does (see db_path below) so a real app
+        // restart can rehydrate the *small handful of threads panel-rust
+        // itself still tracks* (thread-by-thread, via spec.session_id /
+        // requested_session_id in spawn_background_attachment below --
+        // this process never relies on acpx-server's own bulk recovery
+        // pass to do that). But db_path points at the SAME persistent
+        // file across every single launch of this app, forever, and
+        // acpx-core's list_recoverable_sessions has no age bound at all
+        // -- every session ever opened and never gracefully closed (the
+        // overwhelmingly common case for a desktop app that's almost
+        // always killed, not shut down cleanly) stays a recovery
+        // candidate. Confirmed live: one real, accumulated-over-days
+        // acpx-claude.sqlite3 on this machine had 4367 such rows, and a
+        // single fresh launch's own spawned "claude" gateway tried to
+        // recover every one of them on startup, saturating the per-
+        // tenant session cap within seconds -- not test-run
+        // accumulation, this exact unconditional bulk recovery pass.
+        // Disabled here since this spawn path never needs or uses it.
+        .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
