@@ -4134,6 +4134,183 @@ mod tests {
         assert!(!bridge2.thread_archived(1));
     }
 
+    /// setup-followups plan, archive_thread_backend_verify: real-backend
+    /// counterpart to `archived_thread_survives_bridge_restart_via_jsonl_
+    /// cache` above, following the exact real/opt-in/free-model
+    /// convention `add_thread_after_empty_cold_start_reaches_a_real_
+    /// codex_backend` established (this machine's real, already-
+    /// logged-in Codex CLI session via `ACPX_NATIVE_AUTH_METHOD_ID=
+    /// api-key` + `CODEX_API_KEY` from the auth file; `session/new` +
+    /// `session/prompt` are real ACP round trips through the genuine
+    /// codex-acp adapter, but the actual model call is forced to
+    /// `ollama/qwen2.5:0.5b` via the real `session/set_config_option`
+    /// extension -- free and local, not a billed API call).
+    ///
+    /// Where the unit test above only proves `archive_thread`'s flag
+    /// itself survives a bridge restart, this proves the *full* pipeline
+    /// a user actually exercises: create a thread against a real
+    /// backend, get a real reply, archive it, and drive that archived
+    /// state through the exact same `update()`/`sync::apply_thread_row`
+    /// reducer path `dispatch_frame_poll` uses in the live app -- the
+    /// layer `archived_thread_survives_bridge_restart_via_jsonl_cache`
+    /// cannot reach, since it only calls `AgentBridge` methods directly.
+    ///
+    /// `#[ignore]`d and gated on `ACPX_LIVE_TEST_AMBIENT=1` -- still
+    /// needs a real codex-acp ACP handshake (this machine's real Codex
+    /// CLI login), so not safe to run unconditionally in CI.
+    ///
+    /// Run with:
+    /// ```text
+    /// ACPX_LIVE_TEST_AMBIENT=1 cargo test --lib \
+    ///   agent_bridge::tests::archiving_a_real_backend_thread_renders_through_the_full_reducer \
+    ///   -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn archiving_a_real_backend_thread_renders_through_the_full_reducer() {
+        use slint::Model as _;
+        if std::env::var("ACPX_LIVE_TEST_AMBIENT").as_deref() != Ok("1") {
+            eprintln!(
+                "skipping: set ACPX_LIVE_TEST_AMBIENT=1 to run this test against this \
+                 machine's real, already-logged-in codex CLI session (free/local via Ollama, \
+                 but still needs a real codex-acp ACP handshake)"
+            );
+            return;
+        }
+
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_DEFAULT_AGENT_ID", "codex")
+                .env("RUST_LOG", "error")
+                .env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
+            if std::env::var_os("CODEX_API_KEY").is_none() {
+                if let Some(key) = read_codex_api_key_from_auth_file() {
+                    command.env("CODEX_API_KEY", key);
+                }
+            }
+        });
+        let _gateway_guard = TestGateway {
+            child,
+            base_url: base_url.clone(),
+        };
+
+        let mut bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &[],
+            move |_provider| Ok(base_url.clone()),
+            Some(cache_dir.path().to_path_buf()),
+        )
+        .expect("bridge with zero initial threads");
+
+        let index = bridge
+            .add_thread_with_profile_and_provider("Real archive smoke test", None, Some("codex"))
+            .unwrap_or_else(|error| {
+                panic!("add_thread_with_profile_and_provider must succeed against a real, correctly-configured codex gateway: {error}")
+            });
+
+        // Force the free/local model before prompting, same as
+        // add_thread_after_empty_cold_start_reaches_a_real_codex_backend.
+        bridge.set_config_option(index, "model".to_owned(), serde_json::json!("ollama/qwen2.5:0.5b"));
+        let config_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < config_deadline
+            && !bridge
+                .config_options(index)
+                .iter()
+                .any(|opt| opt.current_value.as_deref() == Some("ollama/qwen2.5:0.5b"))
+        {
+            bridge.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let prompt = "Reply with exactly the single word PANG and nothing else.";
+        bridge.push_local(
+            index,
+            ChatMessage {
+                kind: MessageKind::User,
+                text: prompt.to_owned(),
+                status: None,
+                id: None,
+                raw_input: None,
+                raw_output: None,
+            },
+        );
+        bridge.send_prompt(index, prompt.to_owned());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut ended = false;
+        while std::time::Instant::now() < deadline && !ended {
+            ended = bridge
+                .poll()
+                .into_iter()
+                .any(|event| matches!(event.event, AgentEvent::TurnEnded(_)));
+            if !ended {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        assert!(ended, "real codex-acp turn did not finish within 60s");
+        assert!(
+            !bridge.thread_archived(index),
+            "thread must not be archived yet"
+        );
+
+        // The actual feature under test: archive the real, now-populated
+        // thread, then render it through the exact same reducer path
+        // dispatch_frame_poll uses live.
+        assert!(bridge.archive_thread(index), "archive_thread must succeed");
+        assert!(bridge.thread_archived(index));
+
+        let thread_id = bridge
+            .thread_binding(index)
+            .map(|binding| binding.thread_id)
+            .unwrap_or_else(|| format!("thread:{index}"));
+        let mut model = crate::model::Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: thread_id.clone(),
+            display_name: "Real archive smoke test".to_owned(),
+            provider: "codex".to_owned(),
+            archived: bridge.thread_archived(index),
+            ..crate::model::ThreadModel::default()
+        });
+        model.visible_indices = vec![0];
+        // Build model.thread_rows via the exact same private row-builder
+        // production's thread_list_dirty_with_keys calls, rather than
+        // hand-crafting a fixture that risks silently drifting from what
+        // that function really outputs.
+        model.thread_rows = vec![crate::update::visible_thread_row(&model, 0)
+            .expect("visible_thread_row for a real, archived thread")];
+
+        // apply_thread_row only ever *updates* an existing thread_model
+        // row (set_row_data by key lookup) -- it doesn't insert one, same
+        // as the real live app: this row already exists (pushed when the
+        // thread was first created), and the archive click is an
+        // in-place Dirty::ThreadRow update to that same row. Seed the
+        // pre-archive state exactly like a real cold render would.
+        model.thread_model.push(crate::ThreadItem {
+            name: "Real archive smoke test".into(),
+            archived: false,
+            ..crate::ThreadItem::default()
+        });
+        model.thread_model_keys.borrow_mut().push(thread_id.clone());
+
+        // Same Dirty::ThreadRow -> apply_thread_row path
+        // ThreadMsg::ArchiveRequested's handler in update.rs queues, and
+        // dispatch_thread_archive drives after the real archive_thread
+        // effect completes.
+        crate::sync::apply_thread_row(&model, 0);
+
+        assert_eq!(
+            model.thread_model.row_count(),
+            1,
+            "the archived real thread must render into the shared thread_model"
+        );
+        let row = model.thread_model.row_data(0).expect("archived row");
+        assert!(
+            row.archived,
+            "the real, archived thread's row must render archived: true, got {row:?}"
+        );
+    }
+
     #[test]
     fn archive_thread_on_out_of_range_index_returns_false() {
         let gateway = TestGateway::spawn();

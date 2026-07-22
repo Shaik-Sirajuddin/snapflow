@@ -90,7 +90,11 @@ fn selected_real_index(model: &Model) -> usize {
         .unwrap_or(model.selected_thread)
 }
 
-fn visible_thread_row(
+// setup-followups plan, archive_thread_backend_verify: pub(crate) so a
+// real-backend test can build the exact row shape production actually
+// produces, rather than hand-crafting a fixture that risks silently
+// drifting from what this function really outputs.
+pub(crate) fn visible_thread_row(
     model: &Model,
     real_index: usize,
 ) -> Option<crate::models::VisibleThreadItem> {

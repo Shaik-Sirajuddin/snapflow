@@ -186,7 +186,10 @@ fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
     component.set_active_pane(model.active_pane.clone().into());
 }
 
-fn apply_thread_row(model: &Model, real_index: usize) {
+// setup-followups plan, archive_thread_backend_verify: pub(crate), same
+// reasoning as apply_message_ops -- lets agent_bridge.rs's real-backend
+// test drive this exact reducer/sync path directly.
+pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
     let keys = model.thread_model_keys.borrow();
     let Some(thread_id) = model
         .threads
