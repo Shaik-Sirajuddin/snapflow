@@ -24,11 +24,25 @@ where
         new_rows.len(),
         "row keys and row data must have the same length"
     );
-    assert_eq!(
-        model.row_count(),
-        old_keys.len(),
-        "persistent VecModel and key cache must stay aligned"
-    );
+    // This crate builds with `panic = "abort"` (real-time render path can't
+    // unwind), so a hard assert here used to take down the whole host
+    // process on any desync between a persistent VecModel and its paired key
+    // cache -- e.g. a caller that mutated the model directly, or two
+    // reconcile() calls racing on the same model from different dirty
+    // events. Self-heal instead: drop the stale key cache and rebuild the
+    // model from scratch this one time, so a bug elsewhere degrades to a
+    // visible one-frame flicker/rebuild rather than an app-wide abort.
+    if model.row_count() != old_keys.len() {
+        eprintln!(
+            "panel-rust: list_model::reconcile key-cache desync (model rows: {}, key cache: {}) -- rebuilding from scratch",
+            model.row_count(),
+            old_keys.len()
+        );
+        old_keys.clear();
+        for _ in 0..model.row_count() {
+            model.remove(0);
+        }
+    }
 
     let ops = diff_by_id(old_keys, new_keys, new_rows);
     for op in &ops {

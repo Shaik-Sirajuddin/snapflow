@@ -268,17 +268,30 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
     for op in ops {
         match op {
             RowOp::Insert { at, row } => {
-                model.thread_model.insert(*at, row.item.clone());
-                keys.insert(*at, row.thread_id.clone());
+                // `diff_by_id` computes `at` against the key-cache length at
+                // the time the ops were built. If something else touched
+                // `thread_model`/`keys` between then and now (a bug this
+                // clamp doesn't fix, but shouldn't crash the whole app over
+                // either -- this crate is `panic = "abort"`, so an
+                // out-of-bounds insert here used to kill the process on any
+                // message send), clamp to the current length instead of
+                // panicking.
+                let at = (*at).min(model.thread_model.row_count()).min(keys.len());
+                model.thread_model.insert(at, row.item.clone());
+                keys.insert(at, row.thread_id.clone());
             }
             RowOp::Remove { at } => {
-                if *at < model.thread_model.row_count() {
+                if *at < model.thread_model.row_count() && *at < keys.len() {
                     model.thread_model.remove(*at);
                     keys.remove(*at);
                 }
             }
             RowOp::Move { from, to } => {
-                if *from < model.thread_model.row_count() && *to <= model.thread_model.row_count() {
+                if *from < model.thread_model.row_count()
+                    && *to <= model.thread_model.row_count()
+                    && *from < keys.len()
+                    && *to <= keys.len()
+                {
                     let row = model.thread_model.remove(*from);
                     model.thread_model.insert(*to, row);
                     let key = keys.remove(*from);
@@ -287,10 +300,36 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
             }
         }
     }
+    // Ops are computed from a snapshot of `keys` taken earlier in the same
+    // turn. If anything mutated `thread_model`/`keys` out from under that
+    // snapshot -- a bug elsewhere, or two dirty events racing on the same
+    // model -- applying stale ops above can leave the row count short of,
+    // or past, the real desired length. Previously that showed up as an
+    // `assert_eq!` abort (this crate is `panic = "abort"`); the clamps
+    // above stop the abort but, left alone, a persistent desync would just
+    // silently keep inserting rows every poll tick forever (duplicate
+    // sidebar entries that never go away). Force convergence to
+    // `model.thread_rows` -- the actual source of truth -- so any drift
+    // self-heals within one frame instead of accumulating.
+    let desired_len = model.thread_rows.len();
+    while model.thread_model.row_count() > desired_len {
+        model.thread_model.remove(model.thread_model.row_count() - 1);
+    }
+    while keys.len() > desired_len {
+        keys.pop();
+    }
+    for row in model.thread_rows.iter().skip(model.thread_model.row_count()) {
+        model.thread_model.push(row.item.clone());
+    }
+    for row in model.thread_rows.iter().skip(keys.len()) {
+        keys.push(row.thread_id.clone());
+    }
+    // Length now matches, but existing slots can still hold the wrong
+    // *content* (e.g. a stale key left over from before the desync) --
+    // overwrite every slot, not just newly-appended ones.
     for (index, row) in model.thread_rows.iter().enumerate() {
-        if index < model.thread_model.row_count() {
-            model.thread_model.set_row_data(index, row.item.clone());
-        }
+        model.thread_model.set_row_data(index, row.item.clone());
+        keys[index] = row.thread_id.clone();
     }
 }
 
@@ -318,11 +357,16 @@ fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::Message
     for op in ops {
         match op {
             RowOp::Insert { at, row } => {
-                model.messages_model.insert(*at, row.clone());
-                keys.insert(*at, desired_keys.get(*at).cloned().unwrap_or_default());
+                // See apply_thread_ops's comment: clamp instead of trusting
+                // `at` against a key cache that may have drifted since the
+                // ops were computed -- an out-of-bounds insert here is what
+                // was aborting the whole process on message send.
+                let at = (*at).min(model.messages_model.row_count()).min(keys.len());
+                model.messages_model.insert(at, row.clone());
+                keys.insert(at, desired_keys.get(at).cloned().unwrap_or_default());
             }
             RowOp::Remove { at } => {
-                if *at < model.messages_model.row_count() {
+                if *at < model.messages_model.row_count() && *at < keys.len() {
                     model.messages_model.remove(*at);
                     keys.remove(*at);
                 }
@@ -330,6 +374,8 @@ fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::Message
             RowOp::Move { from, to } => {
                 if *from < model.messages_model.row_count()
                     && *to <= model.messages_model.row_count()
+                    && *from < keys.len()
+                    && *to <= keys.len()
                 {
                     let row = model.messages_model.remove(*from);
                     model.messages_model.insert(*to, row);
@@ -339,9 +385,30 @@ fn apply_message_ops(model: &Model, thread_id: &str, ops: &[RowOp<crate::Message
             }
         }
     }
+    // See apply_thread_ops's comment: force convergence to `desired_rows`/
+    // `desired_keys` (the actual per-thread transcript) instead of trusting
+    // that the ops above landed the model at the right length.
+    while model.messages_model.row_count() > desired_rows.len() {
+        model
+            .messages_model
+            .remove(model.messages_model.row_count() - 1);
+    }
+    while keys.len() > desired_keys.len() {
+        keys.pop();
+    }
+    for key in desired_keys.iter().skip(keys.len()) {
+        keys.push(key.clone());
+    }
+    // Length now matches; overwrite every slot's content too, not just
+    // newly-appended ones (see apply_thread_ops's comment).
+    for (index, key) in desired_keys.iter().enumerate() {
+        keys[index] = key.clone();
+    }
     for (index, row) in desired_rows.into_iter().enumerate() {
         if index < model.messages_model.row_count() {
             model.messages_model.set_row_data(index, row);
+        } else {
+            model.messages_model.push(row);
         }
     }
 }
@@ -351,17 +418,24 @@ fn apply_skill_ops(model: &Model, ops: &[RowOp<crate::SkillOption>]) {
     for op in ops {
         match op {
             RowOp::Insert { at, row } => {
-                model.skills_model.insert(*at, row.clone());
-                keys.insert(*at, std::path::PathBuf::from(row.path.to_string()));
+                // See apply_thread_ops's comment: clamp instead of trusting
+                // a possibly-stale `at`.
+                let at = (*at).min(model.skills_model.row_count()).min(keys.len());
+                model.skills_model.insert(at, row.clone());
+                keys.insert(at, std::path::PathBuf::from(row.path.to_string()));
             }
             RowOp::Remove { at } => {
-                if *at < model.skills_model.row_count() {
+                if *at < model.skills_model.row_count() && *at < keys.len() {
                     model.skills_model.remove(*at);
                     keys.remove(*at);
                 }
             }
             RowOp::Move { from, to } => {
-                if *from < model.skills_model.row_count() && *to <= model.skills_model.row_count() {
+                if *from < model.skills_model.row_count()
+                    && *to <= model.skills_model.row_count()
+                    && *from < keys.len()
+                    && *to <= keys.len()
+                {
                     let row = model.skills_model.remove(*from);
                     model.skills_model.insert(*to, row);
                     let key = keys.remove(*from);
@@ -371,9 +445,32 @@ fn apply_skill_ops(model: &Model, ops: &[RowOp<crate::SkillOption>]) {
         }
     }
     let rows = crate::models::to_skill_option_rows(model.skills.clone());
+    // See apply_thread_ops's comment: force convergence to `rows` instead
+    // of trusting that the ops above landed the model at the right length.
+    let row_paths: Vec<std::path::PathBuf> = model
+        .skills
+        .iter()
+        .map(|skill| skill.path.clone())
+        .collect();
+    while model.skills_model.row_count() > rows.len() {
+        model.skills_model.remove(model.skills_model.row_count() - 1);
+    }
+    while keys.len() > row_paths.len() {
+        keys.pop();
+    }
+    for path in row_paths.iter().skip(keys.len()) {
+        keys.push(path.clone());
+    }
+    // Length now matches; overwrite every slot's content too (see
+    // apply_thread_ops's comment).
+    for (index, path) in row_paths.iter().enumerate() {
+        keys[index] = path.clone();
+    }
     for (index, row) in rows.into_iter().enumerate() {
         if index < model.skills_model.row_count() {
             model.skills_model.set_row_data(index, row);
+        } else {
+            model.skills_model.push(row);
         }
     }
 }
@@ -543,24 +640,81 @@ mod tests {
 
     #[test]
     fn thread_row_ops_apply_to_the_persistent_model_and_key_cache() {
-        let model = Model::default();
-        apply_thread_ops(
-            &model,
-            &[RowOp::Insert {
-                at: 0,
-                row: VisibleThreadItem {
-                    real_index: 7,
-                    thread_id: "thread-7".to_owned(),
-                    item: crate::ThreadItem::default(),
-                },
-            }],
-        );
+        let mut model = Model::default();
+        let row = VisibleThreadItem {
+            real_index: 7,
+            thread_id: "thread-7".to_owned(),
+            item: crate::ThreadItem::default(),
+        };
+        // apply_thread_ops converges thread_model/keys to `model.thread_rows`
+        // (the real caller, thread_list_dirty_with_keys, always updates both
+        // together) -- a real caller's ops and its `thread_rows` snapshot
+        // describe the same target state, so tests must too.
+        model.thread_rows.push(row.clone());
+        apply_thread_ops(&model, &[RowOp::Insert { at: 0, row }]);
         assert_eq!(model.thread_model.row_count(), 1);
         assert_eq!(*model.thread_model_keys.borrow(), vec!["thread-7"]);
 
+        model.thread_rows.clear();
         apply_thread_ops(&model, &[RowOp::Remove { at: 0 }]);
         assert_eq!(model.thread_model.row_count(), 0);
         assert!(model.thread_model_keys.borrow().is_empty());
+    }
+
+    #[test]
+    fn thread_row_ops_self_heal_a_stale_key_cache_instead_of_duplicating_rows() {
+        // Regression test: a real crash chain hit this exact scenario --
+        // `list_model::reconcile`'s (and this file's hand-rolled
+        // apply_*_ops's) `keys` cache could desync from the persistent
+        // VecModel's real row count. Because this crate is
+        // `panic = "abort"`, a bare `assert_eq!` on that invariant used to
+        // kill the whole host process on the very next message send after
+        // any such desync. Clamping the ops stopped the abort, but on its
+        // own that just let a bad diff silently keep *inserting* rows every
+        // poll tick forever -- the "clicking + spawns 100s of threads"
+        // symptom the abort used to mask. `apply_thread_ops` must converge
+        // to `model.thread_rows` (the real source of truth) regardless of
+        // how garbled the incoming ops or the pre-existing key cache are.
+        let mut model = Model::default();
+        // Simulate a badly desynced key cache: three stale keys, but only
+        // one live row (mirrors the observed "New thread 3" spam: many
+        // stale rows sharing one real thread's identity/content).
+        model.thread_model.push(crate::ThreadItem::default());
+        model.thread_model.push(crate::ThreadItem::default());
+        model.thread_model.push(crate::ThreadItem::default());
+        *model.thread_model_keys.borrow_mut() = vec![
+            "stale-a".to_owned(),
+            "stale-b".to_owned(),
+            "stale-c".to_owned(),
+        ];
+        let row = VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            item: crate::ThreadItem {
+                name: "New thread 1".into(),
+                ..crate::ThreadItem::default()
+            },
+        };
+        model.thread_rows.push(row.clone());
+
+        // A garbled/stale op list (e.g. an Insert computed against a key
+        // cache that no longer matches reality) must not be able to grow
+        // the model past the true desired length.
+        apply_thread_ops(
+            &model,
+            &[RowOp::Insert {
+                at: 99,
+                row: row.clone(),
+            }],
+        );
+
+        assert_eq!(
+            model.thread_model.row_count(),
+            1,
+            "must converge to the one real thread, not accumulate duplicates"
+        );
+        assert_eq!(*model.thread_model_keys.borrow(), vec!["thread-0"]);
+        assert_eq!(model.thread_model.row_data(0).unwrap().name, "New thread 1");
     }
 
     #[test]

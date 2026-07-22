@@ -138,10 +138,26 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 _ => "codex",
             }
             .to_owned();
-            let profile_name =
-                (!model.default_profile.is_empty()).then(|| model.default_profile.clone());
-            let permission_profile =
-                (!model.permission_profile.is_empty()).then(|| model.permission_profile.clone());
+            // The literal string "default" is a reserved sentinel, never a
+            // real profile name -- see settings_file.rs's
+            // non_default_sentinel and acpxmgr.go's WriteConfig doc
+            // comment (the "snapshotd-mcp-attach" profile's own agent_id
+            // is deliberately the placeholder "default", which no real
+            // backend is ever registered under). That fix only guards
+            // settings loaded from disk into the panel; a raw
+            // SettingsMsg::Save can still land a literal "default" in
+            // `model.default_profile`/`permission_profile` directly (a
+            // settings form re-saved without ever touching the profile
+            // dropdown), which then forwards straight to `_acpx.profile`
+            // on `session/new` and makes acpx-server try to dial a
+            // nonexistent "default" agent forever ("agent default is in
+            // crash backoff"). Guard at the point of use too.
+            let profile_name = (!model.default_profile.is_empty()
+                && model.default_profile != "default")
+                .then(|| model.default_profile.clone());
+            let permission_profile = (!model.permission_profile.is_empty()
+                && model.permission_profile != "default")
+                .then(|| model.permission_profile.clone());
             model.threads.push(ThreadModel {
                 thread_id: thread_id.clone(),
                 display_name: display_name.clone(),
@@ -500,8 +516,21 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             (vec![], vec![Dirty::Scalar(ScalarField::SettingsOpen)])
         }
         SettingsMsg::Save(input) => {
-            model.default_profile = input.default_profile.clone();
-            model.permission_profile = input.permission_profile.clone();
+            // See ThreadMsg::New's comment: "default" is a reserved
+            // sentinel that must never be treated as a real profile name,
+            // including here where a settings form re-save (without the
+            // user ever touching the profile dropdown) could otherwise
+            // land the literal string straight into `model.default_profile`.
+            model.default_profile = if input.default_profile == "default" {
+                String::new()
+            } else {
+                input.default_profile.clone()
+            };
+            model.permission_profile = if input.permission_profile == "default" {
+                String::new()
+            } else {
+                input.permission_profile.clone()
+            };
             model.background_default = input.background_default;
             model.default_agent_id = input.default_agent_id.clone();
             model.background_override_set = input.background_override_set;
@@ -1236,17 +1265,37 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 &expanded,
             );
             let new_keys = crate::models::transcript_row_keys(&snapshot.transcript);
-            let transcript_changed = old_keys != new_keys
+            // `old_keys`/`thread.message_rows` are this thread's *own*
+            // previously-cached copy, not what's actually still on screen.
+            // A brand new thread's own cache is empty both before and
+            // after this snapshot, so without `switched_thread` here the
+            // diff below never fires on switch -- the shared
+            // `messages_model` then keeps showing whatever the *previously
+            // displayed* thread had (the "new chat shows prefill data from
+            // another thread" bug). Any actual thread switch must always
+            // resync the shared model, regardless of whether this thread's
+            // own transcript happened to be unchanged since its last visit.
+            let transcript_changed = switched_thread
+                || old_keys != new_keys
                 || thread.message_rows != rows
                 || thread.transcript != snapshot.transcript;
-            let pending_changed = thread.pending_request != snapshot.pending_request;
-            let terminals_changed = thread.terminals != snapshot.terminals
+            // Same "own cache vs. what's actually still on screen" gap as
+            // `transcript_changed` above applies to every other
+            // per-thread view fragment: force a resync on switch even when
+            // the target thread's own diff is a no-op.
+            let pending_changed =
+                switched_thread || thread.pending_request != snapshot.pending_request;
+            let terminals_changed = switched_thread
+                || thread.terminals != snapshot.terminals
                 || thread.expanded_terminal != snapshot.expanded_terminal;
-            let local_terminal_changed = thread.local_terminal != snapshot.local_terminal;
+            let local_terminal_changed =
+                switched_thread || thread.local_terminal != snapshot.local_terminal;
             let local_terminal_output_changed =
                 thread.local_terminal.screen_text != snapshot.local_terminal.screen_text;
-            let connection_changed = thread.connection_status != snapshot.connection_status;
-            let capabilities_changed = thread.session_modes != snapshot.session_modes
+            let connection_changed =
+                switched_thread || thread.connection_status != snapshot.connection_status;
+            let capabilities_changed = switched_thread
+                || thread.session_modes != snapshot.session_modes
                 || thread.config_options != snapshot.config_options;
 
             thread.transcript = snapshot.transcript;
@@ -1548,6 +1597,61 @@ mod tests {
         assert_eq!(model.threads[1].thread_id, "durable-new");
         assert_eq!(model.threads[1].session_id.as_deref(), Some("session-new"));
         assert_eq!(dirty, vec![Dirty::ThreadRow(1)]);
+    }
+
+    #[test]
+    fn new_thread_never_forwards_the_literal_default_profile_sentinel() {
+        // Regression test: "agent default is in crash backoff". The
+        // literal string "default" is a reserved acpx-server sentinel
+        // (see acpxmgr.go's WriteConfig doc comment: the
+        // "snapshotd-mcp-attach" profile's own agent_id is deliberately
+        // the placeholder "default", which no real backend is ever
+        // registered under). A settings form re-saved without ever
+        // touching the profile dropdown could land that literal string in
+        // `model.default_profile`/`permission_profile`; forwarding it as
+        // `_acpx.profile` on `session/new` makes acpx-server try to dial a
+        // nonexistent "default" agent, fail, and crash-loop forever.
+        let mut model = model_with_threads(&["existing"]);
+        model.default_profile = "default".to_owned();
+        model.permission_profile = "default".to_owned();
+        model.default_agent_id = "codex".to_owned();
+
+        let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+
+        assert_eq!(
+            effects,
+            vec![Effect::NewThread {
+                real_index: 1,
+                display_name: "New thread 2".to_owned(),
+                provider: "codex".to_owned(),
+                profile_name: None,
+                permission_profile: None,
+            }],
+            "a literal \"default\" profile/permission-profile must never reach session/new"
+        );
+    }
+
+    #[test]
+    fn settings_save_never_persists_the_literal_default_profile_sentinel() {
+        let mut model = model_with_threads(&["existing"]);
+        let input = crate::msg::SettingsSaveInput {
+            scope: "global".to_owned(),
+            default_profile: "default".to_owned(),
+            permission_profile: "default".to_owned(),
+            background_default: false,
+            default_agent_id: "codex".to_owned(),
+            selected_thread_id: None,
+            background_override_set: false,
+            background_override: false,
+        };
+
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::Save(input))),
+        );
+
+        assert_eq!(model.default_profile, "");
+        assert_eq!(model.permission_profile, "");
     }
 
     #[test]
@@ -2047,6 +2151,65 @@ mod tests {
             item,
             Dirty::Connection { thread_id } if thread_id == "thread-0"
         )));
+    }
+
+    #[test]
+    fn switching_to_a_thread_with_a_coincidentally_unchanged_transcript_still_resyncs_the_shared_model() {
+        // Regression test: "starting a new chat shows prefill data [from
+        // the previous thread]". `transcript_changed` used to compare the
+        // *target* thread's own transcript against its own previously
+        // cached copy -- for a brand new thread both are empty, so the
+        // comparison was a no-op and no `Dirty::MessagesDiff` fired. But
+        // the *shared* `messages_model`/`message_model_keys` (what's
+        // actually on screen) still held the *previously displayed*
+        // thread's messages, which were never told to clear. The fix
+        // forces a resync on every real `switched_thread` transition,
+        // regardless of whether the newly-selected thread's own transcript
+        // happened to be unchanged since its last visit.
+        let mut model = model_with_threads(&["first", "second"]);
+        model.threads[0].session_id = Some("thread-0-session".to_owned());
+        model.threads[0].transcript = vec![crate::conversation::TranscriptItem::Assistant {
+            message_id: "old-message".to_owned(),
+            text: "leftover from the previous thread".to_owned(),
+            streaming: false,
+        }];
+        model.threads[0].transcript_keys = vec!["assistant:old-message".to_owned()];
+        model.displayed_thread = Some(0);
+        model.selected_thread = 1;
+
+        // Thread 1 is brand new: its own cached transcript is empty both
+        // before and after this snapshot -- the exact "coincidentally
+        // unchanged" case that used to suppress the dirty marker.
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
+                    real_index: 1,
+                    transcript: vec![],
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.displayed_thread, Some(1));
+        assert!(
+            dirty.iter().any(|item| matches!(
+                item,
+                Dirty::MessagesDiff { thread_id, .. } if thread_id == "thread-1"
+            )),
+            "switching to the new thread must resync the shared messages model even though \
+             thread-1's own transcript diff is a no-op -- otherwise thread-0's messages stay \
+             on screen as bogus 'prefill' data: {dirty:?}"
+        );
     }
 
     #[test]
