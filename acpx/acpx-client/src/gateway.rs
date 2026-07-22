@@ -201,18 +201,72 @@ impl Gateway {
                     // `ClientError::WebSocket` covers a dead/dropped
                     // connection (send failure, response channel closed,
                     // send/response timeout -- see ws.rs's `request()`), the
-                    // signal that reconnecting is worth trying. A
-                    // `ClientError::Rpc` is the gateway alive and
-                    // answering with a real JSON-RPC error; retrying on a
-                    // fresh connection wouldn't change that, so it's
-                    // returned as-is.
+                    // signal that reconnecting is worth trying *for an
+                    // idempotent method*. A `ClientError::Rpc` is the
+                    // gateway alive and answering with a real JSON-RPC
+                    // error; retrying on a fresh connection wouldn't
+                    // change that, so it's returned as-is.
+                    //
+                    // **`acpx-reconnect-retry-duplicates-session-new`.**
+                    // A "response timeout" specifically does not mean the
+                    // server never received/processed the request, only
+                    // that the *response* was lost or delayed. Blindly
+                    // replaying a non-idempotent method here can create a
+                    // second, real server-side effect the caller never
+                    // asked for -- confirmed live: a real gateway process
+                    // accumulated 512 duplicate `session/new`-created
+                    // sessions over ~1.5h of otherwise normal use, with
+                    // panel-rust's own call site invoked only 6-8 times.
+                    // Every caller of a non-idempotent method already has
+                    // (or should have) its own higher-level retry/
+                    // fallback logic for a request that turns out to have
+                    // genuinely failed (panel-rust's "cached session
+                    // resume failed ... opening a fresh session" is
+                    // exactly that) -- the transport silently retrying
+                    // underneath it too is redundant at best, a silent
+                    // resource leak at worst.
+                    Err(ClientError::WebSocket(_)) if !is_safe_to_retry_after_reconnect(method) => {
+                        Err(ClientError::WebSocket(
+                            "not retrying a non-idempotent method after a WebSocket failure \
+                             (the request may have already reached the server)"
+                                .to_owned(),
+                        ))
+                    }
                     Err(ClientError::WebSocket(_)) => {
                         self.call_after_reconnect(method, params, profile).await
                     }
                     other => other,
                 }
             }
-            None => self.call_after_reconnect(method, params, profile).await,
+            // **`acpx-reconnect-retry-duplicates-session-new`.** `None`
+            // is *not* the same as "this exact request was never sent at
+            // all" -- a background disconnect watcher can clear a dead
+            // connection asynchronously, independent of any specific
+            // in-flight call, so a request can still have gone out over
+            // a connection that's already been cleared by the time this
+            // match runs. For a non-idempotent method, still attempt
+            // exactly once (reconnecting first if needed -- there's
+            // nothing safer to fall back to), but never retry again if
+            // that single attempt itself fails.
+            None if !is_safe_to_retry_after_reconnect(method) => {
+                if !self.reconnect().await {
+                    return Err(ClientError::WebSocket(
+                        "no connection available and reconnect failed".to_owned(),
+                    ));
+                }
+                match self.current_websocket() {
+                    Some(websocket) => {
+                        let full_params = with_profile(params, profile);
+                        websocket.call(method, full_params).await
+                    }
+                    None => Err(ClientError::WebSocket(
+                        "reconnect reported success but no connection is available".to_owned(),
+                    )),
+                }
+            }
+            None => {
+                self.call_after_reconnect(method, params, profile).await
+            }
         }
     }
 
@@ -345,6 +399,20 @@ impl Gateway {
             .and_then(|v| v.as_bool())
             .unwrap_or(false))
     }
+}
+
+/// **`acpx-reconnect-retry-duplicates-session-new`.** `false` for methods
+/// whose effect is not safe to risk duplicating -- currently just
+/// `session/new`, the one genuinely confirmed live to leak real, distinct
+/// sessions when retried blindly after a WebSocket failure whose cause
+/// might have been a lost *response* rather than a lost *request*. Other
+/// methods (`session/prompt` is arguably also unsafe; `session/close`/
+/// `session/resume`/`session/load` are closer to idempotent from the
+/// client's perspective) are intentionally left retry-eligible here --
+/// narrowly scoped to the one method with confirmed real-world impact
+/// rather than guessing at every other method's safety up front.
+fn is_safe_to_retry_after_reconnect(method: &str) -> bool {
+    method != "session/new"
 }
 
 fn with_profile(mut params: serde_json::Value, profile: Option<&str>) -> serde_json::Value {

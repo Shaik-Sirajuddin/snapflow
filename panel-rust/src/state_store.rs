@@ -444,6 +444,75 @@ mod tests {
         assert_eq!(store.thread_records().unwrap(), vec![first, second]);
     }
 
+    /// **`panel-rust-e2e-hardening`'s `default_thread_not_linked_to_real_agent`
+    /// phase.** `update.rs`'s `ThreadMsg::New` and `settings_file.rs`'s
+    /// `resolved_to_panel_defaults` both already guard against the literal
+    /// "default" sentinel (a reserved acpx-server placeholder, never a
+    /// real profile name) at their own point of use/write -- but a thread
+    /// record persisted to `panel-state.sqlite3` *before* either fix
+    /// landed (or written by any other path that predates them) still
+    /// round-trips that literal string through this store untouched.
+    /// `lib.rs`'s cold-start restoration reads `thread_records()` directly
+    /// into `ThreadSpec::profile_name`/the permission-profile list with no
+    /// guard at all -- this proves the actual fix (wrapping both fields in
+    /// `settings_file::non_default_sentinel` at that read site) strips a
+    /// real, sqlite-round-tripped sentinel while leaving a real profile
+    /// name untouched, using the exact same composition lib.rs's cold
+    /// start calls.
+    #[test]
+    fn a_persisted_default_sentinel_profile_is_stripped_on_restore_not_forwarded_to_a_real_session() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let poisoned = ThreadRecord {
+            thread_id: "legacy-thread".to_owned(),
+            display_name: "Legacy Thread".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-legacy".to_owned(),
+            profile_name: Some("default".to_owned()),
+            permission_profile: Some("default".to_owned()),
+            background_session: None,
+        };
+        let real = ThreadRecord {
+            thread_id: "real-thread".to_owned(),
+            display_name: "Real Thread".to_owned(),
+            provider: "claude".to_owned(),
+            session_id: "session-real".to_owned(),
+            profile_name: Some("my-real-profile".to_owned()),
+            permission_profile: Some("workspace".to_owned()),
+            background_session: None,
+        };
+        store.save_thread_record(&poisoned).unwrap();
+        store.save_thread_record(&real).unwrap();
+
+        let restored = store.thread_records().unwrap();
+        assert_eq!(restored, vec![poisoned, real]);
+
+        // The actual fix: the same composition lib.rs's cold-start
+        // restoration applies at the point it builds ThreadSpec/
+        // initial_permission_profiles from these records.
+        let sanitized: Vec<(Option<String>, Option<String>)> = restored
+            .iter()
+            .map(|record| {
+                (
+                    crate::settings_file::non_default_sentinel(record.profile_name.clone()),
+                    crate::settings_file::non_default_sentinel(record.permission_profile.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sanitized[0],
+            (None, None),
+            "the literal \"default\" sentinel must never survive into a real session/new call"
+        );
+        assert_eq!(
+            sanitized[1],
+            (
+                Some("my-real-profile".to_owned()),
+                Some("workspace".to_owned())
+            ),
+            "a real, non-sentinel profile name must pass through unchanged"
+        );
+    }
+
     #[test]
     fn update_thread_display_name_preserves_durable_binding() {
         let store = PanelStateStore::in_memory().unwrap();

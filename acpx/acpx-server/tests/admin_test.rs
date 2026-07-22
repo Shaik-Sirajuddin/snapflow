@@ -530,3 +530,139 @@ async fn disabling_an_agent_over_the_real_admin_http_blocks_a_real_session_new()
         "expected a real AgentDisabled error message, got: {after:?}"
     );
 }
+
+/// **`e2e_session_teardown_automation` / `e2e_teardown_headless_test`.**
+/// Headless (no VNC, no manual step, no live desktop) proof that the new
+/// `/admin/sessions/close-all` + `/admin/sessions/count` endpoints do what
+/// e2e/dev-test teardown needs: open several real sessions against a real
+/// `acpx-server` process, confirm the count reflects them, close them all
+/// through the real admin HTTP boundary, then confirm the count is
+/// genuinely back to zero -- not just that each individual `session/
+/// close` call returned success. Same real-binary + stand-in-backend
+/// pattern as `disabling_an_agent_over_the_real_admin_http_blocks_a_real_
+/// session_new` above.
+#[tokio::test]
+async fn closing_all_sessions_over_the_real_admin_http_leaves_the_tenant_count_at_zero() {
+    let client_address = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind client probe");
+        let address = listener.local_addr().expect("client probe address");
+        drop(listener);
+        address
+    };
+    let admin_address = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind admin probe");
+        let address = listener.local_addr().expect("admin probe address");
+        drop(listener);
+        address
+    };
+    let database = unique_temp_path("acpx-admin-teardown-test.sqlite");
+    let script_path = unique_temp_path("acpx-admin-teardown-backend.sh");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(echo \"$line\" | grep -o '\"id\":[0-9]*' | head -1 | cut -d: -f2)\n  printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"sessionId\":\"live\"}}\\n' \"$id\"\ndone\n",
+    )
+    .expect("write stand-in backend script");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
+    command
+        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
+        .env("ACPX_HTTP_BIND", client_address.to_string())
+        .env("ACPX_ADMIN_TOKEN", "admin-secret")
+        .env("ACPX_ADMIN_BIND", admin_address.to_string())
+        .env("ACPX_DB_PATH", database.display().to_string())
+        .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let child = command.spawn().expect("spawn real acpx-server");
+    let _server = BinaryGuard { child, database };
+
+    for _ in 0..160 {
+        if tokio::net::TcpStream::connect(admin_address).await.is_ok()
+            && tokio::net::TcpStream::connect(client_address).await.is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let client = reqwest::Client::new();
+    const SESSION_COUNT: usize = 3;
+    for id in 1..=SESSION_COUNT {
+        let response = client
+            .post(format!("http://{client_address}/rpc"))
+            .json(&json!({
+                "jsonrpc": "2.0", "id": id, "method": "session/new",
+                "params": {"cwd": "/tmp", "mcpServers": []}
+            }))
+            .send()
+            .await
+            .expect("POST session/new")
+            .json::<serde_json::Value>()
+            .await
+            .expect("parse session/new response");
+        assert!(
+            response.get("result").is_some(),
+            "expected session/new #{id} to succeed against the real stand-in backend, \
+             got: {response:?}"
+        );
+    }
+
+    let count_before = client
+        .get(format!(
+            "http://{admin_address}/admin/sessions/count?tenant=default"
+        ))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .expect("GET session count before teardown")
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse session count response");
+    assert_eq!(
+        count_before["count"],
+        json!(SESSION_COUNT),
+        "expected the real admin session count to reflect every session/new opened above, \
+         got: {count_before:?}"
+    );
+
+    let close_all = client
+        .post(format!(
+            "http://{admin_address}/admin/sessions/close-all?tenant=default"
+        ))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .expect("POST close-all over the real admin transport");
+    assert_eq!(close_all.status(), reqwest::StatusCode::OK);
+    let close_all: serde_json::Value = close_all.json().await.expect("close-all response JSON");
+    assert_eq!(
+        close_all["closed"],
+        json!(SESSION_COUNT),
+        "expected close-all to report every session closed, got: {close_all:?}"
+    );
+    assert_eq!(close_all["failed"], json!(0), "got: {close_all:?}");
+
+    let count_after = client
+        .get(format!(
+            "http://{admin_address}/admin/sessions/count?tenant=default"
+        ))
+        .bearer_auth("admin-secret")
+        .send()
+        .await
+        .expect("GET session count after teardown")
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse session count response");
+    assert_eq!(
+        count_after["count"],
+        json!(0),
+        "expected the tenant's live session count to be genuinely zero after teardown, \
+         not just each session/close call individually reporting success, got: {count_after:?}"
+    );
+}

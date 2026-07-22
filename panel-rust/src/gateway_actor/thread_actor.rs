@@ -101,9 +101,16 @@ enum Command {
     /// sent by `shutdown()`/`Drop` -- see this crate's module doc and
     /// `agent_bridge.rs`'s teardown path: window/process close must not
     /// imply session close by default, only an explicit caller
-    /// (a future per-thread "close on exit" setting) should ever send
-    /// this.
+    /// (the per-thread "background" setting, `AgentBridge::close_thread`'s
+    /// `background` parameter) should ever send this. `background: true`
+    /// sends acpx-core's additive `_acpx.bg` extension field (see
+    /// `LifecycleConfig::background_mode`'s doc comment) so the gateway
+    /// treats this explicit close as a soft no-op -- the session (and
+    /// its backend process) stays alive for a later resume, exactly as
+    /// if the client had merely disconnected rather than explicitly
+    /// closed.
     CloseSession {
+        background: bool,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// Real, stable v1 ACP `session/delete` -- permanently removes a
@@ -371,8 +378,9 @@ impl AcpxThreadHandle {
     }
 
     /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
-    pub async fn close_session(&self) -> Result<(), AcpxThreadError> {
-        self.call(|resp| Command::CloseSession { resp }).await
+    pub async fn close_session(&self, background: bool) -> Result<(), AcpxThreadError> {
+        self.call(|resp| Command::CloseSession { background, resp })
+            .await
     }
 
     /// Real `session/delete` -- opt-in only, see [`Command::
@@ -1333,7 +1341,7 @@ async fn run_thread_actor(
                     });
                 let _ = resp.send(result.map_err(Into::into));
             }
-            Command::CloseSession { resp } => {
+            Command::CloseSession { background, resp } => {
                 let Some(sid) = session_id.clone() else {
                     // Never opened -- closing a session that was never
                     // opened on this handle is a no-op success, not an
@@ -1341,7 +1349,10 @@ async fn run_thread_actor(
                     let _ = resp.send(Ok(()));
                     continue;
                 };
-                let params = serde_json::json!({ "sessionId": sid });
+                let mut params = serde_json::json!({ "sessionId": sid });
+                if background {
+                    params["_acpx"] = serde_json::json!({ "bg": true });
+                }
                 let result = client.call("session/close", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }

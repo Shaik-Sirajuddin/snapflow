@@ -14,6 +14,14 @@ pub struct AgentEnablement {
     pub enabled: bool,
 }
 
+/// Result returned by `POST /admin/sessions/close-all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct SessionsCloseAllReport {
+    pub closed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+}
+
 /// Failures returned by the HTTP-only administration plane.
 #[derive(Debug, thiserror::Error)]
 pub enum AdminClientError {
@@ -109,6 +117,43 @@ impl AdminClient {
             .send()
             .await?;
         self.empty(response).await
+    }
+
+    /// **`e2e_session_teardown_automation`.** Live count of sessions
+    /// currently registered for one tenant (default: `"default"`) --
+    /// what an e2e teardown check should assert against, not just
+    /// trusting each individual `close_all_sessions` response.
+    pub async fn session_count(&self, tenant: &str) -> Result<u64, AdminClientError> {
+        #[derive(serde::Deserialize)]
+        struct SessionsCountResponse {
+            count: u64,
+        }
+        let response = self
+            .http
+            .get(self.endpoint(&format!("admin/sessions/count?tenant={tenant}")))
+            .bearer_auth(&self.admin_token)
+            .send()
+            .await?;
+        let parsed: SessionsCountResponse = self.json(response).await?;
+        Ok(parsed.count)
+    }
+
+    /// **`e2e_session_teardown_automation`.** Closes every unpinned,
+    /// not-in-flight session for one tenant right now, regardless of
+    /// idle time -- the e2e/dev-test teardown call: after a test run is
+    /// done, close everything it opened instead of leaving it for the
+    /// (deliberately unchanged, 30-minute) idle-TTL reaper.
+    pub async fn close_all_sessions(
+        &self,
+        tenant: &str,
+    ) -> Result<SessionsCloseAllReport, AdminClientError> {
+        let response = self
+            .http
+            .post(self.endpoint(&format!("admin/sessions/close-all?tenant={tenant}")))
+            .bearer_auth(&self.admin_token)
+            .send()
+            .await?;
+        self.json(response).await
     }
 
     async fn set_enabled(

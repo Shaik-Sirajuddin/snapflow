@@ -82,6 +82,30 @@ pub struct LifecycleConfig {
     /// silently keeping a session alive under that call would be
     /// surprising for a caller that just asked to delete it.
     pub background_mode: bool,
+    /// **`acpx-startup-recovery-unbounded`.** Bounds *startup session
+    /// recovery* candidacy by recency -- a session record whose most
+    /// recent known activity (`last_activity_at_unix_nanos`, falling
+    /// back to `created_at_unix_nanos`) is older than this is never
+    /// even attempted on the next startup recovery pass, regardless of
+    /// its `status`/`recovery_method`. Deliberately independent of
+    /// `idle_session_ttl` (which governs *live*, currently-registered
+    /// session idling -- this governs whether a session that was never
+    /// explicitly closed is still worth trying to *recover* after a
+    /// process restart). Without this, `PersistenceStore::
+    /// list_recoverable_sessions`'s query has no age bound at all: any
+    /// session ever opened and never gracefully closed stays a
+    /// recovery candidate forever. In practice a desktop client is
+    /// almost always killed rather than shut down cleanly, so this
+    /// list only ever grows -- confirmed live: a real, accumulated-
+    /// over-~28-hours session database had 4367 such rows, and a
+    /// single fresh startup recovery pass against it tried to recover
+    /// every one of them, saturating the per-tenant session cap within
+    /// seconds. `None` disables the bound entirely (unattenuated,
+    /// pre-existing behavior) -- the default is `Some(24h)`, long
+    /// enough to cover a real "closed the app overnight, reopened it
+    /// the next day" continuity case, short enough that this list can
+    /// never again silently grow into the thousands.
+    pub startup_recovery_max_age: Option<std::time::Duration>,
 }
 
 impl Default for LifecycleConfig {
@@ -96,6 +120,7 @@ impl Default for LifecycleConfig {
             connector_idle_shutdown_ttl: None,
             active_turn_deadline: None,
             background_mode: false,
+            startup_recovery_max_age: Some(std::time::Duration::from_secs(24 * 60 * 60)),
         }
     }
 }
@@ -134,6 +159,14 @@ impl LifecycleConfig {
         }
         if self.active_turn_deadline.is_some_and(|ttl| ttl.is_zero()) {
             return Err(LifecycleConfigError::ZeroDuration("active_turn_deadline"));
+        }
+        if self
+            .startup_recovery_max_age
+            .is_some_and(|ttl| ttl.is_zero())
+        {
+            return Err(LifecycleConfigError::ZeroDuration(
+                "startup_recovery_max_age",
+            ));
         }
         Ok(())
     }

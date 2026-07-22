@@ -298,7 +298,7 @@ fn dirs_fallback_config() -> PathBuf {
 /// way an actually-empty value would. Found live: a real settings.global.
 /// json on a real dev machine had exactly this value, silently breaking
 /// every new thread's session/new call with no indication why.
-fn non_default_sentinel(value: Option<String>) -> Option<String> {
+pub(crate) fn non_default_sentinel(value: Option<String>) -> Option<String> {
     value.filter(|v| v != "default")
 }
 

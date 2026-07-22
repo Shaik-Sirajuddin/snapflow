@@ -9,7 +9,7 @@ use acpx_core::{
 use acpx_proto::admin::CustomAgentSpec;
 use acpx_proto::agent::{AgentListEntry, AgentSource, AgentStatus};
 use acpx_registry::Registry;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -116,6 +116,8 @@ pub async fn serve_on_with_router(
             get(list_custom_agents).post(create_custom_agent),
         )
         .route("/admin/agents/custom/:id", delete(delete_custom_agent))
+        .route("/admin/sessions/count", get(sessions_count))
+        .route("/admin/sessions/close-all", post(close_all_sessions))
         .with_state(state);
     tracing::info!(
         bind_addr = %bind_addr,
@@ -266,6 +268,69 @@ fn custom_agent_spec(agent: CustomAgent) -> CustomAgentSpec {
 fn persistence_error(error: acpx_core::PersistenceError) -> Response {
     tracing::error!(%error, "admin persistence read failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TenantQuery {
+    #[serde(default = "default_tenant_param")]
+    tenant: String,
+}
+
+fn default_tenant_param() -> String {
+    acpx_core::TenantId::default_tenant().0
+}
+
+/// **`e2e_session_teardown_automation`.** The headless teardown-
+/// verification test's actual assertion target: a live (not idle-
+/// filtered) count of sessions currently registered for one tenant, so
+/// a test can confirm teardown genuinely reached zero rather than just
+/// trusting each individual `session/close` response.
+async fn sessions_count(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<TenantQuery>,
+) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(router) = &state.router else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let tenant_id = acpx_core::TenantId(query.tenant.clone());
+    let count = router.lock().await.session_count_for_tenant(&tenant_id);
+    Json(serde_json::json!({ "tenant": query.tenant, "count": count })).into_response()
+}
+
+/// **`e2e_session_teardown_automation`.** Loopback-only bulk teardown for
+/// e2e/dev-test harnesses: closes every unpinned, not-in-flight session
+/// for one tenant right now, regardless of idle time. Deliberately
+/// separate from the idle-TTL reaper (`ACPX_SESSION_IDLE_TTL_SECONDS`,
+/// left at its existing default) -- this is e2e code cleaning up after
+/// itself on demand, not a change to that production safety net.
+async fn close_all_sessions(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Query(query): Query<TenantQuery>,
+) -> Response {
+    if !state.auth.authorize(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(router) = &state.router else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let tenant_id = acpx_core::TenantId(query.tenant.clone());
+    let report = router
+        .lock()
+        .await
+        .close_all_sessions_for_tenant(&tenant_id)
+        .await;
+    Json(serde_json::json!({
+        "tenant": query.tenant,
+        "closed": report.closed,
+        "failed": report.failed,
+        "skipped": report.skipped,
+    }))
+    .into_response()
 }
 
 fn admin_error(error: AdminError) -> Response {

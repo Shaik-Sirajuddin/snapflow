@@ -320,7 +320,23 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             }
             Effect::CloseThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
-                    if !bridge.close_thread(real_index) {
+                    // The actual wiring for this thread's own "background"
+                    // toggle (previously stored and displayed, but never
+                    // connected to any real close-session behavior) --
+                    // see AgentBridge::close_thread's doc comment.
+                    let background = bridge
+                        .thread_binding(real_index)
+                        .and_then(|binding| {
+                            panel
+                                .panel_state
+                                .as_ref()
+                                .map(|store| (store, binding.thread_id))
+                        })
+                        .and_then(|(store, thread_id)| {
+                            store.effective_background_session(&thread_id).ok()
+                        })
+                        .unwrap_or(false);
+                    if !bridge.close_thread(real_index, background) {
                         eprintln!("panel-rust: close_thread({real_index}) returned false");
                     }
                 }

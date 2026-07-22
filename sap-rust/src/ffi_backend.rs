@@ -23,7 +23,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -152,6 +157,7 @@ unsafe impl Send for FfiBackend {}
 /// on the forking thread) even though it alone was insufficient --
 /// confirmed by hand: wired in, rebuilt, retested, and the stall still
 /// reproduced at the identical byte offset on all 3 watchdog attempts.
+#[cfg(unix)]
 fn reset_child_signals(cmd: &mut Command) {
     unsafe {
         cmd.pre_exec(|| {
@@ -171,6 +177,21 @@ fn reset_child_signals(cmd: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// Windows has no fork/exec boundary (no `pre_exec` equivalent) and the
+/// Linux dma-buf/sync-fence wedge above does not reproduce there (Windows'
+/// handle inheritance is opt-in per-handle, not inherit-by-default), so
+/// this is not a port of the Unix fix -- it only suppresses the console
+/// window flash a GUI process (`shotcut.exe`) spawning a console
+/// subprocess (`melt.exe`) would otherwise show. The other Windows-only
+/// concern (killing `melt.exe` if the parent dies unexpectedly) is handled
+/// separately in `spawn_melt_draining_stderr` via a Job Object, since that
+/// needs the spawned `Child` handle, not just the `Command` being built.
+#[cfg(windows)]
+fn reset_child_signals(cmd: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
 }
 
 /// Spawn `cmd` (which must already have `.stdout(Stdio::null())` and
@@ -199,8 +220,65 @@ fn reset_child_signals(cmd: &mut Command) {
 /// caller -- nothing in this codebase ever consumed it) and stderr is
 /// drained continuously here rather than buffered up and read once at
 /// the end.
+/// Windows has no `SIGCHLD`/process-group equivalent, so if this daemon
+/// (or the host Shotcut process) dies or is killed unexpectedly, a spawned
+/// `melt.exe` would otherwise keep running as an orphan forever -- the
+/// closest Windows analogue to what `reset_child_signals`' Unix fd-cleanup
+/// protects against, even though the concrete failure mode differs (orphan
+/// survival vs. fd inheritance). Fix: put the child in a fresh Job Object
+/// with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then deliberately leak the
+/// job handle (`std::mem::forget`) rather than close it ourselves --
+/// closing it immediately would kill the child right away, whereas leaking
+/// it keeps the job (and its kill-on-close semantics) alive for exactly as
+/// long as this process runs; Windows closes every handle this process
+/// still holds when it exits or is killed, which is the trigger that
+/// terminates `melt.exe` too. A failure here (job creation/assignment)
+/// is deliberately non-fatal to the export itself -- worst case melt just
+/// loses the orphan-cleanup guarantee, same tradeoff `reset_child_signals`
+/// makes with `close_range`'s return value on Unix.
+#[cfg(windows)]
+fn assign_to_kill_on_close_job(child: &Child) {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job: HANDLE = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            windows_sys::Win32::Foundation::CloseHandle(job);
+            return;
+        }
+
+        let process_handle: HANDLE = child.as_raw_handle() as HANDLE;
+        if AssignProcessToJobObject(job, process_handle) == 0 {
+            windows_sys::Win32::Foundation::CloseHandle(job);
+        }
+        // On success, `job` is deliberately never closed here -- see doc
+        // comment above (closing it now would kill the child immediately;
+        // it must outlive this function, closed only by the OS when this
+        // process itself exits).
+    }
+}
+
 fn spawn_melt_draining_stderr(mut cmd: Command) -> std::io::Result<(Child, Arc<Mutex<String>>)> {
     let mut child = cmd.spawn()?;
+    #[cfg(windows)]
+    assign_to_kill_on_close_job(&child);
     let stderr_buf = Arc::new(Mutex::new(String::new()));
     if let Some(mut pipe) = child.stderr.take() {
         let buf = stderr_buf.clone();

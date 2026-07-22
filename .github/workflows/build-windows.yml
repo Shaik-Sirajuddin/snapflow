@@ -3,9 +3,11 @@ name: build-windows
 # Builds the three shippable pieces of the stack for Windows and bundles
 # them into one installable zip:
 #   - snapshotd   (Go MCP daemon, real standalone binary)
-#   - panel-rust  (Rust staticlib linked into the Shotcut/Snapflow GUI --
-#                  built + tested here as a correctness gate; not shipped
-#                  standalone since nothing links it yet)
+#   - panel-rust  (Rust staticlib linked into the Shotcut/Snapflow GUI via
+#                  Corrosion, alongside sap-rust, in shotcut-rebrand's own
+#                  CMakeLists.txt -- built + tested standalone here too as a
+#                  faster correctness gate than waiting on the full
+#                  shotcut-rebrand job)
 #   - shotcut-rebrand (the Snapflow GUI app, compiled via MSYS2/MinGW64
 #                  using scripts/build-snapflow-msys2.sh -- this uses a
 #                  prebuilt MLT downloaded from a public S3 bucket rather
@@ -101,10 +103,15 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     steps:
-      # This repo, for sap-rust -- shotcut-rebrand/CMakeLists.txt builds it
-      # via Corrosion at ${CMAKE_SOURCE_DIR}/../sap-rust (a sibling crate,
-      # not part of the shotcut-rebrand checkout itself), so it needs to
-      # land as a sibling of the shotcut-rebrand checkout below.
+      # This repo, for sap-rust and panel-rust -- shotcut-rebrand/
+      # CMakeLists.txt builds both via Corrosion at
+      # ${CMAKE_SOURCE_DIR}/../sap-rust and ${CMAKE_SOURCE_DIR}/../panel-rust
+      # (sibling crates, not part of the shotcut-rebrand checkout itself),
+      # so both need to land as siblings of the shotcut-rebrand checkout
+      # below. panel-rust in turn depends on acpx-client via a `../acpx/
+      # acpx-client` path dependency (panel-rust/Cargo.toml), so acpx must
+      # land as a sibling of panel-rust too -- i.e. at the same top level as
+      # sap-rust/panel-rust/shotcut-rebrand.
       - uses: actions/checkout@v4
         with:
           path: multi-media-main
@@ -118,9 +125,12 @@ jobs:
           ref: rebrand/snapflow
           path: shotcut-rebrand
 
-      - name: Place sap-rust as a sibling of shotcut-rebrand
+      - name: Place sap-rust, panel-rust, and acpx as siblings of shotcut-rebrand
         shell: bash
-        run: cp -r multi-media-main/sap-rust sap-rust
+        run: |
+          cp -r multi-media-main/sap-rust sap-rust
+          cp -r multi-media-main/panel-rust panel-rust
+          cp -r multi-media-main/acpx acpx
 
       # Set up the base MSYS2 environment only -- packages are installed as
       # a separate step below so the pacman package-download cache
@@ -169,6 +179,7 @@ jobs:
         shell: msys2 {0}
         run: |
           pacman -S --noconfirm \
+            zip \
             mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
             mingw-w64-x86_64-ninja mingw-w64-x86_64-pkgconf \
             mingw-w64-x86_64-mlt mingw-w64-x86_64-fftw \
@@ -216,13 +227,91 @@ jobs:
         shell: msys2 {0}
         working-directory: shotcut-rebrand
         run: |
-          APPDIR="build/Snapflow/bin"
-          windeployqt --release --no-translations "$APPDIR/snapflow.exe"
-          cp /mingw64/bin/mlt*.dll "$APPDIR/" 2>/dev/null || true
-          mkdir -p build/Snapflow/lib build/Snapflow/share
-          cp -r /mingw64/lib/mlt-7 build/Snapflow/lib/mlt-7
-          cp -r /mingw64/share/mlt-7 build/Snapflow/share/mlt-7
-          ldd "$APPDIR/snapflow.exe" | awk '/mingw64/ {print $3}' | sort -u | xargs -I{} cp -n {} "$APPDIR/" 2>/dev/null || true
+          set -euo pipefail
+          # shotcut-rebrand's CMakeLists.txt's WINDOWS_DEPLOY option
+          # defaults ON, which installs snapflow.exe directly to
+          # CMAKE_INSTALL_PREFIX (build/Snapflow) rather than a bin/
+          # subdir -- confirmed on a real windows-latest run ("build\
+          # Snapflow\bin\snapflow.exe does not exist", the install step
+          # right before this one having placed it at build/Snapflow/
+          # snapflow.exe instead).
+          APPDIR="build/Snapflow"
+          QTDIR="$(pkg-config --variable=prefix Qt6Core)"
+          QT_SHARE_DIR="$QTDIR/share/qt6"
+
+          # windeployqt tries to invoke qmlimportscanner to detect QML
+          # imports, which does not exist at all in this MSYS2 Qt6
+          # mingw64 package (confirmed directly: `/mingw64/bin/
+          # qmlimportscanner: No such file or directory`) -- so
+          # windeployqt can never work here. Instead, bundle exactly the
+          # way the real upstream mltframework/shotcut project's own
+          # production build script does (scripts/build-shotcut-msys2.sh,
+          # function bundle_dlls + its `deploy` step): recursively copy
+          # every mingw64 DLL dependency flat next to the exe, then copy
+          # a fixed, known list of Qt plugin directories and QML modules
+          # by name (Shotcut's own actual QML/plugin usage, not a dynamic
+          # scan) and point qt.conf at them. src/main.cpp's own
+          # Application constructor already expects Qt plugins at
+          # <appdir>/lib/qt6 (dir.cd("lib"); dir.cd("qt6");
+          # addLibraryPath(...)) -- this fix supplies exactly that
+          # directory instead of relying on windeployqt to create it.
+          cp build/CuteLogger/libCuteLogger.dll "$APPDIR/"
+
+          bundle_dlls() {
+            local target="$1"
+            local libs
+            libs=$(ldd "$target" | awk '($3 ~ /\/mingw64\/bin\//) {print $3}')
+            local lib basename_lib
+            for lib in $libs; do
+              basename_lib=$(basename "$lib")
+              [ -e "$APPDIR/$basename_lib" ] || cp -p "$lib" "$APPDIR/"
+            done
+            for lib in $libs; do
+              basename_lib=$(basename "$lib")
+              if [ ! -e "$APPDIR/${basename_lib}.bundled" ]; then
+                touch "$APPDIR/${basename_lib}.bundled"
+                bundle_dlls "$APPDIR/$basename_lib"
+              fi
+            done
+          }
+          bundle_dlls "$APPDIR/snapflow.exe"
+
+          # /mingw64/lib/mlt-7 does not exist -- confirmed via a real
+          # `find` on a windows-latest run; the MSYS2 mingw-w64-x86_64-mlt
+          # package installs its modules/data unversioned, at
+          # /mingw64/lib/mlt and /mingw64/share/mlt. The destination name
+          # (mlt-7) is still correct and must be kept: MLT's own compiled
+          # default module-repository lookup (Mlt::Factory::init() is
+          # called with no explicit path in mltcontroller.cpp, matching
+          # upstream shotcut's own main.cpp, which also never sets
+          # MLT_REPOSITORY/MLT_DATA) auto-detects lib/mlt-7 and
+          # share/mlt-7 relative to wherever libmlt-7.dll itself sits --
+          # a versioned name baked into libmlt-7.dll regardless of how
+          # MSYS2 happened to lay out its own system install.
+          mkdir -p "$APPDIR/lib" "$APPDIR/share"
+          cp -r /mingw64/lib/mlt "$APPDIR/lib/mlt-7"
+          cp -r /mingw64/share/mlt "$APPDIR/share/mlt-7"
+
+          # Qt plugins: fixed list matching what Shotcut (and this fork)
+          # actually use, identical to upstream's own build-shotcut-msys2.sh.
+          mkdir -p "$APPDIR/lib/qt6"
+          for plugin in generic iconengines imageformats multimedia platforms sqldrivers styles tls; do
+            cp -pr "$QT_SHARE_DIR/plugins/$plugin" "$APPDIR/lib/qt6/"
+            for lib in "$APPDIR/lib/qt6/$plugin"/*.dll; do
+              [ -e "$lib" ] && bundle_dlls "$lib"
+            done
+          done
+
+          # QML modules actually used by this app's own src/qml tree
+          # (Qt, QtCore, QtMultimedia, QtQml, QtQuick), same fixed list
+          # upstream's build script copies -- avoids ever needing
+          # qmlimportscanner's dynamic import detection at all.
+          mkdir -p "$APPDIR/lib/qml"
+          cp -pr "$QT_SHARE_DIR"/qml/{Qt,QtCore,QtMultimedia,QtQml,QtQuick} "$APPDIR/lib/qml/"
+
+          printf "[Paths]\nPlugins=lib/qt6\nQml2Imports=lib/qml\n" > "$APPDIR/qt.conf"
+
+          find "$APPDIR" -name '*.bundled' -delete
 
       - name: Package the portable zip
         shell: msys2 {0}

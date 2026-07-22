@@ -339,6 +339,19 @@ impl ServerConfig {
         lifecycle.background_mode = std::env::var("ACPX_BACKGROUND_MODE")
             .map(|value| value == "1")
             .unwrap_or(lifecycle.background_mode);
+        lifecycle.startup_recovery_max_age =
+            match std::env::var("ACPX_STARTUP_RECOVERY_MAX_AGE_SECONDS") {
+                Ok(value)
+                    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("none") =>
+                {
+                    None
+                }
+                Ok(value) => Some(parse_positive_duration(
+                    "ACPX_STARTUP_RECOVERY_MAX_AGE_SECONDS",
+                    &value,
+                )),
+                Err(_) => lifecycle.startup_recovery_max_age,
+            };
         lifecycle
             .validate()
             .unwrap_or_else(|err| panic!("invalid ACPX lifecycle configuration: {err}"));
