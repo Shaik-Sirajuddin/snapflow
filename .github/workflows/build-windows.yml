@@ -247,6 +247,14 @@ jobs:
           # right before this one having placed it at build/Snapflow/
           # snapflow.exe instead).
           APPDIR="build/Snapflow"
+          # TEMPORARY diagnostic (this plan's end-to-end verification
+          # only): windeployqt actually executes snapflow.exe (to detect
+          # QML imports), which just failed with "Process failed to
+          # start: The system cannot find the file specified" on a real
+          # windows-latest run -- dump ldd's dependency list first so a
+          # missing DLL is visible in CI logs instead of guessing again.
+          echo "--- ldd $APPDIR/snapflow.exe (before windeployqt) ---"
+          ldd "$APPDIR/snapflow.exe" || true
           windeployqt --release --no-translations "$APPDIR/snapflow.exe"
           cp /mingw64/bin/mlt*.dll "$APPDIR/" 2>/dev/null || true
           mkdir -p build/Snapflow/lib build/Snapflow/share
