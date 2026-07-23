@@ -337,6 +337,16 @@ fn refresh_transcript(slot: &ThreadSlot) {
     *slot.transcript.lock().unwrap_or_else(|e| e.into_inner()) = rebuilt;
 }
 
+/// Caps how many distinct terminal ids one thread retains in
+/// `ThreadSlot::terminal_buffers`/`terminal_order`. Without this, every
+/// terminal a thread's agent ever spawns over a long-lived session (or
+/// across restarts, since both fields are persisted whole into the JSONL
+/// runtime snapshot -- see [`persist_runtime_snapshot`]) accumulates
+/// forever; only exited terminals are evicted, oldest first, so a
+/// terminal the user might still be watching is never dropped out from
+/// under them.
+const MAX_RETAINED_TERMINALS_PER_THREAD: usize = 8;
+
 fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
     let is_new = !slot
         .terminal_buffers
@@ -360,6 +370,47 @@ fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
                 exit_status: ev.exit_status,
             },
         );
+    evict_exited_terminals_over_cap(slot);
+}
+
+fn evict_exited_terminals_over_cap(slot: &ThreadSlot) {
+    let mut order = slot
+        .terminal_order
+        .lock()
+        .expect("terminal_order mutex poisoned");
+    let mut buffers = slot
+        .terminal_buffers
+        .lock()
+        .expect("terminal_buffers mutex poisoned");
+    evict_exited_terminals_over_cap_in(&mut order, &mut buffers, MAX_RETAINED_TERMINALS_PER_THREAD);
+}
+
+/// Evicts the oldest *exited* terminals (by first-seen order in `order`)
+/// until at most `cap` remain, or until none of the remaining candidates
+/// have exited -- a still-running terminal is never evicted, so this only
+/// bounds growth once terminals actually finish. Free of `ThreadSlot`/
+/// `Mutex` so the eviction policy itself is unit-testable without
+/// constructing a full bridge thread slot.
+fn evict_exited_terminals_over_cap_in(
+    order: &mut Vec<String>,
+    buffers: &mut HashMap<String, TerminalBuffer>,
+    cap: usize,
+) {
+    if order.len() <= cap {
+        return;
+    }
+    let mut idx = 0;
+    while order.len() > cap && idx < order.len() {
+        let has_exited = buffers
+            .get(&order[idx])
+            .is_some_and(|buffer| buffer.exit_status.is_some());
+        if has_exited {
+            let terminal_id = order.remove(idx);
+            buffers.remove(&terminal_id);
+        } else {
+            idx += 1;
+        }
+    }
 }
 
 /// Applies one [`AgentEvent::SessionModes`]/[`AgentEvent::
@@ -3505,6 +3556,89 @@ mod tests {
     // row_count()/row_data() on the persistent messages_model VecModel in
     // the full-reducer real-backend tests below.
     use slint::Model as _;
+
+    fn exited_buffer() -> TerminalBuffer {
+        TerminalBuffer {
+            output: "done".to_owned(),
+            truncated: false,
+            exit_status: Some((Some(0), None)),
+        }
+    }
+
+    fn running_buffer() -> TerminalBuffer {
+        TerminalBuffer {
+            output: "still going".to_owned(),
+            truncated: false,
+            exit_status: None,
+        }
+    }
+
+    #[test]
+    fn terminal_eviction_is_a_no_op_under_the_cap() {
+        let mut order = vec!["t1".to_owned(), "t2".to_owned()];
+        let mut buffers = HashMap::from([
+            ("t1".to_owned(), exited_buffer()),
+            ("t2".to_owned(), exited_buffer()),
+        ]);
+        evict_exited_terminals_over_cap_in(&mut order, &mut buffers, 8);
+        assert_eq!(order.len(), 2);
+        assert_eq!(buffers.len(), 2);
+    }
+
+    #[test]
+    fn terminal_eviction_drops_oldest_exited_terminals_first_once_over_cap() {
+        let mut order: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let mut buffers: HashMap<String, TerminalBuffer> = order
+            .iter()
+            .cloned()
+            .map(|id| (id, exited_buffer()))
+            .collect();
+        evict_exited_terminals_over_cap_in(&mut order, &mut buffers, 8);
+        assert_eq!(order.len(), 8);
+        assert_eq!(buffers.len(), 8);
+        // Oldest (t0, t1) evicted first; newest (t8, t9) survive.
+        assert!(!order.contains(&"t0".to_owned()));
+        assert!(!order.contains(&"t1".to_owned()));
+        assert!(order.contains(&"t9".to_owned()));
+    }
+
+    #[test]
+    fn terminal_eviction_never_drops_a_still_running_terminal() {
+        // All 10 terminals are still running (no exit_status) -- none are
+        // eligible for eviction, so the cap is exceeded rather than
+        // dropping a terminal the user might still be watching.
+        let mut order: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let mut buffers: HashMap<String, TerminalBuffer> = order
+            .iter()
+            .cloned()
+            .map(|id| (id, running_buffer()))
+            .collect();
+        evict_exited_terminals_over_cap_in(&mut order, &mut buffers, 8);
+        assert_eq!(order.len(), 10);
+        assert_eq!(buffers.len(), 10);
+    }
+
+    #[test]
+    fn terminal_eviction_only_removes_as_many_exited_terminals_as_needed() {
+        // 10 total, 8 cap -- 2 must go. t0/t1 exited, the rest still
+        // running: only the exited ones are evicted, exactly enough to
+        // reach the cap.
+        let mut order: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let mut buffers: HashMap<String, TerminalBuffer> = order
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, id)| {
+                let buffer = if i < 2 { exited_buffer() } else { running_buffer() };
+                (id, buffer)
+            })
+            .collect();
+        evict_exited_terminals_over_cap_in(&mut order, &mut buffers, 8);
+        assert_eq!(order.len(), 8);
+        assert_eq!(buffers.len(), 8);
+        assert!(!order.contains(&"t0".to_owned()));
+        assert!(!order.contains(&"t1".to_owned()));
+    }
 
     /// Real, already-built `acpx-server` binary next to this crate's own
     /// checkout -- same dev-checkout-relative-path convention
