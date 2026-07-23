@@ -20,7 +20,10 @@ import { Icon } from "./icon.slint";
 export component NavItem inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
-    in property <string> accessible-label: root.label;
+    // Named button-accessible-label (not accessible-label) -- Rectangle
+    // already owns the latter as a built-in a11y property (same naming
+    // as `base/hover.slint`'s HoverSurface).
+    in property <string> button-accessible-label: root.label;
 
     // Layout flags -- `left_tabs.slint` shows icon+label (expanded) or
     // icon-only centered (collapsed); `top_tabs.slint` shows a centered
@@ -48,7 +51,7 @@ export component NavItem inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: pointer;
         accessible-role: button;
-        accessible-label: root.accessible-label;
+        accessible-label: root.button-accessible-label;
         accessible-action-default => { root.clicked(); }
         clicked => { root.clicked(); }
         double-clicked => { root.double-clicked(); }
