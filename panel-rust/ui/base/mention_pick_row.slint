@@ -30,6 +30,11 @@ export component MentionPickRow inherits Rectangle {
     // direction to use colored markers wherever MCP connection state
     // shows, superseding the earlier no-status-color convention.
     in property <string> status-dot: "";
+    // Phase 15: optional inline action (e.g. "Connect" for an MCP server
+    // needing OAuth). Empty label renders nothing; the action click is
+    // its own callback and does NOT trigger the row's clicked().
+    in property <string> action-label: "";
+    callback action-clicked();
     callback clicked();
 
     height: 28px;
@@ -43,6 +48,29 @@ export component MentionPickRow inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+    }
+    if root.action-label != "" : Rectangle {
+        x: parent.width - self.width - (root.status-dot != "" ? 8px + Metrics.space-3 : 0px) - Metrics.space-3;
+        y: (parent.height - self.height) / 2;
+        width: 52px;
+        height: 18px;
+        border-radius: Theme.radius-sm;
+        border-width: 1px;
+        border-color: Theme.border-default;
+        background: action-touch.has-hover ? Theme.bg-primary-container : transparent;
+        action-touch := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.action-clicked(); }
+        }
+        Text {
+            text: root.action-label;
+            color: Theme.text-primary;
+            font-size: 9px * Theme.font-scale;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
     }
     if root.status-dot != "" : Rectangle {
         x: parent.width - self.width - Metrics.space-3;

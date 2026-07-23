@@ -55,6 +55,7 @@ export component ChatArea inherits Rectangle {
     // Phase 14: forwarded to ChatInputLayout.inputs-enabled (false for
     // archived threads -- inputs render disabled, not just inert).
     in property <bool> inputs-enabled: true;
+    callback mcp-connect-requested(string);
     // Mode/model selector addition: the *currently displayed* thread's
     // live capability advertisement (`AgentBridge::session_modes`/
     // `config_options`, flattened into domain-neutral `DropdownEntry` rows
@@ -934,6 +935,7 @@ export component ChatArea inherits Rectangle {
         // cutoff regressions when this band stretched).
         chat-input := ChatInputLayout {
             inputs-enabled: root.inputs-enabled;
+            mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
             width: 100%;
             horizontal-stretch: 1;
             vertical-stretch: 0;

@@ -478,6 +478,7 @@ export component ChatPanel inherits Window {
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
                 inputs-enabled: !(threads.length > 0 && threads[selected-thread].archived);
+                mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 connection-status: connection-status;
                 last-error: last-error;
                 error-banner-dismissed => { error-banner-dismissed(); }
