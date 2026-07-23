@@ -512,6 +512,16 @@ export component Sidebar inherits Rectangle {
                 viewport-height: active-thread-col.preferred-height;
                 active-thread-col := VerticalLayout {
                     spacing: Metrics.space-1;
+                    // Phase 18: never leave the thread list blank.
+                    if threads.length == 0 && expanded : Text {
+                        text: "No conversations yet - create one with +";
+                        color: Theme.text-muted;
+                        font-size: 10px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        height: 40px;
+                    }
                     for thread[i] in threads : active-row := SidebarThreadRow {
                         // Expanded: hide archived here (they live below).
                         // Collapsed: keep every thread so rail icons remain.

@@ -221,6 +221,14 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 sync_profile_picker(model, component, thread);
                 // Model list after provider resolve so it can filter by agent.
                 sync_model_dropdown_for_provider(model, component, thread);
+                // Phase 18: live token usage -> compose context ring,
+                // streaming DURING a turn (usage folds through the
+                // frame snapshot; Capabilities dirty fires on change).
+                component.set_context_used_tokens(thread.usage.0 as i32);
+                component.set_context_limit_tokens(thread.usage.1 as i32);
+                component.set_context_ratio(if thread.usage.1 > 0 {
+                    (thread.usage.0 as f32 / thread.usage.1 as f32).clamp(0.0, 1.0)
+                } else { 0.0 });
             }
         }
     }
@@ -1031,6 +1039,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..crate::msg::FrameInput::default()
             }),

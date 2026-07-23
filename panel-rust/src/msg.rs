@@ -318,6 +318,8 @@ pub struct ThreadFrameSnapshot {
     pub connection_status: String,
     pub session_modes: Option<crate::protocol_types::SessionModesEvent>,
     pub config_options: Vec<crate::protocol_types::ConfigOptionInfo>,
+    /// Phase 18: live (used, size) token usage for the context ring.
+    pub usage: (i64, i64),
 }
 
 #[cfg(test)]

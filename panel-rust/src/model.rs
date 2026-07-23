@@ -85,6 +85,8 @@ pub struct ThreadModel {
     pub connection_status: String,
     pub session_modes: Option<SessionModesEvent>,
     pub config_options: Vec<ConfigOptionInfo>,
+    /// Phase 18: live (used, size) token usage for the context ring.
+    pub usage: (i64, i64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -183,6 +185,7 @@ impl Default for ThreadModel {
             connection_status: "Connecting...".to_owned(),
             session_modes: None,
             config_options: Vec::new(),
+            usage: (0, 0),
         }
     }
 }

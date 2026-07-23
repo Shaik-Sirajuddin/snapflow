@@ -708,10 +708,34 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
+                // Phase 18 empty/loading states: never leave the chat
+                // view blank. While (re)connecting, a blinking loading
+                // line; once live with no messages, a centered starter.
+                if root.messages.length == 0 : VerticalLayout {
+                    height: 160px;
+                    alignment: center;
+                    property <bool> reloading: connection-status == "Connecting...";
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), 1000ms) / 1000ms));
+                    Text {
+                        text: reloading ? "loading conversation..."
+                            : "Send a message to start the conversation";
+                        color: Theme.text-muted;
+                        opacity: reloading ? blink : 0.8;
+                        font-size: 11px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
                 // chat-items-redesign.md #11: kind switch — user /
                 // agent|thinking / tool-event / legacy MessageCard.
                 for msg[i] in messages : HorizontalLayout {
                     property <bool> is-queued: msg.queued;
+                    // Phase 18: synthetic awaiting-response row (models.rs
+                    // appends kind "pending" while a just-sent user message
+                    // is the transcript tail). Subtle dots, distinct from
+                    // real thinking rows.
+                    property <bool> is-pending: msg.kind == "pending";
                     property <bool> is-user: msg.kind == "user" && !msg.queued;
                     property <bool> is-agent-side: msg.kind == "agent"
                         || msg.kind == "thinking";
@@ -785,6 +809,28 @@ export component ChatArea inherits Rectangle {
                     Rectangle {
                         width: is-user ? user-indent : rail-gap;
                         horizontal-stretch: 0;
+                    }
+                    if is-pending : HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        padding-left: rail-w + Metrics.space-2;
+                        height: 20px;
+                        cross-axis-alignment: center;
+                        property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms));
+                        Text {
+                            text: "\u{2022} \u{2022} \u{2022}";
+                            color: Theme.text-muted;
+                            opacity: parent.pulse;
+                            font-size: 11px * Theme.font-scale;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "waiting for response";
+                            color: Theme.text-muted;
+                            opacity: 0.7;
+                            font-size: 9px * Theme.font-scale;
+                            font-italic: true;
+                            vertical-alignment: center;
+                        }
                     }
                     if is-queued : QueuedMessageBar {
                         horizontal-stretch: 1;

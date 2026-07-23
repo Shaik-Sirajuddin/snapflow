@@ -474,7 +474,24 @@ pub fn message_rows_for_thread_with_state(
     generation_in_flight: bool,
 ) -> (Vec<MessageItem>, Vec<String>) {
     let mut keys = transcript_row_keys(&transcript);
+    let last_is_user = transcript
+        .last()
+        .map(|item| matches!(item, crate::conversation::TranscriptItem::User { .. }))
+        .unwrap_or(false);
     let mut rows = to_message_rows_from_transcript(transcript, expanded);
+    // Phase 18 (send_feedback_and_empty_states): the instant the user's
+    // message is the transcript tail and a generation is in flight,
+    // append a synthetic minimal "pending" row (kind "pending") so the
+    // chat shows immediate feedback before any real agent event
+    // arrives. Rendered as a subtle thinking-style item with a loading
+    // animation, deliberately distinct from real "thinking" rows.
+    if generation_in_flight && last_is_user {
+        rows.push(MessageItem {
+            kind: "pending".into(),
+            ..MessageItem::default()
+        });
+        keys.push("pending:awaiting-response".to_string());
+    }
     append_send_queue_rows(&mut rows, &mut keys, queue, generation_in_flight);
     // Re-index after append so Slint toggle-expanded still matches.
     for (i, row) in rows.iter_mut().enumerate() {

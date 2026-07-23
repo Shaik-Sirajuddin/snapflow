@@ -1528,6 +1528,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     },
                 });
             }
+            crate::protocol_types::AgentEvent::UsageUpdate { .. } => {
+                // Live usage flows through the per-frame runtime
+                // snapshot fold below (thread.usage) -- nothing to do
+                // per-event beyond letting the frame refresh.
+            }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
@@ -1722,7 +1727,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 switched_thread || thread.connection_status != snapshot.connection_status;
             let capabilities_changed = switched_thread
                 || thread.session_modes != snapshot.session_modes
-                || thread.config_options != snapshot.config_options;
+                || thread.config_options != snapshot.config_options
+                || thread.usage != snapshot.usage;
 
             thread.transcript = snapshot.transcript;
             thread.transcript_keys = new_keys.clone();
@@ -1739,6 +1745,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.connection_status = snapshot.connection_status;
             thread.session_modes = snapshot.session_modes;
             thread.config_options = snapshot.config_options;
+            thread.usage = snapshot.usage;
 
             if transcript_changed {
                 dirty.push(Dirty::MessagesDiff {
@@ -2586,6 +2593,7 @@ mod tests {
                     connection_status: "Unavailable".to_owned(),
                     session_modes: None,
                     config_options: Vec::new(),
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -2833,6 +2841,7 @@ mod tests {
             connection_status: String::new(),
             session_modes: None,
             config_options: vec![],
+            usage: (0, 0),
         };
 
         let (_, first_dirty) = update(
@@ -2980,6 +2989,7 @@ mod tests {
                     connection_status: "Live connection".to_owned(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3060,6 +3070,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3129,6 +3140,7 @@ mod tests {
                     connection_status: "Live".to_owned(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
