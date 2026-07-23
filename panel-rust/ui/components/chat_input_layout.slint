@@ -620,6 +620,14 @@ export component ChatInputLayout inherits Rectangle {
                     root.local-profile-label = label;
                     root.profile-selected(id);
                 }
+                // Mutually exclusive with mode-dropdown/config-dropdown --
+                // without this, opening one composer popup while another
+                // is already open leaves both rendered on top of each
+                // other (see SearchableDropdown.opened's doc comment).
+                opened => {
+                    mode-dropdown.close();
+                    config-dropdown.close();
+                }
             }
             mode-dropdown := SearchableDropdown {
                 visible: root.mode-dropdown-entries.length > 0;
@@ -636,6 +644,10 @@ export component ChatInputLayout inherits Rectangle {
                     root.local-mode-id = id;
                     root.local-mode-label = label;
                     root.mode-selected(id);
+                }
+                opened => {
+                    profile-dropdown.close();
+                    config-dropdown.close();
                 }
             }
             config-dropdown := SearchableDropdown {
@@ -656,6 +668,10 @@ export component ChatInputLayout inherits Rectangle {
                     root.local-config-value = value;
                     root.local-config-label = label;
                     root.config-option-selected(id, value);
+                }
+                opened => {
+                    profile-dropdown.close();
+                    mode-dropdown.close();
                 }
             }
 

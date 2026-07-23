@@ -1204,3 +1204,66 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
         "no further profile-selected calls once locked"
     );
 }
+
+/// Reproduces a real bug found live via VNC: opening one composer
+/// SearchableDropdown (profile/mode/config) left a previously-opened one
+/// still rendered open too, both popups visibly overlapping -- each
+/// dropdown tracked its own `open` state with no coordination between
+/// siblings. Fixed via `changed open` handlers in chat_input_layout.slint
+/// that call the other dropdowns' `close()`; this proves it through the
+/// real UI rather than by inspecting the Slint source.
+#[test]
+fn composer_dropdowns_are_mutually_exclusive() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+
+    panel.set_mode_trigger_label("Ask".into());
+    panel.set_mode_dropdown_entries(ModelRc::new(VecModel::from(vec![DropdownEntry {
+        id: "plan".into(),
+        label: "Plan".into(),
+        value: "".into(),
+        is_header: false,
+        is_current: false,
+    }])));
+    panel.set_config_dropdown_entries(ModelRc::new(VecModel::from(vec![DropdownEntry {
+        id: "reasoning".into(),
+        label: "High".into(),
+        value: "high".into(),
+        is_header: false,
+        is_current: false,
+    }])));
+
+    let mode_trigger = ElementHandle::find_by_accessible_label(&panel, "Ask")
+        .next()
+        .expect("mode selector trigger must be accessible");
+    mode_trigger.invoke_accessible_default_action();
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Plan")
+            .next()
+            .is_some(),
+        "mode popup must be open after invoking its trigger"
+    );
+
+    // Opening the config/model popup next, without ever closing the mode
+    // one by hand -- this is exactly what the live repro did (click
+    // "Model" while "Ask" was still open).
+    let config_trigger = ElementHandle::find_by_accessible_label(&panel, "Model")
+        .next()
+        .expect("model selector trigger must be accessible");
+    config_trigger.invoke_accessible_default_action();
+
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "High")
+            .next()
+            .is_some(),
+        "config popup must be open after invoking its own trigger"
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Plan")
+            .next()
+            .is_none(),
+        "opening the config popup must close the mode popup that was still open, \
+         not leave both rendered on top of each other"
+    );
+}

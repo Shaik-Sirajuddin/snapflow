@@ -34,6 +34,15 @@ export component SearchableDropdown inherits Rectangle {
     // id, value, label — label lets callers update the trigger without
     // re-scanning the model.
     callback entry-selected(string /* id */, string /* value */, string /* label */);
+    // Fired synchronously from open-popup() (an imperative callback, not
+    // a `changed` property-graph notification, so a sibling host is
+    // guaranteed to see it before the same event finishes processing) so
+    // a dropdown host (e.g. chat_input_layout.slint's profile/mode/config
+    // trio) can close its other open popups right when this one opens --
+    // each SearchableDropdown instance otherwise tracks `open` fully
+    // independently, so without this two of them can render open and
+    // overlapping at once.
+    callback opened();
 
     property <bool> open: false;
     property <string> filter: "";
@@ -213,6 +222,7 @@ export component SearchableDropdown inherits Rectangle {
     function open-popup() {
         filter = "";
         open = true;
+        root.opened();
         reselect-closest();
     }
 
