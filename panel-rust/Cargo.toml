@@ -11,6 +11,16 @@ ui-dev-viewer = ["dep:slint-interpreter", "dep:spin_on", "dep:notify"]
 
 [dependencies]
 slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
+# `runtime_gate_full_matrix` (video-generation-e2e-harness plan): Slint's own
+# official MCP UI-introspection/automation server (`mcp_server::init()`,
+# called from `panel_rust_create` right after `set_platform`, see lib.rs).
+# `slint`'s own `mcp` feature only forwards to `i-slint-backend-selector`,
+# which this crate never uses (it installs its own `SpikePlatform` directly)
+# -- calling `i_slint_backend_testing::mcp_server::init()` ourselves is the
+# real integration point, found by reading `i-slint-backend-selector`'s own
+# `init_testing_backends()` (a `pub(crate)` fn that does exactly this, so
+# it's the one part of that wiring safe/intended to be reused directly).
+i-slint-backend-testing = { version = "1.17.1", features = ["mcp"] }
 slint-interpreter = { version = "1.17.1", optional = true, default-features = true, features = ["compat-1-2", "display-diagnostics", "backend-winit", "renderer-femtovg"] }
 spin_on = { version = "0.1", optional = true }
 notify = { version = "6", optional = true }

@@ -51,7 +51,7 @@ use protocol_types::{ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
-use slint::platform::{Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
+use slint::platform::{EventLoopProxy, Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{SharedString, VecModel};
 use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
@@ -404,6 +404,44 @@ struct SpikePlatform {
 impl Platform for SpikePlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
         Ok(self.window.clone())
+    }
+
+    // `runtime_gate_full_matrix`: without an event-loop proxy, any
+    // `slint::spawn_local`/`Context::spawn_local` call (e.g. the one
+    // `i_slint_backend_testing::mcp_server`'s window-shown hook makes to
+    // launch its HTTP listener) fails immediately with
+    // `EventLoopError::NoEventLoopProvider` -- the default `Platform`
+    // impl returns `None` here. `SpikeEventLoopProxy` below queues the
+    // closure and `panel_rust_poll` (already called every tick to drive
+    // animations, see its own doc comment) drains it, so spawned local
+    // futures actually make progress on this crate's one Rust thread
+    // without needing Slint's own `run_event_loop()`.
+    fn new_event_loop_proxy(&self) -> Option<Box<dyn EventLoopProxy>> {
+        Some(Box::new(SpikeEventLoopProxy))
+    }
+}
+
+static EVENT_LOOP_QUEUE: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(Vec::new());
+
+struct SpikeEventLoopProxy;
+
+impl EventLoopProxy for SpikeEventLoopProxy {
+    fn quit_event_loop(&self) -> Result<(), slint::EventLoopError> {
+        // panel-rust never runs Slint's own event loop (see module docs),
+        // so there is nothing to quit.
+        Ok(())
+    }
+
+    fn invoke_from_event_loop(
+        &self,
+        event: Box<dyn FnOnce() + Send>,
+    ) -> Result<(), slint::EventLoopError> {
+        EVENT_LOOP_QUEUE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+        Ok(())
     }
 }
 
@@ -969,6 +1007,10 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 window: window.clone(),
             }))
             .expect("panel-rust: set_platform must only be called once per process");
+            // See the `component.window().show()` call below (right after
+            // `ChatPanel::new()`) for why that call, not this one, is what
+            // actually makes the MCP server's HTTP listener start.
+            let _ = i_slint_backend_testing::mcp_server::init();
             *platform_window = Some(window.clone());
             window
         });
@@ -978,6 +1020,21 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             Ok(c) => c,
             Err(_) => return std::ptr::null_mut(),
         };
+        // `runtime_gate_full_matrix` (video-generation-e2e-harness plan):
+        // panel-rust never runs Slint's own event loop (Qt drives rendering
+        // via panel_rust_poll/panel_rust_render), so this is the only place
+        // that ever calls the official `Window::show()` lifecycle method --
+        // required because `i_slint_backend_testing::mcp_server::init()`'s
+        // deferred HTTP-server spawn is gated on Slint core's internal
+        // `window_shown_hook`, which only `Window::show()` fires. Calling it
+        // here (once, on the real associated top-level component, right
+        // after construction) is the officially supported public API for
+        // this -- it does not start Slint's own event loop or otherwise
+        // change how rendering is driven; see `Window::show()`'s own doc
+        // comment (registers the window/component with the windowing
+        // system, syncs geometry, and fires the hook -- all one-shot,
+        // idempotent bookkeeping compatible with a manual render loop).
+        let _ = component.window().show();
         component
             .global::<TextUtil>()
             .on_contains_ci(|haystack, needle| {
@@ -2416,6 +2473,17 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
     // in-flight animation is itself a reason to redraw even with zero
     // application-state change this tick.
     slint::platform::update_timers_and_animations();
+    // Drain closures queued by `SpikeEventLoopProxy::invoke_from_event_loop`
+    // (e.g. `slint::spawn_local` futures' wakers) -- see `SpikePlatform::
+    // new_event_loop_proxy`'s doc comment for why this is needed at all.
+    let queued: Vec<_> = EVENT_LOOP_QUEUE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain(..)
+        .collect();
+    for event in queued {
+        event();
+    }
     PANEL.with(|cell| {
         let slot = cell.borrow();
         let Some(panel) = slot.as_ref() else {
