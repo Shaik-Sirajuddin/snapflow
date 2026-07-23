@@ -1613,6 +1613,17 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             }
         }
         if changed {
+            // `selected_thread` is a *filtered* index into the visible
+            // list, so before the visible order is rewritten (recency
+            // resort on background activity, archive/resume moving rows
+            // between sections, a new thread landing at the top), pin the
+            // thread the user is actually on by durable id and re-anchor
+            // the index afterwards. Without this the stale filtered index
+            // silently retargets whichever thread now occupies that slot,
+            // and the next frame snapshot renders *that* thread's
+            // transcript -- the live "switching threads shows another
+            // thread's messages" leak (plan phase 23).
+            let selected_id = old_keys.get(model.selected_thread).cloned();
             model.visible_indices = snapshot.visible_indices.clone();
             model.thread_rows = snapshot.rows.clone();
             dirty.push(Dirty::ThreadListDiff(crate::dirty::diff_by_id(
@@ -1620,6 +1631,17 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 &snapshot.visible_thread_ids,
                 &snapshot.rows,
             )));
+            let reanchored = selected_id
+                .and_then(|id| snapshot.visible_thread_ids.iter().position(|key| *key == id))
+                .unwrap_or_else(|| {
+                    model
+                        .selected_thread
+                        .min(snapshot.visible_thread_ids.len().saturating_sub(1))
+                });
+            if reanchored != model.selected_thread {
+                model.selected_thread = reanchored;
+                dirty.push(Dirty::Scalar(ScalarField::SelectedThread));
+            }
         }
     }
     if let Some(snapshot) = frame.settings_gateway_snapshot {
@@ -1689,7 +1711,19 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let Some(target_index) = target_index else {
             return (effects, dirty);
         };
-        let switched_thread = model.displayed_thread != Some(target_index);
+        // One-frame stale-collection guard (plan phase 23): the snapshot
+        // was collected via `visible_indices[selected_thread]` *before*
+        // this same frame's thread-list fold re-anchored the selection, so
+        // after a visible-order rewrite it can legitimately describe a
+        // thread the user is no longer on. Hydrating that thread's own
+        // cache by durable id (below) stays correct either way, but
+        // *promoting it to the displayed thread* is the message-leak bug:
+        // sync.rs renders whatever `displayed_thread` points at, so only
+        // switch the display when the snapshot is for the thread the user
+        // actually has selected -- otherwise leave the display alone and
+        // let the next tick collect the right thread's snapshot.
+        let selection_matches = target_index == selected_real_index(model);
+        let switched_thread = selection_matches && model.displayed_thread != Some(target_index);
         if switched_thread {
             model.expanded.clear();
             model.displayed_thread = Some(target_index);
@@ -3347,5 +3381,134 @@ mod tests {
             [Dirty::ThreadListDiff(ops)]
                 if matches!(ops.as_slice(), [RowOp::Insert { at: 0, .. }])
         ));
+    }
+
+    fn visible_row(real_index: usize, thread_id: &str) -> crate::models::VisibleThreadItem {
+        crate::models::VisibleThreadItem {
+            real_index,
+            thread_id: thread_id.to_owned(),
+            item: crate::ThreadItem::default(),
+        }
+    }
+
+    #[test]
+    fn visible_reorder_reanchors_selection_to_the_same_thread() {
+        // Plan phase 23 (thread-switch message leak): `selected_thread` is
+        // a filtered index, so a visible-order rewrite (recency resort,
+        // archive/resume, new thread on top) used to silently retarget the
+        // selection at whichever thread now occupies that slot -- the next
+        // frame then rendered *that* thread's transcript. The fold must
+        // re-anchor the index to the same durable thread id.
+        let mut model = model_with_threads(&["a", "b", "c"]);
+        model.visible_indices = vec![0, 1, 2];
+        model.selected_thread = 1; // thread-1
+        *model.thread_model_keys.borrow_mut() = vec![
+            "thread-0".to_owned(),
+            "thread-1".to_owned(),
+            "thread-2".to_owned(),
+        ];
+
+        // thread-2 got background activity and resorted to the top;
+        // thread-1 now sits at visible position 2.
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![2, 0, 1],
+                    visible_thread_ids: vec![
+                        "thread-2".to_owned(),
+                        "thread-0".to_owned(),
+                        "thread-1".to_owned(),
+                    ],
+                    rows: vec![
+                        visible_row(2, "thread-2"),
+                        visible_row(0, "thread-0"),
+                        visible_row(1, "thread-1"),
+                    ],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.selected_thread, 2,
+            "selection must follow thread-1 to its new visible slot"
+        );
+        assert_eq!(selected_real_index(&model), 1);
+        assert!(dirty
+            .iter()
+            .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread))));
+    }
+
+    #[test]
+    fn selection_clamps_when_the_selected_thread_leaves_the_visible_list() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.visible_indices = vec![0, 1];
+        model.selected_thread = 1;
+        *model.thread_model_keys.borrow_mut() =
+            vec!["thread-0".to_owned(), "thread-1".to_owned()];
+
+        let (_, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![visible_row(0, "thread-0")],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.selected_thread, 0, "gone thread clamps selection");
+    }
+
+    #[test]
+    fn stale_snapshot_for_an_unselected_thread_never_steals_the_display() {
+        // Plan phase 23, second leg: a selected-thread snapshot is
+        // collected via the *pre-reanchor* index mapping, so for one frame
+        // it can describe a thread the user is no longer on. Its data may
+        // hydrate that thread's own cache (by durable id), but it must not
+        // flip `displayed_thread` -- sync.rs renders whatever
+        // `displayed_thread` points at, and flipping it here was the
+        // visible cross-thread message leak.
+        let mut model = model_with_threads(&["a", "b"]);
+        model.visible_indices = vec![0, 1];
+        model.selected_thread = 0;
+        model.displayed_thread = Some(0);
+
+        let transcript = vec![crate::conversation::TranscriptItem::Assistant {
+            message_id: "other-thread-msg".to_owned(),
+            text: "belongs to thread-1".to_owned(),
+            streaming: false,
+        }];
+        let (_, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
+                    real_index: 1,
+                    transcript: transcript.clone(),
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                    usage: (0, 0),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.displayed_thread,
+            Some(0),
+            "a snapshot for an unselected thread must not become the displayed thread"
+        );
+        // Hydration by durable id still lands in the right thread's cache.
+        assert_eq!(model.threads[1].transcript, transcript);
     }
 }
