@@ -502,30 +502,11 @@ export component ChatInputLayout inherits Rectangle {
         padding-bottom: Metrics.pad-md;
         spacing: Metrics.gap-md;
 
-        // Indeterminate progress bar while a turn is in flight.
-        // audit-fixes animation_tick_loaders: keep mounted (height/opacity
-        // collapse when idle) and drive travel with animation-tick(). A
-        // mount-time `if root.sending` + `bar-t: 1.0` + `animate` never
-        // transitioned (instantiated already at end value) so the bar
-        // looked frozen.
-        Rectangle {
-            height: root.sending ? 2px : 0px;
-            opacity: root.sending ? 1.0 : 0.0;
-            animate height, opacity { duration: 150ms; easing: ease-in-out; }
-            width: 100%;
-            background: Theme.border-default;
-            clip: true;
-            property <float> bar-t: root.sending
-                ? mod(animation-tick(), 1100ms) / 1100ms
-                : 0.0;
-            Rectangle {
-                width: parent.width * 0.35;
-                height: parent.height;
-                x: (parent.width + self.width) * bar-t - self.width;
-                background: Theme.bg-primary.with-alpha(0.9);
-                border-radius: 1px;
-            }
-        }
+        // Phase 20 (input_border_animation_removal): the traveling
+        // indeterminate bar that rode the compose box's top border during
+        // a turn is removed per explicit user direction -- the composer's
+        // spinning ring and the phase-18 pending row already signal an
+        // in-flight turn.
 
         // Row 1 — input fills remaining width; send fixed, bottom-aligned.
         HorizontalLayout {
