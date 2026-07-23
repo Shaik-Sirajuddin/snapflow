@@ -67,6 +67,10 @@ export component FilterSearchBar inherits Rectangle {
             horizontal-stretch: 0;
             accessible-role: button;
             accessible-label: root.bar-accessible-label;
+            accessible-action-default => {
+                root.icon-clicked();
+                search-input.focus();
+            }
             clicked => {
                 root.icon-clicked();
                 search-input.focus();
@@ -129,6 +133,10 @@ export component FilterSearchBar inherits Rectangle {
             horizontal-stretch: 0;
             accessible-role: button;
             accessible-label: root.bar-accessible-label;
+            accessible-action-default => {
+                root.icon-clicked();
+                search-input.focus();
+            }
             clicked => {
                 root.icon-clicked();
                 search-input.focus();

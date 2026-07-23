@@ -15,6 +15,16 @@ export component TextField inherits Rectangle {
     in property <string> field-accessible-label: "";
     in property <length> field-font-size: 11px;
     callback edited();
+    // See FilterSearchBar.input-has-focus's doc comment: real keystrokes
+    // only reach any editable Slint surface when *something* in the
+    // host's OR-chain aggregate reads true. Unlike FilterSearchBar, this
+    // component never exposed its own focus state at all, so every call
+    // site (MCP server name/command, agent default-profile/
+    // permission-profile) was structurally unable to wire itself into
+    // that chain -- clicking in focused the field (a real click), but
+    // every typed keystroke afterward was silently dropped before ever
+    // reaching Slint.
+    out property <bool> has-focus: field-input.has-focus;
 
     height: 26px;
     background: Theme.bg-sidebar;
@@ -22,7 +32,7 @@ export component TextField inherits Rectangle {
     border-color: Theme.border-default;
     border-radius: Theme.radius-sm;
 
-    TextInput {
+    field-input := TextInput {
         accessible-label: root.field-accessible-label;
         accessible-action-default => { self.focus(); }
         text <=> root.text;

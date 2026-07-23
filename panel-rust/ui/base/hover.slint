@@ -12,6 +12,13 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 export component HoverSurface inherits Rectangle {
     in property <color> idle-bg: transparent;
     in property <color> selected-bg: Theme.bg-chat;
+    // Was hardcoded to Theme.bg-primary-container -- generalized so
+    // callers that need a different hover tint (e.g. an alpha-tinted
+    // hover distinct from a solid selected fill, or no hover tint at
+    // all when hover-bg == idle-bg) can still build on HoverSurface
+    // instead of re-hand-rolling the TouchArea/CursorHost wiring.
+    // Default preserves every pre-existing call site's look.
+    in property <brush> hover-bg: Theme.bg-primary-container;
     in property <bool> selected: false;
     // Named button-accessible-label (not accessible-label) -- Rectangle
     // already owns the latter as a built-in a11y property.
@@ -24,7 +31,7 @@ export component HoverSurface inherits Rectangle {
     out property <bool> has-hover: touch.has-hover;
 
     background: selected ? selected-bg
-        : touch.has-hover ? Theme.bg-primary-container
+        : touch.has-hover ? hover-bg
         : idle-bg;
     animate background { duration: 100ms; }
 

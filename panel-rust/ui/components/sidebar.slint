@@ -3,10 +3,10 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
+import { NavItem } from "../base/nav_item.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { NamePromptDialog } from "../base/name_prompt_dialog.slint";
 import { TextUtil } from "../base/text_util.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
 import { ThreadItem, SkillOption } from "../types.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
@@ -22,10 +22,24 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
-    // Aggregates thread-search's own FilterSearchBar.input-has-focus --
-    // see that property's doc comment for why this needs re-exposing at
-    // every component boundary up to the root gate in app.slint.
-    out property <bool> search-has-focus: thread-search.input-has-focus;
+    // Aggregates thread-search's own FilterSearchBar.input-has-focus, the
+    // per-row inline thread-rename TextInput, and the shared "new skill"
+    // NamePromptDialog -- see that property's doc comment for why this
+    // needs re-exposing at every component boundary up to the root gate
+    // in app.slint. Without rename-input-has-focus/new-skill-dialog.has-focus
+    // here, both renaming a thread and naming a new skill would silently
+    // drop every typed keystroke (TextField.has-focus's doc comment names
+    // the exact same failure mode).
+    out property <bool> search-has-focus:
+        thread-search.input-has-focus
+        || rename-input-has-focus
+        || new-skill-dialog.has-focus;
+    // rename-input lives inside a `for thread[i] in threads` repeater, so
+    // there's no single element id to reference from search-has-focus
+    // above -- only ever one row is in rename mode at a time
+    // (rename-thread-index gates it), so each row's own `changed
+    // has-focus` handler converging this property nets out correctly.
+    property <bool> rename-input-has-focus: false;
     callback thread-selected(int);
     callback new-thread-requested();
     callback search-changed(string);
@@ -162,7 +176,7 @@ export component Sidebar inherits Rectangle {
                     alignment: center;
                     HorizontalLayout {
                         alignment: center;
-                        IconButton {
+                        sidebar-toggle := IconButton {
                             button-accessible-label: "Expand thread sidebar";
                             clicked => { toggle-expanded(); }
                             Icon {
@@ -177,7 +191,7 @@ export component Sidebar inherits Rectangle {
                     horizontal-stretch: 0;
                     height: parent.height;
                     alignment: center;
-                    IconButton {
+                    sidebar-toggle-collapse := IconButton {
                         button-accessible-label: "Collapse thread sidebar";
                         clicked => { toggle-expanded(); }
                         Icon {
@@ -247,33 +261,31 @@ export component Sidebar inherits Rectangle {
                 padding-left: Metrics.space-3;
                 padding-right: Metrics.space-3;
                 spacing: Metrics.space-3;
-                threads-tab := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Show threads";
+                NavItem {
+                    horizontal-stretch: 0;
+                    fill-width: false;
+                    idle-bg: transparent;
+                    hover-bg: transparent;
+                    selected-bg: transparent;
+                    active-color: Theme.bg-primary;
+                    inactive-color: Theme.text-muted;
+                    label: "Threads";
+                    active: !skill-mode;
+                    button-accessible-label: "Show threads";
                     clicked => { skill-mode = false; }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    Text {
-                        text: "Threads";
-                        color: !skill-mode ? Theme.bg-primary : Theme.text-muted;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: !skill-mode ? 700 : 400;
-                        vertical-alignment: center;
-                    }
                 }
-                skills-tab := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Show skills";
+                NavItem {
+                    horizontal-stretch: 0;
+                    fill-width: false;
+                    idle-bg: transparent;
+                    hover-bg: transparent;
+                    selected-bg: transparent;
+                    active-color: Theme.bg-primary;
+                    inactive-color: Theme.text-muted;
+                    label: "Skills";
+                    active: skill-mode;
+                    button-accessible-label: "Show skills";
                     clicked => { skill-mode = true; }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    Text {
-                        text: "Skills";
-                        color: skill-mode ? Theme.bg-primary : Theme.text-muted;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: skill-mode ? 700 : 400;
-                        vertical-alignment: center;
-                    }
                 }
             }
         }
@@ -293,6 +305,7 @@ export component Sidebar inherits Rectangle {
                     accessible-label: root.show-global-skills
                         ? "Hide global skills"
                         : "Show global skills";
+                    accessible-action-default => { root.show-global-skills = !root.show-global-skills; }
                     clicked => { root.show-global-skills = !root.show-global-skills; }
                     Rectangle {
                         height: 24px;
@@ -567,13 +580,16 @@ export component Sidebar inherits Rectangle {
                                 // frozen except when some unrelated
                                 // interaction (e.g. a mouse move) happened
                                 // to trigger a repaint anyway.
-                                property <angle> load-spin: thread.status == "loading" ? 360deg : 0deg;
-                                animate load-spin {
-                                    duration: 800ms;
-                                    iteration-count: thread.status == "loading" ? -1 : 1;
-                                    easing: linear;
-                                }
-                                if thread.status == "loading" : Rectangle {
+                                // audit-fixes animation_tick_loaders +
+                                // cancelling_status_sidebar_parity: spin on
+                                // loading *or* cancelling (composer already
+                                // treats cancelling as in-flight).
+                                property <bool> row-busy:
+                                    thread.status == "loading" || thread.status == "cancelling";
+                                property <angle> load-spin: row-busy
+                                    ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                                    : 0deg;
+                                if row-busy : Rectangle {
                                     width: 14px;
                                     height: 14px;
                                     Icon {
@@ -589,7 +605,7 @@ export component Sidebar inherits Rectangle {
                                     size: 14px;
                                     color: Theme.bg-primary;
                                 }
-                                if thread.status != "loading" && thread.status != "error" : Rectangle {
+                                if !row-busy && thread.status != "error" : Rectangle {
                                     width: 6px;
                                     height: 6px;
                                     border-radius: 3px;
@@ -609,7 +625,25 @@ export component Sidebar inherits Rectangle {
                                 }
                                 rename-editor := Rectangle {
                                     visible: expanded && root.rename-thread-index == i;
-                                    height: 24px;
+                                    // `visible:` (not `if:`) so rename-focus-delay's
+                                    // `rename-input.focus()` stays a valid id
+                                    // reference even outside rename mode -- but
+                                    // that means this element never leaves the
+                                    // layout tree, so a bare fixed `height: 24px`
+                                    // was silently forcing every row's icon-row
+                                    // HorizontalLayout to be at least 24px tall
+                                    // (a HorizontalLayout's cross-axis size is the
+                                    // max of ALL children's heights, regardless of
+                                    // whether a zero-width child is actually
+                                    // visible), pushing the status dot/other
+                                    // siblings off the row's true vertical center
+                                    // even when this row was never being renamed.
+                                    // Confirmed live: the collapsed rail's status
+                                    // dot rendered ~10px above row-center instead
+                                    // of centered. Zeroing height alongside the
+                                    // existing zero min/max-width when inactive
+                                    // removes that contribution entirely.
+                                    height: root.rename-thread-index == i ? 24px : 0px;
                                     // TextInput selection/caret painting may
                                     // extend past its visual box otherwise.
                                     clip: true;
@@ -644,6 +678,7 @@ export component Sidebar inherits Rectangle {
                                             }
                                             return EventResult.reject;
                                         }
+                                        changed has-focus => { root.rename-input-has-focus = self.has-focus; }
                                     }
                                 }
                                 rename-focus-delay := Timer {
@@ -678,14 +713,44 @@ export component Sidebar inherits Rectangle {
                                     max-width: 64px;
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.background && i == selected-thread : Text {
+                                    && thread.archived : Text {
+                                    // Archive is a local presentation flag
+                                    // (no gateway call) -- without this badge
+                                    // the only feedback is the archive icon
+                                    // disappearing, which looks like a no-op.
+                                    text: "ARCHIVED";
+                                    color: Theme.text-muted;
+                                    font-size: 8px * Theme.font-scale;
+                                    font-family: Theme.font-mono;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                                if expanded && root.rename-thread-index != i
+                                    && thread.closed && !thread.archived : Text {
+                                    text: "CLOSED";
+                                    color: Theme.text-muted;
+                                    font-size: 8px * Theme.font-scale;
+                                    font-family: Theme.font-mono;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                                if expanded && root.rename-thread-index != i
+                                    && !thread.background && !thread.closed && !thread.archived
+                                    && i == selected-thread : Text {
                                     text: "ACTIVE";
                                     color: Theme.text-muted;
                                     font-size: 8px * Theme.font-scale;
                                     font-family: Theme.font-mono;
                                     vertical-alignment: center;
+                                    horizontal-stretch: 0;
                                 }
-                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
+                                // Trailing action cluster: stretch 0 so the
+                                // title elides before these get squeezed off
+                                // the 200px compact rail. Always visible for
+                                // the selected row (and on hover for others)
+                                // so keyboard / headless e2e can reach them
+                                // without a pointer hover.
+                                if expanded && root.rename-thread-index != i && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Rename thread " + thread.name;
@@ -730,7 +795,7 @@ export component Sidebar inherits Rectangle {
                                 // `settings_sheet.slint`'s profile
                                 // delete control.
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.closed && root.pending-close-index != i && thread-row.has-hover : IconButton {
+                                    && !thread.closed && root.pending-close-index != i && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Close thread " + thread.name;
@@ -771,7 +836,7 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && thread.closed && root.pending-delete-index != i && thread-row.has-hover : IconButton {
+                                    && thread.closed && root.pending-delete-index != i && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Delete thread " + thread.name;
@@ -812,7 +877,7 @@ export component Sidebar inherits Rectangle {
                                     }
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.archived && thread-row.has-hover : IconButton {
+                                    && !thread.archived && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
                                     button-accessible-label: "Archive thread " + thread.name;
@@ -974,7 +1039,7 @@ export component Sidebar inherits Rectangle {
 
     // Shared NamePromptDialog (base/) -- cursor-kind reporting (pointer/
     // text) lives inside it, so this call site inherits it.
-    NamePromptDialog {
+    new-skill-dialog := NamePromptDialog {
         x: 0px;
         y: 0px;
         width: root.width;
@@ -983,6 +1048,23 @@ export component Sidebar inherits Rectangle {
         title: "New skill";
         field-accessible-label: "New skill name";
         confirm-label: "Create";
-        confirmed(name) => { root.new-skill-requested(name, "project"); }
+        // Prefer a project-local skill when a project is open so the new
+        // entry is visible under the default sidebar filter (project
+        // skills always show; global skills need the "Show global
+        // skills" toggle). Fall back to global when no project is open
+        // -- hard-coding "project" used to fail CreateSkill with
+        // "cannot create a project skill without an open project", so
+        // the dialog closed, nothing was written, and the list never
+        // gained the skill (setup-followups skill_not_listed_after_creation).
+        confirmed(name) => {
+            if (root.active-project-path == "") {
+                // Make the new global skill visible immediately rather
+                // than requiring a separate toggle discovery.
+                root.show-global-skills = true;
+                root.new-skill-requested(name, "global");
+            } else {
+                root.new-skill-requested(name, "project");
+            }
+        }
     }
 }

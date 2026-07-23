@@ -21,6 +21,12 @@ export component IconButton inherits Rectangle {
 
     width: btn-width;
     height: btn-height;
+    // Fixed hit target: never let stretch layouts (sidebar title rows,
+    // header bars) steal space from these and squeeze the icon away.
+    // (Slint forbids min-width alongside an explicit width, so stretch
+    // zero is the lever that keeps preferred size.)
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
     border-radius: Theme.radius-sm;
     background: (active || touch.has-hover) ? Theme.bg-primary-container : transparent;
     animate background { duration: 100ms; }

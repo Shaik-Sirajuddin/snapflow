@@ -399,6 +399,11 @@ slint::include_modules!();
 
 struct SpikePlatform {
     window: Rc<MinimalSoftwareWindow>,
+    // Set once at construction, true for the very first `SpikePlatform`
+    // ever created in this process, false for every one after it. See
+    // `new_event_loop_proxy`'s doc comment for why this must be a
+    // per-*instance* flag, not a per-*call* one.
+    is_first_platform: bool,
 }
 
 impl Platform for SpikePlatform {
@@ -416,7 +421,34 @@ impl Platform for SpikePlatform {
     // animations, see its own doc comment) drains it, so spawned local
     // futures actually make progress on this crate's one Rust thread
     // without needing Slint's own `run_event_loop()`.
+    //
+    // Must return `Some` for every call from the first-ever `SpikePlatform`
+    // instance (real production has exactly one, for its whole lifetime,
+    // and `Context::spawn_local` calls this fresh on every single
+    // `spawn_local` invocation -- see `i-slint-core-1.17.1/future.rs`'s
+    // `spawn_local_with_ctx`, which never caches the result), but `None`
+    // for every call from any *later* instance: `slint::platform::
+    // set_platform` stores its own `SlintContext` in a `thread_local!`
+    // (fine -- a fresh one per test thread, since `TestPanel::new()`
+    // constructs a whole new `SpikePlatform` per libtest-spawned test
+    // thread), but it also forwards this return value into
+    // `EVENTLOOP_PROXY`, a `static OnceCell` at the Slint-core level that
+    // is genuinely process-global, not per-thread. Returning `Some` from
+    // a second instance's `set_platform` call makes that `OnceCell::set`
+    // fail, which `set_platform` surfaces as `SetPlatformError::
+    // AlreadySet` for that *whole* call -- indistinguishable from (and
+    // easily misread as) the platform itself already being set, but
+    // really just this one proxy-registration cell colliding. Only the
+    // first-ever instance can win that registration anyway, and only
+    // that instance is ever the one a real `SLINT_MCP_PORT`-driven
+    // process needs a working proxy for (every other instance only
+    // exists inside this crate's own test suite, which never sets
+    // `SLINT_MCP_PORT`), so declining unconditionally for every later
+    // instance loses no functionality.
     fn new_event_loop_proxy(&self) -> Option<Box<dyn EventLoopProxy>> {
+        if !self.is_first_platform {
+            return None;
+        }
         Some(Box::new(SpikeEventLoopProxy))
     }
 }
@@ -1003,14 +1035,38 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 return window.clone();
             }
             let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
+            static FIRST_PLATFORM_CLAIMED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let is_first_platform = !FIRST_PLATFORM_CLAIMED
+                .swap(true, std::sync::atomic::Ordering::SeqCst);
             slint::platform::set_platform(Box::new(SpikePlatform {
                 window: window.clone(),
+                is_first_platform,
             }))
             .expect("panel-rust: set_platform must only be called once per process");
             // See the `component.window().show()` call below (right after
             // `ChatPanel::new()`) for why that call, not this one, is what
             // actually makes the MCP server's HTTP listener start.
-            let _ = i_slint_backend_testing::mcp_server::init();
+            //
+            // Must run at most once per *process*, not once per thread:
+            // `PLATFORM_WINDOW` above is `thread_local!`, so this branch is
+            // re-entered on every fresh OS thread that calls
+            // `panel_rust_create` for the first time on that thread --
+            // harmless in production (one long-lived thread), but
+            // `TestPanel::new()` in this crate's own test suite constructs
+            // many panels, each on its own libtest-spawned thread. Calling
+            // `mcp_server::init()` again on a second thread registers a
+            // process-wide hook that holds the first thread's platform/
+            // window state alive past that thread's exit, which then makes
+            // *this exact* `set_platform` call above panic
+            // (`AlreadySet`) for the *next* test thread instead of
+            // succeeding the way it always did before this hook existed --
+            // a real regression this `Once` guard closes without changing
+            // the single-process production behavior at all.
+            static MCP_SERVER_INIT: std::sync::Once = std::sync::Once::new();
+            MCP_SERVER_INIT.call_once(|| {
+                let _ = i_slint_backend_testing::mcp_server::init();
+            });
             *platform_window = Some(window.clone());
             window
         });
@@ -1105,12 +1161,28 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
             })
             .unwrap_or_default();
+        // Cold-start seed when panel-state has no prior threads.
+        // RUI_SEED_THREADS:
+        //   unset  -> DEFAULT_THREAD_NAMES (product v1 fixtures)
+        //   "0"    -> single empty "Chat" (dev/VNC: no fake stale-looking titles)
+        //   "1".."N" -> first N of DEFAULT_THREAD_NAMES (capped)
+        // setup-followups stale_threads_not_torn_down_after_testing: VNC
+        // harnesses must set RUI_SEED_THREADS=0 so restarts don't look like
+        // leftover work ("Fix timeline crash" et al.) and only open one session.
         let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
-            DEFAULT_THREAD_NAMES
-                .iter()
+            let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
+                Ok(v) if v.trim() == "0" => vec!["Chat"],
+                Ok(v) => {
+                    let n = v.trim().parse::<usize>().unwrap_or(DEFAULT_THREAD_NAMES.len());
+                    DEFAULT_THREAD_NAMES.iter().copied().take(n).collect()
+                }
+                Err(_) => DEFAULT_THREAD_NAMES.to_vec(),
+            };
+            seed_names
+                .into_iter()
                 .enumerate()
                 .map(|(idx, name)| ThreadSpec {
-                    display_name: (*name).to_owned(),
+                    display_name: name.to_owned(),
                     provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
                     session_id: None,
                     profile_name: None,
@@ -1918,6 +1990,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        panel.component.on_profile_selected(move |profile_name| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_profile_selected(panel, profile_name.to_string());
+                }
+            });
+        });
+
         let component_weak = panel.component.as_weak();
         panel
             .component
@@ -2483,23 +2563,21 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         };
         let frame_changed = dispatch::dispatch_frame_poll(panel);
         let animating = panel.window.window().has_active_animations();
-        // chat_area.slint's `live-flow-timer` (the traveling pulse on the
-        // last row of a streaming/cancelling thread) is a plain `Timer`
-        // mutating `flow-t`, not a Slint `animate`/`@keyframes` block, so
-        // `has_active_animations()` never reports it active even though
-        // `update_timers_and_animations()` above ticks it every poll.
-        // Without repainting on that condition the pulse only advanced on
-        // some unrelated repaint (a mouse move), looking frozen otherwise.
-        let live_tail_pulsing = {
+        // audit-fixes animation_tick_loaders: progress bar, live-tail
+        // pulse, and loaders are driven by `animation-tick()`, not
+        // `animate` keyframes. `has_active_animations()` does not always
+        // report that path as active, so without an explicit busy-thread
+        // repaint the tick only advances on unrelated input (mouse move)
+        // and the UI looks frozen. Any Loading/Cancelling thread (not
+        // only the displayed one) needs continuous redraw so sidebar
+        // spinners on other rows keep spinning too.
+        let busy_thread_animating = {
             let model = panel.model.borrow();
-            model
-                .displayed_thread
-                .and_then(|idx| model.threads.get(idx))
-                .is_some_and(|thread| {
-                    matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
-                })
+            model.threads.iter().any(|thread| {
+                matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+            })
         };
-        frame_changed || animating || live_tail_pulsing
+        frame_changed || animating || busy_thread_animating
     })
 }
 
@@ -2990,6 +3068,8 @@ mod keyboard_shortcut_tests {
             model: "".into(),
             project_name: "".into(),
             project_path: "".into(),
+            profile_name: "".into(),
+            has_session: false,
         }
     }
 

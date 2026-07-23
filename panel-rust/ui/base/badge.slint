@@ -12,6 +12,7 @@ export component Badge inherits Rectangle {
     in property <length> border-w: 1px;
     in property <length> font-size: 9px;
     in property <string> badge-font-family: Theme.font-mono;
+    in property <int> badge-font-weight: 400;
     in property <length> pad-h: 6px;
     in property <length> pad-v: 2px;
 
@@ -30,6 +31,7 @@ export component Badge inherits Rectangle {
             color: root.fg;
             font-family: root.badge-font-family;
             font-size: root.font-size * Theme.font-scale;
+            font-weight: root.badge-font-weight;
             vertical-alignment: center;
         }
     }

@@ -7,7 +7,8 @@ import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider 
 import { SettingsSearchBar } from "../components/search_bar.slint";
 import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { TextUtil } from "../../../base/text_util.slint";
+import { SelectableChip } from "../../../base/selectable_chip.slint";
 
 // Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
 // former `components/settings_sheet.slint` that is agent/profile/session
@@ -29,8 +30,15 @@ export component AgentsView inherits Rectangle {
     in property <[ProfileOption]> available-profiles: [];
     in property <[AgentCatalogEntry]> agent-catalog: [];
     in property <[RemoteSessionOption]> recoverable-sessions: [];
-    // See FilterSearchBar.input-has-focus's doc comment.
-    out property <bool> search-has-focus: agent-search-bar.input-has-focus;
+    // See FilterSearchBar.input-has-focus's doc comment. Also covers the
+    // plain TextField instances below (default-profile/permission-profile)
+    // -- those never had any focus state to aggregate here at all until
+    // TextField.has-focus was added (see its own doc comment), which had
+    // silently dropped every keystroke typed into either field.
+    out property <bool> search-has-focus:
+        agent-search-bar.input-has-focus
+        || default-profile-field.has-focus
+        || permission-profile-field.has-focus;
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -58,15 +66,40 @@ export component AgentsView inherits Rectangle {
     // two-step confirm rather than an immediate delete.
     property <string> profile-pending-delete: "";
 
-    // Agents-grid-local search -- scoped to just this grid, separate from
-    // the page-level `SettingsSearchBar` in `settings_page.slint` (which
-    // filters nothing yet either, per that component's own doc comment --
-    // Slint's `string` type has no `contains`/`index-of` builtin, so real
-    // substring filtering needs a small Rust-side helper; wiring the query
-    // itself now and leaving actual filtering for that later pass, same
-    // posture the page-level bar already takes).
+    // Agents-grid-local search -- scoped to this grid (not the page-level
+    // SettingsSearchBar). Uses TextUtil.matches-filter (Rust contains-ci)
+    // against each card's name + id, same helper as sidebar thread/skill
+    // search. Empty query shows the full catalog.
     property <string> agent-search-query: "";
+    // Page-level SettingsSearchBar (settings_page_search_filter).
+    in property <string> page-search-query: "";
     in-out property <string> default-agent-id: "";
+
+    pure function agent-matches(index: int) -> bool {
+        if (index < 0 || index >= root.agent-catalog.length) {
+            return false;
+        }
+        if (root.agent-search-query == "" && root.page-search-query == "") {
+            return true;
+        }
+        // Match name or id (name may be empty for some catalog rows).
+        // Inline hay twice — SharedString is moved into matches-filter.
+        if (root.agent-search-query != ""
+            && !TextUtil.matches-filter(
+                root.agent-catalog[index].name + "\n" + root.agent-catalog[index].id,
+                root.agent-search-query,
+            )) {
+            return false;
+        }
+        if (root.page-search-query != ""
+            && !TextUtil.matches-filter(
+                root.agent-catalog[index].name + "\n" + root.agent-catalog[index].id,
+                root.page-search-query,
+            )) {
+            return false;
+        }
+        return true;
+    }
 
     background: transparent;
 
@@ -78,7 +111,7 @@ export component AgentsView inherits Rectangle {
         SettingsField {
             width: parent.width;
             label: "Profile";
-            TextField {
+            default-profile-field := TextField {
                 text <=> root.default-profile;
                 field-accessible-label: "Default profile";
                 field-font-size: 12px;
@@ -103,35 +136,18 @@ export component AgentsView inherits Rectangle {
                     // accessible-element geometry (see the original of
                     // this row, `components/settings_sheet.slint`, for the
                     // bisection that found this).
-                    width: profile-chip-label.preferred-width + Metrics.pad-lg
+                    width: profile-chip.content-width + Metrics.pad-lg
                         + Metrics.space-1
                         + (root.profile-pending-delete == profile.name ? 114px : 20px);
                     HorizontalLayout {
                         spacing: Metrics.space-1;
-                        Rectangle {
-                            width: profile-chip-label.preferred-width + Metrics.pad-lg;
-                            height: 24px;
-                            background: profile.name == root.default-profile ? Theme.bg-primary : Theme.bg-sidebar;
-                            border-color: Theme.border-default;
-                            border-width: 1px;
-                            border-radius: Theme.radius-sm;
-                            TouchArea {
-                                accessible-role: button;
-                                accessible-label: "Select profile " + profile.name;
-                                accessible-action-default => { root.default-profile = profile.name; }
-                                clicked => { root.default-profile = profile.name; }
-                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                            }
-                            profile-chip-label := Text {
-                                text: profile.name
-                                    + (profile.terminal-enabled ? " T" : "")
-                                    + (profile.fs-enabled ? " F" : "");
-                                color: profile.name == root.default-profile ? Theme.text-on-primary : Theme.text-primary;
-                                font-family: Theme.font-mono;
-                                font-size: 10px * Theme.font-scale;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
+                        profile-chip := SelectableChip {
+                            label: profile.name
+                                + (profile.terminal-enabled ? " T" : "")
+                                + (profile.fs-enabled ? " F" : "");
+                            selected: profile.name == root.default-profile;
+                            button-accessible-label: "Select profile " + profile.name;
+                            clicked => { root.default-profile = profile.name; }
                         }
                         if root.profile-pending-delete != profile.name : Button {
                             label: "\u{2715}";
@@ -266,7 +282,7 @@ export component AgentsView inherits Rectangle {
         SettingsField {
             width: parent.width;
             label: "Permission profile";
-            TextField {
+            permission-profile-field := TextField {
                 text <=> root.permission-profile;
                 field-accessible-label: "Permission profile";
                 field-font-size: 12px;
@@ -279,6 +295,8 @@ export component AgentsView inherits Rectangle {
 
         agent-search-bar := SettingsSearchBar {
             width: parent.width;
+            placeholder: "Search agents...";
+            bar-accessible-label: "Search agents";
             query <=> root.agent-search-query;
         }
 
@@ -317,8 +335,14 @@ export component AgentsView inherits Rectangle {
         // divider slicing through a row anyway. Making the default agent
         // *physically jump* to the top on toggle (vs. the connected-status
         // grouping here) would need a real reorder primitive Slint doesn't
-        // have and is deferred to a Rust-side ordering pass -- the default
+        // have, and is deferred to a Rust-side ordering pass -- the default
         // card still reads as default via its own tint wherever it sits.
+        //
+        // SEARCH FILTER: rows/cards that fail `agent-matches` are omitted
+        // via `if` (not merely zero-height), so a filtered grid collapses
+        // cleanly instead of leaving empty slots. The installed/uninstalled
+        // divider is suppressed while a query is active -- partial rows
+        // make the status boundary ambiguous.
         //
         VerticalLayout {
             width: parent.width;
@@ -339,16 +363,24 @@ export component AgentsView inherits Rectangle {
             for row-idx in row-count : VerticalLayout {
                 spacing: Metrics.space-6;
                 property <int> first-agent-index: row-idx * cards-per-row;
+                property <bool> first-visible: root.agent-matches(first-agent-index);
+                property <bool> second-visible:
+                    cards-per-row == 2
+                    && first-agent-index + 1 < root.agent-catalog.length
+                    && root.agent-matches(first-agent-index + 1);
+                property <bool> row-visible: first-visible || second-visible;
 
-                if root.agent-catalog[first-agent-index].status != "installed"
+                if row-visible
+                    && root.agent-search-query == ""
+                    && root.agent-catalog[first-agent-index].status != "installed"
                     && (first-agent-index == 0 || root.agent-catalog[first-agent-index - 1].status == "installed")
                     : SettingsDivider { width: parent.width; }
 
-                HorizontalLayout {
+                if row-visible : HorizontalLayout {
                     spacing: Metrics.space-6;
                     alignment: start;
 
-                    AgentCard {
+                    if first-visible : AgentCard {
                         agent-id: root.agent-catalog[first-agent-index].id;
                         agent-name: root.agent-catalog[first-agent-index].name != ""
                             ? root.agent-catalog[first-agent-index].name : root.agent-catalog[first-agent-index].id;
@@ -365,7 +397,7 @@ export component AgentsView inherits Rectangle {
                         set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index].id, new-enabled); }
                     }
 
-                    if cards-per-row == 2 && first-agent-index + 1 < root.agent-catalog.length : AgentCard {
+                    if second-visible : AgentCard {
                         agent-id: root.agent-catalog[first-agent-index + 1].id;
                         agent-name: root.agent-catalog[first-agent-index + 1].name != ""
                             ? root.agent-catalog[first-agent-index + 1].name : root.agent-catalog[first-agent-index + 1].id;
@@ -382,6 +414,43 @@ export component AgentsView inherits Rectangle {
                         set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index + 1].id, new-enabled); }
                     }
                 }
+            }
+        }
+
+        SettingsDivider { width: parent.width; }
+
+        // Recovery/import section (Coverage Matrix `session/list` row):
+        // real remote gateway sessions not currently bound to any local
+        // thread row, for the active thread's own provider. Ported from
+        // the dead components/settings_sheet.slint -- the
+        // recoverable-sessions property and recover-session-attach
+        // callback were already fully plumbed through this view (and
+        // down into lib.rs/dispatch.rs) but never actually rendered here
+        // after the settings-pane-redesign migration, so this whole
+        // feature was silently unreachable from the live UI despite
+        // looking fully wired at the Msg/Effect level (found via a real
+        // e2e test's "Attach recovered session" assertion never matching
+        // anything). Attaching binds via `session/load`, never
+        // `session/new` (`AgentBridge::add_thread_recovering_session`).
+        SettingsSectionHeader { text: "Recoverable Sessions"; subsection: true; }
+        if root.recoverable-sessions.length == 0 : Text {
+            text: "No orphaned sessions for this provider.";
+            color: Theme.text-muted;
+            font-size: 10px * Theme.font-scale;
+        }
+        for session in root.recoverable-sessions : SettingsRow {
+            label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
+            row-height: 26px;
+            Button {
+                label: "Attach";
+                button-accessible-label: "Attach recovered session " + session.session-id;
+                btn-width: 52px;
+                btn-height: 20px;
+                font-size: 9px;
+                font-weight: 400;
+                bg: Theme.bg-card;
+                fg: Theme.text-secondary;
+                clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
             }
         }
     }

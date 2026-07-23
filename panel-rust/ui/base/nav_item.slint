@@ -1,0 +1,77 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { Icon } from "./icon.slint";
+import { HoverSurface } from "./hover.slint";
+
+// Layer 3 (base) -- the repeated "nav tab" shape hand-rolled per item in
+// `pages/settings/components/left_tabs.slint` (4x) and `top_tabs.slint`
+// (2x): a Rectangle with active/hover tint, a TouchArea wired to
+// CursorHost + accessible-role button, and an optional icon + label Text.
+// Built on `base/hover.slint`'s `HoverSurface` (its `hover-bg` is
+// generalized here to the 50%-alpha inactive-hover tint, while
+// `selected`/`selected-bg` carries the solid active fill) rather than
+// duplicating the TouchArea/CursorHost/background wiring a second time.
+//
+// Icon is passed in as an already-resolved `image` (via `@image-url(...)`
+// at the call site), not a string name -- see `icon.slint`'s own comment:
+// `@image-url` requires a compile-time-constant literal path, so it can't
+// be resolved dynamically from a `for` loop keyed by id/label.
+export component NavItem inherits HoverSurface {
+    in property <string> label;
+    in property <bool> active: false;
+
+    // Layout flags -- `left_tabs.slint` shows icon+label (expanded) or
+    // icon-only centered (collapsed); `top_tabs.slint` shows a centered
+    // label with no icon at all.
+    in property <bool> show-icon: false;
+    in property <bool> show-label: true;
+    in property <bool> centered: false;
+    in property <image> icon-source;
+    in property <length> icon-size: 14px;
+    in property <length> label-font-size: 11px;
+    in property <int> label-font-weight-active: 700;
+    in property <int> label-font-weight-inactive: 400;
+    in property <length> content-padding-left: Metrics.space-3;
+    in property <length> content-spacing: Metrics.space-3;
+    // Overridable text/icon color pair -- default matches every
+    // pill-shaped call site (left_tabs/top_tabs); `sidebar.slint`'s
+    // Threads/Skills toggle has no pill background at all and needs its
+    // own active/inactive colors instead.
+    in property <color> active-color: Theme.text-primary;
+    in property <color> inactive-color: Theme.text-secondary;
+    // `left_tabs.slint`/`top_tabs.slint` need this row to fill whatever
+    // width its container (top-down) already gave it -- without this,
+    // the inner HorizontalLayout sizes to its own natural content width
+    // instead (same class of bug `settings_row.slint`'s own comment
+    // describes). `sidebar.slint`'s Threads/Skills toggle is the
+    // opposite: two content-sized labels side by side, no forced fill.
+    in property <bool> fill-width: true;
+
+    border-radius: Theme.radius-sm;
+    selected: root.active;
+    selected-bg: Theme.bg-primary-container;
+    hover-bg: Theme.bg-primary-container.with-alpha(0.5);
+    button-accessible-label: root.label;
+
+    HorizontalLayout {
+        width: root.fill-width ? parent.width : self.preferred-width;
+        height: parent.height;
+        alignment: root.centered ? center : start;
+        padding-left: (root.centered || !root.show-icon) ? 0px : root.content-padding-left;
+        spacing: (root.show-icon && root.show-label) ? root.content-spacing : 0px;
+
+        if root.show-icon : Icon {
+            source: root.icon-source;
+            size: root.icon-size;
+            color: root.active ? root.active-color : root.inactive-color;
+        }
+        if root.show-label : Text {
+            text: root.label;
+            color: root.active ? root.active-color : root.inactive-color;
+            font-size: root.label-font-size * Theme.font-scale;
+            font-weight: root.active ? root.label-font-weight-active : root.label-font-weight-inactive;
+            horizontal-alignment: root.centered ? center : left;
+            vertical-alignment: center;
+        }
+    }
+}

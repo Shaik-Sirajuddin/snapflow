@@ -191,9 +191,9 @@ pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usi
         settings_gateway_snapshot,
         ..crate::msg::FrameInput::default()
     });
-    debug_assert!(dirty
-        .iter()
-        .all(|d| matches!(d, Dirty::Scalar(ScalarField::SelectedThread))));
+    // May also clear messages/terminals/pending/compose on real switch
+    // (leak_audit_report thread_switch_sync_clear_models).
+    let _ = dirty;
 }
 
 /// Wired from `component.on_thread_navigation_requested`. `delta` is
@@ -216,9 +216,7 @@ pub(crate) fn dispatch_thread_navigate(panel: &PanelSingleton, delta: i32) {
         settings_gateway_snapshot,
         ..crate::msg::FrameInput::default()
     });
-    debug_assert!(dirty
-        .iter()
-        .all(|d| matches!(d, Dirty::Scalar(ScalarField::SelectedThread))));
+    let _ = dirty;
 }
 
 pub(crate) fn dispatch_thread_recover_session_attach(
@@ -896,6 +894,14 @@ pub(crate) fn dispatch_mode_selected(
         Msg::Ui(UiMsg::Settings(SettingsMsg::ModeSelected(mode_id.clone()))),
     );
     let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_profile_selected(panel: &PanelSingleton, profile_name: String) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(profile_name))),
+    );
     execute_effects(panel, effects);
 }
 

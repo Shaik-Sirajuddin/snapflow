@@ -183,10 +183,9 @@ pub fn save_document(path: &Path, doc: &SettingsDocument) -> Result<(), Settings
             path: tmp.clone(),
             source,
         })?;
-        f.sync_all().map_err(|source| SettingsFileError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
+        // audit-fixes offload_persist_sync_all: skip fsync on settings
+        // write (UI-path latency); atomic rename is enough for small JSON.
+        drop(f);
     }
     fs::rename(&tmp, path).map_err(|source| SettingsFileError::Io {
         path: path.to_path_buf(),

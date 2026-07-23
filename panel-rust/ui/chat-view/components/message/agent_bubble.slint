@@ -2,14 +2,20 @@ import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { MessageItem } from "../../../types.slint";
 import { MarkdownView } from "../../../base/markdown_view.slint";
+import { CollapseExpand } from "../../../base/collapse_expand.slint";
+import { HoverSurface } from "../../../base/hover.slint";
 
 // Agent / thinking bubble — chat-items-redesign.md #3 / #10.
 // Agent: elevated fill, no label, 3-corner radius (bottom-left cut).
-// Thinking: transparent, muted, no card chrome.
+// Thinking: collapsible block (collapsed by default), muted header + body.
 // Body: streaming MarkdownView (visual lines from `markdown.rs`).
 export component AgentBubble inherits Rectangle {
     in property <MessageItem> item;
     callback link-clicked(string);
+    // Shared with tool-call expand state (MessageItem.expanded / index
+    // round-trip through ChromeMsg::ToggleExpanded). Only meaningful for
+    // thinking rows; agent rows ignore it.
+    callback toggle-expanded(int);
 
     property <bool> is-thinking: item.kind == "thinking";
     property <bool> is-agent: item.kind == "agent";
@@ -26,8 +32,67 @@ export component AgentBubble inherits Rectangle {
     border-bottom-right-radius: is-thinking ? 0px : Theme.radius-lg;
 
     content := VerticalLayout {
+        // Stretch the body across the full bubble width. MarkdownView
+        // left-packs its runs *inside* that full width (see its module
+        // comment). Using `alignment: start` here was wrong for the
+        // default case: VerticalLayout's cross-axis start shrink-wraps
+        // children to preferred-width, so a short agent reply becomes a
+        // narrow column that a parent stretch layout then re-centers —
+        // the classic "md looks centered" regression.
+        alignment: stretch;
         padding: is-thinking ? Metrics.space-2 : Metrics.space-4;
-        Flickable {
+        spacing: is-thinking ? Metrics.space-2 : 0px;
+
+        // Thinking header — always visible; click toggles the body.
+        if is-thinking : HoverSurface {
+            height: 22px;
+            border-radius: Theme.radius-sm;
+            button-accessible-label: item.expanded
+                ? "Collapse thinking"
+                : "Expand thinking";
+            clicked => { root.toggle-expanded(item.index); }
+            HorizontalLayout {
+                padding-left: Metrics.space-2;
+                padding-right: Metrics.space-2;
+                spacing: Metrics.space-2;
+                Text {
+                    // Chevron: ▶ collapsed, ▼ expanded.
+                    text: item.expanded ? "\u{25BC}" : "\u{25B6}";
+                    color: Theme.text-muted;
+                    font-size: 9px * Theme.font-scale;
+                    font-family: Theme.font-mono;
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+                Text {
+                    text: "Thinking";
+                    color: Theme.text-muted;
+                    font-size: 11px * Theme.font-scale;
+                    font-family: Theme.font-sans;
+                    font-weight: 600;
+                    font-italic: true;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                // One-line preview while collapsed so the block isn't a
+                // mystery empty chevron row.
+                if !item.expanded && item.text != "" : Text {
+                    text: item.text;
+                    color: Theme.text-tertiary;
+                    font-size: 10px * Theme.font-scale;
+                    font-family: Theme.font-sans;
+                    font-italic: true;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                    max-width: 220px;
+                }
+            }
+        }
+
+        // Agent body always open; thinking body animates open/closed via
+        // CollapseExpand (real `animate height`, not a Timer).
+        if is-agent : Flickable {
             height: md.preferred-height;
             viewport-height: md.preferred-height;
             horizontal-stretch: 1;
@@ -36,10 +101,31 @@ export component AgentBubble inherits Rectangle {
             md := MarkdownView {
                 width: parent.width;
                 row-width: parent.width;
-                // Agent rows carry pre-parsed lines; thinking falls back
-                // to plain text (empty lines model).
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
                 lines: item.markdown-lines;
                 fallback-text: item.text;
+            }
+        }
+
+        if is-thinking : CollapseExpand {
+            open: item.expanded;
+            Flickable {
+                height: think-md.preferred-height;
+                viewport-height: think-md.preferred-height;
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                think-md := MarkdownView {
+                    width: parent.width;
+                    row-width: parent.width;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    lines: item.markdown-lines;
+                    fallback-text: item.text;
+                }
             }
         }
     }
