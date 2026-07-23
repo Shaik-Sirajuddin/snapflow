@@ -112,8 +112,22 @@ else
   echo "warning: no .sha256 found for this asset, skipping checksum verification" >&2
 fi
 
+# On an upgrade (not a fresh install), keep exactly one backup of the
+# previous bundle before wiping it -- not a version history, just a
+# bounded safety net so a botched extraction (disk full mid-write, a
+# killed process) doesn't leave the user with nothing to fall back to.
+# $INSTALL_DIR only ever holds static application content (binaries,
+# models, shaders, licenses) -- real user/project data lives entirely
+# under SNAPSHOTD_HOME (~/.snapshotd by default), a separate tree this
+# script never touches, so this backup is about install resilience, not
+# user-data preservation.
+if [ -d "$INSTALL_DIR" ]; then
+  info "Backing up previous install to $INSTALL_DIR.prev..."
+  rm -rf "$INSTALL_DIR.prev"
+  mv "$INSTALL_DIR" "$INSTALL_DIR.prev"
+fi
+
 info "Extracting to $INSTALL_DIR..."
-rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$archive" -C "$INSTALL_DIR" --strip-components=1
 echo "$target_version" > "$VERSION_FILE"

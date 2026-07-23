@@ -1,0 +1,36 @@
+# Systemd-capable variant to exercise install.sh's REAL setup_linux_service
+# path (systemctl --user enable --now snapflowd), instead of a hand-run
+# `snapflowd serve` (see the plain Dockerfile for that simpler scenario).
+#
+# systemd as PID 1 inside Docker is the fragile part here: it needs real
+# cgroup access and a dbus user-session stack, which is why run-test-systemd.sh
+# runs this container with --privileged + cgroup passthrough rather than the
+# plain `docker run` the other scenario uses, and drives the actual test
+# steps via `docker exec` (this image's ENTRYPOINT is systemd itself, not a
+# test script).
+FROM ubuntu:24.04
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        systemd systemd-sysv dbus dbus-user-session \
+        curl ca-certificates tar coreutils procps sudo && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Strip units we don't need in a container and that fail/hang boot
+    # (real hardware/network/getty targets) -- standard "systemd in
+    # Docker" trimming.
+    rm -f /lib/systemd/system/multi-user.target.wants/* && \
+    rm -f /etc/systemd/system/*.wants/* && \
+    rm -f /lib/systemd/system/local-fs.target.wants/* && \
+    rm -f /lib/systemd/system/sockets.target.wants/*udev* && \
+    rm -f /lib/systemd/system/sockets.target.wants/*initctl* && \
+    rm -f /lib/systemd/system/basic.target.wants/* && \
+    rm -f /lib/systemd/system/anaconda.target.wants/*
+
+RUN useradd -m -s /bin/bash tester && \
+    echo "tester ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/tester
+
+COPY --chown=tester:tester scripts/install.sh /home/tester/install.sh
+RUN chmod +x /home/tester/install.sh
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

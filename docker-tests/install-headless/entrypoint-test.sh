@@ -134,5 +134,60 @@ else
   kill -9 "$SNAPFLOWD_PID" 2>/dev/null || true
 fi
 
+# ── Phase: upgrade scenario -- backup + user-data preservation ─────────
+# Proves two things for real, not just by reading the code: (1) install.sh
+# now backs up the previous bundle before overwriting it on upgrade, and
+# (2) upgrading never touches real user/daemon data (SNAPSHOTD_HOME is a
+# separate tree install.sh doesn't manage at all).
+UPGRADE_ARTIFACT="$(find /artifact -maxdepth 1 -iname '*upgrade-test-v2*.tar.gz' | head -n1)"
+if [ -z "$UPGRADE_ARTIFACT" ]; then
+  fail "no upgrade-test-v2 artifact found under /artifact -- skipping upgrade scenario"
+else
+  MARKER="$SNAPSHOTD_HOME/USER_DATA_MARKER"
+  mkdir -p "$SNAPSHOTD_HOME"
+  echo "this-represents-real-user-project-data-$(date +%s)" > "$MARKER"
+  marker_before="$(cat "$MARKER")"
+  echo "==> Planted user-data marker: $marker_before"
+
+  INSTALL_DIR="$HOME/.local/share/snapflow"
+  OLD_BIN_CHECKSUM="$(sha256sum "$INSTALL_DIR/bin/snapflowd" 2>/dev/null | cut -d' ' -f1)"
+
+  export SNAPFLOW_ASSET_URL="file://$UPGRADE_ARTIFACT"
+  echo "==> Running install.sh again as an upgrade (SNAPFLOW_ASSET_URL=$SNAPFLOW_ASSET_URL)"
+  if bash /home/tester/install.sh; then
+    pass "upgrade install.sh run exited 0"
+  else
+    fail "upgrade install.sh run exited non-zero ($?)"
+  fi
+
+  if [ -x "$BIN_DIR/snapflowd" ] && [ -x "$BIN_DIR/snapflow" ]; then
+    pass "post-upgrade: both binaries still present and executable"
+  else
+    fail "post-upgrade: snapflowd/snapflow binary missing or not executable"
+  fi
+
+  if [ -d "$INSTALL_DIR.prev" ] && [ -x "$INSTALL_DIR.prev/bin/snapflowd" ]; then
+    prev_checksum="$(sha256sum "$INSTALL_DIR.prev/bin/snapflowd" | cut -d' ' -f1)"
+    if [ -n "$OLD_BIN_CHECKSUM" ] && [ "$prev_checksum" = "$OLD_BIN_CHECKSUM" ]; then
+      pass "$INSTALL_DIR.prev exists and contains the real previous bundle (checksum matches pre-upgrade binary)"
+    else
+      fail "$INSTALL_DIR.prev exists but its snapflowd checksum ($prev_checksum) doesn't match the pre-upgrade one ($OLD_BIN_CHECKSUM)"
+    fi
+  else
+    fail "$INSTALL_DIR.prev missing or doesn't contain a valid backed-up bundle after upgrade"
+  fi
+
+  if [ -f "$MARKER" ]; then
+    marker_after="$(cat "$MARKER")"
+    if [ "$marker_after" = "$marker_before" ]; then
+      pass "user-data marker under \$SNAPSHOTD_HOME survived the upgrade unchanged: $marker_after"
+    else
+      fail "user-data marker changed across upgrade: before='$marker_before' after='$marker_after'"
+    fi
+  else
+    fail "user-data marker under \$SNAPSHOTD_HOME was deleted by the upgrade"
+  fi
+fi
+
 echo "==> Summary: $FAILURES failure(s)"
 exit "$FAILURES"
