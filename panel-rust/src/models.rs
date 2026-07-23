@@ -53,6 +53,7 @@ fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
                         italic: r.italic,
                         code: r.code,
                         strike: r.strike,
+                        link: r.link.into(),
                     })
                     .collect::<Vec<_>>(),
             )),

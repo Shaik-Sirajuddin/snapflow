@@ -217,6 +217,8 @@ export component ChatPanel inherits Window {
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
     callback mcp-server-authenticate(string);
+    // Phase 17: host opens files/URLs from markdown Ctrl+Click.
+    callback md-link-activated(string);
     callback mcp-server-tool-enabled-changed(string, string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
@@ -488,6 +490,7 @@ export component ChatPanel inherits Window {
                 // Live values from the bridge: "Live connection" (WS interactive)
                 // counts as live; "HTTP fallback"/"Connecting..." do not.
                 project-mcp-live: connection-status == "Live connection";
+                md-link-activated(target) => { root.md-link-activated(target); }
                 connection-status: connection-status;
                 last-error: last-error;
                 error-banner-dismissed => { error-banner-dismissed(); }

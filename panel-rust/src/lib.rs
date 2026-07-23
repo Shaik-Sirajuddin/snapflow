@@ -1640,6 +1640,12 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 });
             });
 
+        panel
+            .component
+            .on_md_link_activated(move |target| {
+                open_md_link_target(target.as_str());
+            });
+
         let component_weak = panel.component.as_weak();
         panel
             .component
@@ -3467,5 +3473,29 @@ mod keyboard_shortcut_tests {
             "Ctrl+B's real control-character text (\\u{{2}}) must still toggle the sidebar \
              once map_qt_key recovers the plain letter"
         );
+    }
+}
+
+
+/// Phase 17 (`markdown_highlight_and_real_links`): opens a Ctrl+Clicked
+/// markdown link target -- file paths and external URLs both go through
+/// the platform opener (`xdg-open` on Linux). `RUI_LINK_OPEN_CMD`
+/// overrides the command for e2e tests, which point it at a recorder
+/// script and assert the exact target that was passed through.
+pub(crate) fn open_md_link_target(target: &str) {
+    let target = target.trim();
+    if target.is_empty() {
+        return;
+    }
+    let opener = std::env::var("RUI_LINK_OPEN_CMD").unwrap_or_else(|_| "xdg-open".to_string());
+    match std::process::Command::new(&opener)
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => {}
+        Err(error) => eprintln!("panel-rust: failed to open link {target:?} via {opener:?}: {error}"),
     }
 }

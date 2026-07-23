@@ -70,6 +70,9 @@ export struct MarkdownRun {
     italic: bool,
     code: bool,
     strike: bool,
+    // Phase 17: link target ("" = not a link). Styled Theme.md-link and
+    // Ctrl+Click opens it (files locally, URLs in the system browser).
+    link: string,
 }
 
 export struct MarkdownLine {

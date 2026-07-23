@@ -10,6 +10,8 @@ import { HoverSurface } from "../../../base/hover.slint";
 // Thinking: collapsible block (collapsed by default), muted header + body.
 // Body: streaming MarkdownView (visual lines from `markdown.rs`).
 export component AgentBubble inherits Rectangle {
+    // Phase 17: markdown link Ctrl+Click, bubbled to the host opener.
+    callback link-activated(string);
     in property <MessageItem> item;
     callback link-clicked(string);
     // Shared with tool-call expand state (MessageItem.expanded / index
@@ -99,6 +101,7 @@ export component AgentBubble inherits Rectangle {
             preferred-width: 0px;
             min-width: 0px;
             md := MarkdownView {
+                link-activated(target) => { root.link-activated(target); }
                 width: parent.width;
                 row-width: parent.width;
                 horizontal-stretch: 1;
@@ -118,6 +121,7 @@ export component AgentBubble inherits Rectangle {
                 preferred-width: 0px;
                 min-width: 0px;
                 think-md := MarkdownView {
+                    link-activated(target) => { root.link-activated(target); }
                     width: parent.width;
                     row-width: parent.width;
                     horizontal-stretch: 1;

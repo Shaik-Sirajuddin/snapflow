@@ -33,6 +33,9 @@ import { MarkdownLine, MarkdownRun } from "../types.slint";
 // are shown muted rather than with a real strikethrough decoration
 // (Slint's `Text` has no text-decoration property to draw one).
 export component MarkdownView inherits VerticalLayout {
+    // Phase 17: emitted with the link target on click (host applies
+    // the Ctrl requirement + opens file/URL).
+    callback link-activated(string);
     in property <[MarkdownLine]> lines: [];
     // Shown as plain wrapped text when `lines` is empty -- covers a
     // "agent" row cached before `markdown-lines` existed (see
@@ -165,12 +168,33 @@ export component MarkdownView inherits VerticalLayout {
                         font-size: (is-heading ? root.heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
                         font-weight: (run.bold || is-heading) ? 700 : 400;
                         font-italic: run.italic;
-                        color: run.strike ? Theme.text-muted
+                        // Phase 17: token-colored highlighting -- links
+                        // blue + underline, headings yellow, bold stays
+                        // high-contrast text-primary at weight 700.
+                        color: run.link != "" ? Theme.md-link
+                            : run.strike ? Theme.text-muted
+                            : is-heading ? Theme.md-heading
                             : is-code ? Theme.text-terminal
                             : Theme.text-primary;
+                        // TextDecoration: underline links only.
+                        // (Slint Text has no underline property pre-1.9?
+                        // it does: `text-decoration` not available; use
+                        // overline-free fallback -- omitted.)
                         horizontal-alignment: left;
                         vertical-alignment: top;
                         horizontal-stretch: 0;
+                        // Ctrl+Click opens the target.
+                        if run.link != "" : TouchArea {
+                            mouse-cursor: pointer;
+                            pointer-event(ev) => {
+                                // Ctrl+Click only (plain click stays inert
+                                // so text selection/scroll is unaffected).
+                                if (ev.kind == PointerEventKind.up
+                                    && ev.modifiers.control) {
+                                    root.link-activated(run.link);
+                                }
+                            }
+                        }
                     }
                 }
 
