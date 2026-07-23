@@ -13,6 +13,7 @@
 
 use acpx_conductor::SpawnSpec;
 use acpx_core::router::Router;
+use acpx_core::LifecycleConfig;
 use serde_json::json;
 
 /// Replies to `session/new` with a fixed backend session id
@@ -206,6 +207,74 @@ async fn session_list_with_a_profile_selector_resolves_through_the_same_profile_
         2,
         "an _acpx.profile selector should reach the same stand-in backend's real \
          session/list reply as an _acpx.agentId selector does: {sessions:?}"
+    );
+}
+
+/// **`bound_new_registrations_per_session_list_call`.** A backend that
+/// reports far more sessions in one `session/list` reply than the
+/// configured `max_new_sessions_per_list_call` cap (mirroring the real
+/// live incident: `claude-agent-acp`, a globally-shared tool, reporting
+/// its entire cross-project session history in a single call) must only
+/// have the first `cap` *novel* sessions registered/translated -- the
+/// rest are dropped from the response, never silently registered, and
+/// never an error.
+#[tokio::test]
+async fn session_list_with_a_selector_stops_registering_new_sessions_once_the_per_call_cap_is_hit()
+{
+    let five_sessions_script = r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q 'session/list'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessions":[{"sessionId":"backend-1","cwd":"/a"},{"sessionId":"backend-2","cwd":"/b"},{"sessionId":"backend-3","cwd":"/c"},{"sessionId":"backend-4","cwd":"/d"},{"sessionId":"backend-5","cwd":"/e"}]}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+    let mut router = Router::new("stand-in-agent")
+        .with_lifecycle_config(LifecycleConfig {
+            max_new_sessions_per_list_call: Some(2),
+            ..Default::default()
+        });
+    router.register_agent(
+        "stand-in-agent",
+        SpawnSpec::new("sh", vec!["-c".to_string(), five_sessions_script.to_string()]),
+    );
+
+    let list_response = router
+        .dispatch(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/list",
+            "params": {"_acpx": {"agentId": "stand-in-agent"}}
+        }))
+        .await
+        .expect("session/list");
+    let sessions = list_response["result"]["sessions"]
+        .as_array()
+        .expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        2,
+        "only the first 2 (the configured cap) of the 5 reported sessions should be \
+         registered and surfaced -- the rest must be dropped, not silently registered: \
+         {sessions:?}"
+    );
+
+    // The gateway aggregate (no `_acpx` selector) reads straight from the
+    // real `SessionRegistry`, not the backend's reply -- confirming the
+    // cap actually stopped registrations rather than merely trimming the
+    // *response*.
+    let aggregate_response = router
+        .dispatch(json!({"jsonrpc": "2.0", "id": 2, "method": "session/list", "params": {}}))
+        .await
+        .expect("session/list (aggregate)");
+    let aggregate_sessions = aggregate_response["result"]["sessions"]
+        .as_array()
+        .expect("sessions array");
+    assert_eq!(
+        aggregate_sessions.len(),
+        2,
+        "the tenant's real registered-session count must reflect the cap, not the full \
+         5 the backend reported: {aggregate_sessions:?}"
     );
 }
 
