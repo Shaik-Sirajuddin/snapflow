@@ -2,6 +2,7 @@ import { Theme } from "../../tokens/theme.slint";
 import { Metrics } from "../../tokens/metrics.slint";
 import { Icon } from "../../base/icon.slint";
 import { IconButton } from "../../base/icon_button.slint";
+import { TextPillButton } from "../../base/text_pill_button.slint";
 import { CursorHost } from "../../tokens/cursor_host.slint";
 
 // Skill editor -- `active_pane_and_editor_view` phase. Replaces
@@ -119,98 +120,20 @@ export component SkillEditorView inherits Rectangle {
 
                     // Variable-width text actions — token-colored pills
                     // (Button is fixed-width; long "Open in …" labels need flex).
-                    copy-path-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        horizontal-stretch: 0;
-                        accessible-role: button;
-                        accessible-label: "Copy skill path";
-                        accessible-action-default => { root.copy-path-requested(); }
+                    TextPillButton {
+                        label: "Copy path";
+                        button-accessible-label: "Copy skill path";
                         clicked => { root.copy-path-requested(); }
-                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                        Rectangle {
-                            background: copy-path-touch.has-hover
-                                ? Theme.bg-primary-container
-                                : Theme.bg-primary-container.with-alpha(0.6);
-                            border-width: 1px;
-                            border-color: Theme.border-default;
-                            border-radius: Theme.radius-sm;
-                            HorizontalLayout {
-                                padding-left: Metrics.space-2;
-                                padding-right: Metrics.space-2;
-                                padding-top: Metrics.space-1;
-                                padding-bottom: Metrics.space-1;
-                                Text {
-                                    text: "Copy path";
-                                    color: Theme.text-secondary;
-                                    font-size: 9px * Theme.font-scale;
-                                    font-family: Theme.font-sans;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
                     }
-                    for editor-name in root.detected-editors : ed-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        horizontal-stretch: 0;
-                        accessible-role: button;
-                        accessible-label: "Open in " + editor-name;
-                        accessible-action-default => { root.open-in-editor-requested(editor-name); }
+                    for editor-name in root.detected-editors : TextPillButton {
+                        label: "Open in " + editor-name;
+                        button-accessible-label: "Open in " + editor-name;
                         clicked => { root.open-in-editor-requested(editor-name); }
-                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                        Rectangle {
-                            background: ed-touch.has-hover
-                                ? Theme.bg-primary-container
-                                : Theme.bg-primary-container.with-alpha(0.6);
-                            border-width: 1px;
-                            border-color: Theme.border-default;
-                            border-radius: Theme.radius-sm;
-                            HorizontalLayout {
-                                padding-left: Metrics.space-2;
-                                padding-right: Metrics.space-2;
-                                padding-top: Metrics.space-1;
-                                padding-bottom: Metrics.space-1;
-                                Text {
-                                    text: "Open in " + editor-name;
-                                    color: Theme.text-secondary;
-                                    font-size: 9px * Theme.font-scale;
-                                    font-family: Theme.font-sans;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
                     }
-                    open-default-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        horizontal-stretch: 0;
-                        accessible-role: button;
-                        accessible-label: "Open with OS default application";
-                        accessible-action-default => { root.open-with-os-default-requested(); }
+                    TextPillButton {
+                        label: "Open";
+                        button-accessible-label: "Open with OS default application";
                         clicked => { root.open-with-os-default-requested(); }
-                        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                        Rectangle {
-                            background: open-default-touch.has-hover
-                                ? Theme.bg-primary-container
-                                : Theme.bg-primary-container.with-alpha(0.6);
-                            border-width: 1px;
-                            border-color: Theme.border-default;
-                            border-radius: Theme.radius-sm;
-                            HorizontalLayout {
-                                padding-left: Metrics.space-2;
-                                padding-right: Metrics.space-2;
-                                padding-top: Metrics.space-1;
-                                padding-bottom: Metrics.space-1;
-                                Text {
-                                    text: "Open";
-                                    color: Theme.text-secondary;
-                                    font-size: 9px * Theme.font-scale;
-                                    font-family: Theme.font-sans;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
                     }
                     IconButton {
                         button-accessible-label: "Close skill editor";
