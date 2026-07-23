@@ -3,7 +3,7 @@ import { Metrics } from "../../../tokens/metrics.slint";
 import { MessageItem } from "../../../types.slint";
 import { MarkdownView } from "../../../base/markdown_view.slint";
 import { CollapseExpand } from "../../../base/collapse_expand.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { HoverSurface } from "../../../base/hover.slint";
 
 // Agent / thinking bubble — chat-items-redesign.md #3 / #10.
 // Agent: elevated fill, no label, 3-corner radius (bottom-left cut).
@@ -44,23 +44,13 @@ export component AgentBubble inherits Rectangle {
         spacing: is-thinking ? Metrics.space-2 : 0px;
 
         // Thinking header — always visible; click toggles the body.
-        if is-thinking : Rectangle {
+        if is-thinking : HoverSurface {
             height: 22px;
-            background: think-header.has-hover ? Theme.bg-primary-container : transparent;
-            animate background { duration: 100ms; }
             border-radius: Theme.radius-sm;
-            think-header := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: item.expanded
-                    ? "Collapse thinking"
-                    : "Expand thinking";
-                accessible-action-default => { root.toggle-expanded(item.index); }
-                clicked => { root.toggle-expanded(item.index); }
-                changed has-hover => {
-                    CursorHost.kind = self.has-hover ? "pointer" : "default";
-                }
-            }
+            button-accessible-label: item.expanded
+                ? "Collapse thinking"
+                : "Expand thinking";
+            clicked => { root.toggle-expanded(item.index); }
             HorizontalLayout {
                 padding-left: Metrics.space-2;
                 padding-right: Metrics.space-2;

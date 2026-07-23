@@ -308,6 +308,13 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
                 .collect_thread_list_snapshot(),
         ),
+        // Same catalog pull recover_session does: ensures compose Provider
+        // has profiles even if the periodic frame path has not filled them
+        // yet (cold start, settings never opened).
+        settings_gateway_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
 
@@ -1247,11 +1254,17 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
         }
         _ => return false,
     }
+    // Since the thread-switch leak fix (worktree-slint-dedup, adopted in
+    // the consolidation merge), a switch legitimately dirties the
+    // compose draft and the per-thread panels (pending request,
+    // terminals, error) alongside the selection scalar -- the invariant
+    // worth keeping is that a switch command MARKS the selection dirty,
+    // not that it marks nothing else.
     debug_assert!(
         command == crate::PANEL_COMMAND_OPEN_THREAD_SEARCH
             || dirty
                 .iter()
-                .all(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))
+                .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))
     );
     true
 }
@@ -1320,6 +1333,15 @@ mod tests {
             Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(1))),
         );
         assert_eq!(model.selected_thread, 0);
-        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+        // A thread switch is no longer a bare SelectedThread scalar:
+        // since the thread-switch leak fix (worktree-slint-dedup,
+        // adopted in the consolidation merge) switching also restores
+        // the target thread's compose draft and refreshes its
+        // per-thread panels. The wrap-around behavior under test only
+        // requires that the selection scalar is among the dirty items.
+        assert!(
+            dirty.contains(&Dirty::Scalar(ScalarField::SelectedThread)),
+            "wrap must mark SelectedThread dirty, got {dirty:?}"
+        );
     }
 }

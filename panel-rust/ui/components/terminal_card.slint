@@ -2,7 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { TerminalItem } from "../types.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
+import { TerminalHeader } from "../base/terminal_header.slint";
 
 // Real embedded terminal view -- Phase 4 terminal-view addition. Two
 // components:
@@ -39,58 +39,17 @@ export component TerminalCard inherits Rectangle {
     VerticalLayout {
         padding: Metrics.space-4;
         spacing: Metrics.space-2;
-        Rectangle {
-            height: 18px;
-            background: terminal-expand.has-hover ? Theme.bg-primary-container : transparent;
-            animate background { duration: 100ms; }
-            terminal-expand := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Expand terminal " + item.terminal-id;
-                accessible-action-default => { expand(); }
-                clicked => { expand(); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            HorizontalLayout {
-                spacing: Metrics.space-3;
-                Text {
-                    text: "\u{2318}"; // terminal glyph stand-in
-                    color: Theme.bg-primary;
-                    font-size: 11px * Theme.font-scale;
-                    vertical-alignment: center;
-                }
-                Text {
-                    text: "terminal " + item.terminal-id;
-                    color: Theme.text-primary;
-                    font-family: Theme.font-mono;
-                    font-size: 10px * Theme.font-scale;
-                    font-weight: 700;
-                    horizontal-stretch: 1;
-                    preferred-width: 0px;
-                    min-width: 0px;
-                    overflow: elide;
-                    vertical-alignment: center;
-                }
-                if item.has-exited : Text {
-                    text: "exit " + item.exit-code;
-                    color: Theme.text-muted;
-                    font-family: Theme.font-mono;
-                    font-size: 9px * Theme.font-scale;
-                    vertical-alignment: center;
-                }
-                if !item.has-exited : Text {
-                    text: "running";
-                    color: Theme.text-secondary;
-                    font-family: Theme.font-mono;
-                    font-size: 9px * Theme.font-scale;
-                    vertical-alignment: center;
-                }
-                Text {
-                    text: "\u{2922}"; // expand glyph
-                    color: Theme.text-muted;
-                    font-size: 11px * Theme.font-scale;
-                    vertical-alignment: center;
-                }
+        TerminalHeader {
+            title: "terminal " + item.terminal-id;
+            status-text: item.has-exited ? "exit " + item.exit-code : "running";
+            status-color: item.has-exited ? Theme.text-muted : Theme.text-secondary;
+            button-accessible-label: "Expand terminal " + item.terminal-id;
+            clicked => { expand(); }
+            Text {
+                text: "\u{2922}"; // expand glyph
+                color: Theme.text-muted;
+                font-size: 11px * Theme.font-scale;
+                vertical-alignment: center;
             }
         }
         Flickable {

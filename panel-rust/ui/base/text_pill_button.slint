@@ -1,0 +1,38 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { HoverSurface } from "./hover.slint";
+
+// Layer 3 (base) -- the variable-width clickable text pill hand-rolled
+// 3x in `pages/skills/skill_view.slint`'s editor header (copy-path,
+// one per detected editor in a `for` loop, open-with-OS-default): a
+// bordered token-tinted box with a small label. Neither `Button`
+// (fixed-width) nor `IconButton` (icon-only) fits labels like "Open in
+// Visual Studio Code" that need to size to their own content. Builds on
+// `HoverSurface` (idle-bg/hover-bg carry the two alpha states the
+// original hand-rolled pill used) rather than its own TouchArea.
+export component TextPillButton inherits HoverSurface {
+    in property <string> label;
+
+    horizontal-stretch: 0;
+    idle-bg: Theme.bg-primary-container.with-alpha(0.6);
+    hover-bg: Theme.bg-primary-container;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-sm;
+    button-accessible-label: root.label;
+
+    HorizontalLayout {
+        padding-left: Metrics.space-2;
+        padding-right: Metrics.space-2;
+        padding-top: Metrics.space-1;
+        padding-bottom: Metrics.space-1;
+        Text {
+            text: root.label;
+            color: Theme.text-secondary;
+            font-size: 9px * Theme.font-scale;
+            font-family: Theme.font-sans;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}

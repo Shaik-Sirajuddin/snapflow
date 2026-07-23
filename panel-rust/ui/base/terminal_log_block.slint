@@ -1,0 +1,54 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+
+// Layer 3 (base) -- the bordered mono/terminal output box hand-rolled 3x:
+// twice in `chat-view/components/execution/api_call_view.slint` (INPUT
+// and OUTPUT), once in `components/message_card.slint`'s expanded
+// tool-call log body. The first two scroll via `Flickable` and never
+// elide (raw payload, want it all); the third doesn't scroll and elides
+// instead (log preview inline in the card) -- both are still the same
+// bordered box + mono `Text` shape, just parameterized by `scrollable`.
+export component TerminalLogBlock inherits Rectangle {
+    in property <string> text;
+    in property <length> content-padding: Metrics.space-2;
+    in property <length> font-size: 10px;
+    in property <bool> scrollable: true;
+    in property <TextOverflow> text-overflow: clip;
+
+    background: Theme.bg-terminal;
+    border-color: Theme.border-terminal;
+    border-width: 1px;
+    border-radius: Theme.radius-sm;
+
+    VerticalLayout {
+        padding: root.content-padding;
+
+        if root.scrollable : Flickable {
+            height: scroll-text.preferred-height;
+            viewport-height: scroll-text.preferred-height;
+            scroll-text := Text {
+                text: root.text;
+                font-family: Theme.font-mono;
+                font-size: root.font-size * Theme.font-scale;
+                color: Theme.text-terminal;
+                wrap: word-wrap;
+                horizontal-alignment: left;
+                vertical-alignment: top;
+                width: parent.width;
+            }
+        }
+        if !root.scrollable : Text {
+            text: root.text;
+            font-family: Theme.font-mono;
+            font-size: root.font-size * Theme.font-scale;
+            color: Theme.text-terminal;
+            wrap: word-wrap;
+            overflow: root.text-overflow;
+            horizontal-alignment: left;
+            vertical-alignment: top;
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+        }
+    }
+}

@@ -615,6 +615,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             }
             thread.error = None;
             thread.state = ThreadState::Loading;
+            thread.agent_content_this_turn = false;
             // Sending resumes auto-processing after a manual stop.
             thread.send_queue.resume();
             (
@@ -1555,17 +1556,55 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                         thread.message_ids.push(message_id.clone());
                     }
                 }
+                // Visible output only: thinking/thought chunks don't
+                // count -- the live failure this flag exists for (see
+                // `ThreadModel::agent_content_this_turn`'s doc comment)
+                // streamed reasoning summaries and then ended with no
+                // message or tool call at all.
+                if matches!(
+                    message.kind,
+                    crate::protocol_types::MessageKind::Agent
+                        | crate::protocol_types::MessageKind::ToolCall
+                ) {
+                    thread.agent_content_this_turn = true;
+                }
                 dirty.push(Dirty::MessageAppended {
                     thread_id: thread.thread_id.clone(),
                 });
             }
             crate::protocol_types::AgentEvent::TurnEnded(reason) => {
+                // Captured BEFORE the Idle reset below: only a turn this
+                // session itself was generating on (Loading, and a
+                // cancel is the user's own doing) qualifies for the
+                // empty-turn notice -- a TurnEnded relayed while already
+                // Idle (e.g. replay after a reconnect) must not
+                // fabricate a notice about a turn we never watched
+                // start.
+                let was_generating = matches!(thread.state, ThreadState::Loading);
                 thread.state = ThreadState::Idle;
                 thread.error = None;
                 crate::trace_host_input(format_args!(
                     "turn ended thread={} reason={:?}",
                     bridge_event.thread_index, reason
                 ));
+                // A turn that ends without ANY visible agent output is
+                // indistinguishable from a hang in the UI -- surface it
+                // explicitly (error card; state stays Idle so the user
+                // can just re-send).
+                if was_generating && !thread.agent_content_this_turn {
+                    let message = format!(
+                        "Agent ended its turn without a response (stopReason: {reason}). \
+                         Check gateway-{}.stderr.log in the chat cache directory for \
+                         backend diagnostics.",
+                        thread.provider
+                    );
+                    thread.error = Some(message.clone());
+                    dirty.push(Dirty::Error {
+                        thread_id: thread.thread_id.clone(),
+                        detail: ErrorDetail { message },
+                    });
+                }
+                thread.agent_content_this_turn = false;
                 if let Some(entry) = thread
                     .send_queue
                     .on_generation_stopped(false)
@@ -2425,6 +2464,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_turn_while_generating_surfaces_an_explicit_notice() {
+        // The live failure this guards (2026-07-23): a provider-side
+        // tool_search bug ended every MCP-needing codex turn after only
+        // reasoning -- no message, no tool call -- and the UI showed
+        // nothing, indistinguishable from a hang.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0].agent_content_this_turn = false;
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        // State stays Idle (user can just re-send), but the empty turn
+        // is called out via the error surface.
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        let error = model.threads[0].error.as_deref().expect("empty-turn notice set");
+        assert!(error.contains("without a response"), "got: {error}");
+        assert!(
+            dirty.iter().any(|d| matches!(d, Dirty::Error { .. })),
+            "expected a Dirty::Error for the notice"
+        );
+    }
+
+    #[test]
     fn queue_cancel_removes_entry_and_rebuilds_message_rows() {
         let mut model = model_with_threads(&["a"]);
         model.threads[0].state = ThreadState::Loading;
@@ -2464,6 +2533,45 @@ mod tests {
             dirty.iter().any(|d| matches!(d, Dirty::MessagesDiff { .. })),
             "cancel must rebuild message rows, got {dirty:?}"
         );
+    }
+
+    #[test]
+    fn turn_with_agent_content_ends_without_any_notice() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0].agent_content_this_turn = true;
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        assert!(model.threads[0].error.is_none());
+        assert!(!dirty.iter().any(|d| matches!(d, Dirty::Error { .. })));
+    }
+
+    #[test]
+    fn turn_ended_while_already_idle_never_fabricates_a_notice() {
+        // Replayed/late TurnEnded (reconnect) on a thread this session
+        // never watched generate must not invent an empty-turn error.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Idle;
+        let (_effects, _dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("late".to_owned()),
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        assert!(model.threads[0].error.is_none());
     }
 
     #[test]
@@ -2625,6 +2733,36 @@ mod tests {
             "paused queue must not auto-send after stop, got {effects2:?}"
         );
         assert_eq!(model.threads[0].send_queue.len(), 1);
+    }
+
+    #[test]
+    fn cancelled_empty_turn_never_fires_the_empty_turn_notice() {
+        // Interaction between setup-followups' queue-stop semantics and
+        // main's empty-turn notice (adopted during the worktree
+        // consolidation merge): a user-initiated stop ends the turn from
+        // Cancelling with no agent output -- that is the user's own
+        // doing, not a silent failure, so the "ended without a
+        // response" notice must stay silent. Only a turn that dies from
+        // Loading qualifies.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Cancelling;
+        model.threads[0].agent_content_this_turn = false;
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("cancelled".to_owned()),
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        assert!(
+            model.threads[0].error.is_none(),
+            "user-cancelled empty turn must not fabricate a notice"
+        );
+        assert!(!dirty.iter().any(|d| matches!(d, Dirty::Error { .. })));
     }
 
     #[test]

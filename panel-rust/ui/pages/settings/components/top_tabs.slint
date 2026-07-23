@@ -1,6 +1,5 @@
-import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { NavItem } from "../../../base/nav_item.slint";
 
 // Settings page chrome -- the `[Project | Global]` scope switcher from the
 // settings-pane-redesign plan's "Component layout" section. Project is the
@@ -17,53 +16,25 @@ export component SettingsTopTabs inherits Rectangle {
         alignment: start;
         spacing: Metrics.space-2;
 
-        Rectangle {
+        NavItem {
             width: 72px;
-            border-radius: Theme.radius-sm;
-            background: root.scope == "project"
-                ? Theme.bg-primary-container
-                : (project-tab.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
-            animate background { duration: 100ms; }
-            project-tab := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Show project settings";
-                accessible-action-default => { root.scope-selected("project"); }
-                clicked => { root.scope-selected("project"); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            Text {
-                text: "Project";
-                color: root.scope == "project" ? Theme.text-primary : Theme.text-secondary;
-                font-size: 11px * Theme.font-scale;
-                font-weight: 600;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
+            label: "Project";
+            button-accessible-label: "Show project settings";
+            active: root.scope == "project";
+            centered: true;
+            label-font-weight-active: 600;
+            label-font-weight-inactive: 600;
+            clicked => { root.scope-selected("project"); }
         }
-        Rectangle {
+        NavItem {
             width: 72px;
-            border-radius: Theme.radius-sm;
-            background: root.scope == "global"
-                ? Theme.bg-primary-container
-                : (global-tab.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
-            animate background { duration: 100ms; }
-            global-tab := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Show global settings";
-                accessible-action-default => { root.scope-selected("global"); }
-                clicked => { root.scope-selected("global"); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            Text {
-                text: "Global";
-                color: root.scope == "global" ? Theme.text-primary : Theme.text-secondary;
-                font-size: 11px * Theme.font-scale;
-                font-weight: 600;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
+            label: "Global";
+            button-accessible-label: "Show global settings";
+            active: root.scope == "global";
+            centered: true;
+            label-font-weight-active: 600;
+            label-font-weight-inactive: 600;
+            clicked => { root.scope-selected("global"); }
         }
     }
 }

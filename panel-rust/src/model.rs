@@ -65,6 +65,15 @@ pub struct ThreadModel {
     pub session_id: Option<String>,
     pub state: ThreadState,
     pub error: Option<String>,
+    /// Whether any *visible agent output* (an agent message or tool call
+    /// -- deliberately not thinking/thought chunks) has arrived since
+    /// this thread's latest prompt was sent. Lets `update()`'s
+    /// `TurnEnded` arm surface an explicit "the agent ended its turn
+    /// without a response" notice instead of silently going idle --
+    /// found live (2026-07-23): a provider-side tool_search bug ended
+    /// every MCP-needing codex turn after only reasoning, and the UI
+    /// showed nothing at all, indistinguishable from a hang.
+    pub agent_content_this_turn: bool,
     pub send_queue: SendQueue,
     /// Per-thread compose draft (leak_audit_report §2.5 / §4.2). The
     /// global `Model::compose_text` is only the *active* buffer for the
@@ -171,6 +180,7 @@ impl Default for ThreadModel {
             session_id: None,
             state: ThreadState::Idle,
             error: None,
+            agent_content_this_turn: false,
             send_queue: SendQueue::default(),
             compose_draft: String::new(),
             closed: false,

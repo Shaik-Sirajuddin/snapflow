@@ -3,7 +3,7 @@ import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { AgentLogo } from "../components/agent_logo.slint";
 import { Button } from "../../../base/button.slint";
-import { Toggle } from "../../../base/toggle.slint";
+import { ResetOnFlipToggle } from "../../../base/reset_on_flip_toggle.slint";
 
 // Grid tile for the Agents view -- one per catalog entry (auto-discovered
 // or installable), per the settings-pane-redesign plan's "Agents view is a
@@ -156,28 +156,15 @@ export component AgentCard inherits Rectangle {
                 font-size: 10px * Theme.font-scale;
                 vertical-alignment: center;
             }
-            // Split into two `if` branches (rather than one `Toggle`
-            // with `checked: root.is-default`) so the whole element gets
-            // destroyed and recreated -- and its `checked` binding fully
-            // reset -- whenever `is-default` flips. `Toggle.checked` is
-            // `in-out` and self-assigns on click (`toggle.slint`'s own
-            // `clicked` handler does `root.checked = !root.checked`),
-            // which is fine for `Toggle`'s other, single-instance,
-            // self-managed call sites (e.g. the MCP-server enable
-            // toggles), but a plain one-way `checked: root.is-default`
-            // binding gets permanently severed the first time a user
-            // clicks it -- so clicking a *different* card's default
-          // toggle afterward never turned this one back off, letting
-            // more than one card show as default at once. This is the
-            // reason "the default agent should only be one" broke.
-            if root.is-default : Toggle {
-                checked: true;
-                toggle-accessible-label: "Unset " + root.agent-name + " as default agent";
-                toggled(new-checked) => { root.set-default(new-checked); }
-            }
-            if !root.is-default : Toggle {
-                checked: false;
-                toggle-accessible-label: "Set " + root.agent-name + " as default agent";
+            // See base/reset_on_flip_toggle.slint's doc comment for why a
+            // plain one-way `Toggle { checked: root.is-default; }` broke
+            // "the default agent should only be one" (Toggle.checked is
+            // in-out and self-assigns on click, permanently severing a
+            // one-way binding the first time a user clicks it).
+            ResetOnFlipToggle {
+                checked: root.is-default;
+                toggle-accessible-label-on: "Unset " + root.agent-name + " as default agent";
+                toggle-accessible-label-off: "Set " + root.agent-name + " as default agent";
                 toggled(new-checked) => { root.set-default(new-checked); }
             }
         }
@@ -193,14 +180,10 @@ export component AgentCard inherits Rectangle {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-            if root.enabled : Toggle {
-                checked: true;
-                toggle-accessible-label: "Disable " + root.agent-name;
-                toggled(new-checked) => { root.set-enabled(new-checked); }
-            }
-            if !root.enabled : Toggle {
-                checked: false;
-                toggle-accessible-label: "Enable " + root.agent-name;
+            ResetOnFlipToggle {
+                checked: root.enabled;
+                toggle-accessible-label-on: "Disable " + root.agent-name;
+                toggle-accessible-label-off: "Enable " + root.agent-name;
                 toggled(new-checked) => { root.set-enabled(new-checked); }
             }
         }

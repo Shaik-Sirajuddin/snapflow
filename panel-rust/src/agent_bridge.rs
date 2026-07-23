@@ -642,6 +642,33 @@ pub fn provider_for_index(idx: usize) -> &'static str {
     }
 }
 
+/// TRANSITIONAL (`thread_provider_model_binding_fix`): normalizes a
+/// caller-supplied provider/agent identifier to one of the two gateway
+/// keys this bridge currently provisions ("codex"/"claude"). Exists
+/// only because those keys are NOT real acpx registry ids
+/// (registry.fallback.json defines `codex-acp`/`claude-acp`/`gemini`),
+/// so a registry id arriving from settings (a real
+/// settings.global.json carried `default_agent_id: "claude-acp"`) needs
+/// mapping -- and the previous exact-match check silently DROPPED such
+/// ids and fell back to the index-parity rotation, binding an
+/// explicitly-claude thread to codex with no error.
+///
+/// The agreed end-state (recorded in the
+/// worktree-consolidation-and-provider-binding plan) removes this
+/// function entirely: agent-agnostic selection per the ACP protocol
+/// through acpx -- one gateway, thread providers ARE registry agent ids
+/// from `agents/list`, and per-session agent selection goes through
+/// acpx's native `profiles/create {agent_id}` + `session/new
+/// {_acpx.profile}` (proven live by the e2e harness's agent-driven
+/// export phase), with no per-provider string handling anywhere.
+pub fn normalize_provider(id: &str) -> &'static str {
+    if id.to_ascii_lowercase().contains("claude") {
+        "claude"
+    } else {
+        "codex"
+    }
+}
+
 /// Resolves the dev-checkout `acpx-server` binary path: `RUI_ACPX_SERVER_BIN`
 /// env override, else a path relative to this crate's own
 /// `CARGO_MANIFEST_DIR`, matching the same convention
@@ -1387,8 +1414,38 @@ fn spawn_gateway_process(
         // Disabled here since this spawn path never needs or uses it.
         .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    // Gateway stderr goes to a per-provider log file in the cache dir,
+    // NOT /dev/null: acpx-server's tracing output AND every backend
+    // adapter's inherited stderr flow through it (acpx-conductor spawns
+    // backends with Stdio::inherit for stderr) -- discarding it left a
+    // real mid-turn agent failure (the bifrost tool_search dead-turn,
+    // 2026-07-23) with literally zero diagnostics anywhere on disk,
+    // costing a full forensic session to what one log line would have
+    // answered. Truncated on each gateway spawn so it stays bounded by
+    // one gateway lifetime; falls back to null only if the file can't
+    // be created (never blocks the spawn itself).
+    // Without RUST_LOG, acpx-server's tracing subscriber emits nothing at
+    // all -- an empty log file is barely better than /dev/null. INFO is
+    // acpx-server's own documented operational level (startup config,
+    // per-request router lines, backend spawn failures); an operator's
+    // explicit RUST_LOG still wins.
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info");
+    }
+    let stderr_log = resolve_cache_dir().join(format!("gateway-{provider}.stderr.log"));
+    match std::fs::File::create(&stderr_log) {
+        Ok(file) => {
+            cmd.stderr(file);
+        }
+        Err(error) => {
+            eprintln!(
+                "panel-rust: gateway stderr log unavailable ({error}); \
+                 falling back to discarding {provider} gateway stderr"
+            );
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
     // Only set ACPX_BACKEND_CMD when we have a real command to point it
     // at (an explicit override, or a dev-checkout mock binary confirmed
     // to actually exist) -- leaving it unset lets acpx-server fall back
@@ -2305,9 +2362,26 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        let provider = preferred_provider
-            .filter(|provider| self.gateway_urls.contains_key(*provider))
-            .unwrap_or_else(|| provider_for_index(idx));
+        // `thread_provider_model_binding_fix`: a requested provider is
+        // NEVER silently dropped. Any non-empty request normalizes to
+        // one of the two real gateway keys (see `normalize_provider`);
+        // if that gateway genuinely isn't provisioned the caller gets a
+        // real error instead of a thread quietly bound to the rotation's
+        // pick -- the exact "selected claude-acp, codex-acp underneath"
+        // failure reported live on the VNC demo.
+        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => {
+                let normalized = normalize_provider(requested);
+                if !self.gateway_urls.contains_key(normalized) {
+                    return Err(BridgeError::Gateway(format!(
+                        "requested provider {requested:?} (normalized {normalized:?}) has no \
+                         provisioned gateway; refusing to silently bind another provider"
+                    )));
+                }
+                normalized
+            }
+            None => provider_for_index(idx),
+        };
         let base_url =
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
@@ -5607,6 +5681,20 @@ done
     fn slug_collapses_non_alphanumerics_and_lowercases() {
         assert_eq!(slug("Fix timeline crash"), "fix-timeline-crash");
         assert_eq!(slug("Export pipeline bug!"), "export-pipeline-bug");
+    }
+
+    #[test]
+    fn normalize_provider_maps_registry_ids_onto_gateway_keys() {
+        // thread_provider_model_binding_fix: registry ids (the values a
+        // real settings.global.json/default-agent picker persists) must
+        // resolve to the gateway actually serving that family -- the
+        // old exact-match filter dropped them silently and the rotation
+        // bound the thread to whatever parity said.
+        assert_eq!(normalize_provider("claude"), "claude");
+        assert_eq!(normalize_provider("claude-acp"), "claude");
+        assert_eq!(normalize_provider("Claude-ACP"), "claude");
+        assert_eq!(normalize_provider("codex"), "codex");
+        assert_eq!(normalize_provider("codex-acp"), "codex");
     }
 
     #[test]

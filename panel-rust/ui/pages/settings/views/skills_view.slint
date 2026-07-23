@@ -38,15 +38,8 @@ export component SkillsView inherits Rectangle {
 
         SettingsSectionHeader { text: "Skills"; }
 
-        HorizontalLayout {
-            spacing: Metrics.gap-sm;
-            Text {
-                text: "Show global skills";
-                color: Theme.text-secondary;
-                font-size: 11px * Theme.font-scale;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
+        SettingsRow {
+            label: "Show global skills";
             Toggle {
                 checked: root.show-global-skills;
                 toggle-accessible-label: "Toggle global skills visibility";
@@ -54,15 +47,8 @@ export component SkillsView inherits Rectangle {
             }
         }
 
-        HorizontalLayout {
-            spacing: Metrics.gap-sm;
-            Text {
-                text: "Dev mode";
-                color: Theme.text-secondary;
-                font-size: 11px * Theme.font-scale;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
+        SettingsRow {
+            label: "Dev mode";
             Toggle {
                 checked: root.dev-mode;
                 toggle-accessible-label: "Toggle dev mode";

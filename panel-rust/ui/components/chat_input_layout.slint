@@ -6,6 +6,7 @@ import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { ContextRing } from "../base/context_ring.slint";
 import { Toggle } from "../base/toggle.slint";
 import { TextUtil } from "../base/text_util.slint";
+import { MentionPickRow } from "../base/mention_pick_row.slint";
 import { DropdownEntry, SkillOption, McpServerOption } from "../types.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
@@ -692,9 +693,40 @@ export component ChatInputLayout inherits Rectangle {
         // center so geometric midlines match. Do not stretch items.
         // Do NOT clip this row: SearchableDropdown popups are children of
         // the trigger and must paint outside the 24px band. Narrow-dock
-        // cutoff is handled by row2-compact + trigger-min-width shrink.
-        HorizontalLayout {
+        // cutoff is handled by row2-compact + trigger-min-width shrink,
+        // plus (consolidation plan phase 10, min-width devices) a
+        // horizontal pan host: when the selector strip's natural width
+        // exceeds the dock, scrolling over it pans the strip so every
+        // control stays reachable. A plain Flickable can't be used --
+        // the dropdown popups are inline children painted UPWARD out of
+        // the 24px band and a Flickable always clips. Instead the host
+        // clips only while every popup is closed (is-open re-exports),
+        // and the pan offset clamps to the overflow range.
+        row2-host := Rectangle {
             width: 100%;
+            height: root.row2-h;
+            clip: !(profile-dropdown.is-open
+                || mode-dropdown.is-open
+                || config-dropdown.is-open
+                || reasoning-dropdown.is-open);
+            property <length> pan: 0px;
+            property <length> overflow: max(0px, row2-strip.preferred-width - self.width);
+            // Declared BEFORE the strip so every trigger keeps click
+            // priority; unconsumed scroll events fall through here.
+            row2-scroll := TouchArea {
+                width: 100%;
+                height: 100%;
+                scroll-event(e) => {
+                    if (row2-host.overflow > 0px) {
+                        row2-host.pan = max(-row2-host.overflow,
+                            min(0px, row2-host.pan + e.delta-x + e.delta-y));
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+        row2-strip := HorizontalLayout {
+            x: row2-host.overflow > 0px ? row2-host.pan : 0px;
             height: root.row2-h;
             preferred-height: root.row2-h;
             spacing: Metrics.gap-sm;
@@ -858,6 +890,7 @@ export component ChatInputLayout inherits Rectangle {
                 context-view-requested => { root.context-view-requested(); }
             }
         }
+        }
     }
 
     // / @ # suggestion popup — sibling of the main VerticalLayout so it
@@ -910,56 +943,18 @@ export component ChatInputLayout inherits Rectangle {
 
                     if root.token-prefix == "/" : VerticalLayout {
                         spacing: Metrics.space-1;
-                        for skill[i] in root.skill-options : Rectangle {
+                        for skill[i] in root.skill-options : MentionPickRow {
                             property <bool> hidden: root.row-hidden(skill.name, skill.description);
-                            property <bool> hi: !hidden && i == root.mention-sel;
                             height: hidden ? 0px : 28px;
-                            clip: true;
-                            background: hi ? Theme.bg-primary
-                                : sk-touch.has-hover ? Theme.bg-primary-container
-                                : transparent;
-                            border-radius: Theme.radius-sm;
-                            sk-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    root.mention-sel = i;
-                                    root.apply-mention-pick("/" + skill.name + " ");
-                                }
-                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                            }
-                            HorizontalLayout {
-                                width: 100%;
-                                height: 100%;
-                                padding-left: Metrics.space-4;
-                                padding-right: Metrics.space-4;
-                                spacing: Metrics.gap-md;
-                                alignment: stretch;
-                                cross-axis-alignment: center;
-                                Icon {
-                                    source: @image-url("../assets/icons/sparkles.svg");
-                                    size: Metrics.icon-sm;
-                                    color: hi ? Theme.text-on-primary : Theme.text-secondary;
-                                    horizontal-stretch: 0;
-                                    vertical-stretch: 0;
-                                }
-                                Text {
-                                    text: skill.name;
-                                    color: hi ? Theme.text-on-primary : Theme.text-primary;
-                                    font-size: 11px * Theme.font-scale;
-                                    font-family: Theme.font-sans;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 0;
-                                }
-                                Text {
-                                    text: skill.description;
-                                    color: hi ? Theme.text-on-primary.with-alpha(0.85) : Theme.text-muted;
-                                    font-size: 10px * Theme.font-scale;
-                                    font-family: Theme.font-sans;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                }
+                            highlighted: !hidden && i == root.mention-sel;
+                            show-icon: true;
+                            icon-source: @image-url("../assets/icons/sparkles.svg");
+                            title: skill.name;
+                            title-font-weight: 600;
+                            subtitle: skill.description;
+                            clicked => {
+                                root.mention-sel = i;
+                                root.apply-mention-pick("/" + skill.name + " ");
                             }
                         }
                         if root.skill-options.length == 0 : Text {
@@ -971,56 +966,18 @@ export component ChatInputLayout inherits Rectangle {
 
                     if root.token-prefix == "@" : VerticalLayout {
                         spacing: Metrics.space-1;
-                        for srv[i] in root.mcp-options : Rectangle {
+                        for srv[i] in root.mcp-options : MentionPickRow {
                             property <bool> hidden: root.row-hidden(srv.name, srv.command);
-                            property <bool> hi: !hidden && i == root.mention-sel;
                             height: hidden ? 0px : 28px;
-                            clip: true;
-                            background: hi ? Theme.bg-primary
-                                : mcp-touch.has-hover ? Theme.bg-primary-container
-                                : transparent;
-                            border-radius: Theme.radius-sm;
-                            mcp-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    root.mention-sel = i;
-                                    root.apply-mention-pick("@" + srv.name + " ");
-                                }
-                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                            }
-                            HorizontalLayout {
-                                width: 100%;
-                                height: 100%;
-                                padding-left: Metrics.space-4;
-                                padding-right: Metrics.space-4;
-                                spacing: Metrics.gap-md;
-                                alignment: stretch;
-                                cross-axis-alignment: center;
-                                Icon {
-                                    source: @image-url("../assets/icons/server.svg");
-                                    size: Metrics.icon-sm;
-                                    color: hi ? Theme.text-on-primary : Theme.text-secondary;
-                                    horizontal-stretch: 0;
-                                    vertical-stretch: 0;
-                                }
-                                Text {
-                                    text: srv.name;
-                                    color: hi ? Theme.text-on-primary : Theme.text-primary;
-                                    font-size: 11px * Theme.font-scale;
-                                    font-family: Theme.font-sans;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 0;
-                                }
-                                Text {
-                                    text: srv.command;
-                                    color: hi ? Theme.text-on-primary.with-alpha(0.85) : Theme.text-muted;
-                                    font-size: 10px * Theme.font-scale;
-                                    font-family: Theme.font-sans;
-                                    vertical-alignment: center;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                }
+                            highlighted: !hidden && i == root.mention-sel;
+                            show-icon: true;
+                            icon-source: @image-url("../assets/icons/server.svg");
+                            title: srv.name;
+                            title-font-weight: 600;
+                            subtitle: srv.command;
+                            clicked => {
+                                root.mention-sel = i;
+                                root.apply-mention-pick("@" + srv.name + " ");
                             }
                         }
                         if root.mcp-options.length == 0 : Text {
@@ -1032,38 +989,15 @@ export component ChatInputLayout inherits Rectangle {
 
                     if root.token-prefix == "#" : VerticalLayout {
                         spacing: Metrics.space-1;
-                        for f[i] in root.file-options : Rectangle {
+                        for f[i] in root.file-options : MentionPickRow {
                             property <bool> hidden: root.row-hidden(f, "");
-                            property <bool> hi: !hidden && i == root.mention-sel;
                             height: hidden ? 0px : 28px;
-                            clip: true;
-                            background: hi ? Theme.bg-primary
-                                : file-touch.has-hover ? Theme.bg-primary-container
-                                : transparent;
-                            border-radius: Theme.radius-sm;
-                            file-touch := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    root.mention-sel = i;
-                                    root.apply-mention-pick("#" + f + " ");
-                                }
-                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                            }
-                            HorizontalLayout {
-                                width: 100%;
-                                height: 100%;
-                                padding-left: Metrics.space-4;
-                                padding-right: Metrics.space-4;
-                                alignment: stretch;
-                                cross-axis-alignment: center;
-                                Text {
-                                    text: f;
-                                    color: hi ? Theme.text-on-primary : Theme.text-primary;
-                                    font-size: 11px * Theme.font-scale;
-                                    font-family: Theme.font-mono;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
+                            highlighted: !hidden && i == root.mention-sel;
+                            title: f;
+                            title-font-family: Theme.font-mono;
+                            clicked => {
+                                root.mention-sel = i;
+                                root.apply-mention-pick("#" + f + " ");
                             }
                         }
                         if root.file-options.length == 0 : Text {

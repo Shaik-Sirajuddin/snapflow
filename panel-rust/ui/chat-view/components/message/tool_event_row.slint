@@ -5,7 +5,7 @@ import { ExpandablePanel } from "../../../base/expandable_panel.slint";
 import { CollapseExpand } from "../../../base/collapse_expand.slint";
 import { ApiCallView } from "../execution/api_call_view.slint";
 import { TerminalView } from "../execution/terminal_view.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { HoverSurface } from "../../../base/hover.slint";
 
 // One tool-taxonomy event row -- chat-items-redesign.md #5/#6. Transparent
 // background (these are inline stream markers, not cards); a dot + an
@@ -44,6 +44,19 @@ export component ToolEventRow inherits Rectangle {
 
     property <bool> is-skill-use: kind == "skill_use";
     property <bool> is-terminal: kind == "terminal";
+    // kind -> icon lookup. @image-url requires a compile-time-constant
+    // literal path (see base/icon.slint's own comment), so this can't be
+    // resolved from a `for`/data-driven source string -- a ternary chain
+    // of literal @image-url branches is the one way to make an icon
+    // choice conditional on a runtime string while keeping each path a
+    // compile-time literal. Fallback branch is unreachable given `kind`'s
+    // documented enum, but ternary chains need one.
+    property <image> kind-icon-source:
+        kind == "tool_use" ? @image-url("../../../assets/icons/wrench.svg")
+        : kind == "skill_load" ? @image-url("../../../assets/icons/book-open.svg")
+        : kind == "skill_use" ? @image-url("../../../assets/icons/sparkles.svg")
+        : kind == "mcp_server_call" ? @image-url("../../../assets/icons/plug-zap.svg")
+        : @image-url("../../../assets/icons/terminal.svg");
     // Execution-view content only applies to the two non-skill kinds --
     // chat-items-redesign.md #7-#9 never describes a terminal/api-call
     // view for `skill_load`/`skill_use`. Terminal rows always show body.
@@ -88,48 +101,11 @@ export component ToolEventRow inherits Rectangle {
                     background: Theme.text-muted;
                 }
             }
-            // Only the matching kind icon participates in layout.
-            if kind == "tool_use" : VerticalLayout {
+            VerticalLayout {
                 alignment: center;
                 horizontal-stretch: 0;
                 Icon {
-                    source: @image-url("../../../assets/icons/wrench.svg");
-                    size: Metrics.icon-sm;
-                    color: Theme.text-secondary;
-                }
-            }
-            if kind == "skill_load" : VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Icon {
-                    source: @image-url("../../../assets/icons/book-open.svg");
-                    size: Metrics.icon-sm;
-                    color: Theme.text-secondary;
-                }
-            }
-            if kind == "skill_use" : VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Icon {
-                    source: @image-url("../../../assets/icons/sparkles.svg");
-                    size: Metrics.icon-sm;
-                    color: Theme.text-secondary;
-                }
-            }
-            if kind == "mcp_server_call" : VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Icon {
-                    source: @image-url("../../../assets/icons/plug-zap.svg");
-                    size: Metrics.icon-sm;
-                    color: Theme.text-secondary;
-                }
-            }
-            if kind == "terminal" : VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Icon {
-                    source: @image-url("../../../assets/icons/terminal.svg");
+                    source: root.kind-icon-source;
                     size: Metrics.icon-sm;
                     color: Theme.text-secondary;
                 }
@@ -160,23 +136,12 @@ export component ToolEventRow inherits Rectangle {
         if has-execution-content : VerticalLayout {
             vertical-stretch: 0;
             spacing: Metrics.gap-sm;
-            Rectangle {
+            HoverSurface {
                 height: 18px;
-                background: toggle-area.has-hover ? Theme.bg-primary-container : transparent;
-                animate background { duration: 100ms; }
-                toggle-area := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: root.details-open ? "Hide call details" : "Show call details";
-                    accessible-action-default => {
-                        root.details-open = !root.details-open;
-                        root.toggle-expanded(root.index);
-                    }
-                    clicked => {
-                        root.details-open = !root.details-open;
-                        root.toggle-expanded(root.index);
-                    }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                button-accessible-label: root.details-open ? "Hide call details" : "Show call details";
+                clicked => {
+                    root.details-open = !root.details-open;
+                    root.toggle-expanded(root.index);
                 }
                 HorizontalLayout {
                     padding-left: root.lead-indent;

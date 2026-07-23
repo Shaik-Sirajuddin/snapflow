@@ -2832,13 +2832,28 @@ pub extern "C" fn panel_rust_poll(_handle: *mut PanelHandle) -> bool {
         // and the UI looks frozen. Any Loading/Cancelling thread (not
         // only the displayed one) needs continuous redraw so sidebar
         // spinners on other rows keep spinning too.
+        //
+        // Connecting... also drives the chat-header loader (chat_area
+        // `header-spinning`) even before ThreadState flips to Loading.
         let busy_thread_animating = {
             let model = panel.model.borrow();
             model.threads.iter().any(|thread| {
                 matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                    || thread.connection_status == "Connecting..."
             })
         };
-        frame_changed || animating || busy_thread_animating
+        let needs_paint = frame_changed || animating || busy_thread_animating;
+        // Critical: Qt's `requestRepaint` only re-blits the software
+        // buffer. `MinimalSoftwareWindow::draw_if_needed` no-ops unless
+        // Slint itself was told to redraw. `animation-tick()` bindings
+        // do not always set that flag (unlike keyframed `animate`), so
+        // a busy loader froze: poll returned true, paint ran, but the
+        // buffer was never re-rendered. Force the flag whenever we
+        // need continuous tick-driven paint.
+        if needs_paint && (animating || busy_thread_animating) {
+            panel.window.window().request_redraw();
+        }
+        needs_paint
     })
 }
 
