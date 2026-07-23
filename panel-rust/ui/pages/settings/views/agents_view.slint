@@ -7,8 +7,8 @@ import { SettingsSection, SettingsSectionHeader, SettingsField, SettingsDivider 
 import { SettingsSearchBar } from "../components/search_bar.slint";
 import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
 import { TextUtil } from "../../../base/text_util.slint";
+import { SelectableChip } from "../../../base/selectable_chip.slint";
 
 // Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
 // former `components/settings_sheet.slint` that is agent/profile/session
@@ -136,35 +136,18 @@ export component AgentsView inherits Rectangle {
                     // accessible-element geometry (see the original of
                     // this row, `components/settings_sheet.slint`, for the
                     // bisection that found this).
-                    width: profile-chip-label.preferred-width + Metrics.pad-lg
+                    width: profile-chip.content-width + Metrics.pad-lg
                         + Metrics.space-1
                         + (root.profile-pending-delete == profile.name ? 114px : 20px);
                     HorizontalLayout {
                         spacing: Metrics.space-1;
-                        Rectangle {
-                            width: profile-chip-label.preferred-width + Metrics.pad-lg;
-                            height: 24px;
-                            background: profile.name == root.default-profile ? Theme.bg-primary : Theme.bg-sidebar;
-                            border-color: Theme.border-default;
-                            border-width: 1px;
-                            border-radius: Theme.radius-sm;
-                            TouchArea {
-                                accessible-role: button;
-                                accessible-label: "Select profile " + profile.name;
-                                accessible-action-default => { root.default-profile = profile.name; }
-                                clicked => { root.default-profile = profile.name; }
-                                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                            }
-                            profile-chip-label := Text {
-                                text: profile.name
-                                    + (profile.terminal-enabled ? " T" : "")
-                                    + (profile.fs-enabled ? " F" : "");
-                                color: profile.name == root.default-profile ? Theme.text-on-primary : Theme.text-primary;
-                                font-family: Theme.font-mono;
-                                font-size: 10px * Theme.font-scale;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
+                        profile-chip := SelectableChip {
+                            label: profile.name
+                                + (profile.terminal-enabled ? " T" : "")
+                                + (profile.fs-enabled ? " F" : "");
+                            selected: profile.name == root.default-profile;
+                            button-accessible-label: "Select profile " + profile.name;
+                            clicked => { root.default-profile = profile.name; }
                         }
                         if root.profile-pending-delete != profile.name : Button {
                             label: "\u{2715}";

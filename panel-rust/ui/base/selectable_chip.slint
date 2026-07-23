@@ -1,0 +1,49 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
+
+// Layer 3 (base) -- the selectable-pill shape from `agents_view.slint`'s
+// profile chip row: a bordered rounded box, filled solid when selected,
+// with a click target. Not `Badge` -- `badge.slint` is deliberately
+// non-interactive (never wraps a `TouchArea`), and this needs to be
+// clickable, so it gets its own small component instead of bolting a
+// TouchArea onto Badge.
+//
+// `content-width` exposes this chip's own label's preferred width so a
+// caller that needs the chip's total footprint (e.g. to size a wider
+// row that also has trailing Confirm/Cancel controls, as
+// `agents_view.slint` does) can read it back rather than reaching into
+// this component's internals -- reaching into a repeated item's child
+// layout's `preferred-width` from outside was exactly the binding-loop
+// class of bug `agents_view.slint`'s own comment on this row warns
+// about, so this stays the one safe supported way to get that number.
+export component SelectableChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected: false;
+    in property <string> button-accessible-label: "Select " + root.label;
+    out property <length> content-width: chip-label.preferred-width;
+    callback clicked();
+
+    height: 24px;
+    width: root.content-width + Metrics.pad-lg;
+    background: root.selected ? Theme.bg-primary : Theme.bg-sidebar;
+    border-color: Theme.border-default;
+    border-width: 1px;
+    border-radius: Theme.radius-sm;
+
+    TouchArea {
+        accessible-role: button;
+        accessible-label: root.button-accessible-label;
+        accessible-action-default => { root.clicked(); }
+        clicked => { root.clicked(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+    }
+    chip-label := Text {
+        text: root.label;
+        color: root.selected ? Theme.text-on-primary : Theme.text-primary;
+        font-family: Theme.font-mono;
+        font-size: 10px * Theme.font-scale;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
