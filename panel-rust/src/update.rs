@@ -714,6 +714,70 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 }
             }
         }
+        ComposeMsg::QueueSendNow { message_index } => {
+            let (entry_id, is_generating) = {
+                let Some(thread) = model.threads.get(idx) else {
+                    return (vec![], vec![]);
+                };
+                let Some(entry_id) = queue_entry_id_at(thread, message_index) else {
+                    return (vec![], vec![]);
+                };
+                let is_generating = matches!(
+                    thread.state,
+                    ThreadState::Loading | ThreadState::Cancelling
+                );
+                (entry_id, is_generating)
+            };
+            let send_now_result = {
+                let Some(thread) = model.threads.get_mut(idx) else {
+                    return (vec![], vec![]);
+                };
+                thread.send_queue.send_now(entry_id, is_generating)
+            };
+            match send_now_result {
+                Ok(Some(entry)) => {
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = None;
+                    thread.state = ThreadState::Loading;
+                    let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
+                    dirty.push(Dirty::Connection { thread_id });
+                    let mut effects = Vec::with_capacity(2);
+                    if is_generating {
+                        // A turn is already in flight -- cancel it. The
+                        // resulting Stopped/TurnEnded event is absorbed by
+                        // the queue's AbsorbingCancel state (armed by
+                        // send_now above) so it doesn't also auto-drain
+                        // the next entry once send_prompt below starts a
+                        // new one.
+                        effects.push(Effect::CancelGeneration { real_index: idx });
+                    }
+                    effects.push(Effect::SendPrompt {
+                        real_index: idx,
+                        text: entry.text,
+                    });
+                    (effects, dirty)
+                }
+                Ok(None) => (vec![], vec![]),
+                Err(error) => {
+                    let message = error.to_string();
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = Some(message.clone());
+                    (
+                        vec![],
+                        vec![Dirty::Error {
+                            thread_id,
+                            detail: ErrorDetail { message },
+                        }],
+                    )
+                }
+            }
+        }
         // Pure text-parsing helpers -- no Model mutation, no Dirty. These
         // exist as Msg variants for coverage completeness (see
         // 00-plan.md's callback mapping table) but their real logic stays
@@ -2367,6 +2431,101 @@ mod tests {
         assert!(model.threads[0].send_queue.is_empty());
         assert_eq!(model.compose_text, "edit this");
         assert!(dirty.contains(&Dirty::Scalar(ScalarField::ComposeText)));
+    }
+
+    #[test]
+    fn queue_send_now_while_idle_sends_immediately_with_no_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        // Idle: nothing in flight, so send-now is a plain immediate send.
+        model.threads[0]
+            .send_queue
+            .enqueue("go now".to_owned(), false)
+            .expect("queue");
+        let expanded = model.expanded.clone();
+        let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+            model.threads[0].transcript.clone(),
+            &expanded,
+            &model.threads[0].send_queue,
+            false,
+        );
+        model.threads[0].message_rows = rows;
+        model.threads[0].transcript_keys = keys;
+        let last = model.threads[0].transcript_keys.len() - 1;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueSendNow {
+                message_index: last,
+            })),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SendPrompt {
+                real_index: 0,
+                text: "go now".to_owned(),
+            }]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Connection { .. })));
+    }
+
+    #[test]
+    fn queue_send_now_while_generating_cancels_then_sends_and_arms_absorbing_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("front".to_owned(), false)
+            .expect("queue");
+        model.threads[0]
+            .send_queue
+            .enqueue("steer me".to_owned(), false)
+            .expect("queue");
+        let expanded = model.expanded.clone();
+        let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+            model.threads[0].transcript.clone(),
+            &expanded,
+            &model.threads[0].send_queue,
+            true,
+        );
+        model.threads[0].message_rows = rows;
+        model.threads[0].transcript_keys = keys;
+        // The second (non-front) entry: "steer me".
+        let target_index = model.threads[0].transcript_keys.len() - 1;
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueSendNow {
+                message_index: target_index,
+            })),
+        );
+        assert_eq!(
+            effects,
+            vec![
+                Effect::CancelGeneration { real_index: 0 },
+                Effect::SendPrompt {
+                    real_index: 0,
+                    text: "steer me".to_owned(),
+                },
+            ]
+        );
+        // "steer me" was pulled out; only "front" remains queued.
+        assert_eq!(model.threads[0].send_queue.len(), 1);
+        assert_eq!(
+            model.threads[0]
+                .send_queue
+                .first()
+                .map(|entry| entry.text.as_str()),
+            Some("front")
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        // The eventual TurnEnded from the cancel above must not also
+        // auto-drain "front" -- AbsorbingCancel swallows it once.
+        let popped = model.threads[0]
+            .send_queue
+            .on_generation_stopped(false)
+            .unwrap();
+        assert!(popped.is_none(), "AbsorbingCancel must swallow this Stopped event");
+        assert_eq!(model.threads[0].send_queue.len(), 1);
     }
 
     #[test]

@@ -67,6 +67,15 @@ pub enum ComposeMsg {
     QueueEdit {
         message_index: usize,
     },
+    /// Jump one send-queue entry to the front and send it immediately
+    /// (QueuedMessageBar's send-now affordance -- send_queue.rs's
+    /// send_now/steer subsystem). If a turn is currently in flight, the
+    /// caller must cancel it; `update()` arms the queue's
+    /// `AbsorbingCancel` state so the resulting `Stopped` event doesn't
+    /// also auto-drain the next entry.
+    QueueSendNow {
+        message_index: usize,
+    },
     /// Stop in-flight generation and pause auto-drain of the send queue
     /// (QueuedMessageBar stop while an entry is marked `sending`).
     QueueStop,

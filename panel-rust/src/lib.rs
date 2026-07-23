@@ -2045,6 +2045,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
             });
         });
+        panel.component.on_queue_send_now_requested(move |message_index| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_queue_send_now(panel, message_index as usize);
+                }
+            });
+        });
 
         // setup-followups plan, archive_thread_backend_verify: the
         // sidebar's Archive control was previously a UI-only stub with

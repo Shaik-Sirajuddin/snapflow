@@ -533,6 +533,25 @@ pub(crate) fn dispatch_queue_edit(panel: &PanelSingleton, message_index: usize) 
     execute_effects(panel, effects);
 }
 
+/// QueuedMessageBar send-now -- jump one queue entry to the front and
+/// send it immediately, cancelling any in-flight turn first.
+pub(crate) fn dispatch_queue_send_now(panel: &PanelSingleton, message_index: usize) {
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::QueueSendNow { message_index })),
+    );
+    debug_assert!(
+        effects.len() <= 2
+            && effects.iter().all(|effect| matches!(
+                effect,
+                crate::effect::Effect::CancelGeneration { .. }
+                    | crate::effect::Effect::SendPrompt { .. }
+            )),
+        "Compose::QueueSendNow must only produce CancelGeneration/SendPrompt effects"
+    );
+    execute_effects(panel, effects);
+}
+
 /// QueuedMessageBar stop -- pause queue auto-drain and cancel generation.
 pub(crate) fn dispatch_queue_stop(panel: &PanelSingleton) {
     let (effects, _dirty) =
