@@ -39,6 +39,15 @@ export component ChatArea inherits Rectangle {
     in-out property <bool> loading-older-messages: false;
     callback load-older-requested();
     in property <string> agent-badge: "agent . ask";
+    // Phase 16 (topbar_project_indicator): the session's connected
+    // project (the snapshotd MCP bound via the agent). Name shown,
+    // full path in the accessible label; the dot is green while the
+    // MCP connection is live, red when disconnected. Live state is the
+    // source of truth; hosts fall back to the session jsonl record only
+    // during load (answered open question 5). Empty name hides it.
+    in property <string> project-name: "";
+    in property <string> project-path: "";
+    in property <bool> project-mcp-live: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
     callback error-banner-dismissed();
@@ -498,6 +507,29 @@ export component ChatArea inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
+                    if root.project-name != "" : HorizontalLayout {
+                        spacing: Metrics.space-1;
+                        horizontal-stretch: 0;
+                        cross-axis-alignment: center;
+                        accessible-role: text;
+                        accessible-label: "Project " + root.project-path
+                            + (root.project-mcp-live ? " (MCP connected)" : " (MCP disconnected)");
+                        Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: root.project-mcp-live ? #22c55e : #ef4444;
+                        }
+                        Text {
+                            text: root.project-name;
+                            color: Theme.text-muted;
+                            font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
+                            font-family: Theme.font-mono;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            max-width: compact ? 70px : 130px;
+                        }
+                    }
                     Text {
                         text: agent-badge;
                         color: Theme.text-primary;

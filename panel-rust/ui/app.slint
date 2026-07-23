@@ -480,6 +480,14 @@ export component ChatPanel inherits Window {
                 inputs-enabled: !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
+                // Phase 16: project indicator from the selected thread's
+                // live fields (project_* post-populated from the bridge;
+                // connection-status is the live MCP/agent link state).
+                project-name: threads.length > 0 ? threads[selected-thread].project-name : "";
+                project-path: threads.length > 0 ? threads[selected-thread].project-path : "";
+                // Live values from the bridge: "Live connection" (WS interactive)
+                // counts as live; "HTTP fallback"/"Connecting..." do not.
+                project-mcp-live: connection-status == "Live connection";
                 connection-status: connection-status;
                 last-error: last-error;
                 error-banner-dismissed => { error-banner-dismissed(); }
