@@ -13,7 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
-    McpServerOption, MessageItem, ProfileOption, SkillOption, TerminalItem, ThreadItem,
+    McpServerOption, McpToolOption, MessageItem, ProfileOption, SkillOption, TerminalItem,
+    ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -421,10 +422,15 @@ pub fn to_message_rows_from_transcript(
 /// Append per-thread send-queue entries as trailing `queued` user rows
 /// (audit-fixes wire_queued_message_bar). Mutates `rows` and returns keys
 /// for the appended entries (`queue:{id}`).
+///
+/// `generation_in_flight`: when true, the front queue entry is marked
+/// `sending` so QueuedMessageBar shows Stop (cancel the blocking turn)
+/// instead of Cancel on that row.
 pub fn append_send_queue_rows(
     rows: &mut Vec<MessageItem>,
     keys: &mut Vec<String>,
     queue: &crate::send_queue::SendQueue,
+    generation_in_flight: bool,
 ) {
     let last = queue.len().saturating_sub(1);
     for (i, entry) in queue.iter().enumerate() {
@@ -440,8 +446,10 @@ pub fn append_send_queue_rows(
             raw_input: "".into(),
             raw_output: "".into(),
             queued: true,
-            can_edit: i == last,
-            sending: false,
+            can_edit: i == last && !(generation_in_flight && i == 0),
+            // Front entry while a turn is in flight: Stop cancels that turn
+            // (and pauses auto-drain). Other entries stay cancel/edit.
+            sending: generation_in_flight && i == 0,
             first_use: false,
         });
     }
@@ -453,9 +461,20 @@ pub fn message_rows_for_thread(
     expanded: &[bool],
     queue: &crate::send_queue::SendQueue,
 ) -> (Vec<MessageItem>, Vec<String>) {
+    message_rows_for_thread_with_state(transcript, expanded, queue, false)
+}
+
+/// Like [`message_rows_for_thread`], but marks the front queue row as
+/// `sending` when a turn is currently in flight.
+pub fn message_rows_for_thread_with_state(
+    transcript: Vec<crate::conversation::TranscriptItem>,
+    expanded: &[bool],
+    queue: &crate::send_queue::SendQueue,
+    generation_in_flight: bool,
+) -> (Vec<MessageItem>, Vec<String>) {
     let mut keys = transcript_row_keys(&transcript);
     let mut rows = to_message_rows_from_transcript(transcript, expanded);
-    append_send_queue_rows(&mut rows, &mut keys, queue);
+    append_send_queue_rows(&mut rows, &mut keys, queue, generation_in_flight);
     // Re-index after append so Slint toggle-expanded still matches.
     for (i, row) in rows.iter_mut().enumerate() {
         row.index = i as i32;
@@ -1139,12 +1158,37 @@ pub fn to_mcp_server_option_rows(
                 .get("enabled")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(true);
+            let url = entry
+                .extra
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            // Prefer explicit transport; fall back to type: remote/http or
+            // presence of a url field (opencode remote servers).
             let transport = entry
                 .extra
                 .get("transport")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
+                .map(str::to_owned)
+                .or_else(|| {
+                    entry
+                        .extra
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|t| match t {
+                            "remote" | "http" | "sse" | "streamable_http" => "http".to_owned(),
+                            "local" | "stdio" => "stdio".to_owned(),
+                            other => other.to_owned(),
+                        })
+                })
+                .unwrap_or_else(|| {
+                    if !url.is_empty() {
+                        "http".to_owned()
+                    } else {
+                        String::new()
+                    }
+                });
             let status = entry
                 .extra
                 .get("status")
@@ -1157,6 +1201,15 @@ pub fn to_mcp_server_option_rows(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_owned();
+            let needs_auth = entry
+                .extra
+                .get("needs_auth")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| {
+                    // Remote HTTP servers that are not yet authenticated.
+                    transport == "http" && auth != "authenticated"
+                });
+            let tools = mcp_tools_from_extra(&entry.extra);
             // Pre-format status subtitle in Rust (audit §4.3) so Slint
             // does not concatenate nested ternaries.
             let mut parts: Vec<&str> = Vec::new();
@@ -1178,11 +1231,43 @@ pub fn to_mcp_server_option_rows(
                 command: entry.command.unwrap_or_default().into(),
                 status_line: status_line.into(),
                 transport: transport.into(),
+                url: url.into(),
                 enabled,
                 status: status.into(),
+                needs_auth,
                 auth_status: auth.into(),
-                ..Default::default()
+                tools: ModelRc::new(VecModel::from(tools)),
             }
+        })
+        .collect()
+}
+
+/// Parse a persisted `tools` array from an MCP server registry entry.
+fn mcp_tools_from_extra(extra: &serde_json::Value) -> Vec<McpToolOption> {
+    let Some(arr) = extra.get("tools").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?.to_owned();
+            let enabled = tool
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let deferred = tool
+                .get("deferred")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let token_usage = tool
+                .get("token_usage")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            Some(McpToolOption {
+                name: name.into(),
+                enabled,
+                deferred,
+                token_usage,
+            })
         })
         .collect()
 }
@@ -1566,6 +1651,38 @@ mod tests {
         let second = model.row_data(1).unwrap();
         assert_eq!(second.name, "url-only");
         assert_eq!(second.command, "");
+    }
+
+    #[test]
+    fn to_mcp_server_options_parses_tools_url_and_needs_auth() {
+        use slint::Model;
+        let servers = vec![crate::protocol_types::McpServerEntry::from_json(
+            &serde_json::json!({
+                "name": "remote-tools",
+                "url": "https://example.com/mcp",
+                "type": "remote",
+                "auth_status": "not authenticated",
+                "tools": [
+                    { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
+                    { "name": "write", "enabled": false, "deferred": true }
+                ]
+            }),
+        )
+        .unwrap()];
+        let model = to_mcp_server_options(servers);
+        let row = model.row_data(0).unwrap();
+        assert_eq!(row.transport.as_str(), "http");
+        assert_eq!(row.url.as_str(), "https://example.com/mcp");
+        assert!(row.needs_auth);
+        assert_eq!(row.tools.row_count(), 2);
+        let t0 = row.tools.row_data(0).unwrap();
+        assert_eq!(t0.name.as_str(), "read");
+        assert!(t0.enabled);
+        assert_eq!(t0.token_usage, 12);
+        let t1 = row.tools.row_data(1).unwrap();
+        assert_eq!(t1.name.as_str(), "write");
+        assert!(!t1.enabled);
+        assert!(t1.deferred);
     }
 
     #[test]

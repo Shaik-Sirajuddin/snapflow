@@ -308,6 +308,13 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
                 .collect_thread_list_snapshot(),
         ),
+        // Same catalog pull recover_session does: ensures compose Provider
+        // has profiles even if the periodic frame path has not filled them
+        // yet (cold start, settings never opened).
+        settings_gateway_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
 
@@ -503,6 +510,44 @@ pub(crate) fn dispatch_compose_stop(panel: &PanelSingleton) {
         effects.is_empty()
             || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
         "Compose::StopRequested must produce zero (no selected thread) or one CancelGeneration effect"
+    );
+    execute_effects(panel, effects);
+}
+
+/// QueuedMessageBar cancel -- drop one send-queue entry by message index.
+pub(crate) fn dispatch_queue_cancel(panel: &PanelSingleton, message_index: usize) {
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::QueueCancel { message_index })),
+    );
+    debug_assert!(
+        effects.is_empty(),
+        "Compose::QueueCancel must not produce effects"
+    );
+    execute_effects(panel, effects);
+}
+
+/// QueuedMessageBar edit -- pull one queue entry into the composer.
+pub(crate) fn dispatch_queue_edit(panel: &PanelSingleton, message_index: usize) {
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::QueueEdit { message_index })),
+    );
+    debug_assert!(
+        effects.is_empty(),
+        "Compose::QueueEdit must not produce effects"
+    );
+    execute_effects(panel, effects);
+}
+
+/// QueuedMessageBar stop -- pause queue auto-drain and cancel generation.
+pub(crate) fn dispatch_queue_stop(panel: &PanelSingleton) {
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)));
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
+        "Compose::QueueStop must produce zero or one CancelGeneration effect"
     );
     execute_effects(panel, effects);
 }
@@ -809,6 +854,40 @@ pub(crate) fn dispatch_mcp_server_enabled_changed(
         panel,
         Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
             name: name.clone(),
+            enabled,
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_authenticate(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    name: String,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerAuthenticate {
+            name: name.clone(),
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    server_name: String,
+    tool_name: String,
+    enabled: bool,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+            server_name: server_name.clone(),
+            tool_name: tool_name.clone(),
             enabled,
         })),
     );

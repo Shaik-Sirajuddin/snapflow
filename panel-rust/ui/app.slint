@@ -206,6 +206,9 @@ export component ChatPanel inherits Window {
     callback search-submitted(string, bool, bool);
     callback send-requested();
     callback stop-requested();
+    callback queue-cancel-requested(int);
+    callback queue-edit-requested(int);
+    callback queue-stop-requested();
     callback settings-requested();
     callback settings-scope-changed(string);
     callback settings-save();
@@ -213,6 +216,8 @@ export component ChatPanel inherits Window {
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
+    callback mcp-server-authenticate(string);
+    callback mcp-server-tool-enabled-changed(string, string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -482,6 +487,9 @@ export component ChatPanel inherits Window {
                 compose-text <=> compose-text;
                 send-requested => { send-requested(); }
                 stop-requested => { stop-requested(); }
+                queue-cancel-requested(i) => { queue-cancel-requested(i); }
+                queue-edit-requested(i) => { queue-edit-requested(i); }
+                queue-stop-requested => { queue-stop-requested(); }
                 settings-requested => { root.open-settings(); }
                 new-thread-requested => { root.start-new-thread(); }
                 thread-rename-started => {
@@ -640,6 +648,10 @@ export component ChatPanel inherits Window {
             mcp-server-delete(name) => { mcp-server-delete(name); }
             mcp-server-enabled-changed(name, enabled) => {
                 mcp-server-enabled-changed(name, enabled);
+            }
+            mcp-server-authenticate(name) => { mcp-server-authenticate(name); }
+            mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
+                mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
             }
             profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
                 profile-create(name, agent-id, terminal-enabled, fs-enabled);

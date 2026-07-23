@@ -81,6 +81,8 @@ export component SettingsPage inherits Rectangle {
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
+    callback mcp-server-authenticate(string);
+    callback mcp-server-tool-enabled-changed(string, string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -234,6 +236,12 @@ export component SettingsPage inherits Rectangle {
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }
                             mcp-server-enabled-changed(name, enabled) => {
                                 root.mcp-server-enabled-changed(name, enabled);
+                            }
+                            mcp-server-authenticate(name) => {
+                                root.mcp-server-authenticate(name);
+                            }
+                            mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
+                                root.mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
                             }
                             changed search-has-focus => {
                                 root.mcp-servers-focus-mirror = self.search-has-focus;

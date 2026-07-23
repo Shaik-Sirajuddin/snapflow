@@ -27,18 +27,13 @@ import { TextUtil } from "../../../base/text_util.slint";
 // enable toggle, Remove) plus, when it advertises tools, an expand/collapse
 // nested list of per-tool rows (name, "deferred" tag, enable toggle).
 //
-// Backend reality: `src/agent_bridge.rs`'s `mcp_servers/*` RPCs still only
-// support create/delete by name+command. So every per-row control beyond
-// create/delete (transport tag, url, status text, auth status, enable
-// toggle, OAuth "Connect", the whole per-tool list) is **UI-only** for now
-// -- driven by `McpServerOption`'s UI-only fields (which
-// `models::to_mcp_server_options` default-fills empty), the same "UI ahead
-// of backend" posture `harness_view.slint` documents for its own toggles.
-// Every toggle's state is local/visual only and is not persisted or read by
-// any runtime code; "Connect" is a placeholder for a future
-// `mcp_servers/authenticate` round trip; the tool list is a placeholder for
-// a future `tools/list` round trip (always empty today). Only the
-// create/delete round trip is wired to real Rust.
+// Backend reality: acpx's central registry is opaque JSON via
+// `mcp_servers/{create,update,delete,list}` -- there is no separate
+// `mcp_servers/authenticate` or live `tools/list` RPC on the panel
+// gateway. Connect and per-tool toggles therefore persist registry-side
+// fields (`auth_status`/`needs_auth`/`tools[]`) through `mcp_servers/update`,
+// same as the per-server `enabled` toggle. Live OAuth browser flows and
+// discovery of tools from a running MCP process remain out of band.
 export component McpServersView inherits Rectangle {
     in property <[McpServerOption]> servers: [];
     // settings_page_search_filter: page-level query filters this list.
@@ -46,6 +41,8 @@ export component McpServersView inherits Rectangle {
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
+    callback mcp-server-authenticate(string);
+    callback mcp-server-tool-enabled-changed(string, string, bool);
     // See FilterSearchBar.input-has-focus's doc comment / TextField.has-focus's
     // own doc comment: this view's add-server name/command fields never had
     // any focus state to aggregate up into settings_page.slint's OR-chain,
@@ -121,6 +118,31 @@ export component McpServersView inherits Rectangle {
                         overflow: elide;
                     }
 
+                    // OAuth "Connect" -- remote servers advertising auth.
+                    // Persists registry-side auth flags via mcp_servers/update.
+                    if server.transport == "http" && server.needs-auth : Button {
+                        label: "Connect";
+                        button-accessible-label: "Connect (authenticate) MCP server " + server.name;
+                        btn-width: 56px;
+                        btn-height: 24px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        clicked => { root.mcp-server-authenticate(server.name); }
+                    }
+
+                    // Expand/collapse the per-tool list (when tools are present).
+                    if server.tools.length > 0 : Button {
+                        label: (server-block.tools-expanded ? "Hide tools" : "Tools")
+                            + " (" + server.tools.length + ")";
+                        button-accessible-label: (server-block.tools-expanded ? "Hide" : "Show")
+                            + " " + server.tools.length + " tools for MCP server " + server.name;
+                        btn-width: 88px;
+                        btn-height: 24px;
+                        font-size: 9px;
+                        font-weight: 400;
+                        clicked => { server-block.tools-expanded = !server-block.tools-expanded; }
+                    }
+
                     // Enable/disable without removing the entry (opencode/Codex
                     // per-server `enabled`) is registry-backed and immediately
                     // re-listed by the Rust host after update.
@@ -142,6 +164,62 @@ export component McpServersView inherits Rectangle {
                         font-size: 9px;
                         font-weight: 400;
                         clicked => { root.mcp-server-delete(server.name); }
+                    }
+                }
+
+                // Nested per-tool list -- each tool individually enable/disable
+                // (persisted in the server entry's `tools` JSON array).
+                if server-block.tools-expanded && server.tools.length > 0 : Rectangle {
+                    width: parent.width;
+                    background: Theme.bg-sidebar;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border-default;
+
+                    VerticalLayout {
+                        padding: Metrics.pad-md;
+                        padding-left: Metrics.pad-lg;
+                        spacing: Metrics.gap-sm;
+
+                        for tool in server.tools : HorizontalLayout {
+                            spacing: Metrics.gap-md;
+
+                            Text {
+                                text: tool.name;
+                                color: Theme.text-primary;
+                                font-family: Theme.font-mono;
+                                font-size: 10px * Theme.font-scale;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+
+                            if tool.token-usage > 0 : Text {
+                                text: tool.token-usage + " tok";
+                                color: Theme.text-muted;
+                                font-family: Theme.font-mono;
+                                font-size: 9px * Theme.font-scale;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                            }
+
+                            if tool.deferred : Text {
+                                text: "deferred";
+                                color: Theme.text-muted;
+                                font-family: Theme.font-mono;
+                                font-size: 9px * Theme.font-scale;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                            }
+
+                            Toggle {
+                                checked: tool.enabled;
+                                toggle-accessible-label: "Toggle tool " + tool.name + " on MCP server " + server.name;
+                                toggled(enabled) => {
+                                    root.mcp-server-tool-enabled-changed(server.name, tool.name, enabled);
+                                }
+                            }
+                        }
                     }
                 }
             }
