@@ -148,8 +148,19 @@ case "$platform" in
     # editor binary never got linked. Caught for real by
     # docker-tests/install-headless's headless install test.
     app_dir="$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -iname 'snapflow*' -type d | head -n1)"
-    if [ -n "$app_dir" ] && [ -x "$app_dir/bin/snapflow" ]; then
-      ln -sf "$app_dir/bin/snapflow" "$BIN_DIR/snapflow"
+    # Link the top-level wrapper script ($app_dir/snapflow), NOT the raw
+    # binary at $app_dir/bin/snapflow -- the raw binary has no RPATH/RUNPATH
+    # baked in and fails immediately with "error while loading shared
+    # libraries: libCuteLogger.so: cannot open shared object file", since
+    # it needs LD_LIBRARY_PATH/MLT_*/QT_PLUGIN_PATH set first. The wrapper
+    # script ($app_dir/snapflow, upstream Shotcut's standard packaging
+    # pattern) sets all of that up before exec'ing the real binary --
+    # confirmed by its own comment: "Run this instead of trying to run
+    # bin/snapflow. It runs snapflow with the correct environment."
+    # Caught for real by docker-tests/install-headless trying to actually
+    # launch the installed `snapflow` command, not just checking it exists.
+    if [ -n "$app_dir" ] && [ -x "$app_dir/snapflow" ]; then
+      ln -sf "$app_dir/snapflow" "$BIN_DIR/snapflow"
       info "Linked snapflow -> $BIN_DIR/snapflow"
     fi
 
