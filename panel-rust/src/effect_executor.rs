@@ -414,19 +414,33 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 }
             }
             Effect::PersistSelectedThread { thread_id } => {
-                if let Some(store) = panel.panel_state.as_ref() {
+                let Some(store) = panel.panel_state.clone() else {
+                    continue;
+                };
+                std::thread::spawn(move || {
                     if let Err(error) = store.set_selected_thread_id(Some(&thread_id)) {
                         let message = format!("failed to persist selected chat thread: {error}");
                         eprintln!("panel-rust: {message}");
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
-                        );
+                        let _ = slint::invoke_from_event_loop(move || {
+                            crate::PANEL.with(|cell| {
+                                let slot = cell.borrow();
+                                let Some(panel) = slot.as_ref() else {
+                                    return;
+                                };
+                                let _ = update_persistent(
+                                    panel,
+                                    Msg::Effect(EffectResultMsg::StateEffectFailed {
+                                        thread_id,
+                                        message,
+                                    }),
+                                );
+                            });
+                        });
                     }
-                }
+                });
             }
             Effect::ToggleBackground { real_index } => {
-                let Some(store) = panel.panel_state.as_ref() else {
+                let Some(store) = panel.panel_state.clone() else {
                     continue;
                 };
                 let Some(thread_id) = panel
@@ -437,48 +451,66 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 else {
                     continue;
                 };
-                let next = !store
-                    .effective_background_session(&thread_id)
-                    .unwrap_or(false);
-                if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
-                    let message = format!("failed to toggle background-session override: {error}");
-                    eprintln!("panel-rust: {message}");
-                    let _ = update_persistent(
-                        panel,
-                        Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
-                    );
-                }
+                std::thread::spawn(move || {
+                    let next = !store
+                        .effective_background_session(&thread_id)
+                        .unwrap_or(false);
+                    if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
+                        let message =
+                            format!("failed to toggle background-session override: {error}");
+                        eprintln!("panel-rust: {message}");
+                        let _ = slint::invoke_from_event_loop(move || {
+                            crate::PANEL.with(|cell| {
+                                let slot = cell.borrow();
+                                let Some(panel) = slot.as_ref() else {
+                                    return;
+                                };
+                                let _ = update_persistent(
+                                    panel,
+                                    Msg::Effect(EffectResultMsg::StateEffectFailed {
+                                        thread_id,
+                                        message,
+                                    }),
+                                );
+                            });
+                        });
+                    }
+                });
             }
             Effect::PersistThreadRecord { record } => {
-                let result = panel
-                    .panel_state
-                    .as_ref()
-                    .map(|store| {
-                        store
-                            .save_thread_record(&record)
-                            .map_err(|error| EffectError::new(error.to_string()))
-                    })
-                    .unwrap_or(Ok(()));
-                let _ = slint::invoke_from_event_loop(move || {
-                    crate::PANEL.with(|cell| {
-                        let slot = cell.borrow();
-                        let Some(panel) = slot.as_ref() else {
-                            return;
-                        };
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::ThreadRecordPersisted(result)),
-                        );
+                let store = panel.panel_state.clone();
+                std::thread::spawn(move || {
+                    let result = store
+                        .map(|store| {
+                            store
+                                .save_thread_record(&record)
+                                .map_err(|error| EffectError::new(error.to_string()))
+                        })
+                        .unwrap_or(Ok(()));
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::ThreadRecordPersisted(result)),
+                            );
+                        });
                     });
                 });
             }
             Effect::PersistThread { real_index } => {
-                let result = crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                    .collect_thread_record(real_index)
-                    .map(|record| {
-                        panel
-                            .panel_state
-                            .as_ref()
+                // collect_thread_record reads live model/bridge state, so it
+                // must run on this (UI) thread; only the blocking SQLite
+                // write itself is offloaded.
+                let record = crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                    .collect_thread_record(real_index);
+                let store = panel.panel_state.clone();
+                std::thread::spawn(move || {
+                    let result = record.map(|record| {
+                        store
                             .map(|store| {
                                 store
                                     .save_thread_record(&record)
@@ -486,36 +518,54 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                             })
                             .unwrap_or(Ok(()))
                     });
-                let result = result.unwrap_or(Ok(()));
-                let _ = slint::invoke_from_event_loop(move || {
-                    crate::PANEL.with(|cell| {
-                        let slot = cell.borrow();
-                        let Some(panel) = slot.as_ref() else {
-                            return;
-                        };
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::ThreadPersisted { real_index, result }),
-                        );
+                    let result = result.unwrap_or(Ok(()));
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::ThreadPersisted { real_index, result }),
+                            );
+                        });
                     });
                 });
             }
             Effect::RenameThread { real_index, name } => {
+                // Thread-id lookup needs the (non-Send) model RefCell, so it
+                // must happen here; only the blocking SQLite write moves to
+                // the spawned thread.
                 let thread_id = panel
                     .model
                     .borrow()
                     .threads
                     .get(real_index)
                     .map(|thread| thread.thread_id.clone());
-                if let (Some(store), Some(thread_id)) = (panel.panel_state.as_ref(), thread_id) {
-                    if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
-                        let message = format!("failed to persist renamed chat thread: {error}");
-                        eprintln!("panel-rust: {message}");
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
-                        );
-                    }
+                let store = panel.panel_state.clone();
+                if let (Some(store), Some(thread_id)) = (store, thread_id) {
+                    std::thread::spawn(move || {
+                        if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
+                            let message = format!("failed to persist renamed chat thread: {error}");
+                            eprintln!("panel-rust: {message}");
+                            let _ = slint::invoke_from_event_loop(move || {
+                                crate::PANEL.with(|cell| {
+                                    let slot = cell.borrow();
+                                    let Some(panel) = slot.as_ref() else {
+                                        return;
+                                    };
+                                    let _ = update_persistent(
+                                        panel,
+                                        Msg::Effect(EffectResultMsg::StateEffectFailed {
+                                            thread_id,
+                                            message,
+                                        }),
+                                    );
+                                });
+                            });
+                        }
+                    });
                 }
             }
             Effect::DeleteThread { real_index } => {
@@ -535,19 +585,29 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 }
             }
             Effect::SkillDelete { path } => {
-                let result = std::fs::remove_dir_all(&path)
-                    .map_err(|error| EffectError::new(error.to_string()));
-                if let Err(error) = &result {
-                    eprintln!("panel-rust: failed to delete skill: {error}");
-                }
-                let _ = update_persistent(
-                    panel,
-                    Msg::Effect(match result {
-                        Ok(()) => EffectResultMsg::SkillWritten(Ok(())),
-                        Err(error) => EffectResultMsg::SkillWritten(Err(error)),
-                    }),
-                );
-                refresh_skills_after_effect(panel);
+                std::thread::spawn(move || {
+                    let result = std::fs::remove_dir_all(&path)
+                        .map_err(|error| EffectError::new(error.to_string()));
+                    if let Err(error) = &result {
+                        eprintln!("panel-rust: failed to delete skill: {error}");
+                    }
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(match result {
+                                    Ok(()) => EffectResultMsg::SkillWritten(Ok(())),
+                                    Err(error) => EffectResultMsg::SkillWritten(Err(error)),
+                                }),
+                            );
+                            refresh_skills_after_effect(panel);
+                        });
+                    });
+                });
             }
             Effect::NewThread { .. } | Effect::RecoverSessionAttach { .. } => {
                 debug_assert!(

@@ -57,6 +57,7 @@ use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Truncation length for `models::describe_thread`'s sidebar preview --
 /// matches the HTML source's short one-liners (e.g. "Trim clips and add
@@ -501,7 +502,11 @@ struct PanelSingleton {
     width: u32,
     height: u32,
     bridge: Option<AgentBridge>,
-    panel_state: Option<PanelStateStore>,
+    // Arc, not a plain owned value: several Effect handlers in
+    // effect_executor.rs move a clone of this into a std::thread::spawn
+    // closure so the blocking SQLite write happens off the Slint UI
+    // thread (offload_state_effects_off_ui_thread).
+    panel_state: Option<Arc<PanelStateStore>>,
     /// Set by [`settings_file::SettingsWatcher`]; drained on poll to
     /// refresh open settings fields without clobbering dirty edits.
     settings_reload_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1284,7 +1289,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         let panel_state = {
             let path = resolve_cache_dir().join("panel-state.sqlite3");
             match PanelStateStore::open(path) {
-                Ok(store) => Some(store),
+                Ok(store) => Some(Arc::new(store)),
                 Err(error) => {
                     let message = format!("panel settings persistence unavailable: {error}");
                     eprintln!("panel-rust: {message}");
