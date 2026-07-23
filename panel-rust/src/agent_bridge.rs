@@ -351,17 +351,17 @@ fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
     let is_new = !slot
         .terminal_buffers
         .lock()
-        .expect("terminal_buffers mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .contains_key(&ev.terminal_id);
     if is_new {
         slot.terminal_order
             .lock()
-            .expect("terminal_order mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(ev.terminal_id.clone());
     }
     slot.terminal_buffers
         .lock()
-        .expect("terminal_buffers mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .insert(
             ev.terminal_id.clone(),
             TerminalBuffer {
@@ -377,11 +377,11 @@ fn evict_exited_terminals_over_cap(slot: &ThreadSlot) {
     let mut order = slot
         .terminal_order
         .lock()
-        .expect("terminal_order mutex poisoned");
+        .unwrap_or_else(|e| e.into_inner());
     let mut buffers = slot
         .terminal_buffers
         .lock()
-        .expect("terminal_buffers mutex poisoned");
+        .unwrap_or_else(|e| e.into_inner());
     evict_exited_terminals_over_cap_in(&mut order, &mut buffers, MAX_RETAINED_TERMINALS_PER_THREAD);
 }
 
@@ -423,13 +423,13 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
             *slot
                 .session_modes
                 .lock()
-                .expect("session_modes mutex poisoned") = Some(modes.clone());
+                .unwrap_or_else(|e| e.into_inner()) = Some(modes.clone());
         }
         AgentEvent::CurrentModeChanged(mode_id) => {
             if let Some(modes) = slot
                 .session_modes
                 .lock()
-                .expect("session_modes mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .as_mut()
             {
                 modes.current_mode_id = mode_id.clone();
@@ -439,7 +439,7 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
             *slot
                 .config_options
                 .lock()
-                .expect("config_options mutex poisoned") = options.clone();
+                .unwrap_or_else(|e| e.into_inner()) = options.clone();
         }
         _ => {}
     }
@@ -457,18 +457,18 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
     let terminal_order = slot
         .terminal_order
         .lock()
-        .expect("terminal_order mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
     let terminal_buffers = slot
         .terminal_buffers
         .lock()
-        .expect("terminal_buffers mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .clone();
     let snapshot = ThreadRuntimeSnapshot {
         pending_requests: slot
             .pending_requests
             .lock()
-            .expect("pending_requests mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone(),
         terminals: terminal_order
             .into_iter()
@@ -486,12 +486,12 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
         session_modes: slot
             .session_modes
             .lock()
-            .expect("session_modes mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone(),
         config_options: slot
             .config_options
             .lock()
-            .expect("config_options mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone(),
         archived: *slot.archived.lock().unwrap_or_else(|e| e.into_inner()),
     };
@@ -1495,7 +1495,7 @@ fn spawn_gateway_process(
             .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"));
         self_spawned_admin_creds()
             .lock()
-            .expect("admin creds mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(
                 format!("http://127.0.0.1:{port}"),
                 (format!("http://127.0.0.1:{admin_port}"), token),
@@ -1669,7 +1669,7 @@ fn resolve_admin_creds() -> Option<(String, String)> {
     {
         let creds = self_spawned_admin_creds()
             .lock()
-            .expect("admin creds mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         if creds.len() == 1 {
             return creds.values().next().cloned();
         }
@@ -1698,7 +1698,7 @@ fn now_token() -> String {
 fn cwd_for_session(session_cwd_override: &Mutex<Option<PathBuf>>) -> PathBuf {
     session_cwd_override
         .lock()
-        .expect("session cwd override mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
@@ -1744,7 +1744,7 @@ fn complete_attachment(slot: &ThreadSlot, error: Option<String>) {
             slot.thread_id,
             slot.acp_session_id
                 .lock()
-                .expect("acp_session_id mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .as_deref()
         );
     }
@@ -1771,7 +1771,7 @@ fn spawn_event_forwarder(
                     slot_for_task
                         .history
                         .lock()
-                        .expect("history mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .push(msg.clone());
                     refresh_transcript(&slot_for_task);
                     if let Some(store) = &store_for_task {
@@ -1788,7 +1788,7 @@ fn spawn_event_forwarder(
                     slot_for_task
                         .transcript
                         .lock()
-                        .expect("transcript mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .mark_all_streaming_completed();
                 }
                 AgentEvent::Error(_) => {}
@@ -1796,7 +1796,7 @@ fn spawn_event_forwarder(
                     slot_for_task
                         .pending_requests
                         .lock()
-                        .expect("pending_requests mutex poisoned")
+                        .unwrap_or_else(|e| e.into_inner())
                         .push(req.clone());
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
@@ -1813,7 +1813,7 @@ fn spawn_event_forwarder(
             }
             events_out
                 .lock()
-                .expect("event queue mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .push_back(BridgeEvent {
                     thread_index: idx,
                     event: ev,
@@ -1848,7 +1848,7 @@ fn spawn_background_attachment(
     let mcp_servers = snapflowd_mcp_servers_entry(
         session_cwd_override
             .lock()
-            .expect("session cwd override mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .as_deref(),
         &slot.provider,
     );
@@ -1899,7 +1899,7 @@ fn spawn_background_attachment(
                 *slot
                     .acp_session_id
                     .lock()
-                    .expect("acp_session_id mutex poisoned") = Some(session_id);
+                    .unwrap_or_else(|e| e.into_inner()) = Some(session_id);
                 persist_thread_snapshot(store.as_ref(), &slot, now_token());
 
                 if requested_session_id.is_some() {
@@ -1933,7 +1933,7 @@ fn spawn_background_attachment(
                 complete_attachment(&slot, Some(message.clone()));
                 events_out
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(message),
@@ -2225,7 +2225,7 @@ impl AgentBridge {
                 let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
                 gateways
                     .lock()
-                    .expect("gateways mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .insert(url, gateway.clone());
                 for setter in setters {
                     setter.set_gateway(gateway.clone());
@@ -2255,7 +2255,7 @@ impl AgentBridge {
         *self
             .session_cwd_override
             .lock()
-            .expect("session cwd override mutex poisoned") = path;
+            .unwrap_or_else(|e| e.into_inner()) = path;
     }
 
     /// Adds one open thread using the already-provisioned provider gateway.
@@ -2337,7 +2337,7 @@ impl AgentBridge {
         match self
             .gateways
             .lock()
-            .expect("gateways mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&base_url)
             .cloned()
         {
@@ -2352,7 +2352,7 @@ impl AgentBridge {
                     loop {
                         if let Some(gateway) = gateways
                             .lock()
-                            .expect("gateways mutex poisoned")
+                            .unwrap_or_else(|e| e.into_inner())
                             .get(&base_url)
                             .cloned()
                         {
@@ -2372,7 +2372,7 @@ impl AgentBridge {
         let project_path_for_slot = self
             .session_cwd_override
             .lock()
-            .expect("session cwd override mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
@@ -2467,7 +2467,7 @@ impl AgentBridge {
             .filter_map(|slot| {
                 slot.acp_session_id
                     .lock()
-                    .expect("acp_session_id mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .clone()
             })
             .collect();
@@ -2524,7 +2524,7 @@ impl AgentBridge {
             loop {
                 if let Some(gateway) = gateways
                     .lock()
-                    .expect("gateways mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(&base_url)
                     .cloned()
                 {
@@ -2553,7 +2553,7 @@ impl AgentBridge {
         let project_path_for_slot = self
             .session_cwd_override
             .lock()
-            .expect("session cwd override mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.clone(),
@@ -2586,7 +2586,7 @@ impl AgentBridge {
         let mcp_servers = snapflowd_mcp_servers_entry(
             self.session_cwd_override
                 .lock()
-                .expect("session cwd override mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .as_deref(),
             provider,
         );
@@ -2596,7 +2596,7 @@ impl AgentBridge {
         *slot
             .acp_session_id
             .lock()
-            .expect("acp_session_id mutex poisoned") = Some(session_id.to_string());
+            .unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
         persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
 
         // `resume_session`'s own replayed `session/update` history has
@@ -2613,7 +2613,7 @@ impl AgentBridge {
             if let AgentEvent::Message(message) = event {
                 slot.history
                     .lock()
-                    .expect("history mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push(message.clone());
                 replayed_any = true;
                 if let Some(store) = &self.store {
@@ -2646,7 +2646,7 @@ impl AgentBridge {
     pub fn poll(&self) -> Vec<BridgeEvent> {
         self.events
             .lock()
-            .expect("event queue mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .drain(..)
             .collect()
     }
@@ -2658,7 +2658,7 @@ impl AgentBridge {
         !self
             .events
             .lock()
-            .expect("event queue mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .is_empty()
     }
 
@@ -2698,7 +2698,7 @@ impl AgentBridge {
         self.slots.get(idx).and_then(|slot| {
             slot.acp_session_id
                 .lock()
-                .expect("acp_session_id mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .clone()
                 .map(|session_id| ThreadBinding {
                     thread_id: slot.thread_id.clone(),
@@ -2738,7 +2738,7 @@ impl AgentBridge {
             .map(|s| {
                 s.pending_requests
                     .lock()
-                    .expect("pending_requests mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .clone()
             })
             .unwrap_or_default()
@@ -2750,7 +2750,7 @@ impl AgentBridge {
         self.slots.get(idx).and_then(|s| {
             s.terminal_buffers
                 .lock()
-                .expect("terminal_buffers mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .get(terminal_id)
                 .cloned()
         })
@@ -2766,7 +2766,7 @@ impl AgentBridge {
             .map(|s| {
                 s.terminal_order
                     .lock()
-                    .expect("terminal_order mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .clone()
             })
             .unwrap_or_default()
@@ -3166,7 +3166,7 @@ impl AgentBridge {
             let mut pending = slot
                 .pending_requests
                 .lock()
-                .expect("pending_requests mutex poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             pending.retain(|req| req.relay_id != relay_id);
         }
         persist_runtime_snapshot(self.store.as_ref(), slot);
@@ -3177,7 +3177,7 @@ impl AgentBridge {
             if let Err(e) = handle.respond_agent_request(relay_id, response).await {
                 events_out
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("respond_agent_request failed: {e}")),
@@ -3198,7 +3198,7 @@ impl AgentBridge {
         };
         slot.history
             .lock()
-            .expect("history mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(msg.clone());
         refresh_transcript(slot);
         if let Some(store) = &self.store {
@@ -3223,7 +3223,7 @@ impl AgentBridge {
             .map(|s| {
                 s.transcript
                     .lock()
-                    .expect("transcript mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .items()
                     .to_vec()
             })
@@ -3240,7 +3240,7 @@ impl AgentBridge {
             .map(|s| {
                 *s.older_available
                     .lock()
-                    .expect("older_available mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
             })
             .unwrap_or(false)
     }
@@ -3267,14 +3267,14 @@ impl AgentBridge {
         if !*slot
             .older_available
             .lock()
-            .expect("older_available mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
         {
             return false;
         }
         let before_index = *slot
             .oldest_loaded_index
             .lock()
-            .expect("oldest_loaded_index mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         let page = match store.predecessor_page(&slot.thread_id, before_index, HISTORY_PAGE_SIZE) {
             Ok(page) => page,
             Err(e) => {
@@ -3293,7 +3293,7 @@ impl AgentBridge {
             *slot
                 .older_available
                 .lock()
-                .expect("older_available mutex poisoned") = false;
+                .unwrap_or_else(|e| e.into_inner()) = false;
             return false;
         }
         {
@@ -3305,11 +3305,11 @@ impl AgentBridge {
         *slot
             .older_available
             .lock()
-            .expect("older_available mutex poisoned") = page.older_available;
+            .unwrap_or_else(|e| e.into_inner()) = page.older_available;
         *slot
             .oldest_loaded_index
             .lock()
-            .expect("oldest_loaded_index mutex poisoned") = page.oldest_loaded_index;
+            .unwrap_or_else(|e| e.into_inner()) = page.oldest_loaded_index;
         refresh_transcript(slot);
         true
     }
@@ -3330,7 +3330,7 @@ impl AgentBridge {
             if let Err(error) = wait_for_attachment(&slot).await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("session attachment failed: {error}")),
@@ -3340,7 +3340,7 @@ impl AgentBridge {
             if let Err(e) = handle.send_prompt(text).await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("send_prompt failed: {e}")),
@@ -3362,7 +3362,7 @@ impl AgentBridge {
             if let Err(error) = wait_for_attachment(&slot).await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("session attachment failed: {error}")),
@@ -3372,7 +3372,7 @@ impl AgentBridge {
             if let Err(e) = handle.cancel_session().await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("session/cancel failed: {e}")),
@@ -3393,7 +3393,7 @@ impl AgentBridge {
         let slot = self.slots.get(idx)?;
         slot.session_modes
             .lock()
-            .expect("session_modes mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -3406,7 +3406,7 @@ impl AgentBridge {
         };
         slot.config_options
             .lock()
-            .expect("config_options mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -3431,7 +3431,7 @@ impl AgentBridge {
             if let Err(error) = wait_for_attachment(&slot).await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("session attachment failed: {error}")),
@@ -3441,7 +3441,7 @@ impl AgentBridge {
             if let Err(e) = handle.set_mode(mode_id).await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("session/set_mode failed: {e}")),
@@ -3483,7 +3483,7 @@ impl AgentBridge {
             let config_options = slot
                 .config_options
                 .lock()
-                .expect("config_options mutex poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             config_options.iter().any(|option| {
                 option.id == config_id
                     && option
@@ -3495,7 +3495,7 @@ impl AgentBridge {
         if !is_known_value {
             self.events
                 .lock()
-                .expect("event queue mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .push_back(BridgeEvent {
                     thread_index: idx,
                     event: AgentEvent::Error(format!(
@@ -3513,7 +3513,7 @@ impl AgentBridge {
             if let Err(error) = wait_for_attachment(&slot).await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("session attachment failed: {error}")),
@@ -3523,7 +3523,7 @@ impl AgentBridge {
             if let Err(e) = handle.set_config_option(config_id, value).await {
                 events
                     .lock()
-                    .expect("event queue mutex poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .push_back(BridgeEvent {
                         thread_index: idx,
                         event: AgentEvent::Error(format!("session/set_config_option failed: {e}")),
@@ -3889,7 +3889,7 @@ mod tests {
             let state = bridge.slots[idx]
                 .attachment
                 .lock()
-                .expect("attachment mutex poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             if state.complete {
                 assert!(
                     state.error.is_none(),
@@ -7082,19 +7082,19 @@ fn persist_thread_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot, update
     let session_id = slot
         .acp_session_id
         .lock()
-        .expect("acp_session_id mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default();
     let older_available = *slot
         .older_available
         .lock()
-        .expect("older_available mutex poisoned");
+        .unwrap_or_else(|e| e.into_inner());
     let real_message_count = if older_available {
         history.len()
             + *slot
                 .oldest_loaded_index
                 .lock()
-                .expect("oldest_loaded_index mutex poisoned")
+                .unwrap_or_else(|e| e.into_inner())
     } else {
         history.len()
     };

@@ -151,7 +151,7 @@ impl PanelStateStore {
     }
 
     pub fn defaults(&self) -> Result<PanelDefaults, StateStoreError> {
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection
             .query_row(
                 "SELECT profile_name, permission_profile, background_session, selected_thread_id
@@ -172,7 +172,7 @@ impl PanelStateStore {
     }
 
     pub fn save_defaults(&self, defaults: &PanelDefaults) -> Result<(), StateStoreError> {
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "INSERT INTO panel_defaults
                 (id, profile_name, permission_profile, background_session, selected_thread_id)
@@ -199,7 +199,7 @@ impl PanelStateStore {
         &self,
         selected_thread_id: Option<&str>,
     ) -> Result<(), StateStoreError> {
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "INSERT INTO panel_defaults
                 (id, profile_name, permission_profile, background_session, selected_thread_id)
@@ -215,7 +215,7 @@ impl PanelStateStore {
         &self,
         thread_id: &str,
     ) -> Result<Option<ThreadSettings>, StateStoreError> {
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection
             .query_row(
                 "SELECT thread_id, session_id, profile_name, permission_profile, background_session
@@ -240,7 +240,7 @@ impl PanelStateStore {
     /// remain available through `thread_settings`, but do not provide enough
     /// information to safely reconstruct a live panel thread.
     pub fn thread_records(&self) -> Result<Vec<ThreadRecord>, StateStoreError> {
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let mut statement = connection.prepare(
             "SELECT thread_id, display_name, provider, session_id,
                     profile_name, permission_profile, background_session
@@ -275,7 +275,7 @@ impl PanelStateStore {
             record.profile_name.as_deref(),
             record.permission_profile.as_deref(),
         )?;
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "UPDATE thread_settings
              SET display_name = ?2, provider = ?3
@@ -292,7 +292,7 @@ impl PanelStateStore {
         thread_id: &str,
         display_name: &str,
     ) -> Result<(), StateStoreError> {
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "UPDATE thread_settings SET display_name = ?2 WHERE thread_id = ?1",
             params![thread_id, display_name],
@@ -329,7 +329,7 @@ impl PanelStateStore {
             }
         }
 
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "INSERT INTO thread_settings
                 (thread_id, session_id, profile_name, permission_profile, background_session)
@@ -348,7 +348,7 @@ impl PanelStateStore {
         thread_id: &str,
         background_session: Option<bool>,
     ) -> Result<(), StateStoreError> {
-        let connection = self.connection.lock().expect("panel state mutex poisoned");
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "INSERT INTO thread_settings
                 (thread_id, session_id, profile_name, permission_profile, background_session)
@@ -371,6 +371,31 @@ impl PanelStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mutex_poison_convention_unification: a panic in one caller while
+    /// holding `connection`'s lock must not permanently wedge every future
+    /// caller -- `.lock().unwrap_or_else(|e| e.into_inner())` self-heals
+    /// instead of the old `.expect("... poisoned")`, which would panic
+    /// again (forever) on the very next call.
+    #[test]
+    fn a_poisoned_connection_mutex_self_heals_instead_of_wedging_every_future_caller() {
+        let store = std::sync::Arc::new(PanelStateStore::in_memory().unwrap());
+        let poisoning = store.clone();
+        let joined = std::thread::spawn(move || {
+            let _connection = poisoning.connection.lock().unwrap();
+            panic!("intentionally poison the mutex while holding the guard");
+        })
+        .join();
+        assert!(joined.is_err(), "the spawned thread should have panicked");
+
+        // Pre-fix (.expect("... poisoned")) this call would panic again,
+        // forever, for the rest of the process's life.
+        let defaults = store.defaults();
+        assert!(
+            defaults.is_ok(),
+            "connection mutex should have self-healed, got {defaults:?}"
+        );
+    }
 
     #[test]
     fn defaults_and_background_override_restore_without_transcript_data() {
