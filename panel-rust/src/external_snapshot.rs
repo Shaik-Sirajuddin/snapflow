@@ -310,7 +310,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .unwrap_or_default()
             })
             .collect();
-        let items = models::build_thread_items(
+        let mut items = models::build_thread_items(
             &names,
             &state,
             &descriptions,
@@ -318,6 +318,17 @@ impl<'a> ExternalSnapshotSource<'a> {
             &closed,
             &archived,
             &query,
+        );
+        // Plan phase 26: the chat view binds to the selected project --
+        // threads recorded against a DIFFERENT project drop out of the
+        // visible list when the editor switches projects (path-less
+        // threads stay). The phase-23 selection re-anchor keeps the
+        // selected index sane across this rewrite.
+        let active_project_path = self.panel.model.borrow().active_project_path.clone();
+        models::retain_items_for_project(
+            &mut items,
+            &thread_project_paths,
+            active_project_path.as_deref(),
         );
         let visible_indices: Vec<usize> = items.iter().map(|item| item.real_index).collect();
         // Profile/session identity live on the TEA ThreadModel, not the
@@ -343,9 +354,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .cloned()
                     .unwrap_or_default()
                     .into();
+                // Phase 26/16: a thread with no recorded session project
+                // path inherits the ACTIVE project for display, so the
+                // top-bar project indicator lights up instead of staying
+                // dark for every pre-project thread (the phase-16 "empty
+                // project fields" defect).
                 let project_path = thread_project_paths
                     .get(item.real_index)
+                    .filter(|path| !path.is_empty())
                     .cloned()
+                    .or_else(|| active_project_path.clone())
                     .unwrap_or_default();
                 row.project_name = std::path::Path::new(&project_path)
                     .file_name()

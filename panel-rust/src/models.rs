@@ -1003,6 +1003,30 @@ pub fn build_thread_items<N: AsRef<str>>(
         .collect()
 }
 
+/// Plan phase 26 (`chat_project_binding`): scope the visible thread list
+/// to the active project. A thread belongs to the active project when its
+/// recorded session project path (captured at session-open time from the
+/// active MLT project) matches it, or when it has NO recorded path yet
+/// (pre-project/global threads stay visible everywhere rather than
+/// vanishing). With no active project everything is visible. Pure so the
+/// reducer-side snapshot collection stays thin and this stays unit-tested.
+pub fn retain_items_for_project(
+    items: &mut Vec<VisibleThreadItem>,
+    thread_project_paths: &[String],
+    active_project_path: Option<&str>,
+) {
+    let Some(active) = active_project_path.filter(|path| !path.is_empty()) else {
+        return;
+    };
+    items.retain(|item| {
+        let recorded = thread_project_paths
+            .get(item.real_index)
+            .map(String::as_str)
+            .unwrap_or("");
+        recorded.is_empty() || recorded == active
+    });
+}
+
 /// The current value of a thread's `"model"` config option, or "" when the
 /// backend advertises no such option (or no current value) -- the sidebar's
 /// Phase 8 model label. Reads the same `configOptions[]` feed the compose
@@ -2160,6 +2184,44 @@ mod transcript_model_tests {
         ]);
         let entries = to_config_dropdown_entries_for_provider(gpt_only, "claude-acp");
         assert_eq!(entries.row_count(), 0);
+    }
+
+    // Plan phase 26: project-scoped thread list.
+    fn project_items(n: usize) -> Vec<VisibleThreadItem> {
+        (0..n)
+            .map(|real_index| VisibleThreadItem {
+                real_index,
+                thread_id: format!("thread:{real_index}"),
+                item: ThreadItem::default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn project_switch_rebinds_the_visible_thread_list() {
+        let mut items = project_items(3);
+        let paths = vec![
+            "/work/a/project.mlt".to_owned(), // other project
+            "/work/b/project.mlt".to_owned(), // active project
+            String::new(),                    // pre-project thread
+        ];
+        retain_items_for_project(&mut items, &paths, Some("/work/b/project.mlt"));
+        assert_eq!(
+            items.iter().map(|i| i.real_index).collect::<Vec<_>>(),
+            vec![1, 2],
+            "other-project threads drop; active + path-less threads stay"
+        );
+    }
+
+    #[test]
+    fn no_active_project_keeps_every_thread_visible() {
+        let mut items = project_items(2);
+        let paths = vec!["/work/a/project.mlt".to_owned(), String::new()];
+        retain_items_for_project(&mut items, &paths, None);
+        assert_eq!(items.len(), 2);
+        let mut items = project_items(2);
+        retain_items_for_project(&mut items, &paths, Some(""));
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
