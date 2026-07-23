@@ -1,5 +1,5 @@
 import { Theme } from "tokens/theme.slint";
-import { ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
+import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
@@ -138,6 +138,9 @@ export component ChatPanel inherits Window {
     in property <string> active-skill-name: "";
     in property <string> active-skill-path: "";
     in-out property <string> active-skill-content: "";
+    // Phase 27: markdown render of active-skill-content (sync-owned)
+    // for the skill editor's Preview toggle.
+    in property <[MarkdownLine]> active-skill-markdown: [];
     // skills_audit_report §3.1: true while a skill SKILL.md write is in flight.
     in property <bool> skill-saving: false;
     in property <[string]> detected-editors: [];
@@ -568,6 +571,7 @@ export component ChatPanel inherits Window {
                 skill-name: root.active-skill-name;
                 skill-path: root.active-skill-path;
                 skill-content <=> root.active-skill-content;
+                preview-lines: root.active-skill-markdown;
                 skill-saving: root.skill-saving;
                 detected-editors: root.detected-editors;
                 copy-path-requested => { root.skill-copy-path-requested(root.active-skill-path); }

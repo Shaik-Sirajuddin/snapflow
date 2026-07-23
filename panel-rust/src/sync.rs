@@ -246,6 +246,11 @@ fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
     component.set_active_skill_name(model.active_skill_name.clone().into());
     component.set_active_skill_path(model.active_skill_path.clone().into());
     component.set_active_skill_content(model.active_skill_content.clone().into());
+    // Phase 27: markdown preview of the active content for the editor's
+    // Preview toggle.
+    component.set_active_skill_markdown(crate::models::skill_markdown_preview(
+        &model.active_skill_content,
+    ));
     component.set_skill_saving(model.skill_saving);
     let editors = model
         .detected_editors

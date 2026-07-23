@@ -1009,6 +1009,14 @@ fn update_skill(model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) {
         ),
         SkillMsg::ContentEdited { path, content } => {
             model.skill_saving = true;
+            // Plan phase 27 (skill editing pipeline): the model copy MUST
+            // absorb the edit before Dirty::SkillEditor syncs. Without
+            // this, sync_skill_editor_state pushed the STALE
+            // active_skill_content back into the two-way-bound editor
+            // text on every keystroke -- typing never stuck in the
+            // editor and saves recorded no lasting delta (the live
+            // "user typing doesn't reach the skill section" report).
+            model.active_skill_content = content.clone();
             (
                 vec![Effect::SkillWrite { path, content }],
                 vec![Dirty::SkillEditor],
@@ -3461,6 +3469,32 @@ mod tests {
         );
 
         assert_eq!(model.selected_thread, 0, "gone thread clamps selection");
+    }
+
+    #[test]
+    fn skill_content_edit_absorbs_into_the_model_before_sync_runs() {
+        // Plan phase 27: ContentEdited used to emit Dirty::SkillEditor
+        // WITHOUT updating model.active_skill_content -- sync then pushed
+        // the stale content back into the two-way-bound editor text on
+        // every keystroke, so typing never stuck and saves recorded no
+        // lasting delta.
+        let mut model = Model::default();
+        model.active_skill_path = "/skills/demo/SKILL.md".to_owned();
+        model.active_skill_content = "old body".to_owned();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(crate::msg::UiMsg::Skill(crate::msg::SkillMsg::ContentEdited {
+                path: "/skills/demo/SKILL.md".into(),
+                content: "old body plus a typed delta".to_owned(),
+            })),
+        );
+        assert_eq!(model.active_skill_content, "old body plus a typed delta");
+        assert!(model.skill_saving);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SkillWrite { content, .. }] if content == "old body plus a typed delta"
+        ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::SkillEditor)));
     }
 
     #[test]

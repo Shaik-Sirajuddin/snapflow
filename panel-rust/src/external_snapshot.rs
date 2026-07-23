@@ -9,6 +9,27 @@ use crate::{models, msg, AgentBridge, PanelSingleton};
 use slint::ModelRc;
 use std::sync::atomic::Ordering;
 
+/// Phase 27: ~1s throttle for the settings-open skills re-scan (the frame
+/// poll runs per repaint; scanning the skills directories that often is
+/// pure waste). Thread-local because the poll only ever runs on the UI
+/// thread.
+fn skills_rescan_due() -> bool {
+    thread_local! {
+        static LAST_SKILLS_SCAN: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST_SKILLS_SCAN.with(|last| {
+        let now = std::time::Instant::now();
+        let due = last
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(1));
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
 pub(crate) struct ExternalSnapshotSource<'a> {
     panel: &'a PanelSingleton,
 }
@@ -85,7 +106,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .then(|| self.collect_settings_preferences_snapshot(None)),
             settings_gateway_snapshot: need_gateway_catalog
                 .then(|| self.collect_settings_gateway_snapshot()),
-            skills_snapshot: None,
+            // Plan phase 27 (skills view reactivity): while Settings is on
+            // screen, re-scan the skills dirs about once a second and fold
+            // the result, so the live skills view tracks filesystem/state
+            // changes (bundled getting-started appearing, dev-mode or
+            // scope flips, external edits) instead of only refreshing
+            // after this panel's own skill effects. Throttled because the
+            // frame poll runs per repaint; the fold diffs by content, so
+            // an unchanged scan dirties nothing.
+            skills_snapshot: (settings_open && skills_rescan_due())
+                .then(|| self.collect_skills_snapshot()),
         }
     }
 

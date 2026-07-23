@@ -74,6 +74,16 @@ fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
     lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
 }
 
+/// Plan phase 27: markdown render of the skill editor's active content
+/// for the editor's Preview toggle -- same renderer/wrap as agent chat
+/// bodies, so the "MD formatter" applies to the skill's editing section.
+pub fn skill_markdown_preview(text: &str) -> ModelRc<MarkdownLine> {
+    lines_to_slint_model(markdown::render_document(
+        text,
+        markdown::DEFAULT_WRAP_COLS,
+    ))
+}
+
 /// Incremental render for an in-flight agent message.
 pub fn streaming_markdown_model(
     renderer: &mut markdown::StreamingMarkdownRenderer,
