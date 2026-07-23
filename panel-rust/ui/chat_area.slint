@@ -52,6 +52,9 @@ export component ChatArea inherits Rectangle {
     // struct" convention `PendingRequestItem` already established.
     in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
+    // Phase 14: forwarded to ChatInputLayout.inputs-enabled (false for
+    // archived threads -- inputs render disabled, not just inert).
+    in property <bool> inputs-enabled: true;
     // Mode/model selector addition: the *currently displayed* thread's
     // live capability advertisement (`AgentBridge::session_modes`/
     // `config_options`, flattened into domain-neutral `DropdownEntry` rows
@@ -930,6 +933,7 @@ export component ChatArea inherits Rectangle {
         // message Flickable remains the only elastic region (bottom-box
         // cutoff regressions when this band stretched).
         chat-input := ChatInputLayout {
+            inputs-enabled: root.inputs-enabled;
             width: 100%;
             horizontal-stretch: 1;
             vertical-stretch: 0;
