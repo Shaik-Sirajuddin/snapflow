@@ -34,6 +34,13 @@ pub struct InitialState {
     pub selected_thread_id: Option<String>,
     pub permission_profiles: Vec<Option<String>>,
     pub thread_states: Vec<ThreadState>,
+    /// Non-fatal failures collected while assembling cold-start state
+    /// (settings load, panel-defaults sync, dev-mode persistence, bundled
+    /// skill install, chat-thread-record restoration, agent-bridge
+    /// unavailable, ...) that previously only reached `eprintln!`. Folded
+    /// into `Dirty::Error` by `update()`'s `InitialStateLoaded` handler so
+    /// cold-start problems are visible in the UI, not just stderr.
+    pub startup_warnings: Vec<String>,
 }
 
 /// One thread's `Model`-side state -- the former parallel-array fields in
@@ -243,6 +250,7 @@ mod tests {
             selected_thread_id: None,
             permission_profiles: vec![],
             thread_states: vec![],
+            startup_warnings: vec![],
         });
         assert!(model.threads.is_empty());
         assert_eq!(model.selected_thread, 0);
@@ -269,6 +277,7 @@ mod tests {
             selected_thread_id: Some("sess-2".to_owned()),
             permission_profiles: vec![None, None],
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
+            startup_warnings: vec![],
         };
         let model = Model::from_initial_state(initial);
         assert_eq!(model.threads.len(), 2);
@@ -297,6 +306,7 @@ mod tests {
             selected_thread_id: None,
             permission_profiles: vec![Some("workspace".to_owned())],
             thread_states: vec![ThreadState::Error],
+            startup_warnings: vec![],
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
         assert_eq!(

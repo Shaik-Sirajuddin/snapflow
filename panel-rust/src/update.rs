@@ -1149,6 +1149,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let agent_catalog_keys = model.agent_catalog_model_keys.borrow().clone();
             let recoverable_session_keys = model.recoverable_session_model_keys.borrow().clone();
             let terminal_keys = model.terminal_model_keys.borrow().clone();
+            let startup_warnings = initial.startup_warnings.clone();
             *model = Model::from_initial_state(initial);
             model.thread_model = thread_model;
             model.messages_model = messages_model;
@@ -1169,13 +1170,20 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let thread_list_dirty = thread_list_dirty_with_keys(model, thread_keys);
             // Cold start: everything is dirty, there is no prior row
             // identity to preserve (see 00-plan.md's known-gap section).
-            (
-                vec![],
-                vec![
-                    thread_list_dirty,
-                    Dirty::Scalar(ScalarField::SelectedThread),
-                ],
-            )
+            let mut dirty = vec![
+                thread_list_dirty,
+                Dirty::Scalar(ScalarField::SelectedThread),
+            ];
+            // Non-fatal cold-start failures (settings load, panel-defaults
+            // sync, thread-record restoration, ...) previously only
+            // reached eprintln! -- surface them the same way any other
+            // Effect failure is surfaced, instead of silently dropping
+            // them once hydration itself otherwise succeeds.
+            dirty.extend(startup_warnings.into_iter().map(|message| Dirty::Error {
+                thread_id: String::new(),
+                detail: ErrorDetail { message },
+            }));
+            (vec![], dirty)
         }
         EffectResultMsg::InitialStateLoaded(Err(err)) => (
             vec![],
@@ -2665,6 +2673,7 @@ mod tests {
                     selected_thread_id: None,
                     permission_profiles: vec![],
                     thread_states: vec![],
+                    startup_warnings: vec![],
                 },
             ))),
         );
@@ -2684,6 +2693,41 @@ mod tests {
             &model.recoverable_sessions_model
         ));
         assert!(!dirty.is_empty());
+    }
+
+    #[test]
+    fn initial_state_loaded_surfaces_startup_warnings_as_dirty_errors() {
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::InitialStateLoaded(Ok(
+                crate::model::InitialState {
+                    threads: vec![],
+                    thread_ids: vec![],
+                    selected_thread_id: None,
+                    permission_profiles: vec![],
+                    thread_states: vec![],
+                    startup_warnings: vec![
+                        "panel settings persistence unavailable: boom".to_owned(),
+                        "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
+                    ],
+                },
+            ))),
+        );
+        let errors: Vec<&str> = dirty
+            .iter()
+            .filter_map(|d| match d {
+                Dirty::Error { detail, .. } => Some(detail.message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                "panel settings persistence unavailable: boom",
+                "agent bridge unavailable, chat panel is display-only: boom",
+            ]
+        );
     }
 
     #[test]
