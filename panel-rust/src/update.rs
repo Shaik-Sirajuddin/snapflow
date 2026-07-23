@@ -88,6 +88,17 @@ fn current_visible_keys(model: &Model) -> Vec<String> {
 // instead of hand-rolling the visible_indices-empty-fallback logic
 // (current_visible_indices' own reason for existing) a second time and
 // risking it drifting out of sync with this one.
+/// Plan phase 28: arm the shared action-feedback toast (one popup for
+/// error/info/status of user actions) and return its Dirty. `toast_seq`
+/// bumps every call so the UI restarts its auto-hide timer even when the
+/// same message repeats.
+pub(crate) fn show_toast(model: &mut Model, kind: &str, message: impl Into<String>) -> Dirty {
+    model.toast_message = message.into();
+    model.toast_kind = kind.to_owned();
+    model.toast_seq = model.toast_seq.wrapping_add(1);
+    Dirty::Toast
+}
+
 pub(crate) fn selected_real_index(model: &Model) -> usize {
     current_visible_indices(model)
         .get(model.selected_thread)
@@ -1022,12 +1033,15 @@ fn update_skill(model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) {
                 vec![Dirty::SkillEditor],
             )
         }
-        SkillMsg::CopyPathRequested { path } => (
-            vec![Effect::ClipboardWrite {
-                text: path.to_string_lossy().into_owned(),
-            }],
-            vec![],
-        ),
+        SkillMsg::CopyPathRequested { path } => {
+            let toast = show_toast(model, "info", "Path copied to clipboard");
+            (
+                vec![Effect::ClipboardWrite {
+                    text: path.to_string_lossy().into_owned(),
+                }],
+                vec![toast],
+            )
+        }
         SkillMsg::EditorOpenRequested { path } => (vec![Effect::OpenSkillEditor { path }], vec![]),
         SkillMsg::OpenInEditorRequested { editor_name, path } => {
             (vec![Effect::OpenInEditor { editor_name, path }], vec![])
@@ -1292,12 +1306,18 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         // result is folded (see CreateSkill's refresh-before-open
         // order); do not emit an empty SkillsListDiff here -- that
         // would re-push the pre-create list and race the real rescan.
-        EffectResultMsg::SkillCreated(Ok(path)) => (vec![Effect::OpenSkillEditor { path }], vec![]),
+        EffectResultMsg::SkillCreated(Ok(path)) => {
+            let toast = show_toast(model, "status", "Skill created");
+            (vec![Effect::OpenSkillEditor { path }], vec![toast])
+        }
         EffectResultMsg::SkillWritten(Ok(())) => {
             model.skill_saving = false;
             (vec![], vec![Dirty::SkillEditor])
         }
-        EffectResultMsg::SkillPromoted(Ok(())) => (vec![], vec![]),
+        EffectResultMsg::SkillPromoted(Ok(())) => {
+            let toast = show_toast(model, "status", "Skill promoted to global");
+            (vec![], vec![toast])
+        }
         EffectResultMsg::ExternalEditorOpened(Ok(()))
         | EffectResultMsg::OsDefaultOpened(Ok(())) => (vec![], vec![]),
         EffectResultMsg::SkillEditorLoaded(Ok(state)) => {
@@ -1319,10 +1339,12 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         ),
         EffectResultMsg::SkillWritten(Err(err)) => {
             model.skill_saving = false;
+            let toast = show_toast(model, "error", format!("Skill save failed: {}", err.message));
             (
                 vec![],
                 vec![
                     Dirty::SkillEditor,
+                    toast,
                     Dirty::Error {
                         thread_id: String::new(),
                         detail: ErrorDetail {
@@ -1335,15 +1357,24 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         EffectResultMsg::SkillCreated(Err(err))
         | EffectResultMsg::SkillPromoted(Err(err))
         | EffectResultMsg::ExternalEditorOpened(Err(err))
-        | EffectResultMsg::OsDefaultOpened(Err(err)) => (
-            vec![],
-            vec![Dirty::Error {
-                thread_id: String::new(),
-                detail: ErrorDetail {
-                    message: err.message,
-                },
-            }],
-        ),
+        | EffectResultMsg::OsDefaultOpened(Err(err)) => {
+            // Phase 28: these are exactly the "skills top-bar button
+            // failures show nothing" class -- global (no-thread) action
+            // errors that the per-thread error banner never displayed.
+            let toast = show_toast(model, "error", err.message.clone());
+            (
+                vec![],
+                vec![
+                    toast,
+                    Dirty::Error {
+                        thread_id: String::new(),
+                        detail: ErrorDetail {
+                            message: err.message,
+                        },
+                    },
+                ],
+            )
+        }
         EffectResultMsg::PromptStreamDelta {
             thread_id,
             message_id,
@@ -1428,16 +1459,25 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 }
             }
         }
-        EffectResultMsg::SettingsSaved(Ok(())) => (vec![], vec![Dirty::Settings]),
-        EffectResultMsg::SettingsSaved(Err(err)) => (
-            vec![],
-            vec![Dirty::Error {
-                thread_id: String::new(),
-                detail: ErrorDetail {
-                    message: err.message,
-                },
-            }],
-        ),
+        EffectResultMsg::SettingsSaved(Ok(())) => {
+            let toast = show_toast(model, "status", "Settings saved");
+            (vec![], vec![Dirty::Settings, toast])
+        }
+        EffectResultMsg::SettingsSaved(Err(err)) => {
+            let toast = show_toast(model, "error", format!("Settings save failed: {}", err.message));
+            (
+                vec![],
+                vec![
+                    toast,
+                    Dirty::Error {
+                        thread_id: String::new(),
+                        detail: ErrorDetail {
+                            message: err.message,
+                        },
+                    },
+                ],
+            )
+        }
         EffectResultMsg::GatewayCallCompleted { real_index, result } => match result {
             Ok(()) => (
                 vec![],
@@ -3356,8 +3396,10 @@ mod tests {
         );
         assert_eq!(effects, vec![Effect::OpenSkillEditor { path }]);
         // Skills list is refreshed by the effect executor *before* this
-        // result is folded; SkillCreated itself only opens the editor.
-        assert!(dirty.is_empty());
+        // result is folded; SkillCreated opens the editor and (phase 28)
+        // arms the shared feedback toast.
+        assert!(dirty.iter().all(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_message, "Skill created");
     }
 
     #[test]
@@ -3469,6 +3511,44 @@ mod tests {
         );
 
         assert_eq!(model.selected_thread, 0, "gone thread clamps selection");
+    }
+
+    #[test]
+    fn action_results_arm_the_shared_feedback_toast() {
+        // Plan phase 28: skills top-bar failures used to emit only a
+        // global (empty thread_id) Dirty::Error that no surface showed.
+        // Every action-result site now also arms the shared toast.
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SkillCreated(Err(
+                crate::effect::EffectError::new("mkdir failed"),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "error");
+        assert_eq!(model.toast_message, "mkdir failed");
+        let seq_after_error = model.toast_seq;
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SettingsSaved(Ok(()))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "status");
+        assert_eq!(model.toast_message, "Settings saved");
+        assert_ne!(model.toast_seq, seq_after_error, "seq bumps every show");
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Ui(crate::msg::UiMsg::Skill(
+                crate::msg::SkillMsg::CopyPathRequested {
+                    path: "/skills/demo/SKILL.md".into(),
+                },
+            )),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "info");
     }
 
     #[test]

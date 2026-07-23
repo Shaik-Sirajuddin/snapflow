@@ -97,6 +97,21 @@ export component ChatPanel inherits Window {
     // the thread list. Rendered as a dismissible banner in chat_area.
     in property <string> last-error: "";
     callback error-banner-dismissed();
+    // Phase 28: shared action-feedback toast (one popup for error/info/
+    // status of user actions -- sync.rs's Dirty::Toast arm drives these).
+    // `toast-seq` bumps on every show so the auto-hide timer restarts
+    // even for a repeated identical message.
+    in property <string> toast-message: "";
+    in property <string> toast-kind: "info";
+    in property <int> toast-seq: 0;
+    property <bool> toast-visible: false;
+    changed toast-seq => {
+        if (root.toast-message != "") {
+            root.toast-visible = true;
+            toast-hide.running = false;
+            toast-hide.running = true;
+        }
+    }
     in property <bool> compact: true;
     in-out property <bool> narrow: false;
     in-out property <bool> sidebar-expanded: false;
@@ -283,6 +298,15 @@ export component ChatPanel inherits Window {
             root.thread-rename-requested(index, name);
         }
         root.cancel-thread-rename();
+    }
+
+    toast-hide := Timer {
+        interval: 4s;
+        running: false;
+        triggered => {
+            root.toast-visible = false;
+            self.running = false;
+        }
     }
 
     compose-focus-delay := Timer {
@@ -588,6 +612,35 @@ export component ChatPanel inherits Window {
                 changed has-focus => {
                     root.skill-editor-focus-mirror = self.has-focus;
                 }
+            }
+        }
+        // Phase 28: the shared toast surface. Bottom-center of the main
+        // content area, above the compose box, color-coded by kind.
+        if root.toast-visible && root.toast-message != "" : Rectangle {
+            x: sidebar.width + ((root.width - sidebar.width) - self.width) / 2;
+            y: root.height - self.height - 84px;
+            width: min(root.width - sidebar.width - 24px, max(220px, toast-text.preferred-width + 28px));
+            height: toast-text.preferred-height + 16px;
+            background: Theme.bg-primary-container;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: root.toast-kind == "error" ? #ef4444
+                : root.toast-kind == "status" ? #22c55e
+                : Theme.border-default;
+            accessible-role: text;
+            accessible-label: "action feedback: " + root.toast-message;
+            toast-text := Text {
+                x: 14px;
+                y: 8px;
+                width: parent.width - 28px;
+                text: (root.toast-kind == "error" ? "⚠ " : "") + root.toast-message;
+                color: root.toast-kind == "error" ? #ef4444 : Theme.text-primary;
+                font-size: 10px * Theme.font-scale;
+                font-family: Theme.font-mono;
+                wrap: word-wrap;
+            }
+            TouchArea {
+                clicked => { root.toast-visible = false; }
             }
         }
         if expanded-terminal.terminal-id != "" : TerminalOverlay {

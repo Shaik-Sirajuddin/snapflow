@@ -260,6 +260,10 @@ pub enum Dirty {
     /// text, settings-open flag, etc.) -- `sync()` re-pushes just that
     /// setter.
     Scalar(ScalarField),
+    /// Plan phase 28: the shared action-feedback toast changed
+    /// (`Model::toast_*`) -- one popup surface for error/info/status of
+    /// user actions, wired at every action-result site.
+    Toast,
     /// One existing thread row changed shape-preservingly (rename,
     /// toggle-background, status) -- `set_row_data(idx, ..)`, no
     /// insert/remove.

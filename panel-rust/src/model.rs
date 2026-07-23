@@ -126,6 +126,12 @@ pub struct Model {
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
+    /// Plan phase 28: shared action-feedback toast. `toast_seq` bumps on
+    /// every show so the UI can restart its auto-hide timer even for an
+    /// identical message.
+    pub toast_message: String,
+    pub toast_kind: String,
+    pub toast_seq: i32,
     pub active_skill_name: String,
     pub active_skill_path: String,
     pub active_skill_content: String,

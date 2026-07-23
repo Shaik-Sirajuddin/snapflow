@@ -114,6 +114,11 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 component.set_connection_status(thread.connection_status.clone().into());
             }
         }
+        Dirty::Toast => {
+            component.set_toast_message(model.toast_message.clone().into());
+            component.set_toast_kind(model.toast_kind.clone().into());
+            component.set_toast_seq(model.toast_seq);
+        }
         Dirty::Error { thread_id, detail } => {
             // Match durable thread_id *or* session_id (same contract as
             // MessageStreamingDelta / frame snapshots). Comparing only
