@@ -125,27 +125,44 @@ export component SidebarThreadRow inherits HoverSurface {
                     property <angle> load-spin: row-busy
                         ? 360deg * mod(animation-tick(), 800ms) / 800ms
                         : 0deg;
+                    // Phase 25 (thread_row_loading_indicator_fix): two
+                    // live defects here. (1) The spinner/hand were drawn
+                    // `Theme.bg-primary` -- the row's own background color
+                    // on every non-selected row, so the (correctly
+                    // animating) loader was simply invisible: color now
+                    // follows selection like the title text. (2) A fixed
+                    // 14px box top-aligned inside this HorizontalLayout
+                    // (fixed-height children sit at the cross-axis start),
+                    // so the loader rode high against the first-row title;
+                    // each state icon now lives in a height-stretching
+                    // cell whose inner fixed-size child self-centers
+                    // (default x/y center an element in its parent).
                     if row-busy : Rectangle {
                         width: 14px;
-                        height: 14px;
                         Icon {
                             source: @image-url("../assets/icons/loader-circle.svg");
                             size: 14px;
-                            color: Theme.bg-primary;
+                            color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
                             transform-rotation: load-spin;
                             transform-origin: { x: self.width / 2, y: self.height / 2 };
                         }
                     }
-                    if thread.status == "error" : Icon {
-                        source: @image-url("../assets/icons/hand.svg");
-                        size: 14px;
-                        color: Theme.bg-primary;
+                    if thread.status == "error" : Rectangle {
+                        width: 14px;
+                        Icon {
+                            source: @image-url("../assets/icons/hand.svg");
+                            size: 14px;
+                            color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
+                        }
                     }
                     if !row-busy && thread.status != "error" : Rectangle {
                         width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: Theme.text-muted;
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.text-muted;
+                        }
                     }
                     if expanded && rename-thread-index != index : Text {
                         text: thread.name;
