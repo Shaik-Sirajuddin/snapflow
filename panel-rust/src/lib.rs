@@ -416,7 +416,27 @@ impl Platform for SpikePlatform {
     // animations, see its own doc comment) drains it, so spawned local
     // futures actually make progress on this crate's one Rust thread
     // without needing Slint's own `run_event_loop()`.
+    //
+    // Must return `Some` at most once per *process*: `slint::platform::
+    // set_platform` stores its own `SlintContext` in a `thread_local!`
+    // (fine -- a fresh one per test thread), but it forwards this
+    // return value into `EVENTLOOP_PROXY`, a `static OnceCell` at the
+    // Slint-core level that is genuinely process-global, not per-thread.
+    // Returning `Some` again from a second thread makes that `OnceCell::
+    // set` fail, which `set_platform` surfaces as `SetPlatformError::
+    // AlreadySet` -- indistinguishable from (and easily misread as) the
+    // platform itself already being set, but really a second thread
+    // simply colliding on this one truly-global cell. A single proxy
+    // registered once already serves every future `spawn_local` call
+    // process-wide regardless of which thread dispatches it, so `None`
+    // on every later call loses no functionality.
     fn new_event_loop_proxy(&self) -> Option<Box<dyn EventLoopProxy>> {
+        static REGISTERED: std::sync::Once = std::sync::Once::new();
+        let mut already_registered = true;
+        REGISTERED.call_once(|| already_registered = false);
+        if already_registered {
+            return None;
+        }
         Some(Box::new(SpikeEventLoopProxy))
     }
 }
@@ -1010,7 +1030,26 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             // See the `component.window().show()` call below (right after
             // `ChatPanel::new()`) for why that call, not this one, is what
             // actually makes the MCP server's HTTP listener start.
-            let _ = i_slint_backend_testing::mcp_server::init();
+            //
+            // Must run at most once per *process*, not once per thread:
+            // `PLATFORM_WINDOW` above is `thread_local!`, so this branch is
+            // re-entered on every fresh OS thread that calls
+            // `panel_rust_create` for the first time on that thread --
+            // harmless in production (one long-lived thread), but
+            // `TestPanel::new()` in this crate's own test suite constructs
+            // many panels, each on its own libtest-spawned thread. Calling
+            // `mcp_server::init()` again on a second thread registers a
+            // process-wide hook that holds the first thread's platform/
+            // window state alive past that thread's exit, which then makes
+            // *this exact* `set_platform` call above panic
+            // (`AlreadySet`) for the *next* test thread instead of
+            // succeeding the way it always did before this hook existed --
+            // a real regression this `Once` guard closes without changing
+            // the single-process production behavior at all.
+            static MCP_SERVER_INIT: std::sync::Once = std::sync::Once::new();
+            MCP_SERVER_INIT.call_once(|| {
+                let _ = i_slint_backend_testing::mcp_server::init();
+            });
             *platform_window = Some(window.clone());
             window
         });
