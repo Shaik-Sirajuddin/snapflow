@@ -60,6 +60,12 @@ export component SearchableDropdown inherits Rectangle {
     // referencing its property outside that scope still resolves to false
     // when absent, matching the intent here.
     out property <bool> search-has-focus: dd-search-bar.input-has-focus;
+    // Whether the popup is currently open -- exposed for hosts that must
+    // adapt their own clipping while a popup paints outside the trigger
+    // band (chat_input_layout's min-width pan host, consolidation plan
+    // phase 10: a clipping ancestor would cut the upward popup off, so
+    // the host only clips while every popup is closed).
+    out property <bool> is-open: open;
 
     pure function row-current(entry: DropdownEntry) -> bool {
         if (entry.is-header) {

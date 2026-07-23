@@ -693,9 +693,40 @@ export component ChatInputLayout inherits Rectangle {
         // center so geometric midlines match. Do not stretch items.
         // Do NOT clip this row: SearchableDropdown popups are children of
         // the trigger and must paint outside the 24px band. Narrow-dock
-        // cutoff is handled by row2-compact + trigger-min-width shrink.
-        HorizontalLayout {
+        // cutoff is handled by row2-compact + trigger-min-width shrink,
+        // plus (consolidation plan phase 10, min-width devices) a
+        // horizontal pan host: when the selector strip's natural width
+        // exceeds the dock, scrolling over it pans the strip so every
+        // control stays reachable. A plain Flickable can't be used --
+        // the dropdown popups are inline children painted UPWARD out of
+        // the 24px band and a Flickable always clips. Instead the host
+        // clips only while every popup is closed (is-open re-exports),
+        // and the pan offset clamps to the overflow range.
+        row2-host := Rectangle {
             width: 100%;
+            height: root.row2-h;
+            clip: !(profile-dropdown.is-open
+                || mode-dropdown.is-open
+                || config-dropdown.is-open
+                || reasoning-dropdown.is-open);
+            property <length> pan: 0px;
+            property <length> overflow: max(0px, row2-strip.preferred-width - self.width);
+            // Declared BEFORE the strip so every trigger keeps click
+            // priority; unconsumed scroll events fall through here.
+            row2-scroll := TouchArea {
+                width: 100%;
+                height: 100%;
+                scroll-event(e) => {
+                    if (row2-host.overflow > 0px) {
+                        row2-host.pan = max(-row2-host.overflow,
+                            min(0px, row2-host.pan + e.delta-x + e.delta-y));
+                        return accept;
+                    }
+                    return reject;
+                }
+            }
+        row2-strip := HorizontalLayout {
+            x: row2-host.overflow > 0px ? row2-host.pan : 0px;
             height: root.row2-h;
             preferred-height: root.row2-h;
             spacing: Metrics.gap-sm;
@@ -858,6 +889,7 @@ export component ChatInputLayout inherits Rectangle {
                 limit-tokens: root.context-limit-tokens;
                 context-view-requested => { root.context-view-requested(); }
             }
+        }
         }
     }
 
