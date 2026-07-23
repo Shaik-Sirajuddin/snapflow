@@ -1803,6 +1803,28 @@ mod tests {
         }
     }
 
+    /// Dirty set emitted when selection actually changes thread (leak-fix
+    /// clear of compose/pending/error/terminals for the outgoing row).
+    fn thread_switch_dirty() -> Vec<Dirty> {
+        vec![
+            Dirty::Scalar(ScalarField::SelectedThread),
+            Dirty::Scalar(ScalarField::ComposeText),
+            Dirty::PendingRequest {
+                thread_id: String::new(),
+            },
+            Dirty::Error {
+                thread_id: String::new(),
+                detail: ErrorDetail {
+                    message: String::new(),
+                },
+            },
+            Dirty::Terminal {
+                id: String::new(),
+            },
+            Dirty::LocalTerminal,
+        ]
+    }
+
     #[test]
     fn thread_navigate_delta_advances_by_one() {
         let mut model = model_with_threads(&["a", "b", "c"]);
@@ -1812,7 +1834,7 @@ mod tests {
             Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(1))),
         );
         assert_eq!(model.selected_thread, 1);
-        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+        assert_eq!(dirty, thread_switch_dirty());
     }
 
     #[test]
@@ -1847,7 +1869,7 @@ mod tests {
             Msg::Host(HostMsg::InvokeCommand("previous-thread".to_owned())),
         );
         assert_eq!(model.selected_thread, 0);
-        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+        assert_eq!(dirty, thread_switch_dirty());
     }
 
     #[test]
@@ -1859,7 +1881,7 @@ mod tests {
             Msg::Host(HostMsg::InvokeCommand("next-thread".to_owned())),
         );
         assert_eq!(model.selected_thread, 2);
-        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+        assert_eq!(dirty, thread_switch_dirty());
     }
 
     #[test]
@@ -1900,7 +1922,7 @@ mod tests {
                 thread_id: "thread-1".to_owned()
             }]
         );
-        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+        assert_eq!(dirty, thread_switch_dirty());
     }
 
     #[test]
@@ -1966,6 +1988,23 @@ mod tests {
     #[test]
     fn selecting_a_thread_emits_one_persistence_effect() {
         let mut model = model_with_threads(&["a", "b"]);
+        let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+        assert_eq!(
+            effects,
+            vec![Effect::PersistSelectedThread {
+                thread_id: "thread-1".to_owned()
+            }]
+        );
+        // Selection change also dirties compose/pending/error/terminals so
+        // the outgoing thread's UI state cannot leak (apply_thread_selection_switch).
+        assert_eq!(dirty, thread_switch_dirty());
+    }
+
+    #[test]
+    fn reselecting_the_already_displayed_thread_only_dirties_selected() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.selected_thread = 1;
+        model.displayed_thread = Some(1);
         let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
         assert_eq!(
             effects,
