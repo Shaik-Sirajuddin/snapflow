@@ -3495,7 +3495,15 @@ pub(crate) fn open_md_link_target(target: &str) {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(_) => {}
+        // Reap on a detached thread -- dropping the Child without wait()
+        // left one defunct opener process per Ctrl+Click for the panel's
+        // lifetime (review-gate finding; effect_executor's child-process
+        // site already reaps the same way).
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
         Err(error) => eprintln!("panel-rust: failed to open link {target:?} via {opener:?}: {error}"),
     }
 }

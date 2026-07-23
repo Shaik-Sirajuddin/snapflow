@@ -868,6 +868,7 @@ mod tests {
     fn thread_row_ops_apply_to_the_persistent_model_and_key_cache() {
         let mut model = Model::default();
         let row = VisibleThreadItem {
+            session_id: None,
             real_index: 7,
             thread_id: "thread-7".to_owned(),
             item: crate::ThreadItem::default(),
@@ -902,6 +903,7 @@ mod tests {
             ..crate::ThreadItem::default()
         };
         let row = VisibleThreadItem {
+            session_id: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: item.clone(),
@@ -947,6 +949,7 @@ mod tests {
             "stale-c".to_owned(),
         ];
         let row = VisibleThreadItem {
+            session_id: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: crate::ThreadItem {
@@ -1103,6 +1106,7 @@ mod tests {
         *model.thread_model_keys.borrow_mut() = vec!["thread:0".to_owned()];
         model.visible_indices = vec![0];
         model.thread_rows.push(VisibleThreadItem {
+            session_id: None,
             real_index: 0,
             thread_id: "thread:0".to_owned(),
             item: crate::ThreadItem {

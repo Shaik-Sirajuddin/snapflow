@@ -64,7 +64,11 @@ fn visible_thread_indices(model: &Model) -> Vec<usize> {
 }
 
 fn current_visible_indices(model: &Model) -> Vec<usize> {
-    if model.visible_indices.is_empty() && !model.threads.is_empty() {
+    if model.visible_indices.is_empty() && !model.threads.is_empty() && !model.visible_list_synced {
+        // Pre-first-snapshot fallback only. After a real list sync an
+        // empty visible list is genuine (project scope/search matched
+        // nothing) -- expanding to all threads here silently retargeted
+        // actions at hidden threads (review-gate finding 3).
         (0..model.threads.len()).collect()
     } else {
         model.visible_indices.clone()
@@ -144,6 +148,7 @@ pub(crate) fn visible_thread_row(
     Some(crate::models::VisibleThreadItem {
         real_index,
         thread_id,
+        session_id: thread.session_id.clone(),
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
             status: status.into(),
@@ -458,9 +463,16 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                     .map(|(i, _)| i)
                     .collect();
                 if archived_indices.len() > ARCHIVE_POOL_CAP {
-                    // Oldest = first in model order (creation order).
-                    let drop_idx = archived_indices[0];
-                    if drop_idx != idx {
+                    // Oldest = first in model order (creation order). Never
+                    // drop the thread the user JUST archived -- take the
+                    // next-oldest instead (review-gate finding: skipping
+                    // entirely left the pool at cap+1 until the next
+                    // archive).
+                    let drop_idx = archived_indices
+                        .iter()
+                        .copied()
+                        .find(|candidate| *candidate != idx);
+                    if let Some(drop_idx) = drop_idx {
                         if let Some(oldest) = model.threads.get_mut(drop_idx) {
                             oldest.closed = true;
                         }
@@ -1658,8 +1670,35 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         for row in &snapshot.rows {
             if let Some(thread) = model.threads.get_mut(row.real_index) {
                 thread.thread_id = row.thread_id.clone();
+                // Review-gate fix (phase 32): fold a background-attached
+                // session binding into the model. add_thread attaches in
+                // the background (phase 30), so no SessionAttached fold
+                // ever delivers the session id for `+`-created threads;
+                // without this the profile picker never locks and
+                // Effect::PersistThread never fires.
+                if thread.session_id.is_none() {
+                    if let Some(session_id) = row.session_id.clone() {
+                        thread.session_id = Some(session_id);
+                        effects.push(Effect::PersistThread {
+                            real_index: row.real_index,
+                        });
+                        dirty.push(Dirty::ThreadRow(row.real_index));
+                        dirty.push(Dirty::Capabilities {
+                            thread_id: row.thread_id.clone(),
+                        });
+                    }
+                }
             }
         }
+        // Review-gate fix (phase 32): hydrate bridge-persisted archived
+        // flags (restarts previously left every ThreadModel::archived
+        // false -- wrong sidebar counters, unenforced pool cap).
+        for (idx, archived) in snapshot.archived_flags.iter().enumerate() {
+            if let Some(thread) = model.threads.get_mut(idx) {
+                thread.archived = *archived;
+            }
+        }
+        model.visible_list_synced = true;
         if changed {
             // `selected_thread` is a *filtered* index into the visible
             // list, so before the visible order is rewritten (recency
@@ -1689,6 +1728,26 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             if reanchored != model.selected_thread {
                 model.selected_thread = reanchored;
                 dirty.push(Dirty::Scalar(ScalarField::SelectedThread));
+            }
+            // Review-gate fix (phase 32): a project switch can scope the
+            // visible list down to NOTHING. Without clearing the display,
+            // the previous project's transcript kept rendering next to an
+            // empty sidebar (and index fallbacks retargeted hidden
+            // threads). Same convergence the clear_selected_thread arm
+            // uses: drop displayed_thread and diff the shared model to
+            // empty.
+            if snapshot.visible_thread_ids.is_empty() {
+                let old_keys = model.message_model_keys.borrow().clone();
+                if model.displayed_thread.take().is_some() || !old_keys.is_empty() {
+                    dirty.push(Dirty::MessagesDiff {
+                        thread_id: String::new(),
+                        ops: crate::dirty::diff_by_id(
+                            &old_keys,
+                            &[],
+                            &Vec::<crate::MessageItem>::new(),
+                        ),
+                    });
+                }
             }
         }
     }
@@ -3408,6 +3467,7 @@ mod tests {
         let row = crate::models::VisibleThreadItem {
             real_index: 4,
             thread_id: "durable-thread-4".to_owned(),
+            session_id: None,
             item: crate::ThreadItem {
                 name: "filtered".into(),
                 ..crate::ThreadItem::default()
@@ -3420,6 +3480,7 @@ mod tests {
                     visible_indices: vec![4],
                     visible_thread_ids: vec!["durable-thread-4".to_owned()],
                     rows: vec![row.clone()],
+                    archived_flags: vec![],
                 }),
                 ..FrameInput::default()
             }),
@@ -3437,6 +3498,7 @@ mod tests {
         crate::models::VisibleThreadItem {
             real_index,
             thread_id: thread_id.to_owned(),
+            session_id: None,
             item: crate::ThreadItem::default(),
         }
     }
@@ -3475,6 +3537,7 @@ mod tests {
                         visible_row(0, "thread-0"),
                         visible_row(1, "thread-1"),
                     ],
+                    archived_flags: vec![],
                 }),
                 ..FrameInput::default()
             }),
@@ -3488,6 +3551,95 @@ mod tests {
         assert!(dirty
             .iter()
             .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread))));
+    }
+
+    #[test]
+    fn frame_fold_hydrates_a_background_attached_session_binding() {
+        // Phase-32 review finding 1: add_thread attaches in the background
+        // (phase 30), so no SessionAttached fold ever carries the session
+        // id for +-created threads -- the model's session_id stayed None
+        // forever (profile picker never locked, PersistThread never
+        // fired). The thread-list fold now hydrates it from the row.
+        let mut model = model_with_threads(&["a"]);
+        assert!(model.threads[0].session_id.is_none());
+        let mut row = visible_row(0, "thread-0");
+        row.session_id = Some("sess-live".to_owned());
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].session_id.as_deref(), Some("sess-live"));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistThread { real_index: 0 })));
+        assert!(dirty
+            .iter()
+            .any(|d| matches!(d, Dirty::Capabilities { thread_id } if thread_id == "thread-0")));
+    }
+
+    #[test]
+    fn frame_fold_hydrates_bridge_archived_flags() {
+        // Phase-32 review finding 2: restarts left every
+        // ThreadModel::archived false while the bridge restored the
+        // persisted flags -- wrong sidebar counters, unenforced pool cap.
+        let mut model = model_with_threads(&["a", "b"]);
+        let (_, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0, 1],
+                    visible_thread_ids: vec!["thread-0".to_owned(), "thread-1".to_owned()],
+                    rows: vec![visible_row(0, "thread-0"), visible_row(1, "thread-1")],
+                    archived_flags: vec![true, false],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(model.threads[0].archived);
+        assert!(!model.threads[1].archived);
+    }
+
+    #[test]
+    fn empty_scoped_visible_list_clears_the_displayed_transcript() {
+        // Phase-32 review finding 3: switching to a project with no
+        // matching threads left the previous project's transcript on
+        // screen and the empty-visible fallback retargeted hidden
+        // threads. The fold now clears the display, and the fallback
+        // stays off once a real list sync has happened.
+        let mut model = model_with_threads(&["a"]);
+        model.visible_indices = vec![0];
+        model.displayed_thread = Some(0);
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned()];
+        *model.message_model_keys.borrow_mut() = vec!["assistant:m1".to_owned()];
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![],
+                    visible_thread_ids: vec![],
+                    rows: vec![],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.displayed_thread, None);
+        assert!(dirty.iter().any(|d| matches!(
+            d,
+            Dirty::MessagesDiff { thread_id, ops } if thread_id.is_empty() && !ops.is_empty()
+        )));
+        // Post-sync fallback: an empty visible list is real now.
+        assert!(model.visible_list_synced);
+        assert!(current_visible_indices(&model).is_empty());
     }
 
     #[test]
@@ -3505,6 +3657,7 @@ mod tests {
                     visible_indices: vec![0],
                     visible_thread_ids: vec!["thread-0".to_owned()],
                     rows: vec![visible_row(0, "thread-0")],
+                    archived_flags: vec![],
                 }),
                 ..FrameInput::default()
             }),

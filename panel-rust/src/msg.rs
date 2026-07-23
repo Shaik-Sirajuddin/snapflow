@@ -272,6 +272,11 @@ pub struct ThreadListSnapshot {
     pub visible_indices: Vec<usize>,
     pub visible_thread_ids: Vec<String>,
     pub rows: Vec<crate::models::VisibleThreadItem>,
+    /// Review-gate fix (phase 32): bridge-persisted archived flags for
+    /// EVERY thread (indexed by real index, not filtered) -- restart
+    /// hydration for `ThreadModel::archived`, which the sidebar counters
+    /// and the archive pool cap read. Empty = no data (tests).
+    pub archived_flags: Vec<bool>,
 }
 
 /// Read-only settings data collected from the selected gateway for one

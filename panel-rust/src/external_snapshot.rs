@@ -428,6 +428,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                         .get(item.real_index)
                         .cloned()
                         .unwrap_or_else(|| format!("thread:{}", item.real_index)),
+                    // Review-gate fix (phase 32): carry the live bridge
+                    // binding so the frame fold can hydrate
+                    // ThreadModel::session_id once a background attach
+                    // resolves.
+                    session_id: self
+                        .panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_binding(item.real_index))
+                        .map(|binding| binding.session_id),
                     item: row,
                 }
             })
@@ -437,6 +447,10 @@ impl<'a> ExternalSnapshotSource<'a> {
             visible_indices,
             visible_thread_ids: rows.iter().map(|row| row.thread_id.clone()).collect(),
             rows,
+            // Review-gate fix (phase 32): bridge-persisted archived flags
+            // for every thread, so restarts hydrate ThreadModel::archived
+            // (sidebar counters + archive pool cap read the model).
+            archived_flags: archived,
         }
     }
 

@@ -939,6 +939,11 @@ pub struct VisibleThreadItem {
     pub real_index: usize,
     /// Durable panel-local identity used for list reconciliation.
     pub thread_id: String,
+    /// Review-gate fix (phase 32): the bridge-side session binding, when
+    /// known -- how the frame poll folds a background-attached session
+    /// into `ThreadModel::session_id` (add_thread attaches async now, so
+    /// no `SessionAttached` fold ever carries it).
+    pub session_id: Option<String>,
     pub item: ThreadItem,
 }
 
@@ -971,6 +976,9 @@ pub fn build_thread_items<N: AsRef<str>>(
         .map(|((real_index, name), st)| VisibleThreadItem {
             real_index,
             thread_id: format!("thread:{real_index}"),
+            // Post-populated by real_index in external_snapshot, same as
+            // provider/model.
+            session_id: None,
             item: ThreadItem {
                 name: name.as_ref().into(),
                 // Archived takes precedence over closed: it is the final,
@@ -2202,6 +2210,7 @@ mod transcript_model_tests {
             .map(|real_index| VisibleThreadItem {
                 real_index,
                 thread_id: format!("thread:{real_index}"),
+                session_id: None,
                 item: ThreadItem::default(),
             })
             .collect()
