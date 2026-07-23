@@ -57,6 +57,7 @@ pub enum Effect {
     },
     ArchiveThread {
         real_index: usize,
+        archived: bool,
     },
     RenameThread {
         real_index: usize,

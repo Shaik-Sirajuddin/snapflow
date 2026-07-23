@@ -658,7 +658,8 @@ export component Sidebar inherits Rectangle {
                             cancel-rename => { root.cancel-thread-rename(); }
                             close-requested => { root.thread-close-requested(i); }
                             delete-requested => { root.thread-delete-requested(i); }
-                            archive-requested => { }
+                            // Phase 19: same toggle = resume.
+                            archive-requested => { root.thread-archive-requested(i); }
                             rename-focus-changed(has-focus) => {
                                 root.rename-input-has-focus = has-focus;
                             }

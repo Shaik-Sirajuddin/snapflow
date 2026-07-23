@@ -386,10 +386,10 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     }
                 }
             }
-            Effect::ArchiveThread { real_index } => {
+            Effect::ArchiveThread { real_index, archived } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
-                    if !bridge.archive_thread(real_index) {
-                        eprintln!("panel-rust: archive_thread({real_index}) returned false");
+                    if !bridge.set_thread_archived(real_index, archived) {
+                        eprintln!("panel-rust: set_thread_archived({real_index}) returned false");
                     }
                 }
             }

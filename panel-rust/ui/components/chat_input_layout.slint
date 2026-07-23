@@ -24,6 +24,9 @@ export component ChatInputLayout inherits Rectangle {
     // control visibly disabled (dimmed, no hover/cursor affordance,
     // accessible-enabled false) -- used e.g. for archived threads.
     in property <bool> inputs-enabled: true;
+    // Phase 19: explicit blocking overlay (drawn last, swallows clicks)
+    // whenever inputs are disabled -- archived threads read as read-only
+    // rather than merely dimmed.
     in-out property <string> compose-text: "";
     in property <bool> sending: false;
     in property <[DropdownEntry]> mode-dropdown-entries: [];
@@ -1054,4 +1057,20 @@ export component ChatInputLayout inherits Rectangle {
     }
 
     focus-compose => { compose.focus(); }
+
+    if !root.inputs-enabled : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.bg-canvas.with-alpha(0.35);
+        TouchArea { }
+        Text {
+            text: "Archived thread - resume it to continue the conversation";
+            color: Theme.text-muted;
+            font-size: 10px * Theme.font-scale;
+            font-italic: true;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+        }
+    }
 }

@@ -2932,10 +2932,16 @@ impl AgentBridge {
     /// restart. Returns `false` for an out-of-range `idx` (nothing to
     /// archive); otherwise always succeeds and is idempotent.
     pub fn archive_thread(&self, idx: usize) -> bool {
+        self.set_thread_archived(idx, true)
+    }
+
+    /// Phase 19: toggle-capable archive state (false = resume from
+    /// archive). Same persistence as archive_thread.
+    pub fn set_thread_archived(&self, idx: usize, archived: bool) -> bool {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
-        *slot.archived.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *slot.archived.lock().unwrap_or_else(|e| e.into_inner()) = archived;
         persist_runtime_snapshot(self.store.as_ref(), slot);
         true
     }

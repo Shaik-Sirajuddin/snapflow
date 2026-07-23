@@ -426,11 +426,39 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);
             };
-            thread.archived = true;
-            (
-                vec![Effect::ArchiveThread { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
-            )
+            // Phase 19: TOGGLE -- the same action resumes an archived
+            // thread (sidebar's archived rows wire it as Resume).
+            let now_archived = !thread.archived;
+            thread.archived = now_archived;
+            let mut effects = vec![Effect::ArchiveThread { real_index: idx, archived: now_archived }];
+            let mut dirty = vec![Dirty::ThreadRow(idx)];
+            // Phase 19 pool cap: at most ARCHIVE_POOL_CAP archived
+            // threads; beyond it the OLDEST archived thread is quietly
+            // dropped -- permanent delete via the existing delete flow
+            // (acpx session close/delete + local purge), per the
+            // defaulted open question 1.
+            const ARCHIVE_POOL_CAP: usize = 10;
+            if now_archived {
+                let archived_indices: Vec<usize> = model
+                    .threads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.archived && !t.closed)
+                    .map(|(i, _)| i)
+                    .collect();
+                if archived_indices.len() > ARCHIVE_POOL_CAP {
+                    // Oldest = first in model order (creation order).
+                    let drop_idx = archived_indices[0];
+                    if drop_idx != idx {
+                        if let Some(oldest) = model.threads.get_mut(drop_idx) {
+                            oldest.closed = true;
+                        }
+                        effects.push(Effect::DeleteThread { real_index: drop_idx });
+                        dirty.push(Dirty::ThreadRow(drop_idx));
+                    }
+                }
+            }
+            (effects, dirty)
         }
         ThreadMsg::RenameRequested(idx, name) => {
             let old_keys = current_visible_keys(model);

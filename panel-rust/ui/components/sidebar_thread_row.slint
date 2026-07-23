@@ -73,9 +73,11 @@ export component SidebarThreadRow inherits HoverSurface {
                 // Collapsed: per-thread accent (rose/orange/…).
                 // Expanded: white selection bar (bg-primary) on
                 // the selected row only; transparent otherwise.
+                // Phase 29: archived rows carry NO accent glow in the
+                // collapsed rail -- only live threads get their color.
                 background: expanded
                     ? (index == selected-thread ? Theme.bg-primary : transparent)
-                    : accent-color;
+                    : (thread.archived ? transparent : accent-color);
             }
             VerticalLayout {
                 horizontal-stretch: 1;
@@ -378,7 +380,9 @@ export component SidebarThreadRow inherits HoverSurface {
                         Icon {
                             source: @image-url("../assets/icons/trash-2.svg");
                             size: 13px;
-                            color: Theme.text-muted;
+                            // Phase 29: destructive action reads as such --
+                            // subtle red, not full alert saturation.
+                            color: #ef4444.with-alpha(0.75);
                         }
                     }
                     if expanded && rename-thread-index != index
@@ -408,6 +412,22 @@ export component SidebarThreadRow inherits HoverSurface {
                                 size: 13px;
                                 color: Theme.text-secondary;
                             }
+                        }
+                    }
+                    // Phase 19: resume from archive -- same toggle action,
+                    // shown on archived rows (distinct accessible label).
+                    if expanded && rename-thread-index != index
+                        && thread.archived && (root.has-hover || index == selected-thread) : IconButton {
+                        btn-width: 18px;
+                        btn-height: 18px;
+                        button-accessible-label: "Resume thread " + thread.name;
+                        clicked => { archive-requested(); }
+                        Icon {
+                            source: @image-url("../assets/icons/archive.svg");
+                            size: 13px;
+                            // Phase 29: archive-family action gets its own
+                            // color, distinct from delete's red.
+                            color: #38bdf8;
                         }
                     }
                     if expanded && rename-thread-index != index
