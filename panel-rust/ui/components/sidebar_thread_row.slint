@@ -131,7 +131,7 @@ export component SidebarThreadRow inherits HoverSurface {
                             size: 14px;
                             color: Theme.bg-primary;
                             transform-rotation: load-spin;
-                            transform-origin: { x: 7px, y: 7px };
+                            transform-origin: { x: self.width / 2, y: self.height / 2 };
                         }
                     }
                     if thread.status == "error" : Icon {

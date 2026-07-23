@@ -379,7 +379,9 @@ export component ChatArea inherits Rectangle {
                             size: Metrics.icon-md;
                             color: Theme.bg-primary;
                             transform-rotation: header-spin;
-                            transform-origin: { x: 8px, y: 8px };
+                            // Center on the icon itself (not a fixed 8px
+                            // assumption) so the ring actually spins.
+                            transform-origin: { x: self.width / 2, y: self.height / 2 };
                         }
                         if !(root.sending || connection-status == "Connecting...")
                             && root.status-needs-attention : Icon {
