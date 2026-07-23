@@ -983,6 +983,8 @@ export component ChatInputLayout inherits Rectangle {
                             title: srv.name;
                             title-font-weight: 600;
                             subtitle: srv.command;
+                            // Phase 15: live connection dot on MCP rows.
+                            status-dot: srv.status;
                             clicked => {
                                 root.mention-sel = i;
                                 root.apply-mention-pick("@" + srv.name + " ");

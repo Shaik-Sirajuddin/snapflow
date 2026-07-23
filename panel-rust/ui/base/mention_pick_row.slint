@@ -24,6 +24,12 @@ export component MentionPickRow inherits Rectangle {
     in property <string> title-font-family: Theme.font-sans;
     in property <int> title-font-weight: 400;
     in property <string> subtitle: "";
+    // Phase 15 (mcp_skills_control_surface): live connection state dot.
+    // "" renders nothing; "connected" green, "error"/"disconnected" red,
+    // anything else (e.g. "auth required") yellow -- explicit user
+    // direction to use colored markers wherever MCP connection state
+    // shows, superseding the earlier no-status-color convention.
+    in property <string> status-dot: "";
     callback clicked();
 
     height: 28px;
@@ -37,6 +43,16 @@ export component MentionPickRow inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
         changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+    }
+    if root.status-dot != "" : Rectangle {
+        x: parent.width - self.width - Metrics.space-3;
+        y: (parent.height - self.height) / 2;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: root.status-dot == "connected" ? #22c55e
+            : (root.status-dot == "error" || root.status-dot == "disconnected") ? #ef4444
+            : #eab308;
     }
 
     HorizontalLayout {
