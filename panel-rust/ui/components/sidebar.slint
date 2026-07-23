@@ -3,10 +3,10 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
+import { NavItem } from "../base/nav_item.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { NamePromptDialog } from "../base/name_prompt_dialog.slint";
 import { TextUtil } from "../base/text_util.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
 import { ThreadItem, SkillOption } from "../types.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
@@ -261,42 +261,31 @@ export component Sidebar inherits Rectangle {
                 padding-left: Metrics.space-3;
                 padding-right: Metrics.space-3;
                 spacing: Metrics.space-3;
-                threads-tab := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Show threads";
-                    // Every other interactive control in this file (HoverSurface,
-                    // IconButton, Button) wires accessible-action-default
-                    // alongside clicked -- this TouchArea and skills-tab below
-                    // were missing it, so a keyboard/screen-reader "activate"
-                    // was a silent no-op despite both being fully labelled and
-                    // roled as buttons (found via a real e2e test never
-                    // switching skill-mode).
-                    accessible-action-default => { skill-mode = false; }
+                NavItem {
+                    horizontal-stretch: 0;
+                    fill-width: false;
+                    idle-bg: transparent;
+                    hover-bg: transparent;
+                    selected-bg: transparent;
+                    active-color: Theme.bg-primary;
+                    inactive-color: Theme.text-muted;
+                    label: "Threads";
+                    active: !skill-mode;
+                    button-accessible-label: "Show threads";
                     clicked => { skill-mode = false; }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    Text {
-                        text: "Threads";
-                        color: !skill-mode ? Theme.bg-primary : Theme.text-muted;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: !skill-mode ? 700 : 400;
-                        vertical-alignment: center;
-                    }
                 }
-                skills-tab := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Show skills";
-                    accessible-action-default => { skill-mode = true; }
+                NavItem {
+                    horizontal-stretch: 0;
+                    fill-width: false;
+                    idle-bg: transparent;
+                    hover-bg: transparent;
+                    selected-bg: transparent;
+                    active-color: Theme.bg-primary;
+                    inactive-color: Theme.text-muted;
+                    label: "Skills";
+                    active: skill-mode;
+                    button-accessible-label: "Show skills";
                     clicked => { skill-mode = true; }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    Text {
-                        text: "Skills";
-                        color: skill-mode ? Theme.bg-primary : Theme.text-muted;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: skill-mode ? 700 : 400;
-                        vertical-alignment: center;
-                    }
                 }
             }
         }
