@@ -486,6 +486,53 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
     }
 }
 
+/// Rebuild transcript + send-queue projection after a queue mutation and
+/// emit the matching `MessagesDiff` dirty set.
+fn rebuild_send_queue_projection(
+    model: &mut Model,
+    idx: usize,
+) -> (String, Vec<Dirty>) {
+    let expanded = model.expanded.clone();
+    let Some(thread) = model.threads.get_mut(idx) else {
+        return (String::new(), vec![]);
+    };
+    let thread_id = thread.thread_id.clone();
+    let old_keys = thread.transcript_keys.clone();
+    let in_flight = matches!(
+        thread.state,
+        ThreadState::Loading | ThreadState::Cancelling
+    );
+    let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+        thread.transcript.clone(),
+        &expanded,
+        &thread.send_queue,
+        in_flight,
+    );
+    let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
+    thread.message_rows = rows;
+    thread.transcript_keys = keys;
+    (
+        thread_id.clone(),
+        vec![
+            Dirty::ThreadRow(idx),
+            Dirty::MessagesDiff {
+                thread_id,
+                ops,
+            },
+        ],
+    )
+}
+
+fn queue_entry_id_at(
+    thread: &ThreadModel,
+    message_index: usize,
+) -> Option<crate::send_queue::QueueEntryId> {
+    let key = thread.transcript_keys.get(message_index)?;
+    let raw = key.strip_prefix("queue:")?;
+    let n: u64 = raw.parse().ok()?;
+    Some(crate::send_queue::QueueEntryId(n))
+}
+
 fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty>) {
     let idx = selected_real_index(model);
     match msg {
@@ -502,10 +549,15 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         // QueuedMessageBar appears immediately.
                         let expanded = model.expanded.clone();
                         let old_keys = thread.transcript_keys.clone();
-                        let (rows, keys) = crate::models::message_rows_for_thread(
+                        let in_flight = matches!(
+                            thread.state,
+                            ThreadState::Loading | ThreadState::Cancelling
+                        );
+                        let (rows, keys) = crate::models::message_rows_for_thread_with_state(
                             thread.transcript.clone(),
                             &expanded,
                             &thread.send_queue,
+                            in_flight,
                         );
                         let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
                         thread.message_rows = rows;
@@ -541,6 +593,8 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             }
             thread.error = None;
             thread.state = ThreadState::Loading;
+            // Sending resumes auto-processing after a manual stop.
+            thread.send_queue.resume();
             (
                 vec![Effect::SendPrompt {
                     real_index: idx,
@@ -560,10 +614,13 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 ],
             )
         }
-        ComposeMsg::StopRequested => {
+        ComposeMsg::StopRequested | ComposeMsg::QueueStop => {
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);
             };
+            // Manual stop freezes the queue until the user re-engages
+            // (SendQueue::pause / resume).
+            thread.send_queue.pause();
             thread.state = ThreadState::Cancelling;
             (
                 vec![Effect::CancelGeneration { real_index: idx }],
@@ -576,6 +633,86 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             };
             thread.state = ThreadState::Idle;
             (vec![], vec![Dirty::ThreadRow(idx)])
+        }
+        ComposeMsg::QueueCancel { message_index } => {
+            let entry_id = {
+                let Some(thread) = model.threads.get(idx) else {
+                    return (vec![], vec![]);
+                };
+                match queue_entry_id_at(thread, message_index) {
+                    Some(id) => id,
+                    None => return (vec![], vec![]),
+                }
+            };
+            let remove_result = {
+                let Some(thread) = model.threads.get_mut(idx) else {
+                    return (vec![], vec![]);
+                };
+                thread.send_queue.remove(entry_id)
+            };
+            match remove_result {
+                Ok(Some(_)) => {
+                    let (_thread_id, dirty) = rebuild_send_queue_projection(model, idx);
+                    (vec![], dirty)
+                }
+                Ok(None) => (vec![], vec![]),
+                Err(error) => {
+                    let message = error.to_string();
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = Some(message.clone());
+                    (
+                        vec![],
+                        vec![Dirty::Error {
+                            thread_id,
+                            detail: ErrorDetail { message },
+                        }],
+                    )
+                }
+            }
+        }
+        ComposeMsg::QueueEdit { message_index } => {
+            let entry_id = {
+                let Some(thread) = model.threads.get(idx) else {
+                    return (vec![], vec![]);
+                };
+                match queue_entry_id_at(thread, message_index) {
+                    Some(id) => id,
+                    None => return (vec![], vec![]),
+                }
+            };
+            let remove_result = {
+                let Some(thread) = model.threads.get_mut(idx) else {
+                    return (vec![], vec![]);
+                };
+                thread.send_queue.remove(entry_id)
+            };
+            match remove_result {
+                Ok(Some(entry)) => {
+                    model.compose_text = entry.text;
+                    let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
+                    dirty.push(Dirty::Scalar(ScalarField::ComposeText));
+                    (vec![], dirty)
+                }
+                Ok(None) => (vec![], vec![]),
+                Err(error) => {
+                    let message = error.to_string();
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = Some(message.clone());
+                    (
+                        vec![],
+                        vec![Dirty::Error {
+                            thread_id,
+                            detail: ErrorDetail { message },
+                        }],
+                    )
+                }
+            }
         }
         // Pure text-parsing helpers -- no Model mutation, no Dirty. These
         // exist as Msg variants for coverage completeness (see
@@ -767,6 +904,26 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             vec![Effect::McpServerEnabledChanged {
                 real_index: idx,
                 name,
+                enabled,
+            }],
+            vec![Dirty::Settings],
+        ),
+        SettingsMsg::McpServerAuthenticate { name } => (
+            vec![Effect::McpServerAuthenticate {
+                real_index: idx,
+                name,
+            }],
+            vec![Dirty::Settings],
+        ),
+        SettingsMsg::McpServerToolEnabledChanged {
+            server_name,
+            tool_name,
+            enabled,
+        } => (
+            vec![Effect::McpServerToolEnabledChanged {
+                real_index: idx,
+                server_name,
+                tool_name,
                 enabled,
             }],
             vec![Dirty::Settings],
@@ -1475,10 +1632,15 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
             // Include send-queue rows (QueuedMessageBar) in the projection.
-            let (rows, new_keys) = crate::models::message_rows_for_thread(
+            let in_flight = matches!(
+                thread.state,
+                ThreadState::Loading | ThreadState::Cancelling
+            );
+            let (rows, new_keys) = crate::models::message_rows_for_thread_with_state(
                 snapshot.transcript.clone(),
                 &expanded,
                 &thread.send_queue,
+                in_flight,
             );
             // `old_keys`/`thread.message_rows` are this thread's *own*
             // previously-cached copy, not what's actually still on screen.
@@ -2079,6 +2241,114 @@ mod tests {
         );
         assert_eq!(model.threads[0].state, ThreadState::Loading);
         assert!(dirty.contains(&Dirty::ThreadRow(0)));
+    }
+
+    #[test]
+    fn queue_cancel_removes_entry_and_rebuilds_message_rows() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("stay".to_owned(), false)
+            .expect("queue");
+        model.threads[0]
+            .send_queue
+            .enqueue("drop-me".to_owned(), false)
+            .expect("queue");
+        // Project once so transcript_keys include queue:{id} rows.
+        let expanded = model.expanded.clone();
+        let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+            model.threads[0].transcript.clone(),
+            &expanded,
+            &model.threads[0].send_queue,
+            true,
+        );
+        model.threads[0].message_rows = rows;
+        model.threads[0].transcript_keys = keys;
+        // Last queue row is "drop-me" (can_edit / most recent).
+        let last = model.threads[0].transcript_keys.len() - 1;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueCancel {
+                message_index: last,
+            })),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(model.threads[0].send_queue.len(), 1);
+        assert_eq!(
+            model.threads[0].send_queue.first().map(|e| e.text.as_str()),
+            Some("stay")
+        );
+        assert!(
+            dirty.iter().any(|d| matches!(d, Dirty::MessagesDiff { .. })),
+            "cancel must rebuild message rows, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn queue_edit_moves_entry_text_into_compose() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("edit this".to_owned(), false)
+            .expect("queue");
+        let expanded = model.expanded.clone();
+        let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+            model.threads[0].transcript.clone(),
+            &expanded,
+            &model.threads[0].send_queue,
+            true,
+        );
+        model.threads[0].message_rows = rows;
+        model.threads[0].transcript_keys = keys;
+        let last = model.threads[0].transcript_keys.len() - 1;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueEdit {
+                message_index: last,
+            })),
+        );
+        assert!(effects.is_empty());
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.compose_text, "edit this");
+        assert!(dirty.contains(&Dirty::Scalar(ScalarField::ComposeText)));
+    }
+
+    #[test]
+    fn queue_stop_pauses_queue_and_cancels_generation() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("waiting".to_owned(), false)
+            .expect("queue");
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::CancelGeneration { real_index: 0 }]
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Cancelling);
+        assert!(dirty.contains(&Dirty::ThreadRow(0)));
+        // Paused: TurnEnded must not auto-drain.
+        let (effects2, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("cancelled".to_owned()),
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            effects2.is_empty(),
+            "paused queue must not auto-send after stop, got {effects2:?}"
+        );
+        assert_eq!(model.threads[0].send_queue.len(), 1);
     }
 
     #[test]

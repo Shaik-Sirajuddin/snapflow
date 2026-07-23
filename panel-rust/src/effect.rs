@@ -128,6 +128,16 @@ pub enum Effect {
         name: String,
         enabled: bool,
     },
+    McpServerAuthenticate {
+        real_index: usize,
+        name: String,
+    },
+    McpServerToolEnabledChanged {
+        real_index: usize,
+        server_name: String,
+        tool_name: String,
+        enabled: bool,
+    },
     ProfileCreate {
         real_index: usize,
         name: String,

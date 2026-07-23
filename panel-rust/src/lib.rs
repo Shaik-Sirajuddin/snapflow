@@ -794,6 +794,94 @@ impl PanelSingleton {
         }
     }
 
+    /// Registry-side "Connect" for remote MCP servers. There is no
+    /// `mcp_servers/authenticate` RPC on acpx; this persists
+    /// `auth_status`/`needs_auth` on the entry via `mcp_servers/update`
+    /// so the Connect button can clear and the status line updates on
+    /// the next settings gateway snapshot.
+    pub(crate) fn dispatch_mcp_server_authenticate(
+        &self,
+        _component: &ChatPanel,
+        name: &str,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        let Some(mut entry) = bridge
+            .list_mcp_servers(gw)
+            .into_iter()
+            .find(|entry| entry.name == name)
+        else {
+            eprintln!(
+                "panel-rust: MCP server {:?} disappeared before authenticate could run",
+                name
+            );
+            return;
+        };
+        entry.extra["auth_status"] = serde_json::Value::String("authenticated".to_owned());
+        entry.extra["needs_auth"] = serde_json::Value::Bool(false);
+        if !bridge.update_mcp_server(gw, entry.extra) {
+            eprintln!(
+                "panel-rust: failed to persist auth state for MCP server {:?}",
+                name
+            );
+        }
+    }
+
+    /// Per-tool enable flag on one MCP server entry. Persists into the
+    /// entry's opaque `tools` JSON array via `mcp_servers/update`.
+    pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
+        &self,
+        _component: &ChatPanel,
+        server_name: &str,
+        tool_name: &str,
+        enabled: bool,
+    ) {
+        let Some(bridge) = &self.bridge else { return };
+        let gw = self.settings_gateway_index();
+        let Some(mut entry) = bridge
+            .list_mcp_servers(gw)
+            .into_iter()
+            .find(|entry| entry.name == server_name)
+        else {
+            eprintln!(
+                "panel-rust: MCP server {:?} disappeared before tool enable update",
+                server_name
+            );
+            return;
+        };
+        let tools = entry
+            .extra
+            .get_mut("tools")
+            .and_then(|v| v.as_array_mut());
+        if let Some(tools) = tools {
+            let mut found = false;
+            for tool in tools.iter_mut() {
+                if tool.get("name").and_then(|n| n.as_str()) == Some(tool_name) {
+                    tool["enabled"] = serde_json::Value::Bool(enabled);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                tools.push(serde_json::json!({
+                    "name": tool_name,
+                    "enabled": enabled,
+                }));
+            }
+        } else {
+            entry.extra["tools"] = serde_json::json!([{
+                "name": tool_name,
+                "enabled": enabled,
+            }]);
+        }
+        if !bridge.update_mcp_server(gw, entry.extra) {
+            eprintln!(
+                "panel-rust: failed to update tool {:?} on MCP server {:?}",
+                tool_name, server_name
+            );
+        }
+    }
+
     pub(crate) fn dispatch_profile_create(
         &self,
         _component: &ChatPanel,
@@ -1555,6 +1643,44 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         let component_weak = panel.component.as_weak();
         panel
             .component
+            .on_mcp_server_authenticate(move |name| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_authenticate(
+                            panel,
+                            &component,
+                            name.to_string(),
+                        );
+                    }
+                });
+            });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_mcp_server_tool_enabled_changed(
+            move |server_name, tool_name, enabled| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_mcp_server_tool_enabled_changed(
+                            panel,
+                            &component,
+                            server_name.to_string(),
+                            tool_name.to_string(),
+                            enabled,
+                        );
+                    }
+                });
+            },
+        );
+
+        let component_weak = panel.component.as_weak();
+        panel
+            .component
             .on_profile_create(move |name, agent_id, terminal_enabled, fs_enabled| {
                 let Some(component) = component_weak.upgrade() else {
                     return;
@@ -1809,6 +1935,28 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_compose_stop(panel);
+                }
+            });
+        });
+
+        panel.component.on_queue_cancel_requested(move |message_index| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_queue_cancel(panel, message_index as usize);
+                }
+            });
+        });
+        panel.component.on_queue_edit_requested(move |message_index| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_queue_edit(panel, message_index as usize);
+                }
+            });
+        });
+        panel.component.on_queue_stop_requested(move || {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_queue_stop(panel);
                 }
             });
         });

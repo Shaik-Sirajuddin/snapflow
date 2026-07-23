@@ -294,6 +294,28 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 };
                 panel.dispatch_mcp_server_enabled_changed(&component, &name, enabled);
             }
+            Effect::McpServerAuthenticate { name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_authenticate(&component, &name);
+            }
+            Effect::McpServerToolEnabledChanged {
+                server_name,
+                tool_name,
+                enabled,
+                ..
+            } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_tool_enabled_changed(
+                    &component,
+                    &server_name,
+                    &tool_name,
+                    enabled,
+                );
+            }
             Effect::ProfileCreate {
                 name,
                 agent_id,

@@ -93,6 +93,10 @@ export component ChatArea inherits Rectangle {
     callback context-view-requested();
     callback send-requested();
     callback stop-requested();
+    // QueuedMessageBar actions: message-list index of the queued row.
+    callback queue-cancel-requested(int);
+    callback queue-edit-requested(int);
+    callback queue-stop-requested();
     callback settings-requested();
     callback new-thread-requested();
     callback thread-rename-started();
@@ -748,8 +752,9 @@ export component ChatArea inherits Rectangle {
                         text: msg.text;
                         can-edit: msg.can-edit;
                         sending: msg.sending;
-                        // Cancel/edit/stop round-trip is a later wiring
-                        // pass; showing the bar is the audit-fix gap.
+                        cancel-requested => { root.queue-cancel-requested(msg.index); }
+                        edit-requested => { root.queue-edit-requested(msg.index); }
+                        stop-requested => { root.queue-stop-requested(); }
                     }
                     if is-user : UserBubble {
                         // Stretch within the available chat column instead

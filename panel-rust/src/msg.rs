@@ -58,6 +58,18 @@ pub enum ComposeMsg {
     SendRequested(String),
     StopRequested,
     GenerationStopped,
+    /// Drop one send-queue entry (QueuedMessageBar cancel).
+    /// `message_index` is the Slint message-list index (`MessageItem.index`).
+    QueueCancel {
+        message_index: usize,
+    },
+    /// Pull one send-queue entry into the composer for editing.
+    QueueEdit {
+        message_index: usize,
+    },
+    /// Stop in-flight generation and pause auto-drain of the send queue
+    /// (QueuedMessageBar stop while an entry is marked `sending`).
+    QueueStop,
     MentionTokenPrefix {
         text: String,
         cursor: i32,
@@ -125,6 +137,18 @@ pub enum SettingsMsg {
     },
     McpServerEnabledChanged {
         name: String,
+        enabled: bool,
+    },
+    /// OAuth / auth Connect for a remote MCP server. Persists registry-side
+    /// auth flags via `mcp_servers/update` (no separate authenticate RPC).
+    McpServerAuthenticate {
+        name: String,
+    },
+    /// Per-tool enable toggle on one MCP server entry (persisted in the
+    /// server's opaque JSON `tools` array via `mcp_servers/update`).
+    McpServerToolEnabledChanged {
+        server_name: String,
+        tool_name: String,
         enabled: bool,
     },
     ProfileCreate {
@@ -326,15 +350,20 @@ mod tests {
         "local_terminal_close_requested",
         "local_terminal_key_input",
         "local_terminal_toggle_requested",
+        "mcp_server_authenticate",
         "mcp_server_create",
         "mcp_server_delete",
         "mcp_server_enabled_changed",
+        "mcp_server_tool_enabled_changed",
         "mode_selected",
         "new_skill_requested",
         "new_thread_requested",
         "permission_option_selected",
         "profile_create",
         "profile_delete",
+        "queue_cancel_requested",
+        "queue_edit_requested",
+        "queue_stop_requested",
         "recover_session_attach",
         "reject_request",
         "replace_active_token",
@@ -381,6 +410,9 @@ mod tests {
             "send_requested"
             | "stop_requested"
             | "generation_stopped"
+            | "queue_cancel_requested"
+            | "queue_edit_requested"
+            | "queue_stop_requested"
             | "active_token_prefix"
             | "active_token_query"
             | "replace_active_token"
@@ -405,6 +437,8 @@ mod tests {
             | "mcp_server_create"
             | "mcp_server_delete"
             | "mcp_server_enabled_changed"
+            | "mcp_server_authenticate"
+            | "mcp_server_tool_enabled_changed"
             | "profile_create"
             | "profile_delete"
             | "agent_install_requested" => "settings",
