@@ -1,0 +1,50 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { HoverSurface } from "./hover.slint";
+
+// Layer 3 (base) -- the terminal-card header row (glyph + title + status
+// + trailing controls) shared verbatim by `components/terminal_card.slint`
+// (agent-created, read-only -- trailing content is just a static expand
+// glyph) and `components/local_terminal_card.slint` (client-local PTY --
+// trailing content is a Kill button + an expand IconButton). Inherits
+// `HoverSurface` directly (not composed) so the click/hover/cursor
+// wiring both cards already used post-Phase-2 stays exactly the same;
+// `@children` here is the trailing-controls slot, same convention as
+// `SettingsRow`.
+export component TerminalHeader inherits HoverSurface {
+    in property <string> title;
+    in property <string> status-text;
+    in property <color> status-color: Theme.text-secondary;
+
+    height: 18px;
+
+    HorizontalLayout {
+        spacing: Metrics.space-3;
+        Text {
+            text: "\u{2318}"; // terminal glyph stand-in
+            color: Theme.bg-primary;
+            font-size: 11px * Theme.font-scale;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.title;
+            color: Theme.text-primary;
+            font-family: Theme.font-mono;
+            font-size: 10px * Theme.font-scale;
+            font-weight: 700;
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.status-text;
+            color: root.status-color;
+            font-family: Theme.font-mono;
+            font-size: 9px * Theme.font-scale;
+            vertical-alignment: center;
+        }
+        @children
+    }
+}

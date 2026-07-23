@@ -47,10 +47,24 @@ export component ChatPanel inherits Window {
     // (conditional element); referencing its property outside that scope
     // still resolves to false when absent, same as the other conditional
     // refs in this OR-chain.
+    // SkillEditorView (`if root.active-pane == "skill"`) can't be
+    // referenced directly for the same reason -- mirrored into
+    // skill-editor-focus-mirror instead, same pattern settings_page.slint
+    // uses for its own conditional section views. Without this, every
+    // keystroke typed while editing a skill's content was silently
+    // dropped (TextField.has-focus's doc comment names the same failure
+    // class).
+    property <bool> skill-editor-focus-mirror: false;
+    changed active-pane => {
+        if (self.active-pane != "skill") {
+            self.skill-editor-focus-mirror = false;
+        }
+    }
     out property <bool> secondary-text-input-has-focus:
         sidebar.search-has-focus
         || chat-area.secondary-text-input-has-focus
-        || settings-page-instance.search-has-focus;
+        || settings-page-instance.search-has-focus
+        || skill-editor-focus-mirror;
     out property <bool> local-terminal-has-focus:
         chat-area.local-terminal-has-focus
         || (local-terminal-overlay-open && local-terminal-overlay.has-focus);
@@ -124,6 +138,8 @@ export component ChatPanel inherits Window {
     in property <string> active-skill-name: "";
     in property <string> active-skill-path: "";
     in-out property <string> active-skill-content: "";
+    // skills_audit_report §3.1: true while a skill SKILL.md write is in flight.
+    in property <bool> skill-saving: false;
     in property <[string]> detected-editors: [];
     // `thread_item_project_context` phase: the currently-open MLT
     // project's path (mirrors PanelSingleton::active_project_path),
@@ -146,6 +162,19 @@ export component ChatPanel inherits Window {
     // Active model/config display name for the compose-bar trigger
     // (host: models::current_config_trigger_label). Empty → "Model".
     in-out property <string> config-trigger-label: "";
+    // Reasoning effort dropdown (separate from model).
+    in-out property <[DropdownEntry]> reasoning-dropdown-entries: [];
+    in-out property <string> reasoning-trigger-label: "";
+    // setup-followups plan, provider_fastmode_profile_persistence.
+    in-out property <[DropdownEntry]> profile-dropdown-entries: [];
+    in-out property <string> profile-trigger-label: "";
+    in property <bool> active-thread-has-session: false;
+    // Fast-mode toggle (binary ACP config option, e.g. id "fastMode").
+    in property <bool> fast-mode-available: false;
+    in property <bool> fast-mode-enabled: false;
+    in property <string> fast-mode-option-id: "fastMode";
+    in property <string> fast-mode-on-value: "on";
+    in property <string> fast-mode-off-value: "off";
     // Session context ring (ui.yaml chat-view-input). Host fills real
     // numbers when available; defaults stay at zero until then.
     in property <float> context-ratio: 0.0;
@@ -177,6 +206,9 @@ export component ChatPanel inherits Window {
     callback search-submitted(string, bool, bool);
     callback send-requested();
     callback stop-requested();
+    callback queue-cancel-requested(int);
+    callback queue-edit-requested(int);
+    callback queue-stop-requested();
     callback settings-requested();
     callback settings-scope-changed(string);
     callback settings-save();
@@ -184,6 +216,8 @@ export component ChatPanel inherits Window {
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
+    callback mcp-server-authenticate(string);
+    callback mcp-server-tool-enabled-changed(string, string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
     callback agent-install-requested(string);
@@ -202,6 +236,7 @@ export component ChatPanel inherits Window {
     callback local-terminal-close-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback profile-selected(string);
     callback thread-toggle-background(int);
     property <int> rename-thread-index: -1;
     property <string> rename-thread-draft: "";
@@ -452,6 +487,9 @@ export component ChatPanel inherits Window {
                 compose-text <=> compose-text;
                 send-requested => { send-requested(); }
                 stop-requested => { stop-requested(); }
+                queue-cancel-requested(i) => { queue-cancel-requested(i); }
+                queue-edit-requested(i) => { queue-edit-requested(i); }
+                queue-stop-requested => { queue-stop-requested(); }
                 settings-requested => { root.open-settings(); }
                 new-thread-requested => { root.start-new-thread(); }
                 thread-rename-started => {
@@ -477,6 +515,16 @@ export component ChatPanel inherits Window {
                 config-dropdown-entries: config-dropdown-entries;
                 mode-trigger-label: mode-trigger-label;
                 config-trigger-label: config-trigger-label;
+                reasoning-dropdown-entries: reasoning-dropdown-entries;
+                reasoning-trigger-label: reasoning-trigger-label;
+                profile-dropdown-entries: profile-dropdown-entries;
+                profile-trigger-label: profile-trigger-label;
+                active-thread-has-session: active-thread-has-session;
+                fast-mode-available: fast-mode-available;
+                fast-mode-enabled: fast-mode-enabled;
+                fast-mode-option-id: fast-mode-option-id;
+                fast-mode-on-value: fast-mode-on-value;
+                fast-mode-off-value: fast-mode-off-value;
                 context-ratio: context-ratio;
                 context-used-tokens: context-used-tokens;
                 context-limit-tokens: context-limit-tokens;
@@ -485,6 +533,7 @@ export component ChatPanel inherits Window {
                 file-options: file-options;
                 mode-selected(id) => { mode-selected(id); }
                 config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+                profile-selected(id) => { profile-selected(id); }
                 context-view-requested => { context-view-requested(); }
                 // Compose owns focus for typing -- re-dispatch panel chords
                 // so Ctrl+B/N/K/, and Escape still work while composing.
@@ -500,6 +549,7 @@ export component ChatPanel inherits Window {
                 skill-name: root.active-skill-name;
                 skill-path: root.active-skill-path;
                 skill-content <=> root.active-skill-content;
+                skill-saving: root.skill-saving;
                 detected-editors: root.detected-editors;
                 copy-path-requested => { root.skill-copy-path-requested(root.active-skill-path); }
                 open-in-editor-requested(editor-name) => {
@@ -512,6 +562,9 @@ export component ChatPanel inherits Window {
                     root.skill-content-edited(root.active-skill-path, new-content);
                 }
                 close-requested => { root.active-pane = "chat"; }
+                changed has-focus => {
+                    root.skill-editor-focus-mirror = self.has-focus;
+                }
             }
         }
         if expanded-terminal.terminal-id != "" : TerminalOverlay {
@@ -595,6 +648,10 @@ export component ChatPanel inherits Window {
             mcp-server-delete(name) => { mcp-server-delete(name); }
             mcp-server-enabled-changed(name, enabled) => {
                 mcp-server-enabled-changed(name, enabled);
+            }
+            mcp-server-authenticate(name) => { mcp-server-authenticate(name); }
+            mcp-server-tool-enabled-changed(server-name, tool-name, enabled) => {
+                mcp-server-tool-enabled-changed(server-name, tool-name, enabled);
             }
             profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
                 profile-create(name, agent-id, terminal-enabled, fs-enabled);

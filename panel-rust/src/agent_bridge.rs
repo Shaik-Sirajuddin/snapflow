@@ -332,9 +332,9 @@ async fn open_session_maybe_profiled(
 /// own doc comment on why this is a full rebuild rather than an
 /// incremental merge.
 fn refresh_transcript(slot: &ThreadSlot) {
-    let history = slot.history.lock().expect("history mutex poisoned").clone();
+    let history = slot.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let rebuilt = crate::conversation::rebuild_from_chat_messages(&slot.thread_id, &history);
-    *slot.transcript.lock().expect("transcript mutex poisoned") = rebuilt;
+    *slot.transcript.lock().unwrap_or_else(|e| e.into_inner()) = rebuilt;
 }
 
 fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
@@ -442,7 +442,7 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
             .lock()
             .expect("config_options mutex poisoned")
             .clone(),
-        archived: *slot.archived.lock().expect("archived mutex poisoned"),
+        archived: *slot.archived.lock().unwrap_or_else(|e| e.into_inner()),
     };
     if let Err(error) = store.write_runtime_snapshot(&slot.thread_id, &snapshot) {
         eprintln!(
@@ -1707,7 +1707,7 @@ async fn wait_for_attachment(slot: &ThreadSlot) -> Result<(), String> {
     loop {
         let notified = slot.attachment_ready.notified();
         {
-            let state = slot.attachment.lock().expect("attachment mutex poisoned");
+            let state = slot.attachment.lock().unwrap_or_else(|e| e.into_inner());
             if state.complete {
                 return state.error.clone().map_or(Ok(()), Err);
             }
@@ -1728,7 +1728,7 @@ fn complete_attachment(slot: &ThreadSlot, error: Option<String>) {
         );
     }
     {
-        let mut state = slot.attachment.lock().expect("attachment mutex poisoned");
+        let mut state = slot.attachment.lock().unwrap_or_else(|e| e.into_inner());
         state.complete = true;
         state.error = error;
     }
@@ -1886,7 +1886,7 @@ fn spawn_background_attachment(
                     let mut replayed_any = false;
                     while let Ok(ev) = events_rx.try_recv() {
                         if let AgentEvent::Message(message) = &ev {
-                            let mut history = slot.history.lock().expect("history mutex poisoned");
+                            let mut history = slot.history.lock().unwrap_or_else(|e| e.into_inner());
                             if !replay_matches_cached_position(&history, &mut cached_index, message) {
                                 history.push(message.clone());
                                 replayed_any = true;
@@ -2652,7 +2652,7 @@ impl AgentBridge {
         let Some(url) = self.gateway_urls.get(&slot.provider) else {
             return "Unavailable".to_owned();
         };
-        let gateways = self.gateways.lock().expect("gateways mutex poisoned");
+        let gateways = self.gateways.lock().unwrap_or_else(|e| e.into_inner());
         match gateways.get(url).map(|gateway| gateway.mode()) {
             Some(acpx_client::TransportMode::WebSocketInteractive) => "Live connection".to_owned(),
             Some(acpx_client::TransportMode::HttpDegraded) => {
@@ -2667,7 +2667,7 @@ impl AgentBridge {
     pub fn history(&self, idx: usize) -> Vec<ChatMessage> {
         self.slots
             .get(idx)
-            .map(|s| s.history.lock().expect("history mutex poisoned").clone())
+            .map(|s| s.history.lock().unwrap_or_else(|e| e.into_inner()).clone())
             .unwrap_or_default()
     }
 
@@ -2832,7 +2832,7 @@ impl AgentBridge {
             .block_on(handle.close_session(background))
             .is_ok();
         if ok {
-            *slot.closed.lock().expect("closed mutex poisoned") = true;
+            *slot.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
         ok
     }
@@ -2854,7 +2854,7 @@ impl AgentBridge {
         let handle = slot.handle.clone();
         let ok = self.runtime.block_on(handle.delete_session()).is_ok();
         if ok {
-            *slot.closed.lock().expect("closed mutex poisoned") = true;
+            *slot.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
         ok
     }
@@ -2865,7 +2865,7 @@ impl AgentBridge {
     pub fn thread_closed(&self, idx: usize) -> bool {
         self.slots
             .get(idx)
-            .map(|slot| *slot.closed.lock().expect("closed mutex poisoned"))
+            .map(|slot| *slot.closed.lock().unwrap_or_else(|e| e.into_inner()))
             .unwrap_or(false)
     }
 
@@ -2881,7 +2881,7 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
-        *slot.archived.lock().expect("archived mutex poisoned") = true;
+        *slot.archived.lock().unwrap_or_else(|e| e.into_inner()) = true;
         persist_runtime_snapshot(self.store.as_ref(), slot);
         true
     }
@@ -2892,7 +2892,7 @@ impl AgentBridge {
     pub fn thread_archived(&self, idx: usize) -> bool {
         self.slots
             .get(idx)
-            .map(|slot| *slot.archived.lock().expect("archived mutex poisoned"))
+            .map(|slot| *slot.archived.lock().unwrap_or_else(|e| e.into_inner()))
             .unwrap_or(false)
     }
 
@@ -3276,7 +3276,7 @@ impl AgentBridge {
             return false;
         }
         {
-            let mut history = slot.history.lock().expect("history mutex poisoned");
+            let mut history = slot.history.lock().unwrap_or_else(|e| e.into_inner());
             let mut prepended = page.messages;
             prepended.extend(history.drain(..));
             *history = prepended;
@@ -3441,6 +3441,50 @@ impl AgentBridge {
         let Some(slot) = self.slots.get(idx) else {
             return;
         };
+        // Defensive validation, not a normal-path check: session/set_
+        // config_option is scoped entirely to whichever one backend
+        // process is already attached to this thread -- ACP has no
+        // primitive for switching a live session to a different
+        // provider/agent (confirmed against Zed's own AgentSessionConfig
+        // Options::set_config_option, which is likewise per-connection
+        // only; Zed's own answer for changing providers is client-side,
+        // entirely outside ACP: free agent choice on an empty draft
+        // thread, a brand-new thread once real content exists). A normal
+        // UI flow can't actually construct a cross-provider selection
+        // today (config_dropdown_entries only ever lists this thread's
+        // own advertised options), but nothing enforced that -- calling
+        // this with a value this thread never advertised would have
+        // silently forwarded the RPC to the (wrong) attached backend
+        // and surfaced whatever confusing native error it happened to
+        // produce. Reject it here instead, with a clear message, until
+        // real provider-switching (restart-under-a-new-agent) exists.
+        let is_known_value = {
+            let config_options = slot
+                .config_options
+                .lock()
+                .expect("config_options mutex poisoned");
+            config_options.iter().any(|option| {
+                option.id == config_id
+                    && option
+                        .options
+                        .iter()
+                        .any(|v| serde_json::Value::String(v.value.clone()) == value)
+            })
+        };
+        if !is_known_value {
+            self.events
+                .lock()
+                .expect("event queue mutex poisoned")
+                .push_back(BridgeEvent {
+                    thread_index: idx,
+                    event: AgentEvent::Error(format!(
+                        "config option {config_id:?}={value} is not one this thread's \
+                         attached backend advertised -- switching a live session to a \
+                         different provider is not supported yet"
+                    )),
+                });
+            return;
+        }
         let slot = slot.clone();
         let handle = slot.handle.clone();
         let events = self.events.clone();
@@ -3819,7 +3863,12 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
             let mut reachable = false;
             while std::time::Instant::now() < deadline {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                if std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    std::time::Duration::from_millis(100),
+                )
+                .is_ok()
+                {
                     reachable = true;
                     break;
                 }
@@ -6180,7 +6229,12 @@ done
         let child = command.spawn().expect("spawn real acpx-server binary");
         let base_url = format!("http://127.0.0.1:{port}");
         for _ in 0..100 {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                std::time::Duration::from_millis(100),
+            )
+            .is_ok()
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
@@ -6408,6 +6462,40 @@ done
             Some("gpt-5-mini"),
             "config_options(0) should reflect the backend's own updated currentValue \
              after session/set_config_option resolves"
+        );
+
+        // setup-followups plan: a value this thread's attached backend
+        // never advertised (the cross-provider case ACP has no
+        // primitive for -- see set_config_option's own doc comment)
+        // must be rejected before ever reaching the backend, not
+        // silently forwarded to whatever process happens to be
+        // attached. Overwrite the marker file first so its continued
+        // absence-of-a-*new*-write is a real signal, not just "the
+        // earlier real call already wrote it".
+        std::fs::write(&set_config_marker, "UNTOUCHED\n").expect("reset marker");
+        bridge.set_config_option(
+            0,
+            "model".to_string(),
+            serde_json::json!("claude-opus-not-a-real-codex-model"),
+        );
+        // No deadline-poll here on purpose: this must resolve
+        // synchronously (the validation runs before the async task is
+        // even spawned) or not at all -- a fixed settle time is the
+        // right tool for asserting an absence, unlike the real round
+        // trips above which need to poll for a positive result.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            std::fs::read_to_string(&set_config_marker).unwrap_or_default(),
+            "UNTOUCHED\n",
+            "an unadvertised config value must never reach the backend"
+        );
+        let events = bridge.poll();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::Error(message) if message.contains("is not one this thread's attached backend advertised")
+            )),
+            "expected a rejection AgentEvent::Error, got: {events:?}"
         );
     }
 
@@ -6886,7 +6974,7 @@ fn persist_thread_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot, update
     let Some(store) = store else {
         return;
     };
-    let history = slot.history.lock().expect("history mutex poisoned").clone();
+    let history = slot.history.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let session_id = slot
         .acp_session_id
         .lock()

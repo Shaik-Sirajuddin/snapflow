@@ -1,8 +1,9 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Badge } from "../base/badge.slint";
+import { TerminalLogBlock } from "../base/terminal_log_block.slint";
 import { MessageItem } from "../types.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
+import { HoverSurface } from "../base/hover.slint";
 
 // Agent / thinking / legacy tool-call card.
 // Styling on top of the working baseline:
@@ -93,17 +94,9 @@ export component MessageCard inherits Rectangle {
             }
         }
 
-        if is-tool-call : Rectangle {
-            background: tool-toggle-touch.has-hover ? Theme.bg-primary-container : transparent;
-            animate background { duration: 100ms; }
-            tool-toggle-touch := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: item.expanded ? "Hide logs" : "Show logs";
-                accessible-action-default => { toggle-expanded(item.index); }
-                clicked => { toggle-expanded(item.index); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
+        if is-tool-call : HoverSurface {
+            button-accessible-label: item.expanded ? "Hide logs" : "Show logs";
+            clicked => { toggle-expanded(item.index); }
             VerticalLayout {
                 spacing: Metrics.space-3;
                 HorizontalLayout {
@@ -135,25 +128,11 @@ export component MessageCard inherits Rectangle {
                         preferred-height: 0px;
                     }
                 }
-                if item.expanded : Rectangle {
-                    background: Theme.bg-terminal;
-                    border-color: Theme.border-terminal;
-                    border-width: 1px;
-                    border-radius: Theme.radius-sm;
-                    HorizontalLayout {
-                        padding: Metrics.space-4;
-                        Text {
-                            text: item.text;
-                            font-family: Theme.font-mono;
-                            font-size: 10px * Theme.font-scale;
-                            color: Theme.text-terminal;
-                            wrap: word-wrap;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                            preferred-width: 0px;
-                            min-width: 0px;
-                        }
-                    }
+                if item.expanded : TerminalLogBlock {
+                    text: item.text;
+                    content-padding: Metrics.space-4;
+                    scrollable: false;
+                    text-overflow: elide;
                 }
             }
         }

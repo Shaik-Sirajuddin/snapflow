@@ -55,6 +55,22 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .get()
                 .is_some_and(|until| std::time::Instant::now() < until);
 
+        // Gateway catalog (profiles/agents/mcp) was previously only
+        // collected while Settings is open. The compose-bar Provider
+        // dropdown is driven by the same `available_profiles` list, so a
+        // cold start that never opens Settings left profile_dropdown
+        // empty (visible: length > 0) until the user happened to open
+        // Settings once. Fetch when Settings is open *or* when the
+        // catalogs are still empty so first-new-thread can show Provider.
+        let (settings_open, need_gateway_catalog) = {
+            let model = self.panel.model.borrow();
+            (
+                model.settings_open,
+                model.settings_open
+                    || model.available_profiles.is_empty()
+                    || model.agent_catalog.is_empty(),
+            )
+        };
         msg::FrameInput {
             bridge_events_pending: !bridge_events.is_empty(),
             bridge_events,
@@ -65,14 +81,9 @@ impl<'a> ExternalSnapshotSource<'a> {
             clear_selected_thread: false,
             thread_list_snapshot: Some(self.collect_thread_list_snapshot()),
             selected_thread_snapshot: self.collect_selected_thread_snapshot(),
-            settings_preferences_snapshot: (self.panel.model.borrow().settings_open
-                || settings_reload_pending)
+            settings_preferences_snapshot: (settings_open || settings_reload_pending)
                 .then(|| self.collect_settings_preferences_snapshot(None)),
-            settings_gateway_snapshot: self
-                .panel
-                .model
-                .borrow()
-                .settings_open
+            settings_gateway_snapshot: need_gateway_catalog
                 .then(|| self.collect_settings_gateway_snapshot()),
             skills_snapshot: None,
         }
@@ -309,6 +320,15 @@ impl<'a> ExternalSnapshotSource<'a> {
             &query,
         );
         let visible_indices: Vec<usize> = items.iter().map(|item| item.real_index).collect();
+        // Profile/session identity live on the TEA ThreadModel, not the
+        // name/state slices build_thread_items filters -- post-populate
+        // them the same way provider/model/project are, so a frame poll
+        // does not rewrite every row with has_session=false /
+        // profile_name="" and force a ThreadListDiff + set_row_data
+        // every tick (which tears down sidebar if-conditional children
+        // such as the close/delete IconButtons and invalidates live MCP
+        // element handles).
+        let model_snapshot = self.panel.model.borrow();
         let rows: Vec<models::VisibleThreadItem> = items
             .into_iter()
             .map(|item| {
@@ -333,6 +353,10 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .unwrap_or_default()
                     .into();
                 row.project_path = project_path.into();
+                if let Some(thread) = model_snapshot.threads.get(item.real_index) {
+                    row.profile_name = thread.profile_name.clone().unwrap_or_default().into();
+                    row.has_session = thread.session_id.is_some();
+                }
                 if !row.closed
                     && self
                         .panel
@@ -353,6 +377,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                 }
             })
             .collect();
+        drop(model_snapshot);
         msg::ThreadListSnapshot {
             visible_indices,
             visible_thread_ids: rows.iter().map(|row| row.thread_id.clone()).collect(),

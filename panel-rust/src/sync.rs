@@ -122,7 +122,10 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             }
         }
         Dirty::PendingRequest { thread_id } => {
-            if let Some(thread) = thread_for_id(model, thread_id) {
+            // Empty id = transition clear on thread switch (leak_audit §2.3).
+            if thread_id.is_empty() {
+                component.set_pending_request(crate::PendingRequestItem::default());
+            } else if let Some(thread) = thread_for_id(model, thread_id) {
                 component.set_pending_request(thread.pending_request.clone());
             }
         }
@@ -137,6 +140,11 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                         component.set_expanded_terminal(crate::TerminalItem::default());
                     }
                 }
+            } else {
+                // Transition clear before the new thread's snapshot lands.
+                reconcile_terminals(model, &[]);
+                component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
+                component.set_expanded_terminal(crate::TerminalItem::default());
             }
         }
         Dirty::LocalTerminal => {
@@ -144,6 +152,8 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 if let Some(thread) = model.threads.get(idx) {
                     component.set_local_terminal(thread.local_terminal.clone());
                 }
+            } else {
+                component.set_local_terminal(crate::LocalTerminalItem::default());
             }
         }
         Dirty::ProjectPath => {
@@ -163,6 +173,18 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             component.set_background_override_set(model.background_override_set);
             component.set_background_override(model.background_override);
             reconcile_settings_models(model, component);
+            // model.available_profiles (the compose-bar profile picker's
+            // own data source) is refreshed here, via the periodic
+            // settings-gateway snapshot poll -- not tied to the
+            // currently-selected thread's own Dirty::Capabilities at
+            // all. Without this, a picker whose profile list was still
+            // empty at startup would never pick up the real list once it
+            // arrived until some unrelated capability change or thread
+            // switch happened to also fire.
+            let real_idx = crate::update::selected_real_index(model);
+            if let Some(thread) = model.threads.get(real_idx) {
+                sync_profile_picker(model, component, thread);
+            }
         }
         Dirty::SkillsListDiff(ops) => {
             apply_skill_ops(model, ops);
@@ -184,12 +206,21 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 component.set_mode_dropdown_entries(crate::models::to_mode_dropdown_entries(
                     thread.session_modes.clone(),
                 ));
-                component.set_config_trigger_label(
-                    crate::models::current_config_trigger_label(&thread.config_options).into(),
+                component.set_reasoning_trigger_label(
+                    crate::models::current_reasoning_trigger_label(&thread.config_options).into(),
                 );
-                component.set_config_dropdown_entries(crate::models::to_config_dropdown_entries(
-                    thread.config_options.clone(),
-                ));
+                component.set_reasoning_dropdown_entries(
+                    crate::models::to_reasoning_dropdown_entries(thread.config_options.clone()),
+                );
+                let fast = crate::models::fast_mode_from_config(&thread.config_options);
+                component.set_fast_mode_available(fast.available);
+                component.set_fast_mode_enabled(fast.enabled);
+                component.set_fast_mode_option_id(fast.option_id.into());
+                component.set_fast_mode_on_value(fast.on_value.into());
+                component.set_fast_mode_off_value(fast.off_value.into());
+                sync_profile_picker(model, component, thread);
+                // Model list after provider resolve so it can filter by agent.
+                sync_model_dropdown_for_provider(model, component, thread);
             }
         }
     }
@@ -199,6 +230,7 @@ fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
     component.set_active_skill_name(model.active_skill_name.clone().into());
     component.set_active_skill_path(model.active_skill_path.clone().into());
     component.set_active_skill_content(model.active_skill_content.clone().into());
+    component.set_skill_saving(model.skill_saving);
     let editors = model
         .detected_editors
         .iter()
@@ -213,30 +245,69 @@ fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
 // reasoning as apply_message_ops -- lets agent_bridge.rs's real-backend
 // test drive this exact reducer/sync path directly.
 pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
-    let keys = model.thread_model_keys.borrow();
-    let Some(thread_id) = model
-        .threads
-        .get(real_index)
-        .map(|thread| &thread.thread_id)
-    else {
+    let mut keys = model.thread_model_keys.borrow_mut();
+    let Some(thread) = model.threads.get(real_index) else {
         return;
     };
-    let Some(row_index) = keys.iter().position(|key| key == thread_id) else {
+    // Resolve the sidebar slot by durable id first, then by the synthetic
+    // cold-start key, then by visible_indices / thread_rows real_index.
+    // A pure thread_id lookup used to no-op when bridge-assigned durable
+    // ids and model.threads.thread_id were briefly out of sync — the
+    // exact "thread list does not update on send" failure mode.
+    let durable = thread.thread_id.as_str();
+    let synthetic = format!("thread:{real_index}");
+    let row_index = keys
+        .iter()
+        .position(|key| key == durable || key == synthetic.as_str())
+        .or_else(|| {
+            model
+                .visible_indices
+                .iter()
+                .position(|idx| *idx == real_index)
+        })
+        .or_else(|| {
+            model
+                .thread_rows
+                .iter()
+                .position(|row| row.real_index == real_index)
+        });
+    let Some(row_index) = row_index else {
         return;
     };
-    // Recompute fresh from `model.threads[real_index]`'s *current* state,
-    // not `model.thread_rows[row_index]` -- that cache is only refreshed
-    // by a full `thread_list_dirty_with_keys` pass (thread create/select/
-    // close/...), so re-pushing it here just re-renders whatever it
-    // already held. `Dirty::ThreadRow` fires for exactly the "this one
-    // row's state changed in place" case (a thread starting to load on
-    // send, a turn ending, ...), so its handler must read the live
-    // source of truth, not a snapshot that hasn't caught up yet -- this
-    // was why the sidebar spinner/"sending" pulse didn't start
-    // immediately on a real send, only whenever some unrelated event
-    // later forced a full list rebuild.
-    if let Some(row) = crate::update::visible_thread_row(model, real_index) {
-        model.thread_model.set_row_data(row_index, row.item);
+    // Recompute from live model.threads (status/busy), preserving
+    // snapshot-filled display fields inside visible_thread_row.
+    let Some(row) = crate::update::visible_thread_row(model, real_index) else {
+        return;
+    };
+    let needs_write = model
+        .thread_model
+        .row_data(row_index)
+        .map(|existing| {
+            existing.name != row.item.name
+                || existing.status != row.item.status
+                || existing.busy != row.item.busy
+                || existing.open != row.item.open
+                || existing.background != row.item.background
+                || existing.description != row.item.description
+                || existing.closed != row.item.closed
+                || existing.archived != row.item.archived
+                || existing.provider != row.item.provider
+                || existing.model != row.item.model
+                || existing.project_path != row.item.project_path
+                || existing.project_name != row.item.project_name
+                || existing.profile_name != row.item.profile_name
+                || existing.has_session != row.item.has_session
+        })
+        .unwrap_or(true);
+    if needs_write {
+        model
+            .thread_model
+            .set_row_data(row_index, row.item.clone());
+    }
+    // Keep the key cache on the durable id so the next lookup and
+    // ThreadListDiff reconcile don't miss this slot.
+    if row_index < keys.len() {
+        keys[row_index] = row.thread_id.clone();
     }
 }
 
@@ -362,10 +433,38 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
         keys.push(row.thread_id.clone());
     }
     // Length now matches, but existing slots can still hold the wrong
-    // *content* (e.g. a stale key left over from before the desync) --
-    // overwrite every slot, not just newly-appended ones.
+    // *content* (e.g. a stale key left over from before the desync).
+    // Only call set_row_data when the row actually changed: Slint's
+    // VecModel notifies every set_row_data regardless of value equality,
+    // which tears down and recreates `if`-conditional children inside
+    // the row (sidebar close/delete arm IconButtons, project badges,
+    // etc.). That churn made live MCP element handles go stale on every
+    // poll that re-applied an empty/no-op ThreadListDiff -- the exact
+    // failure mode setup-followups' thread_row_time_controls e2e hit.
     for (index, row) in model.thread_rows.iter().enumerate() {
-        model.thread_model.set_row_data(index, row.item.clone());
+        let needs_write = model
+            .thread_model
+            .row_data(index)
+            .map(|existing| {
+                existing.name != row.item.name
+                    || existing.status != row.item.status
+                    || existing.busy != row.item.busy
+                    || existing.open != row.item.open
+                    || existing.background != row.item.background
+                    || existing.description != row.item.description
+                    || existing.closed != row.item.closed
+                    || existing.archived != row.item.archived
+                    || existing.provider != row.item.provider
+                    || existing.model != row.item.model
+                    || existing.project_path != row.item.project_path
+                    || existing.project_name != row.item.project_name
+                    || existing.profile_name != row.item.profile_name
+                    || existing.has_session != row.item.has_session
+            })
+            .unwrap_or(true);
+        if needs_write {
+            model.thread_model.set_row_data(index, row.item.clone());
+        }
         keys[index] = row.thread_id.clone();
     }
 }
@@ -525,6 +624,45 @@ fn reconcile_terminals(model: &Model, terminals: &[crate::TerminalItem]) {
     );
 }
 
+/// setup-followups plan, provider_fastmode_profile_persistence: refreshes
+/// the compose-bar profile picker for `thread` -- its dropdown model
+/// (`model.available_profiles`, the same data Settings > Agents' profile
+/// chips already fetch), its trigger label (the thread's own
+/// `profile_name`, empty until chosen), and whether it's interactive at
+/// all (`has-session`: false only until a real ACP session attaches,
+/// per ThreadItem.has-session's doc comment).
+fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::model::ThreadModel) {
+    let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
+    let current = thread.profile_name.as_deref().unwrap_or("");
+    component.set_profile_dropdown_entries(crate::models::to_profile_dropdown_entries(
+        &profile_rows,
+        current,
+    ));
+    // Compose trigger shows provider/agent id, not raw profile name.
+    component.set_profile_trigger_label(
+        crate::models::current_provider_trigger_label(&profile_rows, current).into(),
+    );
+    component.set_active_thread_has_session(thread.session_id.is_some());
+}
+
+/// Refresh model dropdown filtered to the thread's selected provider.
+fn sync_model_dropdown_for_provider(
+    model: &Model,
+    component: &ChatPanel,
+    thread: &crate::model::ThreadModel,
+) {
+    let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
+    let current = thread.profile_name.as_deref().unwrap_or("");
+    let agent_id = crate::models::provider_agent_id_for_profile(&profile_rows, current);
+    component.set_config_dropdown_entries(crate::models::to_config_dropdown_entries_for_provider(
+        thread.config_options.clone(),
+        &agent_id,
+    ));
+    component.set_config_trigger_label(
+        crate::models::current_config_trigger_label(&thread.config_options).into(),
+    );
+}
+
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
     let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
     let profile_keys: Vec<String> = model
@@ -594,6 +732,16 @@ fn sync_scalar(model: &Model, component: &ChatPanel, field: crate::dirty::Scalar
     match field {
         ScalarField::SelectedThread => {
             component.set_selected_thread(model.selected_thread as i32);
+            // Dirty::Capabilities only fires when session_modes/
+            // config_options actually change, which a brand-new empty
+            // thread (no capabilities either before or after selecting
+            // it) never does -- sync the profile picker here too so its
+            // enabled/current state is correct immediately on switching,
+            // not just eventually via the next capability event.
+            let real_idx = crate::update::selected_real_index(model);
+            if let Some(thread) = model.threads.get(real_idx) {
+                sync_profile_picker(model, component, thread);
+            }
         }
         ScalarField::ComposeText => {
             component.set_compose_text(model.compose_text.clone().into());
@@ -696,6 +844,39 @@ mod tests {
         apply_thread_ops(&model, &[RowOp::Remove { at: 0 }]);
         assert_eq!(model.thread_model.row_count(), 0);
         assert!(model.thread_model_keys.borrow().is_empty());
+    }
+
+    #[test]
+    fn thread_row_ops_skip_set_row_data_when_content_is_unchanged() {
+        // setup-followups thread_row_time_controls: a no-op force-converge
+        // must not re-notify the VecModel (which would recreate if-children
+        // and invalidate live MCP element handles). Seed a row, re-apply
+        // empty ops against identical thread_rows, and prove the row's
+        // content is still the same identity-equivalent value afterwards.
+        let mut model = Model::default();
+        let item = crate::ThreadItem {
+            name: "Fix timeline crash".into(),
+            status: "idle".into(),
+            open: true,
+            ..crate::ThreadItem::default()
+        };
+        let row = VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            item: item.clone(),
+        };
+        model.thread_rows.push(row);
+        model.thread_model.push(item.clone());
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned()];
+
+        apply_thread_ops(&model, &[]);
+
+        assert_eq!(model.thread_model.row_count(), 1);
+        let after = model.thread_model.row_data(0).unwrap();
+        assert_eq!(after.name, item.name);
+        assert_eq!(after.status, item.status);
+        assert_eq!(after.open, item.open);
+        assert_eq!(*model.thread_model_keys.borrow(), vec!["thread-0"]);
     }
 
     #[test]
@@ -855,6 +1036,55 @@ mod tests {
         assert!(
             model.message_model_keys.borrow().is_empty(),
             "message_model_keys must converge to empty alongside the model"
+        );
+    }
+
+    #[test]
+    fn thread_row_updates_when_key_cache_has_synthetic_id_but_model_has_durable_id() {
+        // setup-followups thread_view_items_not_updating_ui: cold-start
+        // keys use "thread:N" while model.threads later get a durable
+        // bridge session id — pure durable-id lookup used to no-op.
+        let mut model = Model::default();
+        model.threads.push(crate::model::ThreadModel {
+            thread_id: "durable-uuid-0".to_owned(),
+            display_name: "Fix timeline crash".to_owned(),
+            state: crate::models::ThreadState::Idle,
+            ..crate::model::ThreadModel::default()
+        });
+        model.thread_model.push(crate::ThreadItem {
+            name: "Fix timeline crash".into(),
+            status: "idle".into(),
+            busy: false,
+            description: "last reply preview".into(),
+            ..crate::ThreadItem::default()
+        });
+        *model.thread_model_keys.borrow_mut() = vec!["thread:0".to_owned()];
+        model.visible_indices = vec![0];
+        model.thread_rows.push(VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread:0".to_owned(),
+            item: crate::ThreadItem {
+                name: "Fix timeline crash".into(),
+                status: "idle".into(),
+                description: "last reply preview".into(),
+                ..crate::ThreadItem::default()
+            },
+        });
+
+        model.threads[0].state = crate::models::ThreadState::Loading;
+        apply_thread_row(&model, 0);
+
+        let row = model.thread_model.row_data(0).unwrap();
+        assert_eq!(row.status, "loading");
+        assert!(row.busy);
+        assert_eq!(
+            row.description, "last reply preview",
+            "display fields from the snapshot must survive a status-only ThreadRow"
+        );
+        assert_eq!(
+            model.thread_model_keys.borrow()[0],
+            "durable-uuid-0",
+            "key cache must converge to the durable id after a successful apply"
         );
     }
 

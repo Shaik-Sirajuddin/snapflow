@@ -1,5 +1,6 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
+import { TerminalLogBlock } from "../../../base/terminal_log_block.slint";
 
 // Execution-view content variant for `tool_use`/`mcp_server_call` rows --
 // chat-items-remaining-wiring.md #4 (chat-items-redesign.md #9). First-cut
@@ -32,28 +33,8 @@ export component ApiCallView inherits VerticalLayout {
             letter-spacing: 0.5px;
             color: Theme.text-muted;
         }
-        Rectangle {
-            background: Theme.bg-terminal;
-            border-color: Theme.border-terminal;
-            border-width: 1px;
-            border-radius: Theme.radius-sm;
-            VerticalLayout {
-                padding: Metrics.space-2;
-                Flickable {
-                    height: input-text.preferred-height;
-                    viewport-height: input-text.preferred-height;
-                    input-text := Text {
-                        text: root.raw-input;
-                        font-family: Theme.font-mono;
-                        font-size: 10px * Theme.font-scale;
-                        color: Theme.text-terminal;
-                        wrap: word-wrap;
-                        horizontal-alignment: left;
-                        vertical-alignment: top;
-                        width: parent.width;
-                    }
-                }
-            }
+        TerminalLogBlock {
+            text: root.raw-input;
         }
     }
 
@@ -67,28 +48,8 @@ export component ApiCallView inherits VerticalLayout {
             letter-spacing: 0.5px;
             color: Theme.text-muted;
         }
-        Rectangle {
-            background: Theme.bg-terminal;
-            border-color: Theme.border-terminal;
-            border-width: 1px;
-            border-radius: Theme.radius-sm;
-            VerticalLayout {
-                padding: Metrics.space-2;
-                Flickable {
-                    height: output-text.preferred-height;
-                    viewport-height: output-text.preferred-height;
-                    output-text := Text {
-                        text: root.raw-output;
-                        font-family: Theme.font-mono;
-                        font-size: 10px * Theme.font-scale;
-                        color: Theme.text-terminal;
-                        wrap: word-wrap;
-                        horizontal-alignment: left;
-                        vertical-alignment: top;
-                        width: parent.width;
-                    }
-                }
-            }
+        TerminalLogBlock {
+            text: root.raw-output;
         }
     }
 

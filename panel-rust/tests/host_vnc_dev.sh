@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
 # Manual interactive dev harness -- NOT part of the automated test suite.
-# Starts a real acpx-server (real rui-mock-agent backend) and a real
+# Starts a real acpx-server (a REAL agent backend, e.g. codex-acp via its
+# ambient CLI auth -- never the rui-mock-agent stub; per this repo's
+# test-mode/dev-mode/prod convention, only test-mode's automated harness
+# (host_e2e_smoke.sh) is allowed to use the mock backend) and a real
 # Shotcut process under Xvfb, then binds x11vnc to that display so a
 # human can connect a VNC client and click around the real embedded
 # ChatRustDock directly. Mirrors host_e2e_smoke.sh's process wiring
@@ -16,13 +19,20 @@ display="${PANEL_VNC_DEV_DISPLAY:-:110}"
 screen="${PANEL_VNC_DEV_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_VNC_DEV_GATEWAY_PORT:-18791}"
 vnc_port="${PANEL_VNC_DEV_VNC_PORT:-5910}"
-dock_width="${PANEL_VNC_DEV_DOCK_WIDTH:-320}"
+# Empty by default -- unlike host_e2e_smoke.sh's deterministic XTEST
+# harness, a human on VNC wants the dock's normal drag-resize splitter
+# behavior, not chatrustdock.cpp's `setFixedWidth` test-only pin (see its
+# `PANEL_HOST_E2E_DOCK_WIDTH` doc comment: "Never set in production").
+# Set PANEL_VNC_DEV_DOCK_WIDTH explicitly if you actually want it pinned.
+dock_width="${PANEL_VNC_DEV_DOCK_WIDTH:-}"
+# Real registry agent id to default new sessions to (ambient-auth backed,
+# e.g. "codex-acp" or "claude-acp") -- never the mock's fake "codex" id.
+default_agent_id="${PANEL_VNC_DEV_AGENT_ID:-codex-acp}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
-agent_bin="${RUI_MOCK_AGENT_BIN:-$repo_root/panel-rust/target/debug/rui-mock-agent}"
 shotcut_bin="${SHOTCUT_BIN:-$repo_root/shotcut/build/src/shotcut}"
 
-for binary in "$server_bin" "$agent_bin" "$shotcut_bin" Xvfb x11vnc curl xdpyinfo; do
+for binary in "$server_bin" "$shotcut_bin" Xvfb x11vnc curl xdpyinfo; do
     if ! command -v "$binary" >/dev/null 2>&1 && [[ ! -x "$binary" ]]; then
         printf 'required executable is unavailable: %s\n' "$binary" >&2
         exit 1
@@ -52,11 +62,13 @@ x11vnc -display "$display" -rfbport "$vnc_port" -forever -shared -nopw \
     -bg -o "$state_dir/x11vnc.log"
 vnc_pid="$(pgrep -f "x11vnc -display $display -rfbport $vnc_port" | head -1)"
 
+# No ACPX_BACKEND_CMD override -- real agent ids (codex-acp, claude-acp,
+# ...) resolve through acpx-registry's real fallback registry (npx-spawned,
+# ambient CLI auth), the same real-process path this repo's own
+# real-backend tests use (see ACPX_LIVE_TEST_AMBIENT-gated tests).
 ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
-ACPX_BACKEND_CMD="$agent_bin" \
-ACPX_DEFAULT_AGENT_ID="codex" \
+ACPX_DEFAULT_AGENT_ID="$default_agent_id" \
 ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
-RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
 "$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
 server_pid="$!"
 
@@ -68,9 +80,14 @@ for _ in $(seq 1 80); do
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
 
+if [ -n "$dock_width" ]; then
+    export PANEL_HOST_E2E_DOCK_WIDTH="$dock_width"
+else
+    unset PANEL_HOST_E2E_DOCK_WIDTH || true
+fi
+
 QSG_RENDER_LOOP=basic \
 RUI_PANEL_INPUT_TRACE=1 \
-PANEL_HOST_E2E_DOCK_WIDTH="$dock_width" \
 RUI_ACP_CACHE_DIR="$state_dir/panel" \
 RUI_ACPX_CODEX_URL="http://127.0.0.1:$gateway_port" \
 RUI_ACPX_CLAUDE_URL="http://127.0.0.1:$gateway_port" \
@@ -96,9 +113,25 @@ printf 'display   : %s\n' "$display"
 printf 'gateway   : http://127.0.0.1:%s (health ok)\n' "$gateway_port"
 printf 'vnc       : localhost:%s  (raw VNC, no password -- vncviewer localhost:%s)\n' "$vnc_port" "$vnc_port"
 printf 'pids      : xvfb=%s vnc=%s acpx-server=%s shotcut=%s\n' "$xvfb_pid" "$vnc_pid" "$server_pid" "$shotcut_pid"
-printf 'stop with : kill %s %s %s %s\n' "$shotcut_pid" "$server_pid" "$vnc_pid" "$xvfb_pid"
+printf 'stop with : %s/stop.sh  (or kill %s %s %s %s)\n' \
+    "$state_dir" "$shotcut_pid" "$server_pid" "$vnc_pid" "$xvfb_pid"
 printf 'logs      : %s/shotcut.stderr.log , %s/acpx/server.stderr.log\n' "$state_dir" "$state_dir"
 printf '=====================================\n\n'
+
+# setup-followups stale_threads_not_torn_down_after_testing: companion
+# stop script kills shotcut + acpx-server (sessions die with the server).
+cat > "$state_dir/stop.sh" <<'STOP'
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$here/pids.env"
+for p in "${shotcut_pid:-}" "${server_pid:-}" "${vnc_pid:-}" "${xvfb_pid:-}" "${hold_pid:-}"; do
+  if [ -n "${p:-}" ]; then kill "$p" 2>/dev/null || true; fi
+done
+echo "stopped panel VNC harness under $here"
+STOP
+chmod +x "$state_dir/stop.sh"
 
 sleep "${PANEL_VNC_DEV_SETTLE_SECONDS:-5}"
 if ! kill -0 "$shotcut_pid" 2>/dev/null; then

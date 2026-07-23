@@ -77,85 +77,107 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                             let Some(panel) = slot.as_ref() else {
                                 return;
                             };
+                            // Rescan *before* SkillCreated opens the
+                            // editor: SkillCreated itself does not carry
+                            // the new SkillEntry, and a post-open refresh
+                            // was easy to miss if the follow-up effect
+                            // short-circuited. Fold the fresh disk snapshot
+                            // first so the skills list includes the new
+                            // skill the moment the editor appears.
+                            refresh_skills_after_effect(panel);
                             let (follow_up, _) = update_persistent(
                                 panel,
                                 Msg::Effect(EffectResultMsg::SkillCreated(result)),
                             );
                             execute_effects(panel, follow_up);
-                            refresh_skills_after_effect(panel);
                         });
                     });
                 });
             }
+            // skills_audit_report §3.2: disk read / process spawn must not
+            // block the Slint UI thread.
             Effect::OpenSkillEditor { path } => {
-                let result = (|| {
-                    let name = path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let content = std::fs::read_to_string(path.join("SKILL.md"))
-                        .map_err(|error| EffectError::new(error.to_string()))?;
-                    let detected_editors = crate::editor_detect::detect_installed_editors()
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect();
-                    Ok(crate::model::SkillEditorState {
-                        name,
-                        path: path.to_string_lossy().into_owned(),
-                        content,
-                        detected_editors,
-                    })
-                })();
-                let _ = slint::invoke_from_event_loop(move || {
-                    crate::PANEL.with(|cell| {
-                        let slot = cell.borrow();
-                        let Some(panel) = slot.as_ref() else {
-                            return;
-                        };
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::SkillEditorLoaded(result)),
-                        );
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let content = std::fs::read_to_string(path.join("SKILL.md"))
+                            .map_err(|error| EffectError::new(error.to_string()))?;
+                        let detected_editors = crate::editor_detect::detect_installed_editors()
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect();
+                        Ok(crate::model::SkillEditorState {
+                            name,
+                            path: path.to_string_lossy().into_owned(),
+                            content,
+                            detected_editors,
+                        })
+                    })();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::SkillEditorLoaded(result)),
+                            );
+                        });
                     });
                 });
             }
             Effect::OpenInEditor { editor_name, path } => {
-                let result = crate::editor_detect::EDITOR_CANDIDATES
-                    .iter()
-                    .find(|(_, name)| *name == editor_name)
-                    .ok_or_else(|| EffectError::new(format!("unknown editor {editor_name:?}")))
-                    .and_then(|(bin, _)| {
-                        crate::editor_detect::open_in_editor(bin, std::path::Path::new(&path))
-                            .map_err(|error| EffectError::new(error.to_string()))
-                    });
-                let _ = slint::invoke_from_event_loop(move || {
-                    crate::PANEL.with(|cell| {
-                        let slot = cell.borrow();
-                        let Some(panel) = slot.as_ref() else {
-                            return;
-                        };
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::ExternalEditorOpened(result)),
-                        );
+                std::thread::spawn(move || {
+                    let result = crate::editor_detect::EDITOR_CANDIDATES
+                        .iter()
+                        .find(|(_, name)| *name == editor_name)
+                        .ok_or_else(|| EffectError::new(format!("unknown editor {editor_name:?}")))
+                        .and_then(|(bin, _)| {
+                            crate::editor_detect::open_in_editor(bin, std::path::Path::new(&path))
+                                .map_err(|error| EffectError::new(error.to_string()))
+                        });
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::ExternalEditorOpened(result)),
+                            );
+                        });
                     });
                 });
             }
             Effect::OpenWithOsDefault { path } => {
-                let result =
-                    crate::editor_detect::open_with_os_default(std::path::Path::new(&path))
-                        .map_err(|error| EffectError::new(error.to_string()));
-                let _ = slint::invoke_from_event_loop(move || {
-                    crate::PANEL.with(|cell| {
-                        let slot = cell.borrow();
-                        let Some(panel) = slot.as_ref() else {
-                            return;
-                        };
-                        let _ = update_persistent(
-                            panel,
-                            Msg::Effect(EffectResultMsg::OsDefaultOpened(result)),
-                        );
+                std::thread::spawn(move || {
+                    let result =
+                        crate::editor_detect::open_with_os_default(std::path::Path::new(&path))
+                            .map_err(|error| EffectError::new(error.to_string()));
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::OsDefaultOpened(result)),
+                            );
+                        });
                     });
+                });
+            }
+            Effect::ClipboardWrite { text } => {
+                std::thread::spawn(move || {
+                    // Best-effort system clipboard without a new crate dep:
+                    // wl-copy (Wayland) then xclip (X11).
+                    let _ = write_clipboard_text(&text);
                 });
             }
             Effect::SkillPromoteToGlobal { path } => {
@@ -272,6 +294,28 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 };
                 panel.dispatch_mcp_server_enabled_changed(&component, &name, enabled);
             }
+            Effect::McpServerAuthenticate { name, .. } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_authenticate(&component, &name);
+            }
+            Effect::McpServerToolEnabledChanged {
+                server_name,
+                tool_name,
+                enabled,
+                ..
+            } => {
+                let Some(component) = panel.component.as_weak().upgrade() else {
+                    continue;
+                };
+                panel.dispatch_mcp_server_tool_enabled_changed(
+                    &component,
+                    &server_name,
+                    &tool_name,
+                    enabled,
+                );
+            }
             Effect::ProfileCreate {
                 name,
                 agent_id,
@@ -312,7 +356,8 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             | Effect::SkillPromoteToGlobal { .. }
             | Effect::OpenSkillEditor { .. }
             | Effect::OpenInEditor { .. }
-            | Effect::OpenWithOsDefault { .. } => {
+            | Effect::OpenWithOsDefault { .. }
+            | Effect::ClipboardWrite { .. } => {
                 execute_skill_effects(vec![effect]);
             }
             Effect::SetActiveProjectPath { path } => {
@@ -476,4 +521,31 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
     if refresh_frame {
         crate::dispatch::dispatch_frame_poll(panel);
     }
+}
+
+fn write_clipboard_text(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for (bin, args) in [
+        ("wl-copy", Vec::<&str>::new()),
+        ("xclip", vec!["-selection", "clipboard"]),
+        ("xsel", vec!["--clipboard", "--input"]),
+    ] {
+        let Ok(mut child) = Command::new(bin)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return Ok(());
+        }
+    }
+    Err("no clipboard helper (wl-copy/xclip/xsel) available".into())
 }

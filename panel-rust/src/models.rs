@@ -13,7 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
-    McpServerOption, MessageItem, ProfileOption, SkillOption, TerminalItem, ThreadItem,
+    McpServerOption, McpToolOption, MessageItem, ProfileOption, SkillOption, TerminalItem,
+    ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -307,17 +308,12 @@ pub fn transcript_row_key(item: &crate::conversation::TranscriptItem) -> String 
 }
 
 /// Returns stable keys for the rows the Slint message projection renders.
-/// Terminal and notice items are omitted, matching the existing projection.
+/// Notices stay omitted; terminals are included (wire_terminal_view).
 pub fn transcript_row_keys(items: &[crate::conversation::TranscriptItem]) -> Vec<String> {
     use crate::conversation::TranscriptItem;
     items
         .iter()
-        .filter(|item| {
-            !matches!(
-                item,
-                TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. }
-            )
-        })
+        .filter(|item| !matches!(item, TranscriptItem::Notice { .. }))
         .map(transcript_row_key)
         .collect()
 }
@@ -377,7 +373,23 @@ pub fn to_message_rows_from_transcript(
                         raw_out,
                     )
                 }
-                TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. } => return None,
+                // audit-fixes wire_terminal_view: surface terminal
+                // transcript items as tool-event-shaped rows so ToolEventRow
+                // can mount TerminalView (title = command, output body).
+                TranscriptItem::Terminal {
+                    title,
+                    output,
+                    exit_code,
+                    ..
+                } => (
+                    "terminal",
+                    title,
+                    String::new(),
+                    // raw_input carries exit code as decimal text for TerminalView.
+                    exit_code.map(|c| c.to_string()).unwrap_or_default(),
+                    output,
+                ),
+                TranscriptItem::Notice { .. } => return None,
             };
             let first_use = if kind == "skill_use" {
                 seen_skills.insert(text.clone())
@@ -405,6 +417,69 @@ pub fn to_message_rows_from_transcript(
         })
         .collect();
     rows
+}
+
+/// Append per-thread send-queue entries as trailing `queued` user rows
+/// (audit-fixes wire_queued_message_bar). Mutates `rows` and returns keys
+/// for the appended entries (`queue:{id}`).
+///
+/// `generation_in_flight`: when true, the front queue entry is marked
+/// `sending` so QueuedMessageBar shows Stop (cancel the blocking turn)
+/// instead of Cancel on that row.
+pub fn append_send_queue_rows(
+    rows: &mut Vec<MessageItem>,
+    keys: &mut Vec<String>,
+    queue: &crate::send_queue::SendQueue,
+    generation_in_flight: bool,
+) {
+    let last = queue.len().saturating_sub(1);
+    for (i, entry) in queue.iter().enumerate() {
+        let index = rows.len() as i32;
+        keys.push(format!("queue:{}", entry.id.0));
+        rows.push(MessageItem {
+            kind: "user".into(),
+            markdown_lines: ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new())),
+            text: entry.text.clone().into(),
+            status: "".into(),
+            expanded: false,
+            index,
+            raw_input: "".into(),
+            raw_output: "".into(),
+            queued: true,
+            can_edit: i == last && !(generation_in_flight && i == 0),
+            // Front entry while a turn is in flight: Stop cancels that turn
+            // (and pauses auto-drain). Other entries stay cancel/edit.
+            sending: generation_in_flight && i == 0,
+            first_use: false,
+        });
+    }
+}
+
+/// Full projection for a thread: transcript + send queue.
+pub fn message_rows_for_thread(
+    transcript: Vec<crate::conversation::TranscriptItem>,
+    expanded: &[bool],
+    queue: &crate::send_queue::SendQueue,
+) -> (Vec<MessageItem>, Vec<String>) {
+    message_rows_for_thread_with_state(transcript, expanded, queue, false)
+}
+
+/// Like [`message_rows_for_thread`], but marks the front queue row as
+/// `sending` when a turn is currently in flight.
+pub fn message_rows_for_thread_with_state(
+    transcript: Vec<crate::conversation::TranscriptItem>,
+    expanded: &[bool],
+    queue: &crate::send_queue::SendQueue,
+    generation_in_flight: bool,
+) -> (Vec<MessageItem>, Vec<String>) {
+    let mut keys = transcript_row_keys(&transcript);
+    let mut rows = to_message_rows_from_transcript(transcript, expanded);
+    append_send_queue_rows(&mut rows, &mut keys, queue, generation_in_flight);
+    // Re-index after append so Slint toggle-expanded still matches.
+    for (i, row) in rows.iter_mut().enumerate() {
+        row.index = i as i32;
+    }
+    (rows, keys)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,32 +617,232 @@ pub fn to_mode_dropdown_entries(modes: Option<SessionModesEvent>) -> ModelRc<Dro
     ModelRc::new(VecModel::from(items))
 }
 
-/// The model selector's dropdown model -- the thread's `config_options`
-/// advertisement flattened into `DropdownEntry` rows (one `is_header` row
-/// per option, then one selectable row per value carrying its
-/// `session/set_config_option` `value` payload).
+/// True when this config option is the binary "fast mode" tradeoff that
+/// the compose bar surfaces as a dedicated toggle (not a dropdown group).
+pub fn is_fast_mode_option_id(id: &str) -> bool {
+    matches!(
+        id.to_ascii_lowercase().replace('-', "_").as_str(),
+        "fastmode" | "fast_mode" | "fast"
+    )
+}
+
+/// True when this config option is reasoning effort (dedicated compose
+/// dropdown, not mixed into the model selector).
+pub fn is_reasoning_option_id(id: &str) -> bool {
+    matches!(
+        id.to_ascii_lowercase().replace('-', "_").as_str(),
+        "reasoning"
+            | "reasoning_effort"
+            | "reasoningeffort"
+            | "effort"
+            | "think"
+            | "thinking"
+            | "thinking_level"
+    )
+}
+
+fn option_id_norm(id: &str) -> String {
+    id.to_ascii_lowercase().replace('-', "_")
+}
+
+/// Flatten one config option into header + value `DropdownEntry` rows.
+fn append_option_entries(items: &mut Vec<DropdownEntry>, option: ConfigOptionInfo) {
+    items.push(DropdownEntry {
+        id: option.id.clone().into(),
+        label: option.name.into(),
+        value: String::new().into(),
+        is_header: true,
+        is_current: false,
+    });
+    for value in option.options {
+        let is_current = option.current_value.as_deref() == Some(value.value.as_str());
+        items.push(DropdownEntry {
+            is_current,
+            id: option.id.clone().into(),
+            label: value.name.into(),
+            value: value.value.into(),
+            is_header: false,
+        });
+    }
+}
+
+fn looks_on_value(value: &str, name: &str) -> bool {
+    let v = value.to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    matches!(
+        v.as_str(),
+        "on" | "true" | "1" | "yes" | "enabled" | "fast"
+    ) || matches!(n.as_str(), "on" | "true" | "yes" | "enabled" | "fast")
+}
+
+fn looks_off_value(value: &str, name: &str) -> bool {
+    let v = value.to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    matches!(
+        v.as_str(),
+        "off" | "false" | "0" | "no" | "disabled" | "slow" | "quality"
+    ) || matches!(n.as_str(), "off" | "false" | "no" | "disabled" | "slow" | "quality")
+}
+
+/// UI projection for the compose-bar Fast toggle. Empty/unavailable when
+/// the attached backend does not advertise a fast-mode-shaped option.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FastModeUi {
+    pub available: bool,
+    pub enabled: bool,
+    pub option_id: String,
+    pub on_value: String,
+    pub off_value: String,
+}
+
+/// Extract a binary fast-mode option from ACP `configOptions[]` for the
+/// dedicated compose-bar toggle. Prefers common on/off value shapes;
+/// with exactly two values falls back to first=off, second=on.
+pub fn fast_mode_from_config(options: &[ConfigOptionInfo]) -> FastModeUi {
+    let Some(option) = options.iter().find(|o| is_fast_mode_option_id(&o.id)) else {
+        return FastModeUi::default();
+    };
+    if option.options.len() < 2 {
+        return FastModeUi::default();
+    }
+    let on = option
+        .options
+        .iter()
+        .find(|v| looks_on_value(&v.value, &v.name))
+        .or_else(|| option.options.get(1));
+    let off = option
+        .options
+        .iter()
+        .find(|v| looks_off_value(&v.value, &v.name))
+        .or_else(|| option.options.first());
+    let (Some(on), Some(off)) = (on, off) else {
+        return FastModeUi::default();
+    };
+    if on.value == off.value {
+        return FastModeUi::default();
+    }
+    let enabled = option
+        .current_value
+        .as_deref()
+        .map(|cur| cur == on.value.as_str() || looks_on_value(cur, cur))
+        .unwrap_or(false);
+    FastModeUi {
+        available: true,
+        enabled,
+        option_id: option.id.clone(),
+        on_value: on.value.clone(),
+        off_value: off.value.clone(),
+    }
+}
+
+/// Model selector rows: **only** the ACP `"model"` option (not reasoning,
+/// not fast-mode). When `provider_agent_id` is set and at least one value
+/// is namespaced to that agent (`agent/model`, etc.), only those values
+/// are kept; if none are namespaced, the full session model list is
+/// shown (session ads are already per-agent).
 pub fn to_config_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+    to_config_dropdown_entries_for_provider(options, "")
+}
+
+pub fn to_config_dropdown_entries_for_provider(
+    options: Vec<ConfigOptionInfo>,
+    provider_agent_id: &str,
+) -> ModelRc<DropdownEntry> {
     let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
-        items.push(DropdownEntry {
-            id: option.id.clone().into(),
-            label: option.name.into(),
-            value: String::new().into(),
-            is_header: true,
-            is_current: false,
-        });
-        for value in option.options {
-            let is_current = option.current_value.as_deref() == Some(value.value.as_str());
-            items.push(DropdownEntry {
-                is_current,
-                id: option.id.clone().into(),
-                label: value.name.into(),
-                value: value.value.into(),
-                is_header: false,
-            });
+        if option_id_norm(&option.id) != "model" {
+            continue;
+        }
+        let option = filter_model_option_for_provider(option, provider_agent_id);
+        if option.options.is_empty() {
+            continue;
+        }
+        append_option_entries(&mut items, option);
+    }
+    ModelRc::new(VecModel::from(items))
+}
+
+fn filter_model_option_for_provider(
+    mut option: ConfigOptionInfo,
+    provider_agent_id: &str,
+) -> ConfigOptionInfo {
+    if provider_agent_id.is_empty() || option.options.is_empty() {
+        return option;
+    }
+    let agent = provider_agent_id.to_ascii_lowercase();
+    let any_namespaced = option
+        .options
+        .iter()
+        .any(|v| model_value_looks_namespaced(&v.value));
+    if !any_namespaced {
+        // Bare model ids (gpt-5, sonnet) — already session-scoped.
+        return option;
+    }
+    let filtered: Vec<_> = option
+        .options
+        .iter()
+        .filter(|v| model_value_matches_provider(&v.value, &v.name, &agent))
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        return option;
+    }
+    if let Some(cur) = option.current_value.as_ref() {
+        if !filtered.iter().any(|v| &v.value == cur) {
+            option.current_value = filtered.first().map(|v| v.value.clone());
+        }
+    }
+    option.options = filtered;
+    option
+}
+
+fn model_value_looks_namespaced(value: &str) -> bool {
+    value.contains('/') || value.contains(':')
+}
+
+fn model_value_matches_provider(value: &str, name: &str, agent_lower: &str) -> bool {
+    let v = value.to_ascii_lowercase();
+    let n = name.to_ascii_lowercase();
+    if v.starts_with(agent_lower) {
+        return true;
+    }
+    if let Some((prefix, _)) = v.split_once('/') {
+        if prefix == agent_lower || agent_lower.contains(prefix) || prefix.contains(agent_lower) {
+            return true;
+        }
+    }
+    if let Some((prefix, _)) = v.split_once(':') {
+        if prefix == agent_lower {
+            return true;
+        }
+    }
+    let stem = agent_lower.split('-').next().unwrap_or(agent_lower);
+    stem.len() >= 3 && (v.contains(stem) || n.contains(stem))
+}
+
+/// Reasoning-effort selector rows (dedicated compose dropdown).
+pub fn to_reasoning_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
+    let mut items: Vec<DropdownEntry> = Vec::new();
+    for option in options {
+        if is_reasoning_option_id(&option.id) {
+            append_option_entries(&mut items, option);
         }
     }
     ModelRc::new(VecModel::from(items))
+}
+
+/// Trigger label for the reasoning dropdown (current value name, or "").
+pub fn current_reasoning_trigger_label(options: &[ConfigOptionInfo]) -> String {
+    for option in options.iter().filter(|o| is_reasoning_option_id(&o.id)) {
+        let Some(cur) = option.current_value.as_ref() else {
+            continue;
+        };
+        if let Some(v) = option.options.iter().find(|v| &v.value == cur) {
+            return v.name.clone();
+        }
+        return cur.clone();
+    }
+    String::new()
 }
 
 /// One-line preview text for a thread's sidebar card, synthesized from
@@ -671,6 +946,8 @@ pub fn build_thread_items<N: AsRef<str>>(
                 // as provider/model above.
                 project_path: String::new().into(),
                 project_name: String::new().into(),
+                profile_name: String::new().into(),
+                has_session: false,
             },
         })
         .collect()
@@ -691,9 +968,19 @@ pub fn model_name_from_config(options: &[ConfigOptionInfo]) -> String {
 /// Display label for the compose-bar model/config trigger — prefers the
 /// human-readable option `name` for the current value, falls back to the
 /// raw `currentValue`. Empty when nothing is advertised (Slint falls back
-/// to a generic "Model" label).
+/// to a generic "Model" label). Skips fast-mode (compose toggle) and
+/// prefers the `"model"` option when present.
 pub fn current_config_trigger_label(options: &[ConfigOptionInfo]) -> String {
-    for option in options {
+    let prefer = options
+        .iter()
+        .find(|o| option_id_norm(&o.id) == "model")
+        .into_iter()
+        .chain(options.iter().filter(|o| {
+            option_id_norm(&o.id) != "model"
+                && !is_fast_mode_option_id(&o.id)
+                && !is_reasoning_option_id(&o.id)
+        }));
+    for option in prefer {
         let Some(cur) = option.current_value.as_ref() else {
             continue;
         };
@@ -766,6 +1053,86 @@ pub fn to_profile_option_rows(
         .collect()
 }
 
+/// Compose-bar **Provider** picker: one row per distinct `agent_id`
+/// (provider), not one row per profile name. Selecting a provider still
+/// dispatches the representative profile `name` as `id` (so
+/// `ProfileSelected` / session open keep working); `value` carries the
+/// agent/provider id for model filtering. Label prefers `agent_id`.
+/// `current` is the thread's `profile_name` (maps to that profile's agent).
+pub fn to_profile_dropdown_entries(
+    profiles: &[ProfileOption],
+    current: &str,
+) -> ModelRc<DropdownEntry> {
+    let current_agent = profiles
+        .iter()
+        .find(|p| !current.is_empty() && p.name.as_str() == current)
+        .map(|p| p.agent_id.to_string())
+        .unwrap_or_default();
+
+    let mut seen_agents = std::collections::HashSet::<String>::new();
+    let mut items: Vec<DropdownEntry> = Vec::new();
+    for p in profiles {
+        let agent = p.agent_id.to_string();
+        let key = if agent.is_empty() {
+            p.name.to_string()
+        } else {
+            agent.clone()
+        };
+        if !seen_agents.insert(key.clone()) {
+            continue;
+        }
+        let label = if agent.is_empty() {
+            p.name.to_string()
+        } else {
+            agent.clone()
+        };
+        let is_current = if !current_agent.is_empty() {
+            agent == current_agent || (agent.is_empty() && p.name.as_str() == current)
+        } else {
+            !current.is_empty() && p.name.as_str() == current
+        };
+        items.push(DropdownEntry {
+            is_current,
+            id: p.name.clone(),
+            label: label.into(),
+            value: agent.into(),
+            is_header: false,
+        });
+    }
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Trigger label for the Provider control: selected provider/agent id,
+/// or empty so the UI falls back to `"Provider ›"`.
+pub fn current_provider_trigger_label(profiles: &[ProfileOption], current_profile: &str) -> String {
+    if current_profile.is_empty() {
+        return String::new();
+    }
+    profiles
+        .iter()
+        .find(|p| p.name.as_str() == current_profile)
+        .map(|p| {
+            if p.agent_id.is_empty() {
+                p.name.to_string()
+            } else {
+                p.agent_id.to_string()
+            }
+        })
+        .unwrap_or_else(|| current_profile.to_owned())
+}
+
+/// Agent/provider id for the thread's selected profile (empty if unknown).
+pub fn provider_agent_id_for_profile(profiles: &[ProfileOption], current_profile: &str) -> String {
+    if current_profile.is_empty() {
+        return String::new();
+    }
+    profiles
+        .iter()
+        .find(|p| p.name.as_str() == current_profile)
+        .map(|p| p.agent_id.to_string())
+        .unwrap_or_default()
+}
+
 /// Builds the settings sheet's MCP-server list row model from a real
 /// `mcp_servers/list` result (`AgentBridge::list_mcp_servers`). Each
 /// entry is an opaque JSON object on the Rust side (`acpx-core::
@@ -785,18 +1152,122 @@ pub fn to_mcp_server_option_rows(
 ) -> Vec<McpServerOption> {
     servers
         .into_iter()
-        .map(|entry| McpServerOption {
-            name: entry.name.into(),
-            command: entry.command.unwrap_or_default().into(),
-            // `enabled` is a registry-backed field and round-trips through
-            // `mcp_servers/update`; missing means enabled for compatibility
-            // with existing server records.
-            enabled: entry
+        .map(|entry| {
+            let enabled = entry
                 .extra
                 .get("enabled")
                 .and_then(|value| value.as_bool())
-                .unwrap_or(true),
-            ..Default::default()
+                .unwrap_or(true);
+            let url = entry
+                .extra
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            // Prefer explicit transport; fall back to type: remote/http or
+            // presence of a url field (opencode remote servers).
+            let transport = entry
+                .extra
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    entry
+                        .extra
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|t| match t {
+                            "remote" | "http" | "sse" | "streamable_http" => "http".to_owned(),
+                            "local" | "stdio" => "stdio".to_owned(),
+                            other => other.to_owned(),
+                        })
+                })
+                .unwrap_or_else(|| {
+                    if !url.is_empty() {
+                        "http".to_owned()
+                    } else {
+                        String::new()
+                    }
+                });
+            let status = entry
+                .extra
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let auth = entry
+                .extra
+                .get("auth_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let needs_auth = entry
+                .extra
+                .get("needs_auth")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| {
+                    // Remote HTTP servers that are not yet authenticated.
+                    transport == "http" && auth != "authenticated"
+                });
+            let tools = mcp_tools_from_extra(&entry.extra);
+            // Pre-format status subtitle in Rust (audit §4.3) so Slint
+            // does not concatenate nested ternaries.
+            let mut parts: Vec<&str> = Vec::new();
+            if !transport.is_empty() {
+                parts.push(transport.as_str());
+            }
+            if !status.is_empty() {
+                parts.push(status.as_str());
+            }
+            if !auth.is_empty() {
+                parts.push(auth.as_str());
+            }
+            if !enabled {
+                parts.push("disabled");
+            }
+            let status_line = parts.join(" · ");
+            McpServerOption {
+                name: entry.name.into(),
+                command: entry.command.unwrap_or_default().into(),
+                status_line: status_line.into(),
+                transport: transport.into(),
+                url: url.into(),
+                enabled,
+                status: status.into(),
+                needs_auth,
+                auth_status: auth.into(),
+                tools: ModelRc::new(VecModel::from(tools)),
+            }
+        })
+        .collect()
+}
+
+/// Parse a persisted `tools` array from an MCP server registry entry.
+fn mcp_tools_from_extra(extra: &serde_json::Value) -> Vec<McpToolOption> {
+    let Some(arr) = extra.get("tools").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?.to_owned();
+            let enabled = tool
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let deferred = tool
+                .get("deferred")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let token_usage = tool
+                .get("token_usage")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            Some(McpToolOption {
+                name: name.into(),
+                enabled,
+                deferred,
+                token_usage,
+            })
         })
         .collect()
 }
@@ -1183,6 +1654,38 @@ mod tests {
     }
 
     #[test]
+    fn to_mcp_server_options_parses_tools_url_and_needs_auth() {
+        use slint::Model;
+        let servers = vec![crate::protocol_types::McpServerEntry::from_json(
+            &serde_json::json!({
+                "name": "remote-tools",
+                "url": "https://example.com/mcp",
+                "type": "remote",
+                "auth_status": "not authenticated",
+                "tools": [
+                    { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
+                    { "name": "write", "enabled": false, "deferred": true }
+                ]
+            }),
+        )
+        .unwrap()];
+        let model = to_mcp_server_options(servers);
+        let row = model.row_data(0).unwrap();
+        assert_eq!(row.transport.as_str(), "http");
+        assert_eq!(row.url.as_str(), "https://example.com/mcp");
+        assert!(row.needs_auth);
+        assert_eq!(row.tools.row_count(), 2);
+        let t0 = row.tools.row_data(0).unwrap();
+        assert_eq!(t0.name.as_str(), "read");
+        assert!(t0.enabled);
+        assert_eq!(t0.token_usage, 12);
+        let t1 = row.tools.row_data(1).unwrap();
+        assert_eq!(t1.name.as_str(), "write");
+        assert!(!t1.enabled);
+        assert!(t1.deferred);
+    }
+
+    #[test]
     fn to_agent_catalog_entries_forwards_registry_fields_verbatim() {
         let agents =
             vec![
@@ -1414,19 +1917,7 @@ mod transcript_model_tests {
     }
 
     #[test]
-    fn config_dropdown_entries_are_fully_generic_and_already_support_a_fast_mode_style_option() {
-        // setup-followups plan, provider_fastmode_profile_persistence:
-        // `configOptions[]` (real ACP session-config-options, see
-        // agentclientprotocol.com/protocol/session-config-options) is not
-        // hardcoded to "model" -- any option a connected backend
-        // advertises (any `id`, any `kind`) already renders and dispatches
-        // through this same generic pipeline. A "fast mode"-shaped select
-        // option (e.g. a real ACP agent advertising reasoning effort or
-        // a fast/quality tradeoff) needs zero new acpx-core/client/UI
-        // plumbing -- proven here with a second, independent option
-        // alongside "model", both surfacing correctly and independently
-        // selectable in the same dropdown model real ACP clients (Zed
-        // included) already use this exact mechanism for.
+    fn config_dropdown_entries_omit_fast_mode_which_has_its_own_toggle() {
         let options = vec![
             ConfigOptionInfo {
                 id: "model".into(),
@@ -1463,18 +1954,155 @@ mod transcript_model_tests {
             },
         ];
 
-        let entries = to_config_dropdown_entries(options);
-        // model header + 1 value, fastMode header + 2 values.
-        assert_eq!(entries.row_count(), 5);
-        let ids: Vec<String> = (0..entries.row_count())
-            .map(|i| entries.row_data(i).unwrap().id.to_string())
-            .collect();
-        assert_eq!(ids, vec!["model", "model", "fastMode", "fastMode", "fastMode"]);
-        let fast_mode_off = entries.row_data(3).expect("fast mode off row");
-        assert_eq!(fast_mode_off.label, "Off");
-        assert!(fast_mode_off.is_current);
-        let fast_mode_on = entries.row_data(4).expect("fast mode on row");
-        assert_eq!(fast_mode_on.label, "On");
-        assert!(!fast_mode_on.is_current);
+        // Fast mode is a dedicated compose Toggle, not a dropdown group.
+        let entries = to_config_dropdown_entries(options.clone());
+        assert_eq!(entries.row_count(), 2); // model header + value only
+        assert_eq!(entries.row_data(0).unwrap().id.as_str(), "model");
+        assert_eq!(entries.row_data(1).unwrap().id.as_str(), "model");
+
+        let fast = fast_mode_from_config(&options);
+        assert!(fast.available);
+        assert!(!fast.enabled);
+        assert_eq!(fast.option_id, "fastMode");
+        assert_eq!(fast.on_value, "on");
+        assert_eq!(fast.off_value, "off");
+
+        let mut on_opts = options.clone();
+        on_opts[1].current_value = Some("on".into());
+        assert!(fast_mode_from_config(&on_opts).enabled);
+    }
+
+    #[test]
+    fn provider_dropdown_dedupes_by_agent_and_model_list_filters_namespaced_values() {
+        let profiles = vec![
+            ProfileOption {
+                name: "work".into(),
+                agent_id: "codex-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "work-fs".into(),
+                agent_id: "codex-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "claude-safe".into(),
+                agent_id: "claude-acp".into(),
+                terminal_enabled: false,
+                fs_enabled: false,
+            },
+        ];
+        let entries = to_profile_dropdown_entries(&profiles, "work");
+        assert_eq!(entries.row_count(), 2); // one per agent
+        assert_eq!(entries.row_data(0).unwrap().label.as_str(), "codex-acp");
+        assert_eq!(entries.row_data(0).unwrap().value.as_str(), "codex-acp");
+        assert!(entries.row_data(0).unwrap().is_current);
+        assert_eq!(entries.row_data(1).unwrap().label.as_str(), "claude-acp");
+        assert_eq!(
+            current_provider_trigger_label(&profiles, "work"),
+            "codex-acp"
+        );
+
+        let options = vec![ConfigOptionInfo {
+            id: "model".into(),
+            name: "Model".into(),
+            description: None,
+            category: None,
+            kind: "select".into(),
+            current_value: Some("codex-acp/gpt-5".into()),
+            options: vec![
+                ConfigOptionValue {
+                    value: "codex-acp/gpt-5".into(),
+                    name: "GPT-5".into(),
+                    description: None,
+                },
+                ConfigOptionValue {
+                    value: "claude-acp/sonnet".into(),
+                    name: "Sonnet".into(),
+                    description: None,
+                },
+            ],
+        }];
+        let filtered = to_config_dropdown_entries_for_provider(options, "codex-acp");
+        // header + one value
+        assert_eq!(filtered.row_count(), 2);
+        assert_eq!(filtered.row_data(1).unwrap().value.as_str(), "codex-acp/gpt-5");
+    }
+
+    #[test]
+    fn reasoning_effort_is_split_into_its_own_dropdown_model() {
+        let options = vec![
+            ConfigOptionInfo {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: None,
+                kind: "select".into(),
+                current_value: Some("gpt-5".into()),
+                options: vec![ConfigOptionValue {
+                    value: "gpt-5".into(),
+                    name: "GPT-5".into(),
+                    description: None,
+                }],
+            },
+            ConfigOptionInfo {
+                id: "reasoning".into(),
+                name: "Reasoning effort".into(),
+                description: None,
+                category: None,
+                kind: "select".into(),
+                current_value: Some("medium".into()),
+                options: vec![
+                    ConfigOptionValue {
+                        value: "low".into(),
+                        name: "Low".into(),
+                        description: None,
+                    },
+                    ConfigOptionValue {
+                        value: "medium".into(),
+                        name: "Medium".into(),
+                        description: None,
+                    },
+                    ConfigOptionValue {
+                        value: "high".into(),
+                        name: "High".into(),
+                        description: None,
+                    },
+                ],
+            },
+            ConfigOptionInfo {
+                id: "fastMode".into(),
+                name: "Fast Mode".into(),
+                description: None,
+                category: None,
+                kind: "select".into(),
+                current_value: Some("off".into()),
+                options: vec![
+                    ConfigOptionValue {
+                        value: "off".into(),
+                        name: "Off".into(),
+                        description: None,
+                    },
+                    ConfigOptionValue {
+                        value: "on".into(),
+                        name: "On".into(),
+                        description: None,
+                    },
+                ],
+            },
+        ];
+
+        let model_entries = to_config_dropdown_entries(options.clone());
+        assert_eq!(model_entries.row_count(), 2);
+        assert_eq!(model_entries.row_data(0).unwrap().id.as_str(), "model");
+
+        let reasoning = to_reasoning_dropdown_entries(options.clone());
+        assert_eq!(reasoning.row_count(), 4); // header + low/medium/high
+        assert_eq!(reasoning.row_data(0).unwrap().label.as_str(), "Reasoning effort");
+        assert!(reasoning.row_data(2).unwrap().is_current); // medium
+        assert_eq!(current_reasoning_trigger_label(&options), "Medium");
+        assert_eq!(current_config_trigger_label(&options), "GPT-5");
     }
 }

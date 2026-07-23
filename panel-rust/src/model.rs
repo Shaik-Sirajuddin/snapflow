@@ -61,6 +61,10 @@ pub struct ThreadModel {
     /// showed nothing at all, indistinguishable from a hang.
     pub agent_content_this_turn: bool,
     pub send_queue: SendQueue,
+    /// Per-thread compose draft (leak_audit_report §2.5 / §4.2). The
+    /// global `Model::compose_text` is only the *active* buffer for the
+    /// displayed thread; switching saves/restores via this field.
+    pub compose_draft: String,
     pub closed: bool,
     // setup-followups plan, archive_thread_backend_verify: purely local
     // presentation flag (see AgentBridge::archive_thread's doc comment) --
@@ -123,6 +127,8 @@ pub struct Model {
     pub active_skill_name: String,
     pub active_skill_path: String,
     pub active_skill_content: String,
+    /// skills_audit_report §3.1: true while SkillWrite is in flight.
+    pub skill_saving: bool,
     pub detected_editors: Vec<String>,
     pub active_pane: String,
     pub skills: Vec<crate::skills_state::SkillEntry>,
@@ -162,6 +168,7 @@ impl Default for ThreadModel {
             error: None,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),
+            compose_draft: String::new(),
             closed: false,
             archived: false,
             message_ids: Vec::new(),

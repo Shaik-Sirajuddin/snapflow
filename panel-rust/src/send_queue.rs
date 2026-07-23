@@ -25,7 +25,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct QueueEntryId(u64);
+pub struct QueueEntryId(pub u64);
 
 /// One pending message. Only the front entry's `steer` value matters,
 /// since entries are delivered in FIFO order -- matches
@@ -142,7 +142,8 @@ impl SendQueue {
         let tmp_path = path.with_extension("jsonl.tmp");
         let mut tmp = fs::File::create(&tmp_path)?;
         tmp.write_all(out.as_bytes())?;
-        tmp.sync_all()?;
+        // audit-fixes offload_persist_sync_all: avoid sync_all on UI path.
+        drop(tmp);
         fs::rename(&tmp_path, path)?;
         Ok(())
     }

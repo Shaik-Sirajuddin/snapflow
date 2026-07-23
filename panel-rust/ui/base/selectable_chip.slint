@@ -1,0 +1,51 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { HoverSurface } from "./hover.slint";
+
+// Layer 3 (base) -- the selectable-pill shape from `agents_view.slint`'s
+// profile chip row: a bordered rounded box, filled solid when selected,
+// with a click target. Not `Badge` -- `badge.slint` is deliberately
+// non-interactive (never wraps a `TouchArea`), and this needs to be
+// clickable, so it builds on `HoverSurface` instead (its `hover-bg` is
+// set equal to `idle-bg` here since the original hand-rolled chip never
+// had a separate hover tint, only a selected-vs-not fill).
+//
+// One intentional behavior delta from the pre-extraction hand-rolled
+// version: `HoverSurface`'s internal `TouchArea` sets native
+// `mouse-cursor: pointer` (every other clickable row in this codebase
+// already does, redundantly alongside the custom `CursorHost` cursor),
+// which the original profile-chip `TouchArea` omitted. Harmless --
+// `CursorHost` already renders a custom pointer icon on hover, so the
+// native cursor is a no-op layered underneath it, not a visible change.
+//
+// `content-width` exposes this chip's own label's preferred width so a
+// caller that needs the chip's total footprint (e.g. to size a wider
+// row that also has trailing Confirm/Cancel controls, as
+// `agents_view.slint` does) can read it back rather than reaching into
+// this component's internals -- reaching into a repeated item's child
+// layout's `preferred-width` from outside was exactly the binding-loop
+// class of bug `agents_view.slint`'s own comment on this row warns
+// about, so this stays the one safe supported way to get that number.
+export component SelectableChip inherits HoverSurface {
+    in property <string> label;
+    out property <length> content-width: chip-label.preferred-width;
+
+    height: 24px;
+    width: root.content-width + Metrics.pad-lg;
+    idle-bg: Theme.bg-sidebar;
+    hover-bg: Theme.bg-sidebar;
+    selected-bg: Theme.bg-primary;
+    border-color: Theme.border-default;
+    border-width: 1px;
+    border-radius: Theme.radius-sm;
+    button-accessible-label: "Select " + root.label;
+
+    chip-label := Text {
+        text: root.label;
+        color: root.selected ? Theme.text-on-primary : Theme.text-primary;
+        font-family: Theme.font-mono;
+        font-size: 10px * Theme.font-scale;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}

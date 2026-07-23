@@ -8,6 +8,7 @@ import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
 import { AgentBubble } from "./chat-view/components/message/agent_bubble.slint";
+import { QueuedMessageBar } from "./chat-view/components/message/queued_message_bar.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
 import { PermissionCard } from "./components/permission_card.slint";
 import { TerminalCard } from "./components/terminal_card.slint";
@@ -65,6 +66,19 @@ export component ChatArea inherits Rectangle {
     // Active model/config option display name for the model trigger
     // (empty until advertised; trigger falls back to "Model").
     in property <string> config-trigger-label: "";
+    // Reasoning effort (dedicated dropdown; empty hides it).
+    in property <[DropdownEntry]> reasoning-dropdown-entries: [];
+    in property <string> reasoning-trigger-label: "";
+    // setup-followups plan, provider_fastmode_profile_persistence.
+    in property <[DropdownEntry]> profile-dropdown-entries: [];
+    in property <string> profile-trigger-label: "";
+    in property <bool> active-thread-has-session: false;
+    // Dedicated Fast toggle (binary config option; not in model dropdown).
+    in property <bool> fast-mode-available: false;
+    in property <bool> fast-mode-enabled: false;
+    in property <string> fast-mode-option-id: "fastMode";
+    in property <string> fast-mode-on-value: "on";
+    in property <string> fast-mode-off-value: "off";
     // Session context usage for the compose-bar context ring (ui.yaml).
     in property <float> context-ratio: 0.0;
     in property <int> context-used-tokens: 0;
@@ -75,9 +89,14 @@ export component ChatArea inherits Rectangle {
     in property <[string]> file-options: [];
     callback mode-selected(string);
     callback config-option-selected(string, string);
+    callback profile-selected(string);
     callback context-view-requested();
     callback send-requested();
     callback stop-requested();
+    // QueuedMessageBar actions: message-list index of the queued row.
+    callback queue-cancel-requested(int);
+    callback queue-edit-requested(int);
+    callback queue-stop-requested();
     callback settings-requested();
     callback new-thread-requested();
     callback thread-rename-started();
@@ -105,8 +124,12 @@ export component ChatArea inherits Rectangle {
         local-terminal.open && local-terminal-card.has-focus;
     // Mode/model dropdown search + mention popup filter -- see
     // FilterSearchBar.input-has-focus's doc comment.
+    // rename-input (the chat header's inline thread-rename field) was
+    // missing from this OR-chain entirely -- same silently-dropped-
+    // keystrokes failure class TextField.has-focus's doc comment names.
     out property <bool> secondary-text-input-has-focus:
-        chat-input.secondary-text-input-has-focus;
+        chat-input.secondary-text-input-has-focus
+        || rename-input.has-focus;
 
     // --- Demo approval (local one-of card, no ACP round-trip) ------------
     // Type one of these in the compose box and press Send / Enter:
@@ -283,12 +306,24 @@ export component ChatArea inherits Rectangle {
                 : (compact ? 48px : 56px);
             // Match sidebar title strip surface when collapsed.
             background: root.match-title-bar ? Theme.bg-card : Theme.bg-chat;
-            property <angle> header-spin: 0deg;
-            header-spin-timer := Timer {
-                interval: 80ms;
-                running: root.sending || connection-status == "Connecting...";
-                triggered => { header-spin += 30deg; }
-            }
+            // A real Slint animation (not a plain `Timer` stepping this
+            // property by hand, the way this element itself used to) so
+            // the engine's own animation driver runs it --
+            // `has_active_animations()` (panel_rust_poll's host-side
+            // repaint trigger) only ever detects *this* kind of
+            // animation, never a bare `Timer`, so the old hand-rolled
+            // version silently stopped repainting itself except when
+            // some unrelated interaction happened to force a repaint
+            // anyway. Same fix already applied to sidebar.slint's own
+            // load-spin and chat_input_layout.slint's composer spinner
+            // (commit 800bd65) -- this header spinner was the one
+            // instance of the same bug class left unmigrated.
+            // audit-fixes animation_tick_loaders: continuous spin via tick.
+            property <bool> header-spinning:
+                root.sending || connection-status == "Connecting...";
+            property <angle> header-spin: header-spinning
+                ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                : 0deg;
             HorizontalLayout {
                 width: 100%;
                 height: 100%;
@@ -323,35 +358,46 @@ export component ChatArea inherits Rectangle {
                     }
                     // Status icon — Metrics.icon-md (16px), same as sidebar title icons.
                     // No height: parent.height (binding loop with layoutinfo-v).
-                    if root.sending || connection-status == "Connecting..." : Rectangle {
-                        width: Metrics.icon-md;
-                        height: Metrics.icon-md;
+                    //
+                    // Wrapped in one persistent accessible-role: text element
+                    // so connection-status is exposed to accessibility
+                    // regardless of which of the 3 visual variants below is
+                    // showing -- accessible-role: text doesn't support
+                    // accessible-value, so the status is folded into
+                    // accessible-label itself, matching the convention this
+                    // codebase already uses elsewhere for non-interactive
+                    // status indicators.
+                    connection-status-indicator := Rectangle {
                         horizontal-stretch: 0;
                         vertical-stretch: 0;
-                        Icon {
+                        width: Metrics.icon-md;
+                        height: Metrics.icon-md;
+                        accessible-role: text;
+                        accessible-label: "Connection status: " + connection-status;
+                        if root.sending || connection-status == "Connecting..." : Icon {
                             source: @image-url("./assets/icons/loader-circle.svg");
                             size: Metrics.icon-md;
                             color: Theme.bg-primary;
                             transform-rotation: header-spin;
-                            transform-origin: { x: 8px, y: 8px };
+                            // Center on the icon itself (not a fixed 8px
+                            // assumption) so the ring actually spins.
+                            transform-origin: { x: self.width / 2, y: self.height / 2 };
                         }
-                    }
-                    if !(root.sending || connection-status == "Connecting...")
-                        && root.status-needs-attention : Icon {
-                        source: @image-url("./assets/icons/hand-filled.svg");
-                        size: Metrics.icon-md;
-                        color: Theme.bg-primary;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 0;
-                    }
-                    if !(root.sending || connection-status == "Connecting...")
-                        && !root.status-needs-attention : Rectangle {
-                        width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: Theme.text-muted;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 0;
+                        if !(root.sending || connection-status == "Connecting...")
+                            && root.status-needs-attention : Icon {
+                            source: @image-url("./assets/icons/hand-filled.svg");
+                            size: Metrics.icon-md;
+                            color: Theme.bg-primary;
+                        }
+                        if !(root.sending || connection-status == "Connecting...")
+                            && !root.status-needs-attention : Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.text-muted;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                        }
                     }
                     if !root.rename-editing : Text {
                         text: active-thread-name != "" ? active-thread-name : "No thread";
@@ -525,6 +571,7 @@ export component ChatArea inherits Rectangle {
                     width: 16px;
                     accessible-role: button;
                     accessible-label: "Dismiss error";
+                    accessible-action-default => { root.error-banner-dismissed(); }
                     clicked => { root.error-banner-dismissed(); }
                     changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
                     Text {
@@ -625,13 +672,15 @@ export component ChatArea inherits Rectangle {
                 // chat-items-redesign.md #11: kind switch — user /
                 // agent|thinking / tool-event / legacy MessageCard.
                 for msg[i] in messages : HorizontalLayout {
-                    property <bool> is-user: msg.kind == "user";
+                    property <bool> is-queued: msg.queued;
+                    property <bool> is-user: msg.kind == "user" && !msg.queued;
                     property <bool> is-agent-side: msg.kind == "agent"
                         || msg.kind == "thinking";
                     property <bool> is-tool-event: msg.kind == "tool_use"
                         || msg.kind == "mcp_server_call"
                         || msg.kind == "skill_load"
-                        || msg.kind == "skill_use";
+                        || msg.kind == "skill_use"
+                        || msg.kind == "terminal";
                     // Active-session rail on the *latest* row while the
                     // thread is loading (same `sending` state as the
                     // header/sidebar spinner). Pulse *flows* top → bottom.
@@ -652,14 +701,12 @@ export component ChatArea inherits Rectangle {
                     // never repainted on its own and looked frozen except
                     // when some unrelated interaction (e.g. a mouse move)
                     // happened to trigger a repaint anyway.
-                    property <float> flow-t: is-live-tail ? 1.0 : 0.0;
-                    animate flow-t {
-                        // ~1.2s full trip, matching the original timer's
-                        // 30 × 40ms cadence, then loop.
-                        duration: 1200ms;
-                        iteration-count: is-live-tail ? -1 : 1;
-                        easing: linear;
-                    }
+                    // audit-fixes animation_tick_loaders: live-tail pulse
+                    // must not mount already at 1.0 (animate never runs).
+                    // Drive travel with animation-tick while live.
+                    property <float> flow-t: is-live-tail
+                        ? mod(animation-tick(), 1200ms) / 1200ms
+                        : 0.0;
                     property <length> flow-blob: 36px;
 
                     // Left rail track — always reserved for non-user rows
@@ -700,6 +747,17 @@ export component ChatArea inherits Rectangle {
                         width: is-user ? user-indent : rail-gap;
                         horizontal-stretch: 0;
                     }
+                    if is-queued : QueuedMessageBar {
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        text: msg.text;
+                        can-edit: msg.can-edit;
+                        sending: msg.sending;
+                        cancel-requested => { root.queue-cancel-requested(msg.index); }
+                        edit-requested => { root.queue-edit-requested(msg.index); }
+                        stop-requested => { root.queue-stop-requested(); }
+                    }
                     if is-user : UserBubble {
                         // Stretch within the available chat column instead
                         // of binding width back to the Flickable viewport.
@@ -716,6 +774,10 @@ export component ChatArea inherits Rectangle {
                         min-width: 0px;
                         vertical-stretch: 0;
                         item: msg;
+                        // Thinking rows reuse MessageItem.expanded + the
+                        // shared toggle-expanded round-trip (same as
+                        // ToolEventRow / MessageCard log bodies).
+                        toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
                     if is-tool-event : ToolEventRow {
                         horizontal-stretch: 1;
@@ -736,7 +798,7 @@ export component ChatArea inherits Rectangle {
                         index: msg.index;
                         toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
-                    if !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
+                    if !is-queued && !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
@@ -864,15 +926,29 @@ export component ChatArea inherits Rectangle {
             background: Theme.border-default;
         }
         // User input + mode/model selectors (extracted ChatInputLayout).
+        // vertical-stretch:0 keeps the composer a chrome band so the
+        // message Flickable remains the only elastic region (bottom-box
+        // cutoff regressions when this band stretched).
         chat-input := ChatInputLayout {
             width: 100%;
             horizontal-stretch: 1;
+            vertical-stretch: 0;
             compose-text <=> compose-text;
             sending: sending;
             mode-dropdown-entries: mode-dropdown-entries;
             config-dropdown-entries: config-dropdown-entries;
             mode-trigger-label: mode-trigger-label;
             config-trigger-label: config-trigger-label;
+            reasoning-dropdown-entries: reasoning-dropdown-entries;
+            reasoning-trigger-label: reasoning-trigger-label;
+            profile-dropdown-entries: profile-dropdown-entries;
+            profile-trigger-label: profile-trigger-label;
+            active-thread-has-session: active-thread-has-session;
+            fast-mode-available: fast-mode-available;
+            fast-mode-enabled: fast-mode-enabled;
+            fast-mode-option-id: fast-mode-option-id;
+            fast-mode-on-value: fast-mode-on-value;
+            fast-mode-off-value: fast-mode-off-value;
             context-ratio: context-ratio;
             context-used-tokens: context-used-tokens;
             context-limit-tokens: context-limit-tokens;
@@ -883,6 +959,7 @@ export component ChatArea inherits Rectangle {
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
+            profile-selected(id) => { profile-selected(id); }
             context-view-requested => { context-view-requested(); }
             panel-shortcut(event) => { return panel-shortcut(event); }
         }

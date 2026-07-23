@@ -1,7 +1,6 @@
 import { Theme } from "../../../tokens/theme.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
-import { Icon } from "../../../base/icon.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { NavItem } from "../../../base/nav_item.slint";
 
 // Settings page chrome -- the left-side section rail from the
 // settings-pane-redesign plan's "Component layout" section: `MCP Servers`
@@ -22,189 +21,57 @@ export component SettingsLeftTabs inherits Rectangle {
     VerticalLayout {
         spacing: Metrics.space-2;
 
-        mcp-tab := Rectangle {
+        NavItem {
             height: 34px;
-            border-radius: Theme.radius-sm;
-            background: root.active-section == "mcp_servers"
-                ? Theme.bg-primary-container
-                : (mcp-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
-            animate background { duration: 100ms; }
-            mcp-touch := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "MCP Servers section";
-                accessible-action-default => { root.section-selected("mcp_servers"); }
-                clicked => { root.section-selected("mcp_servers"); }
-                double-clicked => { root.collapse-requested(); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            VerticalLayout {
-                width: parent.width;
-                height: parent.height;
-                alignment: center;
-                if root.expanded : HorizontalLayout {
-                    padding-left: Metrics.space-3;
-                    spacing: Metrics.space-3;
-                    Icon {
-                        source: @image-url("../../../assets/icons/plug-zap.svg");
-                        size: 14px;
-                        color: root.active-section == "mcp_servers" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                    Text {
-                        text: "MCP Servers";
-                        color: root.active-section == "mcp_servers" ? Theme.text-primary : Theme.text-secondary;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: root.active-section == "mcp_servers" ? 700 : 400;
-                        vertical-alignment: center;
-                    }
-                }
-                if !root.expanded : HorizontalLayout {
-                    alignment: center;
-                    Icon {
-                        source: @image-url("../../../assets/icons/plug-zap.svg");
-                        size: 15px;
-                        color: root.active-section == "mcp_servers" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                }
-            }
+            label: "MCP Servers";
+            button-accessible-label: "MCP Servers section";
+            active: root.active-section == "mcp_servers";
+            show-icon: true;
+            show-label: root.expanded;
+            centered: !root.expanded;
+            icon-source: @image-url("../../../assets/icons/plug-zap.svg");
+            icon-size: root.expanded ? 14px : 15px;
+            clicked => { root.section-selected("mcp_servers"); }
+            double-clicked => { root.collapse-requested(); }
         }
-        agents-tab := Rectangle {
+        NavItem {
             height: 34px;
-            border-radius: Theme.radius-sm;
-            background: root.active-section == "agents"
-                ? Theme.bg-primary-container
-                : (agents-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
-            animate background { duration: 100ms; }
-            agents-touch := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Agents section";
-                accessible-action-default => { root.section-selected("agents"); }
-                clicked => { root.section-selected("agents"); }
-                double-clicked => { root.collapse-requested(); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            VerticalLayout {
-                width: parent.width;
-                height: parent.height;
-                alignment: center;
-                if root.expanded : HorizontalLayout {
-                    padding-left: Metrics.space-3;
-                    spacing: Metrics.space-3;
-                    Icon {
-                        source: @image-url("../../../assets/icons/sparkles.svg");
-                        size: 14px;
-                        color: root.active-section == "agents" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                    Text {
-                        text: "Agents";
-                        color: root.active-section == "agents" ? Theme.text-primary : Theme.text-secondary;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: root.active-section == "agents" ? 700 : 400;
-                        vertical-alignment: center;
-                    }
-                }
-                if !root.expanded : HorizontalLayout {
-                    alignment: center;
-                    Icon {
-                        source: @image-url("../../../assets/icons/sparkles.svg");
-                        size: 15px;
-                        color: root.active-section == "agents" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                }
-            }
+            label: "Agents";
+            button-accessible-label: "Agents section";
+            active: root.active-section == "agents";
+            show-icon: true;
+            show-label: root.expanded;
+            centered: !root.expanded;
+            icon-source: @image-url("../../../assets/icons/sparkles.svg");
+            icon-size: root.expanded ? 14px : 15px;
+            clicked => { root.section-selected("agents"); }
+            double-clicked => { root.collapse-requested(); }
         }
-        harness-tab := Rectangle {
+        NavItem {
             height: 34px;
-            border-radius: Theme.radius-sm;
-            background: root.active-section == "harness"
-                ? Theme.bg-primary-container
-                : (harness-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
-            animate background { duration: 100ms; }
-            harness-touch := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Harness section";
-                accessible-action-default => { root.section-selected("harness"); }
-                clicked => { root.section-selected("harness"); }
-                double-clicked => { root.collapse-requested(); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            VerticalLayout {
-                width: parent.width;
-                height: parent.height;
-                alignment: center;
-                if root.expanded : HorizontalLayout {
-                    padding-left: Metrics.space-3;
-                    spacing: Metrics.space-3;
-                    Icon {
-                        source: @image-url("../../../assets/icons/terminal.svg");
-                        size: 14px;
-                        color: root.active-section == "harness" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                    Text {
-                        text: "Harness";
-                        color: root.active-section == "harness" ? Theme.text-primary : Theme.text-secondary;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: root.active-section == "harness" ? 700 : 400;
-                        vertical-alignment: center;
-                    }
-                }
-                if !root.expanded : HorizontalLayout {
-                    alignment: center;
-                    Icon {
-                        source: @image-url("../../../assets/icons/terminal.svg");
-                        size: 15px;
-                        color: root.active-section == "harness" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                }
-            }
+            label: "Harness";
+            button-accessible-label: "Harness section";
+            active: root.active-section == "harness";
+            show-icon: true;
+            show-label: root.expanded;
+            centered: !root.expanded;
+            icon-source: @image-url("../../../assets/icons/terminal.svg");
+            icon-size: root.expanded ? 14px : 15px;
+            clicked => { root.section-selected("harness"); }
+            double-clicked => { root.collapse-requested(); }
         }
-        skills-tab := Rectangle {
+        NavItem {
             height: 34px;
-            border-radius: Theme.radius-sm;
-            background: root.active-section == "skills"
-                ? Theme.bg-primary-container
-                : (skills-touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
-            animate background { duration: 100ms; }
-            skills-touch := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Skills section";
-                accessible-action-default => { root.section-selected("skills"); }
-                clicked => { root.section-selected("skills"); }
-                double-clicked => { root.collapse-requested(); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            VerticalLayout {
-                width: parent.width;
-                height: parent.height;
-                alignment: center;
-                if root.expanded : HorizontalLayout {
-                    padding-left: Metrics.space-3;
-                    spacing: Metrics.space-3;
-                    Icon {
-                        source: @image-url("../../../assets/icons/book-open.svg");
-                        size: 14px;
-                        color: root.active-section == "skills" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                    Text {
-                        text: "Skills";
-                        color: root.active-section == "skills" ? Theme.text-primary : Theme.text-secondary;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: root.active-section == "skills" ? 700 : 400;
-                        vertical-alignment: center;
-                    }
-                }
-                if !root.expanded : HorizontalLayout {
-                    alignment: center;
-                    Icon {
-                        source: @image-url("../../../assets/icons/book-open.svg");
-                        size: 15px;
-                        color: root.active-section == "skills" ? Theme.text-primary : Theme.text-secondary;
-                    }
-                }
-            }
+            label: "Skills";
+            button-accessible-label: "Skills section";
+            active: root.active-section == "skills";
+            show-icon: true;
+            show-label: root.expanded;
+            centered: !root.expanded;
+            icon-source: @image-url("../../../assets/icons/book-open.svg");
+            icon-size: root.expanded ? 14px : 15px;
+            clicked => { root.section-selected("skills"); }
+            double-clicked => { root.collapse-requested(); }
         }
     }
 }

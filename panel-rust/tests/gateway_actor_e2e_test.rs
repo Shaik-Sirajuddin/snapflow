@@ -307,27 +307,49 @@ async fn resume_session_retries_after_transient_gateway_errors() {
     let port = listener.local_addr().expect("peer address").port();
     let peer = std::thread::spawn(move || {
         use std::io::{Read, Write};
-        for attempt in 0..4 {
+        // `Gateway::call_with_updates` retries a fresh WS handshake
+        // (`reconnect()` -> a real `GET /ws`) before every HTTP call while
+        // degraded (no live websocket) -- this peer's initial `GET /ws`
+        // always fails (no real WS handshake implemented below), so
+        // every one of resume_session's 5 retry attempts opens a *second*
+        // real connection here (the failed `GET /ws` reconnect attempt,
+        // then the actual `POST /rpc` call), not one. The original
+        // `for attempt in 0..4` loop only budgeted one connection per
+        // logical RPC call, silently exhausting this peer (and getting a
+        // real ConnectionRefused on the next attempt) before the intended
+        // 4th `/rpc` response was ever reached. Loop unbounded instead,
+        // rejecting `GET /ws` immediately (so reconnect() fails fast, one
+        // connection each) and only counting real `POST /rpc` calls
+        // against the intended 4-response script.
+        let mut rpc_attempt = 0;
+        loop {
             let (mut stream, _) = listener.accept().expect("accept transient request");
             let mut request = [0u8; 8192];
-            let _ = stream.read(&mut request);
-            let body = if attempt < 2 {
+            let n = stream.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..n]).into_owned();
+            if request.starts_with("GET /ws") {
+                // Close without a response -- connect_async sees this as
+                // a failed handshake and reconnect() gives up immediately
+                // rather than retrying against this same peer.
+                continue;
+            }
+            let body = if rpc_attempt < 2 {
                 serde_json::json!({
                     "jsonrpc": "2.0",
-                    "id": attempt + 1,
+                    "id": rpc_attempt + 1,
                     "error": {"code": -32603, "message": "gateway starting"}
                 })
-            } else if attempt == 2 {
+            } else if rpc_attempt == 2 {
                 serde_json::json!({
                     "jsonrpc": "2.0",
-                    "id": attempt + 1,
+                    "id": rpc_attempt + 1,
                     "result": {"modes": {"availableModes": [], "currentModeId": "default"}},
                     "_acpx": {"updates": []}
                 })
             } else {
                 serde_json::json!({
                     "jsonrpc": "2.0",
-                    "id": attempt + 1,
+                    "id": rpc_attempt + 1,
                     "result": {"stopReason": "end_turn"},
                     "_acpx": {"updates": []}
                 })
@@ -340,6 +362,10 @@ async fn resume_session_retries_after_transient_gateway_errors() {
                 body
             )
             .expect("write transient response");
+            rpc_attempt += 1;
+            if rpc_attempt == 4 {
+                break;
+            }
         }
     });
 
@@ -485,7 +511,7 @@ async fn close_then_delete_session_round_trip_through_a_real_gateway() {
         .await
         .expect("open_session");
 
-    handle.close_session().await.expect("close_session");
+    handle.close_session(false).await.expect("close_session");
 
     // `session/close` evicts the in-memory registry entry -- proven at
     // the `acpx-core::router` unit-test layer already

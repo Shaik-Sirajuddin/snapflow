@@ -3,11 +3,12 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "../base/icon.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { HoverSurface } from "../base/hover.slint";
+import { NavItem } from "../base/nav_item.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { NamePromptDialog } from "../base/name_prompt_dialog.slint";
 import { TextUtil } from "../base/text_util.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
 import { ThreadItem, SkillOption } from "../types.slint";
+import { SidebarThreadRow } from "./sidebar_thread_row.slint";
 
 // Thread list column -- Phase 2 of chat-panel-ui-theme-parity.md will
 // extend this with a real search box + filtered model and a footer
@@ -22,10 +23,24 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
-    // Aggregates thread-search's own FilterSearchBar.input-has-focus --
-    // see that property's doc comment for why this needs re-exposing at
-    // every component boundary up to the root gate in app.slint.
-    out property <bool> search-has-focus: thread-search.input-has-focus;
+    // Aggregates thread-search's own FilterSearchBar.input-has-focus, the
+    // per-row inline thread-rename TextInput, and the shared "new skill"
+    // NamePromptDialog -- see that property's doc comment for why this
+    // needs re-exposing at every component boundary up to the root gate
+    // in app.slint. Without rename-input-has-focus/new-skill-dialog.has-focus
+    // here, both renaming a thread and naming a new skill would silently
+    // drop every typed keystroke (TextField.has-focus's doc comment names
+    // the exact same failure mode).
+    out property <bool> search-has-focus:
+        thread-search.input-has-focus
+        || rename-input-has-focus
+        || new-skill-dialog.has-focus;
+    // rename-input lives inside a `for thread[i] in threads` repeater, so
+    // there's no single element id to reference from search-has-focus
+    // above -- only ever one row is in rename mode at a time
+    // (rename-thread-index gates it), so each row's own `changed
+    // has-focus` handler converging this property nets out correctly.
+    property <bool> rename-input-has-focus: false;
     callback thread-selected(int);
     callback new-thread-requested();
     callback search-changed(string);
@@ -162,7 +177,7 @@ export component Sidebar inherits Rectangle {
                     alignment: center;
                     HorizontalLayout {
                         alignment: center;
-                        IconButton {
+                        sidebar-toggle := IconButton {
                             button-accessible-label: "Expand thread sidebar";
                             clicked => { toggle-expanded(); }
                             Icon {
@@ -177,7 +192,7 @@ export component Sidebar inherits Rectangle {
                     horizontal-stretch: 0;
                     height: parent.height;
                     alignment: center;
-                    IconButton {
+                    sidebar-toggle-collapse := IconButton {
                         button-accessible-label: "Collapse thread sidebar";
                         clicked => { toggle-expanded(); }
                         Icon {
@@ -247,33 +262,31 @@ export component Sidebar inherits Rectangle {
                 padding-left: Metrics.space-3;
                 padding-right: Metrics.space-3;
                 spacing: Metrics.space-3;
-                threads-tab := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Show threads";
+                NavItem {
+                    horizontal-stretch: 0;
+                    fill-width: false;
+                    idle-bg: transparent;
+                    hover-bg: transparent;
+                    selected-bg: transparent;
+                    active-color: Theme.bg-primary;
+                    inactive-color: Theme.text-muted;
+                    label: "Threads";
+                    active: !skill-mode;
+                    button-accessible-label: "Show threads";
                     clicked => { skill-mode = false; }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    Text {
-                        text: "Threads";
-                        color: !skill-mode ? Theme.bg-primary : Theme.text-muted;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: !skill-mode ? 700 : 400;
-                        vertical-alignment: center;
-                    }
                 }
-                skills-tab := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Show skills";
+                NavItem {
+                    horizontal-stretch: 0;
+                    fill-width: false;
+                    idle-bg: transparent;
+                    hover-bg: transparent;
+                    selected-bg: transparent;
+                    active-color: Theme.bg-primary;
+                    inactive-color: Theme.text-muted;
+                    label: "Skills";
+                    active: skill-mode;
+                    button-accessible-label: "Show skills";
                     clicked => { skill-mode = true; }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-                    Text {
-                        text: "Skills";
-                        color: skill-mode ? Theme.bg-primary : Theme.text-muted;
-                        font-size: 11px * Theme.font-scale;
-                        font-weight: skill-mode ? 700 : 400;
-                        vertical-alignment: center;
-                    }
                 }
             }
         }
@@ -293,6 +306,7 @@ export component Sidebar inherits Rectangle {
                     accessible-label: root.show-global-skills
                         ? "Hide global skills"
                         : "Show global skills";
+                    accessible-action-default => { root.show-global-skills = !root.show-global-skills; }
                     clicked => { root.show-global-skills = !root.show-global-skills; }
                     Rectangle {
                         height: 24px;
@@ -481,359 +495,148 @@ export component Sidebar inherits Rectangle {
                 }
             }
         }
-        // Thread card: title row (+ optional model). No description line.
-        if !skill-mode : Flickable {
+        // Thread lists: active threads fill the top (scrollable);
+        // archived threads pin to a bottom section with a max height
+        // so they never push active rows off the top of the rail.
+        if !skill-mode : VerticalLayout {
             vertical-stretch: 1;
             preferred-height: 0px;
             min-height: 0px;
-            viewport-height: thread-list-col.preferred-height;
-            thread-list-col := VerticalLayout {
-                spacing: Metrics.space-1;
-                for thread[i] in threads : thread-row := HoverSurface {
-                    // Taller only when the model line is shown under the name.
-                    height: expanded && thread.model != "" ? 52px : 44px;
-                    // Fill the rail width so the left stick can pin to x=0
-                    // (content-sized rows left a gap beside a centered group).
-                    width: 100%;
-                    idle-bg: Theme.bg-sidebar;
-                    selected-bg: Theme.bg-chat;
-                    selected: i == selected-thread;
-                    button-accessible-label: thread.name;
-                    clicked => { thread-selected(i); }
-                    double-clicked => {
-                        if (root.expanded) {
-                            root.collapse-requested();
+            spacing: 0px;
+
+            // --- Active (and, when collapsed, all) threads -------------
+            Flickable {
+                vertical-stretch: 1;
+                preferred-height: 0px;
+                min-height: 0px;
+                viewport-height: active-thread-col.preferred-height;
+                active-thread-col := VerticalLayout {
+                    spacing: Metrics.space-1;
+                    for thread[i] in threads : active-row := SidebarThreadRow {
+                        // Expanded: hide archived here (they live below).
+                        // Collapsed: keep every thread so rail icons remain.
+                        property <bool> show-here: !root.expanded || !thread.archived;
+                        height: show-here
+                            ? (root.expanded && thread.model != "" ? 52px : 44px)
+                            : 0px;
+                        visible: show-here;
+                        width: 100%;
+                        thread: thread;
+                        index: i;
+                        selected-thread: root.selected-thread;
+                        expanded: root.expanded;
+                        compact: root.compact;
+                        active-project-path: root.active-project-path;
+                        rename-thread-index: root.rename-thread-index;
+                        rename-thread-draft <=> root.rename-thread-draft;
+                        rename-focus-index <=> root.rename-focus-index;
+                        pending-close-index <=> root.pending-close-index;
+                        pending-delete-index <=> root.pending-delete-index;
+                        accent-color: root.thread-accent(i);
+                        show-archived-badge: true;
+                        show-archive-action: true;
+                        row-selected => { root.thread-selected(i); }
+                        collapse-if-expanded => {
+                            if (root.expanded) {
+                                root.collapse-requested();
+                            }
+                        }
+                        begin-rename => { root.begin-thread-rename(i); }
+                        confirm-rename => { root.confirm-thread-rename(i); }
+                        cancel-rename => { root.cancel-thread-rename(); }
+                        close-requested => { root.thread-close-requested(i); }
+                        delete-requested => { root.thread-delete-requested(i); }
+                        archive-requested => { root.thread-archive-requested(i); }
+                        rename-focus-changed(has-focus) => {
+                            root.rename-input-has-focus = has-focus;
                         }
                     }
-                    // Collapsed: color-coded stick flush LEFT + status glyph
-                    // centered in the remaining width. Expanded: white
-                    // selection stick on the LEFT (Theme.bg-primary — white
-                    // in dark theme) for the active row only.
-                    //
-                    // COLOR CODING (multi-hue accent) ONLY WHEN COLLAPSED.
+                }
+            }
+
+            // --- Archived (bottom, expanded only, max-height) ----------
+            // Caps at ~header + 3 tall rows so active list keeps majority
+            // of the rail. Section collapses entirely when empty.
+            if root.expanded : VerticalLayout {
+                vertical-stretch: 0;
+                spacing: 0px;
+                // Header + up to ~3 model-rows of content.
+                max-height: 22px + 156px;
+
+                archived-header := Rectangle {
+                    height: archived-thread-col.preferred-height > 0px ? 22px : 0px;
+                    visible: archived-thread-col.preferred-height > 0px;
+                    width: 100%;
+                    background: Theme.bg-canvas;
                     HorizontalLayout {
-                        width: 100%;
-                        height: 100%;
-                        // Always stretch so the stick is not centered with
-                        // the icon group (alignment:center was the gap).
-                        alignment: stretch;
-                        spacing: 0px;
-                        Rectangle {
-                            width: 3px;
-                            horizontal-stretch: 0;
-                            // Full row height, flush to the rail's left end.
-                            height: 100%;
-                            // Collapsed: per-thread accent (rose/orange/…).
-                            // Expanded: white selection bar (bg-primary) on
-                            // the selected row only; transparent otherwise.
-                            background: expanded
-                                ? (i == selected-thread ? Theme.bg-primary : transparent)
-                                : root.thread-accent(i);
-                        }
-                        VerticalLayout {
+                        padding-left: Metrics.space-3;
+                        padding-right: Metrics.space-3;
+                        spacing: Metrics.space-2;
+                        Text {
+                            text: "Archived";
+                            color: Theme.text-muted;
+                            font-size: 10px * Theme.font-scale;
+                            font-weight: 700;
+                            font-family: Theme.font-sans;
+                            vertical-alignment: center;
                             horizontal-stretch: 1;
-                            preferred-width: 0px;
-                            min-width: 0px;
-                            padding-left: expanded ? (compact ? Metrics.space-6 : Metrics.space-8) : 0px;
-                            padding-right: expanded ? (compact ? Metrics.space-6 : Metrics.space-8) : 0px;
-                            // Single-line rows need the content group centered
-                            // in the fixed row height. The model-detail variant
-                            // keeps its intentional vertical breathing room.
-                            padding-top: expanded && thread.model != "" ? Metrics.space-3 : 0px;
-                            padding-bottom: expanded && thread.model != "" ? Metrics.space-3 : 0px;
-                            spacing: Metrics.space-3;
-                            alignment: center;
-                            HorizontalLayout {
-                                // Expanded: row content L→R. Collapsed:
-                                // center status icon in space after the stick.
-                                alignment: expanded ? stretch : center;
-                                // Keep titles readable before eliding in the
-                                // compact expanded rail; row actions already
-                                // provide their own button hit targets.
-                                spacing: expanded ? Metrics.space-2 : 0px;
-                                // Left-end state icon: spinning circular progress while
-                                // the thread is actively fetching, a filled hand only
-                                // when an error requires user attention, otherwise a
-                                // plain status dot. Centered in the rail when collapsed.
-                                // A real Slint animation (not a plain
-                                // `Timer` stepping this property by hand)
-                                // so the engine's own animation driver
-                                // drives it -- `has_active_animations()`
-                                // (panel_rust_poll's host-side repaint
-                                // trigger) only ever detected *this* kind
-                                // of animation, never a bare `Timer`, so
-                                // the old hand-rolled version silently
-                                // never repainted on its own and looked
-                                // frozen except when some unrelated
-                                // interaction (e.g. a mouse move) happened
-                                // to trigger a repaint anyway.
-                                property <angle> load-spin: thread.status == "loading" ? 360deg : 0deg;
-                                animate load-spin {
-                                    duration: 800ms;
-                                    iteration-count: thread.status == "loading" ? -1 : 1;
-                                    easing: linear;
-                                }
-                                if thread.status == "loading" : Rectangle {
-                                    width: 14px;
-                                    height: 14px;
-                                    Icon {
-                                        source: @image-url("../assets/icons/loader-circle.svg");
-                                        size: 14px;
-                                        color: Theme.bg-primary;
-                                        transform-rotation: load-spin;
-                                        transform-origin: { x: 7px, y: 7px };
-                                    }
-                                }
-                                if thread.status == "error" : Icon {
-                                    source: @image-url("../assets/icons/hand.svg");
-                                    size: 14px;
-                                    color: Theme.bg-primary;
-                                }
-                                if thread.status != "loading" && thread.status != "error" : Rectangle {
-                                    width: 6px;
-                                    height: 6px;
-                                    border-radius: 3px;
-                                    background: Theme.text-muted;
-                                }
-                                if expanded && root.rename-thread-index != i : Text {
-                                    text: thread.name;
-                                    color: i == selected-thread ? Theme.bg-primary : Theme.text-primary;
-                                    font-size: 11px * Theme.font-scale;
-                                    font-weight: 700;
-                                    font-family: Theme.font-sans;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                    horizontal-stretch: 1;
-                                    preferred-width: 0px;
-                                    min-width: 0px;
-                                }
-                                rename-editor := Rectangle {
-                                    visible: expanded && root.rename-thread-index == i;
-                                    height: 24px;
-                                    // TextInput selection/caret painting may
-                                    // extend past its visual box otherwise.
-                                    clip: true;
-                                    background: Theme.bg-card;
-                                    border-width: 1px;
-                                    border-color: Theme.border-default;
-                                    border-radius: Theme.radius-sm;
-                                    horizontal-stretch: 1;
-                                    preferred-width: 0px;
-                                    min-width: root.rename-thread-index == i ? 56px : 0px;
-                                    max-width: root.rename-thread-index == i ? 10000px : 0px;
-                                    rename-input := TextInput {
-                                        x: Metrics.space-2;
-                                        y: 0px;
-                                        width: parent.width - 2 * Metrics.space-2;
-                                        height: parent.height;
-                                        accessible-label: "Thread name";
-                                        text <=> root.rename-thread-draft;
-                                        color: Theme.text-primary;
-                                        font-family: Theme.font-sans;
-                                        font-size: 10px * Theme.font-scale;
-                                        vertical-alignment: center;
-                                        single-line: true;
-                                        key-pressed(event) => {
-                                            if (event.text == Key.Return) {
-                                                root.confirm-thread-rename(i);
-                                                return EventResult.accept;
-                                            }
-                                            if (event.text == Key.Escape) {
-                                                root.cancel-thread-rename();
-                                                return EventResult.accept;
-                                            }
-                                            return EventResult.reject;
-                                        }
-                                    }
-                                }
-                                rename-focus-delay := Timer {
-                                    interval: 1ms;
-                                    running: root.rename-focus-index == i;
-                                    triggered => {
-                                        root.rename-focus-index = -1;
-                                        rename-input.focus();
-                                    }
-                                }
-                                if expanded && root.rename-thread-index != i && thread.background : Icon {
-                                    source: @image-url("../assets/icons/moon.svg");
-                                    size: Metrics.icon-sm;
-                                    color: Theme.text-tertiary;
-                                }
-                                // `thread_item_project_context` phase: no
-                                // dedicated folder/project icon exists in
-                                // assets/icons (checked the directory
-                                // listing), so this uses a small text
-                                // badge of the project's basename instead
-                                // of a "logo" image, matching the
-                                // established text-label-for-missing-icon
-                                // precedent from active_pane_and_editor_view.
-                                if expanded && root.rename-thread-index != i
-                                    && thread.project-path != "" && thread.project-path != root.active-project-path : Text {
-                                    text: thread.project-name;
-                                    color: Theme.text-tertiary;
-                                    font-size: 8px * Theme.font-scale;
-                                    font-family: Theme.font-mono;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                    max-width: 64px;
-                                }
-                                if expanded && root.rename-thread-index != i
-                                    && !thread.background && i == selected-thread : Text {
-                                    text: "ACTIVE";
-                                    color: Theme.text-muted;
-                                    font-size: 8px * Theme.font-scale;
-                                    font-family: Theme.font-mono;
-                                    vertical-alignment: center;
-                                }
-                                if expanded && root.rename-thread-index != i && thread-row.has-hover : IconButton {
-                                    btn-width: 18px;
-                                    btn-height: 18px;
-                                    button-accessible-label: "Rename thread " + thread.name;
-                                    clicked => { root.begin-thread-rename(i); }
-                                    Icon {
-                                        source: @image-url("../assets/icons/pencil.svg");
-                                        size: 13px;
-                                        color: Theme.text-muted;
-                                    }
-                                }
-                                if expanded && root.rename-thread-index == i : IconButton {
-                                    btn-width: 18px;
-                                    btn-height: 18px;
-                                    button-accessible-label: "Save thread name";
-                                    clicked => { root.confirm-thread-rename(i); }
-                                    Icon {
-                                        source: @image-url("../assets/icons/check.svg");
-                                        size: 13px;
-                                        color: Theme.bg-primary;
-                                    }
-                                }
-                                if expanded && root.rename-thread-index == i : IconButton {
-                                    btn-width: 18px;
-                                    btn-height: 18px;
-                                    button-accessible-label: "Cancel thread rename";
-                                    clicked => { root.cancel-thread-rename(); }
-                                    Icon {
-                                        source: @image-url("../assets/icons/x.svg");
-                                        size: 13px;
-                                        color: Theme.text-muted;
-                                    }
-                                }
-                                // Coverage Matrix `session/close`/
-                                // `session/delete` row: explicit,
-                                // confirm-gated lifecycle controls per
-                                // thread row -- an open thread shows a
-                                // close (power) icon, a closed one
-                                // shows a delete (trash) icon instead,
-                                // both armed by a first click and only
-                                // acted on by a second, explicit
-                                // confirm -- same two-step pattern as
-                                // `settings_sheet.slint`'s profile
-                                // delete control.
-                                if expanded && root.rename-thread-index != i
-                                    && !thread.closed && root.pending-close-index != i && thread-row.has-hover : IconButton {
-                                    btn-width: 18px;
-                                    btn-height: 18px;
-                                    button-accessible-label: "Close thread " + thread.name;
-                                    clicked => { root.pending-close-index = i; }
-                                    Icon {
-                                        source: @image-url("../assets/icons/power.svg");
-                                        size: 13px;
-                                        color: Theme.text-muted;
-                                    }
-                                }
-                                if expanded && root.rename-thread-index != i
-                                    && !thread.closed && root.pending-close-index == i : HorizontalLayout {
-                                    spacing: Metrics.space-1;
-                                    IconButton {
-                                        btn-width: 18px;
-                                        btn-height: 18px;
-                                        button-accessible-label: "Confirm close thread " + thread.name;
-                                        clicked => {
-                                            root.pending-close-index = -1;
-                                            root.thread-close-requested(i);
-                                        }
-                                        Icon {
-                                            source: @image-url("../assets/icons/circle-check.svg");
-                                            size: Metrics.icon-sm;
-                                            color: Theme.bg-primary;
-                                        }
-                                    }
-                                    IconButton {
-                                        btn-width: 18px;
-                                        btn-height: 18px;
-                                        button-accessible-label: "Cancel close thread " + thread.name;
-                                        clicked => { root.pending-close-index = -1; }
-                                        Icon {
-                                            source: @image-url("../assets/icons/x.svg");
-                                            size: 13px;
-                                            color: Theme.text-secondary;
-                                        }
-                                    }
-                                }
-                                if expanded && root.rename-thread-index != i
-                                    && thread.closed && root.pending-delete-index != i && thread-row.has-hover : IconButton {
-                                    btn-width: 18px;
-                                    btn-height: 18px;
-                                    button-accessible-label: "Delete thread " + thread.name;
-                                    clicked => { root.pending-delete-index = i; }
-                                    Icon {
-                                        source: @image-url("../assets/icons/trash-2.svg");
-                                        size: 13px;
-                                        color: Theme.text-muted;
-                                    }
-                                }
-                                if expanded && root.rename-thread-index != i
-                                    && thread.closed && root.pending-delete-index == i : HorizontalLayout {
-                                    spacing: Metrics.space-1;
-                                    IconButton {
-                                        btn-width: 18px;
-                                        btn-height: 18px;
-                                        button-accessible-label: "Confirm delete thread " + thread.name;
-                                        clicked => {
-                                            root.pending-delete-index = -1;
-                                            root.thread-delete-requested(i);
-                                        }
-                                        Icon {
-                                            source: @image-url("../assets/icons/circle-check.svg");
-                                            size: Metrics.icon-sm;
-                                            color: Theme.bg-primary;
-                                        }
-                                    }
-                                    IconButton {
-                                        btn-width: 18px;
-                                        btn-height: 18px;
-                                        button-accessible-label: "Cancel delete thread " + thread.name;
-                                        clicked => { root.pending-delete-index = -1; }
-                                        Icon {
-                                            source: @image-url("../assets/icons/x.svg");
-                                            size: 13px;
-                                            color: Theme.text-secondary;
-                                        }
-                                    }
-                                }
-                                if expanded && root.rename-thread-index != i
-                                    && !thread.archived && thread-row.has-hover : IconButton {
-                                    btn-width: 18px;
-                                    btn-height: 18px;
-                                    button-accessible-label: "Archive thread " + thread.name;
-                                    clicked => { root.thread-archive-requested(i); }
-                                    Icon {
-                                        source: @image-url("../assets/icons/archive.svg");
-                                        size: 13px;
-                                        color: Theme.text-muted;
-                                    }
+                        }
+                        Icon {
+                            source: @image-url("../assets/icons/archive.svg");
+                            size: 12px;
+                            color: Theme.text-muted;
+                        }
+                    }
+                }
+
+                Flickable {
+                    vertical-stretch: 0;
+                    // Grow with content up to 3 rows, then scroll.
+                    // Prefer content height; cap via max-height only (do not
+                    // also bind `height` -- Slint rejects height+max-height).
+                    preferred-height: archived-thread-col.preferred-height;
+                    max-height: 156px;
+                    min-height: 0px;
+                    visible: archived-thread-col.preferred-height > 0px;
+                    viewport-height: archived-thread-col.preferred-height;
+                    archived-thread-col := VerticalLayout {
+                        spacing: Metrics.space-1;
+                        for thread[i] in threads : archived-row := SidebarThreadRow {
+                            property <bool> show-here: thread.archived;
+                            height: show-here
+                                ? (thread.model != "" ? 52px : 44px)
+                                : 0px;
+                            visible: show-here;
+                            width: 100%;
+                            thread: thread;
+                            index: i;
+                            selected-thread: root.selected-thread;
+                            expanded: true;
+                            compact: root.compact;
+                            active-project-path: root.active-project-path;
+                            rename-thread-index: root.rename-thread-index;
+                            rename-thread-draft <=> root.rename-thread-draft;
+                            rename-focus-index <=> root.rename-focus-index;
+                            pending-close-index <=> root.pending-close-index;
+                            pending-delete-index <=> root.pending-delete-index;
+                            accent-color: root.thread-accent(i);
+                            // Already in the Archived section.
+                            show-archived-badge: false;
+                            show-archive-action: false;
+                            row-selected => { root.thread-selected(i); }
+                            collapse-if-expanded => {
+                                if (root.expanded) {
+                                    root.collapse-requested();
                                 }
                             }
-                            // Phase 8: active model (provider · model when known).
-                            if expanded && thread.model != "" : Text {
-                                text: thread.provider != "" ? thread.provider + " \u{00B7} " + thread.model : thread.model;
-                                color: Theme.text-muted;
-                                font-size: 9px * Theme.font-scale;
-                                font-family: Theme.font-mono;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                                preferred-width: 0px;
-                                min-width: 0px;
+                            begin-rename => { root.begin-thread-rename(i); }
+                            confirm-rename => { root.confirm-thread-rename(i); }
+                            cancel-rename => { root.cancel-thread-rename(); }
+                            close-requested => { root.thread-close-requested(i); }
+                            delete-requested => { root.thread-delete-requested(i); }
+                            archive-requested => { }
+                            rename-focus-changed(has-focus) => {
+                                root.rename-input-has-focus = has-focus;
                             }
                         }
                     }
@@ -974,7 +777,7 @@ export component Sidebar inherits Rectangle {
 
     // Shared NamePromptDialog (base/) -- cursor-kind reporting (pointer/
     // text) lives inside it, so this call site inherits it.
-    NamePromptDialog {
+    new-skill-dialog := NamePromptDialog {
         x: 0px;
         y: 0px;
         width: root.width;
@@ -983,6 +786,23 @@ export component Sidebar inherits Rectangle {
         title: "New skill";
         field-accessible-label: "New skill name";
         confirm-label: "Create";
-        confirmed(name) => { root.new-skill-requested(name, "project"); }
+        // Prefer a project-local skill when a project is open so the new
+        // entry is visible under the default sidebar filter (project
+        // skills always show; global skills need the "Show global
+        // skills" toggle). Fall back to global when no project is open
+        // -- hard-coding "project" used to fail CreateSkill with
+        // "cannot create a project skill without an open project", so
+        // the dialog closed, nothing was written, and the list never
+        // gained the skill (setup-followups skill_not_listed_after_creation).
+        confirmed(name) => {
+            if (root.active-project-path == "") {
+                // Make the new global skill visible immediately rather
+                // than requiring a separate toggle discovery.
+                root.show-global-skills = true;
+                root.new-skill-requested(name, "global");
+            } else {
+                root.new-skill-requested(name, "project");
+            }
+        }
     }
 }

@@ -191,9 +191,9 @@ pub(crate) fn dispatch_thread_selected(panel: &PanelSingleton, filtered_idx: usi
         settings_gateway_snapshot,
         ..crate::msg::FrameInput::default()
     });
-    debug_assert!(dirty
-        .iter()
-        .all(|d| matches!(d, Dirty::Scalar(ScalarField::SelectedThread))));
+    // May also clear messages/terminals/pending/compose on real switch
+    // (leak_audit_report thread_switch_sync_clear_models).
+    let _ = dirty;
 }
 
 /// Wired from `component.on_thread_navigation_requested`. `delta` is
@@ -216,9 +216,7 @@ pub(crate) fn dispatch_thread_navigate(panel: &PanelSingleton, delta: i32) {
         settings_gateway_snapshot,
         ..crate::msg::FrameInput::default()
     });
-    debug_assert!(dirty
-        .iter()
-        .all(|d| matches!(d, Dirty::Scalar(ScalarField::SelectedThread))));
+    let _ = dirty;
 }
 
 pub(crate) fn dispatch_thread_recover_session_attach(
@@ -309,6 +307,13 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
         thread_list_snapshot: Some(
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
                 .collect_thread_list_snapshot(),
+        ),
+        // Same catalog pull recover_session does: ensures compose Provider
+        // has profiles even if the periodic frame path has not filled them
+        // yet (cold start, settings never opened).
+        settings_gateway_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot(),
         ),
         ..crate::msg::FrameInput::default()
     });
@@ -505,6 +510,44 @@ pub(crate) fn dispatch_compose_stop(panel: &PanelSingleton) {
         effects.is_empty()
             || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
         "Compose::StopRequested must produce zero (no selected thread) or one CancelGeneration effect"
+    );
+    execute_effects(panel, effects);
+}
+
+/// QueuedMessageBar cancel -- drop one send-queue entry by message index.
+pub(crate) fn dispatch_queue_cancel(panel: &PanelSingleton, message_index: usize) {
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::QueueCancel { message_index })),
+    );
+    debug_assert!(
+        effects.is_empty(),
+        "Compose::QueueCancel must not produce effects"
+    );
+    execute_effects(panel, effects);
+}
+
+/// QueuedMessageBar edit -- pull one queue entry into the composer.
+pub(crate) fn dispatch_queue_edit(panel: &PanelSingleton, message_index: usize) {
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Compose(ComposeMsg::QueueEdit { message_index })),
+    );
+    debug_assert!(
+        effects.is_empty(),
+        "Compose::QueueEdit must not produce effects"
+    );
+    execute_effects(panel, effects);
+}
+
+/// QueuedMessageBar stop -- pause queue auto-drain and cancel generation.
+pub(crate) fn dispatch_queue_stop(panel: &PanelSingleton) {
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)));
+    debug_assert!(
+        effects.is_empty()
+            || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
+        "Compose::QueueStop must produce zero or one CancelGeneration effect"
     );
     execute_effects(panel, effects);
 }
@@ -818,6 +861,40 @@ pub(crate) fn dispatch_mcp_server_enabled_changed(
     execute_effects(panel, effects);
 }
 
+pub(crate) fn dispatch_mcp_server_authenticate(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    name: String,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerAuthenticate {
+            name: name.clone(),
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_mcp_server_tool_enabled_changed(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    server_name: String,
+    tool_name: String,
+    enabled: bool,
+) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+            server_name: server_name.clone(),
+            tool_name: tool_name.clone(),
+            enabled,
+        })),
+    );
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
 pub(crate) fn dispatch_profile_create(
     panel: &PanelSingleton,
     component: &ChatPanel,
@@ -896,6 +973,14 @@ pub(crate) fn dispatch_mode_selected(
         Msg::Ui(UiMsg::Settings(SettingsMsg::ModeSelected(mode_id.clone()))),
     );
     let _ = component;
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_profile_selected(panel: &PanelSingleton, profile_name: String) {
+    let (effects, _) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(profile_name))),
+    );
     execute_effects(panel, effects);
 }
 
@@ -1150,11 +1235,17 @@ pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32)
         }
         _ => return false,
     }
+    // Since the thread-switch leak fix (worktree-slint-dedup, adopted in
+    // the consolidation merge), a switch legitimately dirties the
+    // compose draft and the per-thread panels (pending request,
+    // terminals, error) alongside the selection scalar -- the invariant
+    // worth keeping is that a switch command MARKS the selection dirty,
+    // not that it marks nothing else.
     debug_assert!(
         command == crate::PANEL_COMMAND_OPEN_THREAD_SEARCH
             || dirty
                 .iter()
-                .all(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))
+                .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread)))
     );
     true
 }
@@ -1223,6 +1314,15 @@ mod tests {
             Msg::Ui(UiMsg::Thread(ThreadMsg::NavigateDelta(1))),
         );
         assert_eq!(model.selected_thread, 0);
-        assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
+        // A thread switch is no longer a bare SelectedThread scalar:
+        // since the thread-switch leak fix (worktree-slint-dedup,
+        // adopted in the consolidation merge) switching also restores
+        // the target thread's compose draft and refreshes its
+        // per-thread panels. The wrap-around behavior under test only
+        // requires that the selection scalar is among the dirty items.
+        assert!(
+            dirty.contains(&Dirty::Scalar(ScalarField::SelectedThread)),
+            "wrap must mark SelectedThread dirty, got {dirty:?}"
+        );
     }
 }
