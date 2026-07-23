@@ -1660,7 +1660,18 @@ impl Backend for FfiBackend {
             let p = std::path::Path::new(output_path);
             let mut resolved = if p.is_absolute() {
                 p.to_path_buf()
+            } else if let Some(root) = self.project_root.as_ref() {
+                // A relative outputPath resolves against the bound
+                // project's own root -- the same sandbox root file.import
+                // is confined to -- NOT the daemon process's cwd. Found
+                // live (phase 14b/15b of the video-generation-e2e-harness
+                // plan): a real agent asked for "agent_export.mp4" and the
+                // file landed silently next to the snapshotd binary, which
+                // the project can neither list nor clean up.
+                root.join(output_path)
             } else {
+                // Manual dev launch outside the daemon (no
+                // SNAPSHOT_PROJECT_ROOT): cwd is the only sensible base.
                 std::env::current_dir()
                     .unwrap_or_else(|_| PathBuf::from("."))
                     .join(output_path)

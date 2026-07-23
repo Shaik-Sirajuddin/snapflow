@@ -137,9 +137,31 @@ jobs:
           path: shotcut-rebrand/scripts/Snapflow
           key: shotcut-deps-linux-${{ hashFiles('shotcut-rebrand/scripts/build-snapflow.sh') }}
 
+      # A cache "hit" from actions/cache only means the archive round-tripped
+      # intact -- it does not guarantee the tree it contains is actually a
+      # complete, working deps build. Confirmed for real (run 29985095679):
+      # cache-hit was true, PKG_CONFIG_PATH was correctly exported to the
+      # restored lib/pkgconfig dir, yet CMake's `pkg_check_modules(mlt++-7)`
+      # still failed with "No package 'mlt++-7' found" -- the restored tree
+      # was silently missing it despite the save step for that exact key
+      # having installed it moments earlier in a prior run. Don't trust the
+      # cache-hit flag blindly: verify the one file the whole build depends
+      # on is actually present post-restore, and fall back to a full rebuild
+      # if not.
+      - name: Verify cache-restored deps actually contain a built MLT
+        id: verify-deps
+        run: |
+          if [ "${{ steps.cache-deps.outputs.cache-hit }}" = "true" ] && \
+             [ ! -f "shotcut-rebrand/scripts/Snapflow/Snapflow.app/lib/pkgconfig/mlt++-7.pc" ]; then
+            echo "::warning::Cache hit for shotcut-deps-linux-* but mlt++-7.pc is missing from the restored tree -- treating as a cache miss and rebuilding deps from scratch."
+            echo "effective_cache_hit=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "effective_cache_hit=${{ steps.cache-deps.outputs.cache-hit }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build snapflow (from this fork's rebrand/snapflow branch)
         env:
-          DEPS_CACHE_HIT: ${{ steps.cache-deps.outputs.cache-hit }}
+          DEPS_CACHE_HIT: ${{ steps.verify-deps.outputs.effective_cache_hit }}
         run: |
           VERSION=$(date +"%y.%-m.%-d")
           echo VERSION=$VERSION

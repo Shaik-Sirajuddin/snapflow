@@ -53,6 +53,8 @@ pub struct ThreadRecord {
 pub enum StateStoreError {
     #[error("SQLite panel-state error: {0}")]
     Sql(#[from] rusqlite::Error),
+    #[error("panel-state cache dir error: {0}")]
+    CacheDir(#[from] std::io::Error),
     #[error("thread {thread_id:?} is already bound to session {existing_session_id:?}")]
     SessionBindingConflict {
         thread_id: String,
@@ -68,6 +70,19 @@ pub struct PanelStateStore {
 
 impl PanelStateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StateStoreError> {
+        let path = path.as_ref();
+        // The cache dir may not exist yet: this store opens BEFORE the
+        // jsonl transcript store (which is what used to create
+        // rui-thread-cache/ as a side effect), and every per-project
+        // daemon launch runs under a freshly created sandboxed $HOME
+        // (snapshotd procmgr's qtHomeDir), so on that path the very
+        // first open always failed with "unable to open database file"
+        // and the panel silently ran without settings/thread
+        // persistence for the whole session -- found live on the
+        // video-generation-e2e-harness VNC demo launch.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let connection = Connection::open(path)?;
         Self::from_connection(connection)
     }
