@@ -307,17 +307,12 @@ pub fn transcript_row_key(item: &crate::conversation::TranscriptItem) -> String 
 }
 
 /// Returns stable keys for the rows the Slint message projection renders.
-/// Terminal and notice items are omitted, matching the existing projection.
+/// Notices stay omitted; terminals are included (wire_terminal_view).
 pub fn transcript_row_keys(items: &[crate::conversation::TranscriptItem]) -> Vec<String> {
     use crate::conversation::TranscriptItem;
     items
         .iter()
-        .filter(|item| {
-            !matches!(
-                item,
-                TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. }
-            )
-        })
+        .filter(|item| !matches!(item, TranscriptItem::Notice { .. }))
         .map(transcript_row_key)
         .collect()
 }
@@ -377,7 +372,23 @@ pub fn to_message_rows_from_transcript(
                         raw_out,
                     )
                 }
-                TranscriptItem::Terminal { .. } | TranscriptItem::Notice { .. } => return None,
+                // audit-fixes wire_terminal_view: surface terminal
+                // transcript items as tool-event-shaped rows so ToolEventRow
+                // can mount TerminalView (title = command, output body).
+                TranscriptItem::Terminal {
+                    title,
+                    output,
+                    exit_code,
+                    ..
+                } => (
+                    "terminal",
+                    title,
+                    String::new(),
+                    // raw_input carries exit code as decimal text for TerminalView.
+                    exit_code.map(|c| c.to_string()).unwrap_or_default(),
+                    output,
+                ),
+                TranscriptItem::Notice { .. } => return None,
             };
             let first_use = if kind == "skill_use" {
                 seen_skills.insert(text.clone())
@@ -405,6 +416,51 @@ pub fn to_message_rows_from_transcript(
         })
         .collect();
     rows
+}
+
+/// Append per-thread send-queue entries as trailing `queued` user rows
+/// (audit-fixes wire_queued_message_bar). Mutates `rows` and returns keys
+/// for the appended entries (`queue:{id}`).
+pub fn append_send_queue_rows(
+    rows: &mut Vec<MessageItem>,
+    keys: &mut Vec<String>,
+    queue: &crate::send_queue::SendQueue,
+) {
+    let last = queue.len().saturating_sub(1);
+    for (i, entry) in queue.iter().enumerate() {
+        let index = rows.len() as i32;
+        keys.push(format!("queue:{}", entry.id.0));
+        rows.push(MessageItem {
+            kind: "user".into(),
+            markdown_lines: ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new())),
+            text: entry.text.clone().into(),
+            status: "".into(),
+            expanded: false,
+            index,
+            raw_input: "".into(),
+            raw_output: "".into(),
+            queued: true,
+            can_edit: i == last,
+            sending: false,
+            first_use: false,
+        });
+    }
+}
+
+/// Full projection for a thread: transcript + send queue.
+pub fn message_rows_for_thread(
+    transcript: Vec<crate::conversation::TranscriptItem>,
+    expanded: &[bool],
+    queue: &crate::send_queue::SendQueue,
+) -> (Vec<MessageItem>, Vec<String>) {
+    let mut keys = transcript_row_keys(&transcript);
+    let mut rows = to_message_rows_from_transcript(transcript, expanded);
+    append_send_queue_rows(&mut rows, &mut keys, queue);
+    // Re-index after append so Slint toggle-expanded still matches.
+    for (i, row) in rows.iter_mut().enumerate() {
+        row.index = i as i32;
+    }
+    (rows, keys)
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,18 +1133,56 @@ pub fn to_mcp_server_option_rows(
 ) -> Vec<McpServerOption> {
     servers
         .into_iter()
-        .map(|entry| McpServerOption {
-            name: entry.name.into(),
-            command: entry.command.unwrap_or_default().into(),
-            // `enabled` is a registry-backed field and round-trips through
-            // `mcp_servers/update`; missing means enabled for compatibility
-            // with existing server records.
-            enabled: entry
+        .map(|entry| {
+            let enabled = entry
                 .extra
                 .get("enabled")
                 .and_then(|value| value.as_bool())
-                .unwrap_or(true),
-            ..Default::default()
+                .unwrap_or(true);
+            let transport = entry
+                .extra
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let status = entry
+                .extra
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let auth = entry
+                .extra
+                .get("auth_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            // Pre-format status subtitle in Rust (audit §4.3) so Slint
+            // does not concatenate nested ternaries.
+            let mut parts: Vec<&str> = Vec::new();
+            if !transport.is_empty() {
+                parts.push(transport.as_str());
+            }
+            if !status.is_empty() {
+                parts.push(status.as_str());
+            }
+            if !auth.is_empty() {
+                parts.push(auth.as_str());
+            }
+            if !enabled {
+                parts.push("disabled");
+            }
+            let status_line = parts.join(" · ");
+            McpServerOption {
+                name: entry.name.into(),
+                command: entry.command.unwrap_or_default().into(),
+                status_line: status_line.into(),
+                transport: transport.into(),
+                enabled,
+                status: status.into(),
+                auth_status: auth.into(),
+                ..Default::default()
+            }
         })
         .collect()
 }

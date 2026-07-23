@@ -497,13 +497,31 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             let thread_id = thread.thread_id.clone();
             if matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling) {
                 return match thread.send_queue.enqueue(text, false) {
-                    Ok(_) => (
-                        vec![],
-                        vec![
-                            Dirty::ThreadRow(idx),
-                            Dirty::Scalar(ScalarField::ComposeText),
-                        ],
-                    ),
+                    Ok(_) => {
+                        // Rebuild message projection with queue rows so
+                        // QueuedMessageBar appears immediately.
+                        let expanded = model.expanded.clone();
+                        let old_keys = thread.transcript_keys.clone();
+                        let (rows, keys) = crate::models::message_rows_for_thread(
+                            thread.transcript.clone(),
+                            &expanded,
+                            &thread.send_queue,
+                        );
+                        let ops = crate::dirty::diff_by_id(&old_keys, &keys, &rows);
+                        thread.message_rows = rows;
+                        thread.transcript_keys = keys;
+                        (
+                            vec![],
+                            vec![
+                                Dirty::ThreadRow(idx),
+                                Dirty::Scalar(ScalarField::ComposeText),
+                                Dirty::MessagesDiff {
+                                    thread_id: thread_id.clone(),
+                                    ops,
+                                },
+                            ],
+                        )
+                    }
                     Err(error) => {
                         let message = error.to_string();
                         thread.error = Some(message.clone());
@@ -803,11 +821,19 @@ fn update_skill(model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) {
             }],
             vec![Dirty::SkillsListDiff(vec![])],
         ),
-        SkillMsg::ContentEdited { path, content } => (
-            vec![Effect::SkillWrite { path, content }],
-            vec![Dirty::SkillsListDiff(vec![])],
+        SkillMsg::ContentEdited { path, content } => {
+            model.skill_saving = true;
+            (
+                vec![Effect::SkillWrite { path, content }],
+                vec![Dirty::SkillEditor],
+            )
+        }
+        SkillMsg::CopyPathRequested { path } => (
+            vec![Effect::ClipboardWrite {
+                text: path.to_string_lossy().into_owned(),
+            }],
+            vec![],
         ),
-        SkillMsg::CopyPathRequested { .. } => (vec![], vec![]),
         SkillMsg::EditorOpenRequested { path } => (vec![Effect::OpenSkillEditor { path }], vec![]),
         SkillMsg::OpenInEditorRequested { editor_name, path } => {
             (vec![Effect::OpenInEditor { editor_name, path }], vec![])
@@ -1073,9 +1099,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         // order); do not emit an empty SkillsListDiff here -- that
         // would re-push the pre-create list and race the real rescan.
         EffectResultMsg::SkillCreated(Ok(path)) => (vec![Effect::OpenSkillEditor { path }], vec![]),
-        EffectResultMsg::SkillWritten(Ok(())) | EffectResultMsg::SkillPromoted(Ok(())) => {
-            (vec![], vec![])
+        EffectResultMsg::SkillWritten(Ok(())) => {
+            model.skill_saving = false;
+            (vec![], vec![Dirty::SkillEditor])
         }
+        EffectResultMsg::SkillPromoted(Ok(())) => (vec![], vec![]),
         EffectResultMsg::ExternalEditorOpened(Ok(()))
         | EffectResultMsg::OsDefaultOpened(Ok(())) => (vec![], vec![]),
         EffectResultMsg::SkillEditorLoaded(Ok(state)) => {
@@ -1095,8 +1123,22 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 },
             }],
         ),
+        EffectResultMsg::SkillWritten(Err(err)) => {
+            model.skill_saving = false;
+            (
+                vec![],
+                vec![
+                    Dirty::SkillEditor,
+                    Dirty::Error {
+                        thread_id: String::new(),
+                        detail: ErrorDetail {
+                            message: err.message,
+                        },
+                    },
+                ],
+            )
+        }
         EffectResultMsg::SkillCreated(Err(err))
-        | EffectResultMsg::SkillWritten(Err(err))
         | EffectResultMsg::SkillPromoted(Err(err))
         | EffectResultMsg::ExternalEditorOpened(Err(err))
         | EffectResultMsg::OsDefaultOpened(Err(err)) => (
@@ -1432,11 +1474,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         if let Some(thread) = model.threads.get_mut(target_index) {
             let thread_id = thread.thread_id.clone();
             let old_keys = thread.transcript_keys.clone();
-            let rows = crate::models::to_message_rows_from_transcript(
+            // Include send-queue rows (QueuedMessageBar) in the projection.
+            let (rows, new_keys) = crate::models::message_rows_for_thread(
                 snapshot.transcript.clone(),
                 &expanded,
+                &thread.send_queue,
             );
-            let new_keys = crate::models::transcript_row_keys(&snapshot.transcript);
             // `old_keys`/`thread.message_rows` are this thread's *own*
             // previously-cached copy, not what's actually still on screen.
             // A brand new thread's own cache is empty both before and

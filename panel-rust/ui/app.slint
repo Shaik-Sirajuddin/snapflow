@@ -138,6 +138,8 @@ export component ChatPanel inherits Window {
     in property <string> active-skill-name: "";
     in property <string> active-skill-path: "";
     in-out property <string> active-skill-content: "";
+    // skills_audit_report §3.1: true while a skill SKILL.md write is in flight.
+    in property <bool> skill-saving: false;
     in property <[string]> detected-editors: [];
     // `thread_item_project_context` phase: the currently-open MLT
     // project's path (mirrors PanelSingleton::active_project_path),
@@ -539,6 +541,7 @@ export component ChatPanel inherits Window {
                 skill-name: root.active-skill-name;
                 skill-path: root.active-skill-path;
                 skill-content <=> root.active-skill-content;
+                skill-saving: root.skill-saving;
                 detected-editors: root.detected-editors;
                 copy-path-requested => { root.skill-copy-path-requested(root.active-skill-path); }
                 open-in-editor-requested(editor-name) => {

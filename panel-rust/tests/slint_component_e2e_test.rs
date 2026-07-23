@@ -581,6 +581,7 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
     panel.set_available_mcp_servers(ModelRc::new(VecModel::from(vec![McpServerOption {
         name: "media-fs".into(),
         command: "node server.js".into(),
+        status_line: "".into(),
         transport: "".into(),
         url: "".into(),
         enabled: true,

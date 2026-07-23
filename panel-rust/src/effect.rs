@@ -173,6 +173,10 @@ pub enum Effect {
     OpenWithOsDefault {
         path: std::path::PathBuf,
     },
+    /// skills_audit_report §2.1: write text to the system clipboard.
+    ClipboardWrite {
+        text: String,
+    },
     /// Non-Slint-callback: propagate a Shotcut project-path change to the
     /// bridge (`AgentBridge::set_active_project_path` today), then produce
     /// a fresh skills list diff.

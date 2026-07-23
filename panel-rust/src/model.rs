@@ -118,6 +118,8 @@ pub struct Model {
     pub active_skill_name: String,
     pub active_skill_path: String,
     pub active_skill_content: String,
+    /// skills_audit_report §3.1: true while SkillWrite is in flight.
+    pub skill_saving: bool,
     pub detected_editors: Vec<String>,
     pub active_pane: String,
     pub skills: Vec<crate::skills_state::SkillEntry>,

@@ -71,20 +71,34 @@ export component AgentsView inherits Rectangle {
     // against each card's name + id, same helper as sidebar thread/skill
     // search. Empty query shows the full catalog.
     property <string> agent-search-query: "";
+    // Page-level SettingsSearchBar (settings_page_search_filter).
+    in property <string> page-search-query: "";
     in-out property <string> default-agent-id: "";
 
     pure function agent-matches(index: int) -> bool {
         if (index < 0 || index >= root.agent-catalog.length) {
             return false;
         }
-        if (root.agent-search-query == "") {
+        if (root.agent-search-query == "" && root.page-search-query == "") {
             return true;
         }
         // Match name or id (name may be empty for some catalog rows).
-        return TextUtil.matches-filter(
-            root.agent-catalog[index].name + "\n" + root.agent-catalog[index].id,
-            root.agent-search-query,
-        );
+        // Inline hay twice — SharedString is moved into matches-filter.
+        if (root.agent-search-query != ""
+            && !TextUtil.matches-filter(
+                root.agent-catalog[index].name + "\n" + root.agent-catalog[index].id,
+                root.agent-search-query,
+            )) {
+            return false;
+        }
+        if (root.page-search-query != ""
+            && !TextUtil.matches-filter(
+                root.agent-catalog[index].name + "\n" + root.agent-catalog[index].id,
+                root.page-search-query,
+            )) {
+            return false;
+        }
+        return true;
     }
 
     background: transparent;

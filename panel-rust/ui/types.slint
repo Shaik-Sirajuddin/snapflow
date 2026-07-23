@@ -282,6 +282,9 @@ export struct McpToolOption {
 export struct McpServerOption {
     name: string,
     command: string,
+    // Pre-formatted subtitle from Rust (audit-fixes mcp_status_line_from_rust).
+    // Empty hides the status line in mcp_servers_view.
+    status-line: string,
     // "stdio" (local command child process) | "http" (remote URL, may
     // need OAuth) -- opencode's `type: "local"` vs `"remote"` split, Zed's
     // command-vs-url, Codex's stdio-vs-streamable_http. Empty string

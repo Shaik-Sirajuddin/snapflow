@@ -4,6 +4,7 @@ import { Icon } from "../../../base/icon.slint";
 import { ExpandablePanel } from "../../../base/expandable_panel.slint";
 import { CollapseExpand } from "../../../base/collapse_expand.slint";
 import { ApiCallView } from "../execution/api_call_view.slint";
+import { TerminalView } from "../execution/terminal_view.slint";
 import { CursorHost } from "../../../tokens/cursor_host.slint";
 
 // One tool-taxonomy event row -- chat-items-redesign.md #5/#6. Transparent
@@ -14,7 +15,7 @@ import { CursorHost } from "../../../tokens/cursor_host.slint";
 // text tone) -- the spec gives no equivalent distinction for the other
 // three kinds, so `first-use` is silently ignored for those.
 export component ToolEventRow inherits Rectangle {
-    in property <string> kind; // "tool_use" | "skill_load" | "skill_use" | "mcp_server_call"
+    in property <string> kind; // "tool_use" | "skill_load" | "skill_use" | "mcp_server_call" | "terminal"
     in property <string> text;
     in property <bool> first-use: true;
     // Adaptive height -- grows with wrapped text up to this cap, then
@@ -42,11 +43,14 @@ export component ToolEventRow inherits Rectangle {
     vertical-stretch: 0;
 
     property <bool> is-skill-use: kind == "skill_use";
+    property <bool> is-terminal: kind == "terminal";
     // Execution-view content only applies to the two non-skill kinds --
     // chat-items-redesign.md #7-#9 never describes a terminal/api-call
-    // view for `skill_load`/`skill_use`.
-    property <bool> has-execution-content: (kind == "tool_use" || kind == "mcp_server_call")
-        && (raw-input != "" || raw-output != "");
+    // view for `skill_load`/`skill_use`. Terminal rows always show body.
+    property <bool> has-execution-content:
+        is-terminal
+        || ((kind == "tool_use" || kind == "mcp_server_call")
+            && (raw-input != "" || raw-output != ""));
 
     // Local open state tracks the host `expanded` prop until the user
     // clicks (assignment breaks the binding). That keeps the button
@@ -121,6 +125,15 @@ export component ToolEventRow inherits Rectangle {
                     color: Theme.text-secondary;
                 }
             }
+            if kind == "terminal" : VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 0;
+                Icon {
+                    source: @image-url("../../../assets/icons/terminal.svg");
+                    size: Metrics.icon-sm;
+                    color: Theme.text-secondary;
+                }
+            }
             Flickable {
                 horizontal-stretch: 1;
                 preferred-width: 0px;
@@ -183,7 +196,17 @@ export component ToolEventRow inherits Rectangle {
                 animate-width: false;
                 HorizontalLayout {
                     padding-left: root.lead-indent;
-                    ExpandablePanel {
+                    if root.is-terminal : ExpandablePanel {
+                        collapsed-max-height: root.cap-height * 2;
+                        collapsed-by-default: false;
+                        TerminalView {
+                            command: root.text;
+                            output: root.raw-output;
+                            // raw_input holds exit code decimal when known.
+                            exit-code: root.raw-input == "" ? -1 : root.raw-input.to-float();
+                        }
+                    }
+                    if !root.is-terminal : ExpandablePanel {
                         // When the outer shell is open, start at the
                         // capped preview; user can still "Open full view".
                         collapsed-max-height: root.cap-height * 2;

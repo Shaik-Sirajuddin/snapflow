@@ -8,6 +8,7 @@ import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
 import { AgentBubble } from "./chat-view/components/message/agent_bubble.slint";
+import { QueuedMessageBar } from "./chat-view/components/message/queued_message_bar.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
 import { PermissionCard } from "./components/permission_card.slint";
 import { TerminalCard } from "./components/terminal_card.slint";
@@ -665,13 +666,15 @@ export component ChatArea inherits Rectangle {
                 // chat-items-redesign.md #11: kind switch — user /
                 // agent|thinking / tool-event / legacy MessageCard.
                 for msg[i] in messages : HorizontalLayout {
-                    property <bool> is-user: msg.kind == "user";
+                    property <bool> is-queued: msg.queued;
+                    property <bool> is-user: msg.kind == "user" && !msg.queued;
                     property <bool> is-agent-side: msg.kind == "agent"
                         || msg.kind == "thinking";
                     property <bool> is-tool-event: msg.kind == "tool_use"
                         || msg.kind == "mcp_server_call"
                         || msg.kind == "skill_load"
-                        || msg.kind == "skill_use";
+                        || msg.kind == "skill_use"
+                        || msg.kind == "terminal";
                     // Active-session rail on the *latest* row while the
                     // thread is loading (same `sending` state as the
                     // header/sidebar spinner). Pulse *flows* top → bottom.
@@ -738,6 +741,16 @@ export component ChatArea inherits Rectangle {
                         width: is-user ? user-indent : rail-gap;
                         horizontal-stretch: 0;
                     }
+                    if is-queued : QueuedMessageBar {
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        text: msg.text;
+                        can-edit: msg.can-edit;
+                        sending: msg.sending;
+                        // Cancel/edit/stop round-trip is a later wiring
+                        // pass; showing the bar is the audit-fix gap.
+                    }
                     if is-user : UserBubble {
                         // Stretch within the available chat column instead
                         // of binding width back to the Flickable viewport.
@@ -778,7 +791,7 @@ export component ChatArea inherits Rectangle {
                         index: msg.index;
                         toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
-                    if !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
+                    if !is-queued && !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;

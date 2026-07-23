@@ -6,6 +6,7 @@ import { TextField } from "../../../base/text_field.slint";
 import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
 import { McpServerOption, McpToolOption } from "../../../types.slint";
+import { TextUtil } from "../../../base/text_util.slint";
 
 // MCP Servers left-tab view. Started as a phase-1 shell that only re-hosted
 // the former `components/settings_sheet.slint` list unchanged (name +
@@ -40,6 +41,8 @@ import { McpServerOption, McpToolOption } from "../../../types.slint";
 // create/delete round trip is wired to real Rust.
 export component McpServersView inherits Rectangle {
     in property <[McpServerOption]> servers: [];
+    // settings_page_search_filter: page-level query filters this list.
+    in property <string> page-search-query: "";
     callback mcp-server-create(string, string);
     callback mcp-server-delete(string);
     callback mcp-server-enabled-changed(string, bool);
@@ -65,6 +68,12 @@ export component McpServersView inherits Rectangle {
 
             for server in root.servers : server-block := VerticalLayout {
                 width: parent.width;
+                // Hide non-matching servers when page search is active.
+                visible: root.page-search-query == ""
+                    || TextUtil.matches-filter(
+                        server.name + "\n" + server.command + "\n" + server.url,
+                        root.page-search-query,
+                    );
                 // `pad-xs` (4px) -- the compact pre-reveal gap between a
                 // server's header row and its (conditionally shown)
                 // expanded tool panel.
@@ -75,14 +84,8 @@ export component McpServersView inherits Rectangle {
                 // it, unlike the chat-view's Rust-side `expanded` vec).
                 property <bool> tools-expanded: false;
 
-                // Transport + auth + connection status collapsed into one
-                // subtitle string -- structs (`McpServerOption`) can't carry
-                // computed fields in Slint, so this lives on the `for`
-                // template instead of on the struct itself.
-                property <string> status-line:
-                    server.transport
-                    + (server.auth-status != "" ? (server.transport != "" ? " · " : "") + server.auth-status : "")
-                    + (server.status != "" ? (server.transport != "" || server.auth-status != "" ? " · " : "") + server.status : "");
+                // Pre-formatted in Rust (`McpServerOption.status-line`).
+                property <string> status-line: server.status-line;
 
                 // Header row -- consolidated to 4 trailing controls (was 7:
                 // transport tag, auth-status, status and Connect were each

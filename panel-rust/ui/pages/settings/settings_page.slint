@@ -193,6 +193,8 @@ export component SettingsPage inherits Rectangle {
 
                 top-search-bar := SettingsSearchBar {
                     width: parent.width;
+                    placeholder: "Search settings...";
+                    bar-accessible-label: "Search settings";
                     query <=> root.search-query;
                 }
 
@@ -227,6 +229,7 @@ export component SettingsPage inherits Rectangle {
                         if root.active-section == "mcp_servers" : McpServersView {
                             width: parent.width;
                             servers: root.available-mcp-servers;
+                            page-search-query: root.search-query;
                             mcp-server-create(name, command) => { root.mcp-server-create(name, command); }
                             mcp-server-delete(name) => { root.mcp-server-delete(name); }
                             mcp-server-enabled-changed(name, enabled) => {
@@ -252,6 +255,7 @@ export component SettingsPage inherits Rectangle {
                             default-agent-id <=> root.default-agent-id;
                             available-profiles: root.available-profiles;
                             agent-catalog: root.agent-catalog;
+                            page-search-query: root.search-query;
                             recoverable-sessions: root.recoverable-sessions;
                             profile-create(name, agent-id, terminal-enabled, fs-enabled) => {
                                 root.profile-create(name, agent-id, terminal-enabled, fs-enabled);
