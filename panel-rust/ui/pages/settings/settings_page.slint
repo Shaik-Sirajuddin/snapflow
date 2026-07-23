@@ -132,11 +132,35 @@ export component SettingsPage inherits Rectangle {
             }
         }
 
-        top-tabs := SettingsTopTabs {
-            scope: root.scope;
-            scope-selected(new-scope) => {
-                root.scope = new-scope;
-                root.scope-changed(new-scope);
+        // Phase 31 (settings_search_responsive_layout): scope switcher and
+        // the settings search share ONE line -- the search field takes all
+        // remaining width instead of sitting cramped on its own row.
+        scope-search-row := HorizontalLayout {
+            // Concrete width, same padding-subtraction rationale as the
+            // content row below (an explicit width bypasses the padded
+            // parent's automatic stretch inset).
+            width: parent.width - 2 * Metrics.space-7;
+            height: 28px;
+            spacing: Metrics.space-4;
+
+            top-tabs := SettingsTopTabs {
+                width: 148px;
+                horizontal-stretch: 0;
+                scope: root.scope;
+                scope-selected(new-scope) => {
+                    root.scope = new-scope;
+                    root.scope-changed(new-scope);
+                }
+            }
+
+            top-search-bar := SettingsSearchBar {
+                // Concrete remaining width -- stretch factors do not
+                // propagate reliably in this nesting (see the content
+                // row's comment below).
+                width: parent.width - 148px - Metrics.space-4;
+                placeholder: "Search settings...";
+                bar-accessible-label: "Search settings";
+                query <=> root.search-query;
             }
         }
 
@@ -174,7 +198,7 @@ export component SettingsPage inherits Rectangle {
             // padding-bypass cascaded into all of them at once.
             width: parent.width - 2 * Metrics.space-7;
             height: parent.height - 2 * Metrics.space-7
-                - header-row.height - top-tabs.height - save-row.height
+                - header-row.height - scope-search-row.height - save-row.height
                 - 3 * Metrics.space-6;
             spacing: Metrics.space-6;
 
@@ -192,13 +216,6 @@ export component SettingsPage inherits Rectangle {
                 width: parent.width - left-tabs.width - Metrics.space-6;
                 vertical-stretch: 1;
                 spacing: Metrics.space-4;
-
-                top-search-bar := SettingsSearchBar {
-                    width: parent.width;
-                    placeholder: "Search settings...";
-                    bar-accessible-label: "Search settings";
-                    query <=> root.search-query;
-                }
 
                 // The one elastic region in this column -- same
                 // `vertical-stretch: 1` + `preferred-height: 0px` +
