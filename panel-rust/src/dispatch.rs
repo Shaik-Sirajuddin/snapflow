@@ -308,18 +308,23 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
         let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
         execute_effects(panel, follow_up);
     }
+    // Catalog pull ONLY when the profile catalog is actually empty (cold
+    // start, settings never opened): collect_settings_gateway_snapshot is
+    // four BLOCKING gateway round-trips (list_profiles/mcp/agents +
+    // session/list), and doing it unconditionally here froze the UI ~5s
+    // after every `+` click -- the residual new-thread hang measured live
+    // in the phase-33 gate. The periodic frame poll already re-pulls the
+    // catalog whenever it is empty.
+    let need_catalog = panel.model.borrow().available_profiles.is_empty();
     panel.dispatch_frame_input(crate::msg::FrameInput {
         thread_list_snapshot: Some(
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
                 .collect_thread_list_snapshot(),
         ),
-        // Same catalog pull recover_session does: ensures compose Provider
-        // has profiles even if the periodic frame path has not filled them
-        // yet (cold start, settings never opened).
-        settings_gateway_snapshot: Some(
+        settings_gateway_snapshot: need_catalog.then(|| {
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                .collect_settings_gateway_snapshot(),
-        ),
+                .collect_settings_gateway_snapshot()
+        }),
         ..crate::msg::FrameInput::default()
     });
 
