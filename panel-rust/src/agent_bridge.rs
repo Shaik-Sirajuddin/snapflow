@@ -665,6 +665,22 @@ fn resolve_snapflowd_mcp_bin() -> PathBuf {
 /// `.skills/` directory from its parent, same as
 /// `PanelSingleton::collect_skills_snapshot`
 /// (lib.rs) already does.
+///
+/// **`"env": []` is required, not optional** -- found live
+/// (`video-generation-e2e-harness` plan's `custom_mcp_and_skills_
+/// support` phase, 2026-07-23): real `codex-acp`'s own request schema
+/// (`zMcpServerStdio` in its bundled `dist/index.js`) requires `env` as
+/// a non-optional array for any stdio-shaped MCP server entry, with no
+/// default. Its top-level `mcpServers` array is parsed with `zod`'s
+/// `vecSkipError` (`.catch(sentinel).transform(filter out sentinel)`),
+/// which **silently drops** any entry that fails schema validation --
+/// no error, no log, nothing surfaced to the caller. Without this
+/// field, this "skills" entry (the app's own real, always-on custom
+/// MCP server) was being silently dropped by every real codex-acp
+/// session's own request parsing before it ever reached the model --
+/// confirmed live via `/mcp`: an identical stdio entry without `env`
+/// never appeared in the configured-servers listing at all; the exact
+/// same entry with `"env": []` added did.
 fn snapflowd_mcp_servers_entry(
     project_path: Option<&std::path::Path>,
     provider: &str,
@@ -682,6 +698,7 @@ fn snapflowd_mcp_servers_entry(
         "name": "skills",
         "command": resolve_snapflowd_mcp_bin().to_string_lossy(),
         "args": args,
+        "env": [],
     })];
     entries.extend(snapshotd_mcp_server_entry(provider));
     entries
@@ -6703,6 +6720,28 @@ done
         assert!(
             !args.contains(&serde_json::Value::String("--project-dir".to_string())),
             "no project open -- args must not claim a --project-dir"
+        );
+    }
+
+    /// **Regression test for the real, live-found silent-drop bug**
+    /// (`video-generation-e2e-harness` plan's `custom_mcp_and_skills_
+    /// support` phase, 2026-07-23): real `codex-acp`'s own request
+    /// schema requires `env` as a non-optional array for stdio-shaped
+    /// MCP server entries, and silently drops (no error) any entry that
+    /// fails validation -- confirmed live that an identical entry
+    /// without `env` never appeared in a real session's `/mcp` listing
+    /// at all, while the same entry with `env: []` did. Without this
+    /// field, the app's own real "skills" custom MCP server was being
+    /// silently dropped by every real codex-acp session.
+    #[test]
+    fn snapflowd_mcp_servers_entry_skills_server_includes_the_required_env_field() {
+        let entries = snapflowd_mcp_servers_entry(None, "codex");
+        assert_eq!(entries[0]["name"], "skills");
+        assert!(
+            entries[0]["env"].is_array(),
+            "the skills entry must include an 'env' array -- real codex-acp's own request \
+             schema requires it for stdio-shaped MCP servers and silently drops (no error) \
+             any entry missing it, confirmed live"
         );
     }
 
