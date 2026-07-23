@@ -422,6 +422,22 @@ export component ChatInputLayout inherits Rectangle {
             root.apply-mention-sel();
             return EventResult.accept;
         }
+        // Phase 15 keyboard nav: Ctrl+Enter on a highlighted @ MCP row
+        // triggers its inline lifecycle action (Connect while auth is
+        // pending, Enable/Disable otherwise) -- every popup action stays
+        // reachable keyboard-only, mirroring the mouse action button.
+        if (event.text == Key.Return && event.modifiers.control
+            && root.token-prefix == "@"
+            && root.mention-sel >= 0 && root.mention-sel < root.mcp-options.length) {
+            if (root.mcp-options[root.mention-sel].transport == "http"
+                && root.mcp-options[root.mention-sel].needs-auth) {
+                root.mcp-connect-requested(root.mcp-options[root.mention-sel].name);
+            } else {
+                root.mcp-enabled-changed(root.mcp-options[root.mention-sel].name,
+                    !root.mcp-options[root.mention-sel].enabled);
+            }
+            return EventResult.accept;
+        }
         if (event.text == " ") {
             root.close-local-mention();
             return EventResult.reject;
