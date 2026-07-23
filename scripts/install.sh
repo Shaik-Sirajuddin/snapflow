@@ -127,7 +127,13 @@ info "Linked snapflowd -> $BIN_DIR/snapflowd"
 app_dir=""
 case "$platform" in
   linux)
-    app_dir="$(find "$INSTALL_DIR" -maxdepth 1 -iname 'snapflow*' -type d | head -n1)"
+    # -mindepth 1 matters: without it, find also matches $INSTALL_DIR
+    # itself (its own basename, .../share/snapflow, satisfies -iname
+    # 'snapflow*' too) and sorts before the real Snapflow.app child dir,
+    # so head -n1 silently picked the wrong (parent) directory and the
+    # editor binary never got linked. Caught for real by
+    # docker-tests/install-headless's headless install test.
+    app_dir="$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -iname 'snapflow*' -type d | head -n1)"
     if [ -n "$app_dir" ] && [ -x "$app_dir/bin/snapflow" ]; then
       ln -sf "$app_dir/bin/snapflow" "$BIN_DIR/snapflow"
       info "Linked snapflow -> $BIN_DIR/snapflow"
