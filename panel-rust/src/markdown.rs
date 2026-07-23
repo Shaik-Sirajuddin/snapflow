@@ -44,6 +44,12 @@ pub struct Run {
     pub italic: bool,
     pub code: bool,
     pub strike: bool,
+    /// Phase 17 (markdown_highlight_and_real_links): the link target
+    /// (URL or file path) when this run is inside a markdown link --
+    /// empty for non-link runs. The view styles link runs distinctly
+    /// and Ctrl+Click opens the target (files locally, URLs in the
+    /// system browser).
+    pub link: String,
 }
 
 /// What kind of visual line this is -- drives `markdown_view.slint`'s
@@ -338,6 +344,7 @@ fn collect_inline_runs(
     let mut bold_depth = 0u32;
     let mut italic_depth = 0u32;
     let mut strike_depth = 0u32;
+    let mut link_stack: Vec<String> = Vec::new();
     let mut i = start;
     let end_byte;
     loop {
@@ -357,6 +364,7 @@ fn collect_inline_runs(
                     italic: italic_depth > 0,
                     code: false,
                     strike: strike_depth > 0,
+                    link: link_stack.last().cloned().unwrap_or_default(),
                 });
             }
             Event::Code(t) => {
@@ -366,6 +374,7 @@ fn collect_inline_runs(
                     italic: italic_depth > 0,
                     code: true,
                     strike: strike_depth > 0,
+                    link: link_stack.last().cloned().unwrap_or_default(),
                 });
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -381,8 +390,14 @@ fn collect_inline_runs(
             Event::Start(Tag::Strikethrough) => strike_depth += 1,
             Event::End(TagEnd::Strikethrough) => strike_depth = strike_depth.saturating_sub(1),
             // Link/image wrappers: keep the visible text, drop the target.
-            Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => {}
-            Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {}
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                link_stack.push(dest_url.to_string());
+            }
+            Event::End(TagEnd::Link) => {
+                link_stack.pop();
+            }
+            Event::Start(Tag::Image { .. }) => {}
+            Event::End(TagEnd::Image) => {}
             _ => {}
         }
         i += 1;
@@ -398,6 +413,7 @@ fn wrap_runs(runs: &[Run], wrap_cols: usize) -> Vec<Vec<Run>> {
     struct Word {
         text: String,
         style: (bool, bool, bool, bool), // bold, italic, code, strike
+        link: String,
     }
     let mut words = Vec::new();
     for run in runs {
@@ -408,6 +424,7 @@ fn wrap_runs(runs: &[Run], wrap_cols: usize) -> Vec<Vec<Run>> {
             words.push(Word {
                 text: word.to_string(),
                 style: (run.bold, run.italic, run.code, run.strike),
+                link: run.link.clone(),
             });
         }
     }
@@ -427,6 +444,7 @@ fn wrap_runs(runs: &[Run], wrap_cols: usize) -> Vec<Vec<Run>> {
             current_cols = 0;
         }
         let (bold, italic, code, strike) = word.style;
+        let link = word.link;
         let needs_space = current_cols > 0;
         let text = if needs_space {
             format!(" {}", word.text)
@@ -441,6 +459,7 @@ fn wrap_runs(runs: &[Run], wrap_cols: usize) -> Vec<Vec<Run>> {
                 && last.italic == italic
                 && last.code == code
                 && last.strike == strike
+                && last.link == link
             {
                 last.text.push_str(&text);
                 current_cols += extra + word_cols;
@@ -453,6 +472,7 @@ fn wrap_runs(runs: &[Run], wrap_cols: usize) -> Vec<Vec<Run>> {
             italic,
             code,
             strike,
+            link,
         });
         current_cols += extra + word_cols;
     }
