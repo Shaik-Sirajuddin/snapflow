@@ -645,15 +645,30 @@ fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::mod
     component.set_active_thread_has_session(thread.session_id.is_some());
 }
 
-/// Refresh model dropdown filtered to the thread's selected provider.
+/// Refresh model dropdown filtered to the thread's provider.
+///
+/// `thread_provider_model_binding_fix`: the filter keys off the thread's
+/// ACTUAL bound provider (`thread.provider` -- the gateway its live
+/// session runs on), not the profile picker's selection. Deriving it
+/// from `profile_name` meant selecting a different-provider profile on a
+/// live session (which never rebinds the backend -- ACPX has no
+/// session/set_profile) instantly re-filtered the model list to a
+/// provider the session is NOT running on: the UI showed the new
+/// provider's models while the old backend kept serving the thread.
+/// The profile-derived agent id remains only as a fallback for a thread
+/// that has no provider recorded yet.
 fn sync_model_dropdown_for_provider(
     model: &Model,
     component: &ChatPanel,
     thread: &crate::model::ThreadModel,
 ) {
-    let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
-    let current = thread.profile_name.as_deref().unwrap_or("");
-    let agent_id = crate::models::provider_agent_id_for_profile(&profile_rows, current);
+    let agent_id = if !thread.provider.is_empty() {
+        thread.provider.clone()
+    } else {
+        let profile_rows = crate::models::to_profile_option_rows(model.available_profiles.clone());
+        let current = thread.profile_name.as_deref().unwrap_or("");
+        crate::models::provider_agent_id_for_profile(&profile_rows, current)
+    };
     component.set_config_dropdown_entries(crate::models::to_config_dropdown_entries_for_provider(
         thread.config_options.clone(),
         &agent_id,
