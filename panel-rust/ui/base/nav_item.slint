@@ -1,29 +1,24 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
 import { Icon } from "./icon.slint";
+import { HoverSurface } from "./hover.slint";
 
 // Layer 3 (base) -- the repeated "nav tab" shape hand-rolled per item in
 // `pages/settings/components/left_tabs.slint` (4x) and `top_tabs.slint`
 // (2x): a Rectangle with active/hover tint, a TouchArea wired to
 // CursorHost + accessible-role button, and an optional icon + label Text.
-// Deliberately not built on `base/hover.slint`'s `HoverSurface` -- that
-// component tints hover solid `Theme.bg-primary-container` regardless of
-// selection, while nav tabs need the inactive-hover tint at 50% alpha
-// (only the active tab gets the solid fill), so reusing it here would
-// change the existing hover look.
+// Built on `base/hover.slint`'s `HoverSurface` (its `hover-bg` is
+// generalized here to the 50%-alpha inactive-hover tint, while
+// `selected`/`selected-bg` carries the solid active fill) rather than
+// duplicating the TouchArea/CursorHost/background wiring a second time.
 //
 // Icon is passed in as an already-resolved `image` (via `@image-url(...)`
 // at the call site), not a string name -- see `icon.slint`'s own comment:
 // `@image-url` requires a compile-time-constant literal path, so it can't
 // be resolved dynamically from a `for` loop keyed by id/label.
-export component NavItem inherits Rectangle {
+export component NavItem inherits HoverSurface {
     in property <string> label;
     in property <bool> active: false;
-    // Named button-accessible-label (not accessible-label) -- Rectangle
-    // already owns the latter as a built-in a11y property (same naming
-    // as `base/hover.slint`'s HoverSurface).
-    in property <string> button-accessible-label: root.label;
 
     // Layout flags -- `left_tabs.slint` shows icon+label (expanded) or
     // icon-only centered (collapsed); `top_tabs.slint` shows a centered
@@ -39,24 +34,11 @@ export component NavItem inherits Rectangle {
     in property <length> content-padding-left: Metrics.space-3;
     in property <length> content-spacing: Metrics.space-3;
 
-    callback clicked();
-    callback double-clicked();
-
     border-radius: Theme.radius-sm;
-    background: root.active
-        ? Theme.bg-primary-container
-        : (touch.has-hover ? Theme.bg-primary-container.with-alpha(0.5) : transparent);
-    animate background { duration: 100ms; }
-
-    touch := TouchArea {
-        mouse-cursor: pointer;
-        accessible-role: button;
-        accessible-label: root.button-accessible-label;
-        accessible-action-default => { root.clicked(); }
-        clicked => { root.clicked(); }
-        double-clicked => { root.double-clicked(); }
-        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-    }
+    selected: root.active;
+    selected-bg: Theme.bg-primary-container;
+    hover-bg: Theme.bg-primary-container.with-alpha(0.5);
+    button-accessible-label: root.label;
 
     HorizontalLayout {
         width: parent.width;
