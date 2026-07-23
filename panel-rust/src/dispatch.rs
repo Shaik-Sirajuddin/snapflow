@@ -308,6 +308,13 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
                 .collect_thread_list_snapshot(),
         ),
+        // Same catalog pull recover_session does: ensures compose Provider
+        // has profiles even if the periodic frame path has not filled them
+        // yet (cold start, settings never opened).
+        settings_gateway_snapshot: Some(
+            crate::external_snapshot::ExternalSnapshotSource::new(panel)
+                .collect_settings_gateway_snapshot(),
+        ),
         ..crate::msg::FrameInput::default()
     });
 
