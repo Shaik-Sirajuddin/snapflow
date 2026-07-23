@@ -55,7 +55,7 @@ enum ProcessingState {
 
 /// Holds follow-up messages typed while the agent is generating, along
 /// with the state machine that decides when they're auto-sent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SendQueue {
     entries: VecDeque<QueueEntry>,
     processing_state: ProcessingState,
@@ -88,6 +88,19 @@ impl SendQueue {
     /// their own persistence path (or tests).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fresh, empty queue that persists going forward, without reading
+    /// anything from disk -- for a brand-new thread that provably has no
+    /// prior queue file yet. No I/O (unlike `load`), so this is safe to
+    /// call from `update()`'s pure reducer; use `load` instead when a
+    /// thread's queue might already have content on disk (cold-start
+    /// restoration).
+    pub fn new_with_path(path: PathBuf) -> Self {
+        Self {
+            persist_path: Some(path),
+            ..Self::default()
+        }
     }
 
     /// Loads a previously-persisted queue, or an empty one if the file

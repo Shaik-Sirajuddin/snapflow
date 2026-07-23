@@ -1398,18 +1398,39 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // Cold-start payload is collected once, then folded only through
         // Init -> InitialStateLoaded. The shell Model starts empty so the
         // TEA path owns the first real hydration (no pre-seed + replace).
+        let initial_thread_ids: Vec<String> = restored_records
+            .iter()
+            .map(|record| record.thread_id.clone())
+            .chain(
+                (restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")),
+            )
+            .collect();
+        // Each thread's send queue persists to its own
+        // <thread_id>.sendqueue.jsonl (see send_queue.rs's module doc) --
+        // restore it here (real disk I/O, so it belongs in this cold-start
+        // collection step, never inside update()'s pure reducer). A
+        // missing/corrupt file falls back to an empty queue still wired
+        // to persist going forward, same posture as this function's other
+        // cache reads.
+        let cache_dir = resolve_cache_dir();
+        let initial_send_queues: Vec<send_queue::SendQueue> = initial_thread_ids
+            .iter()
+            .map(|thread_id| {
+                let path = send_queue::send_queue_path(&cache_dir, thread_id);
+                send_queue::SendQueue::load(path.clone()).unwrap_or_else(|error| {
+                    eprintln!(
+                        "panel-rust: failed to restore send queue for thread {thread_id:?}: {error}"
+                    );
+                    send_queue::SendQueue::new_with_path(path)
+                })
+            })
+            .collect();
         let initial = model::InitialState {
             threads: initial_specs.clone(),
-            thread_ids: restored_records
-                .iter()
-                .map(|record| record.thread_id.clone())
-                .chain(
-                    (restored_records.len()..initial_specs.len())
-                        .map(|idx| format!("thread:{idx}")),
-                )
-                .collect(),
+            thread_ids: initial_thread_ids,
             selected_thread_id: initial_selected_thread_id.clone(),
             permission_profiles: initial_permission_profiles.clone(),
+            send_queues: initial_send_queues,
             thread_states: if bridge_available {
                 vec![ThreadState::Idle; initial_specs.len()]
             } else {

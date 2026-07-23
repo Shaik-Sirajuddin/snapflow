@@ -315,6 +315,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 provider: provider.clone(),
                 profile_name: profile_name.clone(),
                 permission_profile: permission_profile.clone(),
+                send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
@@ -345,15 +346,17 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             model.compose_text.clear();
             model.search_query.clear();
             let real_index = model.threads.len();
+            let thread_id = thread_id
+                .or_else(|| session_id.clone())
+                .unwrap_or_else(|| format!("thread:{real_index}"));
             model.threads.push(ThreadModel {
-                thread_id: thread_id
-                    .or_else(|| session_id.clone())
-                    .unwrap_or_else(|| format!("thread:{real_index}")),
+                thread_id: thread_id.clone(),
                 display_name,
                 provider,
                 profile_name,
                 permission_profile,
                 session_id,
+                send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
@@ -464,11 +467,14 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
         } => {
             let old_keys = current_visible_keys(model);
             model.search_query.clear();
+            let thread_id =
+                thread_id.unwrap_or_else(|| format!("thread:{}", model.threads.len()));
             model.threads.push(ThreadModel {
-                thread_id: thread_id.unwrap_or_else(|| format!("thread:{}", model.threads.len())),
+                thread_id: thread_id.clone(),
                 display_name: title,
                 provider: provider.clone(),
                 session_id: Some(session_id.clone()),
+                send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
             let at = model.threads.len() - 1;
@@ -521,6 +527,22 @@ fn rebuild_send_queue_projection(
             },
         ],
     )
+}
+
+/// A brand-new thread's send queue, wired to persist to
+/// `<thread_id>.sendqueue.jsonl` going forward -- `send_queue.rs`'s own
+/// module doc describes this persistence, but nothing previously called
+/// `SendQueue::load`/`send_queue_path` outside that file's own tests, so
+/// every `ThreadModel::default()` silently kept `persist_path: None` and
+/// a queued-but-unsent message never survived a restart. Uses
+/// `new_with_path` (no I/O) rather than `load`, since a genuinely new
+/// thread has nothing to load; `Model::from_initial_state`'s cold-start
+/// path is the one that actually restores prior queue content from disk.
+fn new_thread_send_queue(thread_id: &str) -> crate::send_queue::SendQueue {
+    crate::send_queue::SendQueue::new_with_path(crate::send_queue::send_queue_path(
+        &crate::agent_bridge::resolve_cache_dir(),
+        thread_id,
+    ))
 }
 
 fn queue_entry_id_at(
@@ -2040,6 +2062,47 @@ mod tests {
         assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
     }
 
+    /// send_queue.rs's disk persistence (SendQueue::load/send_queue_path)
+    /// previously had zero call sites outside its own tests -- every
+    /// thread's queue was `SendQueue::default()` (persist_path: None), so
+    /// a queued-but-unsent message was silently lost on restart despite
+    /// the fully-built persistence layer. This proves the wiring actually
+    /// round-trips through a real file, the same way a restart would.
+    #[test]
+    fn a_new_threads_send_queue_persists_and_reloads_after_a_simulated_restart() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let previous = std::env::var("RUI_ACP_CACHE_DIR").ok();
+        unsafe {
+            std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+        }
+
+        let mut model = Model::default();
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        let thread_id = model.threads[0].thread_id.clone();
+        model.threads[0]
+            .send_queue
+            .enqueue("queued across a restart".to_owned(), false)
+            .expect("enqueue must persist, not silently no-op");
+
+        // Simulate a restart: load a fresh SendQueue for the same
+        // thread_id the same way cold-start hydration does in lib.rs.
+        let path = crate::send_queue::send_queue_path(
+            &crate::agent_bridge::resolve_cache_dir(),
+            &thread_id,
+        );
+        let reloaded = crate::send_queue::SendQueue::load(path).expect("reload queue from disk");
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            reloaded.first().map(|entry| entry.text.as_str()),
+            Some("queued across a restart")
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("RUI_ACP_CACHE_DIR", value) },
+            None => unsafe { std::env::remove_var("RUI_ACP_CACHE_DIR") },
+        }
+    }
+
     #[test]
     fn agent_set_enabled_emits_one_admin_effect() {
         // setup-followups plan, agent_settings_ordering_and_install_
@@ -2833,6 +2896,7 @@ mod tests {
                     permission_profiles: vec![],
                     thread_states: vec![],
                     startup_warnings: vec![],
+                    send_queues: vec![],
                 },
             ))),
         );
@@ -2870,6 +2934,7 @@ mod tests {
                         "panel settings persistence unavailable: boom".to_owned(),
                         "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
                     ],
+                    send_queues: vec![],
                 },
             ))),
         );
