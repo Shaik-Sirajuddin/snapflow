@@ -3,7 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { LocalTerminalItem } from "../types.slint";
-import { HoverSurface } from "../base/hover.slint";
+import { TerminalHeader } from "../base/terminal_header.slint";
 
 // Client-local PTY terminal view -- companion to `terminal_card.slint`'s
 // agent-created (read-only) `TerminalCard`/`TerminalOverlay`. This one
@@ -38,68 +38,35 @@ export component LocalTerminalCard inherits Rectangle {
         VerticalLayout {
             padding: Metrics.space-4;
             spacing: Metrics.space-2;
-            HoverSurface {
-                height: 18px;
+            TerminalHeader {
+                title: "local terminal";
+                status-text: item.has-exited ? "exited" : (focus-scope.has-focus ? "focused" : "click to focus");
+                status-color: item.has-exited ? Theme.text-muted : Theme.text-secondary;
                 button-accessible-label: "Focus local terminal";
                 clicked => {
                     focus-scope.focus();
                 }
-                HorizontalLayout {
-                    spacing: Metrics.space-3;
+                Button {
+                    label: "Kill";
+                    button-accessible-label: "Close local terminal";
+                    btn-width: 44px;
+                    btn-height: 16px;
+                    font-size: 8px;
+                    font-weight: 400;
+                    bg: Theme.bg-card;
+                    fg: Theme.text-secondary;
+                    clicked => { close-requested(); }
+                }
+                local-terminal-expand := IconButton {
+                    btn-width: 16px;
+                    btn-height: 16px;
+                    button-accessible-label: "Expand local terminal";
+                    clicked => { expand(); }
                     Text {
-                        text: "\u{2318}"; // terminal glyph stand-in, same as TerminalCard
-                        color: Theme.bg-primary;
+                        text: "\u{2922}"; // expand glyph, same as TerminalCard
+                        color: Theme.text-muted;
                         font-size: 11px * Theme.font-scale;
                         vertical-alignment: center;
-                    }
-                    Text {
-                        text: "local terminal";
-                        color: Theme.text-primary;
-                        font-family: Theme.font-mono;
-                        font-size: 10px * Theme.font-scale;
-                        font-weight: 700;
-                        horizontal-stretch: 1;
-                        preferred-width: 0px;
-                        min-width: 0px;
-                        overflow: elide;
-                        vertical-alignment: center;
-                    }
-                    if item.has-exited : Text {
-                        text: "exited";
-                        color: Theme.text-muted;
-                        font-family: Theme.font-mono;
-                        font-size: 9px * Theme.font-scale;
-                        vertical-alignment: center;
-                    }
-                    if !item.has-exited : Text {
-                        text: focus-scope.has-focus ? "focused" : "click to focus";
-                        color: Theme.text-secondary;
-                        font-family: Theme.font-mono;
-                        font-size: 9px * Theme.font-scale;
-                        vertical-alignment: center;
-                    }
-                    Button {
-                        label: "Kill";
-                        button-accessible-label: "Close local terminal";
-                        btn-width: 44px;
-                        btn-height: 16px;
-                        font-size: 8px;
-                        font-weight: 400;
-                        bg: Theme.bg-card;
-                        fg: Theme.text-secondary;
-                        clicked => { close-requested(); }
-                    }
-                    local-terminal-expand := IconButton {
-                        btn-width: 16px;
-                        btn-height: 16px;
-                        button-accessible-label: "Expand local terminal";
-                        clicked => { expand(); }
-                        Text {
-                            text: "\u{2922}"; // expand glyph, same as TerminalCard
-                            color: Theme.text-muted;
-                            font-size: 11px * Theme.font-scale;
-                            vertical-alignment: center;
-                        }
                     }
                 }
             }
