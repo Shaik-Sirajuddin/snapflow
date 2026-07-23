@@ -19,6 +19,11 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 // ChatArea / overlays can restore keyboard focus without reaching into
 // the TextInput id.
 export component ChatInputLayout inherits Rectangle {
+    // Phase 14 (disabled_input_convention): one root gate for every
+    // interactive control in the compose surface. False renders each
+    // control visibly disabled (dimmed, no hover/cursor affordance,
+    // accessible-enabled false) -- used e.g. for archived threads.
+    in property <bool> inputs-enabled: true;
     in-out property <string> compose-text: "";
     in property <bool> sending: false;
     in property <[DropdownEntry]> mode-dropdown-entries: [];
@@ -542,7 +547,7 @@ export component ChatInputLayout inherits Rectangle {
                     compose := TextInput {
                         accessible-label: "Compose message";
                         text <=> root.compose-text;
-                        enabled: true;
+                        enabled: root.inputs-enabled;
                         color: Theme.text-primary;
                         font-family: Theme.font-sans;
                         font-size: 11px * Theme.font-scale;
@@ -660,7 +665,7 @@ export component ChatInputLayout inherits Rectangle {
                             if root.sending { root.stop-requested(); }
                             else { root.send-requested(); }
                         }
-                        enabled: root.sending || compose.text != "";
+                        enabled: root.inputs-enabled && (root.sending || compose.text != "");
                         clicked => {
                             if root.sending { root.stop-requested(); }
                             else { root.send-requested(); }
@@ -744,7 +749,7 @@ export component ChatInputLayout inherits Rectangle {
                 // Always offer Provider when profiles exist (not only on wide
                 // docks) — it's the cascade root for the model list.
                 visible: root.profile-dropdown-entries.length > 0;
-                enabled: !root.active-thread-has-session;
+                enabled: root.inputs-enabled && !root.active-thread-has-session;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
                 height: root.row2-h;
@@ -768,6 +773,7 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
             mode-dropdown := SearchableDropdown {
+                enabled: root.inputs-enabled;
                 visible: root.mode-dropdown-entries.length > 0;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
@@ -791,6 +797,7 @@ export component ChatInputLayout inherits Rectangle {
                 }
             }
             config-dropdown := SearchableDropdown {
+                enabled: root.inputs-enabled;
                 visible: root.config-dropdown-entries.length > 0;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
@@ -818,6 +825,7 @@ export component ChatInputLayout inherits Rectangle {
             }
             // Reasoning effort — own SearchableDropdown (not under Model).
             reasoning-dropdown := SearchableDropdown {
+                enabled: root.inputs-enabled;
                 visible: root.reasoning-dropdown-entries.length > 0;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
