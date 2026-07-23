@@ -2499,6 +2499,36 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_empty_turn_never_fires_the_empty_turn_notice() {
+        // Interaction between setup-followups' queue-stop semantics and
+        // main's empty-turn notice (adopted during the worktree
+        // consolidation merge): a user-initiated stop ends the turn from
+        // Cancelling with no agent output -- that is the user's own
+        // doing, not a silent failure, so the "ended without a
+        // response" notice must stay silent. Only a turn that dies from
+        // Loading qualifies.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Cancelling;
+        model.threads[0].agent_content_this_turn = false;
+        let (_effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 0,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("cancelled".to_owned()),
+                }],
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        assert!(
+            model.threads[0].error.is_none(),
+            "user-cancelled empty turn must not fabricate a notice"
+        );
+        assert!(!dirty.iter().any(|d| matches!(d, Dirty::Error { .. })));
+    }
+
+    #[test]
     fn frame_event_resolves_by_durable_thread_id_after_model_row_shift() {
         let mut model = model_with_threads(&["target", "other"]);
         model.threads[0].thread_id = "target-id".to_owned();
