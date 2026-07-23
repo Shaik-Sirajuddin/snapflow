@@ -1,0 +1,33 @@
+import { Toggle } from "./toggle.slint";
+
+// Layer 3 (base) -- wraps the if/checked-true-Toggle / if/checked-false-Toggle
+// instance-reset trick `agent_card.slint` hand-rolled twice (default-agent
+// toggle, per-agent enabled toggle) and documented at length in a comment
+// at the first call site: `Toggle.checked` is `in-out` and self-assigns on
+// click, so a plain one-way `checked: root.some-bool` binding gets
+// permanently severed the first time it's clicked -- switching which of
+// two sibling `if` branches is instantiated (rather than mutating one
+// live `Toggle`'s `checked`) forces Slint to destroy/recreate the
+// element, which resets that binding every time the source bool flips.
+// Centralizing it here means future call sites with the same one-way-bool
+// -> toggle shape don't have to rediscover this.
+export component ResetOnFlipToggle {
+    in property <bool> checked: false;
+    in property <string> toggle-accessible-label-on: "";
+    in property <string> toggle-accessible-label-off: "";
+    callback toggled(bool);
+
+    width: 32px;
+    height: 18px;
+
+    if root.checked : Toggle {
+        checked: true;
+        toggle-accessible-label: root.toggle-accessible-label-on;
+        toggled(new-checked) => { root.toggled(new-checked); }
+    }
+    if !root.checked : Toggle {
+        checked: false;
+        toggle-accessible-label: root.toggle-accessible-label-off;
+        toggled(new-checked) => { root.toggled(new-checked); }
+    }
+}
