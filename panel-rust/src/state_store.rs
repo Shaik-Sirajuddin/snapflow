@@ -284,12 +284,32 @@ impl PanelStateStore {
     /// only adds the panel-specific display name and provider needed on the
     /// next host launch.
     pub fn save_thread_record(&self, record: &ThreadRecord) -> Result<(), StateStoreError> {
-        self.bind_session(
+        match self.bind_session(
             &record.thread_id,
             &record.session_id,
             record.profile_name.as_deref(),
             record.permission_profile.as_deref(),
-        )?;
+        ) {
+            // `thread_already_bound_resume_errors` (consolidation plan
+            // phase 9): a DIFFERENT session id landing on a thread that
+            // already has one is the sanctioned supersede path -- the
+            // attachment flow only ever opens a fresh session after the
+            // persisted one failed to resume (dead gateway session,
+            // relaunch races), so erroring here surfaced a per-thread
+            // "already bound" card on every such relaunch. Rebind the
+            // record to the live session instead; the thread's jsonl
+            // transcript is keyed by thread_id and is unaffected. The
+            // profile-immutability rule (BoundSettingsConflict) still
+            // holds -- only the session id is superseded.
+            Err(StateStoreError::SessionBindingConflict { .. }) => {
+                let connection = self.connection.lock().expect("panel state mutex poisoned");
+                connection.execute(
+                    "UPDATE thread_settings SET session_id = ?2 WHERE thread_id = ?1",
+                    params![record.thread_id, record.session_id],
+                )?;
+            }
+            other => other?,
+        }
         let connection = self.connection.lock().expect("panel state mutex poisoned");
         connection.execute(
             "UPDATE thread_settings
@@ -408,6 +428,28 @@ mod tests {
             store.defaults().unwrap().selected_thread_id.as_deref(),
             Some("thread-b")
         );
+    }
+
+
+    #[test]
+    fn save_thread_record_supersedes_a_dead_session_binding() {
+        // consolidation plan phase 9: relaunch after a failed resume
+        // opens a fresh session; persisting it must rebind, not error.
+        let store = PanelStateStore::in_memory().unwrap();
+        let mut record = ThreadRecord {
+            thread_id: "t".to_owned(),
+            display_name: "T".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-1".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+        };
+        store.save_thread_record(&record).unwrap();
+        record.session_id = "session-2".to_owned();
+        store.save_thread_record(&record).unwrap();
+        let settings = store.thread_settings("t").unwrap().unwrap();
+        assert_eq!(settings.session_id.as_deref(), Some("session-2"));
     }
 
     #[test]
