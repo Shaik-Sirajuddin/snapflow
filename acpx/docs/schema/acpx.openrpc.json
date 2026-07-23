@@ -282,6 +282,64 @@
       "x-acpx-side": "client-to-agent"
     },
     {
+      "name": "models/list",
+      "summary": "Agent-scoped model catalogs, pre-session (phase 13, worktree-consolidation-and-provider-binding plan).",
+      "description": "With agentId: runs the TTL-cached adapter capability probe (at most one disposable backend session per TTL window) and returns that agent's model catalog. Without agentId: returns only already-cached catalogs for registry agents -- never spawns a backend per agent to enumerate.",
+      "params": [
+        {
+          "name": "agentId",
+          "required": false,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "type": "string",
+            "description": "cwd for a probe session when one is needed; defaults to '.'"
+          }
+        }
+      ],
+      "result": {
+        "name": "catalogs",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "catalogs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "agentId": {
+                    "type": "string"
+                  },
+                  "models": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "value": {
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "cached": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
       "name": "agents/install",
       "params": [
         {
@@ -1224,14 +1282,14 @@
         "properties": {
           "name": {
             "type": "string",
-            "description": "Intended for programmatic or logical use, but can be used as a display\nname fallback if title isn’t present."
+            "description": "Intended for programmatic or logical use, but can be used as a display\nname fallback if title isn\u2019t present."
           },
           "title": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Intended for UI and end-user contexts — optimized to be human-readable\nand easily understood.\n\nIf not provided, the name should be used for display.",
+            "description": "Intended for UI and end-user contexts \u2014 optimized to be human-readable\nand easily understood.\n\nIf not provided, the name should be used for display.",
             "x-deserialize-default-on-error": true
           },
           "version": {
@@ -2244,7 +2302,7 @@
             "description": "Complete resource contents embedded directly in the message.\n\nPreferred for including context as it avoids extra round-trips.\n\nRequires the `embeddedContext` prompt capability when included in prompts."
           }
         ],
-        "description": "Content blocks represent displayable information in the Agent Client Protocol.\n\nThey provide a structured way to handle various types of user-facing content—whether\nit's text from language models, images for analysis, or embedded resources for context.\n\nContent blocks appear in:\n- User prompts sent via `session/prompt`\n- Language model output streamed through `session/update` notifications\n- Progress updates and results from tool calls\n\nThis structure is compatible with the Model Context Protocol (MCP), enabling\nagents to seamlessly forward content from MCP tool outputs without transformation.\n\nSee protocol docs: [Content](https://agentclientprotocol.com/protocol/content)",
+        "description": "Content blocks represent displayable information in the Agent Client Protocol.\n\nThey provide a structured way to handle various types of user-facing content\u2014whether\nit's text from language models, images for analysis, or embedded resources for context.\n\nContent blocks appear in:\n- User prompts sent via `session/prompt`\n- Language model output streamed through `session/update` notifications\n- Progress updates and results from tool calls\n\nThis structure is compatible with the Model Context Protocol (MCP), enabling\nagents to seamlessly forward content from MCP tool outputs without transformation.\n\nSee protocol docs: [Content](https://agentclientprotocol.com/protocol/content)",
         "discriminator": {
           "propertyName": "type"
         }
