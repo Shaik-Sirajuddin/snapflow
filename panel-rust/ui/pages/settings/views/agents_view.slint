@@ -455,33 +455,19 @@ export component AgentsView inherits Rectangle {
             color: Theme.text-muted;
             font-size: 10px * Theme.font-scale;
         }
-        for session in root.recoverable-sessions : Rectangle {
-            height: 26px;
-            background: Theme.bg-sidebar;
-            border-radius: Theme.radius-sm;
-            HorizontalLayout {
-                padding-left: Metrics.space-4;
-                padding-right: Metrics.space-4;
-                spacing: Metrics.space-4;
-                Text {
-                    text: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
-                    color: Theme.text-primary;
-                    font-size: 11px * Theme.font-scale;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                    overflow: elide;
-                }
-                Button {
-                    label: "Attach";
-                    button-accessible-label: "Attach recovered session " + session.session-id;
-                    btn-width: 52px;
-                    btn-height: 20px;
-                    font-size: 9px;
-                    font-weight: 400;
-                    bg: Theme.bg-card;
-                    fg: Theme.text-secondary;
-                    clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
-                }
+        for session in root.recoverable-sessions : SettingsRow {
+            label: (session.title != "" ? session.title : session.session-id) + " (" + session.provider + ")";
+            row-height: 26px;
+            Button {
+                label: "Attach";
+                button-accessible-label: "Attach recovered session " + session.session-id;
+                btn-width: 52px;
+                btn-height: 20px;
+                font-size: 9px;
+                font-weight: 400;
+                bg: Theme.bg-card;
+                fg: Theme.text-secondary;
+                clicked => { root.recover-session-attach(session.session-id, session.provider, session.title); }
             }
         }
     }

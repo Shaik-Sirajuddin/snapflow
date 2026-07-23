@@ -1,6 +1,7 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { PendingRequestItem } from "../types.slint";
+import { Badge } from "../base/badge.slint";
 
 // Approval card docked above the compose bar.
 //
@@ -89,25 +90,15 @@ export component PermissionCard inherits Rectangle {
                 vertical-alignment: center;
             }
             // Small pill so “approval” is labeled even at a glance.
-            Rectangle {
+            Badge {
                 horizontal-stretch: 0;
                 height: 16px;
-                background: Theme.bg-primary-container;
-                border-radius: Theme.radius-sm;
-                border-width: 1px;
-                border-color: Theme.border-default;
-                HorizontalLayout {
-                    padding-left: Metrics.space-2;
-                    padding-right: Metrics.space-2;
-                    Text {
-                        text: "Approval";
-                        color: Theme.text-secondary;
-                        font-family: Theme.font-mono;
-                        font-size: 8px * Theme.font-scale;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                }
+                label: "Approval";
+                bg: Theme.bg-primary-container;
+                font-size: 8px;
+                badge-font-weight: 700;
+                pad-h: Metrics.space-2;
+                pad-v: 0px;
             }
             Text {
                 text: item.method;
