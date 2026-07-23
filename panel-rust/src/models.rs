@@ -803,6 +803,16 @@ fn filter_model_option_for_provider(
         .cloned()
         .collect();
     if filtered.is_empty() {
+        // Fail CLOSED for providers whose vendor vocabulary we know: a
+        // namespaced catalog where *nothing* matches claude/grok/codex is a
+        // foreign provider's catalog, and returning it whole is exactly the
+        // live "claude-acp thread offering GPT models" bug (plan phase 24).
+        // Unknown/custom agent ids keep the permissive fallback so a
+        // custom-catalog gateway (bifrost-style) still shows its list.
+        if provider_vendor_stems(&agent).is_some() {
+            option.options.clear();
+            return option;
+        }
         return option;
     }
     if let Some(cur) = option.current_value.as_ref() {
@@ -816,6 +826,23 @@ fn filter_model_option_for_provider(
 
 fn model_value_looks_namespaced(value: &str) -> bool {
     value.contains('/') || value.contains(':')
+}
+
+/// Vendor vocabulary per known provider stem. Interim panel-side
+/// heuristic only -- the plan's phase 8 moves provider->model filtering
+/// into acpx-server proper and DELETES this table along with the string
+/// matching around it. Until then it is what makes "codex-acp carries an
+/// additional openai/gpt custom catalog" work while "claude-acp shows a
+/// gpt catalog" fails closed (plan phase 24 matrix).
+fn provider_vendor_stems(agent_lower: &str) -> Option<&'static [&'static str]> {
+    let stem = agent_lower.split('-').next().unwrap_or(agent_lower);
+    match stem {
+        "claude" | "anthropic" => Some(&["claude", "anthropic", "sonnet", "haiku", "opus"]),
+        "codex" | "openai" => Some(&["codex", "openai", "gpt", "o3", "o4"]),
+        "grok" | "xai" => Some(&["grok", "xai"]),
+        "gemini" | "google" => Some(&["gemini", "google"]),
+        _ => None,
+    }
 }
 
 fn model_value_matches_provider(value: &str, name: &str, agent_lower: &str) -> bool {
@@ -833,6 +860,11 @@ fn model_value_matches_provider(value: &str, name: &str, agent_lower: &str) -> b
         if prefix == agent_lower {
             return true;
         }
+    }
+    if let Some(stems) = provider_vendor_stems(agent_lower) {
+        return stems
+            .iter()
+            .any(|stem| v.contains(stem) || n.contains(stem));
     }
     let stem = agent_lower.split('-').next().unwrap_or(agent_lower);
     stem.len() >= 3 && (v.contains(stem) || n.contains(stem))
@@ -2047,6 +2079,96 @@ mod transcript_model_tests {
         // header + one value
         assert_eq!(filtered.row_count(), 2);
         assert_eq!(filtered.row_data(1).unwrap().value.as_str(), "codex-acp/gpt-5");
+    }
+
+    fn model_option(values: &[(&str, &str)]) -> Vec<ConfigOptionInfo> {
+        vec![ConfigOptionInfo {
+            id: "model".into(),
+            name: "Model".into(),
+            description: None,
+            category: None,
+            kind: "select".into(),
+            current_value: values.first().map(|(v, _)| (*v).to_owned()),
+            options: values
+                .iter()
+                .map(|(value, name)| ConfigOptionValue {
+                    value: (*value).to_owned(),
+                    name: (*name).to_owned(),
+                    description: None,
+                })
+                .collect(),
+        }]
+    }
+
+    fn dropdown_values(entries: &ModelRc<DropdownEntry>) -> Vec<String> {
+        (0..entries.row_count())
+            .filter_map(|i| entries.row_data(i))
+            .filter(|e| !e.is_header)
+            .map(|e| e.value.to_string())
+            .collect()
+    }
+
+    // Plan phase 24: provider->models matrix. One shared mixed namespaced
+    // catalog; each provider must keep EXACTLY its own vendor's models.
+    fn mixed_catalog() -> Vec<ConfigOptionInfo> {
+        model_option(&[
+            ("anthropic/claude-sonnet-4", "Claude Sonnet 4"),
+            ("anthropic/claude-opus-4", "Claude Opus 4"),
+            ("openai/gpt-5", "GPT-5"),
+            ("openai/o4-mini", "o4-mini"),
+            ("xai/grok-4", "Grok 4"),
+        ])
+    }
+
+    #[test]
+    fn provider_matrix_claude_acp_keeps_only_anthropic_models() {
+        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "claude-acp");
+        assert_eq!(
+            dropdown_values(&entries),
+            vec!["anthropic/claude-sonnet-4", "anthropic/claude-opus-4"]
+        );
+    }
+
+    #[test]
+    fn provider_matrix_grok_acp_keeps_only_xai_models() {
+        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "grok-acp");
+        assert_eq!(dropdown_values(&entries), vec!["xai/grok-4"]);
+    }
+
+    #[test]
+    fn provider_matrix_codex_acp_keeps_its_openai_custom_catalog() {
+        // codex-acp may carry an ADDITIONAL custom (bifrost-style) openai
+        // catalog whose values never contain "codex" -- the vendor alias
+        // table is what keeps these visible under codex.
+        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "codex-acp");
+        assert_eq!(
+            dropdown_values(&entries),
+            vec!["openai/gpt-5", "openai/o4-mini"]
+        );
+    }
+
+    #[test]
+    fn claude_acp_never_falls_back_to_a_pure_foreign_gpt_catalog() {
+        // The live phase-24 repro: a catalog holding ONLY another vendor's
+        // namespaced models used to hit the permissive empty-filter
+        // fallback and be shown WHOLE under claude-acp ("selected
+        // claude-acp, models of gpt are shown"). Known providers now fail
+        // closed: no foreign models, empty dropdown.
+        let gpt_only = model_option(&[
+            ("openai/gpt-5", "GPT-5"),
+            ("openai/gpt-5-mini", "GPT-5 mini"),
+        ]);
+        let entries = to_config_dropdown_entries_for_provider(gpt_only, "claude-acp");
+        assert_eq!(entries.row_count(), 0);
+    }
+
+    #[test]
+    fn unknown_custom_agent_keeps_the_permissive_catalog_fallback() {
+        // A gateway with an agent id outside the vendor table (fully
+        // custom catalog) still shows its list rather than nothing.
+        let custom = model_option(&[("somevendor/model-x", "Model X")]);
+        let entries = to_config_dropdown_entries_for_provider(custom, "my-router");
+        assert_eq!(dropdown_values(&entries), vec!["somevendor/model-x"]);
     }
 
     #[test]
