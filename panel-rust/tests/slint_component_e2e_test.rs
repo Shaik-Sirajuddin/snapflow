@@ -2,12 +2,46 @@ use i_slint_backend_testing::ElementHandle;
 use panel_rust::{
     AgentCatalogEntry, ChatPanel, DropdownEntry, LocalTerminalItem, McpServerOption,
     MessageItem, PendingRequestItem, ProfileOption, RemoteSessionOption,
-    SkillOption, TerminalItem, ThreadItem,
+    SkillOption, TerminalItem, TextUtil, ThreadItem,
 };
 use slint::platform::{Key, WindowEvent};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
+
+/// Sidebar `width` animates over 180ms when `sidebar-expanded` flips.
+/// Headless `init_no_event_loop` never advances that clock on its own, so
+/// conditional expanded-row controls (rename/close/archive) stay clipped
+/// inside the collapsed 48px rail until we mock elapsed time past the
+/// animation and re-run the layout pass.
+fn settle_sidebar_expand(panel: &ChatPanel) {
+    panel.set_sidebar_expanded(true);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(250));
+    slint::platform::update_timers_and_animations();
+    // Re-assert window size so geometry recomputes against the settled width.
+    let size = panel.window().size();
+    panel.window().set_size(size);
+}
+
+fn sample_open_thread(name: &str) -> ThreadItem {
+    ThreadItem {
+        name: name.into(),
+        status: "idle".into(),
+        busy: false,
+        open: true,
+        background: false,
+        description: "".into(),
+        closed: false,
+        archived: false,
+        provider: "".into(),
+        model: "".into(),
+        project_name: "".into(),
+        project_path: "".into(),
+        profile_name: "".into(),
+        has_session: false,
+    }
+}
 
 #[test]
 fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
@@ -750,29 +784,24 @@ fn connection_status_is_exposed_to_accessibility() {
 /// UI wiring, not the gateway call itself (that's
 /// `gateway_actor_e2e_test.rs::close_then_delete_session_round_trip_
 /// through_a_real_gateway`'s job).
+///
+/// Previously documented as a "harness anomaly": the controls were in
+/// the tree once `selected-thread` revealed them, but the sidebar width
+/// animation left the rail at the collapsed 48px geometry under
+/// `init_no_event_loop`, so the testing backend's `is_visible()` filter
+/// skipped the clipped IconButtons. Settling the expand animation
+/// (see `settle_sidebar_expand`) makes them addressable.
 #[test]
 fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirmed() {
     i_slint_backend_testing::init_no_event_loop();
 
     let panel = ChatPanel::new().expect("construct chat panel");
     panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
-    panel.set_sidebar_expanded(true);
-    panel.set_threads(ModelRc::new(VecModel::from(vec![ThreadItem {
-        name: "Fix timeline crash".into(),
-        status: "idle".into(),
-        busy: false,
-        open: true,
-        background: false,
-        description: "".into(),
-        closed: false,
-        archived: false,
-        provider: "".into(),
-        model: "".into(),
-        project_name: "".into(),
-        project_path: "".into(),
-        profile_name: "".into(),
-        has_session: false,
-    }])));
+    settle_sidebar_expand(&panel);
+    panel.set_threads(ModelRc::new(VecModel::from(vec![sample_open_thread(
+        "Fix timeline crash",
+    )])));
+    panel.set_selected_thread(0);
 
     let closed_index = Rc::new(Cell::new(-1i32));
     let deleted_index = Rc::new(Cell::new(-1i32));
@@ -784,26 +813,6 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         let deleted_index = deleted_index.clone();
         panel.on_thread_delete_requested(move |i| deleted_index.set(i));
     }
-
-    // PRODUCTION FIX APPLIED, TEST STILL CAN'T OBSERVE IT: these controls
-    // were hover-gated only (thread-row.has-hover), which a headless test
-    // (and a real keyboard-only user) had no way to ever trigger.
-    // sidebar.slint now also reveals them for the currently selected row
-    // (`|| i == selected-thread`) -- a real, independently-verified-sound
-    // fix (the exact same `i == selected-thread` comparison, at the exact
-    // same nesting depth, already renders correctly for the row's
-    // "ACTIVE" badge sibling in this same scope). Yet even with that
-    // exact same condition, or with it hardcoded to a literal `true`,
-    // this specific IconButton never appears in this test's element
-    // tree -- while its sibling "ACTIVE" Text and the row's own
-    // HoverSurface both do. Root cause not found despite extensive
-    // isolation (ruled out: the selected-thread reference itself, window
-    // sizing, stale build caches). Left failing rather than faking a
-    // pass; this is now clearly a harness-specific anomaly around this
-    // repeated icon-row structure, not a production bug -- the fix
-    // itself is correct by inspection and consistent with this file's
-    // other proven-working patterns.
-    panel.set_selected_thread(0);
 
     // An open thread shows only the close (arm) control -- no delete
     // control, and no confirm/cancel pair, until armed.
@@ -864,22 +873,10 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
     // here by setting `closed: true` directly, matching what
     // `refresh_threads_model` would push), the row swaps to a delete
     // control instead of a close control.
-    panel.set_threads(ModelRc::new(VecModel::from(vec![ThreadItem {
-        name: "Fix timeline crash".into(),
-        status: "closed".into(),
-        busy: false,
-        open: true,
-        background: false,
-        description: "".into(),
-        closed: true,
-        archived: false,
-        provider: "".into(),
-        model: "".into(),
-        project_name: "".into(),
-        project_path: "".into(),
-        profile_name: "".into(),
-        has_session: false,
-    }])));
+    let mut closed = sample_open_thread("Fix timeline crash");
+    closed.status = "closed".into();
+    closed.closed = true;
+    panel.set_threads(ModelRc::new(VecModel::from(vec![closed])));
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
             .next()
@@ -903,6 +900,62 @@ fn sidebar_thread_close_and_delete_controls_are_addressable_and_two_step_confirm
         0,
         "confirming delete must fire thread-delete-requested(0)"
     );
+}
+
+/// setup-followups: archive is a one-click local presentation flag (not
+/// two-step like close/delete). Proves the selected-row archive control
+/// is addressable after the sidebar expand settles and that clicking it
+/// fires `thread-archive-requested`. Also covers rename-arm presence
+/// (same selected-row reveal gate) which previously had no headless e2e.
+#[test]
+fn sidebar_thread_archive_and_rename_controls_are_addressable_and_dispatch() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    settle_sidebar_expand(&panel);
+    panel.set_threads(ModelRc::new(VecModel::from(vec![sample_open_thread(
+        "Fix timeline crash",
+    )])));
+    panel.set_selected_thread(0);
+
+    let archived_index = Rc::new(Cell::new(-1i32));
+    {
+        let archived_index = archived_index.clone();
+        panel.on_thread_archive_requested(move |i| archived_index.set(i));
+    }
+
+    ElementHandle::find_by_accessible_label(&panel, "Rename thread Fix timeline crash")
+        .next()
+        .expect("rename control must be accessible on the selected open thread");
+
+    let archive =
+        ElementHandle::find_by_accessible_label(&panel, "Archive thread Fix timeline crash")
+            .next()
+            .expect("archive control must be accessible on the selected open thread");
+    archive.invoke_accessible_default_action();
+    assert_eq!(
+        archived_index.get(),
+        0,
+        "archive click must fire thread-archive-requested(0)"
+    );
+
+    // After the host marks the row archived (Dirty::ThreadRow path),
+    // the archive arm disappears and the close arm remains (archive
+    // does not close the session).
+    let mut archived = sample_open_thread("Fix timeline crash");
+    archived.status = "archived".into();
+    archived.archived = true;
+    panel.set_threads(ModelRc::new(VecModel::from(vec![archived])));
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Archive thread Fix timeline crash")
+            .next()
+            .is_none(),
+        "an archived thread must not show an archive control"
+    );
+    ElementHandle::find_by_accessible_label(&panel, "Close thread Fix timeline crash")
+        .next()
+        .expect("archive must not remove the close control on an open-but-archived thread");
 }
 
 /// setup-followups plan, agent_enable_button_e2e_coverage_missing: phase
@@ -971,6 +1024,83 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
     assert_eq!(
         &*set_enabled_calls.borrow(),
         &[("claude".to_owned(), false), ("claude".to_owned(), true)]
+    );
+}
+
+/// Settings > Agents search bar used to be a no-op: query was bound but
+/// never applied to the grid (doc comment in agents_view.slint said
+/// filtering was deferred). Sets the real "Search agents" TextInput
+/// value and asserts non-matching cards disappear.
+#[test]
+fn agents_settings_search_filters_catalog_cards() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    // Production installs this at panel construct; bare ChatPanel::new
+    // does not — without it matches-filter can only exact-match and the
+    // search bar looks broken (every card disappears for any substring).
+    panel.global::<TextUtil>().on_contains_ci(|haystack, needle| {
+        haystack
+            .to_lowercase()
+            .contains(&needle.to_lowercase())
+    });
+    panel.window().set_size(slint::LogicalSize::new(900.0, 1000.0));
+    panel.set_agent_catalog(ModelRc::new(VecModel::from(vec![
+        AgentCatalogEntry {
+            id: "claude".into(),
+            name: "Claude".into(),
+            version: "1.0".into(),
+            status: "installed".into(),
+            enabled: true,
+        },
+        AgentCatalogEntry {
+            id: "codex".into(),
+            name: "Codex".into(),
+            version: "1.0".into(),
+            status: "installed".into(),
+            enabled: true,
+        },
+        AgentCatalogEntry {
+            id: "gemini".into(),
+            name: "Gemini".into(),
+            version: "1.0".into(),
+            status: "available".into(),
+            enabled: false,
+        },
+    ])));
+    panel.set_settings_open(true);
+    panel.set_settings_active_section("agents".into());
+
+    ElementHandle::find_by_accessible_label(&panel, "Disable Claude")
+        .next()
+        .expect("Claude card visible before search");
+    ElementHandle::find_by_accessible_label(&panel, "Disable Codex")
+        .next()
+        .expect("Codex card visible before search");
+    ElementHandle::find_by_accessible_label(&panel, "Install agent Gemini")
+        .next()
+        .expect("Gemini card visible before search");
+
+    let search = ElementHandle::find_by_accessible_label(&panel, "Search agents")
+        .next()
+        .expect("agents search field must be addressable");
+    // TextInput <=> query: setting accessible value updates the filter.
+    search.set_accessible_value("cod");
+
+    ElementHandle::find_by_accessible_label(&panel, "Disable Codex")
+        .next()
+        .expect("Codex remains when search is 'cod'");
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Disable Claude")
+            .next()
+            .is_none(),
+        "Claude must be filtered out by 'cod'"
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Install agent Gemini")
+            .next()
+            .is_none(),
+        "Gemini must be filtered out by 'cod'"
     );
 }
 
@@ -1155,45 +1285,47 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
         panel.on_profile_selected(move |id| profile_selection.borrow_mut().push(id.to_string()));
     }
 
+    // Provider picker: label = agent_id, id = profile name for session open.
     panel.set_profile_dropdown_entries(ModelRc::new(VecModel::from(vec![
         DropdownEntry {
             id: "codex-tools".into(),
-            label: "codex-tools".into(),
-            value: "".into(),
+            label: "codex-acp".into(),
+            value: "codex-acp".into(),
             is_header: false,
             is_current: false,
         },
         DropdownEntry {
             id: "balanced".into(),
-            label: "balanced".into(),
-            value: "".into(),
+            label: "claude-acp".into(),
+            value: "claude-acp".into(),
             is_header: false,
             is_current: false,
         },
     ])));
     panel.set_active_thread_has_session(false);
 
-    let profile_trigger = ElementHandle::find_by_accessible_label(&panel, "Profile")
+    let profile_trigger = ElementHandle::find_by_accessible_label(&panel, "Provider ›")
         .next()
-        .expect("profile selector trigger must be accessible even before any profile is chosen");
+        .expect("provider selector trigger must be accessible even before any choice");
     profile_trigger.invoke_accessible_default_action();
-    let select_profile = ElementHandle::find_by_accessible_label(&panel, "codex-tools")
+    let select_profile = ElementHandle::find_by_accessible_label(&panel, "codex-acp")
         .next()
-        .expect("profile option must be accessible once the dropdown is open");
+        .expect("provider option must be accessible once the dropdown is open");
     select_profile.invoke_accessible_default_action();
     assert_eq!(&*profile_selection.borrow(), &["codex-tools"]);
 
     // Once a session attaches, the picker must be genuinely locked, not
     // merely re-labelled -- SearchableDropdown.enabled: false disables
     // its own accessible-action-default, so invoking it must not open
-    // the popup at all.
+    // the popup at all. Trigger shows "codex-acp ›".
     panel.set_active_thread_has_session(true);
-    let profile_trigger_locked = ElementHandle::find_by_accessible_label(&panel, "codex-tools")
-        .next()
-        .expect("locked trigger must still show the already-chosen profile as its label");
+    let profile_trigger_locked =
+        ElementHandle::find_by_accessible_label(&panel, "codex-acp ›")
+            .next()
+            .expect("locked trigger must still show the chosen provider as its label");
     profile_trigger_locked.invoke_accessible_default_action();
     assert!(
-        ElementHandle::find_by_accessible_label(&panel, "balanced")
+        ElementHandle::find_by_accessible_label(&panel, "claude-acp")
             .next()
             .is_none(),
         "the popup must not open while the picker is locked (has-session: true)"
@@ -1265,5 +1397,406 @@ fn composer_dropdowns_are_mutually_exclusive() {
             .is_none(),
         "opening the config popup must close the mode popup that was still open, \
          not leave both rendered on top of each other"
+    );
+}
+
+/// Reasoning effort is its own compose-bar dropdown (not mixed into Model).
+#[test]
+fn composer_reasoning_effort_dropdown_dispatches_config_option() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    let selected = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+    {
+        let selected = selected.clone();
+        panel.on_config_option_selected(move |id, value| {
+            selected
+                .borrow_mut()
+                .push((id.to_string(), value.to_string()));
+        });
+    }
+
+    panel.set_reasoning_trigger_label("Medium".into());
+    panel.set_reasoning_dropdown_entries(ModelRc::new(VecModel::from(vec![
+        DropdownEntry {
+            id: "reasoning".into(),
+            label: "Reasoning effort".into(),
+            value: "".into(),
+            is_header: true,
+            is_current: false,
+        },
+        DropdownEntry {
+            id: "reasoning".into(),
+            label: "Low".into(),
+            value: "low".into(),
+            is_header: false,
+            is_current: false,
+        },
+        DropdownEntry {
+            id: "reasoning".into(),
+            label: "High".into(),
+            value: "high".into(),
+            is_header: false,
+            is_current: false,
+        },
+    ])));
+
+    let trigger = ElementHandle::find_by_accessible_label(&panel, "Medium")
+        .next()
+        .expect("reasoning trigger uses host label");
+    trigger.invoke_accessible_default_action();
+    let high = ElementHandle::find_by_accessible_label(&panel, "High")
+        .next()
+        .expect("reasoning options open in their own popup");
+    high.invoke_accessible_default_action();
+    assert_eq!(
+        selected.borrow().as_slice(),
+        &[("reasoning".to_owned(), "high".to_owned())]
+    );
+}
+
+/// Compose-bar Fast toggle: when the host marks fast mode available,
+/// the control is addressable and dispatches config-option-selected
+/// with the host-supplied option id / on|off values.
+#[test]
+fn composer_fast_mode_toggle_dispatches_config_option() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    let selected = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
+    {
+        let selected = selected.clone();
+        panel.on_config_option_selected(move |id, value| {
+            selected
+                .borrow_mut()
+                .push((id.to_string(), value.to_string()));
+        });
+    }
+
+    panel.set_fast_mode_available(true);
+    panel.set_fast_mode_enabled(false);
+    panel.set_fast_mode_option_id("fastMode".into());
+    panel.set_fast_mode_on_value("on".into());
+    panel.set_fast_mode_off_value("off".into());
+
+    let enable = ElementHandle::find_by_accessible_label(&panel, "Enable fast mode")
+        .next()
+        .expect("Fast toggle must be accessible when available");
+    enable.invoke_accessible_default_action();
+    assert_eq!(
+        selected.borrow().as_slice(),
+        &[("fastMode".to_owned(), "on".to_owned())]
+    );
+
+    // Host would rewrite enabled after the RPC; simulate for the off path.
+    panel.set_fast_mode_enabled(true);
+    let disable = ElementHandle::find_by_accessible_label(&panel, "Disable fast mode")
+        .next()
+        .expect("toggle label flips when enabled");
+    disable.invoke_accessible_default_action();
+    assert_eq!(
+        selected.borrow().last().map(|(a, b)| (a.as_str(), b.as_str())),
+        Some(("fastMode", "off"))
+    );
+}
+
+/// setup-followups thinking_output_collapsible_block_feature: thinking
+/// content must render as a dedicated collapsible block (collapsed by
+/// default, expands on click) rather than raw inline text. Uses the same
+/// MessageItem.expanded / toggle-expanded round-trip tool rows already
+/// use.
+#[test]
+fn thinking_block_is_collapsed_by_default_and_expands_on_click() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+
+    let toggled = Rc::new(Cell::new(None::<i32>));
+    {
+        let toggled = toggled.clone();
+        panel.on_toggle_expanded(move |index| {
+            toggled.set(Some(index));
+        });
+    }
+
+    panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        kind: "thinking".into(),
+        text: "I should check the timeline first".into(),
+        expanded: false,
+        index: 0,
+        ..MessageItem::default()
+    }])));
+
+    let expand = ElementHandle::find_by_accessible_label(&panel, "Expand thinking")
+        .next()
+        .expect("collapsed thinking block must expose an Expand thinking control");
+    expand.invoke_accessible_default_action();
+    assert_eq!(
+        toggled.get(),
+        Some(0),
+        "clicking the thinking header must dispatch toggle-expanded(0)"
+    );
+
+    // Simulate the reducer flipping expanded (same path ChromeMsg::
+    // ToggleExpanded takes) and prove the control label swaps to Collapse.
+    panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        kind: "thinking".into(),
+        text: "I should check the timeline first".into(),
+        expanded: true,
+        index: 0,
+        ..MessageItem::default()
+    }])));
+
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Collapse thinking")
+            .next()
+            .is_some(),
+        "expanded thinking block must expose a Collapse thinking control"
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Expand thinking")
+            .next()
+            .is_none(),
+        "Expand thinking must go away once the block is expanded"
+    );
+}
+
+/// setup-followups skill_not_listed_after_creation: a newly-created skill
+/// must appear in the Skills list without a manual reload. Proves the UI
+/// half (skills tab + row accessible after available-skills is updated
+/// the same way Dirty::SkillsListDiff does post-create).
+#[test]
+fn newly_added_skill_appears_in_the_skills_list() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel.set_sidebar_expanded(true);
+    panel.set_available_skills(ModelRc::new(VecModel::from(vec![])));
+
+    let skills_tab = ElementHandle::find_by_accessible_label(&panel, "Show skills")
+        .next()
+        .expect("Skills tab must be accessible");
+    skills_tab.invoke_accessible_default_action();
+
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Open skill voice-embedding")
+            .next()
+            .is_none(),
+        "empty skills list must not show the not-yet-created skill"
+    );
+
+    // Same update Dirty::SkillsListDiff -> set_available_skills performs
+    // after CreateSkill's rescan lands.
+    panel.set_available_skills(ModelRc::new(VecModel::from(vec![SkillOption {
+        name: "voice-embedding".into(),
+        description: "auto-pick visuals".into(),
+        scope: "project".into(),
+        path: "/proj/.skills/voice-embedding".into(),
+        started_from: "".into(),
+    }])));
+
+    let skill_row =
+        ElementHandle::find_by_accessible_label(&panel, "Open skill voice-embedding")
+            .next()
+            .expect("newly added skill must appear in the Skills list without a manual reload");
+    assert_eq!(
+        skill_row.accessible_label().unwrap_or_default(),
+        "Open skill voice-embedding"
+    );
+}
+
+/// setup-followups skills_top_tab_buttons_untested: Threads/Skills tabs,
+/// Show global skills toggle, and New skill affordance must be addressable
+/// and actually change UI state (not silent no-ops).
+#[test]
+fn skills_top_tab_buttons_switch_mode_and_toggle_global_visibility() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel.set_sidebar_expanded(true);
+    panel.set_available_skills(ModelRc::new(VecModel::from(vec![
+        SkillOption {
+            name: "project-only".into(),
+            description: "local".into(),
+            scope: "project".into(),
+            path: "/p/.skills/project-only".into(),
+            started_from: "".into(),
+        },
+        SkillOption {
+            name: "global-only".into(),
+            description: "shared".into(),
+            scope: "global".into(),
+            path: "/cache/skills/global-only".into(),
+            started_from: "".into(),
+        },
+    ])));
+
+    // Threads tab is default — project skill row is under Skills mode only.
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Open skill project-only")
+            .next()
+            .is_none(),
+        "skills list must not show while Threads tab is active"
+    );
+
+    let skills_tab = ElementHandle::find_by_accessible_label(&panel, "Show skills")
+        .next()
+        .expect("Skills tab");
+    skills_tab.invoke_accessible_default_action();
+
+    ElementHandle::find_by_accessible_label(&panel, "Open skill project-only")
+        .next()
+        .expect("project skill visible after switching to Skills tab");
+
+    // Global skills hidden by default (show-global-skills: false).
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Open skill global-only")
+            .next()
+            .is_none(),
+        "global skill hidden until Show global skills is on"
+    );
+
+    let show_global = ElementHandle::find_by_accessible_label(&panel, "Show global skills")
+        .next()
+        .expect("Show global skills toggle must be accessible");
+    show_global.invoke_accessible_default_action();
+
+    ElementHandle::find_by_accessible_label(&panel, "Open skill global-only")
+        .next()
+        .expect("global skill appears after enabling Show global skills");
+
+    let new_skill = ElementHandle::find_by_accessible_label(&panel, "New skill")
+        .next()
+        .expect("New skill control must be accessible on Skills tab");
+    new_skill.invoke_accessible_default_action();
+    // Dialog open is local Slint state — confirm field becomes addressable.
+    ElementHandle::find_by_accessible_label(&panel, "New skill name")
+        .next()
+        .expect("New skill dialog name field after New skill click");
+
+    let threads_tab = ElementHandle::find_by_accessible_label(&panel, "Show threads")
+        .next()
+        .expect("Threads tab");
+    threads_tab.invoke_accessible_default_action();
+    assert!(
+        ElementHandle::find_by_accessible_label(&panel, "Open skill project-only")
+            .next()
+            .is_none(),
+        "switching back to Threads must hide the skills list"
+    );
+}
+
+/// setup-followups agent_markdown_default_left_align: agent markdown
+/// runs must pack at the left edge of the bubble, not sit centered in
+/// free space. Slint's default HorizontalLayout `alignment: stretch`
+/// centers a group of non-stretching Text children — geometry check
+/// catches that regression where a mere "surface constructs" smoke test
+/// would not.
+#[test]
+fn agent_message_markdown_is_left_aligned_not_centered() {
+    i_slint_backend_testing::init_no_event_loop();
+
+    let panel = ChatPanel::new().expect("construct chat panel");
+    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+    panel.set_sidebar_expanded(false);
+
+    // Real markdown-lines path (not just fallback text): bold run mixed
+    // with plain so MarkdownView's per-run HorizontalLayout is exercised.
+    let lines = VecModel::from(vec![panel_rust::MarkdownLine {
+        kind: "p".into(),
+        runs: ModelRc::new(VecModel::from(vec![
+            panel_rust::MarkdownRun {
+                text: "Hello ".into(),
+                bold: false,
+                italic: false,
+                code: false,
+                strike: false,
+            },
+            panel_rust::MarkdownRun {
+                text: "agent".into(),
+                bold: true,
+                italic: false,
+                code: false,
+                strike: false,
+            },
+            panel_rust::MarkdownRun {
+                text: " body".into(),
+                bold: false,
+                italic: false,
+                code: false,
+                strike: false,
+            },
+        ])),
+        indent: 0,
+        ordinal: 0,
+        code_block_id: -1,
+    }]);
+    panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        kind: "agent".into(),
+        text: "Hello agent body".into(),
+        markdown_lines: ModelRc::new(lines),
+        expanded: false,
+        index: 0,
+        ..MessageItem::default()
+    }])));
+
+    // Force a geometry pass.
+    panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
+
+    // Geometry proof (ElementHandle has no text-content getter): short
+    // single-line Text boxes in the message band. Centered stretch-layout
+    // places a short "Hello agent body" cluster near x≈350–450 on a 900px
+    // window; left-pack lands near x≈90–160 (pad + rail + bubble pad).
+    let mut candidates: Vec<(f32, f32, f32)> = Vec::new(); // (x, y, w)
+    for el in ElementHandle::find_by_element_type_name(&panel, "Text") {
+        let size = el.size();
+        let pos = el.absolute_position();
+        // Agent body runs sit just under the 48px header (~y=69). Keep
+        // width under 80 so compose/header labels are excluded.
+        if size.height > 8.0
+            && size.height < 22.0
+            && size.width > 8.0
+            && size.width < 80.0
+            && pos.y > 48.0
+            && pos.y < 400.0
+            && pos.x > 48.0
+            && pos.x < 300.0
+        {
+            candidates.push((pos.x, pos.y, size.width));
+        }
+    }
+    assert!(
+        !candidates.is_empty(),
+        "expected agent-body Text runs in the message column"
+    );
+    candidates.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap()
+            .then(a.0.partial_cmp(&b.0).unwrap())
+    });
+    let band_y = candidates[0].1;
+    let band: Vec<_> = candidates
+        .into_iter()
+        .filter(|(_, y, _)| (*y - band_y).abs() < 4.0)
+        .collect();
+    let min_x = band.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+    let max_right = band
+        .iter()
+        .map(|(x, _, w)| x + w)
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        min_x < 200.0,
+        "agent markdown starts too far right (min_x={min_x:.1} band_y={band_y:.1}); \
+         expected left-aligned, not centered (centered ~350+)"
+    );
+    // "Hello " + "agent" + " body" left-packed is well under ~160px.
+    assert!(
+        max_right - min_x < 180.0,
+        "agent markdown runs span too much width ({:.1}px from x={min_x:.1}); \
+         stretch may still be distributing them",
+        max_right - min_x
     );
 }

@@ -11,6 +11,21 @@ import { MarkdownLine, MarkdownRun } from "../types.slint";
 // never wraps text itself: it just lays each line's runs out
 // horizontally and stacks lines vertically, styling each row by `kind`.
 //
+// ## Why left-align is explicit (and easy to regress)
+//
+// Slint `HorizontalLayout` defaults to `alignment: stretch`. When every
+// child is content-sized (`Text` has horizontal-stretch: 0), leftover
+// free space is *not* left at the end -- the engine packs the group as a
+// whole in the middle of the row. That is the opposite of CSS flexbox
+// (`justify-content: flex-start` default). Setting each run's
+// `horizontal-alignment: left` only controls glyphs *inside* that run's
+// own box; it does not decide where the box sits in the row. Visible
+// symptom: agent markdown bodies look centered in the bubble.
+//
+// Fix: every horizontal row uses `alignment: start` and a trailing
+// zero-height stretch spacer that absorbs free space so even a future
+// accidental `stretch` realignment cannot re-center the run group.
+//
 // Known simplifications vs. the ratatui original (acceptable for a v1
 // chat body, see markdown.rs's module doc for the full rationale):
 // no code-fence syntax highlighting, no clickable link targets, tables
@@ -27,10 +42,27 @@ export component MarkdownView inherits VerticalLayout {
     in property <length> row-width: 0px;
 
     spacing: 0px;
+    // Cross-axis for VerticalLayout = horizontal. Stretch children to
+    // the full row width so text starts at the left edge of the bubble,
+    // not at the left edge of a shrink-wrapped content column floating
+    // inside a wider parent.
+    alignment: stretch;
 
     function same-code-group(idx: int) -> bool {
         idx > 0 && root.lines[idx].kind == "code" && root.lines[idx - 1].kind == "code"
             && root.lines[idx].code-block-id == root.lines[idx - 1].code-block-id
+    }
+
+    pure function heading-size(kind: string) -> length {
+        if kind == "h1" {
+            18px
+        } else if kind == "h2" {
+            16px
+        } else if kind == "h3" {
+            14px
+        } else {
+            13px
+        }
     }
 
     if lines.length == 0 : Text {
@@ -40,7 +72,11 @@ export component MarkdownView inherits VerticalLayout {
         color: Theme.text-primary;
         wrap: word-wrap;
         horizontal-alignment: left;
-        width: row-width > 0px ? row-width : parent.width;
+        // Stretch across the bubble; no explicit width (can't combine
+        // with min-width under Slint's layout rules).
+        horizontal-stretch: 1;
+        preferred-width: 0px;
+        min-width: 0px;
     }
 
     for line[i] in lines : VerticalLayout {
@@ -54,100 +90,101 @@ export component MarkdownView inherits VerticalLayout {
         property <bool> group-end: !is-code
             || i + 1 >= root.lines.length
             || !(root.lines[i + 1].kind == "code" && root.lines[i + 1].code-block-id == line.code-block-id);
+
+        horizontal-stretch: 1;
+        preferred-width: 0px;
+        min-width: 0px;
+        alignment: stretch;
+
         // Contiguous lines in the same code-fence group sit flush
         // against each other (one continuous background box); every
         // other line gets a small breathing-room gap above it.
         if i > 0 && !(is-code && !group-start) : Rectangle { height: Metrics.space-2; }
 
-        HorizontalLayout {
-            padding-left: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);
-            padding-right: is-code ? Metrics.space-4 : 0px;
-            padding-top: is-code ? (group-start ? Metrics.space-3 : 0px) : 0px;
-            padding-bottom: is-code ? (group-end ? Metrics.space-3 : 0px) : 0px;
-            spacing: Metrics.space-2;
+        // One content row. Background for code is painted *behind* the
+        // runs (same geometry), not as a stretch sibling that steals
+        // half the row.
+        row-box := Rectangle {
+            horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            background: is-code ? Theme.bg-terminal : transparent;
+            border-color: is-code ? Theme.border-terminal : transparent;
+            border-width: is-code ? 1px : 0px;
+            border-top-left-radius: is-code && group-start ? Theme.radius-sm : 0px;
+            border-top-right-radius: is-code && group-start ? Theme.radius-sm : 0px;
+            border-bottom-left-radius: is-code && group-end ? Theme.radius-sm : 0px;
+            border-bottom-right-radius: is-code && group-end ? Theme.radius-sm : 0px;
 
-            Rectangle {
-                // Code background box -- rounded only at the top/bottom
-                // of a contiguous fenced-block group so grouped lines
-                // read as one seamless card, not stacked separate boxes.
-                visible: is-code;
-                background: Theme.bg-terminal;
-                border-color: Theme.border-terminal;
-                border-width: 1px;
-                border-top-left-radius: group-start ? Theme.radius-sm : 0px;
-                border-top-right-radius: group-start ? Theme.radius-sm : 0px;
-                border-bottom-left-radius: group-end ? Theme.radius-sm : 0px;
-                border-bottom-right-radius: group-end ? Theme.radius-sm : 0px;
-            }
-
-            // Blockquote left accent bar.
-            if is-quote : Rectangle {
-                width: 2px;
-                background: Theme.border-strong;
-            }
-
-            if is-hr : Rectangle {
-                height: 1px;
-                horizontal-stretch: 1;
-                y: parent.height / 2;
-                background: Theme.border-default;
-            }
-
-            if is-li : Text {
-                text: line.kind == "li-ordered" ? line.ordinal + "." : "\u{2022}";
-                font-family: Theme.font-sans;
-                font-size: 12px * Theme.font-scale;
-                color: Theme.text-secondary;
-                horizontal-alignment: left;
-                vertical-alignment: top;
-            }
-
-            if !is-hr : HorizontalLayout {
-                horizontal-stretch: 1;
-                // Without this, Slint's default `stretch` alignment
-                // packs this row's (non-stretching) run `Text`s as a
-                // group centered/distributed across the full stretched
-                // width of this layout, not left-packed -- each run's own
-                // `horizontal-alignment: left` below only controls glyph
-                // alignment *inside* that run's own box, which doesn't
-                // matter if the box itself already sits mid-row. Visible
-                // live as agent replies rendering centered instead of
-                // left-aligned.
+            HorizontalLayout {
+                width: 100%;
+                padding-left: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);
+                padding-right: is-code ? Metrics.space-4 : 0px;
+                padding-top: is-code ? (group-start ? Metrics.space-3 : 0px) : 0px;
+                padding-bottom: is-code ? (group-end ? Metrics.space-3 : 0px) : 0px;
+                spacing: Metrics.space-2;
+                // CRITICAL: start packing — see module comment.
                 alignment: start;
-                for run[ri] in line.runs : Text {
-                    text: run.text;
-                    font-family: (run.code || is-code) ? Theme.font-mono : Theme.font-sans;
-                    font-size: (is-heading ? heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
-                    font-weight: (run.bold || is-heading) ? 700 : 400;
-                    font-italic: run.italic;
-                    color: run.strike ? Theme.text-muted
-                        : is-code ? Theme.text-terminal
-                        : Theme.text-primary;
-                    // `md_formatter_default_alignment` phase: every markdown
-                    // row (paragraph, heading, list item, table row, quote)
-                    // must default to left alignment when the source markdown
-                    // doesn't specify one -- explicit here rather than relying
-                    // on Text's own implicit default, since this component has
-                    // no concept of column/paragraph alignment at all today
-                    // (table cells are joined into one plain string, see
-                    // markdown.rs's BlockAst::Table doc comment) and never
-                    // will unless a real alignment marker is threaded through.
+
+                // Blockquote left accent bar.
+                if is-quote : Rectangle {
+                    width: 2px;
+                    horizontal-stretch: 0;
+                    background: Theme.border-strong;
+                }
+
+                if is-hr : Rectangle {
+                    height: 1px;
+                    horizontal-stretch: 1;
+                    y: parent.height / 2;
+                    background: Theme.border-default;
+                }
+
+                if is-li : Text {
+                    text: line.kind == "li-ordered" ? line.ordinal + "." : "\u{2022}";
+                    font-family: Theme.font-sans;
+                    font-size: 12px * Theme.font-scale;
+                    color: Theme.text-secondary;
                     horizontal-alignment: left;
                     vertical-alignment: top;
+                    horizontal-stretch: 0;
+                }
+
+                if !is-hr : HorizontalLayout {
+                    // Content-sized run cluster, packed by the outer
+                    // `alignment: start`. Do *not* set horizontal-stretch:1
+                    // here without a trailing spacer — a full-width stretch
+                    // child with only non-stretch Text grandchildren and
+                    // default stretch alignment re-centers the glyph group.
+                    alignment: start;
+                    horizontal-stretch: 0;
+                    spacing: 0px;
+                    for run[ri] in line.runs : Text {
+                        text: run.text;
+                        font-family: (run.code || is-code) ? Theme.font-mono : Theme.font-sans;
+                        font-size: (is-heading ? root.heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
+                        font-weight: (run.bold || is-heading) ? 700 : 400;
+                        font-italic: run.italic;
+                        color: run.strike ? Theme.text-muted
+                            : is-code ? Theme.text-terminal
+                            : Theme.text-primary;
+                        horizontal-alignment: left;
+                        vertical-alignment: top;
+                        horizontal-stretch: 0;
+                    }
+                }
+
+                // Absorbs free space so run/bullet boxes stay at the
+                // start edge even if this layout's alignment is ever
+                // changed back to the Slint default (`stretch`).
+                if !is-hr : Rectangle {
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    preferred-width: 0px;
+                    height: 0px;
+                    vertical-stretch: 0;
                 }
             }
-        }
-    }
-
-    pure function heading-size(kind: string) -> length {
-        if kind == "h1" {
-            18px
-        } else if kind == "h2" {
-            16px
-        } else if kind == "h3" {
-            14px
-        } else {
-            13px
         }
     }
 }

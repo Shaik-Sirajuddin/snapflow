@@ -591,13 +591,16 @@ export component Sidebar inherits Rectangle {
                                 // frozen except when some unrelated
                                 // interaction (e.g. a mouse move) happened
                                 // to trigger a repaint anyway.
-                                property <angle> load-spin: thread.status == "loading" ? 360deg : 0deg;
-                                animate load-spin {
-                                    duration: 800ms;
-                                    iteration-count: thread.status == "loading" ? -1 : 1;
-                                    easing: linear;
-                                }
-                                if thread.status == "loading" : Rectangle {
+                                // audit-fixes animation_tick_loaders +
+                                // cancelling_status_sidebar_parity: spin on
+                                // loading *or* cancelling (composer already
+                                // treats cancelling as in-flight).
+                                property <bool> row-busy:
+                                    thread.status == "loading" || thread.status == "cancelling";
+                                property <angle> load-spin: row-busy
+                                    ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                                    : 0deg;
+                                if row-busy : Rectangle {
                                     width: 14px;
                                     height: 14px;
                                     Icon {
@@ -613,7 +616,7 @@ export component Sidebar inherits Rectangle {
                                     size: 14px;
                                     color: Theme.bg-primary;
                                 }
-                                if thread.status != "loading" && thread.status != "error" : Rectangle {
+                                if !row-busy && thread.status != "error" : Rectangle {
                                     width: 6px;
                                     height: 6px;
                                     border-radius: 3px;
@@ -721,22 +724,43 @@ export component Sidebar inherits Rectangle {
                                     max-width: 64px;
                                 }
                                 if expanded && root.rename-thread-index != i
-                                    && !thread.background && i == selected-thread : Text {
+                                    && thread.archived : Text {
+                                    // Archive is a local presentation flag
+                                    // (no gateway call) -- without this badge
+                                    // the only feedback is the archive icon
+                                    // disappearing, which looks like a no-op.
+                                    text: "ARCHIVED";
+                                    color: Theme.text-muted;
+                                    font-size: 8px * Theme.font-scale;
+                                    font-family: Theme.font-mono;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                                if expanded && root.rename-thread-index != i
+                                    && thread.closed && !thread.archived : Text {
+                                    text: "CLOSED";
+                                    color: Theme.text-muted;
+                                    font-size: 8px * Theme.font-scale;
+                                    font-family: Theme.font-mono;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 0;
+                                }
+                                if expanded && root.rename-thread-index != i
+                                    && !thread.background && !thread.closed && !thread.archived
+                                    && i == selected-thread : Text {
                                     text: "ACTIVE";
                                     color: Theme.text-muted;
                                     font-size: 8px * Theme.font-scale;
                                     font-family: Theme.font-mono;
                                     vertical-alignment: center;
+                                    horizontal-stretch: 0;
                                 }
-                                // `|| i == selected-thread`: rename/close/
-                                // delete/archive were hover-only, meaning a
-                                // keyboard-only user (or a real e2e test) had no
-                                // way to ever reach any of them -- the currently
-                                // selected row's own actions now stay visible
-                                // without requiring a mouse hover, matching how
-                                // real file managers/mail clients keep the
-                                // selected row's actions visible alongside
-                                // hover-reveal for other rows.
+                                // Trailing action cluster: stretch 0 so the
+                                // title elides before these get squeezed off
+                                // the 200px compact rail. Always visible for
+                                // the selected row (and on hover for others)
+                                // so keyboard / headless e2e can reach them
+                                // without a pointer hover.
                                 if expanded && root.rename-thread-index != i && (thread-row.has-hover || i == selected-thread) : IconButton {
                                     btn-width: 18px;
                                     btn-height: 18px;
@@ -1035,6 +1059,23 @@ export component Sidebar inherits Rectangle {
         title: "New skill";
         field-accessible-label: "New skill name";
         confirm-label: "Create";
-        confirmed(name) => { root.new-skill-requested(name, "project"); }
+        // Prefer a project-local skill when a project is open so the new
+        // entry is visible under the default sidebar filter (project
+        // skills always show; global skills need the "Show global
+        // skills" toggle). Fall back to global when no project is open
+        // -- hard-coding "project" used to fail CreateSkill with
+        // "cannot create a project skill without an open project", so
+        // the dialog closed, nothing was written, and the list never
+        // gained the skill (setup-followups skill_not_listed_after_creation).
+        confirmed(name) => {
+            if (root.active-project-path == "") {
+                // Make the new global skill visible immediately rather
+                // than requiring a separate toggle discovery.
+                root.show-global-skills = true;
+                root.new-skill-requested(name, "global");
+            } else {
+                root.new-skill-requested(name, "project");
+            }
+        }
     }
 }

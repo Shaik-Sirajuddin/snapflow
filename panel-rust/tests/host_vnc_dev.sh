@@ -113,9 +113,25 @@ printf 'display   : %s\n' "$display"
 printf 'gateway   : http://127.0.0.1:%s (health ok)\n' "$gateway_port"
 printf 'vnc       : localhost:%s  (raw VNC, no password -- vncviewer localhost:%s)\n' "$vnc_port" "$vnc_port"
 printf 'pids      : xvfb=%s vnc=%s acpx-server=%s shotcut=%s\n' "$xvfb_pid" "$vnc_pid" "$server_pid" "$shotcut_pid"
-printf 'stop with : kill %s %s %s %s\n' "$shotcut_pid" "$server_pid" "$vnc_pid" "$xvfb_pid"
+printf 'stop with : %s/stop.sh  (or kill %s %s %s %s)\n' \
+    "$state_dir" "$shotcut_pid" "$server_pid" "$vnc_pid" "$xvfb_pid"
 printf 'logs      : %s/shotcut.stderr.log , %s/acpx/server.stderr.log\n' "$state_dir" "$state_dir"
 printf '=====================================\n\n'
+
+# setup-followups stale_threads_not_torn_down_after_testing: companion
+# stop script kills shotcut + acpx-server (sessions die with the server).
+cat > "$state_dir/stop.sh" <<'STOP'
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/dev/null
+source "$here/pids.env"
+for p in "${shotcut_pid:-}" "${server_pid:-}" "${vnc_pid:-}" "${xvfb_pid:-}" "${hold_pid:-}"; do
+  if [ -n "${p:-}" ]; then kill "$p" 2>/dev/null || true; fi
+done
+echo "stopped panel VNC harness under $here"
+STOP
+chmod +x "$state_dir/stop.sh"
 
 sleep "${PANEL_VNC_DEV_SETTLE_SECONDS:-5}"
 if ! kill -0 "$shotcut_pid" 2>/dev/null; then

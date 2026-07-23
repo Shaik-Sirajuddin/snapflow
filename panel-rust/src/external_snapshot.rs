@@ -309,6 +309,15 @@ impl<'a> ExternalSnapshotSource<'a> {
             &query,
         );
         let visible_indices: Vec<usize> = items.iter().map(|item| item.real_index).collect();
+        // Profile/session identity live on the TEA ThreadModel, not the
+        // name/state slices build_thread_items filters -- post-populate
+        // them the same way provider/model/project are, so a frame poll
+        // does not rewrite every row with has_session=false /
+        // profile_name="" and force a ThreadListDiff + set_row_data
+        // every tick (which tears down sidebar if-conditional children
+        // such as the close/delete IconButtons and invalidates live MCP
+        // element handles).
+        let model_snapshot = self.panel.model.borrow();
         let rows: Vec<models::VisibleThreadItem> = items
             .into_iter()
             .map(|item| {
@@ -333,6 +342,10 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .unwrap_or_default()
                     .into();
                 row.project_path = project_path.into();
+                if let Some(thread) = model_snapshot.threads.get(item.real_index) {
+                    row.profile_name = thread.profile_name.clone().unwrap_or_default().into();
+                    row.has_session = thread.session_id.is_some();
+                }
                 if !row.closed
                     && self
                         .panel
@@ -353,6 +366,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                 }
             })
             .collect();
+        drop(model_snapshot);
         msg::ThreadListSnapshot {
             visible_indices,
             visible_thread_ids: rows.iter().map(|row| row.thread_id.clone()).collect(),

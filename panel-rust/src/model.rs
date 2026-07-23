@@ -52,6 +52,10 @@ pub struct ThreadModel {
     pub state: ThreadState,
     pub error: Option<String>,
     pub send_queue: SendQueue,
+    /// Per-thread compose draft (leak_audit_report §2.5 / §4.2). The
+    /// global `Model::compose_text` is only the *active* buffer for the
+    /// displayed thread; switching saves/restores via this field.
+    pub compose_draft: String,
     pub closed: bool,
     // setup-followups plan, archive_thread_backend_verify: purely local
     // presentation flag (see AgentBridge::archive_thread's doc comment) --
@@ -152,6 +156,7 @@ impl Default for ThreadModel {
             state: ThreadState::Idle,
             error: None,
             send_queue: SendQueue::default(),
+            compose_draft: String::new(),
             closed: false,
             archived: false,
             message_ids: Vec::new(),

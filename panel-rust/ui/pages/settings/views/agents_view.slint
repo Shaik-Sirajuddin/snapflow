@@ -8,6 +8,7 @@ import { SettingsSearchBar } from "../components/search_bar.slint";
 import { AgentCard } from "../components/agent_card.slint";
 import { ProfileOption, AgentCatalogEntry, RemoteSessionOption } from "../../../types.slint";
 import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { TextUtil } from "../../../base/text_util.slint";
 
 // Agents left-tab view -- phase 1 shell. Re-hosts every slice of the
 // former `components/settings_sheet.slint` that is agent/profile/session
@@ -65,15 +66,26 @@ export component AgentsView inherits Rectangle {
     // two-step confirm rather than an immediate delete.
     property <string> profile-pending-delete: "";
 
-    // Agents-grid-local search -- scoped to just this grid, separate from
-    // the page-level `SettingsSearchBar` in `settings_page.slint` (which
-    // filters nothing yet either, per that component's own doc comment --
-    // Slint's `string` type has no `contains`/`index-of` builtin, so real
-    // substring filtering needs a small Rust-side helper; wiring the query
-    // itself now and leaving actual filtering for that later pass, same
-    // posture the page-level bar already takes).
+    // Agents-grid-local search -- scoped to this grid (not the page-level
+    // SettingsSearchBar). Uses TextUtil.matches-filter (Rust contains-ci)
+    // against each card's name + id, same helper as sidebar thread/skill
+    // search. Empty query shows the full catalog.
     property <string> agent-search-query: "";
     in-out property <string> default-agent-id: "";
+
+    pure function agent-matches(index: int) -> bool {
+        if (index < 0 || index >= root.agent-catalog.length) {
+            return false;
+        }
+        if (root.agent-search-query == "") {
+            return true;
+        }
+        // Match name or id (name may be empty for some catalog rows).
+        return TextUtil.matches-filter(
+            root.agent-catalog[index].name + "\n" + root.agent-catalog[index].id,
+            root.agent-search-query,
+        );
+    }
 
     background: transparent;
 
@@ -286,6 +298,8 @@ export component AgentsView inherits Rectangle {
 
         agent-search-bar := SettingsSearchBar {
             width: parent.width;
+            placeholder: "Search agents...";
+            bar-accessible-label: "Search agents";
             query <=> root.agent-search-query;
         }
 
@@ -324,8 +338,14 @@ export component AgentsView inherits Rectangle {
         // divider slicing through a row anyway. Making the default agent
         // *physically jump* to the top on toggle (vs. the connected-status
         // grouping here) would need a real reorder primitive Slint doesn't
-        // have and is deferred to a Rust-side ordering pass -- the default
+        // have, and is deferred to a Rust-side ordering pass -- the default
         // card still reads as default via its own tint wherever it sits.
+        //
+        // SEARCH FILTER: rows/cards that fail `agent-matches` are omitted
+        // via `if` (not merely zero-height), so a filtered grid collapses
+        // cleanly instead of leaving empty slots. The installed/uninstalled
+        // divider is suppressed while a query is active -- partial rows
+        // make the status boundary ambiguous.
         //
         VerticalLayout {
             width: parent.width;
@@ -346,16 +366,24 @@ export component AgentsView inherits Rectangle {
             for row-idx in row-count : VerticalLayout {
                 spacing: Metrics.space-6;
                 property <int> first-agent-index: row-idx * cards-per-row;
+                property <bool> first-visible: root.agent-matches(first-agent-index);
+                property <bool> second-visible:
+                    cards-per-row == 2
+                    && first-agent-index + 1 < root.agent-catalog.length
+                    && root.agent-matches(first-agent-index + 1);
+                property <bool> row-visible: first-visible || second-visible;
 
-                if root.agent-catalog[first-agent-index].status != "installed"
+                if row-visible
+                    && root.agent-search-query == ""
+                    && root.agent-catalog[first-agent-index].status != "installed"
                     && (first-agent-index == 0 || root.agent-catalog[first-agent-index - 1].status == "installed")
                     : SettingsDivider { width: parent.width; }
 
-                HorizontalLayout {
+                if row-visible : HorizontalLayout {
                     spacing: Metrics.space-6;
                     alignment: start;
 
-                    AgentCard {
+                    if first-visible : AgentCard {
                         agent-id: root.agent-catalog[first-agent-index].id;
                         agent-name: root.agent-catalog[first-agent-index].name != ""
                             ? root.agent-catalog[first-agent-index].name : root.agent-catalog[first-agent-index].id;
@@ -372,7 +400,7 @@ export component AgentsView inherits Rectangle {
                         set-enabled(new-enabled) => { root.agent-set-enabled(root.agent-catalog[first-agent-index].id, new-enabled); }
                     }
 
-                    if cards-per-row == 2 && first-agent-index + 1 < root.agent-catalog.length : AgentCard {
+                    if second-visible : AgentCard {
                         agent-id: root.agent-catalog[first-agent-index + 1].id;
                         agent-name: root.agent-catalog[first-agent-index + 1].name != ""
                             ? root.agent-catalog[first-agent-index + 1].name : root.agent-catalog[first-agent-index + 1].id;

@@ -104,26 +104,69 @@ pub(crate) fn visible_thread_row(
     real_index: usize,
 ) -> Option<crate::models::VisibleThreadItem> {
     let thread = model.threads.get(real_index)?;
+    // Prefer durable id; fall back to synthetic so keys always match
+    // what ThreadListDiff stored when bridge binding was not yet known.
+    let thread_id = if thread.thread_id.is_empty() {
+        format!("thread:{real_index}")
+    } else {
+        thread.thread_id.clone()
+    };
+    // Preserve display-only fields last written by the frame snapshot
+    // (description/provider/model/project/background). A bare
+    // `ThreadItem::default()` here used to wipe them on every
+    // Dirty::ThreadRow (send/cancel/turn-end), so the sidebar looked
+    // stuck or "not updating" while only status flickered — and fought
+    // the next frame's full snapshot (setup-followups
+    // thread_view_items_not_updating_ui).
+    let cached = model
+        .thread_rows
+        .iter()
+        .find(|row| row.real_index == real_index || row.thread_id == thread_id)
+        .map(|row| row.item.clone());
+    let status = if thread.archived {
+        "archived"
+    } else if thread.closed {
+        "closed"
+    } else {
+        thread.state.as_str()
+    };
     Some(crate::models::VisibleThreadItem {
         real_index,
-        thread_id: thread.thread_id.clone(),
+        thread_id,
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
-            status: thread.state.as_str().into(),
-            busy: matches!(thread.state, ThreadState::Loading),
+            status: status.into(),
+            busy: matches!(
+                thread.state,
+                ThreadState::Loading | ThreadState::Cancelling
+            ) && !thread.closed
+                && !thread.archived,
             open: true,
             closed: thread.closed,
             archived: thread.archived,
             profile_name: thread.profile_name.clone().unwrap_or_default().into(),
-            // Once a real ACP session has attached, profile_name is
-            // locked -- open_session_maybe_profiled only ever reads it
-            // once, at session creation, and ACP itself has no
-            // primitive for moving a live session to a different
-            // backend (confirmed against Zed's own
-            // AgentSessionConfigOptions::set_config_option, which is
-            // likewise per-connection only).
             has_session: thread.session_id.is_some(),
-            ..crate::ThreadItem::default()
+            description: cached
+                .as_ref()
+                .map(|c| c.description.clone())
+                .unwrap_or_default(),
+            background: cached.as_ref().map(|c| c.background).unwrap_or(false),
+            provider: cached
+                .as_ref()
+                .map(|c| c.provider.clone())
+                .unwrap_or_default(),
+            model: cached
+                .as_ref()
+                .map(|c| c.model.clone())
+                .unwrap_or_default(),
+            project_path: cached
+                .as_ref()
+                .map(|c| c.project_path.clone())
+                .unwrap_or_default(),
+            project_name: cached
+                .as_ref()
+                .map(|c| c.project_name.clone())
+                .unwrap_or_default(),
         },
     })
 }
@@ -141,6 +184,77 @@ fn thread_list_dirty_with_keys(model: &mut Model, old_keys: Vec<String>) -> Dirt
     model.visible_indices = new_indices;
     model.thread_rows = rows.clone();
     Dirty::ThreadListDiff(crate::dirty::diff_by_id(&old_keys, &new_keys, &rows))
+}
+
+/// leak_audit_report §1 / §4.1 + per_thread_compose_draft: after the
+/// filtered selection index is set, swap compose draft and (when the
+/// displayed real thread changes) immediately clear shared view models so
+/// the previous thread does not flash into the new one while FrameInput
+/// snapshot is still in flight.
+fn apply_thread_selection_switch(model: &mut Model) -> (Vec<Effect>, Vec<Dirty>) {
+    let real_idx = selected_real_index(model);
+    let prev_displayed = model.displayed_thread;
+    let switched = prev_displayed != Some(real_idx);
+
+    let mut dirty = vec![Dirty::Scalar(ScalarField::SelectedThread)];
+
+    if switched {
+        // Save outgoing draft; restore incoming draft into the active buffer.
+        if let Some(prev) = prev_displayed {
+            if let Some(thread) = model.threads.get_mut(prev) {
+                thread.compose_draft = std::mem::take(&mut model.compose_text);
+            }
+        } else if !model.compose_text.is_empty() {
+            // No prior displayed thread but global compose has text — keep
+            // it on the newly selected thread only after switch.
+        }
+        model.compose_text = model
+            .threads
+            .get(real_idx)
+            .map(|thread| thread.compose_draft.clone())
+            .unwrap_or_default();
+        dirty.push(Dirty::Scalar(ScalarField::ComposeText));
+
+        // Force next selected_thread_snapshot to treat this as a switch
+        // (resync messages/terminals/pending even if target cache is empty).
+        model.displayed_thread = None;
+
+        let old_msg_keys = model.message_model_keys.borrow().clone();
+        if !old_msg_keys.is_empty() {
+            dirty.push(Dirty::MessagesDiff {
+                thread_id: String::new(),
+                ops: crate::dirty::diff_by_id(
+                    &old_msg_keys,
+                    &[],
+                    &Vec::<crate::MessageItem>::new(),
+                ),
+            });
+        }
+        dirty.push(Dirty::PendingRequest {
+            thread_id: String::new(),
+        });
+        dirty.push(Dirty::Error {
+            thread_id: String::new(),
+            detail: crate::dirty::ErrorDetail {
+                message: String::new(),
+            },
+        });
+        dirty.push(Dirty::Terminal {
+            id: String::new(),
+        });
+        dirty.push(Dirty::LocalTerminal);
+    }
+
+    let thread_id = model
+        .threads
+        .get(real_idx)
+        .map(|thread| thread.thread_id.clone());
+    (
+        thread_id
+            .map(|thread_id| vec![Effect::PersistSelectedThread { thread_id }])
+            .unwrap_or_default(),
+        dirty,
+    )
 }
 
 fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>) {
@@ -264,21 +378,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 return (vec![], vec![]);
             }
             model.selected_thread = idx.min(visible_len - 1);
-            let real_idx = model
-                .visible_indices
-                .get(model.selected_thread)
-                .copied()
-                .unwrap_or(model.selected_thread);
-            let thread_id = model
-                .threads
-                .get(real_idx)
-                .map(|thread| thread.thread_id.clone());
-            (
-                thread_id
-                    .map(|thread_id| vec![Effect::PersistSelectedThread { thread_id }])
-                    .unwrap_or_default(),
-                vec![Dirty::Scalar(ScalarField::SelectedThread)],
-            )
+            apply_thread_selection_switch(model)
         }
         ThreadMsg::NavigateDelta(delta) => {
             let visible_len = if model.visible_indices.is_empty() {
@@ -291,21 +391,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             }
             let next = wrap_thread_index(model.selected_thread, delta, visible_len);
             model.selected_thread = next;
-            let real_idx = model
-                .visible_indices
-                .get(model.selected_thread)
-                .copied()
-                .unwrap_or(model.selected_thread);
-            let thread_id = model
-                .threads
-                .get(real_idx)
-                .map(|thread| thread.thread_id.clone());
-            (
-                thread_id
-                    .map(|thread_id| vec![Effect::PersistSelectedThread { thread_id }])
-                    .unwrap_or_default(),
-                vec![Dirty::Scalar(ScalarField::SelectedThread)],
-            )
+            apply_thread_selection_switch(model)
         }
         ThreadMsg::CloseRequested(idx) => {
             let Some(thread) = model.threads.get_mut(idx) else {
@@ -982,10 +1068,11 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 ),
             }
         }
-        EffectResultMsg::SkillCreated(Ok(path)) => (
-            vec![Effect::OpenSkillEditor { path }],
-            vec![Dirty::SkillsListDiff(vec![])],
-        ),
+        // Skills list is refreshed by effect_executor before this
+        // result is folded (see CreateSkill's refresh-before-open
+        // order); do not emit an empty SkillsListDiff here -- that
+        // would re-push the pre-create list and race the real rescan.
+        EffectResultMsg::SkillCreated(Ok(path)) => (vec![Effect::OpenSkillEditor { path }], vec![]),
         EffectResultMsg::SkillWritten(Ok(())) | EffectResultMsg::SkillPromoted(Ok(())) => {
             (vec![], vec![])
         }
@@ -2696,7 +2783,9 @@ mod tests {
             Msg::Effect(EffectResultMsg::SkillCreated(Ok(path.clone()))),
         );
         assert_eq!(effects, vec![Effect::OpenSkillEditor { path }]);
-        assert!(matches!(dirty.as_slice(), [Dirty::SkillsListDiff(_)]));
+        // Skills list is refreshed by the effect executor *before* this
+        // result is folded; SkillCreated itself only opens the editor.
+        assert!(dirty.is_empty());
     }
 
     #[test]

@@ -31,6 +31,9 @@ export component SearchableDropdown inherits Rectangle {
     // session has attached) rather than simply absent, so the user sees
     // *why* it's inert instead of it vanishing.
     in property <bool> enabled: true;
+    // Narrow docks may shrink below the default 72px so several
+    // triggers still fit side-by-side without painting past the panel edge.
+    in property <length> trigger-min-width: 72px;
     // id, value, label — label lets callers update the trigger without
     // re-scanning the model.
     callback entry-selected(string /* id */, string /* value */, string /* label */);
@@ -247,7 +250,7 @@ export component SearchableDropdown inherits Rectangle {
     height: 24px;
     preferred-height: 24px;
     vertical-stretch: 0;
-    min-width: 72px;
+    min-width: root.trigger-min-width;
     max-width: 140px;
     background: trigger-touch.has-hover || open ? Theme.bg-primary-container : Theme.bg-canvas;
     animate background { duration: 100ms; }

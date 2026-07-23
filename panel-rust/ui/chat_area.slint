@@ -65,10 +65,19 @@ export component ChatArea inherits Rectangle {
     // Active model/config option display name for the model trigger
     // (empty until advertised; trigger falls back to "Model").
     in property <string> config-trigger-label: "";
+    // Reasoning effort (dedicated dropdown; empty hides it).
+    in property <[DropdownEntry]> reasoning-dropdown-entries: [];
+    in property <string> reasoning-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence.
     in property <[DropdownEntry]> profile-dropdown-entries: [];
     in property <string> profile-trigger-label: "";
     in property <bool> active-thread-has-session: false;
+    // Dedicated Fast toggle (binary config option; not in model dropdown).
+    in property <bool> fast-mode-available: false;
+    in property <bool> fast-mode-enabled: false;
+    in property <string> fast-mode-option-id: "fastMode";
+    in property <string> fast-mode-on-value: "on";
+    in property <string> fast-mode-off-value: "off";
     // Session context usage for the compose-bar context ring (ui.yaml).
     in property <float> context-ratio: 0.0;
     in property <int> context-used-tokens: 0;
@@ -304,12 +313,12 @@ export component ChatArea inherits Rectangle {
             // load-spin and chat_input_layout.slint's composer spinner
             // (commit 800bd65) -- this header spinner was the one
             // instance of the same bug class left unmigrated.
-            property <angle> header-spin: (root.sending || connection-status == "Connecting...") ? 360deg : 0deg;
-            animate header-spin {
-                duration: 800ms;
-                iteration-count: (root.sending || connection-status == "Connecting...") ? -1 : 1;
-                easing: linear;
-            }
+            // audit-fixes animation_tick_loaders: continuous spin via tick.
+            property <bool> header-spinning:
+                root.sending || connection-status == "Connecting...";
+            property <angle> header-spin: header-spinning
+                ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                : 0deg;
             HorizontalLayout {
                 width: 100%;
                 height: 100%;
@@ -683,14 +692,12 @@ export component ChatArea inherits Rectangle {
                     // never repainted on its own and looked frozen except
                     // when some unrelated interaction (e.g. a mouse move)
                     // happened to trigger a repaint anyway.
-                    property <float> flow-t: is-live-tail ? 1.0 : 0.0;
-                    animate flow-t {
-                        // ~1.2s full trip, matching the original timer's
-                        // 30 × 40ms cadence, then loop.
-                        duration: 1200ms;
-                        iteration-count: is-live-tail ? -1 : 1;
-                        easing: linear;
-                    }
+                    // audit-fixes animation_tick_loaders: live-tail pulse
+                    // must not mount already at 1.0 (animate never runs).
+                    // Drive travel with animation-tick while live.
+                    property <float> flow-t: is-live-tail
+                        ? mod(animation-tick(), 1200ms) / 1200ms
+                        : 0.0;
                     property <length> flow-blob: 36px;
 
                     // Left rail track — always reserved for non-user rows
@@ -747,6 +754,10 @@ export component ChatArea inherits Rectangle {
                         min-width: 0px;
                         vertical-stretch: 0;
                         item: msg;
+                        // Thinking rows reuse MessageItem.expanded + the
+                        // shared toggle-expanded round-trip (same as
+                        // ToolEventRow / MessageCard log bodies).
+                        toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
                     if is-tool-event : ToolEventRow {
                         horizontal-stretch: 1;
@@ -895,18 +906,29 @@ export component ChatArea inherits Rectangle {
             background: Theme.border-default;
         }
         // User input + mode/model selectors (extracted ChatInputLayout).
+        // vertical-stretch:0 keeps the composer a chrome band so the
+        // message Flickable remains the only elastic region (bottom-box
+        // cutoff regressions when this band stretched).
         chat-input := ChatInputLayout {
             width: 100%;
             horizontal-stretch: 1;
+            vertical-stretch: 0;
             compose-text <=> compose-text;
             sending: sending;
             mode-dropdown-entries: mode-dropdown-entries;
             config-dropdown-entries: config-dropdown-entries;
             mode-trigger-label: mode-trigger-label;
             config-trigger-label: config-trigger-label;
+            reasoning-dropdown-entries: reasoning-dropdown-entries;
+            reasoning-trigger-label: reasoning-trigger-label;
             profile-dropdown-entries: profile-dropdown-entries;
             profile-trigger-label: profile-trigger-label;
             active-thread-has-session: active-thread-has-session;
+            fast-mode-available: fast-mode-available;
+            fast-mode-enabled: fast-mode-enabled;
+            fast-mode-option-id: fast-mode-option-id;
+            fast-mode-on-value: fast-mode-on-value;
+            fast-mode-off-value: fast-mode-off-value;
             context-ratio: context-ratio;
             context-used-tokens: context-used-tokens;
             context-limit-tokens: context-limit-tokens;

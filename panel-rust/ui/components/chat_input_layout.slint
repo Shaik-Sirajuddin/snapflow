@@ -4,6 +4,7 @@ import { Icon } from "../base/icon.slint";
 import { SearchableDropdown } from "../base/searchable_dropdown.slint";
 import { FilterSearchBar } from "../base/filter_search_bar.slint";
 import { ContextRing } from "../base/context_ring.slint";
+import { Toggle } from "../base/toggle.slint";
 import { TextUtil } from "../base/text_util.slint";
 import { DropdownEntry, SkillOption, McpServerOption } from "../types.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
@@ -24,6 +25,9 @@ export component ChatInputLayout inherits Rectangle {
     in property <string> mode-trigger-label: "";
     // Host-supplied current model/config label (ACP configOptions).
     in property <string> config-trigger-label: "";
+    // Reasoning effort — own dropdown (not mixed into model).
+    in property <[DropdownEntry]> reasoning-dropdown-entries: [];
+    in property <string> reasoning-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence:
     // profile/provider picker. Only ever interactive while the active
     // thread has no attached session yet (ThreadItem.has-session) --
@@ -34,6 +38,14 @@ export component ChatInputLayout inherits Rectangle {
     in property <[DropdownEntry]> profile-dropdown-entries: [];
     in property <string> profile-trigger-label: "";
     in property <bool> active-thread-has-session: false;
+    // Dedicated Fast toggle — binary ACP config option (id typically
+    // "fastMode"). Host derives availability/values from configOptions[];
+    // the model dropdown deliberately omits this option.
+    in property <bool> fast-mode-available: false;
+    in property <bool> fast-mode-enabled: false;
+    in property <string> fast-mode-option-id: "fastMode";
+    in property <string> fast-mode-on-value: "on";
+    in property <string> fast-mode-off-value: "off";
     // Session context (ui.yaml chat-view-input). Host pushes real numbers
     // when available; defaults keep the ring useful in pure viewers.
     in property <float> context-ratio: 0.0;
@@ -63,6 +75,7 @@ export component ChatInputLayout inherits Rectangle {
     out property <bool> secondary-text-input-has-focus:
         mode-dropdown.search-has-focus
         || config-dropdown.search-has-focus
+        || reasoning-dropdown.search-has-focus
         || profile-dropdown.search-has-focus
         || mention-search-bar.input-has-focus;
     callback focus-compose();
@@ -75,12 +88,27 @@ export component ChatInputLayout inherits Rectangle {
     property <string> local-config-id: "";
     property <string> local-config-value: "";
     property <string> local-config-label: "";
+    property <string> local-reasoning-id: "";
+    property <string> local-reasoning-value: "";
+    property <string> local-reasoning-label: "";
     property <string> local-profile-id: "";
     property <string> local-profile-label: "";
+    // Optimistic Fast toggle state until the host rewrites capabilities.
+    property <bool> local-fast-mode: root.fast-mode-enabled;
+    changed fast-mode-enabled => {
+        local-fast-mode = root.fast-mode-enabled;
+    }
+    changed fast-mode-available => {
+        if (!root.fast-mode-available) {
+            local-fast-mode = false;
+        }
+    }
 
+    // First control is **Provider** (was "Profile") — shows agent/provider
+    // id; " ›" marks it as a chooser for the cascade (provider → models).
     property <string> profile-label-shown:
-        local-profile-label != "" ? local-profile-label
-        : (root.profile-trigger-label != "" ? root.profile-trigger-label : "Profile");
+        local-profile-label != "" ? local-profile-label + " ›"
+        : (root.profile-trigger-label != "" ? root.profile-trigger-label + " ›" : "Provider ›");
 
     property <string> mode-label-shown:
         local-mode-label != "" ? local-mode-label
@@ -88,6 +116,9 @@ export component ChatInputLayout inherits Rectangle {
     property <string> config-label-shown:
         local-config-label != "" ? local-config-label
         : (root.config-trigger-label != "" ? root.config-trigger-label : "Model");
+    property <string> reasoning-label-shown:
+        local-reasoning-label != "" ? local-reasoning-label
+        : (root.reasoning-trigger-label != "" ? root.reasoning-trigger-label : "Effort");
 
     // --- / @ # mention popup ---------------------------------------------
     // TextUtil.* callbacks are installed by the Rust host (lib.rs) or
@@ -213,54 +244,95 @@ export component ChatInputLayout inherits Rectangle {
         }
         return true;
     }
-    // Walk from `from` in `dir` (+1 / -1), skip hidden rows, wrap.
-    // Unrolled (no recursion — recursive pure/helpers trip binding loops).
-    function next-visible(from: int, dir: int) -> int {
-        if (root.catalog-len() <= 0) {
+    // Positive wrap of `from + steps` into [0, catalog-len).
+    // `+ n*64` keeps the argument non-negative when `steps` is negative
+    // (dir == -1); 64 is enough headroom for any realistic catalog size.
+    function wrap-index(from: int, steps: int) -> int {
+        let n = root.catalog-len();
+        if (n <= 0) {
             return -1;
         }
-        if (!root.item-hidden(Math.mod(from + 1 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 1 * dir + root.catalog-len() * 64, root.catalog-len());
+        return Math.mod(from + steps + n * 64, n);
+    }
+
+    // Walk from `from` in `dir` (+1 / -1), skip filter-hidden rows, wrap.
+    // Still step-unrolled: Slint forbids recursion / general loops in
+    // component functions (they trip the property binding loop detector).
+    // Previously this was sparse (1..10 then 12,16,20,24) and repeated the
+    // same Math.mod expression twice per step — missed indices and was
+    // hard to read. Now: wrap-index helper + consecutive steps 1..=32.
+    function next-visible(from: int, dir: int) -> int {
+        let n = root.catalog-len();
+        if (n <= 0) {
+            return -1;
         }
-        if (!root.item-hidden(Math.mod(from + 2 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 2 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 3 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 3 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 4 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 4 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 5 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 5 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 6 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 6 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 7 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 7 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 8 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 8 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 9 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 9 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 10 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 10 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 12 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 12 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 16 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 16 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 20 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 20 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
-        if (!root.item-hidden(Math.mod(from + 24 * dir + root.catalog-len() * 64, root.catalog-len()))) {
-            return Math.mod(from + 24 * dir + root.catalog-len() * 64, root.catalog-len());
-        }
+        // Cap walk at min(n, 32): enough for /@# pickers; longer catalogs
+        // still find a match if one of the first 32 candidates in `dir` is
+        // visible (typical filtered lists are short).
+        let i1 = root.wrap-index(from, 1 * dir);
+        if (!root.item-hidden(i1)) { return i1; }
+        let i2 = root.wrap-index(from, 2 * dir);
+        if (!root.item-hidden(i2)) { return i2; }
+        let i3 = root.wrap-index(from, 3 * dir);
+        if (!root.item-hidden(i3)) { return i3; }
+        let i4 = root.wrap-index(from, 4 * dir);
+        if (!root.item-hidden(i4)) { return i4; }
+        let i5 = root.wrap-index(from, 5 * dir);
+        if (!root.item-hidden(i5)) { return i5; }
+        let i6 = root.wrap-index(from, 6 * dir);
+        if (!root.item-hidden(i6)) { return i6; }
+        let i7 = root.wrap-index(from, 7 * dir);
+        if (!root.item-hidden(i7)) { return i7; }
+        let i8 = root.wrap-index(from, 8 * dir);
+        if (!root.item-hidden(i8)) { return i8; }
+        let i9 = root.wrap-index(from, 9 * dir);
+        if (!root.item-hidden(i9)) { return i9; }
+        let i10 = root.wrap-index(from, 10 * dir);
+        if (!root.item-hidden(i10)) { return i10; }
+        let i11 = root.wrap-index(from, 11 * dir);
+        if (!root.item-hidden(i11)) { return i11; }
+        let i12 = root.wrap-index(from, 12 * dir);
+        if (!root.item-hidden(i12)) { return i12; }
+        let i13 = root.wrap-index(from, 13 * dir);
+        if (!root.item-hidden(i13)) { return i13; }
+        let i14 = root.wrap-index(from, 14 * dir);
+        if (!root.item-hidden(i14)) { return i14; }
+        let i15 = root.wrap-index(from, 15 * dir);
+        if (!root.item-hidden(i15)) { return i15; }
+        let i16 = root.wrap-index(from, 16 * dir);
+        if (!root.item-hidden(i16)) { return i16; }
+        let i17 = root.wrap-index(from, 17 * dir);
+        if (!root.item-hidden(i17)) { return i17; }
+        let i18 = root.wrap-index(from, 18 * dir);
+        if (!root.item-hidden(i18)) { return i18; }
+        let i19 = root.wrap-index(from, 19 * dir);
+        if (!root.item-hidden(i19)) { return i19; }
+        let i20 = root.wrap-index(from, 20 * dir);
+        if (!root.item-hidden(i20)) { return i20; }
+        let i21 = root.wrap-index(from, 21 * dir);
+        if (!root.item-hidden(i21)) { return i21; }
+        let i22 = root.wrap-index(from, 22 * dir);
+        if (!root.item-hidden(i22)) { return i22; }
+        let i23 = root.wrap-index(from, 23 * dir);
+        if (!root.item-hidden(i23)) { return i23; }
+        let i24 = root.wrap-index(from, 24 * dir);
+        if (!root.item-hidden(i24)) { return i24; }
+        let i25 = root.wrap-index(from, 25 * dir);
+        if (!root.item-hidden(i25)) { return i25; }
+        let i26 = root.wrap-index(from, 26 * dir);
+        if (!root.item-hidden(i26)) { return i26; }
+        let i27 = root.wrap-index(from, 27 * dir);
+        if (!root.item-hidden(i27)) { return i27; }
+        let i28 = root.wrap-index(from, 28 * dir);
+        if (!root.item-hidden(i28)) { return i28; }
+        let i29 = root.wrap-index(from, 29 * dir);
+        if (!root.item-hidden(i29)) { return i29; }
+        let i30 = root.wrap-index(from, 30 * dir);
+        if (!root.item-hidden(i30)) { return i30; }
+        let i31 = root.wrap-index(from, 31 * dir);
+        if (!root.item-hidden(i31)) { return i31; }
+        let i32 = root.wrap-index(from, 32 * dir);
+        if (!root.item-hidden(i32)) { return i32; }
         return -1;
     }
     function reselect-closest() {
@@ -362,7 +434,9 @@ export component ChatInputLayout inherits Rectangle {
     // which is the "hidden model selector" symptom this threshold fixes:
     // drop the least essential item (the context ring) first so the two
     // selects stay reachable.
-    property <bool> row2-compact: root.width < 280px;
+    // Drop context ring earlier on narrow docks so mode/model triggers
+    // stay fully inside the panel (composer_input_text_cutoff_small_width).
+    property <bool> row2-compact: root.width < 320px;
     // setup-followups plan, provider_fastmode_profile_persistence: the
     // profile picker is a 3rd SearchableDropdown (also min-width 72px)
     // added to a row whose own doc comment above already documents
@@ -379,12 +453,18 @@ export component ChatInputLayout inherits Rectangle {
 
     width: 100%;
     horizontal-stretch: 1;
-    // Don't clip the upward mention popup.
+    // Composer is a fixed-height chrome band, not an elastic region —
+    // without vertical-stretch:0 it could expand and steal space from
+    // the message Flickable (user_input_bottom_box_view_cutoff).
+    vertical-stretch: 0;
+    // Don't clip the upward mention popup (overflows above this bar).
+    // Row content itself is clipped inside input-box / row2 below.
     clip: false;
     background: Theme.bg-sidebar;
 
     VerticalLayout {
         width: 100%;
+        vertical-stretch: 0;
         // Horizontal gutter matches permission-card dock (pad-2xl).
         // Vertical: pad-md (12px) — pad-xl (24px) made the bar look over-tall.
         padding-left: Metrics.pad-2xl;
@@ -392,6 +472,31 @@ export component ChatInputLayout inherits Rectangle {
         padding-top: Metrics.pad-md;
         padding-bottom: Metrics.pad-md;
         spacing: Metrics.gap-md;
+
+        // Indeterminate progress bar while a turn is in flight.
+        // audit-fixes animation_tick_loaders: keep mounted (height/opacity
+        // collapse when idle) and drive travel with animation-tick(). A
+        // mount-time `if root.sending` + `bar-t: 1.0` + `animate` never
+        // transitioned (instantiated already at end value) so the bar
+        // looked frozen.
+        Rectangle {
+            height: root.sending ? 2px : 0px;
+            opacity: root.sending ? 1.0 : 0.0;
+            animate height, opacity { duration: 150ms; easing: ease-in-out; }
+            width: 100%;
+            background: Theme.border-default;
+            clip: true;
+            property <float> bar-t: root.sending
+                ? mod(animation-tick(), 1100ms) / 1100ms
+                : 0.0;
+            Rectangle {
+                width: parent.width * 0.35;
+                height: parent.height;
+                x: (parent.width + self.width) * bar-t - self.width;
+                background: Theme.bg-primary.with-alpha(0.9);
+                border-radius: 1px;
+            }
+        }
 
         // Row 1 — input fills remaining width; send fixed, bottom-aligned.
         HorizontalLayout {
@@ -401,6 +506,10 @@ export component ChatInputLayout inherits Rectangle {
                 horizontal-stretch: 1;
                 preferred-width: 0px;
                 min-width: 0px;
+                // Clip glyphs at the right edge so multi-line compose
+                // never paints under the send button or past the dock
+                // (composer_input_text_cutoff_small_width).
+                clip: true;
                 height: Math.clamp(compose.preferred-height + Metrics.pad-lg, 34px, 120px);
                 background: Theme.bg-tertiary;
                 border-radius: Theme.radius-md;
@@ -428,6 +537,7 @@ export component ChatInputLayout inherits Rectangle {
                     width: parent.width - 2 * Metrics.pad-lg;
                     height: parent.height - Metrics.pad-lg;
                     viewport-height: compose.preferred-height;
+                    viewport-width: self.width;
                     compose := TextInput {
                         accessible-label: "Compose message";
                         text <=> root.compose-text;
@@ -514,21 +624,11 @@ export component ChatInputLayout inherits Rectangle {
                     // (not the sidebar) can still see the turn is actively
                     // in progress.
                     //
-                    // A real Slint animation (not a plain `Timer` stepping
-                    // this property by hand) so the engine's own animation
-                    // driver drives it -- `has_active_animations()`
-                    // (panel_rust_poll's host-side repaint trigger) only
-                    // ever detected *this* kind of animation, never a bare
-                    // `Timer`, so the old hand-rolled version silently
-                    // never repainted on its own and looked frozen except
-                    // when some unrelated interaction happened to repaint
-                    // anyway.
-                    property <angle> load-spin: root.sending ? 360deg : 0deg;
-                    animate load-spin {
-                        duration: 800ms;
-                        iteration-count: root.sending ? -1 : 1;
-                        easing: linear;
-                    }
+                    // audit-fixes animation_tick_loaders: continuous spin
+                    // via animation-tick (no dynamic iteration-count).
+                    property <angle> load-spin: root.sending
+                        ? 360deg * mod(animation-tick(), 800ms) / 800ms
+                        : 0deg;
                     if root.sending : VerticalLayout {
                         // Without this wrapper the ring rendered pinned to
                         // this Rectangle's top-left corner (a plain child
@@ -590,43 +690,49 @@ export component ChatInputLayout inherits Rectangle {
         // Row 2: mode → model → context. Default for both control types:
         // same preferred height (row2-h) + parent cross-axis-alignment:
         // center so geometric midlines match. Do not stretch items.
+        // Do NOT clip this row: SearchableDropdown popups are children of
+        // the trigger and must paint outside the 24px band. Narrow-dock
+        // cutoff is handled by row2-compact + trigger-min-width shrink.
         HorizontalLayout {
             width: 100%;
             height: root.row2-h;
             preferred-height: root.row2-h;
             spacing: Metrics.gap-sm;
             alignment: start;
-            // Default vertical behavior for selects + ring.
             cross-axis-alignment: center;
 
             // Unconditionally mounted (visible:, not if:) -- see
             // FilterSearchBar.input-has-focus's doc comment: this
             // component's own id needs to stay referenceable from
             // secondary-text-input-has-focus below.
+            // Provider (first control): pick agent/provider before model.
+            // `id` = profile name (session open), `value` = agent_id,
+            // `label` = provider display. Locked once a session attaches.
             profile-dropdown := SearchableDropdown {
-                visible: root.profile-dropdown-entries.length > 0 && root.row2-has-room-for-profile;
+                // Always offer Provider when profiles exist (not only on wide
+                // docks) — it's the cascade root for the model list.
+                visible: root.profile-dropdown-entries.length > 0;
                 enabled: !root.active-thread-has-session;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
                 height: root.row2-h;
                 preferred-height: root.row2-h;
+                trigger-min-width: root.row2-compact ? 56px : 72px;
                 trigger-label: root.profile-label-shown;
                 options: root.profile-dropdown-entries;
                 selected-id: root.local-profile-id;
-                placeholder: "Search profiles...";
+                placeholder: "Search providers...";
                 popup-width: 200px;
                 entry-selected(id, value, label) => {
                     root.local-profile-id = id;
-                    root.local-profile-label = label;
+                    // Show provider id (value/agent) or label without " ›".
+                    root.local-profile-label = value != "" ? value : label;
                     root.profile-selected(id);
                 }
-                // Mutually exclusive with mode-dropdown/config-dropdown --
-                // without this, opening one composer popup while another
-                // is already open leaves both rendered on top of each
-                // other (see SearchableDropdown.opened's doc comment).
                 opened => {
                     mode-dropdown.close();
                     config-dropdown.close();
+                    reasoning-dropdown.close();
                 }
             }
             mode-dropdown := SearchableDropdown {
@@ -635,6 +741,7 @@ export component ChatInputLayout inherits Rectangle {
                 vertical-stretch: 0;
                 height: root.row2-h;
                 preferred-height: root.row2-h;
+                trigger-min-width: root.row2-compact ? 56px : 72px;
                 trigger-label: root.mode-label-shown;
                 options: root.mode-dropdown-entries;
                 selected-id: root.local-mode-id;
@@ -648,6 +755,7 @@ export component ChatInputLayout inherits Rectangle {
                 opened => {
                     profile-dropdown.close();
                     config-dropdown.close();
+                    reasoning-dropdown.close();
                 }
             }
             config-dropdown := SearchableDropdown {
@@ -656,6 +764,7 @@ export component ChatInputLayout inherits Rectangle {
                 vertical-stretch: 0;
                 height: root.row2-h;
                 preferred-height: root.row2-h;
+                trigger-min-width: root.row2-compact ? 56px : 72px;
                 trigger-label: root.config-label-shown;
                 options: root.config-dropdown-entries;
                 selected-id: root.local-config-id;
@@ -672,6 +781,66 @@ export component ChatInputLayout inherits Rectangle {
                 opened => {
                     profile-dropdown.close();
                     mode-dropdown.close();
+                    reasoning-dropdown.close();
+                }
+            }
+            // Reasoning effort — own SearchableDropdown (not under Model).
+            reasoning-dropdown := SearchableDropdown {
+                visible: root.reasoning-dropdown-entries.length > 0;
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                height: root.row2-h;
+                preferred-height: root.row2-h;
+                trigger-min-width: root.row2-compact ? 56px : 72px;
+                trigger-label: root.reasoning-label-shown;
+                options: root.reasoning-dropdown-entries;
+                selected-id: root.local-reasoning-id;
+                selected-value: root.local-reasoning-value;
+                placeholder: "Search effort...";
+                popup-width: 200px;
+                entry-selected(id, value, label) => {
+                    root.local-reasoning-id = id;
+                    root.local-reasoning-value = value;
+                    root.local-reasoning-label = label;
+                    root.config-option-selected(id, value);
+                }
+                opened => {
+                    profile-dropdown.close();
+                    mode-dropdown.close();
+                    config-dropdown.close();
+                }
+            }
+
+            // Fast model toggle — binary config option (fastMode / etc.).
+            // Only shown when the attached backend advertises one.
+            if root.fast-mode-available : HorizontalLayout {
+                horizontal-stretch: 0;
+                vertical-stretch: 0;
+                height: root.row2-h;
+                spacing: Metrics.space-2;
+                alignment: start;
+                cross-axis-alignment: center;
+                Text {
+                    text: "Fast";
+                    color: Theme.text-secondary;
+                    font-size: 10px * Theme.font-scale;
+                    font-family: Theme.font-sans;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
+                Toggle {
+                    checked: root.local-fast-mode;
+                    toggle-accessible-label: root.local-fast-mode
+                        ? "Disable fast mode"
+                        : "Enable fast mode";
+                    toggled(on) => {
+                        root.local-fast-mode = on;
+                        root.config-option-selected(
+                            root.fast-mode-option-id,
+                            on ? root.fast-mode-on-value : root.fast-mode-off-value,
+                        );
+                    }
                 }
             }
 

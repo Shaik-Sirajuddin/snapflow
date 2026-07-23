@@ -160,10 +160,19 @@ export component ChatPanel inherits Window {
     // Active model/config display name for the compose-bar trigger
     // (host: models::current_config_trigger_label). Empty → "Model".
     in-out property <string> config-trigger-label: "";
+    // Reasoning effort dropdown (separate from model).
+    in-out property <[DropdownEntry]> reasoning-dropdown-entries: [];
+    in-out property <string> reasoning-trigger-label: "";
     // setup-followups plan, provider_fastmode_profile_persistence.
     in-out property <[DropdownEntry]> profile-dropdown-entries: [];
     in-out property <string> profile-trigger-label: "";
     in property <bool> active-thread-has-session: false;
+    // Fast-mode toggle (binary ACP config option, e.g. id "fastMode").
+    in property <bool> fast-mode-available: false;
+    in property <bool> fast-mode-enabled: false;
+    in property <string> fast-mode-option-id: "fastMode";
+    in property <string> fast-mode-on-value: "on";
+    in property <string> fast-mode-off-value: "off";
     // Session context ring (ui.yaml chat-view-input). Host fills real
     // numbers when available; defaults stay at zero until then.
     in property <float> context-ratio: 0.0;
@@ -496,9 +505,16 @@ export component ChatPanel inherits Window {
                 config-dropdown-entries: config-dropdown-entries;
                 mode-trigger-label: mode-trigger-label;
                 config-trigger-label: config-trigger-label;
+                reasoning-dropdown-entries: reasoning-dropdown-entries;
+                reasoning-trigger-label: reasoning-trigger-label;
                 profile-dropdown-entries: profile-dropdown-entries;
                 profile-trigger-label: profile-trigger-label;
                 active-thread-has-session: active-thread-has-session;
+                fast-mode-available: fast-mode-available;
+                fast-mode-enabled: fast-mode-enabled;
+                fast-mode-option-id: fast-mode-option-id;
+                fast-mode-on-value: fast-mode-on-value;
+                fast-mode-off-value: fast-mode-off-value;
                 context-ratio: context-ratio;
                 context-used-tokens: context-used-tokens;
                 context-limit-tokens: context-limit-tokens;

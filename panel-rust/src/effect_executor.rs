@@ -77,12 +77,19 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                             let Some(panel) = slot.as_ref() else {
                                 return;
                             };
+                            // Rescan *before* SkillCreated opens the
+                            // editor: SkillCreated itself does not carry
+                            // the new SkillEntry, and a post-open refresh
+                            // was easy to miss if the follow-up effect
+                            // short-circuited. Fold the fresh disk snapshot
+                            // first so the skills list includes the new
+                            // skill the moment the editor appears.
+                            refresh_skills_after_effect(panel);
                             let (follow_up, _) = update_persistent(
                                 panel,
                                 Msg::Effect(EffectResultMsg::SkillCreated(result)),
                             );
                             execute_effects(panel, follow_up);
-                            refresh_skills_after_effect(panel);
                         });
                     });
                 });
