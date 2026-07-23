@@ -414,6 +414,13 @@ impl<'a> ExternalSnapshotSource<'a> {
                 {
                     row.status = "loading".into();
                     row.busy = true;
+                    // Plan phase 30: immediate feedback while the
+                    // background session attach is in flight -- the row
+                    // appears instantly with a spinner (phase 25) and
+                    // this caption instead of sitting silent.
+                    if row.description.is_empty() {
+                        row.description = "Starting new thread...".into();
+                    }
                 }
                 models::VisibleThreadItem {
                     real_index: item.real_index,
