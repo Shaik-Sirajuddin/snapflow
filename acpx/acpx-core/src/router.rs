@@ -147,6 +147,14 @@ pub fn classify(method: &str) -> MethodClass {
         "agents/list" | "agents/install" | "agents/status" | "session/list" => {
             MethodClass::GatewayNative
         }
+        // `acpx_native_models_list_endpoint` (worktree-consolidation-and-
+        // provider-binding plan, phase 13): native pre-session model
+        // catalogs. Previously models were only reachable through the
+        // off-by-default `/acp` bridge's `/acp/models` route -- native
+        // clients (panel-rust's pre-session pickers) had no protocol way
+        // to ask "what models does agent X offer?" and were re-deriving
+        // it with UI-side string filtering.
+        "models/list" => MethodClass::GatewayNative,
         "profiles/create" | "profiles/list" | "profiles/update" | "profiles/delete" => {
             MethodClass::GatewayNative
         }
@@ -4123,6 +4131,72 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                     }
                 }
                 serde_json::json!({ "agents": entries })
+            }
+            // Phase 13 (`acpx_native_models_list_endpoint`): agent-scoped
+            // model catalogs, pre-session. With `agentId`, runs the same
+            // TTL-cached capability probe the `/acp` bridge uses (one
+            // disposable backend session at most per TTL window -- see
+            // `probe_adapter_capabilities`); without, returns ONLY what
+            // the cache already holds for the registry's agents, never
+            // spawning a backend per agent just to enumerate ("catalog
+            // endpoints must never trigger a new backend process for
+            // every request", capability_cache.rs's own contract).
+            "models/list" => {
+                let requested_agent = request
+                    .get("params")
+                    .and_then(|p| p.get("agentId").or_else(|| p.get("agent_id")))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let cwd = request
+                    .get("params")
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string();
+                let mut catalogs: Vec<serde_json::Value> = Vec::new();
+                match requested_agent {
+                    Some(agent_id) => {
+                        let capabilities =
+                            self.probe_adapter_capabilities(&agent_id, &cwd).await?;
+                        catalogs.push(serde_json::json!({
+                            "agentId": agent_id,
+                            "models": capabilities.models,
+                            "cached": true,
+                        }));
+                    }
+                    None => {
+                        self.ensure_registry_loaded().await;
+                        let agents: Vec<(String, Option<String>)> = self
+                            .registry_cache
+                            .as_ref()
+                            .map(|registry| {
+                                registry
+                                    .agents
+                                    .iter()
+                                    .map(|agent| {
+                                        (agent.id.clone(), Some(agent.version.clone()))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for (agent_id, version) in agents {
+                            let key = acpx_registry::CapabilityCacheKey::new(
+                                agent_id.clone(),
+                                version,
+                            );
+                            if let Some(capabilities) =
+                                self.capability_cache.get(&key, Instant::now())
+                            {
+                                catalogs.push(serde_json::json!({
+                                    "agentId": agent_id,
+                                    "models": capabilities.models,
+                                    "cached": true,
+                                }));
+                            }
+                        }
+                    }
+                }
+                serde_json::json!({ "catalogs": catalogs })
             }
             "agents/status" => {
                 let agent_id = request
