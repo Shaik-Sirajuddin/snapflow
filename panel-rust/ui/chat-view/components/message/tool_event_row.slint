@@ -5,7 +5,7 @@ import { ExpandablePanel } from "../../../base/expandable_panel.slint";
 import { CollapseExpand } from "../../../base/collapse_expand.slint";
 import { ApiCallView } from "../execution/api_call_view.slint";
 import { TerminalView } from "../execution/terminal_view.slint";
-import { CursorHost } from "../../../tokens/cursor_host.slint";
+import { HoverSurface } from "../../../base/hover.slint";
 
 // One tool-taxonomy event row -- chat-items-redesign.md #5/#6. Transparent
 // background (these are inline stream markers, not cards); a dot + an
@@ -160,23 +160,12 @@ export component ToolEventRow inherits Rectangle {
         if has-execution-content : VerticalLayout {
             vertical-stretch: 0;
             spacing: Metrics.gap-sm;
-            Rectangle {
+            HoverSurface {
                 height: 18px;
-                background: toggle-area.has-hover ? Theme.bg-primary-container : transparent;
-                animate background { duration: 100ms; }
-                toggle-area := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: root.details-open ? "Hide call details" : "Show call details";
-                    accessible-action-default => {
-                        root.details-open = !root.details-open;
-                        root.toggle-expanded(root.index);
-                    }
-                    clicked => {
-                        root.details-open = !root.details-open;
-                        root.toggle-expanded(root.index);
-                    }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                button-accessible-label: root.details-open ? "Hide call details" : "Show call details";
+                clicked => {
+                    root.details-open = !root.details-open;
+                    root.toggle-expanded(root.index);
                 }
                 HorizontalLayout {
                     padding-left: root.lead-indent;

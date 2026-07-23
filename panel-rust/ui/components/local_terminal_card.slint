@@ -3,7 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { IconButton } from "../base/icon_button.slint";
 import { LocalTerminalItem } from "../types.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
+import { HoverSurface } from "../base/hover.slint";
 
 // Client-local PTY terminal view -- companion to `terminal_card.slint`'s
 // agent-created (read-only) `TerminalCard`/`TerminalOverlay`. This one
@@ -38,21 +38,11 @@ export component LocalTerminalCard inherits Rectangle {
         VerticalLayout {
             padding: Metrics.space-4;
             spacing: Metrics.space-2;
-            Rectangle {
+            HoverSurface {
                 height: 18px;
-                background: header-touch.has-hover ? Theme.bg-primary-container : transparent;
-                animate background { duration: 100ms; }
-                header-touch := TouchArea {
-                    mouse-cursor: pointer;
-                    accessible-role: button;
-                    accessible-label: "Focus local terminal";
-                    accessible-action-default => {
-                        focus-scope.focus();
-                    }
-                    clicked => {
-                        focus-scope.focus();
-                    }
-                    changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+                button-accessible-label: "Focus local terminal";
+                clicked => {
+                    focus-scope.focus();
                 }
                 HorizontalLayout {
                     spacing: Metrics.space-3;

@@ -2,7 +2,7 @@ import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { TerminalItem } from "../types.slint";
-import { CursorHost } from "../tokens/cursor_host.slint";
+import { HoverSurface } from "../base/hover.slint";
 
 // Real embedded terminal view -- Phase 4 terminal-view addition. Two
 // components:
@@ -39,18 +39,10 @@ export component TerminalCard inherits Rectangle {
     VerticalLayout {
         padding: Metrics.space-4;
         spacing: Metrics.space-2;
-        Rectangle {
+        HoverSurface {
             height: 18px;
-            background: terminal-expand.has-hover ? Theme.bg-primary-container : transparent;
-            animate background { duration: 100ms; }
-            terminal-expand := TouchArea {
-                mouse-cursor: pointer;
-                accessible-role: button;
-                accessible-label: "Expand terminal " + item.terminal-id;
-                accessible-action-default => { expand(); }
-                clicked => { expand(); }
-                changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
+            button-accessible-label: "Expand terminal " + item.terminal-id;
+            clicked => { expand(); }
             HorizontalLayout {
                 spacing: Metrics.space-3;
                 Text {
