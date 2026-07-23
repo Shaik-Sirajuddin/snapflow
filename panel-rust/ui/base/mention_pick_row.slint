@@ -1,0 +1,78 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+import { CursorHost } from "../tokens/cursor_host.slint";
+import { Icon } from "./icon.slint";
+
+// Layer 3 (base) -- the "@"/"/"/"#" mention-picker dropdown row hand-rolled
+// 3x in `components/chat_input_layout.slint` (skill, MCP server, file):
+// a Rectangle with highlighted/hover/idle tint, a TouchArea, and an
+// optional icon + title + subtitle, all three sharing the same
+// highlighted-vs-not color treatment. Not built on `HoverSurface` --
+// that models selected/hover/idle as a two-color pair, but this row
+// needs three DIFFERENT elements (icon, title, subtitle) to each pick
+// their own highlighted-vs-not color, not just the row background.
+//
+// `title-font-weight` defaults to Slint's own Text default (400, not
+// this component's own opinion) so the file row -- the one variant that
+// never set an explicit weight -- doesn't need to override anything to
+// match its pre-extraction look; skill/MCP rows pass 600 explicitly.
+export component MentionPickRow inherits Rectangle {
+    in property <bool> highlighted: false;
+    in property <bool> show-icon: false;
+    in property <image> icon-source;
+    in property <string> title;
+    in property <string> title-font-family: Theme.font-sans;
+    in property <int> title-font-weight: 400;
+    in property <string> subtitle: "";
+    callback clicked();
+
+    height: 28px;
+    clip: true;
+    background: root.highlighted ? Theme.bg-primary
+        : touch.has-hover ? Theme.bg-primary-container
+        : transparent;
+    border-radius: Theme.radius-sm;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
+    }
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        padding-left: Metrics.space-4;
+        padding-right: Metrics.space-4;
+        spacing: root.show-icon ? Metrics.gap-md : 0px;
+        alignment: stretch;
+        cross-axis-alignment: center;
+
+        if root.show-icon : Icon {
+            source: root.icon-source;
+            size: Metrics.icon-sm;
+            color: root.highlighted ? Theme.text-on-primary : Theme.text-secondary;
+            horizontal-stretch: 0;
+            vertical-stretch: 0;
+        }
+        Text {
+            text: root.title;
+            color: root.highlighted ? Theme.text-on-primary : Theme.text-primary;
+            font-size: 11px * Theme.font-scale;
+            font-family: root.title-font-family;
+            font-weight: root.title-font-weight;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+            overflow: elide;
+        }
+        if root.subtitle != "" : Text {
+            text: root.subtitle;
+            color: root.highlighted ? Theme.text-on-primary.with-alpha(0.85) : Theme.text-muted;
+            font-size: 10px * Theme.font-scale;
+            font-family: Theme.font-sans;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+    }
+}
