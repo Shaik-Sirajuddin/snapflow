@@ -42,7 +42,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -353,7 +352,7 @@ func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			if len(result) == 0 {
-				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", method)), nil
+				return okResult(method)
 			}
 			return mcp.NewToolResultJSON(wrapArrayResult(result))
 		},
@@ -394,7 +393,7 @@ func sapTool(s *server.MCPServer, h Handler, mcpName, sapMethod, description str
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			if len(result) == 0 {
-				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", mcpName)), nil
+				return okResult(mcpName)
 			}
 			return mcp.NewToolResultJSON(wrapArrayResult(result))
 		},
@@ -438,6 +437,22 @@ func (s *mcpSink) Notify(method string, params json.RawMessage) {
 // sap.call passthrough). Rather than typing this per call site, wrap any
 // top-level JSON array as {"items": [...]} right before handing it to
 // mcp.NewToolResultJSON; objects and scalars pass through unchanged.
+// okResult is the uniform success shape for tools whose underlying call
+// returns no payload. Previously these returned the plain-text string
+// "<name>: ok" while every other result was structured JSON -- a real
+// inconsistency callers had to special-case (found live by the phase 15b
+// failure/edge-case sweep via daemon.close). Structured like everything
+// else now: {"ok": true, "tool": "<name>"}.
+func okResult(name string) (*mcp.CallToolResult, error) {
+	// The struct goes to NewToolResultJSON directly -- pre-marshaling it
+	// here would hand NewToolResultJSON a []byte, which json re-marshals
+	// as a base64 string (caught live by phase 15b's re-run).
+	return mcp.NewToolResultJSON(struct {
+		OK   bool   `json:"ok"`
+		Tool string `json:"tool"`
+	}{OK: true, Tool: name})
+}
+
 func wrapArrayResult(raw json.RawMessage) json.RawMessage {
 	trimmed := bytes.TrimLeft(raw, " \t\r\n")
 	if len(trimmed) == 0 || trimmed[0] != '[' {
@@ -471,7 +486,7 @@ func tool(name, description string, primaryOpt mcp.ToolOption, h Handler, extraO
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			if result == nil {
-				return mcp.NewToolResultText(fmt.Sprintf("%s: ok", name)), nil
+				return okResult(name)
 			}
 			resultRaw, err := json.Marshal(result)
 			if err != nil {

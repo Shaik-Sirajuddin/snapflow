@@ -1336,8 +1336,38 @@ fn spawn_gateway_process(
         // Disabled here since this spawn path never needs or uses it.
         .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::null());
+    // Gateway stderr goes to a per-provider log file in the cache dir,
+    // NOT /dev/null: acpx-server's tracing output AND every backend
+    // adapter's inherited stderr flow through it (acpx-conductor spawns
+    // backends with Stdio::inherit for stderr) -- discarding it left a
+    // real mid-turn agent failure (the bifrost tool_search dead-turn,
+    // 2026-07-23) with literally zero diagnostics anywhere on disk,
+    // costing a full forensic session to what one log line would have
+    // answered. Truncated on each gateway spawn so it stays bounded by
+    // one gateway lifetime; falls back to null only if the file can't
+    // be created (never blocks the spawn itself).
+    // Without RUST_LOG, acpx-server's tracing subscriber emits nothing at
+    // all -- an empty log file is barely better than /dev/null. INFO is
+    // acpx-server's own documented operational level (startup config,
+    // per-request router lines, backend spawn failures); an operator's
+    // explicit RUST_LOG still wins.
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info");
+    }
+    let stderr_log = resolve_cache_dir().join(format!("gateway-{provider}.stderr.log"));
+    match std::fs::File::create(&stderr_log) {
+        Ok(file) => {
+            cmd.stderr(file);
+        }
+        Err(error) => {
+            eprintln!(
+                "panel-rust: gateway stderr log unavailable ({error}); \
+                 falling back to discarding {provider} gateway stderr"
+            );
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
     // Only set ACPX_BACKEND_CMD when we have a real command to point it
     // at (an explicit override, or a dev-checkout mock binary confirmed
     // to actually exist) -- leaving it unset lets acpx-server fall back

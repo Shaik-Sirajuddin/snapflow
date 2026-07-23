@@ -32,6 +32,136 @@ pub struct SpawnSpec {
     pub env: HashMap<String, String>,
 }
 
+/// Serializes the cold-cache install step of `npx`-distributed backends
+/// before their real spawn. `npx pkg@ver`'s first run extracts the
+/// package into a shared `~/.npm/_npx/<hash>` directory with **no
+/// locking of its own** -- two concurrent first runs race and can leave
+/// a corrupt entry (`node_modules/` present, `package.json` missing),
+/// after which *every* subsequent spawn fails with npm's ENOENT and the
+/// agent lands in crash backoff. Found live twice on the
+/// video-generation-e2e-harness plan: once as a cross-session race on
+/// the shared user cache (phase 14b), then structurally on every real
+/// editor launch -- snapshotd's per-project sandboxed `$HOME` starts
+/// with an *empty* npm cache, and the panel's per-thread session
+/// connects fan out several concurrent `session/new` spawns of the same
+/// adapter into it at once.
+///
+/// The fix: for `npx` programs only, run one `--version` warm-up of the
+/// same package under (a) an in-process once-per-spec set and (b) a
+/// cross-process advisory file lock keyed on (HOME, program, args) --
+/// same-HOME processes share an npm cache, different-HOME processes
+/// don't contend at all. Once the cache is warm the guarded path runs
+/// exactly once per acpx-server process (a fast no-op resolve);
+/// failures here are deliberately non-fatal -- worst case is exactly
+/// today's behavior, the real spawn proceeds and reports its own error.
+async fn warm_npx_cache_if_needed(spec: &SpawnSpec) {
+    let is_npx = std::path::Path::new(&spec.program)
+        .file_name()
+        .map(|name| name == "npx")
+        .unwrap_or(false);
+    if !is_npx {
+        return;
+    }
+
+    static WARMED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = format!(
+        "{}|{}|{}",
+        std::env::var("HOME").unwrap_or_default(),
+        spec.program,
+        spec.args.join(" ")
+    );
+    {
+        let warmed = WARMED.get_or_init(Default::default);
+        if !warmed.lock().expect("warmed set poisoned").insert(key.clone()) {
+            return;
+        }
+    }
+
+    let lock_path = std::env::temp_dir().join(format!(
+        "acpx-npx-warm-{:016x}.lock",
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            hasher.finish()
+        }
+    ));
+    let program = spec.program.clone();
+    let args = spec.args.clone();
+    let env = spec.env.clone();
+    let warm = tokio::task::spawn_blocking(move || {
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::debug!(?error, "npx warm-up lock unavailable, skipping");
+                return;
+            }
+        };
+        if let Err(error) = lock_file.lock() {
+            tracing::debug!(?error, "npx warm-up flock failed, skipping");
+            return;
+        }
+        // Self-repair before warming: a *previous* race (or an interrupted
+        // install) leaves a permanently corrupt `_npx/<hash>` entry --
+        // `node_modules/` present, `package.json` missing -- that every
+        // later npx run (this warm-up included) fails against with ENOENT
+        // forever; npx never heals it. Prune exactly that signature, only
+        // for entries old enough (>60s) that they cannot be another
+        // process's install-in-progress -- and same-HOME installers are
+        // all serialized behind this very lock anyway.
+        let npx_cache = env
+            .get("npm_config_cache")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("npm_config_cache").map(Into::into))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join(".npm")
+            })
+            .join("_npx");
+        if let Ok(entries) = std::fs::read_dir(&npx_cache) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !dir.is_dir() || dir.join("package.json").exists() {
+                    continue;
+                }
+                let old_enough = entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .map(|age| age.as_secs() > 60)
+                    .unwrap_or(false);
+                if old_enough {
+                    tracing::info!(?dir, "pruning corrupt npx cache entry (no package.json)");
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+        }
+        let status = std::process::Command::new(&program)
+            .args(&args)
+            .arg("--version")
+            .envs(&env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Err(error) = status {
+            tracing::debug!(?error, "npx warm-up run failed (non-fatal)");
+        }
+        let _ = lock_file.unlock();
+    });
+    // Bounded wait: a hung npm (dead registry, full disk) must not wedge
+    // session creation forever -- fall through to the real spawn, which
+    // owns its own failure reporting.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(120), warm).await;
+}
+
 impl SpawnSpec {
     pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
         Self {
@@ -142,6 +272,7 @@ impl BackendProcess {
     /// so backend diagnostics surface directly in acpx's own logs for now;
     /// revisit if that gets noisy.
     pub async fn spawn(spec: &SpawnSpec) -> Result<Self, ProcessError> {
+        warm_npx_cache_if_needed(spec).await;
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .envs(&spec.env)
