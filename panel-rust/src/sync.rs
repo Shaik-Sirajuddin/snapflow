@@ -57,7 +57,15 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         Dirty::ThreadRow(idx) => {
             apply_thread_row(model, *idx);
         }
-        Dirty::ThreadListDiff(ops) => apply_thread_ops(model, ops),
+        Dirty::ThreadListDiff(ops) => {
+            apply_thread_ops(model, ops);
+            // Phase 19: section counters (active vs archived) follow every
+            // thread-list rebuild.
+            let archived = model.threads.iter().filter(|t| t.archived && !t.closed).count() as i32;
+            let active = model.threads.iter().filter(|t| !t.archived && !t.closed).count() as i32;
+            component.set_active_thread_count(active);
+            component.set_archived_thread_count(archived);
+        }
         Dirty::MessageAppended { thread_id } => {
             sync_message_snapshot(model, thread_id);
             sync_has_older_messages(model, component, thread_id);

@@ -219,6 +219,9 @@ export component ChatPanel inherits Window {
     callback mcp-server-authenticate(string);
     // Phase 17: host opens files/URLs from markdown Ctrl+Click.
     callback md-link-activated(string);
+    // Phase 19: section counters computed Rust-side.
+    in-out property <int> active-thread-count: 0;
+    in-out property <int> archived-thread-count: 0;
     callback mcp-server-tool-enabled-changed(string, string, bool);
     callback profile-create(string, string, bool, bool);
     callback profile-delete(string);
@@ -394,6 +397,8 @@ export component ChatPanel inherits Window {
             height: root.height;
             background: Theme.bg-chat;
             sidebar := Sidebar {
+                active-count: root.active-thread-count;
+                archived-count: root.archived-thread-count;
                 x: 0px;
                 y: 0px;
                 height: parent.height;

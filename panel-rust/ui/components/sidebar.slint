@@ -23,6 +23,9 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
+    // Phase 19: section counters (computed in Rust; slint lacks reduce).
+    in property <int> active-count: 0;
+    in property <int> archived-count: 0;
     // Aggregates thread-search's own FilterSearchBar.input-has-focus, the
     // per-row inline thread-rename TextInput, and the shared "new skill"
     // NamePromptDialog -- see that property's doc comment for why this
@@ -505,9 +508,12 @@ export component Sidebar inherits Rectangle {
             spacing: 0px;
 
             // --- Active (and, when collapsed, all) threads -------------
+            // Phase 19: sized to content (scrolling past the cap) so the
+            // stretch spacer below pins the Archived section to the
+            // BOTTOM of the rail instead of it trailing the active rows.
             Flickable {
-                vertical-stretch: 1;
-                preferred-height: 0px;
+                vertical-stretch: 0;
+                preferred-height: active-thread-col.preferred-height;
                 min-height: 0px;
                 viewport-height: active-thread-col.preferred-height;
                 active-thread-col := VerticalLayout {
@@ -564,6 +570,14 @@ export component Sidebar inherits Rectangle {
                 }
             }
 
+            // Phase 19: absorbs all free space so Archived grows from
+            // the BOTTOM up (bottom-anchored, capped, inner scroll).
+            Rectangle {
+                vertical-stretch: 1;
+                min-height: 0px;
+                preferred-height: 0px;
+            }
+
             // --- Archived (bottom, expanded only, max-height) ----------
             // Caps at ~header + 3 tall rows so active list keeps majority
             // of the rail. Section collapses entirely when empty.
@@ -583,7 +597,7 @@ export component Sidebar inherits Rectangle {
                         padding-right: Metrics.space-3;
                         spacing: Metrics.space-2;
                         Text {
-                            text: "Archived";
+                            text: root.archived-count > 0 ? "Archived  [" + root.archived-count + "]" : "Archived";
                             color: Theme.text-muted;
                             font-size: 10px * Theme.font-scale;
                             font-weight: 700;
