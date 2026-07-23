@@ -1214,6 +1214,13 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 }],
             ),
         },
+        EffectResultMsg::StateEffectFailed { thread_id, message } => (
+            vec![],
+            vec![Dirty::Error {
+                thread_id,
+                detail: ErrorDetail { message },
+            }],
+        ),
         EffectResultMsg::SessionAttached {
             real_index,
             thread_id,
@@ -2606,6 +2613,28 @@ mod tests {
         assert_eq!(model.threads[0].state, ThreadState::Error);
         assert_eq!(model.threads[0].error.as_deref(), Some("boom"));
         assert!(matches!(dirty[0], Dirty::Error { .. }));
+    }
+
+    #[test]
+    fn state_effect_failed_surfaces_as_dirty_error_not_silently_dropped() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::StateEffectFailed {
+                thread_id: "thread-a".to_owned(),
+                message: "failed to toggle background-session override: boom".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            dirty,
+            vec![Dirty::Error {
+                thread_id: "thread-a".to_owned(),
+                detail: ErrorDetail {
+                    message: "failed to toggle background-session override: boom".to_owned(),
+                },
+            }]
+        );
     }
 
     #[test]

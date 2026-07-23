@@ -369,34 +369,59 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     // toggle (previously stored and displayed, but never
                     // connected to any real close-session behavior) --
                     // see AgentBridge::close_thread's doc comment.
-                    let background = bridge
+                    let thread_id = bridge
                         .thread_binding(real_index)
-                        .and_then(|binding| {
+                        .map(|binding| binding.thread_id);
+                    let background = thread_id
+                        .as_ref()
+                        .and_then(|thread_id| {
                             panel
                                 .panel_state
                                 .as_ref()
-                                .map(|store| (store, binding.thread_id))
+                                .map(|store| (store, thread_id))
                         })
                         .and_then(|(store, thread_id)| {
-                            store.effective_background_session(&thread_id).ok()
+                            store.effective_background_session(thread_id).ok()
                         })
                         .unwrap_or(false);
                     if !bridge.close_thread(real_index, background) {
-                        eprintln!("panel-rust: close_thread({real_index}) returned false");
+                        let message = format!("failed to close thread {real_index}");
+                        eprintln!("panel-rust: {message}");
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::StateEffectFailed {
+                                thread_id: thread_id.unwrap_or_default(),
+                                message,
+                            }),
+                        );
                     }
                 }
             }
             Effect::ArchiveThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
+                    let thread_id = bridge
+                        .thread_binding(real_index)
+                        .map(|binding| binding.thread_id)
+                        .unwrap_or_default();
                     if !bridge.archive_thread(real_index) {
-                        eprintln!("panel-rust: archive_thread({real_index}) returned false");
+                        let message = format!("failed to archive thread {real_index}");
+                        eprintln!("panel-rust: {message}");
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
+                        );
                     }
                 }
             }
             Effect::PersistSelectedThread { thread_id } => {
                 if let Some(store) = panel.panel_state.as_ref() {
                     if let Err(error) = store.set_selected_thread_id(Some(&thread_id)) {
-                        eprintln!("panel-rust: failed to persist selected chat thread: {error}");
+                        let message = format!("failed to persist selected chat thread: {error}");
+                        eprintln!("panel-rust: {message}");
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
+                        );
                     }
                 }
             }
@@ -416,7 +441,12 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     .effective_background_session(&thread_id)
                     .unwrap_or(false);
                 if let Err(error) = store.set_background_override(&thread_id, Some(next)) {
-                    eprintln!("panel-rust: failed to toggle background-session override: {error}");
+                    let message = format!("failed to toggle background-session override: {error}");
+                    eprintln!("panel-rust: {message}");
+                    let _ = update_persistent(
+                        panel,
+                        Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
+                    );
                 }
             }
             Effect::PersistThreadRecord { record } => {
@@ -471,24 +501,36 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::RenameThread { real_index, name } => {
-                if let (Some(store), Some(thread_id)) = (
-                    panel.panel_state.as_ref(),
-                    panel
-                        .model
-                        .borrow()
-                        .threads
-                        .get(real_index)
-                        .map(|thread| thread.thread_id.clone()),
-                ) {
+                let thread_id = panel
+                    .model
+                    .borrow()
+                    .threads
+                    .get(real_index)
+                    .map(|thread| thread.thread_id.clone());
+                if let (Some(store), Some(thread_id)) = (panel.panel_state.as_ref(), thread_id) {
                     if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
-                        eprintln!("panel-rust: failed to persist renamed chat thread: {error}");
+                        let message = format!("failed to persist renamed chat thread: {error}");
+                        eprintln!("panel-rust: {message}");
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
+                        );
                     }
                 }
             }
             Effect::DeleteThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
+                    let thread_id = bridge
+                        .thread_binding(real_index)
+                        .map(|binding| binding.thread_id)
+                        .unwrap_or_default();
                     if !bridge.delete_thread(real_index) {
-                        eprintln!("panel-rust: delete_thread({real_index}) returned false");
+                        let message = format!("failed to delete thread {real_index}");
+                        eprintln!("panel-rust: {message}");
+                        let _ = update_persistent(
+                            panel,
+                            Msg::Effect(EffectResultMsg::StateEffectFailed { thread_id, message }),
+                        );
                     }
                 }
             }
