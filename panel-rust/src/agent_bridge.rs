@@ -591,6 +591,33 @@ pub fn provider_for_index(idx: usize) -> &'static str {
     }
 }
 
+/// TRANSITIONAL (`thread_provider_model_binding_fix`): normalizes a
+/// caller-supplied provider/agent identifier to one of the two gateway
+/// keys this bridge currently provisions ("codex"/"claude"). Exists
+/// only because those keys are NOT real acpx registry ids
+/// (registry.fallback.json defines `codex-acp`/`claude-acp`/`gemini`),
+/// so a registry id arriving from settings (a real
+/// settings.global.json carried `default_agent_id: "claude-acp"`) needs
+/// mapping -- and the previous exact-match check silently DROPPED such
+/// ids and fell back to the index-parity rotation, binding an
+/// explicitly-claude thread to codex with no error.
+///
+/// The agreed end-state (recorded in the
+/// worktree-consolidation-and-provider-binding plan) removes this
+/// function entirely: agent-agnostic selection per the ACP protocol
+/// through acpx -- one gateway, thread providers ARE registry agent ids
+/// from `agents/list`, and per-session agent selection goes through
+/// acpx's native `profiles/create {agent_id}` + `session/new
+/// {_acpx.profile}` (proven live by the e2e harness's agent-driven
+/// export phase), with no per-provider string handling anywhere.
+pub fn normalize_provider(id: &str) -> &'static str {
+    if id.to_ascii_lowercase().contains("claude") {
+        "claude"
+    } else {
+        "codex"
+    }
+}
+
 /// Resolves the dev-checkout `acpx-server` binary path: `RUI_ACPX_SERVER_BIN`
 /// env override, else a path relative to this crate's own
 /// `CARGO_MANIFEST_DIR`, matching the same convention
@@ -2284,9 +2311,26 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        let provider = preferred_provider
-            .filter(|provider| self.gateway_urls.contains_key(*provider))
-            .unwrap_or_else(|| provider_for_index(idx));
+        // `thread_provider_model_binding_fix`: a requested provider is
+        // NEVER silently dropped. Any non-empty request normalizes to
+        // one of the two real gateway keys (see `normalize_provider`);
+        // if that gateway genuinely isn't provisioned the caller gets a
+        // real error instead of a thread quietly bound to the rotation's
+        // pick -- the exact "selected claude-acp, codex-acp underneath"
+        // failure reported live on the VNC demo.
+        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => {
+                let normalized = normalize_provider(requested);
+                if !self.gateway_urls.contains_key(normalized) {
+                    return Err(BridgeError::Gateway(format!(
+                        "requested provider {requested:?} (normalized {normalized:?}) has no \
+                         provisioned gateway; refusing to silently bind another provider"
+                    )));
+                }
+                normalized
+            }
+            None => provider_for_index(idx),
+        };
         let base_url =
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
@@ -5503,6 +5547,20 @@ done
     fn slug_collapses_non_alphanumerics_and_lowercases() {
         assert_eq!(slug("Fix timeline crash"), "fix-timeline-crash");
         assert_eq!(slug("Export pipeline bug!"), "export-pipeline-bug");
+    }
+
+    #[test]
+    fn normalize_provider_maps_registry_ids_onto_gateway_keys() {
+        // thread_provider_model_binding_fix: registry ids (the values a
+        // real settings.global.json/default-agent picker persists) must
+        // resolve to the gateway actually serving that family -- the
+        // old exact-match filter dropped them silently and the rotation
+        // bound the thread to whatever parity said.
+        assert_eq!(normalize_provider("claude"), "claude");
+        assert_eq!(normalize_provider("claude-acp"), "claude");
+        assert_eq!(normalize_provider("Claude-ACP"), "claude");
+        assert_eq!(normalize_provider("codex"), "codex");
+        assert_eq!(normalize_provider("codex-acp"), "codex");
     }
 
     #[test]
