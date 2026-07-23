@@ -70,6 +70,8 @@ export component ChatInputLayout inherits Rectangle {
     callback context-view-requested();
     // Phase 15: inline OAuth/connect from the @ MCP popup row.
     callback mcp-connect-requested(string);
+    // Phase 15: inline enable/disable from the @ MCP popup row.
+    callback mcp-enabled-changed(string, bool);
     // Panel chords (Ctrl+B/N/K/,, Escape, Ctrl+Enter approve) re-dispatched
     // while the composer owns focus — wired by ChatArea → ChatPanel.
     callback panel-shortcut(KeyEvent) -> EventResult;
@@ -987,8 +989,18 @@ export component ChatInputLayout inherits Rectangle {
                             subtitle: srv.command;
                             // Phase 15: live connection dot on MCP rows.
                             status-dot: srv.status;
-                            action-label: srv.transport == "http" && srv.needs-auth ? "Connect" : "";
-                            action-clicked => { root.mcp-connect-requested(srv.name); }
+                            // Connect wins when auth is pending; otherwise the
+                            // action toggles enablement (Disable/Enable) via the
+                            // same root callback the Settings toggle uses.
+                            action-label: srv.transport == "http" && srv.needs-auth ? "Connect"
+                                : (srv.enabled ? "Disable" : "Enable");
+                            action-clicked => {
+                                if (srv.transport == "http" && srv.needs-auth) {
+                                    root.mcp-connect-requested(srv.name);
+                                } else {
+                                    root.mcp-enabled-changed(srv.name, !srv.enabled);
+                                }
+                            }
                             clicked => {
                                 root.mention-sel = i;
                                 root.apply-mention-pick("@" + srv.name + " ");
