@@ -585,7 +585,11 @@ export component Sidebar inherits Rectangle {
             // --- Archived (bottom, expanded only, max-height) ----------
             // Caps at ~header + 3 tall rows so active list keeps majority
             // of the rail. Section collapses entirely when empty.
-            if root.expanded : VerticalLayout {
+            if root.expanded : archived-section := VerticalLayout {
+                // PUI-016: collapsible archived section. Header click toggles;
+                // the arrow at the row end points down when collapsed (expand)
+                // and up when expanded (collapse).
+                property <bool> archived-collapsed: false;
                 vertical-stretch: 0;
                 spacing: 0px;
                 // Header + up to ~3 model-rows of content.
@@ -610,9 +614,16 @@ export component Sidebar inherits Rectangle {
                             horizontal-stretch: 1;
                         }
                         Icon {
-                            source: @image-url("../assets/icons/archive.svg");
+                            source: @image-url("../assets/icons/arrow-down.svg");
                             size: 12px;
                             color: Theme.text-muted;
+                            transform-rotation: archived-section.archived-collapsed ? 0deg : 180deg;
+                        }
+                    }
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            archived-section.archived-collapsed = !archived-section.archived-collapsed;
                         }
                     }
                 }
@@ -622,10 +633,10 @@ export component Sidebar inherits Rectangle {
                     // Grow with content up to 3 rows, then scroll.
                     // Prefer content height; cap via max-height only (do not
                     // also bind `height` -- Slint rejects height+max-height).
-                    preferred-height: archived-thread-col.preferred-height;
-                    max-height: 156px;
+                    preferred-height: archived-section.archived-collapsed ? 0px : archived-thread-col.preferred-height;
+                    max-height: archived-section.archived-collapsed ? 0px : 156px;
                     min-height: 0px;
-                    visible: archived-thread-col.preferred-height > 0px;
+                    visible: !archived-section.archived-collapsed && archived-thread-col.preferred-height > 0px;
                     viewport-height: archived-thread-col.preferred-height;
                     archived-thread-col := VerticalLayout {
                         spacing: Metrics.space-1;
