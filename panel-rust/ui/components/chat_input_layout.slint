@@ -498,8 +498,8 @@ export component ChatInputLayout inherits Rectangle {
         // Vertical: pad-md (12px) — pad-xl (24px) made the bar look over-tall.
         padding-left: Metrics.pad-2xl;
         padding-right: Metrics.pad-2xl;
-        padding-top: Metrics.pad-md;
-        padding-bottom: Metrics.pad-md;
+        padding-top: Metrics.pad-lg;
+        padding-bottom: Metrics.pad-lg;
         spacing: Metrics.gap-md;
 
         // Phase 20 (input_border_animation_removal): the traveling
@@ -520,7 +520,7 @@ export component ChatInputLayout inherits Rectangle {
                 // never paints under the send button or past the dock
                 // (composer_input_text_cutoff_small_width).
                 clip: true;
-                height: Math.clamp(compose.preferred-height + Metrics.pad-lg, 34px, 120px);
+                height: Math.clamp(compose.preferred-height + Metrics.pad-xl, 34px, 120px);
                 background: Theme.bg-tertiary;
                 border-radius: Theme.radius-md;
                 Text {
@@ -538,14 +538,14 @@ export component ChatInputLayout inherits Rectangle {
                     overflow: elide;
                     visible: compose.text == "";
                     x: Metrics.pad-lg;
-                    y: Metrics.pad-lg / 2;
+                    y: Metrics.pad-xl / 2;
                     width: parent.width - 2 * Metrics.pad-lg;
                 }
                 Flickable {
                     x: Metrics.pad-lg;
-                    y: Metrics.pad-lg / 2;
+                    y: Metrics.pad-xl / 2;
                     width: parent.width - 2 * Metrics.pad-lg;
-                    height: parent.height - Metrics.pad-lg;
+                    height: parent.height - Metrics.pad-xl;
                     viewport-height: compose.preferred-height;
                     viewport-width: self.width;
                     compose := TextInput {
