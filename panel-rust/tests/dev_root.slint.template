@@ -229,6 +229,7 @@ export component DevRoot inherits ChatPanel {
             can-edit: false,
             sending: false,
             first-use: false,
+            tool-group-len: 1,
         },
         {
             kind: "agent",
@@ -257,6 +258,9 @@ export component DevRoot inherits ChatPanel {
             can-edit: false,
             sending: false,
             first-use: false,
+            // First of 5 contiguous tool-kind rows below (index 4-8:
+            // tool_use, tool_use, mcp_server_call, tool_use, tool_use).
+            tool-group-len: 5,
         },
         {
             kind: "tool_use",
@@ -341,6 +345,7 @@ export component DevRoot inherits ChatPanel {
             can-edit: false,
             sending: false,
             first-use: false,
+            tool-group-len: 1,
         },
         {
             kind: "agent",
@@ -383,6 +388,8 @@ export component DevRoot inherits ChatPanel {
             can-edit: false,
             sending: false,
             first-use: true,
+            // First of 2 contiguous tool-kind rows (skill_use, mcp_server_call).
+            tool-group-len: 2,
         },
         {
             kind: "mcp_server_call",

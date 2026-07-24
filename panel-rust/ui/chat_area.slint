@@ -72,7 +72,19 @@ export component ChatArea inherits Rectangle {
     in-out property <string> full-view-raw-output: "";
     in-out property <bool> full-view-is-terminal: false;
     in-out property <bool> full-view-is-mcp: false;
-    // Stack management for nested full views inside popups
+    // One saved level, not an arbitrary-depth stack -- Slint has no
+    // array push/pop/slice/concat to build a real one from `.slint` code
+    // (confirmed: `arr + [x]` and `arr.slice(...)` both fail to compile).
+    // This is enough because the popup structure below only ever reaches
+    // two levels: the group popup (`full-view-group-idx >= 0`, opened
+    // from `ToolGroupView`'s maximize button) can nest one single-call
+    // popup (`full-view-group-idx == -1`, opened via a `ToolEventRow`'s
+    // own `open-full-view`); once there, the modal renders a leaf
+    // `TerminalView`/`ApiCallView` with no further `open-full-view`
+    // trigger of its own, so a third level is structurally unreachable.
+    // If a future popup variant *does* need to nest from within a leaf
+    // view, this would need to become real Rust-backed state instead of
+    // widening this to more scalar fields.
     property <int> prev-full-view-group-idx: -1;
     property <string> prev-full-view-title: "";
     property <string> prev-full-view-raw-input: "";
@@ -194,34 +206,37 @@ export component ChatArea inherits Rectangle {
         return k == "tool_use" || k == "mcp_server_call" || k == "skill_use" || k == "skill_load" || k == "terminal";
     }
 
-    pure function count-tool-group(msgs: [MessageItem], s: int) -> int {
-        if (s >= msgs.length || !is-tool-kind(msgs[s].kind)) { return 0; }
-        if (s + 1 >= msgs.length || !is-tool-kind(msgs[s + 1].kind)) { return 1; }
-        if (s + 2 >= msgs.length || !is-tool-kind(msgs[s + 2].kind)) { return 2; }
-        if (s + 3 >= msgs.length || !is-tool-kind(msgs[s + 3].kind)) { return 3; }
-        if (s + 4 >= msgs.length || !is-tool-kind(msgs[s + 4].kind)) { return 4; }
-        if (s + 5 >= msgs.length || !is-tool-kind(msgs[s + 5].kind)) { return 5; }
-        if (s + 6 >= msgs.length || !is-tool-kind(msgs[s + 6].kind)) { return 6; }
-        if (s + 7 >= msgs.length || !is-tool-kind(msgs[s + 7].kind)) { return 7; }
-        if (s + 8 >= msgs.length || !is-tool-kind(msgs[s + 8].kind)) { return 8; }
-        if (s + 9 >= msgs.length || !is-tool-kind(msgs[s + 9].kind)) { return 9; }
-        return 10;
+    // Group length/membership come straight from `MessageItem.tool-group-
+    // len` (`models::assign_tool_group_lengths`, Rust-computed once per
+    // transcript build) instead of scanning here: Slint `pure function`s
+    // support neither loops nor recursion (a `pure function` calling
+    // itself compiles to a "binding loop" error), so a Slint-side scan
+    // would need a hand-unrolled, arbitrarily-capped `if` ladder that
+    // silently undercounts any run longer than the cap. Plain arithmetic
+    // on the precomputed length has no such limit.
+    pure function in-same-tool-group(msgs: [MessageItem], s: int, c: int) -> bool {
+        return c >= s && c < s + msgs[s].tool-group-len;
     }
 
-    pure function in-same-tool-group(msgs: [MessageItem], s: int, c: int) -> bool {
-        if (c < s || c >= msgs.length) { return false; }
-        let diff = c - s;
-        if (diff == 0) { return is-tool-kind(msgs[s].kind); }
-        if (diff == 1) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind); }
-        if (diff == 2) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind); }
-        if (diff == 3) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind); }
-        if (diff == 4) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind); }
-        if (diff == 5) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind); }
-        if (diff == 6) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind); }
-        if (diff == 7) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind) && is-tool-kind(msgs[s + 7].kind); }
-        if (diff == 8) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind) && is-tool-kind(msgs[s + 7].kind) && is-tool-kind(msgs[s + 8].kind); }
-        if (diff == 9) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind) && is-tool-kind(msgs[s + 7].kind) && is-tool-kind(msgs[s + 8].kind) && is-tool-kind(msgs[s + 9].kind); }
-        return is-tool-kind(msgs[c].kind);
+    // Shared by the popup backdrop `TouchArea` and the header `×` button
+    // (previously duplicated inline in both places): a nested full-view
+    // (opened from a tool event inside an already-open group popup) pops
+    // back to that group's popup state; a non-nested one closes outright.
+    function close-full-view() {
+        if (root.prev-full-view-group-idx >= 0) {
+            root.full-view-group-idx = root.prev-full-view-group-idx;
+            root.full-view-title = root.prev-full-view-title;
+            root.full-view-raw-input = root.prev-full-view-raw-input;
+            root.full-view-raw-output = root.prev-full-view-raw-output;
+            root.full-view-is-terminal = root.prev-full-view-is-terminal;
+            root.full-view-is-mcp = root.prev-full-view-is-mcp;
+            root.prev-full-view-group-idx = -1;
+        } else {
+            root.full-view-open = false;
+            root.full-view-title = "";
+            root.full-view-raw-input = "";
+            root.full-view-raw-output = "";
+        }
     }
 
     property <PendingRequestItem> demo-pending: {
@@ -797,8 +812,7 @@ export component ChatArea inherits Rectangle {
                     // header/sidebar spinner). Pulse *flows* top → bottom.
                     property <bool> is-live-tail:
                         root.sending && i == root.messages.length - 1;
-                    property <int> tool-group-size:
-                        root.count-tool-group(root.messages, i);
+                    property <int> tool-group-size: msg.tool-group-len;
                     // Fixed gutter widths — never toggle 0↔N when the live
                     // rail appears, or the bubble column jumps horizontally.
                     property <length> rail-w: 3px;
@@ -1034,24 +1048,7 @@ export component ChatArea inherits Rectangle {
 
                 TouchArea {
                     // Only close full-view, restoring previous state if nested
-                    clicked => {
-                        if (root.prev-full-view-group-idx >= 0) {
-                            // Restore previous popup state
-                            root.full-view-group-idx = root.prev-full-view-group-idx;
-                            root.full-view-title = root.prev-full-view-title;
-                            root.full-view-raw-input = root.prev-full-view-raw-input;
-                            root.full-view-raw-output = root.prev-full-view-raw-output;
-                            root.full-view-is-terminal = root.prev-full-view-is-terminal;
-                            root.full-view-is-mcp = root.prev-full-view-is-mcp;
-                            root.prev-full-view-group-idx = -1;
-                        } else {
-                            // Close full view completely
-                            root.full-view-open = false;
-                            root.full-view-title = "";
-                            root.full-view-raw-input = "";
-                            root.full-view-raw-output = "";
-                        }
-                    }
+                    clicked => { root.close-full-view(); }
                 }
 
                 Rectangle {
@@ -1094,24 +1091,7 @@ export component ChatArea inherits Rectangle {
                                 width: 20px;
                                 height: 20px;
                                 mouse-cursor: pointer;
-                                clicked => {
-                                    if (root.prev-full-view-group-idx >= 0) {
-                                        // Restore previous popup state
-                                        root.full-view-group-idx = root.prev-full-view-group-idx;
-                                        root.full-view-title = root.prev-full-view-title;
-                                        root.full-view-raw-input = root.prev-full-view-raw-input;
-                                        root.full-view-raw-output = root.prev-full-view-raw-output;
-                                        root.full-view-is-terminal = root.prev-full-view-is-terminal;
-                                        root.full-view-is-mcp = root.prev-full-view-is-mcp;
-                                        root.prev-full-view-group-idx = -1;
-                                    } else {
-                                        // Close full view completely
-                                        root.full-view-open = false;
-                                        root.full-view-title = "";
-                                        root.full-view-raw-input = "";
-                                        root.full-view-raw-output = "";
-                                    }
-                                }
+                                clicked => { root.close-full-view(); }
                                 Text {
                                     text: "\u{2715}";
                                     color: Theme.text-muted;

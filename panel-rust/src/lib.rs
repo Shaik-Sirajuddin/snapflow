@@ -3364,6 +3364,7 @@ mod keyboard_shortcut_tests {
             project_path: "".into(),
             profile_name: "".into(),
             has_session: false,
+            relative_time: "now".into(),
         }
     }
 

@@ -184,7 +184,19 @@ export component ToolEventRow inherits Rectangle {
         // Details body stays mounted and uses CollapseExpand (height +
         // opacity) so show/hide is smooth — same approach as sidebar
         // width animate and ExpandablePanel height animate.
-        if has-execution-content : VerticalLayout {
+        //
+        // `root.visible` gate: `ToolGroupView`/the full-view popup both
+        // instantiate one `ToolEventRow` per message in the *entire*
+        // thread per group (toggling `visible` per row to show only that
+        // group's slice -- Slint's declarative `for` has no way to bind
+        // to an actual sub-slice of a model), so a long thread with many
+        // tool groups mounts far more rows than are ever shown at once.
+        // This can't reduce the *instance count* (would need a Rust-side
+        // per-group model instead of one flat message list), but gating
+        // the heavy children -- `CollapseExpand`/`ExpandablePanel`/
+        // `ApiCallView`/`TerminalView` -- behind `root.visible` keeps
+        // every invisible instance down to its cheap header row only.
+        if root.visible && has-execution-content : VerticalLayout {
             vertical-stretch: 0;
             spacing: Metrics.gap-sm;
             HoverSurface {
