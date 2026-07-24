@@ -948,7 +948,9 @@ impl PanelSingleton {
     pub(crate) fn dispatch_agent_install_requested(&self, _component: &ChatPanel, agent_id: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
-        bridge.install_agent(gw, agent_id);
+        // PUI-013: fire-and-forget so the agents/install round-trip does not
+        // block the Slint UI thread (the Settings>Agents Install freeze).
+        bridge.install_agent_async(gw, agent_id);
     }
 
     /// setup-followups plan, agent_settings_ordering_and_install_enable_
@@ -959,12 +961,9 @@ impl PanelSingleton {
     /// need an index at all.
     pub(crate) fn dispatch_agent_set_enabled(&self, agent_id: &str, enabled: bool) {
         let Some(bridge) = &self.bridge else { return };
-        if !bridge.set_agent_enabled(agent_id, enabled) {
-            eprintln!(
-                "panel-rust: set_agent_enabled({agent_id}, {enabled}) failed \
-                 (no admin plane reachable, or the request itself failed)"
-            );
-        }
+        // PUI-013: fire-and-forget so the admin-plane enable/disable
+        // round-trip does not block the Slint UI thread.
+        bridge.set_agent_enabled_async(agent_id, enabled);
     }
 
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {

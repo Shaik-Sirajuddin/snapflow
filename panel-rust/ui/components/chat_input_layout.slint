@@ -62,6 +62,10 @@ export component ChatInputLayout inherits Rectangle {
     in property <int> context-limit-tokens: 0;
     // Slash/mention catalogs for the compose popup.
     in property <[SkillOption]> skill-options: [];
+    // PUI-003: the agent's own ACP slash-commands. The `/` menu shows these
+    // when the agent advertises any, else falls back to the local skills list.
+    in property <[SkillOption]> command-options: [];
+    property <[SkillOption]> slash-source: root.command-options.length > 0 ? root.command-options : root.skill-options;
     in property <[McpServerOption]> mcp-options: [];
     in property <[string]> file-options: [];
 
@@ -232,7 +236,7 @@ export component ChatInputLayout inherits Rectangle {
 
     function catalog-len() -> int {
         if (root.token-prefix == "/") {
-            return root.skill-options.length;
+            return root.slash-source.length;
         }
         if (root.token-prefix == "@") {
             return root.mcp-options.length;
@@ -247,7 +251,7 @@ export component ChatInputLayout inherits Rectangle {
             return true;
         }
         if (root.token-prefix == "/") {
-            return root.row-hidden(root.skill-options[i].name, root.skill-options[i].description);
+            return root.row-hidden(root.slash-source[i].name, root.slash-source[i].description);
         }
         if (root.token-prefix == "@") {
             return root.row-hidden(root.mcp-options[i].name, root.mcp-options[i].command);
@@ -367,7 +371,7 @@ export component ChatInputLayout inherits Rectangle {
             return;
         }
         if (root.token-prefix == "/") {
-            root.apply-mention-pick("/" + root.skill-options[root.mention-sel].name + " ");
+            root.apply-mention-pick("/" + root.slash-source[root.mention-sel].name + " ");
         } else if (root.token-prefix == "@") {
             root.apply-mention-pick("@" + root.mcp-options[root.mention-sel].name + " ");
         } else if (root.token-prefix == "#") {
@@ -498,8 +502,8 @@ export component ChatInputLayout inherits Rectangle {
         // Vertical: pad-md (12px) — pad-xl (24px) made the bar look over-tall.
         padding-left: Metrics.pad-2xl;
         padding-right: Metrics.pad-2xl;
-        padding-top: Metrics.pad-md;
-        padding-bottom: Metrics.pad-md;
+        padding-top: Metrics.pad-lg;
+        padding-bottom: Metrics.pad-lg;
         spacing: Metrics.gap-md;
 
         // Phase 20 (input_border_animation_removal): the traveling
@@ -520,7 +524,7 @@ export component ChatInputLayout inherits Rectangle {
                 // never paints under the send button or past the dock
                 // (composer_input_text_cutoff_small_width).
                 clip: true;
-                height: Math.clamp(compose.preferred-height + Metrics.pad-lg, 34px, 120px);
+                height: Math.clamp(compose.preferred-height + Metrics.pad-xl, 34px, 120px);
                 background: Theme.bg-tertiary;
                 border-radius: Theme.radius-md;
                 Text {
@@ -538,14 +542,14 @@ export component ChatInputLayout inherits Rectangle {
                     overflow: elide;
                     visible: compose.text == "";
                     x: Metrics.pad-lg;
-                    y: Metrics.pad-lg / 2;
+                    y: Metrics.pad-xl / 2;
                     width: parent.width - 2 * Metrics.pad-lg;
                 }
                 Flickable {
                     x: Metrics.pad-lg;
-                    y: Metrics.pad-lg / 2;
+                    y: Metrics.pad-xl / 2;
                     width: parent.width - 2 * Metrics.pad-lg;
-                    height: parent.height - Metrics.pad-lg;
+                    height: parent.height - Metrics.pad-xl;
                     viewport-height: compose.preferred-height;
                     viewport-width: self.width;
                     compose := TextInput {
@@ -955,7 +959,7 @@ export component ChatInputLayout inherits Rectangle {
 
                     if root.token-prefix == "/" : VerticalLayout {
                         spacing: Metrics.space-1;
-                        for skill[i] in root.skill-options : MentionPickRow {
+                        for skill[i] in root.slash-source : MentionPickRow {
                             property <bool> hidden: root.row-hidden(skill.name, skill.description);
                             height: hidden ? 0px : 28px;
                             highlighted: !hidden && i == root.mention-sel;
@@ -969,7 +973,7 @@ export component ChatInputLayout inherits Rectangle {
                                 root.apply-mention-pick("/" + skill.name + " ");
                             }
                         }
-                        if root.skill-options.length == 0 : Text {
+                        if root.slash-source.length == 0 : Text {
                             text: "No skills discovered yet";
                             color: Theme.text-muted;
                             font-size: 11px * Theme.font-scale;

@@ -14,7 +14,7 @@ use crate::agent_bridge::ThreadSpec;
 use crate::appearance::AppearanceState;
 use crate::conversation::TranscriptItem;
 use crate::models::ThreadState;
-use crate::protocol_types::{ConfigOptionInfo, SessionModesEvent};
+use crate::protocol_types::{AvailableCommandInfo, ConfigOptionInfo, SessionModesEvent};
 use crate::send_queue::SendQueue;
 use slint::VecModel;
 use std::cell::RefCell;
@@ -99,6 +99,8 @@ pub struct ThreadModel {
     pub connection_status: String,
     pub session_modes: Option<SessionModesEvent>,
     pub config_options: Vec<ConfigOptionInfo>,
+    /// PUI-003: the agent's built-in slash commands for the `/` menu.
+    pub available_commands: Vec<AvailableCommandInfo>,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
 }
@@ -169,6 +171,10 @@ pub struct Model {
     pub messages_model: Rc<VecModel<crate::MessageItem>>,
     pub message_model_keys: RefCell<Vec<String>>,
     pub skills_model: Rc<VecModel<crate::SkillOption>>,
+    /// PUI-003: the displayed thread's ACP available_commands, projected as
+    /// SkillOption rows (name+description) for the compose `/` menu. Reuses
+    /// SkillOption rather than a new Slint struct since the shape matches.
+    pub commands_model: Rc<VecModel<crate::SkillOption>>,
     pub skill_model_keys: RefCell<Vec<std::path::PathBuf>>,
     pub profiles_model: Rc<VecModel<crate::ProfileOption>>,
     pub profile_model_keys: RefCell<Vec<String>>,
@@ -212,6 +218,7 @@ impl Default for ThreadModel {
             connection_status: "Connecting...".to_owned(),
             session_modes: None,
             config_options: Vec::new(),
+            available_commands: Vec::new(),
             usage: (0, 0),
         }
     }

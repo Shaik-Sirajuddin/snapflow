@@ -121,6 +121,12 @@ pub enum AgentEvent {
     /// -- streams DURING a turn so the compose context ring updates
     /// actively, not only at turn end.
     UsageUpdate { used: i64, size: i64 },
+    /// PUI-003: the agent's own built-in slash commands, from an ACP
+    /// `available_commands_update` session/update (schema
+    /// `AvailableCommandsUpdate { available_commands: Vec<AvailableCommand> }`).
+    /// Like [`AgentEvent::ConfigOptions`], the notification always carries
+    /// the *complete* current command set -- replace, don't append.
+    AvailableCommands(Vec<AvailableCommandInfo>),
 }
 
 /// One mode an ACP agent advertises as selectable for a session. See
@@ -139,6 +145,17 @@ pub struct SessionModeInfo {
 pub struct SessionModesEvent {
     pub current_mode_id: String,
     pub available: Vec<SessionModeInfo>,
+}
+
+/// PUI-003: one ACP-agent built-in slash command from an
+/// `available_commands_update` (schema `AvailableCommand { name,
+/// description, input? }`). Only `name`/`description` are surfaced to the
+/// `/` menu today; `input` is accepted-but-ignored so an agent supplying
+/// it doesn't drop the whole command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableCommandInfo {
+    pub name: String,
+    pub description: String,
 }
 
 /// One selectable value inside a `select`-kind [`ConfigOptionInfo::

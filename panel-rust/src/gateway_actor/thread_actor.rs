@@ -781,8 +781,42 @@ fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
             let options = parse_config_options(session_update.get("configOptions")?)?;
             Some(AgentEvent::ConfigOptions(options))
         }
+        // PUI-003: the agent's built-in slash commands. Wire field is
+        // `availableCommands: [{name, description, input?}]`.
+        "available_commands_update" => {
+            let commands = parse_available_commands(session_update.get("availableCommands")?);
+            Some(AgentEvent::AvailableCommands(commands))
+        }
         _ => None,
     }
+}
+
+/// PUI-003: parse an `available_commands_update`'s `availableCommands`
+/// array into [`AvailableCommandInfo`]s. Same tolerant convention as
+/// `parse_config_options`: skip any entry missing a `name`, default a
+/// missing `description` to empty, and accept the whole (possibly empty)
+/// list rather than dropping it.
+fn parse_available_commands(
+    value: &serde_json::Value,
+) -> Vec<crate::protocol_types::AvailableCommandInfo> {
+    value
+        .as_array()
+        .map(|commands| {
+            commands
+                .iter()
+                .filter_map(|command| {
+                    Some(crate::protocol_types::AvailableCommandInfo {
+                        name: command.get("name")?.as_str()?.to_string(),
+                        description: command
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parses a `session/new`/`session/load`/`session/resume` response's
@@ -1676,5 +1710,34 @@ mod capability_parsing_tests {
             "params": {"sessionId": "s1", "update": {"sessionUpdate": "plan"}}
         });
         assert!(parse_capability_update(&update).is_none());
+    }
+
+    #[test]
+    fn parse_capability_update_recognizes_available_commands_update() {
+        // PUI-003: the agent's built-in slash commands arrive as an ACP
+        // available_commands_update; entries missing a name are skipped and
+        // a missing description defaults to empty (tolerant parse).
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {"name": "create_plan", "description": "Draft a plan"},
+                    {"name": "research_codebase"},
+                    {"description": "no name -> skipped"}
+                ]
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::AvailableCommands(commands) => {
+                assert_eq!(commands.len(), 2, "the nameless entry is skipped");
+                assert_eq!(commands[0].name, "create_plan");
+                assert_eq!(commands[0].description, "Draft a plan");
+                assert_eq!(commands[1].name, "research_codebase");
+                assert_eq!(commands[1].description, "", "missing description -> empty");
+            }
+            other => panic!("expected AvailableCommands, got {other:?}"),
+        }
     }
 }

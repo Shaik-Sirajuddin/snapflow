@@ -702,6 +702,21 @@ fn sync_model_dropdown_for_provider(
     component.set_config_trigger_label(
         crate::models::current_config_trigger_label(&thread.config_options).into(),
     );
+    // PUI-003: feed the compose `/` menu from this thread's ACP
+    // available_commands (projected as SkillOption rows). Empty when the
+    // agent advertises none, so the `/` menu falls back to local skills.
+    model.commands_model.set_vec(
+        thread
+            .available_commands
+            .iter()
+            .map(|command| crate::SkillOption {
+                name: command.name.clone().into(),
+                description: command.description.clone().into(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    );
+    component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
 }
 
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
@@ -843,6 +858,7 @@ pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_threads(slint::ModelRc::from(model.thread_model.clone()));
     component.set_messages(slint::ModelRc::from(model.messages_model.clone()));
     component.set_available_skills(slint::ModelRc::from(model.skills_model.clone()));
+    component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
     reconcile_settings_models(model, component);
 }
@@ -1060,6 +1076,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    available_commands: vec![],
                     usage: (0, 0),
                 }),
                 ..crate::msg::FrameInput::default()

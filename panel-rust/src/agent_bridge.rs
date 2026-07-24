@@ -194,6 +194,11 @@ struct ThreadSlot {
     /// shown as a dead/always-present control.
     session_modes: Mutex<Option<SessionModesEvent>>,
     config_options: Mutex<Vec<ConfigOptionInfo>>,
+    /// PUI-003: the agent's own built-in slash commands, from
+    /// `available_commands_update`. Replaced wholesale on each push; not
+    /// persisted (the agent re-advertises on session start), so it is not
+    /// part of the runtime snapshot.
+    available_commands: Mutex<Vec<crate::protocol_types::AvailableCommandInfo>>,
     /// Phase 2 step 3 (chat-panel-production-ui/execution-plan.md):
     /// typed, merged conversation view -- `history` above stays the
     /// raw, unmerged, append-only `ChatMessage` feed (JSONL cache
@@ -444,6 +449,12 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
                 .config_options
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = options.clone();
+        }
+        AgentEvent::AvailableCommands(commands) => {
+            *slot
+                .available_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = commands.clone();
         }
         _ => {}
     }
@@ -1870,7 +1881,8 @@ fn spawn_event_forwarder(
                 }
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
-                | AgentEvent::ConfigOptions(_) => {
+                | AgentEvent::ConfigOptions(_)
+                | AgentEvent::AvailableCommands(_) => {
                     store_capability_event(&slot_for_task, &ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
@@ -2257,6 +2269,7 @@ impl AgentBridge {
                 ),
                 session_modes: Mutex::new(runtime_snapshot.session_modes),
                 config_options: Mutex::new(runtime_snapshot.config_options),
+                available_commands: Mutex::new(Vec::new()),
                 attachment: Mutex::new(AttachmentState::default()),
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
@@ -2494,6 +2507,7 @@ impl AgentBridge {
             ),
             session_modes: Mutex::new(runtime_snapshot.session_modes),
             config_options: Mutex::new(runtime_snapshot.config_options),
+            available_commands: Mutex::new(Vec::new()),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
@@ -2656,6 +2670,7 @@ impl AgentBridge {
             terminal_order: Mutex::new(Vec::new()),
             session_modes: Mutex::new(None),
             config_options: Mutex::new(Vec::new()),
+            available_commands: Mutex::new(Vec::new()),
             attachment: Mutex::new(AttachmentState {
                 complete: true,
                 error: None,
@@ -3150,6 +3165,53 @@ impl AgentBridge {
         }
     }
 
+    /// PUI-013: non-blocking Install. `install_agent` above does a
+    /// synchronous `runtime.block_on` on the caller -- which is the Slint
+    /// UI thread -- so the whole panel froze for the duration of the
+    /// `agents/install` round-trip (the reported Settings>Agents freeze).
+    /// This fire-and-forget variant runs the same round-trip on the tokio
+    /// runtime instead; the periodic frame poll re-pulls `list_agents`, so
+    /// the installed status still refreshes on its own. Kept separate from
+    /// `install_agent` so the synchronous, bool-returning method still
+    /// backs the unit tests.
+    pub fn install_agent_async(&self, idx: usize, agent_id: &str) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let handle = slot.handle.clone();
+        let agent_id = agent_id.to_string();
+        self.runtime.spawn(async move {
+            if handle.install_agent(agent_id.clone()).await.is_err() {
+                eprintln!("panel-rust: install_agent({agent_id}) failed (async)");
+            }
+        });
+    }
+
+    /// PUI-013: non-blocking enable/disable -- same rationale as
+    /// `install_agent_async`; `set_agent_enabled`'s `runtime.block_on` also
+    /// ran on the UI thread. Fire-and-forget on the tokio runtime.
+    pub fn set_agent_enabled_async(&self, agent_id: &str, enabled: bool) {
+        let Some((admin_url, admin_token)) = resolve_admin_creds() else {
+            eprintln!(
+                "panel-rust: set_agent_enabled({agent_id}, {enabled}) skipped \
+                 (no admin plane reachable)"
+            );
+            return;
+        };
+        let agent_id = agent_id.to_string();
+        self.runtime.spawn(async move {
+            let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
+            let ok = if enabled {
+                client.enable_agent(&agent_id).await.is_ok()
+            } else {
+                client.disable_agent(&agent_id).await.is_ok()
+            };
+            if !ok {
+                eprintln!("panel-rust: set_agent_enabled({agent_id}, {enabled}) failed (async)");
+            }
+        });
+    }
+
     /// Opens (or returns the already-open) client-local PTY terminal
     /// for thread `idx` -- see [`crate::local_terminal::LocalTerminal`]'s
     /// doc comment for what "client-local" means (a real shell process
@@ -3502,6 +3564,21 @@ impl AgentBridge {
             return Vec::new();
         };
         slot.config_options
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// PUI-003: the agent's own built-in slash commands for thread `idx`
+    /// (from `available_commands_update`), for the compose `/` menu.
+    pub fn available_commands(
+        &self,
+        idx: usize,
+    ) -> Vec<crate::protocol_types::AvailableCommandInfo> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        slot.available_commands
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -4486,6 +4563,7 @@ mod tests {
             connection_status: bridge.transport_status(index),
             session_modes: bridge.session_modes(index),
             config_options: bridge.config_options(index),
+            available_commands: bridge.available_commands(index),
             usage: (0, 0),
         };
         let (_, dirty) = crate::update::update(

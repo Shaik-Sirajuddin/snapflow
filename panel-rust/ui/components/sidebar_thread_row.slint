@@ -347,47 +347,10 @@ export component SidebarThreadRow inherits HoverSurface {
                     // confirm -- same two-step pattern as
                     // `settings_sheet.slint`'s profile
                     // delete control.
-                    if expanded && rename-thread-index != index
-                        && !thread.closed && pending-close-index != index && (root.has-hover || index == selected-thread) : IconButton {
-                        btn-width: 18px;
-                        btn-height: 18px;
-                        button-accessible-label: "Close thread " + thread.name;
-                        clicked => { pending-close-index = index; }
-                        Icon {
-                            source: @image-url("../assets/icons/power.svg");
-                            size: 13px;
-                            color: Theme.text-muted;
-                        }
-                    }
-                    if expanded && rename-thread-index != index
-                        && !thread.closed && pending-close-index == index : HorizontalLayout {
-                        spacing: Metrics.space-1;
-                        IconButton {
-                            btn-width: 18px;
-                            btn-height: 18px;
-                            button-accessible-label: "Confirm close thread " + thread.name;
-                            clicked => {
-                                pending-close-index = -1;
-                                close-requested();
-                            }
-                            Icon {
-                                source: @image-url("../assets/icons/circle-check.svg");
-                                size: Metrics.icon-sm;
-                                color: Theme.bg-primary;
-                            }
-                        }
-                        IconButton {
-                            btn-width: 18px;
-                            btn-height: 18px;
-                            button-accessible-label: "Cancel close thread " + thread.name;
-                            clicked => { pending-close-index = -1; }
-                            Icon {
-                                source: @image-url("../assets/icons/x.svg");
-                                size: 13px;
-                                color: Theme.text-secondary;
-                            }
-                        }
-                    }
+                    // PUI-007: power (close) button removed from active and
+                    // archived rows -- it was unused; archive is the primary
+                    // hide action. `close-requested`/`pending-close-index`
+                    // retained but no longer surfaced from this row.
                     if expanded && rename-thread-index != index
                         && thread.closed && pending-delete-index != index && (root.has-hover || index == selected-thread) : IconButton {
                         btn-width: 18px;
@@ -456,7 +419,8 @@ export component SidebarThreadRow inherits HoverSurface {
                         Icon {
                             source: @image-url("../assets/icons/archive.svg");
                             size: 13px;
-                            color: Theme.text-muted;
+                            // PUI-007: archive reads as a destructive/hide action -- red.
+                            color: #ef4444;
                         }
                     }
                 }

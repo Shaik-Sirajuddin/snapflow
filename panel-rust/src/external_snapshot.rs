@@ -547,6 +547,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             session_modes: bridge.session_modes(real_idx),
             usage: bridge.thread_usage(real_idx),
             config_options: bridge.config_options(real_idx),
+            available_commands: bridge.available_commands(real_idx),
         })
     }
 
