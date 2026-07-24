@@ -39,6 +39,29 @@ fn execute_thread_lifecycle_effect(
     effect: crate::effect::Effect,
 ) -> Option<crate::effect::EffectResultMsg> {
     match effect {
+        // PUI-014: deferred create -- build a placeholder slot (claims its
+        // positional index) with NO session attach, so the provider stays
+        // editable until first send. Returns None: there is no SessionAttached
+        // result to fold yet (no session exists); the row renders idle (see
+        // external_snapshot's is_deferred branch), and the first message's
+        // imperative attach produces the eventual binding the frame poll folds.
+        crate::effect::Effect::NewThreadDeferred {
+            real_index,
+            display_name,
+            provider,
+        } => {
+            if let Some(bridge) = panel.bridge.as_mut() {
+                if let Err(error) = bridge.add_thread_deferred(&display_name, Some(&provider)) {
+                    return Some(crate::effect::EffectResultMsg::SessionAttached {
+                        real_index,
+                        thread_id: None,
+                        provider: Some(provider),
+                        result: Err(crate::effect::EffectError::new(error.to_string())),
+                    });
+                }
+            }
+            None
+        }
         crate::effect::Effect::NewThread {
             real_index,
             display_name,
@@ -302,6 +325,7 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
     };
     let real_idx = match &effect {
         crate::effect::Effect::NewThread { real_index, .. } => *real_index,
+        crate::effect::Effect::NewThreadDeferred { real_index, .. } => *real_index,
         _ => return,
     };
     if let Some(result) = execute_thread_lifecycle_effect(panel, effect) {
@@ -483,6 +507,57 @@ pub(crate) fn dispatch_thread_delete(
 /// queue/bridge-aware cascade is delegated to
 /// the bridge send effect executor; the queue/state transition itself is
 /// owned by `update()`.
+/// PUI-014: the `&mut` entry point the send closure calls. If the selected
+/// thread is still a DEFERRED placeholder (created but never attached, its
+/// provider/profile picker still editable), this is its first message: attach
+/// its session NOW, bound to the provider/profile as they stand in the model
+/// (which may differ from the creation-time hint if the user changed the
+/// picker). The attach runs in the background (like the eager path); the
+/// subsequent `SendPrompt`'s `wait_for_attachment` blocks on it before sending.
+/// Then delegate to the unchanged `&self` send path. A no-op passthrough for a
+/// thread that is already attached (not deferred).
+pub(crate) fn dispatch_compose_send_maybe_attach(
+    panel: &mut PanelSingleton,
+    filtered_idx: usize,
+    text: String,
+) {
+    if let Some(real_idx) = panel.real_index(filtered_idx) {
+        let is_deferred = panel
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.is_deferred(real_idx));
+        if is_deferred {
+            let (provider, profile) = {
+                let model = panel.model.borrow();
+                match model.threads.get(real_idx) {
+                    Some(thread) => (thread.provider.clone(), thread.profile_name.clone()),
+                    None => (String::new(), None),
+                }
+            };
+            if let Some(bridge) = panel.bridge.as_mut() {
+                let provider_arg = (!provider.is_empty()).then_some(provider.as_str());
+                if let Err(error) =
+                    bridge.attach_deferred_thread(real_idx, provider_arg, profile.as_deref())
+                {
+                    // Surface attach failure the same shape a failed eager
+                    // attach would: mark the thread errored via the reducer.
+                    let _ = update_persistent(
+                        panel,
+                        Msg::Effect(crate::effect::EffectResultMsg::SessionAttached {
+                            real_index: real_idx,
+                            thread_id: None,
+                            provider: Some(provider),
+                            result: Err(crate::effect::EffectError::new(error.to_string())),
+                        }),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    dispatch_compose_send(panel, filtered_idx, text);
+}
+
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
     let real_idx = panel.real_index(filtered_idx);
     let (effects, _dirty) = update_persistent(

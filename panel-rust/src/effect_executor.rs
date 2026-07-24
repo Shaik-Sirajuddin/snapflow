@@ -883,7 +883,9 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     });
                 });
             }
-            Effect::NewThread { .. } | Effect::RecoverSessionAttach { .. } => {
+            Effect::NewThread { .. }
+            | Effect::NewThreadDeferred { .. }
+            | Effect::RecoverSessionAttach { .. } => {
                 debug_assert!(
                     false,
                     "thread lifecycle effects must use execute_thread_lifecycle_effect"

@@ -335,13 +335,16 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 ..ThreadModel::default()
             });
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
+            // PUI-014: create the thread DEFERRED -- no ACP session opens until
+            // the first message is sent, so the provider/profile picker stays
+            // editable. profile_name/permission_profile are already stored on
+            // the model thread above and are read at attach time. The imperative
+            // attach in the &mut send dispatch reads the then-current provider.
             (
-                vec![Effect::NewThread {
+                vec![Effect::NewThreadDeferred {
                     real_index,
                     display_name,
                     provider,
-                    profile_name,
-                    permission_profile,
                 }],
                 vec![
                     list_dirty,
@@ -2503,7 +2506,7 @@ mod tests {
             assert!(
                 matches!(
                     effects.as_slice(),
-                    [Effect::NewThread { provider, .. }] if provider == "claude"
+                    [Effect::NewThreadDeferred { provider, .. }] if provider == "claude"
                 ),
                 "default_agent_id {agent_id:?} must route new threads to the claude provider, \
                  got: {effects:?}"
@@ -2519,19 +2522,29 @@ mod tests {
         model.default_agent_id = "claude".to_owned();
 
         let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        // PUI-014: New now creates a DEFERRED thread -- no eager attach, so the
+        // provider/profile stay editable. The effect carries only what the
+        // deferred slot needs; the profile/permission are retained on the model
+        // thread and read at first-send attach time.
         assert_eq!(
             effects,
-            vec![Effect::NewThread {
+            vec![Effect::NewThreadDeferred {
                 real_index: 1,
                 display_name: "New thread 2".to_owned(),
                 provider: "claude".to_owned(),
-                profile_name: Some("safe".to_owned()),
-                permission_profile: Some("workspace".to_owned()),
             }]
         );
         assert_eq!(model.threads.len(), 2);
         assert!(model.threads[1].session_id.is_none());
+        assert_eq!(model.threads[1].profile_name.as_deref(), Some("safe"));
+        assert_eq!(
+            model.threads[1].permission_profile.as_deref(),
+            Some("workspace")
+        );
 
+        // The first message's imperative attach eventually resolves the binding
+        // exactly as before -- SessionAttached still folds the session id and
+        // emits the persistence effect.
         let (follow_up, dirty) = update(
             &mut model,
             Msg::Effect(EffectResultMsg::SessionAttached {
@@ -2568,14 +2581,22 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![Effect::NewThread {
+            vec![Effect::NewThreadDeferred {
                 real_index: 1,
                 display_name: "New thread 2".to_owned(),
                 provider: "codex".to_owned(),
-                profile_name: None,
-                permission_profile: None,
             }],
-            "a literal \"default\" profile/permission-profile must never reach session/new"
+        );
+        // PUI-014: the profile/permission are now read from the model thread at
+        // attach time, so the "default" sentinel must be filtered to None BEFORE
+        // it is stored -- otherwise it would reach session/new at first send.
+        assert_eq!(
+            model.threads[1].profile_name, None,
+            "a literal \"default\" profile must never be stored (would reach session/new)"
+        );
+        assert_eq!(
+            model.threads[1].permission_profile, None,
+            "a literal \"default\" permission-profile must never be stored"
         );
     }
 

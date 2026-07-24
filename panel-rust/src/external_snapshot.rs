@@ -412,12 +412,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                     row.profile_name = thread.profile_name.clone().unwrap_or_default().into();
                     row.has_session = thread.session_id.is_some();
                 }
+                // PUI-014: a DEFERRED slot (created but intentionally not yet
+                // attached -- provider still editable, no message sent) is idle
+                // and ready for input, NOT an attach-in-flight. Only show the
+                // "Starting new thread..." loading state for a slot whose attach
+                // has actually begun (eager/recovered) but not yet bound.
                 if !row.closed
-                    && self
-                        .panel
-                        .bridge
-                        .as_ref()
-                        .is_some_and(|bridge| bridge.thread_binding(item.real_index).is_none())
+                    && self.panel.bridge.as_ref().is_some_and(|bridge| {
+                        bridge.thread_binding(item.real_index).is_none()
+                            && !bridge.is_deferred(item.real_index)
+                    })
                 {
                     row.status = "loading".into();
                     row.busy = true;

@@ -43,6 +43,17 @@ pub enum Effect {
         profile_name: Option<String>,
         permission_profile: Option<String>,
     },
+    /// PUI-014: create a new thread as a DEFERRED placeholder -- claims its
+    /// positional slot index but opens no ACP session yet, so the provider
+    /// stays editable until the first message triggers the attach (imperatively,
+    /// in the `&mut` send dispatch). Carries only what
+    /// `AgentBridge::add_thread_deferred` needs; profile/permission are read
+    /// from the model thread at attach time.
+    NewThreadDeferred {
+        real_index: usize,
+        display_name: String,
+        provider: String,
+    },
     CloseThread {
         real_index: usize,
     },
