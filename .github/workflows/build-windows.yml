@@ -134,6 +134,14 @@ jobs:
           cp -r multi-media-main/sap-rust sap-rust
           cp -r multi-media-main/panel-rust panel-rust
           cp -r multi-media-main/acpx acpx
+          # panel-rust/Cargo.toml declares `skills-manager = { path =
+          # "../lib/skills-manager" }`, so the lib/ workspace has to land as a
+          # sibling too or cargo fails before compiling anything with
+          # "failed to load source for dependency `skills-manager` ... The
+          # system cannot find the path specified". Missed when the
+          # skills-manager crate was introduced (it only ever built locally,
+          # where lib/ is simply present in the checkout).
+          cp -r multi-media-main/lib lib
 
       # Set up the base MSYS2 environment only -- packages are installed as
       # a separate step below so the pacman package-download cache

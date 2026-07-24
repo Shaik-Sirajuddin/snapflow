@@ -190,6 +190,7 @@ jobs:
             -v "$GITHUB_WORKSPACE/multi-media-main/sap-rust:/root/sap-rust-src:ro" \
             -v "$GITHUB_WORKSPACE/multi-media-main/panel-rust:/root/panel-rust-src:ro" \
             -v "$GITHUB_WORKSPACE/multi-media-main/acpx:/root/acpx-src:ro" \
+            -v "$GITHUB_WORKSPACE/multi-media-main/lib:/root/lib-src:ro" \
             -e "DEPS_CACHE_HIT=$DEPS_CACHE_HIT" \
             "$IMAGE_NAME" \
             -c '
@@ -211,6 +212,14 @@ jobs:
               fi
               if [ ! -d /root/shotcut/src/acpx ]; then
                 cp -r /root/acpx-src /root/shotcut/src/acpx
+              fi
+              # panel-rust/Cargo.toml declares `skills-manager = { path =
+              # "../lib/skills-manager" }`, so lib/ must land as a sibling of
+              # panel-rust too, or cargo aborts before compiling with
+              # "failed to load source for dependency `skills-manager`".
+              # Missed when the skills-manager crate was introduced.
+              if [ ! -d /root/shotcut/src/lib ]; then
+                cp -r /root/lib-src /root/shotcut/src/lib
               fi
               export PATH="/root/.cargo/bin:$PATH"
               if ! command -v rustc >/dev/null 2>&1; then
