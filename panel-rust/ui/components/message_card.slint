@@ -72,13 +72,19 @@ export component MessageCard inherits Rectangle {
             }
         }
 
+        // `interactive: false`: this Flickable is a layout boundary
+        // (height == viewport-height, nothing pans), not a scroller --
+        // see markdown_view.slint's overlay doc comment. Releasing its
+        // drag capture lets `body-text`'s native click-drag selection
+        // through.
         if !is-tool-call : Flickable {
+            interactive: false;
             height: body-text.preferred-height;
             viewport-height: body-text.preferred-height;
             horizontal-stretch: 1;
             preferred-width: 0px;
             min-width: 0px;
-            body-text := Text {
+            body-text := TextInput {
                 text: item.text;
                 font-italic: is-thinking;
                 font-family: Theme.font-sans;
@@ -86,11 +92,13 @@ export component MessageCard inherits Rectangle {
                 color: is-user ? Theme.text-user-bubble
                     : is-thinking ? Theme.text-muted
                     : Theme.text-primary;
+                read-only: true;
                 wrap: word-wrap;
-                overflow: elide;
                 horizontal-alignment: left;
                 vertical-alignment: top;
                 width: parent.width;
+                selection-foreground-color: Theme.text-primary;
+                selection-background-color: #60a5fa80;
             }
         }
 

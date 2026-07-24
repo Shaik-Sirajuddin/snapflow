@@ -149,7 +149,18 @@ export component ToolGroupView inherits Rectangle {
             height: root.expanded ? (root.maximized ? body-layout.preferred-height : min(body-layout.preferred-height, root.max-visible-height)) : 0px;
             spacing: Metrics.space-2;
 
+            // `interactive: false`: this Flickable is the first *interactive*
+            // Flickable ancestor between the root and every `TextInput`
+            // nested arbitrarily deep inside `@children` (ToolEventRow's
+            // title, ExpandablePanel's body, TerminalLogBlock's payload --
+            // see each of their own `interactive: false` doc comments), so
+            // it was winning every click-drag gesture before it could ever
+            // reach those `TextInput`s, even after they were fixed
+            // individually. Mouse-wheel scroll and the index scrollbar
+            // rail (right of this Flickable) still work; only drag-to-pan
+            // is traded away for click-drag text selection.
             flickable := Flickable {
+                interactive: false;
                 height: parent.height;
                 viewport-height: body-layout.preferred-height;
                 horizontal-stretch: 1;

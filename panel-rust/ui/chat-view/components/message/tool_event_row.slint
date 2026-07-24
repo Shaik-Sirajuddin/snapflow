@@ -121,13 +121,19 @@ export component ToolEventRow inherits Rectangle {
                     color: Theme.text-primary;
                 }
             }
+            // `interactive: false` trades away drag-to-pan for the rare
+            // title that exceeds `cap-height` in favor of native
+            // click-drag selection (see markdown_view.slint's overlay doc
+            // comment) -- selection still reaches every character via
+            // Ctrl+A even while visually capped/clipped.
             Flickable {
+                interactive: false;
                 horizontal-stretch: 1;
                 preferred-width: 0px;
                 min-width: 0px;
                 height: min(text-content.preferred-height, root.cap-height);
                 viewport-height: text-content.preferred-height;
-                text-content := Text {
+                text-content := TextInput {
                     text: root.text;
                     font-family: Theme.font-sans;
                     font-size: 12px * Theme.font-scale;
@@ -135,10 +141,13 @@ export component ToolEventRow inherits Rectangle {
                     color: (is-mcp || is-tool-use || is-terminal) ? Theme.text-primary
                         : (is-skill-use && first-use) ? Theme.text-accent-bright
                         : Theme.text-primary;
+                    read-only: true;
                     horizontal-alignment: left;
                     vertical-alignment: center;
                     wrap: word-wrap;
                     width: parent.width;
+                    selection-foreground-color: Theme.text-primary;
+                    selection-background-color: #60a5fa80;
                 }
             }
 

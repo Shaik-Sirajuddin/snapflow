@@ -33,6 +33,17 @@ export component ExpandablePanel {
             // measure against, same fix `ToolEventRow`'s own inline text
             // Flickable already relies on (binding off a named child
             // instead of `self`).
+            //
+            // `interactive: false`: this one *does* have real scroll range
+            // while collapsed (`height` caps at `collapsed-max-height` but
+            // `viewport-height` doesn't), unlike the "layout boundary only"
+            // Flickables documented in markdown_view.slint. Disabling its
+            // drag-to-pan anyway so click-drag reaches the `TextInput`s in
+            // `ApiCallView`/`TerminalView` underneath -- the "Open full
+            // view" toggle below is still the way to see clipped content,
+            // and Ctrl+A still selects everything even while visually
+            // capped.
+            interactive: false;
             height: expanded ? content-wrapper.preferred-height : min(content-wrapper.preferred-height, collapsed-max-height);
             viewport-height: content-wrapper.preferred-height;
             animate height { duration: 150ms; easing: ease-in-out; }
