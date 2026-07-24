@@ -34,17 +34,20 @@ export component TerminalView inherits VerticalLayout {
             text: "$";
             font-family: Theme.font-mono;
             font-size: 10px * Theme.font-scale;
-            font-weight: 700;
+            font-weight: 600;
             color: Theme.text-muted;
         }
-        Text {
+        TextInput {
             text: root.command;
             font-family: Theme.font-mono;
             font-size: 10px * Theme.font-scale;
             color: Theme.text-primary;
+            read-only: true;
             wrap: word-wrap;
             horizontal-alignment: left;
             horizontal-stretch: 1;
+            selection-foreground-color: Theme.text-primary;
+            selection-background-color: #60a5fa80;
         }
     }
 
@@ -56,18 +59,25 @@ export component TerminalView inherits VerticalLayout {
         visible: root.output != "";
         VerticalLayout {
             padding: Metrics.space-2;
+            // `interactive: false`: layout boundary only (height ==
+            // viewport-height, nothing pans) -- see markdown_view.slint's
+            // overlay doc comment.
             Flickable {
+                interactive: false;
                 height: output-text.preferred-height;
                 viewport-height: output-text.preferred-height;
-                output-text := Text {
+                output-text := TextInput {
                     text: root.output;
                     font-family: Theme.font-mono;
                     font-size: 10px * Theme.font-scale;
                     color: Theme.text-terminal;
+                    read-only: true;
                     wrap: word-wrap;
                     horizontal-alignment: left;
                     vertical-alignment: top;
                     width: parent.width;
+                    selection-foreground-color: Theme.text-terminal;
+                    selection-background-color: #60a5fa80;
                 }
             }
         }

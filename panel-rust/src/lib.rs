@@ -646,22 +646,11 @@ impl PanelSingleton {
             .map(|bridge| bridge.cancel_prompt(real_idx));
     }
 
-    /// Answers the currently-displayed thread's first pending request
-    /// with a concrete one-of option id (Zed flat permission model), then
-    /// immediately re-renders the request card (which will hide it, since
-    /// `AgentBridge::respond_to_request` removes the entry synchronously).
-    /// `dispatch.rs`'s Request-domain wrapper (tea-slint-model Phase 4)
-    /// calls this -- extracted verbatim from the former
-    /// `on_load_older_requested` closure's `PANEL.with` body.
-    /// PUI-002: send `terminal/kill` for `terminal_id` on the displayed
-    /// thread -- the background-terminals popup's `[x]` control. Fire-and-
-    /// forget; a failure surfaces as a thread error event.
-    pub(crate) fn dispatch_kill_terminal(&self, terminal_id: String) {
-        let Some(bridge) = &self.bridge else { return };
-        let Some(real_idx) = self.model.borrow().displayed_thread else {
-            return;
-        };
-        bridge.kill_terminal(real_idx, terminal_id);
+    /// Executes the bridge side of `Effect::KillAgentTerminal` (PUI-002b).
+    pub(crate) fn execute_kill_agent_terminal_real(&self, real_idx: usize, terminal_id: String) {
+        self.bridge
+            .as_ref()
+            .map(|bridge| bridge.kill_terminal(real_idx, terminal_id));
     }
 
     pub(crate) fn dispatch_load_older_requested(&self) {
@@ -2190,11 +2179,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
-        // PUI-002: background-terminals popup [x] -> terminal/kill.
-        panel.component.on_kill_terminal(move |terminal_id| {
+        // PUI-002b: terminals popup's `[x]` kill button.
+        let component_weak = panel.component.as_weak();
+        panel.component.on_terminal_kill_requested(move |terminal_id| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    panel.dispatch_kill_terminal(terminal_id.to_string());
+                    dispatch::dispatch_terminal_kill_requested(
+                        panel,
+                        &component,
+                        terminal_id.to_string(),
+                    );
                 }
             });
         });
@@ -2347,6 +2344,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_toggle_expanded(panel, index as usize);
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_copy_message(move |text| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_copy_message(panel, text.to_string());
                 }
             });
         });
@@ -3385,6 +3394,7 @@ mod keyboard_shortcut_tests {
             project_path: "".into(),
             profile_name: "".into(),
             has_session: false,
+            relative_time: "now".into(),
         }
     }
 

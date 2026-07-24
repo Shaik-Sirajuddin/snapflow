@@ -99,6 +99,15 @@ pub struct TerminalRuntimeSnapshot {
     pub output: String,
     pub truncated: bool,
     pub exit_status: Option<(Option<i32>, Option<i32>)>,
+    // PUI-002b: mirrors TerminalBuffer's own `#[serde(default)]` additions
+    // -- a runtime snapshot persisted before this field existed still
+    // deserializes (older rows just restore with an empty command/title).
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub started_at: String,
 }
 
 /// Owns the cache directory; one `.jsonl` file per thread id.
@@ -888,6 +897,9 @@ mod tests {
                 output: "building\n".into(),
                 truncated: false,
                 exit_status: Some((Some(0), None)),
+                command: "cargo build".into(),
+                args: Vec::new(),
+                started_at: "2026-07-24T00:00:00.000000000Z".into(),
             }],
             session_modes: Some(SessionModesEvent {
                 current_mode_id: "ask".into(),

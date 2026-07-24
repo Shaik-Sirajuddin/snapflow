@@ -64,6 +64,7 @@ pub struct ThreadModel {
     pub permission_profile: Option<String>,
     pub session_id: Option<String>,
     pub state: ThreadState,
+    pub last_activity_time: Option<std::time::Instant>,
     pub error: Option<String>,
     /// Whether any *visible agent output* (an agent message or tool call
     /// -- deliberately not thinking/thought chunks) has arrived since
@@ -200,6 +201,7 @@ impl Default for ThreadModel {
             permission_profile: None,
             session_id: None,
             state: ThreadState::Idle,
+            last_activity_time: Some(std::time::Instant::now()),
             error: None,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),

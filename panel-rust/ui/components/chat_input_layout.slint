@@ -7,6 +7,7 @@ import { ContextRing } from "../base/context_ring.slint";
 import { Toggle } from "../base/toggle.slint";
 import { TextUtil } from "../base/text_util.slint";
 import { MentionPickRow } from "../base/mention_pick_row.slint";
+import { SelectableChip } from "../base/selectable_chip.slint";
 import { DropdownEntry, SkillOption, McpServerOption } from "../types.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
@@ -47,11 +48,6 @@ export component ChatInputLayout inherits Rectangle {
     in property <[DropdownEntry]> profile-dropdown-entries: [];
     in property <string> profile-trigger-label: "";
     in property <bool> active-thread-has-session: false;
-    // PUI-002: number of background terminals for the active thread; drives the
-    // "N terminals" chip below the select-inputs. Chip hidden when 0.
-    in property <int> terminal-count: 0;
-    // Emitted when the terminals chip is clicked -- ChatArea toggles the popup.
-    callback terminals-clicked();
     // Dedicated Fast toggle — binary ACP config option (id typically
     // "fastMode"). Host derives availability/values from configOptions[];
     // the model dropdown deliberately omits this option.
@@ -76,6 +72,11 @@ export component ChatInputLayout inherits Rectangle {
     property <[SkillOption]> slash-source: root.command-options;
     in property <[McpServerOption]> mcp-options: [];
     in property <[string]> file-options: [];
+    // PUI-002a: live count of the displayed thread's background terminals
+    // (ThreadModel.terminals.length, see chat_area.slint). Drives the
+    // "{terminal-count} terminals" chip below row 2; the chip itself opens
+    // the terminals popup via terminals-clicked (PUI-002b).
+    in property <int> terminal-count: 0;
 
     callback send-requested();
     callback stop-requested();
@@ -83,6 +84,7 @@ export component ChatInputLayout inherits Rectangle {
     callback config-option-selected(string, string);
     callback profile-selected(string);
     callback context-view-requested();
+    callback terminals-clicked();
     // Phase 15: inline OAuth/connect from the @ MCP popup row.
     callback mcp-connect-requested(string);
     // Phase 15: inline enable/disable from the @ MCP popup row.
@@ -916,43 +918,31 @@ export component ChatInputLayout inherits Rectangle {
         }
         }
 
-        // PUI-002: background-terminals chip -- a thin rule under the select
-        // inputs, then a clickable "{N} terminals" pill. Hidden when the
-        // active thread has no terminals. ChatArea toggles the popup.
+        // PUI-002a: background-terminals chip, own row below the row2
+        // selector strip. Mirrors the hr + chip convention used elsewhere
+        // (e.g. terminal_card.slint's `Rectangle { height: 1px; background:
+        // Theme.border-default; }` divider) rather than inventing a new
+        // one. Hidden when there are no terminals for the displayed
+        // thread -- PUI-018 keeps terminal-count scoped per-ThreadSlot, so
+        // switching threads/agents changes this without any extra wiring
+        // here.
         if root.terminal-count > 0 : VerticalLayout {
-            spacing: Metrics.space-1;
-            Rectangle {
-                height: 1px;
-                background: Theme.border-default;
-            }
+            spacing: Metrics.gap-sm;
+            Rectangle { height: 1px; background: Theme.border-default; }
+            // Reuses SelectableChip (base/) rather than hand-rolling a
+            // TouchArea+Rectangle+Text -- agy -p's review-ui pass caught
+            // the hand-rolled version both misusing a padding token
+            // (Metrics.pad-2xl) as a control height and omitting the
+            // CursorHost wiring every other clickable surface in this
+            // codebase sets. SelectableChip (built on HoverSurface)
+            // already owns hover tint + CursorHost + content-width
+            // sizing; `selected` is left at its default `false` since
+            // this chip has no persistent selected state, only hover.
             HorizontalLayout {
                 alignment: start;
-                terminals-chip := Rectangle {
-                    horizontal-stretch: 0;
-                    height: 24px;
-                    border-radius: 6px;
-                    border-width: 1px;
-                    border-color: Theme.border-default;
-                    background: chip-hit.has-hover ? Theme.bg-card : Theme.bg-sidebar;
-                    HorizontalLayout {
-                        padding-left: Metrics.space-2;
-                        padding-right: Metrics.space-2;
-                        spacing: Metrics.space-1;
-                        cross-axis-alignment: center;
-                        Text {
-                            text: root.terminal-count == 1
-                                ? "1 terminal"
-                                : root.terminal-count + " terminals";
-                            color: Theme.text-secondary;
-                            font-size: 10px * Theme.font-scale;
-                            font-family: Theme.font-sans;
-                            vertical-alignment: center;
-                        }
-                    }
-                    chip-hit := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.terminals-clicked(); }
-                    }
+                SelectableChip {
+                    label: root.terminal-count + " terminal" + (root.terminal-count == 1 ? "" : "s");
+                    clicked => { root.terminals-clicked(); }
                 }
             }
         }

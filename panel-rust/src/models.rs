@@ -19,6 +19,36 @@ use crate::{
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
 
+/// Same taxonomy as `chat_area.slint`'s `is-tool-kind` -- kept in sync by
+/// hand since the Slint side can't import a Rust constant list.
+fn is_tool_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tool_use" | "mcp_server_call" | "skill_use" | "skill_load" | "terminal"
+    )
+}
+
+/// Stamps `MessageItem::tool_group_len` on the first row of every
+/// contiguous tool-kind run (see that field's doc comment in
+/// `types.slint` for why this lives in Rust rather than a Slint
+/// `pure function`: no loops/recursion there, so an unbounded scan isn't
+/// expressible without a hand-unrolled, arbitrarily-capped `if` ladder).
+/// Every other row's `tool_group_len` is left at its literal default (0).
+fn assign_tool_group_lengths(rows: &mut [MessageItem]) {
+    let mut i = 0;
+    while i < rows.len() {
+        if !is_tool_kind(rows[i].kind.as_str()) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < rows.len() && is_tool_kind(rows[i].kind.as_str()) {
+            i += 1;
+        }
+        rows[start].tool_group_len = (i - start) as i32;
+    }
+}
+
 /// Maps `markdown::LineKind` to tags used by `base/markdown_view.slint`.
 fn line_kind_str(kind: LineKind) -> &'static str {
     match kind {
@@ -42,24 +72,28 @@ fn line_kind_str(kind: LineKind) -> &'static str {
 fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
     let rows: Vec<MarkdownLine> = lines
         .into_iter()
-        .map(|line| MarkdownLine {
-            kind: line_kind_str(line.kind).into(),
-            runs: ModelRc::new(VecModel::from(
-                line.runs
-                    .into_iter()
-                    .map(|r| MarkdownRun {
-                        text: r.text.into(),
-                        bold: r.bold,
-                        italic: r.italic,
-                        code: r.code,
-                        strike: r.strike,
-                        link: r.link.into(),
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-            indent: line.indent as i32,
-            ordinal: line.ordinal as i32,
-            code_block_id: line.code_block_id,
+        .map(|line| {
+            let plain_text: String = line.runs.iter().map(|r| r.text.as_str()).collect();
+            MarkdownLine {
+                kind: line_kind_str(line.kind).into(),
+                runs: ModelRc::new(VecModel::from(
+                    line.runs
+                        .into_iter()
+                        .map(|r| MarkdownRun {
+                            text: r.text.into(),
+                            bold: r.bold,
+                            italic: r.italic,
+                            code: r.code,
+                            strike: r.strike,
+                            link: r.link.into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                indent: line.indent as i32,
+                ordinal: line.ordinal as i32,
+                code_block_id: line.code_block_id,
+                plain_text: plain_text.into(),
+            }
         })
         .collect();
     ModelRc::new(VecModel::from(rows))
@@ -227,7 +261,7 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
     // First-use skill tracking: walk the list in order, mark a skill_use
     // row first-use only the first time its tracking name appears.
     let mut seen_skills = std::collections::HashSet::<String>::new();
-    let items: Vec<MessageItem> = msgs
+    let mut items: Vec<MessageItem> = msgs
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
@@ -272,9 +306,11 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                 can_send_now: false,
                 sending: false,
                 first_use,
+                tool_group_len: 0,
             }
         })
         .collect();
+    assign_tool_group_lengths(&mut items);
     ModelRc::new(VecModel::from(items))
 }
 
@@ -339,7 +375,7 @@ pub fn to_message_rows_from_transcript(
 
     let mut index = 0i32;
     let mut seen_skills = std::collections::HashSet::<String>::new();
-    let rows: Vec<MessageItem> = items
+    let mut rows: Vec<MessageItem> = items
         .into_iter()
         .filter_map(|item| {
             // Live tool details: raw_input/raw_output flow from
@@ -424,11 +460,13 @@ pub fn to_message_rows_from_transcript(
                 can_send_now: false,
                 sending: false,
                 first_use,
+                tool_group_len: 0,
             };
             index += 1;
             Some(row)
         })
         .collect();
+    assign_tool_group_lengths(&mut rows);
     rows
 }
 
@@ -469,6 +507,8 @@ pub fn append_send_queue_rows(
             // already shows Stop instead.
             can_send_now: !(generation_in_flight && i == 0),
             first_use: false,
+            // Always "user" kind above -- never a tool-group start.
+            tool_group_len: 0,
         });
     }
 }
@@ -988,6 +1028,7 @@ pub fn build_thread_items<N: AsRef<str>>(
             session_id: None,
             item: ThreadItem {
                 name: name.as_ref().into(),
+                relative_time: String::from("now").into(),
                 // Archived takes precedence over closed: it is the final,
                 // explicitly-chosen state, whereas closed can still precede
                 // an archive action on the same thread.
@@ -1104,55 +1145,41 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
     ModelRc::new(VecModel::from(to_terminal_item_rows(entries)))
 }
 
-/// Builds concrete terminal rows for a reducer-owned thread snapshot.
-/// PUI-002: format a terminal's first-seen unix-millis timestamp as a stable
-/// `HH:MM:SS` clock string (UTC) for the popup's start-time column. Empty for
-/// a terminal with no known start time (restored from cache). UTC keeps it
-/// dependency-free and stable across frames; a real command title/local-time
-/// arrives with the acpx-core change (see meta PUI-002).
-pub fn format_terminal_start_time(started_at: Option<u64>) -> String {
-    match started_at {
-        Some(ms) => {
-            let seconds_of_day = (ms / 1000) % 86_400;
-            format!(
-                "{:02}:{:02}:{:02}",
-                seconds_of_day / 3600,
-                (seconds_of_day % 3600) / 60,
-                seconds_of_day % 60
-            )
-        }
-        None => String::new(),
-    }
-}
-
 pub fn to_terminal_item_rows(entries: Vec<(String, Option<TerminalBuffer>)>) -> Vec<TerminalItem> {
     entries
         .into_iter()
         .map(|(terminal_id, buffer)| match buffer {
-            Some(buffer) => TerminalItem {
-                title: terminal_id.clone().into(),
-                last_command: String::new().into(),
-                started_at: format_terminal_start_time(buffer.started_at).into(),
-                active: buffer.exit_status.is_none(),
-                terminal_id: terminal_id.into(),
-                output: buffer.output.into(),
-                truncated: buffer.truncated,
-                has_exited: buffer.exit_status.is_some(),
-                exit_code: buffer
-                    .exit_status
-                    .and_then(|(code, _signal)| code)
-                    .unwrap_or_default(),
-            },
+            Some(buffer) => {
+                let active = buffer.active();
+                TerminalItem {
+                    terminal_id: terminal_id.into(),
+                    output: buffer.output.into(),
+                    truncated: buffer.truncated,
+                    has_exited: buffer.exit_status.is_some(),
+                    exit_code: buffer
+                        .exit_status
+                        .and_then(|(code, _signal)| code)
+                        .unwrap_or_default(),
+                    title: buffer.command.clone().into(),
+                    last_command: if buffer.args.is_empty() {
+                        buffer.command.clone().into()
+                    } else {
+                        format!("{} {}", buffer.command, buffer.args.join(" ")).into()
+                    },
+                    started_at: buffer.started_at.into(),
+                    active,
+                }
+            }
             None => TerminalItem {
-                title: terminal_id.clone().into(),
-                last_command: String::new().into(),
-                started_at: String::new().into(),
-                active: false,
                 terminal_id: terminal_id.into(),
                 output: String::new().into(),
                 truncated: false,
                 has_exited: false,
                 exit_code: 0,
+                title: String::new().into(),
+                last_command: String::new().into(),
+                started_at: String::new().into(),
+                active: true,
             },
         })
         .collect()
@@ -1828,12 +1855,40 @@ mod tests {
         assert!(model.row_data(0).unwrap().expanded);
     }
 
+    // Regression coverage for `chat_area.slint`'s formerly Slint-side,
+    // hand-unrolled-to-10 group scan (undercounted/mis-rendered any
+    // contiguous tool-kind run past that cap) -- `assign_tool_group_lengths`
+    // replaces it with an unbounded Rust pass. 15 > the old cap of 10.
     #[test]
-    fn terminal_start_time_formats_millis_as_hhmmss_and_empty_when_unknown() {
-        // 1h 02m 03s past a UTC midnight = 3723 seconds -> 01:02:03.
-        let ms = (1 * 3600 + 2 * 60 + 3) * 1000;
-        assert_eq!(format_terminal_start_time(Some(ms)), "01:02:03");
-        assert_eq!(format_terminal_start_time(None), "");
+    fn tool_group_length_is_not_capped_at_ten() {
+        let mut msgs = vec![chat_msg(MessageKind::User, "start", None)];
+        for _ in 0..15 {
+            msgs.push(chat_msg(MessageKind::ToolCall, "x", Some("completed")));
+        }
+        msgs.push(chat_msg(MessageKind::User, "end", None));
+        let model = to_message_model(msgs, &[]);
+        assert_eq!(model.row_count(), 17);
+        assert_eq!(model.row_data(0).unwrap().tool_group_len, 0);
+        assert_eq!(model.row_data(1).unwrap().tool_group_len, 15);
+        for i in 2..16 {
+            assert_eq!(model.row_data(i).unwrap().tool_group_len, 0);
+        }
+        assert_eq!(model.row_data(16).unwrap().tool_group_len, 0);
+    }
+
+    #[test]
+    fn tool_group_length_handles_multiple_separate_groups() {
+        let msgs = vec![
+            chat_msg(MessageKind::ToolCall, "a", Some("completed")),
+            chat_msg(MessageKind::ToolCall, "b", Some("completed")),
+            chat_msg(MessageKind::User, "between", None),
+            chat_msg(MessageKind::ToolCall, "c", Some("completed")),
+        ];
+        let model = to_message_model(msgs, &[]);
+        assert_eq!(model.row_data(0).unwrap().tool_group_len, 2);
+        assert_eq!(model.row_data(1).unwrap().tool_group_len, 0);
+        assert_eq!(model.row_data(2).unwrap().tool_group_len, 0);
+        assert_eq!(model.row_data(3).unwrap().tool_group_len, 1);
     }
 
     #[test]
@@ -1844,13 +1899,16 @@ mod tests {
                 output: "hi".to_owned(),
                 truncated: false,
                 exit_status: None, // still running -> active
-                started_at: Some((5 * 3600) * 1000),
+                command: "cargo test".to_owned(),
+                args: vec!["--lib".to_owned()],
+                started_at: "2026-07-24T05:00:00.000000000Z".to_owned(),
             }),
         )]);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].title.as_str(), "term_7");
+        assert_eq!(rows[0].title.as_str(), "cargo test");
+        assert_eq!(rows[0].last_command.as_str(), "cargo test --lib");
         assert!(rows[0].active, "a non-exited terminal is active");
-        assert_eq!(rows[0].started_at.as_str(), "05:00:00");
+        assert_eq!(rows[0].started_at.as_str(), "2026-07-24T05:00:00.000000000Z");
     }
 
     #[test]

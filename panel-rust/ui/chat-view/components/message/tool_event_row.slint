@@ -36,14 +36,24 @@ export component ToolEventRow inherits Rectangle {
     // list), instead of resetting every time this row is rebuilt.
     in property <bool> expanded;
     in property <int> index;
+    in property <bool> in-group: false;
     callback toggle-expanded(int);
-
-    background: transparent;
-    // Content-sized height — do not stretch and steal space from compose.
-    vertical-stretch: 0;
+    callback open-full-view(string, string, string, bool, bool);
 
     property <bool> is-skill-use: kind == "skill_use";
     property <bool> is-terminal: kind == "terminal";
+    property <bool> is-tool-use: kind == "tool_use";
+    property <bool> is-mcp: kind == "mcp_server_call";
+
+    // Container surface for tool calls, MCP calls, and execution rows
+    background: in-group ? transparent : ((is-mcp || is-tool-use || is-terminal) ? Theme.bg-agent-bubble : transparent);
+    border-color: transparent;
+    border-width: 0px;
+    border-radius: Theme.radius-md;
+
+    // Content-sized height — do not stretch and steal space from compose.
+    vertical-stretch: 0;
+
     // kind -> icon lookup. @image-url requires a compile-time-constant
     // literal path (see base/icon.slint's own comment), so this can't be
     // resolved from a `for`/data-driven source string -- a ternary chain
@@ -73,58 +83,99 @@ export component ToolEventRow inherits Rectangle {
     property <bool> details-open: root.expanded;
     changed expanded => { details-open = root.expanded; }
 
-    // Dot + icon lead for details indent (matches first-row layout).
-    property <length> lead-indent: Metrics.pad-sm + 4px + Metrics.gap-sm + Metrics.icon-sm + Metrics.gap-sm;
+    // Dot (8px) + Gap (Metrics.space-2) + Icon (16px) + Gap (Metrics.space-2) + Padding (Metrics.space-2)
+    property <length> lead-indent: Metrics.space-2 + 8px + Metrics.space-2 + 16px + Metrics.space-2;
 
     VerticalLayout {
-        spacing: Metrics.gap-sm;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        padding-left: 0px;
+        padding-right: 0px;
+        spacing: 2px;
 
-        // First row: dot + kind icon + name. pad-sm horizontal, left text.
-        // Keep default HorizontalLayout alignment (stretch) so the name
-        // Flickable can use horizontal-stretch: 1 — alignment:start made
-        // preferred-width:0 collapse to zero width (name disappeared).
-        // Dot/icon wrappers use alignment: center so they sit on the
-        // vertical midline of the row (cross-axis), not the top.
+        // First row: dot + kind icon + name. Exact uniform alignment across all kinds.
         HorizontalLayout {
-            padding-left: Metrics.pad-sm;
-            padding-right: Metrics.pad-sm;
-            padding-top: Metrics.pad-xs;
-            padding-bottom: Metrics.pad-xs;
-            spacing: Metrics.gap-sm;
+            padding-left: Metrics.space-2;
+            padding-right: Metrics.space-2;
+            padding-top: 0px;
+            padding-bottom: 0px;
+            spacing: Metrics.space-2;
             VerticalLayout {
                 alignment: center;
                 horizontal-stretch: 0;
+                width: 8px;
                 Rectangle {
-                    width: 4px;
-                    height: 4px;
-                    border-radius: 2px;
-                    background: Theme.text-muted;
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Theme.text-primary;
                 }
             }
             VerticalLayout {
                 alignment: center;
                 horizontal-stretch: 0;
+                width: 16px;
                 Icon {
                     source: root.kind-icon-source;
-                    size: Metrics.icon-sm;
-                    color: Theme.text-secondary;
+                    size: 16px;
+                    color: Theme.text-primary;
                 }
             }
+            // `interactive: false` trades away drag-to-pan for the rare
+            // title that exceeds `cap-height` in favor of native
+            // click-drag selection (see markdown_view.slint's overlay doc
+            // comment) -- selection still reaches every character via
+            // Ctrl+A even while visually capped/clipped.
             Flickable {
+                interactive: false;
                 horizontal-stretch: 1;
                 preferred-width: 0px;
                 min-width: 0px;
                 height: min(text-content.preferred-height, root.cap-height);
                 viewport-height: text-content.preferred-height;
-                text-content := Text {
+                text-content := TextInput {
                     text: root.text;
                     font-family: Theme.font-sans;
-                    font-size: 11px * Theme.font-scale;
-                    color: is-skill-use && first-use ? Theme.text-accent-bright : Theme.text-tertiary;
+                    font-size: 12px * Theme.font-scale;
+                    font-weight: 600;
+                    color: (is-mcp || is-tool-use || is-terminal) ? Theme.text-primary
+                        : (is-skill-use && first-use) ? Theme.text-accent-bright
+                        : Theme.text-primary;
+                    read-only: true;
                     horizontal-alignment: left;
                     vertical-alignment: center;
                     wrap: word-wrap;
                     width: parent.width;
+                    selection-foreground-color: Theme.text-primary;
+                    selection-background-color: #60a5fa80;
+                }
+            }
+
+            // Maximize / Open full view button right on the call title line
+            if has-execution-content : TouchArea {
+                width: 22px;
+                height: 22px;
+                mouse-cursor: pointer;
+                clicked => {
+                    root.open-full-view(
+                        root.is-mcp ? "MCP CALL PAYLOAD & DETAILS" : (root.is-terminal ? "TERMINAL EXECUTION FULL VIEW" : "TOOL CALL PAYLOAD & DETAILS"),
+                        root.is-terminal ? root.text : root.raw-input,
+                        root.raw-output,
+                        root.is-terminal,
+                        root.is-mcp
+                    );
+                }
+
+                Rectangle {
+                    background: parent.has-hover ? Theme.bg-sidebar : transparent;
+                    border-radius: Theme.radius-sm;
+                    animate background { duration: 120ms; }
+
+                    Icon {
+                        source: @image-url("../../../assets/icons/maximize-2.svg");
+                        size: 14px;
+                        color: Theme.text-primary;
+                    }
                 }
             }
         }
@@ -133,11 +184,24 @@ export component ToolEventRow inherits Rectangle {
         // Details body stays mounted and uses CollapseExpand (height +
         // opacity) so show/hide is smooth — same approach as sidebar
         // width animate and ExpandablePanel height animate.
-        if has-execution-content : VerticalLayout {
+        //
+        // `root.visible` gate: `ToolGroupView`/the full-view popup both
+        // instantiate one `ToolEventRow` per message in the *entire*
+        // thread per group (toggling `visible` per row to show only that
+        // group's slice -- Slint's declarative `for` has no way to bind
+        // to an actual sub-slice of a model), so a long thread with many
+        // tool groups mounts far more rows than are ever shown at once.
+        // This can't reduce the *instance count* (would need a Rust-side
+        // per-group model instead of one flat message list), but gating
+        // the heavy children -- `CollapseExpand`/`ExpandablePanel`/
+        // `ApiCallView`/`TerminalView` -- behind `root.visible` keeps
+        // every invisible instance down to its cheap header row only.
+        if root.visible && has-execution-content : VerticalLayout {
             vertical-stretch: 0;
             spacing: Metrics.gap-sm;
             HoverSurface {
-                height: 18px;
+                height: 22px;
+                border-radius: Theme.radius-sm;
                 button-accessible-label: root.details-open ? "Hide call details" : "Show call details";
                 clicked => {
                     root.details-open = !root.details-open;
@@ -146,10 +210,11 @@ export component ToolEventRow inherits Rectangle {
                 HorizontalLayout {
                     padding-left: root.lead-indent;
                     Text {
-                        text: root.details-open ? "[-] hide details" : "[+] show details";
+                        text: root.details-open ? "[-] hide call details" : "[+] show call details";
                         font-family: Theme.font-mono;
-                        font-size: 9px * Theme.font-scale;
-                        color: Theme.text-secondary;
+                        font-size: 10px * Theme.font-scale;
+                        font-weight: 600;
+                        color: Theme.text-primary;
                         vertical-alignment: center;
                     }
                 }
@@ -164,6 +229,11 @@ export component ToolEventRow inherits Rectangle {
                     if root.is-terminal : ExpandablePanel {
                         collapsed-max-height: root.cap-height * 2;
                         collapsed-by-default: false;
+                        raw-input: root.text;
+                        raw-output: root.raw-output;
+                        is-terminal: true;
+                        title: "TERMINAL EXECUTION FULL VIEW";
+                        open-full-view => { root.open-full-view("TERMINAL EXECUTION FULL VIEW", root.text, root.raw-output, true, false); }
                         TerminalView {
                             command: root.text;
                             output: root.raw-output;
@@ -176,6 +246,11 @@ export component ToolEventRow inherits Rectangle {
                         // capped preview; user can still "Open full view".
                         collapsed-max-height: root.cap-height * 2;
                         collapsed-by-default: true;
+                        raw-input: root.raw-input;
+                        raw-output: root.raw-output;
+                        is-terminal: false;
+                        title: "TOOL CALL PAYLOAD & DETAILS";
+                        open-full-view => { root.open-full-view(root.is-mcp ? "MCP CALL PAYLOAD & DETAILS" : "TOOL CALL PAYLOAD & DETAILS", root.raw-input, root.raw-output, false, root.is-mcp); }
                         ApiCallView {
                             raw-input: root.raw-input;
                             raw-output: root.raw-output;

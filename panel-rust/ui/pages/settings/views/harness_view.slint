@@ -45,33 +45,6 @@ export component HarnessView inherits Rectangle {
                     toggled(new-checked) => { root.background-default = new-checked; }
                 }
             }
-
-            SettingsRow {
-                label: "This chat";
-                hint: root.background-override-set
-                    ? (root.background-override ? "Background" : "Foreground")
-                    : "Use default";
-                Toggle {
-                    checked: root.background-override-set;
-                    toggle-accessible-label: "Toggle background session override";
-                    toggled(new-checked) => {
-                        root.background-override-set = new-checked;
-                        if (new-checked) {
-                            root.background-override = root.background-default;
-                        }
-                    }
-                }
-            }
-
-            if root.background-override-set : SettingsRow {
-                row-height: 24px;
-                label: root.background-override ? "Set this chat foreground" : "Set this chat background";
-                Toggle {
-                    checked: root.background-override;
-                    toggle-accessible-label: "Toggle selected chat background session";
-                    toggled(new-checked) => { root.background-override = new-checked; }
-                }
-            }
         }
     }
 }

@@ -251,13 +251,14 @@ export component ChatPanel inherits Window {
     callback recover-session-attach(string, string, string);
     callback search-changed(string);
     callback toggle-expanded(int);
+    callback copy-message(string);
     callback approve-request();
     callback reject-request();
     // One-of permission option pick (ACP optionId or synthetic approve/reject).
     callback permission-option-selected(string);
     callback expand-terminal(string);
-    // PUI-002: background-terminals popup [x] kill.
-    callback kill-terminal(string);
+    // PUI-002b: terminals popup's `[x]` kill button.
+    callback terminal-kill-requested(string);
     callback close-terminal-overlay();
     callback local-terminal-toggle-requested();
     callback local-terminal-key-input(string);
@@ -552,13 +553,14 @@ export component ChatPanel inherits Window {
                     root.confirm-thread-rename(selected-thread, name);
                 }
                 toggle-expanded(i) => { toggle-expanded(i); }
+                copy-message(text) => { copy-message(text); }
                 pending-request: pending-request;
                 approve-request => { approve-request(); }
                 reject-request => { reject-request(); }
                 permission-option-selected(option-id) => { permission-option-selected(option-id); }
                 terminals: terminals;
                 expand-terminal(id) => { expand-terminal(id); }
-                kill-terminal(id) => { kill-terminal(id); }
+                terminal-kill-requested(id) => { terminal-kill-requested(id); }
                 local-terminal: local-terminal;
                 local-terminal-toggle-requested => { local-terminal-toggle-requested(); }
                 local-terminal-key-input(text) => { local-terminal-key-input(text); }

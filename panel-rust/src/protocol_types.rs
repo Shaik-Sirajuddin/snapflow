@@ -92,6 +92,13 @@ pub enum AgentEvent {
     /// byte delta -- a client displaying this is expected to simply
     /// replace its shown contents each time, not append.
     TerminalOutput(TerminalOutputEvent),
+    /// A one-shot `acpx/terminal_created` notification (background-
+    /// terminals-ui plan, PUI-002b) -- the command/args/start-time a
+    /// `terminal/create` request carried, which is otherwise never seen
+    /// again (`terminal/output`/`acpx/terminal_output` only ever carry
+    /// `{terminalId, output, truncated, exitStatus}`). Fired exactly once
+    /// per terminal, right after creation succeeds.
+    TerminalCreated(TerminalCreatedEvent),
     /// Session modes advertised by a `session/new`/`session/load`/
     /// `session/resume` response's `modes` field. Per
     /// agentclientprotocol.com's "Session Config Options" doc, `modes`
@@ -201,6 +208,16 @@ pub struct TerminalOutputEvent {
     /// semantics (a signal-killed process has no exit code and vice
     /// versa).
     pub exit_status: Option<(Option<i32>, Option<i32>)>,
+}
+
+/// See [`AgentEvent::TerminalCreated`]'s doc comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalCreatedEvent {
+    pub terminal_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// RFC 3339, as emitted by `acpx_core::router`'s `now_rfc3339()`.
+    pub started_at: String,
 }
 
 /// A pending interactive decision the UI must render and answer. Carries

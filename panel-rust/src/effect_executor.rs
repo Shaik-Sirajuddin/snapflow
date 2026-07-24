@@ -495,6 +495,12 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 let text = String::from_utf8_lossy(&bytes);
                 panel.dispatch_local_terminal_key_input(&text);
             }
+            Effect::KillAgentTerminal {
+                real_index,
+                terminal_id,
+            } => {
+                panel.execute_kill_agent_terminal_real(real_index, terminal_id);
+            }
             Effect::SaveSettings { input } => {
                 let result = panel.execute_settings_save(input);
                 let _ = slint::invoke_from_event_loop(move || {

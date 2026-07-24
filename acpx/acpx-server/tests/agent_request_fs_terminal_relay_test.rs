@@ -307,6 +307,14 @@ async fn ws_client_approves_terminal_create_and_receives_live_output_stream() {
         .expect("send session/prompt");
 
     let mut terminal_output_frames: Vec<serde_json::Value> = Vec::new();
+    // background-terminals-ui plan (PUI-002b): the panel-rust UI's
+    // terminals popup needs a real command/title/start-time for a
+    // terminal, which acpx-core now surfaces as a one-shot
+    // `acpx/terminal_created` push (see acpx-core/src/router.rs's
+    // terminal/create arm) -- captured here so this real WS/process
+    // test can assert it actually arrives with the right fields, not
+    // just that the UI-side parsing code compiles.
+    let mut terminal_created_frames: Vec<serde_json::Value> = Vec::new();
     let outcome = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let frame = read_json_frame(&mut socket).await;
@@ -348,6 +356,10 @@ async fn ws_client_approves_terminal_create_and_receives_live_output_stream() {
                     .expect("send acpx/agent_response");
                 continue;
             }
+            if frame.get("method").and_then(|m| m.as_str()) == Some("acpx/terminal_created") {
+                terminal_created_frames.push(frame);
+                continue;
+            }
             if frame.get("method").and_then(|m| m.as_str()) == Some("acpx/terminal_output") {
                 terminal_output_frames.push(frame);
                 continue;
@@ -364,6 +376,33 @@ async fn ws_client_approves_terminal_create_and_receives_live_output_stream() {
     assert!(
         create_reply["result"]["terminalId"].is_string(),
         "expected a real terminalId from the approved terminal/create, got {create_reply}"
+    );
+    let real_terminal_id = create_reply["result"]["terminalId"]
+        .as_str()
+        .expect("terminalId");
+
+    assert_eq!(
+        terminal_created_frames.len(),
+        1,
+        "expected exactly one acpx/terminal_created push, got {terminal_created_frames:?}"
+    );
+    let created = &terminal_created_frames[0]["params"];
+    assert_eq!(
+        created["terminalId"], real_terminal_id,
+        "acpx/terminal_created's terminalId must match the real terminal/create reply"
+    );
+    assert_eq!(
+        created["command"], "sh",
+        "acpx/terminal_created must carry the real command the backend's terminal/create requested"
+    );
+    assert_eq!(
+        created["args"],
+        json!(["-c", "printf streamed-output"]),
+        "acpx/terminal_created must carry the real args"
+    );
+    assert!(
+        created["startedAt"].as_str().is_some_and(|s| !s.is_empty()),
+        "acpx/terminal_created must carry a non-empty startedAt, got {created}"
     );
 
     // Give the (very short-lived) approved command's streaming poller a
@@ -406,5 +445,194 @@ async fn ws_client_approves_terminal_create_and_receives_live_output_stream() {
             .iter()
             .any(|f| !f["params"]["exitStatus"].is_null()),
         "expected a final push carrying a non-null exitStatus once the command exited, got {terminal_output_frames:?}"
+    );
+}
+
+/// Answers `session/new` normally; on `session/prompt`, sends a real
+/// `terminal/create` for a long-running `sleep 30` (blocks for its reply
+/// like `stand_in_backend_script` does), then replies to the outer call
+/// immediately without waiting for the sleep to finish -- the test client
+/// kills it independently afterwards.
+fn long_running_backend_script() -> String {
+    r#"
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"backend-abc"}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+    printf '{"jsonrpc":"2.0","id":970,"method":"terminal/create","params":{"sessionId":"backend-abc","command":"sleep","args":["30"]}}\n'
+    create_reply=""
+    while IFS= read -r reply_line; do
+      echo "$reply_line" | grep -q '"id":970' && { create_reply="$reply_line"; break; }
+    done
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn","createReply":%s}}\n' "$id" "$create_reply"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#
+    .to_string()
+}
+
+fn long_running_backend_spec() -> SpawnSpec {
+    SpawnSpec::new("sh", vec!["-c".to_string(), long_running_backend_script()])
+}
+
+/// A live WS client that independently sends `terminal/kill` (not
+/// answering any relayed agent request -- this is the client's own
+/// initiative, exactly what `AgentBridge::kill_terminal`'s popup `[x]`
+/// button does) against a real long-running (`sleep 30`) terminal
+/// actually terminates the real process quickly, rather than the test
+/// having to wait out the full 30s sleep. Proves the `background-
+/// terminals-ui` plan's real gap-fix: `classify("terminal/kill")` is now
+/// `MethodClass::GatewayNative` with its own resolve-then-kill handler
+/// (`Router::dispatch_native`'s `"terminal/kill"` arm), not `Unknown` --
+/// before that fix, this exact call from a downstream client (which is
+/// all `AgentBridge::kill_terminal` ever does) would have failed with a
+/// generic unknown-method error and never reached a real terminal at all.
+#[tokio::test]
+async fn ws_client_initiated_kill_terminates_a_long_running_terminal() {
+    let mut router = Router::new("kill-agent");
+    router.register_agent("kill-agent", long_running_backend_spec());
+    let router: SharedRouter = Arc::new(Mutex::new(router));
+    let addr = spawn_server(router.clone()).await;
+
+    let (mut socket, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("ws connect");
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "profiles/create",
+                "params": {
+                    "name": "kill-enabled",
+                    "agent_id": "kill-agent",
+                    "allow_terminal_access": true
+                }
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send profiles/create");
+    let _create_reply = read_json_frame(&mut socket).await;
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": "/tmp", "_acpx": {"profile": "kill-enabled"}}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send session/new");
+    let new_reply = read_json_frame(&mut socket).await;
+    let gateway_id = new_reply["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": {"sessionId": gateway_id, "prompt": []}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send session/prompt");
+
+    // Approve the relayed terminal/create, capture the real terminalId,
+    // then stop waiting for the prompt's own final reply -- this test
+    // only needs the terminal, not the full turn lifecycle.
+    let real_terminal_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = read_json_frame(&mut socket).await;
+            if frame.get("method").and_then(|m| m.as_str()) == Some("acpx/agent_request")
+                && frame["params"]["request"]["method"] == json!("terminal/create")
+            {
+                let relay_id = frame["params"]["relayId"]
+                    .as_str()
+                    .expect("relayId")
+                    .to_string();
+                socket
+                    .send(WsMessage::Text(
+                        json!({
+                            "jsonrpc": "2.0", "id": 4, "method": "acpx/agent_response",
+                            "params": {"relayId": relay_id, "response": {"approved": true}}
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .expect("send acpx/agent_response");
+                continue;
+            }
+            if frame.get("method").and_then(|m| m.as_str()) == Some("acpx/terminal_created") {
+                let terminal_id = frame["params"]["terminalId"]
+                    .as_str()
+                    .expect("terminalId")
+                    .to_string();
+                return terminal_id;
+            }
+        }
+    })
+    .await
+    .expect("terminal/create approval + acpx/terminal_created timed out");
+
+    // The client-initiated kill this whole fix is about: a request the
+    // client sends on its own initiative, not an answer to any relayed
+    // agent request.
+    socket
+        .send(WsMessage::Text(
+            json!({
+                "jsonrpc": "2.0", "id": 10, "method": "terminal/kill",
+                "params": {"sessionId": gateway_id, "terminalId": real_terminal_id}
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send terminal/kill");
+
+    let kill_reply = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = read_json_frame(&mut socket).await;
+            if frame.get("id") == Some(&json!(10)) {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("terminal/kill reply timed out");
+    assert!(
+        kill_reply.get("error").is_none(),
+        "terminal/kill must succeed for a client-initiated kill, got {kill_reply}"
+    );
+
+    // Real proof the process actually died, not just that the RPC
+    // replied ok: the next acpx/terminal_output push must carry a
+    // non-null exitStatus, arriving well before the 30s sleep would have
+    // finished on its own.
+    let exited = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = read_json_frame(&mut socket).await;
+            if frame.get("method").and_then(|m| m.as_str()) == Some("acpx/terminal_output")
+                && !frame["params"]["exitStatus"].is_null()
+            {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect(
+        "expected a real acpx/terminal_output push with a non-null exitStatus \
+         shortly after terminal/kill, proving the sleep-30 process was actually \
+         killed rather than left running",
+    );
+    assert!(
+        exited["params"]["exitStatus"]["signal"].is_number()
+            || exited["params"]["exitStatus"]["exitCode"].is_number(),
+        "expected a real signal or exit code from the killed process, got {exited}"
     );
 }
