@@ -171,6 +171,10 @@ pub struct Model {
     pub messages_model: Rc<VecModel<crate::MessageItem>>,
     pub message_model_keys: RefCell<Vec<String>>,
     pub skills_model: Rc<VecModel<crate::SkillOption>>,
+    /// PUI-003: the displayed thread's ACP available_commands, projected as
+    /// SkillOption rows (name+description) for the compose `/` menu. Reuses
+    /// SkillOption rather than a new Slint struct since the shape matches.
+    pub commands_model: Rc<VecModel<crate::SkillOption>>,
     pub skill_model_keys: RefCell<Vec<std::path::PathBuf>>,
     pub profiles_model: Rc<VecModel<crate::ProfileOption>>,
     pub profile_model_keys: RefCell<Vec<String>>,

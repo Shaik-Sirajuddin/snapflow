@@ -145,6 +145,8 @@ export component ChatPanel inherits Window {
     // skills_management_settings phases), same "property exists before
     // its consuming UI" precedent as `available-mcp-servers` originally.
     in property <[SkillOption]> available-skills: [];
+    // PUI-003: the active thread's ACP agent slash-commands for the `/` menu.
+    in property <[SkillOption]> available-commands: [];
     in property <bool> dev-mode: false;
     // `active_pane_and_editor_view` phase: which surface the main content
     // area shows -- "chat" (ChatArea, the default) or "skill" (a live
@@ -577,6 +579,7 @@ export component ChatPanel inherits Window {
                 context-used-tokens: context-used-tokens;
                 context-limit-tokens: context-limit-tokens;
                 skill-options: available-skills;
+                command-options: available-commands;
                 mcp-options: available-mcp-servers;
                 file-options: file-options;
                 mode-selected(id) => { mode-selected(id); }

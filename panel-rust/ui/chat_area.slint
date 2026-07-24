@@ -101,6 +101,8 @@ export component ChatArea inherits Rectangle {
     in property <int> context-limit-tokens: 0;
     // Catalogs for compose `/` `@` `#` popups.
     in property <[SkillOption]> skill-options: [];
+    // PUI-003: ACP agent slash-commands forwarded to the compose `/` menu.
+    in property <[SkillOption]> command-options: [];
     in property <[McpServerOption]> mcp-options: [];
     in property <[string]> file-options: [];
     callback mode-selected(string);
@@ -1035,6 +1037,7 @@ export component ChatArea inherits Rectangle {
             context-used-tokens: context-used-tokens;
             context-limit-tokens: context-limit-tokens;
             skill-options: skill-options;
+            command-options: command-options;
             mcp-options: mcp-options;
             file-options: file-options;
             send-requested => { root.handle-send(); }
