@@ -3,6 +3,7 @@ import { Metrics } from "../tokens/metrics.slint";
 import { Button } from "../base/button.slint";
 import { TerminalItem } from "../types.slint";
 import { TerminalHeader } from "../base/terminal_header.slint";
+import { HoverSurface } from "../base/hover.slint";
 
 // Real embedded terminal view -- Phase 4 terminal-view addition. Two
 // components:
@@ -69,12 +70,20 @@ export component TerminalCard inherits Rectangle {
     }
 }
 
-// Full-window floating overlay for one expanded terminal -- same
-// docking convention as `app.slint`'s settings sheet (8px inset
-// Rectangle over the whole window), reused rather than duplicated
-// visually since both are "modal card over the panel" treatments.
+// Full-window floating overlay for one-or-more expanded terminals -- same
+// docking convention as `app.slint`'s settings sheet (8px inset Rectangle
+// over the whole window), reused rather than duplicated visually since
+// both are "modal card over the panel" treatments.
+//
+// Terminal-tabs phase: this used to render exactly one terminal (`item`)
+// with no way to switch without closing the overlay and reopening the
+// popup. `open-tabs` now carries every terminal pinned open as a tab;
+// `item` stays the single *active* one (unchanged prop, still what the
+// header/content read for "which tab is current"). See the tab-strip and
+// content-`for`-loop below for how each tab keeps its own scroll position.
 export component TerminalOverlay inherits Rectangle {
     in property <TerminalItem> item;
+    in property <[TerminalItem]> open-tabs: [];
     // A standalone exported component has no compile-time-resolvable
     // `parent` (unlike `app.slint`'s inline settings sheet, which is
     // lexically nested directly inside the `Window` component and so
@@ -83,6 +92,11 @@ export component TerminalOverlay inherits Rectangle {
     in property <length> container-width;
     in property <length> container-height;
     callback close();
+    // Switch the active tab (fired by clicking a tab pill below).
+    callback tab-selected(string);
+    // Dismiss one tab from the open set (its own close [x], not the
+    // overlay-wide Close button) -- does not kill the underlying process.
+    callback tab-closed(string);
 
     x: 8px;
     y: 8px;
@@ -96,19 +110,80 @@ export component TerminalOverlay inherits Rectangle {
     VerticalLayout {
         padding: Metrics.space-5;
         spacing: Metrics.space-4;
+
+        // Tab strip: one pill per open terminal (title elided, running/
+        // exited dot, own close [x]) plus the overlay-wide exit-code
+        // readout and Close button for whichever tab is active.
         HorizontalLayout {
             spacing: Metrics.space-3;
-            Text {
-                text: "terminal " + item.terminal-id;
-                color: Theme.text-primary;
-                font-family: Theme.font-mono;
-                font-size: 12px * Theme.font-scale;
-                font-weight: 700;
+            tab-scroller := Flickable {
                 horizontal-stretch: 1;
                 preferred-width: 0px;
                 min-width: 0px;
-                overflow: elide;
-                vertical-alignment: center;
+                height: 26px;
+                viewport-width: tab-strip.preferred-width;
+                tab-strip := HorizontalLayout {
+                    spacing: Metrics.gap-sm;
+                    for tab-item in root.open-tabs : HoverSurface {
+                        selected: tab-item.terminal-id == root.item.terminal-id;
+                        idle-bg: Theme.bg-sidebar;
+                        hover-bg: Theme.bg-sidebar;
+                        selected-bg: Theme.bg-primary;
+                        border-color: Theme.border-default;
+                        border-width: 1px;
+                        border-radius: Theme.radius-sm;
+                        height: 26px;
+                        width: tab-label.preferred-width + 40px;
+                        accessible-role: tab;
+                        accessible-label: "Terminal tab " + (tab-item.title != "" ? tab-item.title : tab-item.terminal-id)
+                            + (tab-item.active ? ", running" : ", exited");
+                        accessible-action-default => { self.clicked(); }
+                        clicked => { root.tab-selected(tab-item.terminal-id); }
+
+                        HorizontalLayout {
+                            padding-left: Metrics.space-2;
+                            padding-right: Metrics.space-1;
+                            spacing: Metrics.space-1;
+
+                            Rectangle {
+                                width: 6px;
+                                height: 6px;
+                                border-radius: 3px;
+                                y: (parent.height - self.height) / 2;
+                                background: tab-item.active ? #22c55e : (tab-item.exit-code == 0 ? Theme.text-muted : #ef4444);
+                            }
+                            tab-label := Text {
+                                text: tab-item.title != "" ? tab-item.title : tab-item.terminal-id;
+                                color: (tab-item.terminal-id == root.item.terminal-id) ? Theme.text-on-primary : Theme.text-primary;
+                                font-family: Theme.font-mono;
+                                font-size: 10px * Theme.font-scale;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                preferred-width: 0px;
+                                min-width: 0px;
+                                overflow: elide;
+                            }
+                            close-tab-touch := TouchArea {
+                                width: 14px;
+                                height: 14px;
+                                mouse-cursor: pointer;
+                                accessible-role: button;
+                                accessible-label: "Close terminal tab " + (tab-item.title != "" ? tab-item.title : tab-item.terminal-id);
+                                accessible-action-default => { self.clicked(); }
+                                clicked => { root.tab-closed(tab-item.terminal-id); }
+                                Text {
+                                    text: "×";
+                                    color: (tab-item.terminal-id == root.item.terminal-id) ? Theme.text-on-primary : Theme.text-muted;
+                                    font-size: 12px * Theme.font-scale;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    width: 100%;
+                                    height: 100%;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             if item.has-exited : Text {
                 text: "exit " + item.exit-code;
@@ -130,18 +205,66 @@ export component TerminalOverlay inherits Rectangle {
             height: 1px;
             background: Theme.border-default;
         }
-        Flickable {
-            viewport-height: full-log.preferred-height;
-            full-log := Text {
-                text: item.output + (item.truncated ? "\n... (truncated)" : "");
-                color: Theme.text-terminal;
-                font-family: Theme.font-mono;
-                font-size: 11px * Theme.font-scale;
-                wrap: word-wrap;
-                overflow: clip;
-                horizontal-stretch: 1;
-                preferred-width: 0px;
-                min-width: 0px;
+        // One persistent Flickable+Text per open tab, same `wrap:word-
+        // wrap` + `horizontal-stretch:1` + `preferred-width:0px` +
+        // `min-width:0px` trio the pre-existing single-terminal `full-
+        // log`/`output-text` Texts already used inside their own bare
+        // `Flickable` (unchanged from before this tabs phase -- see
+        // `TerminalCard`'s `log` above and the content Flickable below).
+        //
+        // The wrapping `VerticalLayout` (not a plain `Rectangle`) is
+        // required, though: a plain non-Layout container was the first
+        // attempt here, with each repeated child sized against `parent.
+        // width`/`.height` (or a named sibling reference) -- confirmed
+        // live (headless render) that BOTH silently produce zero-area
+        // children in this Slint version's `for`-repeated-element
+        // handling outside of a real `Layout`, nothing crashes or errors,
+        // the row is just invisible. Real `Layout`s don't have that gap
+        // (they always assign each child, repeated or not, concrete
+        // geometry through their own constraint solver), but naively
+        // wrapping the `for` in one *is* the binding loop this component
+        // hit while building it ("layoutinfo-v -> layout-cache -> height
+        // -> height"): the wrapper's own height would be auto-computed
+        // from its children's layoutinfo, and each child's height would
+        // in turn depend on the wrapper's already-resolved height.
+        // Breaking that cycle: pin the wrapper's OWN contribution to the
+        // outer `VerticalLayout` to a fixed `0` (`preferred-height`/
+        // `min-height` below, so its outward layoutinfo never asks its
+        // children anything) while `vertical-stretch: 1` still lets the
+        // outer layout hand it whatever real space is left over; then,
+        // for each repeated child, `vertical-stretch: 1` only on the
+        // *active* tab (others pinned to `0` the same way) lets this
+        // wrapper's OWN constraint solver hand that one child all of the
+        // wrapper's resolved height directly -- no `parent`/named-height
+        // property reference anywhere in the loop. Every tab stays
+        // mounted via `for` (never `if`, which would tear down and
+        // recreate the element, resetting `Flickable.viewport-y` back to
+        // the top) -- only `visible`/`vertical-stretch` toggle per tab,
+        // so switching tabs and back lands exactly where each tab's own
+        // scroll was.
+        content-host := VerticalLayout {
+            vertical-stretch: 1;
+            preferred-height: 0px;
+            min-height: 0px;
+            spacing: 0px;
+            for tab-item in root.open-tabs : Flickable {
+                property <bool> is-active-tab: tab-item.terminal-id == root.item.terminal-id;
+                vertical-stretch: self.is-active-tab ? 1 : 0;
+                preferred-height: 0px;
+                min-height: 0px;
+                visible: self.is-active-tab;
+                viewport-height: tab-log.preferred-height;
+                tab-log := Text {
+                    text: tab-item.output + (tab-item.truncated ? "\n... (truncated)" : "");
+                    color: Theme.text-terminal;
+                    font-family: Theme.font-mono;
+                    font-size: 11px * Theme.font-scale;
+                    wrap: word-wrap;
+                    overflow: clip;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                }
             }
         }
     }

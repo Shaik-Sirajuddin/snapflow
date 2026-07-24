@@ -4923,6 +4923,7 @@ mod tests {
             pending_request: crate::PendingRequestItem::default(),
             terminals: vec![],
             expanded_terminal: None,
+                    open_terminals: vec![],
             local_terminal: crate::LocalTerminalItem::default(),
             connection_status: bridge.transport_status(index),
             session_modes: bridge.session_modes(index),

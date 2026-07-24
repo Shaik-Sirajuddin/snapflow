@@ -2257,6 +2257,33 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        // Terminal-tabs phase: switch the active tab / dismiss one tab
+        // from the overlay's open set, both fired from the tab strip
+        // inside `TerminalOverlay` itself (not the popup).
+        let component_weak = panel.component.as_weak();
+        panel.component.on_terminal_tab_selected(move |terminal_id| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_terminal_tab_selected(panel, terminal_id.to_string());
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_terminal_tab_closed(move |terminal_id| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_terminal_tab_closed(panel, terminal_id.to_string());
+                }
+            });
+        });
+
         // Client-local PTY terminal addition -- toggle open/closed,
         // forward keyboard input, and an explicit kill action. Real
         // `LocalTerminal::spawn`/`close_local_terminal`, no simulation

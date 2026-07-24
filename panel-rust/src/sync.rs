@@ -147,6 +147,10 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 if let Some(thread) = model.threads.get(idx) {
                     reconcile_terminals(model, &thread.terminals);
                     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
+                    reconcile_open_terminals(model, &thread.open_terminals);
+                    component.set_open_terminal_tabs(slint::ModelRc::from(
+                        model.open_terminals_model.clone(),
+                    ));
                     if let Some(expanded) = &thread.expanded_terminal {
                         component.set_expanded_terminal(expanded.clone());
                     } else {
@@ -157,6 +161,10 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 // Transition clear before the new thread's snapshot lands.
                 reconcile_terminals(model, &[]);
                 component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
+                reconcile_open_terminals(model, &[]);
+                component.set_open_terminal_tabs(slint::ModelRc::from(
+                    model.open_terminals_model.clone(),
+                ));
                 component.set_expanded_terminal(crate::TerminalItem::default());
             }
         }
@@ -651,6 +659,22 @@ fn reconcile_terminals(model: &Model, terminals: &[crate::TerminalItem]) {
     );
 }
 
+/// Terminal-tabs phase: same reconcile-in-place contract as
+/// `reconcile_terminals` above, applied to the open-tabs list instead of
+/// the full terminals popup list.
+fn reconcile_open_terminals(model: &Model, open_terminals: &[crate::TerminalItem]) {
+    let new_keys: Vec<String> = open_terminals
+        .iter()
+        .map(|term| term.terminal_id.to_string())
+        .collect();
+    crate::list_model::reconcile(
+        &model.open_terminals_model,
+        &mut model.open_terminal_model_keys.borrow_mut(),
+        &new_keys,
+        open_terminals,
+    );
+}
+
 /// setup-followups plan, provider_fastmode_profile_persistence: refreshes
 /// the compose-bar profile picker for `thread` -- its dropdown model
 /// (`model.available_profiles`, the same data Settings > Agents' profile
@@ -888,6 +912,7 @@ pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_available_skills(slint::ModelRc::from(model.skills_model.clone()));
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
+    component.set_open_terminal_tabs(slint::ModelRc::from(model.open_terminals_model.clone()));
     reconcile_settings_models(model, component);
 }
 
@@ -1100,6 +1125,7 @@ mod tests {
                     pending_request: crate::PendingRequestItem::default(),
                     terminals: vec![],
                     expanded_terminal: None,
+                    open_terminals: vec![],
                     local_terminal: crate::LocalTerminalItem::default(),
                     connection_status: String::new(),
                     session_modes: None,
