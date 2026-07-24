@@ -1060,6 +1060,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    available_commands: vec![],
                     usage: (0, 0),
                 }),
                 ..crate::msg::FrameInput::default()

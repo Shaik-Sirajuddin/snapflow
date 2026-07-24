@@ -14,7 +14,7 @@ use crate::agent_bridge::ThreadSpec;
 use crate::appearance::AppearanceState;
 use crate::conversation::TranscriptItem;
 use crate::models::ThreadState;
-use crate::protocol_types::{ConfigOptionInfo, SessionModesEvent};
+use crate::protocol_types::{AvailableCommandInfo, ConfigOptionInfo, SessionModesEvent};
 use crate::send_queue::SendQueue;
 use slint::VecModel;
 use std::cell::RefCell;
@@ -99,6 +99,8 @@ pub struct ThreadModel {
     pub connection_status: String,
     pub session_modes: Option<SessionModesEvent>,
     pub config_options: Vec<ConfigOptionInfo>,
+    /// PUI-003: the agent's built-in slash commands for the `/` menu.
+    pub available_commands: Vec<AvailableCommandInfo>,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
 }
@@ -212,6 +214,7 @@ impl Default for ThreadModel {
             connection_status: "Connecting...".to_owned(),
             session_modes: None,
             config_options: Vec::new(),
+            available_commands: Vec::new(),
             usage: (0, 0),
         }
     }

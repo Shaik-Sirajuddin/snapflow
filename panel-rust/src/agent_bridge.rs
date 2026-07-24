@@ -3569,6 +3569,21 @@ impl AgentBridge {
             .clone()
     }
 
+    /// PUI-003: the agent's own built-in slash commands for thread `idx`
+    /// (from `available_commands_update`), for the compose `/` menu.
+    pub fn available_commands(
+        &self,
+        idx: usize,
+    ) -> Vec<crate::protocol_types::AvailableCommandInfo> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        slot.available_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Dispatches `session/set_mode` on the background runtime. Fire-
     /// and-forget like [`Self::send_prompt`]/[`Self::cancel_prompt`]:
     /// the caller is the synchronous UI thread, and a failure surfaces
@@ -4548,6 +4563,7 @@ mod tests {
             connection_status: bridge.transport_status(index),
             session_modes: bridge.session_modes(index),
             config_options: bridge.config_options(index),
+            available_commands: bridge.available_commands(index),
             usage: (0, 0),
         };
         let (_, dirty) = crate::update::update(

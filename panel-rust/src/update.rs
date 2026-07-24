@@ -2018,6 +2018,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.connection_status = snapshot.connection_status;
             thread.session_modes = snapshot.session_modes;
             thread.config_options = snapshot.config_options;
+            thread.available_commands = snapshot.available_commands;
             thread.usage = snapshot.usage;
 
             if transcript_changed {
@@ -3040,6 +3041,7 @@ mod tests {
                     connection_status: "Unavailable".to_owned(),
                     session_modes: None,
                     config_options: Vec::new(),
+                    available_commands: Vec::new(),
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3348,6 +3350,7 @@ mod tests {
             connection_status: String::new(),
             session_modes: None,
             config_options: vec![],
+            available_commands: vec![],
             usage: (0, 0),
         };
 
@@ -3496,6 +3499,7 @@ mod tests {
                     connection_status: "Live connection".to_owned(),
                     session_modes: None,
                     config_options: vec![],
+            available_commands: vec![],
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3577,6 +3581,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+            available_commands: vec![],
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3647,6 +3652,7 @@ mod tests {
                     connection_status: "Live".to_owned(),
                     session_modes: None,
                     config_options: vec![],
+            available_commands: vec![],
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -4102,6 +4108,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+            available_commands: vec![],
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
