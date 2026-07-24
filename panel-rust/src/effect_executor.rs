@@ -81,11 +81,11 @@ fn debounce(
 /// `skill_dir` is the skill's directory (same convention as everywhere
 /// else in this file).
 fn schedule_debounced_skill_resync(skill_dir: std::path::PathBuf) {
-    // enabled_vendor_ids/project_root_from_skill_dir intentionally NOT
-    // computed here -- that would still run the blocking gateway RPC on
-    // every keystroke, defeating the point of debouncing. Deferred to
-    // the event-loop re-entry inside on_settled, which only runs once
-    // per idle pause.
+    // enabled_vendor_ids/project_root_from_skill_dir are computed on the
+    // event-loop re-entry below (once per idle pause), not per keystroke.
+    // enabled_vendor_ids is now a non-blocking read of the already-folded
+    // model catalog (see its doc comment) -- it used to be a blocking
+    // gateway RPC, which froze the UI thread here.
     debounce(&SKILL_EDIT_GENERATION, SKILL_EDIT_DEBOUNCE, move || {
         let _ = slint::invoke_from_event_loop(move || {
             crate::PANEL.with(|cell| {
@@ -93,8 +93,8 @@ fn schedule_debounced_skill_resync(skill_dir: std::path::PathBuf) {
                 let Some(panel) = slot.as_ref() else {
                     return;
                 };
-                // The ONE point, at most once per idle pause, where the
-                // blocking enabled_vendor_ids RPC actually runs.
+                // Non-blocking model read (see enabled_vendor_ids' doc
+                // comment); runs once per idle pause, not per keystroke.
                 let vendor_ids = enabled_vendor_ids(panel);
                 let project_root =
                     crate::skills_manager_adapter::project_root_from_skill_dir(&skill_dir);
@@ -138,16 +138,33 @@ fn refresh_skills_after_effect(panel: &PanelSingleton) {
 /// protocol_types.rs) already says which agent ids are currently enabled.
 /// This is just that filter, reused everywhere trigger (3)/(4) need "which
 /// vendor_ids should a skill mutation propagate to right now."
+/// **Non-blocking.** Reads the agent catalog already folded into `Model`
+/// (`update.rs`'s `model.agent_catalog = snapshot.agents`, refreshed from the
+/// settings-gateway snapshot whenever settings are open or the catalog is
+/// empty) rather than calling `AgentBridge::list_agents`, which is
+/// `runtime.block_on`-backed (a gateway `agents/list` RPC, plus a second
+/// admin-plane `block_on` in `agent_enablement_map`).
+///
+/// It previously did call `list_agents` directly, and every caller runs inside
+/// `slint::invoke_from_event_loop` -- i.e. on the single-threaded Slint UI
+/// thread -- so a skill edit/create/promote froze the whole UI for one or two
+/// network round trips. That is the same bug class as `thread_new_loading_
+/// state`/PUI-013 ("no blocking gateway call on the UI thread"): the fix is to
+/// read state the frame poll already collected, exactly as `snapshotd_
+/// reachable` serves the built-in-MCP row from a cached probe result instead of
+/// re-probing on the UI thread.
+///
+/// Returns an empty list when the catalog has not been fetched yet, which the
+/// reactive-sync callers already treat as "no enabled vendors to propagate to"
+/// -- the same degrade-gracefully outcome the old RPC produced on failure.
 fn enabled_vendor_ids(panel: &PanelSingleton) -> Vec<String> {
-    let Some(bridge) = panel.bridge.as_ref() else {
-        return Vec::new();
-    };
-    let idx = panel.settings_gateway_index();
-    bridge
-        .list_agents(idx)
-        .into_iter()
+    panel
+        .model
+        .borrow()
+        .agent_catalog
+        .iter()
         .filter(|agent| agent.enabled)
-        .map(|agent| agent.id)
+        .map(|agent| agent.id.clone())
         .collect()
 }
 
@@ -891,9 +908,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     });
                 });
             }
-            Effect::NewThread { .. }
-            | Effect::NewThreadDeferred { .. }
-            | Effect::RecoverSessionAttach { .. } => {
+            Effect::NewThreadDeferred { .. } | Effect::RecoverSessionAttach { .. } => {
                 debug_assert!(
                     false,
                     "thread lifecycle effects must use execute_thread_lifecycle_effect"

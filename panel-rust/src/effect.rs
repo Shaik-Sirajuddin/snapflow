@@ -36,13 +36,6 @@ impl std::fmt::Display for EffectError {
 pub enum Effect {
     /// Phase 0: cold-start hydration from `PanelStateStore`.
     LoadInitialState,
-    NewThread {
-        real_index: usize,
-        display_name: String,
-        provider: String,
-        profile_name: Option<String>,
-        permission_profile: Option<String>,
-    },
     /// PUI-014: create a new thread as a DEFERRED placeholder -- claims its
     /// positional slot index but opens no ACP session yet, so the provider
     /// stays editable until the first message triggers the attach (imperatively,

@@ -648,9 +648,9 @@ impl PanelSingleton {
 
     /// Executes the bridge side of `Effect::KillAgentTerminal` (PUI-002b).
     pub(crate) fn execute_kill_agent_terminal_real(&self, real_idx: usize, terminal_id: String) {
-        self.bridge
-            .as_ref()
-            .map(|bridge| bridge.kill_terminal(real_idx, terminal_id));
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.kill_terminal(real_idx, terminal_id);
+        }
     }
 
     pub(crate) fn dispatch_load_older_requested(&self) {

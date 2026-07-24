@@ -62,59 +62,6 @@ fn execute_thread_lifecycle_effect(
             }
             None
         }
-        crate::effect::Effect::NewThread {
-            real_index,
-            display_name,
-            provider,
-            profile_name,
-            ..
-        } => {
-            let result = panel
-                .bridge
-                .as_mut()
-                .ok_or_else(|| crate::effect::EffectError::new("agent bridge unavailable"))
-                .and_then(|bridge| {
-                    bridge
-                        .add_thread_with_profile_and_provider(
-                            &display_name,
-                            profile_name.as_deref(),
-                            Some(&provider),
-                        )
-                        .map_err(|error| crate::effect::EffectError::new(error.to_string()))
-                });
-            let (thread_id, actual_provider, result) = match result {
-                Ok(real_idx) => {
-                    let binding = panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_binding(real_idx));
-                    let actual_provider = panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_provider(real_idx));
-                    match binding {
-                        Some(binding) => (
-                            Some(binding.thread_id),
-                            actual_provider,
-                            Ok(binding.session_id),
-                        ),
-                        // Background attachment still in flight: nothing to
-                        // fold yet; the frame poll picks the binding up.
-                        None => return None,
-                    }
-                }
-                Err(error) => (None, None, Err(error)),
-            };
-            let result = result.map_err(|error| {
-                crate::effect::EffectError::new(format!("thread {real_index}: {error}"))
-            });
-            Some(crate::effect::EffectResultMsg::SessionAttached {
-                real_index,
-                thread_id,
-                provider: actual_provider,
-                result,
-            })
-        }
         crate::effect::Effect::RecoverSessionAttach {
             real_index,
             session_id,
@@ -324,7 +271,6 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
         return;
     };
     let real_idx = match &effect {
-        crate::effect::Effect::NewThread { real_index, .. } => *real_index,
         crate::effect::Effect::NewThreadDeferred { real_index, .. } => *real_index,
         _ => return,
     };
