@@ -668,46 +668,59 @@ export component Sidebar inherits Rectangle {
                     min-height: 0px;
                     visible: archived-thread-col.preferred-height > 0px;
                     viewport-height: archived-thread-col.preferred-height;
+                    // PUI-009 review finding: same spacing-accumulation
+                    // pattern as active-thread-col above (fixed there
+                    // first) -- a shared `spacing` between hidden
+                    // (non-archived, 0-height) rows and visible (archived)
+                    // ones inflates the gap between archived rows in
+                    // proportion to how many non-archived threads sit
+                    // between them in `threads`. Same fix: spacing:0px +
+                    // a per-row trailing spacer that's 0px exactly when
+                    // hidden.
                     archived-thread-col := VerticalLayout {
-                        spacing: Metrics.space-1;
-                        for thread[i] in threads : archived-row := SidebarThreadRow {
+                        spacing: 0px;
+                        for thread[i] in threads : archived-row-wrap := VerticalLayout {
+                            spacing: 0px;
                             property <bool> show-here: thread.archived;
-                            height: show-here
-                                ? (thread.model != "" ? 52px : 44px)
-                                : 0px;
-                            visible: show-here;
-                            width: 100%;
-                            thread: thread;
-                            index: i;
-                            selected-thread: root.selected-thread;
-                            expanded: true;
-                            compact: root.compact;
-                            active-project-path: root.active-project-path;
-                            rename-thread-index: root.rename-thread-index;
-                            rename-thread-draft <=> root.rename-thread-draft;
-                            rename-focus-index <=> root.rename-focus-index;
-                            pending-close-index <=> root.pending-close-index;
-                            pending-delete-index <=> root.pending-delete-index;
-                            accent-color: root.thread-accent(i);
-                            // Already in the Archived section.
-                            show-archived-badge: false;
-                            show-archive-action: false;
-                            row-selected => { root.thread-selected(i); }
-                            collapse-if-expanded => {
-                                if (root.expanded) {
-                                    root.collapse-requested();
+                            archived-row := SidebarThreadRow {
+                                height: archived-row-wrap.show-here
+                                    ? (thread.model != "" ? 52px : 44px)
+                                    : 0px;
+                                visible: archived-row-wrap.show-here;
+                                width: 100%;
+                                thread: thread;
+                                index: i;
+                                selected-thread: root.selected-thread;
+                                expanded: true;
+                                compact: root.compact;
+                                active-project-path: root.active-project-path;
+                                rename-thread-index: root.rename-thread-index;
+                                rename-thread-draft <=> root.rename-thread-draft;
+                                rename-focus-index <=> root.rename-focus-index;
+                                pending-close-index <=> root.pending-close-index;
+                                pending-delete-index <=> root.pending-delete-index;
+                                accent-color: root.thread-accent(i);
+                                // Already in the Archived section.
+                                show-archived-badge: false;
+                                show-archive-action: false;
+                                row-selected => { root.thread-selected(i); }
+                                collapse-if-expanded => {
+                                    if (root.expanded) {
+                                        root.collapse-requested();
+                                    }
+                                }
+                                begin-rename => { root.begin-thread-rename(i); }
+                                confirm-rename => { root.confirm-thread-rename(i); }
+                                cancel-rename => { root.cancel-thread-rename(); }
+                                close-requested => { root.thread-close-requested(i); }
+                                delete-requested => { root.thread-delete-requested(i); }
+                                // Phase 19: same toggle = resume.
+                                archive-requested => { root.thread-archive-requested(i); }
+                                rename-focus-changed(has-focus) => {
+                                    root.rename-input-has-focus = has-focus;
                                 }
                             }
-                            begin-rename => { root.begin-thread-rename(i); }
-                            confirm-rename => { root.confirm-thread-rename(i); }
-                            cancel-rename => { root.cancel-thread-rename(); }
-                            close-requested => { root.thread-close-requested(i); }
-                            delete-requested => { root.thread-delete-requested(i); }
-                            // Phase 19: same toggle = resume.
-                            archive-requested => { root.thread-archive-requested(i); }
-                            rename-focus-changed(has-focus) => {
-                                root.rename-input-has-focus = has-focus;
-                            }
+                            Rectangle { height: archived-row-wrap.show-here ? Metrics.space-1 : 0px; }
                         }
                     }
                 }
