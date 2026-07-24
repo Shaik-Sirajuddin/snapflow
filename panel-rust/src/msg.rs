@@ -76,6 +76,16 @@ pub enum ComposeMsg {
     QueueSendNow {
         message_index: usize,
     },
+    /// SCNA-03: pressing Return on an *empty* compose box immediately
+    /// fast-tracks the front queue entry (send_queue.rs's
+    /// try_fast_track/can_fast_track -- armed for one shot by the enqueue
+    /// that just happened, cleared by consuming it here). No target index:
+    /// unlike QueueSendNow, this always acts on the current front entry
+    /// of the *selected* thread's queue, and is a safe no-op (via
+    /// try_fast_track's own can_fast_track guard) if nothing is eligible
+    /// -- the Slint side does not need to know the queue's state to fire
+    /// this, only that the compose box was empty.
+    QueueFastTrack,
     /// Stop in-flight generation and pause auto-drain of the send queue
     /// (QueuedMessageBar stop while an entry is marked `sending`).
     QueueStop,

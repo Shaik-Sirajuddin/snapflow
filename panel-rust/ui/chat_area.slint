@@ -108,6 +108,7 @@ export component ChatArea inherits Rectangle {
     callback profile-selected(string);
     callback context-view-requested();
     callback send-requested();
+    callback queue-fast-track-requested();
     callback stop-requested();
     // QueuedMessageBar actions: message-list index of the queued row.
     callback queue-cancel-requested(int);
@@ -1048,6 +1049,7 @@ export component ChatArea inherits Rectangle {
             mcp-options: mcp-options;
             file-options: file-options;
             send-requested => { root.handle-send(); }
+            queue-fast-track-requested => { root.queue-fast-track-requested(); }
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }

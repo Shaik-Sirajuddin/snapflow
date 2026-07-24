@@ -22,7 +22,7 @@ display="${PANEL_HOST_E2E_MCP_DISPLAY:-:112}"
 screen="${PANEL_HOST_E2E_MCP_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
-scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|rename|startup-warning>}"
+scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|rename|startup-warning>}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
 agent_bin="${RUI_MOCK_AGENT_BIN:-$repo_root/panel-rust/target/debug/rui-mock-agent}"

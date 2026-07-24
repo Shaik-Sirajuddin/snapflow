@@ -52,8 +52,19 @@ collides with a concurrent `host_e2e_smoke.sh` or `host_vnc_dev.sh` run.
 
 ```bash
 bash tests/host_e2e_mcp_smoke.sh send-now
+bash tests/host_e2e_mcp_smoke.sh fast-track
 bash tests/host_e2e_mcp_smoke.sh rename
+bash tests/host_e2e_mcp_smoke.sh startup-warning
 ```
+
+`fast-track` (state-controller-followup-issues SCNA-03): queues one
+message behind a blocked turn, clears the compose box, presses Return with
+it empty, and confirms via `backend-events.jsonl` that the queued message
+was fast-tracked (sent, turn 1 cancelled) rather than an empty prompt
+being sent -- proves `chat_input_layout.slint`'s Return-key
+compose-text-empty branch reaches `update()`'s `QueueFastTrack` arm
+(`send_queue.rs`'s previously-unwired `try_fast_track`/`can_fast_track`)
+on a real host.
 
 Two lessons from getting the driver working, worth keeping in mind before
 adding a third scenario:

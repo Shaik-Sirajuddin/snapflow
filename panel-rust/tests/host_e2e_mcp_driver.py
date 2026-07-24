@@ -244,6 +244,58 @@ def scenario_send_now(args):
     )
 
 
+def scenario_fast_track(args):
+    """SCNA-03: pressing Return on an *empty* compose box right after
+    queuing a message (while a turn is still in flight) fast-tracks that
+    queued entry instead of sending an empty prompt -- verifies the
+    compose-text-empty branch in chat_input_layout.slint's Return-key
+    handler actually reaches update()'s new QueueFastTrack arm on a real
+    host, cancelling the in-flight turn and sending the queued text.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    compose_handle = find_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose"
+    )
+    click(client, compose_handle)
+
+    # Turn 1: blocks (mock_agent.rs's "slow " marker) so the queued entry
+    # below actually enqueues instead of sending immediately.
+    set_text(client, compose_handle, "slow scenario fast track base")
+    press_return(client, window_handle)
+    wait_for_prompt_texts(args.event_log, ["slow scenario fast track base"])
+
+    # Enqueue one entry (arms can_fast_track), then clear the compose box
+    # and press Return again with it empty -- must fast-track, not send
+    # an empty prompt.
+    set_text(client, compose_handle, "fast tracked message")
+    press_return(client, window_handle)
+    set_text(client, compose_handle, "")
+    press_return(client, window_handle)
+
+    wait_for_prompt_texts(
+        args.event_log,
+        ["slow scenario fast track base", "fast tracked message"],
+        timeout=args.timeout,
+    )
+    sent_texts = [
+        event["detail"]
+        for event in prompt_events(args.event_log)
+        if event["method"] == "session/prompt"
+    ]
+    if "" in sent_texts:
+        raise RuntimeError(
+            f"an empty prompt was sent to the backend -- fast-track did not intercept "
+            f"the empty-compose Return, saw prompts: {sent_texts!r}"
+        )
+    print(
+        "PASS fast_track scenario: empty-compose Return fast-tracked the queued "
+        "message instead of sending an empty prompt"
+    )
+
+
 def scenario_rename(args):
     """Round-trips a real thread rename through the actual host process:
     click Rename thread, type a new name, confirm, verify the header
@@ -309,6 +361,7 @@ def scenario_startup_warning(args):
 
 SCENARIOS = {
     "send-now": scenario_send_now,
+    "fast-track": scenario_fast_track,
     "rename": scenario_rename,
     "startup-warning": scenario_startup_warning,
 }

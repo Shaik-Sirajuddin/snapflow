@@ -223,6 +223,7 @@ export component ChatPanel inherits Window {
     callback thread-rename-requested(int, string);
     callback search-submitted(string, bool, bool);
     callback send-requested();
+    callback queue-fast-track-requested();
     callback stop-requested();
     callback queue-cancel-requested(int);
     callback queue-edit-requested(int);
@@ -533,6 +534,7 @@ export component ChatPanel inherits Window {
                     : false;
                 compose-text <=> compose-text;
                 send-requested => { send-requested(); }
+                queue-fast-track-requested => { queue-fast-track-requested(); }
                 stop-requested => { stop-requested(); }
                 queue-cancel-requested(i) => { queue-cancel-requested(i); }
                 queue-edit-requested(i) => { queue-edit-requested(i); }

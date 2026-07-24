@@ -852,6 +852,63 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 }
             }
         }
+        ComposeMsg::QueueFastTrack => {
+            let is_generating = {
+                let Some(thread) = model.threads.get(idx) else {
+                    return (vec![], vec![]);
+                };
+                matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+            };
+            let fast_track_result = {
+                let Some(thread) = model.threads.get_mut(idx) else {
+                    return (vec![], vec![]);
+                };
+                thread.send_queue.try_fast_track(is_generating)
+            };
+            match fast_track_result {
+                Ok(Some(entry)) => {
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = None;
+                    thread.state = ThreadState::Loading;
+                    let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
+                    dirty.push(Dirty::Connection { thread_id });
+                    let mut effects = Vec::with_capacity(2);
+                    if is_generating {
+                        // Same AbsorbingCancel handoff as QueueSendNow --
+                        // try_fast_track already armed it above.
+                        effects.push(Effect::CancelGeneration { real_index: idx });
+                    }
+                    effects.push(Effect::SendPrompt {
+                        real_index: idx,
+                        text: entry.text,
+                    });
+                    (effects, dirty)
+                }
+                // Safe no-op: no can_fast_track-eligible entry (queue
+                // empty, or the last mutation wasn't a fresh enqueue) --
+                // the Slint side fires this unconditionally on empty-
+                // compose Return, so this is the expected common case.
+                Ok(None) => (vec![], vec![]),
+                Err(error) => {
+                    let message = error.to_string();
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = Some(message.clone());
+                    (
+                        vec![],
+                        vec![Dirty::Error {
+                            thread_id,
+                            detail: ErrorDetail { message },
+                        }],
+                    )
+                }
+            }
+        }
         // Pure text-parsing helpers -- no Model mutation, no Dirty. These
         // exist as Msg variants for coverage completeness (see
         // 00-plan.md's callback mapping table) but their real logic stays
@@ -2897,6 +2954,96 @@ mod tests {
             .unwrap();
         assert!(popped.is_none(), "AbsorbingCancel must swallow this Stopped event");
         assert_eq!(model.threads[0].send_queue.len(), 1);
+    }
+
+    #[test]
+    fn queue_fast_track_while_idle_sends_immediately() {
+        // SCNA-03: Return on an empty compose box right after enqueuing
+        // (can_fast_track armed by enqueue itself) sends immediately.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0]
+            .send_queue
+            .enqueue("go now".to_owned(), false)
+            .expect("queue");
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SendPrompt {
+                real_index: 0,
+                text: "go now".to_owned(),
+            }]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Connection { .. })));
+    }
+
+    #[test]
+    fn queue_fast_track_while_generating_cancels_then_sends_and_arms_absorbing_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("front".to_owned(), false)
+            .expect("queue");
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert_eq!(
+            effects,
+            vec![
+                Effect::CancelGeneration { real_index: 0 },
+                Effect::SendPrompt {
+                    real_index: 0,
+                    text: "front".to_owned(),
+                },
+            ]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        // The eventual TurnEnded from the cancel above must not also
+        // auto-drain -- AbsorbingCancel swallows it once, same
+        // contract as QueueSendNow.
+        let popped = model.threads[0]
+            .send_queue
+            .on_generation_stopped(false)
+            .unwrap();
+        assert!(popped.is_none(), "AbsorbingCancel must swallow this Stopped event");
+    }
+
+    #[test]
+    fn queue_fast_track_is_a_safe_no_op_when_nothing_is_eligible() {
+        // No enqueue just happened (can_fast_track never armed) -- the
+        // Slint side fires this unconditionally on empty-compose Return,
+        // so this is the expected common case, not an error.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0]
+            .send_queue
+            .enqueue("already queued earlier".to_owned(), false)
+            .expect("queue");
+        // Consume the fast-track eligibility some other way (matches how
+        // any queue mutation other than a fresh enqueue leaves nothing
+        // eligible) -- send_now clears it same as try_fast_track would.
+        let entry_id = model.threads[0]
+            .send_queue
+            .first_id()
+            .expect("one entry queued");
+        model.threads[0]
+            .send_queue
+            .send_now(entry_id, false)
+            .expect("send_now");
+        assert!(model.threads[0].send_queue.is_empty());
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
     }
 
     #[test]
