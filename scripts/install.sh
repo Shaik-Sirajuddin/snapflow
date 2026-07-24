@@ -112,8 +112,22 @@ else
   echo "warning: no .sha256 found for this asset, skipping checksum verification" >&2
 fi
 
+# On an upgrade (not a fresh install), keep exactly one backup of the
+# previous bundle before wiping it -- not a version history, just a
+# bounded safety net so a botched extraction (disk full mid-write, a
+# killed process) doesn't leave the user with nothing to fall back to.
+# $INSTALL_DIR only ever holds static application content (binaries,
+# models, shaders, licenses) -- real user/project data lives entirely
+# under SNAPSHOTD_HOME (~/.snapshotd by default), a separate tree this
+# script never touches, so this backup is about install resilience, not
+# user-data preservation.
+if [ -d "$INSTALL_DIR" ]; then
+  info "Backing up previous install to $INSTALL_DIR.prev..."
+  rm -rf "$INSTALL_DIR.prev"
+  mv "$INSTALL_DIR" "$INSTALL_DIR.prev"
+fi
+
 info "Extracting to $INSTALL_DIR..."
-rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$archive" -C "$INSTALL_DIR" --strip-components=1
 echo "$target_version" > "$VERSION_FILE"
@@ -127,9 +141,26 @@ info "Linked snapflowd -> $BIN_DIR/snapflowd"
 app_dir=""
 case "$platform" in
   linux)
-    app_dir="$(find "$INSTALL_DIR" -maxdepth 1 -iname 'snapflow*' -type d | head -n1)"
-    if [ -n "$app_dir" ] && [ -x "$app_dir/bin/snapflow" ]; then
-      ln -sf "$app_dir/bin/snapflow" "$BIN_DIR/snapflow"
+    # -mindepth 1 matters: without it, find also matches $INSTALL_DIR
+    # itself (its own basename, .../share/snapflow, satisfies -iname
+    # 'snapflow*' too) and sorts before the real Snapflow.app child dir,
+    # so head -n1 silently picked the wrong (parent) directory and the
+    # editor binary never got linked. Caught for real by
+    # docker-tests/install-headless's headless install test.
+    app_dir="$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -iname 'snapflow*' -type d | head -n1)"
+    # Link the top-level wrapper script ($app_dir/snapflow), NOT the raw
+    # binary at $app_dir/bin/snapflow -- the raw binary has no RPATH/RUNPATH
+    # baked in and fails immediately with "error while loading shared
+    # libraries: libCuteLogger.so: cannot open shared object file", since
+    # it needs LD_LIBRARY_PATH/MLT_*/QT_PLUGIN_PATH set first. The wrapper
+    # script ($app_dir/snapflow, upstream Shotcut's standard packaging
+    # pattern) sets all of that up before exec'ing the real binary --
+    # confirmed by its own comment: "Run this instead of trying to run
+    # bin/snapflow. It runs snapflow with the correct environment."
+    # Caught for real by docker-tests/install-headless trying to actually
+    # launch the installed `snapflow` command, not just checking it exists.
+    if [ -n "$app_dir" ] && [ -x "$app_dir/snapflow" ]; then
+      ln -sf "$app_dir/snapflow" "$BIN_DIR/snapflow"
       info "Linked snapflow -> $BIN_DIR/snapflow"
     fi
 

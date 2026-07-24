@@ -1,0 +1,30 @@
+# Desktop-stack variant: adds the Qt6 + X11/XCB + Mesa/OpenGL + GLib
+# runtime libraries a real desktop Linux machine already has, so the
+# installed `snapflow` GUI editor binary can actually be launched
+# (offscreen, via QT_QPA_PLATFORM=offscreen) instead of just checked for
+# existence. The plain Dockerfile deliberately stays without these --
+# this is a heavier, separate scenario (~340MB of added packages),
+# confirmed via a real `apt-get install` + `du -sh /` measurement before
+# committing to it.
+FROM ubuntu:24.04
+
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        curl ca-certificates tar coreutils procps \
+        libqt6core6t64 libqt6gui6t64 libqt6widgets6t64 libnss3 \
+        libx11-6 libxext6 libxrender1 libxkbcommon0 libxkbcommon-x11-0 \
+        libgl1 libglx-mesa0 libegl1 libfontconfig1 libfreetype6 libdbus-1-3 \
+        libxcb1 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+        libxcb-render-util0 libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 \
+        libxcb-xkb1 libsqlite3-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash tester
+USER tester
+WORKDIR /home/tester
+
+COPY --chown=tester:tester scripts/install.sh /home/tester/install.sh
+COPY --chown=tester:tester docker-tests/install-headless/entrypoint-desktop-test.sh /home/tester/entrypoint-desktop-test.sh
+RUN chmod +x /home/tester/entrypoint-desktop-test.sh /home/tester/install.sh
+
+ENTRYPOINT ["/home/tester/entrypoint-desktop-test.sh"]
