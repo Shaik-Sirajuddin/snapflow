@@ -39,6 +39,7 @@ mod settings_file;
 // reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
 // of duplicating the SKILL.md front-matter parsing logic.
 pub mod skills_state;
+mod skills_manager_adapter;
 mod state_store;
 mod sync;
 mod theme;

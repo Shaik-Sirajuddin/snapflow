@@ -6,8 +6,10 @@
 //! directory per skill, each with a `SKILL.md` front-matter header.
 //!
 //! Storage location (resolved in `memory/designa/gen/plans/
-//! skill-manager-workspace/01-architecture.md`): project-local skills
-//! live at `<ProjectsRoot>/<project-name>/.skills/`, inside the same
+//! skill-manager-workspace/01-architecture.md`, renamed to the
+//! `.snapflow` namespace per `memory/acpx/gen/plans/acpx-skills/
+//! README.md#storage-layout`): project-local skills live at
+//! `<ProjectsRoot>/<project-name>/.snapflow/skills/`, inside the same
 //! per-project folder `snapshotd` already uses -- the project's existing
 //! canonical name/path is the map key, not a second identity scheme.
 //! This module takes that directory as a plain parameter rather than
@@ -15,6 +17,17 @@
 //! (which would own "what is the active project") hasn't landed yet --
 //! decoupling discovery from that wiring lets this phase be built and
 //! tested in isolation.
+//!
+//! `scan_skills_dir`/`merge_skills_for_context` stay pure filesystem
+//! readers -- they reflect every `SKILL.md` on disk, including ones a
+//! user dropped in by hand, matching `skills-manager`-the-crate's own
+//! "Global Workspace lists everything in that folder, not just what the
+//! tool installed" philosophy (researched from xingkongliang/skills-manager
+//! this session). The new `skills-manager` crate (`lib/skills-manager/`)
+//! is a second, DB-backed system alongside this one: `skills_manager_adapter`
+//! below registers skills into it on create/promote so they become
+//! sync-trackable across ACP agents, without this module's read path
+//! needing to change.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -161,18 +174,22 @@ pub fn merge_skills_for_context(
     by_name.into_values().collect()
 }
 
-/// `<ProjectsRoot>/<project-name>/.skills/` -- the project-local skills
-/// directory inside the project's existing canonical folder, per
-/// `01-architecture.md`'s resolved storage-path decision.
+/// `<ProjectsRoot>/<project-name>/.snapflow/skills/` -- the project-local
+/// skills directory inside the project's existing canonical folder.
+/// Renamed from the earlier bare `.skills` convention to the `.snapflow`
+/// namespace shared with `snapflowd`/`snapflowd-mcp` and with
+/// `skills-manager`'s own default storage layout (see
+/// `memory/acpx/gen/plans/acpx-skills/README.md#storage-layout`).
 pub fn project_skills_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(".skills")
+    project_dir.join(".snapflow").join("skills")
 }
 
-/// Global skills directory: a `skills` sibling of the per-thread JSONL
-/// transcript cache, inside the same cache dir `agent_bridge::
-/// resolve_cache_dir()` already resolves -- no new env var needed.
+/// Global skills directory: a `.snapflow/skills` subfolder of the same
+/// cache dir `agent_bridge::resolve_cache_dir()` already resolves -- no
+/// new env var needed. Renamed from the earlier bare `skills` convention,
+/// same rationale as `project_skills_dir` above.
 pub fn global_skills_dir(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("skills")
+    cache_dir.join(".snapflow").join("skills")
 }
 
 /// Selects the on-disk destination for a newly-created skill. Project
@@ -437,11 +454,11 @@ mod tests {
     }
 
     #[test]
-    fn project_skills_dir_is_dot_skills_inside_the_project_folder() {
+    fn project_skills_dir_is_dot_snapflow_skills_inside_the_project_folder() {
         let project_dir = Path::new("/tmp/example-project");
         assert_eq!(
             project_skills_dir(project_dir),
-            Path::new("/tmp/example-project/.skills")
+            Path::new("/tmp/example-project/.snapflow/skills")
         );
     }
 

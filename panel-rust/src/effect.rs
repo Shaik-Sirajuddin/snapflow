@@ -218,6 +218,13 @@ pub enum EffectResultMsg {
     ExternalEditorOpened(Result<(), EffectError>),
     OsDefaultOpened(Result<(), EffectError>),
     SkillEditorLoaded(Result<crate::model::SkillEditorState, EffectError>),
+    /// One of the 6 reactive-sync trigger call sites (create/promote/
+    /// edit/agent-enable/agent-disable/thread-start) failed to propagate
+    /// a skill to an attached agent -- see memory/acpx/gen/plans/
+    /// acpx-skills/README.md's "reactive-sync failures are invisible to
+    /// the user" gap. Sent alongside (not instead of) the existing
+    /// eprintln! at each call site; best-effort, not retried.
+    SkillReactiveSyncFailed { operation: String, detail: String },
     /// A streamed token/chunk arriving mid-generation -- not a
     /// completion. See 00-plan.md's stale-target no-op contract: if
     /// `thread_id` no longer exists in `Model`, `update()` must no-op.
