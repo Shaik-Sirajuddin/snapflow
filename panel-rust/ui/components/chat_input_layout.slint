@@ -7,6 +7,7 @@ import { ContextRing } from "../base/context_ring.slint";
 import { Toggle } from "../base/toggle.slint";
 import { TextUtil } from "../base/text_util.slint";
 import { MentionPickRow } from "../base/mention_pick_row.slint";
+import { SelectableChip } from "../base/selectable_chip.slint";
 import { DropdownEntry, SkillOption, McpServerOption } from "../types.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
@@ -921,32 +922,20 @@ export component ChatInputLayout inherits Rectangle {
         if root.terminal-count > 0 : VerticalLayout {
             spacing: Metrics.gap-sm;
             Rectangle { height: 1px; background: Theme.border-default; }
-            // Sized to content (horizontal-stretch: 0 + explicit width) --
-            // a bare TouchArea/Rectangle as a VerticalLayout child
-            // defaults to stretching to the FULL row width (Slint's
-            // stretch-to-fill layout default), which would otherwise make
-            // the whole empty row clickable, not just the visible chip.
-            terminals-chip := TouchArea {
-                horizontal-stretch: 0;
-                width: chip-label.preferred-width + 2 * Metrics.pad-sm;
-                height: Metrics.pad-2xl;
-                mouse-cursor: pointer;
-                clicked => { root.terminals-clicked(); }
-                Rectangle {
-                    width: 100%;
-                    height: 100%;
-                    background: terminals-chip.has-hover ? Theme.bg-tertiary : transparent;
-                    border-radius: Theme.radius-sm;
-                    chip-label := Text {
-                        x: Metrics.pad-sm;
-                        text: root.terminal-count + " terminal" + (root.terminal-count == 1 ? "" : "s");
-                        color: Theme.text-secondary;
-                        font-size: 10px * Theme.font-scale;
-                        font-family: Theme.font-sans;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                        horizontal-alignment: left;
-                    }
+            // Reuses SelectableChip (base/) rather than hand-rolling a
+            // TouchArea+Rectangle+Text -- agy -p's review-ui pass caught
+            // the hand-rolled version both misusing a padding token
+            // (Metrics.pad-2xl) as a control height and omitting the
+            // CursorHost wiring every other clickable surface in this
+            // codebase sets. SelectableChip (built on HoverSurface)
+            // already owns hover tint + CursorHost + content-width
+            // sizing; `selected` is left at its default `false` since
+            // this chip has no persistent selected state, only hover.
+            HorizontalLayout {
+                alignment: start;
+                SelectableChip {
+                    label: root.terminal-count + " terminal" + (root.terminal-count == 1 ? "" : "s");
+                    clicked => { root.terminals-clicked(); }
                 }
             }
         }
