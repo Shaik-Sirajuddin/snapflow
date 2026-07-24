@@ -176,6 +176,29 @@ pub fn classify(method: &str) -> MethodClass {
         | "session/retention/pin"
         | "session/retention/unpin"
         | "session/retention/set_ttl" => MethodClass::GatewayNative,
+        // **background-terminals-ui plan, PUI-002b -- real, previously-
+        // undiscovered gap closed here.** `terminal/kill` (and the other
+        // `terminal/*` methods) are ACP `x-side: agent` methods: the real
+        // spec direction is the BACKEND AGENT calling them on acpx (acpx
+        // playing ACP's "client" role), which is exactly what
+        // `handle_terminal_request`'s existing arms already answer --
+        // but that path is ONLY ever reached while acpx is relaying a
+        // live agent-initiated `terminal/create`/etc request for
+        // interactive approval (`read_matching_response_with_idle_
+        // timeout`'s match). A downstream UI client (panel-rust) that
+        // wants to independently kill a terminal it already knows about
+        // -- not answering any relayed agent request -- had NO dispatch
+        // path at all before this: `classify` fell through to `Unknown`
+        // for every `terminal/*` method, so `AgentBridge::kill_terminal`'s
+        // `client.call("terminal/kill", ...)` would have failed with a
+        // generic unknown-method error on every real call. `GatewayNative`
+        // (not `Proxied`): the request must be answered by acpx itself
+        // against its own `BackendProcess::terminals` map, never forwarded
+        // to the backend agent process's stdio channel the way `Proxied`
+        // methods are -- the agent has no handler for being asked "please
+        // kill this terminal" (see `dispatch_native`'s own `"terminal/
+        // kill"` arm for the real resolve-then-kill logic).
+        "terminal/kill" => MethodClass::GatewayNative,
         _ => MethodClass::Unknown,
     }
 }
@@ -818,6 +841,12 @@ pub enum RouterError {
          call failed rather than holding its per-process/writer lock forever"
     )]
     BackendWriteTimeout(Duration),
+    #[error("terminal/kill: unknown terminalId {0}")]
+    UnknownTerminalId(String),
+    #[error("terminal/kill: '{0}' is disabled for this profile (Profile::allow_terminal_access is false)")]
+    TerminalAccessDisabled(String),
+    #[error("terminal/kill: {0}")]
+    TerminalKillFailed(String),
 }
 
 /// Hard ceiling on the per-candidate backend `session/close` round trip
@@ -4049,6 +4078,58 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
             // specific error instead of a bare method-not-found.
             "logout" => {
                 return Err(RouterError::LogoutNotSupported);
+            }
+            // **background-terminals-ui plan, PUI-002b.** See `classify`'s
+            // `"terminal/kill"` arm doc comment for why this needs its own
+            // `GatewayNative` handler rather than `Proxied` forwarding:
+            // this must be answered by acpx itself against its own
+            // `BackendProcess::terminals` map, the backend agent process
+            // is never involved. Resolves the gateway sessionId the same
+            // way `dispatch_proxied` does (including rehydration), but
+            // then calls `handle_terminal_request` directly against the
+            // resolved backend instead of writing the request to its
+            // stdio transport.
+            "terminal/kill" => {
+                let params = request
+                    .get("params")
+                    .ok_or(RouterError::MissingParams)?;
+                let gateway_session_id = params
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .ok_or(RouterError::MissingSessionId)?
+                    .to_string();
+                let terminal_id = params
+                    .get("terminalId")
+                    .and_then(|t| t.as_str())
+                    .ok_or_else(|| RouterError::UnknownTerminalId(String::new()))?
+                    .to_string();
+                let entry = match self.sessions.resolve(
+                    tenant_id,
+                    &acpx_proto::session::GatewaySessionId(gateway_session_id.clone()),
+                ) {
+                    Some(entry) => entry.clone(),
+                    None => {
+                        self.rehydrate_session(tenant_id, "terminal/kill", &gateway_session_id)
+                            .await?
+                    }
+                };
+                let agent_id = entry.agent_id.clone();
+                let call_policy = self
+                    .call_policy_for(entry.profile_name.as_deref(), &agent_id)
+                    .await;
+                if !call_policy.allow_terminal_access {
+                    return Err(RouterError::TerminalAccessDisabled("terminal/kill".to_string()));
+                }
+                let backend = self.supervisor.ensure_running(&agent_id).await?;
+                let mut backend = backend.lock().await;
+                match backend.terminals.get_mut(&terminal_id) {
+                    Some(handle) => handle
+                        .kill()
+                        .await
+                        .map_err(|err| RouterError::TerminalKillFailed(err.to_string()))?,
+                    None => return Err(RouterError::UnknownTerminalId(terminal_id)),
+                }
+                serde_json::json!({})
             }
             // **Phase 13.** `session/list` is dual-mode, distinguished by
             // whether the client supplies a backend selector via the

@@ -1448,7 +1448,19 @@ async fn run_thread_actor(
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::KillTerminal { terminal_id, resp } => {
-                let params = serde_json::json!({ "terminalId": terminal_id });
+                // Real, previously-undiscovered gap closed alongside this
+                // fix (acpx-core/src/router.rs's new `"terminal/kill"`
+                // GatewayNative arm): the client-facing dispatch resolves
+                // the backend from `params.sessionId`, same as every other
+                // client-initiated call against a session (SetMode,
+                // SetConfigOption above) -- terminalId alone can't resolve
+                // a backend on its own since acpx supervises many.
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let params =
+                    serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
                 let result = client.call("terminal/kill", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
