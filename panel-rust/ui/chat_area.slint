@@ -555,18 +555,8 @@ export component ChatArea inherits Rectangle {
                             color: Theme.bg-primary;
                         }
                     }
-                    IconButton {
-                        active: local-terminal.open;
-                        button-accessible-label: "Toggle local terminal";
-                        clicked => { local-terminal-toggle-requested(); }
-                        Text {
-                            text: "\u{2318}";
-                            color: local-terminal.open ? Theme.bg-primary : Theme.text-secondary;
-                            font-size: 12px * Theme.font-scale;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
+                    // PUI-001: top-bar terminal toggle removed (terminal
+                    // access moves to the chat-input affordance, PUI-002).
                 }
             }
         }
