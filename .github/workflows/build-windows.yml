@@ -25,9 +25,12 @@ name: build-windows
 # (build-snapflow.sh) were also found and fixed by inspection in
 # build-snapflow-msys2.sh, but this workflow needs a real run to confirm.
 
+# Auto-rebuild on every push to main is paused (ag-pipelines-setup task) --
+# main only rebuilds via a tag push or an explicit workflow_dispatch now,
+# to stop burning CI minutes on every commit.
+
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch: {}

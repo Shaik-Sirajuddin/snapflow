@@ -1240,6 +1240,64 @@ mod tests {
     }
 
     #[test]
+    fn switching_threads_converges_shared_model_and_ignores_background_stream() {
+        // PUI-008 regression (panel-ui-task-triage): an agent message
+        // streaming for one thread must never surface under another
+        // ("threads active message from agent leak into each other,
+        // specifically on the 2nd/3rd message"). After the displayed thread
+        // switches A -> B the shared messages_model must converge to B's rows
+        // (dropping A's leftovers), and a delta still arriving for the
+        // now-background thread A must be dropped rather than appended.
+        let mut model = Model::default();
+        model.threads.extend([
+            crate::model::ThreadModel {
+                thread_id: "thread-a".to_owned(),
+                ..crate::model::ThreadModel::default()
+            },
+            crate::model::ThreadModel {
+                thread_id: "thread-b".to_owned(),
+                transcript_keys: vec!["assistant:b-1".to_owned()],
+                message_rows: vec![crate::MessageItem {
+                    text: "belongs to B".into(),
+                    ..crate::MessageItem::default()
+                }],
+                ..crate::model::ThreadModel::default()
+            },
+        ]);
+        // Screen currently holds thread A's row (A was the displayed thread).
+        model.messages_model.push(crate::MessageItem {
+            text: "belongs to A".into(),
+            ..crate::MessageItem::default()
+        });
+        *model.message_model_keys.borrow_mut() = vec!["assistant:a-1".to_owned()];
+
+        // User switches to B; the switch emits a MessagesDiff for B, which
+        // apply_message_ops force-converges to B's own transcript.
+        model.displayed_thread = Some(1);
+        apply_message_ops(&model, "thread-b", &[]);
+
+        assert_eq!(model.messages_model.row_count(), 1);
+        assert_eq!(
+            model.messages_model.row_data(0).unwrap().text,
+            "belongs to B",
+            "the shared model must converge to the newly displayed thread"
+        );
+        assert_eq!(
+            *model.message_model_keys.borrow(),
+            vec!["assistant:b-1".to_owned()]
+        );
+
+        // A 2nd/3rd-message stream still arriving for the now-background
+        // thread A must not touch B's on-screen rows.
+        apply_message_streaming(&model, "thread-a", "a-1", " LEAKED");
+        assert_eq!(
+            model.messages_model.row_data(0).unwrap().text,
+            "belongs to B",
+            "a background thread's stream must not leak into the displayed thread"
+        );
+    }
+
+    #[test]
     fn terminals_reconcile_in_place_without_replacing_the_model() {
         let model = Model::default();
         model.terminals_model.push(crate::TerminalItem {

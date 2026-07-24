@@ -15,9 +15,12 @@ name: build-macos
 # job's first real validation has to happen on an actual GitHub-hosted
 # macos-latest runner, not locally.
 
+# Auto-rebuild on every push to main is paused (ag-pipelines-setup task) --
+# main only rebuilds via a tag push or an explicit workflow_dispatch now,
+# to stop burning CI minutes on every commit.
+
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch: {}
