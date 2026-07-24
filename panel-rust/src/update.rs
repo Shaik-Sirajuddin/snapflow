@@ -1757,6 +1757,20 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let Some(target_index) = target_index else {
             return (effects, dirty);
         };
+        // SCNA-01: distinct from `switched_thread` below -- specifically
+        // whether there was a *real* previously-displayed thread to leave.
+        // `model.displayed_thread` starts `None` before cold-start
+        // hydration's first frame, so that first frame's `switched_thread`
+        // is also true; every restored thread starts idle/error-free (see
+        // `Model::from_initial_state`'s own doc comment), so the
+        // `Dirty::Error` this function pushes below on `switched_thread`
+        // always carries an empty message on that first frame -- but
+        // still unconditionally overwrites `last-error`, silently wiping
+        // any global cold-start warning (InitialState::startup_warnings,
+        // routed through `Dirty::Error{thread_id: "", ..}` a moment
+        // earlier in the same synchronous panel_rust_create call) before
+        // the window is ever shown.
+        let had_prior_displayed_thread = model.displayed_thread.is_some();
         let switched_thread = model.displayed_thread != Some(target_index);
         if switched_thread {
             model.expanded.clear();
@@ -1906,7 +1920,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             if capabilities_changed {
                 dirty.push(Dirty::Capabilities { thread_id });
             }
-            if switched_thread {
+            // See had_prior_displayed_thread's doc comment above: skip on
+            // cold start's implicit first display (nothing stale to
+            // clear, and thread.error is always None there anyway per
+            // Model::from_initial_state), so a global cold-start warning
+            // banner set moments earlier survives instead of being wiped.
+            if switched_thread && had_prior_displayed_thread {
                 dirty.push(Dirty::Error {
                     thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {
@@ -3298,6 +3317,83 @@ mod tests {
             item,
             Dirty::Connection { thread_id } if thread_id == "thread-0"
         )));
+    }
+
+    #[test]
+    fn cold_starts_first_displayed_thread_snapshot_never_clears_a_global_error_banner() {
+        // SCNA-01 regression: model.displayed_thread starts None before
+        // cold-start hydration's first Frame. That first frame's own
+        // "switched_thread" (None -> Some(0)) used to unconditionally
+        // push Dirty::Error{thread_id: "thread-0", message: ""}
+        // (thread.error is always None on a freshly-restored thread),
+        // silently wiping out any InitialState::startup_warnings banner
+        // set moments earlier in the same synchronous cold-start call,
+        // before the window was ever shown. The fix: skip that push when
+        // there was no real previously-displayed thread to leave.
+        let mut model = model_with_threads(&["thread"]);
+        assert_eq!(model.displayed_thread, None);
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-0".to_owned(),
+                    real_index: 0,
+                    transcript: vec![],
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.displayed_thread, Some(0));
+        assert!(
+            !dirty.iter().any(|item| matches!(item, Dirty::Error { .. })),
+            "the first-ever displayed-thread snapshot must not emit a Dirty::Error, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_thread_switch_still_clears_the_outgoing_threads_error_banner() {
+        // Companion to the cold-start regression above: once a thread has
+        // genuinely been displayed before, switching away from it must
+        // still clear/refresh the error banner for the incoming thread --
+        // this is the original leak_audit_report behavior the
+        // had_prior_displayed_thread guard must not disable.
+        let mut model = model_with_threads(&["first", "second"]);
+        model.threads[0].session_id = Some("thread-0-session".to_owned());
+        model.displayed_thread = Some(0);
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
+                    real_index: 1,
+                    transcript: vec![],
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            dirty.iter().any(|item| matches!(
+                item,
+                Dirty::Error { thread_id, .. } if thread_id == "thread-1"
+            )),
+            "a genuine thread switch must still refresh the error banner, got {dirty:?}"
+        );
     }
 
     #[test]

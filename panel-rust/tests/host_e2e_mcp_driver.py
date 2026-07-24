@@ -113,6 +113,20 @@ def wait_for_accessible_label(client, root_handle, label, timeout=10, max_elemen
     raise RuntimeError(f"no element with accessibleLabel={label!r} appeared in time")
 
 
+def wait_for_accessible_label_prefix(client, root_handle, prefix, timeout=10, max_elements=600):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        tree = client.call_tool(
+            "get_element_tree", {"elementHandle": root_handle, "maxElements": max_elements}
+        )
+        for element in tree.get("elements", []):
+            label = element.get("accessibleLabel")
+            if label and label.startswith(prefix):
+                return element["handle"], label
+        time.sleep(0.2)
+    raise RuntimeError(f"no element with accessibleLabel starting {prefix!r} appeared in time")
+
+
 def set_text(client, element_handle, text):
     client.call_tool(
         "set_element_value", {"elementHandle": element_handle, "value": text}
@@ -265,9 +279,38 @@ def scenario_rename(args):
     print(f"PASS rename scenario: header title updated to {new_name!r} via the real host")
 
 
+def scenario_startup_warning(args):
+    """SCNA-01: forces PanelStateStore::open to fail at cold start (the
+    launcher chmods the panel cache dir read-only before this process
+    ever starts -- see host_e2e_mcp_smoke.sh) and verifies the failure
+    reaches the live UI as a real error banner, not just stderr or a
+    unit-tested Dirty::Error value.
+
+    This exercises cold_start_error_surfacing's actual production path:
+    lib.rs's panel_rust_create -> InitialState::startup_warnings ->
+    update()'s InitialStateLoaded(Ok(..)) handler -> Dirty::Error{thread_id:
+    "", ..} -> sync.rs (thread_id.is_empty() short-circuits the "only the
+    displayed thread" filter, so this is a global banner) ->
+    ChatArea.last-error -> the real "⚠ ..." Text element in chat_area.slint.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    _window_handle, root_handle = get_root_element(client)
+
+    _handle, label = wait_for_accessible_label_prefix(
+        client, root_handle, "⚠ ", timeout=args.timeout
+    )
+    if "panel settings persistence unavailable" not in label:
+        raise RuntimeError(
+            f"error banner appeared but with an unexpected message: {label!r}"
+        )
+    print(f"PASS startup_warning scenario: real error banner appeared: {label!r}")
+
+
 SCENARIOS = {
     "send-now": scenario_send_now,
     "rename": scenario_rename,
+    "startup-warning": scenario_startup_warning,
 }
 
 

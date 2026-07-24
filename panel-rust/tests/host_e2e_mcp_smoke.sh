@@ -22,7 +22,7 @@ display="${PANEL_HOST_E2E_MCP_DISPLAY:-:112}"
 screen="${PANEL_HOST_E2E_MCP_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
-scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|rename>}"
+scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|rename|startup-warning>}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
 agent_bin="${RUI_MOCK_AGENT_BIN:-$repo_root/panel-rust/target/debug/rui-mock-agent}"
@@ -52,6 +52,7 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
+    chmod -f 755 "$state_dir/panel" 2>/dev/null || true
     if [[ "$keep_state" != "1" ]]; then
         rm -rf "$state_dir"
     else
@@ -86,6 +87,17 @@ for _ in $(seq 1 80); do
     sleep 0.1
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
+
+# SCNA-01: the startup-warning scenario needs PanelStateStore::open to
+# fail predictably at cold start (proving InitialState::startup_warnings
+# -> Dirty::Error actually reaches the UI), which forcing an already-open
+# rusqlite connection to fail on demand can't give reliably -- a
+# read-only cache dir *before* panel_rust_create ever runs is
+# deterministic instead. Restored to writable in cleanup() below so
+# state_dir removal doesn't fail.
+if [[ "$scenario" == "startup-warning" ]]; then
+    chmod 555 "$state_dir/panel"
+fi
 
 env \
 SLINT_MCP_PORT="$mcp_port" \
