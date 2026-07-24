@@ -48,6 +48,10 @@ func main() {
 		err = cmdStop(cfg, os.Args[2:])
 	case "launch":
 		err = cmdLaunch(cfg, os.Args[2:])
+	case "list":
+		err = cmdList(cfg, os.Args[2:])
+	case "close":
+		err = cmdClose(cfg, os.Args[2:])
 	case "install":
 		err = cmdInstall(cfg, os.Args[2:])
 	case "-h", "--help", "help":
@@ -72,6 +76,8 @@ Usage:
   snapshotd status                       connect to a running daemon and print its state
   snapshotd stop                         ask a running daemon to shut down gracefully
   snapshotd launch <projectId>           convenience wrapper around daemon.launch
+  snapshotd list                         list known process instances (bare daemon.list)
+  snapshotd close <instanceId>           stop one running process instance (bare daemon.close)
   snapshotd install                      print what installing a system service would do (not implemented for real)`)
 }
 
@@ -286,6 +292,45 @@ func cmdLaunch(cfg config.Config, args []string) error {
 	}
 	enc, _ := json.MarshalIndent(instance, "", "  ")
 	fmt.Println(string(enc))
+	return nil
+}
+
+func cmdList(cfg config.Config, args []string) error {
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var instances []map[string]any
+	if err := c.Call("daemon.list", map[string]any{}, &instances); err != nil {
+		return fmt.Errorf("daemon.list: %w", err)
+	}
+	for _, in := range instances {
+		enc, _ := json.Marshal(in)
+		fmt.Println(string(enc))
+	}
+	return nil
+}
+
+func cmdClose(cfg config.Config, args []string) error {
+	fs := flag.NewFlagSet("close", flag.ExitOnError)
+	_ = fs.Parse(args)
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: snapshotd close <instanceId>")
+	}
+	instanceID := fs.Arg(0)
+
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	if err := c.Call("daemon.close", map[string]any{"instanceId": instanceID}, nil); err != nil {
+		return fmt.Errorf("daemon.close: %w", err)
+	}
+	fmt.Printf("closed instance %s\n", instanceID)
 	return nil
 }
 
