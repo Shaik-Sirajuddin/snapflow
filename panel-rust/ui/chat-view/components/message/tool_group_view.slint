@@ -94,6 +94,11 @@ export component ToolGroupView inherits Rectangle {
                 width: 22px;
                 height: 22px;
                 mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: root.maximized
+                    ? "Close full view of tool group"
+                    : "Open tool group in full view";
+                accessible-action-default => { self.clicked(); }
                 clicked => {
                     root.maximized = !root.maximized;
                     root.expanded = true;
@@ -118,6 +123,9 @@ export component ToolGroupView inherits Rectangle {
                 width: 22px;
                 height: 22px;
                 mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: root.expanded ? "Collapse tool group" : "Expand tool group";
+                accessible-action-default => { self.clicked(); }
                 clicked => { root.expanded = !root.expanded; }
 
                 Rectangle {
@@ -187,6 +195,9 @@ export component ToolGroupView inherits Rectangle {
 
                     TouchArea {
                         mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Scroll to tool call " + (idx + 1);
+                        accessible-action-default => { self.clicked(); }
                         clicked => {
                             let step = body-layout.preferred-height / max(1, root.item-count);
                             flickable.viewport-y = - min(body-layout.preferred-height - root.max-visible-height, idx * step);

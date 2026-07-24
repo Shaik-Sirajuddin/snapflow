@@ -1092,6 +1092,9 @@ export component ChatArea inherits Rectangle {
                 background: #00000080;
 
                 TouchArea {
+                    accessible-role: button;
+                    accessible-label: "Close full view";
+                    accessible-action-default => { self.clicked(); }
                     // Only close full-view, restoring previous state if nested
                     clicked => { root.close-full-view(); }
                 }
@@ -1108,6 +1111,9 @@ export component ChatArea inherits Rectangle {
                     drop-shadow-color: #00000080;
 
                     TouchArea {
+                        accessible-role: button;
+                        accessible-label: "Close full view";
+                        accessible-action-default => { self.clicked(); }
                         // Intercept clicks on dialog card body so backdrop touch doesn't close
                     }
 
