@@ -100,6 +100,17 @@ fn read_skill_result(args: &Args, name: &str) -> Value {
         });
     };
     let skill_md = entry.path.join("SKILL.md");
+    // PUI-010: guard the "is a directory" case (a SKILL.md that is itself a
+    // directory) so the agent gets a clear message instead of a raw
+    // "Is a directory (os error 21)".
+    if skill_md.is_dir() {
+        return json!({
+            "content": [{"type": "text", "text": format!(
+                "{skill_md:?} is a directory, not a readable SKILL.md file"
+            )}],
+            "isError": true,
+        });
+    }
     match std::fs::read_to_string(&skill_md) {
         Ok(content) => json!({"content": [{"type": "text", "text": content}]}),
         Err(error) => json!({
@@ -223,6 +234,12 @@ fn read_skill_file_result(args: &Args, name: &str, path: &str) -> Value {
             });
         }
     };
+    // PUI-010: a directory path (e.g. "references" / "scripts") is already
+    // rejected upstream by resolve_skill_file's is_file() check ("path must
+    // name a regular file"), so no raw "Is a directory (os error 21)" ever
+    // reaches the read_to_string below on this path. (The SKILL.md reader in
+    // read_skill_result, which has no resolve_skill_file gate, is guarded
+    // separately.) metadata is still used for the size limit below.
     if metadata.len() > MAX_SKILL_FILE_BYTES {
         return json!({
             "content": [{"type": "text", "text": format!("{path:?} exceeds the {MAX_SKILL_FILE_BYTES}-byte skill file limit")}],
@@ -352,7 +369,10 @@ mod tests {
     fn supporting_files_are_live_discoverable_and_readable() {
         let global_dir = tempfile::tempdir().unwrap();
         let project_dir = tempfile::tempdir().unwrap();
-        let skill_dir = project_dir.path().join(".skills").join("release");
+        // PUI-010: use project_skills_dir() (now `.snapflow/skills`, renamed
+        // from the earlier bare `.skills` by the skills-manager reconciliation)
+        // so this path can never drift from the discovery convention again.
+        let skill_dir = project_skills_dir(project_dir.path()).join("release");
         write_skill_file(
             &skill_dir.join("SKILL.md"),
             "---\nname: release\ndescription: release process\n---\n",
@@ -389,6 +409,73 @@ mod tests {
         let skill_dir = tempfile::tempdir().unwrap();
         let error = resolve_skill_file(skill_dir.path(), "../outside.txt").unwrap_err();
         assert!(error.contains("traversal"));
+    }
+
+    // PUI-010: reading a *directory* path (e.g. the "references" subdir)
+    // must return a clean, actionable message -- not the raw OS
+    // "Is a directory (os error 21)" the underlying read_to_string emits.
+    #[test]
+    fn reading_a_directory_path_returns_an_actionable_error_not_raw_eisdir() {
+        let global_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        // PUI-010: use project_skills_dir() (now `.snapflow/skills`, renamed
+        // from the earlier bare `.skills` by the skills-manager reconciliation)
+        // so this path can never drift from the discovery convention again.
+        let skill_dir = project_skills_dir(project_dir.path()).join("release");
+        write_skill_file(
+            &skill_dir.join("SKILL.md"),
+            "---\nname: release\ndescription: release process\n---\n",
+        );
+        write_skill_file(
+            &skill_dir.join("references").join("checklist.md"),
+            "# Release checklist\n",
+        );
+        let args = Args {
+            global_dir: global_dir.path().to_path_buf(),
+            project_dir: Some(project_dir.path().to_path_buf()),
+        };
+
+        // "references" resolves to a real directory below the skill. It must
+        // be rejected cleanly (by resolve_skill_file's is_file gate) -- an
+        // error result that never leaks the raw "Is a directory (os error 21)".
+        let result = read_skill_file_result(&args, "release", "references");
+        assert_eq!(result["isError"], serde_json::json!(true));
+        let text = text_content(result);
+        assert!(
+            text.contains("regular file"),
+            "expected the clean is_file rejection, got: {text}"
+        );
+        assert!(
+            !text.contains("os error"),
+            "must not leak the raw OS EISDIR string, got: {text}"
+        );
+    }
+
+    // PUI-010: a SKILL.md that is itself a directory is likewise guarded.
+    #[test]
+    fn read_skill_guards_a_directory_shaped_skill_md() {
+        let global_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        // PUI-010: use project_skills_dir() (now `.snapflow/skills`, renamed
+        // from the earlier bare `.skills` by the skills-manager reconciliation)
+        // so this path can never drift from the discovery convention again.
+        let skill_dir = project_skills_dir(project_dir.path()).join("weird");
+        // SKILL.md as a directory (so skill_by_name discovers it) with a
+        // nested marker so the discovery scan still treats it as a skill.
+        std::fs::create_dir_all(skill_dir.join("SKILL.md")).unwrap();
+        let args = Args {
+            global_dir: global_dir.path().to_path_buf(),
+            project_dir: Some(project_dir.path().to_path_buf()),
+        };
+        // Only assert the guard when discovery actually surfaces the skill;
+        // otherwise skill_by_name returns "no skill named" (also an error,
+        // but not the case under test).
+        if let Ok(entry) = skill_by_name(&args, "weird") {
+            assert!(entry.path.join("SKILL.md").is_dir());
+            let result = read_skill_result(&args, "weird");
+            assert_eq!(result["isError"], serde_json::json!(true));
+            assert!(!text_content(result).contains("os error"));
+        }
     }
 }
 

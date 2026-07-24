@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { SelectionFocus } from "../tokens/selection_focus.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { MarkdownLine, MarkdownRun } from "../types.slint";
 
@@ -68,11 +69,17 @@ export component MarkdownView inherits VerticalLayout {
         }
     }
 
-    if lines.length == 0 : Text {
+    if lines.length == 0 : TextInput {
         text: fallback-text;
         font-family: Theme.font-sans;
         font-size: 12px * Theme.font-scale;
         color: Theme.text-primary;
+        read-only: true;
+        // Report focus so the host does not drop keystrokes while a
+        // selectable-text surface holds focus (see SelectionFocus).
+        changed has-focus => {
+            SelectionFocus.focused-count += self.has-focus ? 1 : -1;
+        }
         wrap: word-wrap;
         horizontal-alignment: left;
         // Stretch across the bubble; no explicit width (can't combine
@@ -80,6 +87,8 @@ export component MarkdownView inherits VerticalLayout {
         horizontal-stretch: 1;
         preferred-width: 0px;
         min-width: 0px;
+        selection-foreground-color: Theme.text-primary;
+        selection-background-color: Theme.selection-bg;
     }
 
     for line[i] in lines : VerticalLayout {
@@ -118,6 +127,44 @@ export component MarkdownView inherits VerticalLayout {
             border-top-right-radius: is-code && group-start ? Theme.radius-sm : 0px;
             border-bottom-left-radius: is-code && group-end ? Theme.radius-sm : 0px;
             border-bottom-right-radius: is-code && group-end ? Theme.radius-sm : 0px;
+
+            // Invisible click-drag-select overlay: a real (glyph-transparent)
+            // `TextInput` positioned to match the visual run cluster below,
+            // holding `line.plain-text` (the same characters the colored
+            // `Text` runs render, just unstyled). Plain `Text` never
+            // captures pointer events (see the Slint skill's anti-pattern
+            // #5), so mouse-down/drag on this row falls through to this
+            // `TextInput` underneath and gets native browser-style
+            // click-and-drag selection + Ctrl+C copy + the selection
+            // highlight, without re-deriving rich multi-run selection by
+            // hand. Declared *before* the visual `HorizontalLayout` below
+            // so it paints first (behind); paint/hit-test order in Slint
+            // follows declaration order for same-`z` siblings.
+            if !is-hr : TextInput {
+                x: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);
+                y: is-code ? (group-start ? Metrics.space-3 : 0px) : 0px;
+                width: max(0px, parent.width - self.x - (is-code ? Metrics.space-4 : 0px));
+                height: max(0px, parent.height - self.y - (is-code && group-end ? Metrics.space-3 : 0px));
+                text: line.plain-text;
+                font-family: is-code ? Theme.font-mono : Theme.font-sans;
+                font-size: (is-heading ? root.heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
+                read-only: true;
+                // Report focus so the host does not drop keystrokes while a
+                // selectable-text surface holds focus (see SelectionFocus).
+                changed has-focus => {
+                    SelectionFocus.focused-count += self.has-focus ? 1 : -1;
+                }
+                wrap: word-wrap;
+                horizontal-alignment: left;
+                vertical-alignment: top;
+                // Glyphs stay invisible -- the colored `Text` runs painted
+                // on top supply the actual visible characters. Only the
+                // selection highlight (painted behind those runs, which
+                // have no background of their own) shows through.
+                color: transparent;
+                selection-foreground-color: transparent;
+                selection-background-color: Theme.selection-bg;
+            }
 
             HorizontalLayout {
                 width: 100%;

@@ -39,6 +39,7 @@ mod settings_file;
 // reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
 // of duplicating the SKILL.md front-matter parsing logic.
 pub mod skills_state;
+mod skills_manager_adapter;
 mod state_store;
 mod sync;
 mod theme;
@@ -645,13 +646,13 @@ impl PanelSingleton {
             .map(|bridge| bridge.cancel_prompt(real_idx));
     }
 
-    /// Answers the currently-displayed thread's first pending request
-    /// with a concrete one-of option id (Zed flat permission model), then
-    /// immediately re-renders the request card (which will hide it, since
-    /// `AgentBridge::respond_to_request` removes the entry synchronously).
-    /// `dispatch.rs`'s Request-domain wrapper (tea-slint-model Phase 4)
-    /// calls this -- extracted verbatim from the former
-    /// `on_load_older_requested` closure's `PANEL.with` body.
+    /// Executes the bridge side of `Effect::KillAgentTerminal` (PUI-002b).
+    pub(crate) fn execute_kill_agent_terminal_real(&self, real_idx: usize, terminal_id: String) {
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.kill_terminal(real_idx, terminal_id);
+        }
+    }
+
     pub(crate) fn dispatch_load_older_requested(&self) {
         let Some(bridge) = &self.bridge else { return };
         let Some(real_idx) = self.model.borrow().displayed_thread else {
@@ -2032,8 +2033,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 "send requested selected_thread={filtered_idx} text={text:?}"
             ));
             PANEL.with(move |cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_compose_send(panel, filtered_idx, text);
+                // PUI-014: &mut so a deferred thread's first message can attach
+                // its session (bound to the currently-selected provider) before
+                // the send is dispatched.
+                if let Some(panel) = cell.borrow_mut().as_mut() {
+                    dispatch::dispatch_compose_send_maybe_attach(panel, filtered_idx, text);
                 }
             });
         });
@@ -2171,6 +2175,23 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_terminal_expand(panel, &component, terminal_id.to_string());
+                }
+            });
+        });
+
+        // PUI-002b: terminals popup's `[x]` kill button.
+        let component_weak = panel.component.as_weak();
+        panel.component.on_terminal_kill_requested(move |terminal_id| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_terminal_kill_requested(
+                        panel,
+                        &component,
+                        terminal_id.to_string(),
+                    );
                 }
             });
         });
@@ -2323,6 +2344,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_toggle_expanded(panel, index as usize);
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_copy_message(move |text| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_copy_message(panel, text.to_string());
                 }
             });
         });
@@ -3120,42 +3153,52 @@ mod lifecycle_tests {
             dispatch::dispatch_thread_new(panel, &throwaway_component);
         });
 
-        // Wait for the new thread's session to attach (mirrors
-        // agent_bridge.rs's own wait_for_thread_ready, but through the
-        // real poll path since this test drives the full PanelSingleton,
-        // not a bare AgentBridge).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            panel_rust_poll(handle);
-            let attached = PANEL.with(|cell| {
-                let slot = cell.borrow();
-                let panel = slot.as_ref().expect("panel exists");
-                panel
-                    .bridge
-                    .as_ref()
-                    .and_then(|bridge| bridge.thread_binding(0))
-                    .is_some()
-            });
-            if attached {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "new thread never attached a real session"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-
-        PANEL.with(|cell| {
+        // PUI-014: the new thread is created DEFERRED -- it opens no session
+        // until the first message is sent, so (unlike the old eager path) do
+        // NOT wait for a binding before sending. Drive the send through the
+        // same `&mut` attach-aware entry the live `on_send_requested` closure
+        // uses: it attaches the deferred thread (bound to the currently
+        // selected provider) and then sends. This exercises the real
+        // first-send-attach path end to end against a real acpx-server.
+        let selected_filtered_idx = PANEL.with(|cell| {
             let slot = cell.borrow();
             let panel = slot.as_ref().expect("panel exists");
-            let selected_filtered_idx = panel.model.borrow().selected_thread;
-            dispatch::dispatch_compose_send(
+            let idx = panel.model.borrow().selected_thread;
+            idx
+        });
+        PANEL.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let panel = slot.as_mut().expect("panel exists");
+            dispatch::dispatch_compose_send_maybe_attach(
                 panel,
                 selected_filtered_idx,
                 "does this survive".to_owned(),
             );
         });
+
+        // The deferred first-send attach is a real background session/new
+        // round trip, so poll until the just-sent message first appears (with
+        // a generous deadline covering the attach) before running the
+        // "stays visible" regression check below.
+        let appear_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            panel_rust_poll(handle);
+            let present = PANEL.with(|cell| {
+                let slot = cell.borrow();
+                let panel = slot.as_ref().expect("panel exists");
+                (0..panel.component.get_messages().row_count())
+                    .filter_map(|i| panel.component.get_messages().row_data(i))
+                    .any(|row| row.text.to_string().contains("does this survive"))
+            });
+            if present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < appear_deadline,
+                "the sent message never became visible after the deferred thread's first-send attach"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         // The actual regression check: poll several times (simulating
         // several 60-90fps ticks) and confirm the just-sent message is
@@ -3351,6 +3394,7 @@ mod keyboard_shortcut_tests {
             project_path: "".into(),
             profile_name: "".into(),
             has_session: false,
+            relative_time: "now".into(),
         }
     }
 

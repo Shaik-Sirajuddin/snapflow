@@ -7,6 +7,7 @@ import { ContextRing } from "../base/context_ring.slint";
 import { Toggle } from "../base/toggle.slint";
 import { TextUtil } from "../base/text_util.slint";
 import { MentionPickRow } from "../base/mention_pick_row.slint";
+import { SelectableChip } from "../base/selectable_chip.slint";
 import { DropdownEntry, SkillOption, McpServerOption } from "../types.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
@@ -71,6 +72,11 @@ export component ChatInputLayout inherits Rectangle {
     property <[SkillOption]> slash-source: root.command-options;
     in property <[McpServerOption]> mcp-options: [];
     in property <[string]> file-options: [];
+    // PUI-002a: live count of the displayed thread's background terminals
+    // (ThreadModel.terminals.length, see chat_area.slint). Drives the
+    // "{terminal-count} terminals" chip below row 2; the chip itself opens
+    // the terminals popup via terminals-clicked (PUI-002b).
+    in property <int> terminal-count: 0;
 
     callback send-requested();
     callback stop-requested();
@@ -78,6 +84,7 @@ export component ChatInputLayout inherits Rectangle {
     callback config-option-selected(string, string);
     callback profile-selected(string);
     callback context-view-requested();
+    callback terminals-clicked();
     // Phase 15: inline OAuth/connect from the @ MCP popup row.
     callback mcp-connect-requested(string);
     // Phase 15: inline enable/disable from the @ MCP popup row.
@@ -909,6 +916,35 @@ export component ChatInputLayout inherits Rectangle {
                 context-view-requested => { root.context-view-requested(); }
             }
         }
+        }
+
+        // PUI-002a: background-terminals chip, own row below the row2
+        // selector strip. Mirrors the hr + chip convention used elsewhere
+        // (e.g. terminal_card.slint's `Rectangle { height: 1px; background:
+        // Theme.border-default; }` divider) rather than inventing a new
+        // one. Hidden when there are no terminals for the displayed
+        // thread -- PUI-018 keeps terminal-count scoped per-ThreadSlot, so
+        // switching threads/agents changes this without any extra wiring
+        // here.
+        if root.terminal-count > 0 : VerticalLayout {
+            spacing: Metrics.gap-sm;
+            Rectangle { height: 1px; background: Theme.border-default; }
+            // Reuses SelectableChip (base/) rather than hand-rolling a
+            // TouchArea+Rectangle+Text -- agy -p's review-ui pass caught
+            // the hand-rolled version both misusing a padding token
+            // (Metrics.pad-2xl) as a control height and omitting the
+            // CursorHost wiring every other clickable surface in this
+            // codebase sets. SelectableChip (built on HoverSurface)
+            // already owns hover tint + CursorHost + content-width
+            // sizing; `selected` is left at its default `false` since
+            // this chip has no persistent selected state, only hover.
+            HorizontalLayout {
+                alignment: start;
+                SelectableChip {
+                    label: root.terminal-count + " terminal" + (root.terminal-count == 1 ? "" : "s");
+                    clicked => { root.terminals-clicked(); }
+                }
+            }
         }
     }
 

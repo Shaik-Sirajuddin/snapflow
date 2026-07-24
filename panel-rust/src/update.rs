@@ -114,11 +114,33 @@ pub(crate) fn selected_real_index(model: &Model) -> usize {
 // real-backend test can build the exact row shape production actually
 // produces, rather than hand-crafting a fixture that risks silently
 // drifting from what this function really outputs.
+pub(crate) fn format_relative_time(last_activity: Option<std::time::Instant>, state: &ThreadState) -> String {
+    if matches!(state, ThreadState::Loading | ThreadState::Cancelling) {
+        return "now".to_string();
+    }
+    let Some(t) = last_activity else {
+        return "now".to_string();
+    };
+    let elapsed = t.elapsed().as_secs();
+    if elapsed < 60 {
+        "now".to_string()
+    } else if elapsed < 3600 {
+        format!("{}m", elapsed / 60)
+    } else if elapsed < 86400 {
+        format!("{}h", elapsed / 3600)
+    } else if elapsed < 604800 {
+        format!("{}d", elapsed / 86400)
+    } else {
+        format!("{}w", elapsed / 604800)
+    }
+}
+
 pub(crate) fn visible_thread_row(
     model: &Model,
     real_index: usize,
 ) -> Option<crate::models::VisibleThreadItem> {
     let thread = model.threads.get(real_index)?;
+    let rel_time = format_relative_time(thread.last_activity_time, &thread.state);
     // Prefer durable id; fall back to synthetic so keys always match
     // what ThreadListDiff stored when bridge binding was not yet known.
     let thread_id = if thread.thread_id.is_empty() {
@@ -151,6 +173,7 @@ pub(crate) fn visible_thread_row(
         session_id: thread.session_id.clone(),
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
+            relative_time: rel_time.into(),
             status: status.into(),
             busy: matches!(
                 thread.state,
@@ -335,13 +358,16 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 ..ThreadModel::default()
             });
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
+            // PUI-014: create the thread DEFERRED -- no ACP session opens until
+            // the first message is sent, so the provider/profile picker stays
+            // editable. profile_name/permission_profile are already stored on
+            // the model thread above and are read at attach time. The imperative
+            // attach in the &mut send dispatch reads the then-current provider.
             (
-                vec![Effect::NewThread {
+                vec![Effect::NewThreadDeferred {
                     real_index,
                     display_name,
                     provider,
-                    profile_name,
-                    permission_profile,
                 }],
                 vec![
                     list_dirty,
@@ -667,6 +693,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             thread.error = None;
             thread.state = ThreadState::Loading;
             thread.agent_content_this_turn = false;
+            thread.last_activity_time = Some(std::time::Instant::now());
             // Sending resumes auto-processing after a manual stop.
             thread.send_queue.resume();
             (
@@ -915,6 +942,7 @@ fn update_request(model: &mut Model, msg: RequestMsg) -> (Vec<Effect>, Vec<Dirty
 }
 
 fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dirty>) {
+    let idx = selected_real_index(model);
     match msg {
         TerminalMsg::Expand(id) => {
             model.expanded_terminal_id = Some(id.clone());
@@ -932,6 +960,20 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
         TerminalMsg::LocalToggle => (vec![Effect::LocalTerminalSpawn], vec![Dirty::LocalTerminal]),
         TerminalMsg::LocalClose => (vec![Effect::LocalTerminalKill], vec![Dirty::LocalTerminal]),
         TerminalMsg::LocalKeyInput(bytes) => (vec![Effect::LocalTerminalWrite { bytes }], vec![]),
+        TerminalMsg::Kill(terminal_id) => {
+            // No model mutation here -- the real exit is observed the
+            // same way any other terminal exit is, via the next
+            // `AgentEvent::TerminalOutput` carrying a non-null
+            // `exitStatus` (see `AcpxThreadHandle::kill_terminal`'s doc
+            // comment). Nothing to mark dirty until that arrives.
+            (
+                vec![Effect::KillAgentTerminal {
+                    real_index: idx,
+                    terminal_id,
+                }],
+                vec![],
+            )
+        }
     }
 }
 
@@ -1213,6 +1255,10 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 }],
             )
         }
+        ChromeMsg::CopyMessageRequested { text } => (
+            vec![Effect::ClipboardWrite { text }],
+            vec![],
+        ),
         ChromeMsg::ErrorBannerDismissed => {
             let real_idx = selected_real_index(model);
             let Some(thread) = model.threads.get_mut(real_idx) else {
@@ -1436,6 +1482,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         EffectResultMsg::SkillEditorLoaded(Ok(state)) => {
             model.active_skill_name = state.name;
             model.active_skill_path = state.path;
+            model.active_skill_md_path = state.content_path;
             model.active_skill_content = state.content;
             model.detected_editors = state.detected_editors;
             model.active_pane = "skill".to_owned();
@@ -1450,6 +1497,24 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 },
             }],
         ),
+        // memory/acpx/gen/plans/acpx-skills/ phase 17: one of the 6
+        // reactive-sync trigger call sites (create/promote/edit/agent-
+        // enable/agent-disable/thread-start) failed to propagate a
+        // skill to an attached agent. Best-effort, matching every
+        // reactive-sync call site's own posture: surfaced via toast, not
+        // retried, and deliberately NOT a Dirty::Error banner -- the
+        // skill mutation itself already succeeded (it's on disk, it's in
+        // the UI list), only the downstream agent propagation failed, so
+        // this doesn't belong in the same "something is broken" channel
+        // as an actual save/create/promote failure above.
+        EffectResultMsg::SkillReactiveSyncFailed { operation, detail } => {
+            let toast = show_toast(
+                model,
+                "error",
+                format!("Skill sync to agent failed ({operation}): {detail}"),
+            );
+            (vec![], vec![toast])
+        }
         EffectResultMsg::SkillWritten(Err(err)) => {
             model.skill_saving = false;
             let toast = show_toast(model, "error", format!("Skill save failed: {}", err.message));
@@ -1656,6 +1721,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 ) {
                     thread.agent_content_this_turn = true;
                 }
+                thread.last_activity_time = Some(std::time::Instant::now());
                 dirty.push(Dirty::MessageAppended {
                     thread_id: thread.thread_id.clone(),
                 });
@@ -1671,6 +1737,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 let was_generating = matches!(thread.state, ThreadState::Loading);
                 thread.state = ThreadState::Idle;
                 thread.error = None;
+                thread.last_activity_time = Some(std::time::Instant::now());
                 crate::trace_host_input(format_args!(
                     "turn ended thread={} reason={:?}",
                     bridge_event.thread_index, reason
@@ -1724,6 +1791,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
+            | crate::protocol_types::AgentEvent::TerminalCreated(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
             | crate::protocol_types::AgentEvent::CurrentModeChanged(_)
             | crate::protocol_types::AgentEvent::ConfigOptions(_)
@@ -2485,7 +2553,7 @@ mod tests {
             assert!(
                 matches!(
                     effects.as_slice(),
-                    [Effect::NewThread { provider, .. }] if provider == "claude"
+                    [Effect::NewThreadDeferred { provider, .. }] if provider == "claude"
                 ),
                 "default_agent_id {agent_id:?} must route new threads to the claude provider, \
                  got: {effects:?}"
@@ -2501,19 +2569,29 @@ mod tests {
         model.default_agent_id = "claude".to_owned();
 
         let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        // PUI-014: New now creates a DEFERRED thread -- no eager attach, so the
+        // provider/profile stay editable. The effect carries only what the
+        // deferred slot needs; the profile/permission are retained on the model
+        // thread and read at first-send attach time.
         assert_eq!(
             effects,
-            vec![Effect::NewThread {
+            vec![Effect::NewThreadDeferred {
                 real_index: 1,
                 display_name: "New thread 2".to_owned(),
                 provider: "claude".to_owned(),
-                profile_name: Some("safe".to_owned()),
-                permission_profile: Some("workspace".to_owned()),
             }]
         );
         assert_eq!(model.threads.len(), 2);
         assert!(model.threads[1].session_id.is_none());
+        assert_eq!(model.threads[1].profile_name.as_deref(), Some("safe"));
+        assert_eq!(
+            model.threads[1].permission_profile.as_deref(),
+            Some("workspace")
+        );
 
+        // The first message's imperative attach eventually resolves the binding
+        // exactly as before -- SessionAttached still folds the session id and
+        // emits the persistence effect.
         let (follow_up, dirty) = update(
             &mut model,
             Msg::Effect(EffectResultMsg::SessionAttached {
@@ -2550,14 +2628,22 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![Effect::NewThread {
+            vec![Effect::NewThreadDeferred {
                 real_index: 1,
                 display_name: "New thread 2".to_owned(),
                 provider: "codex".to_owned(),
-                profile_name: None,
-                permission_profile: None,
             }],
-            "a literal \"default\" profile/permission-profile must never reach session/new"
+        );
+        // PUI-014: the profile/permission are now read from the model thread at
+        // attach time, so the "default" sentinel must be filtered to None BEFORE
+        // it is stored -- otherwise it would reach session/new at first send.
+        assert_eq!(
+            model.threads[1].profile_name, None,
+            "a literal \"default\" profile must never be stored (would reach session/new)"
+        );
+        assert_eq!(
+            model.threads[1].permission_profile, None,
+            "a literal \"default\" permission-profile must never be stored"
         );
     }
 
@@ -4049,6 +4135,32 @@ mod tests {
     }
 
     #[test]
+    fn skill_reactive_sync_failure_surfaces_as_a_toast_not_an_error_banner() {
+        // memory/acpx/gen/plans/acpx-skills/ phase 17: reactive-sync
+        // failures used to be eprintln!-only, invisible to the user.
+        // Deliberately NOT Dirty::Error -- the skill mutation itself
+        // already succeeded (on disk, in the UI list); only the
+        // downstream agent-propagation step failed.
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SkillReactiveSyncFailed {
+                operation: "create".to_owned(),
+                detail: "codex-acp: no such file or directory".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty(), "a toast-only result produces no further effects");
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert!(
+            !dirty.iter().any(|d| matches!(d, Dirty::Error { .. })),
+            "reactive-sync failures are soft/best-effort -- must not also arm the hard error banner"
+        );
+        assert_eq!(model.toast_kind, "error");
+        assert!(model.toast_message.contains("create"));
+        assert!(model.toast_message.contains("codex-acp: no such file or directory"));
+    }
+
+    #[test]
     fn skill_content_edit_absorbs_into_the_model_before_sync_runs() {
         // Plan phase 27: ContentEdited used to emit Dirty::SkillEditor
         // WITHOUT updating model.active_skill_content -- sync then pushed
@@ -4071,6 +4183,35 @@ mod tests {
             effects.as_slice(),
             [Effect::SkillWrite { content, .. }] if content == "old body plus a typed delta"
         ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::SkillEditor)));
+    }
+
+    #[test]
+    fn skill_editor_loaded_keeps_the_directory_and_the_skill_md_file_distinct() {
+        // PUI-010: SkillEditorLoaded used to fold state.path (the skill
+        // DIRECTORY) into the only path the model tracked
+        // (active_skill_path), which app.slint's content-edited handler
+        // then sent straight into Effect::SkillWrite -- every save wrote
+        // to the directory and hit an EISDIR OS error (see
+        // effect_executor::skill_editor_path_tests for the real
+        // filesystem repro of that error). Fixed by tracking the two
+        // paths separately; this proves the reducer keeps them apart.
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(crate::effect::EffectResultMsg::SkillEditorLoaded(Ok(
+                crate::model::SkillEditorState {
+                    name: "demo".to_owned(),
+                    path: "/skills/demo".to_owned(),
+                    content_path: "/skills/demo/SKILL.md".to_owned(),
+                    content: "body".to_owned(),
+                    detected_editors: vec![],
+                },
+            ))),
+        );
+        assert_eq!(model.active_skill_path, "/skills/demo");
+        assert_eq!(model.active_skill_md_path, "/skills/demo/SKILL.md");
+        assert_ne!(model.active_skill_path, model.active_skill_md_path);
         assert!(dirty.iter().any(|d| matches!(d, Dirty::SkillEditor)));
     }
 

@@ -10,7 +10,7 @@ use crate::gateway_actor::classify_raw_update;
 use crate::protocol_types::AgentEvent;
 use crate::protocol_types::{
     AgentRequestEvent, ConfigOptionInfo, ConfigOptionValue, SessionModeInfo, SessionModesEvent,
-    TerminalOutputEvent,
+    TerminalCreatedEvent, TerminalOutputEvent,
 };
 use acpx_client::raw::ClientError;
 use acpx_client::{AgentRequest, Gateway};
@@ -130,6 +130,17 @@ enum Command {
     /// comment.
     SetMode {
         mode_id: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
+    /// `terminal/kill` -- see [`AcpxThreadHandle::kill_terminal`]'s doc
+    /// comment. Unlike `SetMode`/`SetConfigOption`, takes no `sessionId`:
+    /// ACP's `terminal/kill` schema is `{terminalId}` only (the id acpx
+    /// minted at `terminal/create` already routes the request to the
+    /// right backend connection), per `acpx_core::router::handle_
+    /// terminal_request`'s own generic "every other terminal/* method
+    /// references an existing terminal by id" handling.
+    KillTerminal {
+        terminal_id: String,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
     /// `session/set_config_option` -- see [`AcpxThreadHandle::
@@ -400,6 +411,22 @@ impl AcpxThreadHandle {
     pub async fn set_mode(&self, mode_id: impl Into<String>) -> Result<(), AcpxThreadError> {
         let mode_id = mode_id.into();
         self.call(|resp| Command::SetMode { mode_id, resp }).await
+    }
+
+    /// `terminal/kill` for `terminal_id` -- PUI-002b (background-
+    /// terminals-ui plan)'s popup `[x]` kill button. Fire-and-forget from
+    /// the caller's perspective (mirrors `set_mode`): a failure surfaces
+    /// as a queued `AgentEvent::Error`, and a success has no immediate
+    /// local effect on `terminal_buffer(idx, terminal_id)` -- the real
+    /// exit is observed the same way any other exit is, via the next
+    /// `acpx/terminal_output` push carrying a non-null `exitStatus`.
+    pub async fn kill_terminal(
+        &self,
+        terminal_id: impl Into<String>,
+    ) -> Result<(), AcpxThreadError> {
+        let terminal_id = terminal_id.into();
+        self.call(|resp| Command::KillTerminal { terminal_id, resp })
+            .await
     }
 
     /// `session/set_config_option` against this thread's bound session
@@ -1024,6 +1051,8 @@ fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc
                                     }));
                                 } else if let Some(term_ev) = parse_terminal_output(&update) {
                                     let _ = event_tx.send(AgentEvent::TerminalOutput(term_ev));
+                                } else if let Some(created_ev) = parse_terminal_created(&update) {
+                                    let _ = event_tx.send(AgentEvent::TerminalCreated(created_ev));
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1081,6 +1110,44 @@ fn parse_terminal_output(value: &serde_json::Value) -> Option<TerminalOutputEven
         output,
         truncated,
         exit_status,
+    })
+}
+
+/// Parses a bare `acpx/terminal_created` notification (see
+/// `acpx_core::router`'s `terminal/create` handler, the one-shot publish
+/// right before it starts `spawn_terminal_output_stream`) into this
+/// crate's shared `TerminalCreatedEvent`. `None` for anything else, same
+/// convention as [`parse_terminal_output`].
+fn parse_terminal_created(value: &serde_json::Value) -> Option<TerminalCreatedEvent> {
+    if value.get("method").and_then(|m| m.as_str()) != Some("acpx/terminal_created") {
+        return None;
+    }
+    let params = value.get("params")?;
+    let terminal_id = params.get("terminalId")?.as_str()?.to_string();
+    let command = params
+        .get("command")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let args: Vec<String> = params
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let started_at = params
+        .get("startedAt")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(TerminalCreatedEvent {
+        terminal_id,
+        command,
+        args,
+        started_at,
     })
 }
 
@@ -1412,6 +1479,23 @@ async fn run_thread_actor(
                 };
                 let params = serde_json::json!({ "sessionId": sid, "modeId": mode_id });
                 let result = client.call("session/set_mode", params, None).await;
+                let _ = resp.send(result.map(|_| ()).map_err(Into::into));
+            }
+            Command::KillTerminal { terminal_id, resp } => {
+                // Real, previously-undiscovered gap closed alongside this
+                // fix (acpx-core/src/router.rs's new `"terminal/kill"`
+                // GatewayNative arm): the client-facing dispatch resolves
+                // the backend from `params.sessionId`, same as every other
+                // client-initiated call against a session (SetMode,
+                // SetConfigOption above) -- terminalId alone can't resolve
+                // a backend on its own since acpx supervises many.
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let params =
+                    serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
+                let result = client.call("terminal/kill", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::SetConfigOption {

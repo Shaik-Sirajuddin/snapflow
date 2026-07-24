@@ -15,40 +15,55 @@ export component TerminalLogBlock inherits Rectangle {
     in property <bool> scrollable: true;
     in property <TextOverflow> text-overflow: clip;
 
-    background: Theme.bg-terminal;
-    border-color: Theme.border-terminal;
-    border-width: 1px;
+    background: Theme.bg-tertiary;
+    border-color: transparent;
+    border-width: 0px;
     border-radius: Theme.radius-sm;
 
     VerticalLayout {
         padding: root.content-padding;
 
+        // `TextInput` (read-only) instead of `Text` in both branches so
+        // payload/log text gets real click-drag selection + Ctrl+C copy
+        // (see `markdown_view.slint`'s overlay doc comment for the same
+        // "plain `Text` never captures pointer, only `TextInput` supports
+        // selection" reasoning). `interactive: false` on the wrapping
+        // `Flickable` keeps it purely as the layout boundary it already
+        // was (`height == viewport-height`, nothing to pan) instead of
+        // letting its own drag-to-pan gesture capture the mouse-down-and-
+        // drag before `scroll-text` sees it.
         if root.scrollable : Flickable {
+            interactive: false;
             height: scroll-text.preferred-height;
             viewport-height: scroll-text.preferred-height;
-            scroll-text := Text {
+            scroll-text := TextInput {
                 text: root.text;
                 font-family: Theme.font-mono;
                 font-size: root.font-size * Theme.font-scale;
-                color: Theme.text-terminal;
+                color: Theme.text-primary;
+                read-only: true;
                 wrap: word-wrap;
                 horizontal-alignment: left;
                 vertical-alignment: top;
                 width: parent.width;
+                selection-foreground-color: Theme.text-primary;
+                selection-background-color: Theme.selection-bg;
             }
         }
-        if !root.scrollable : Text {
+        if !root.scrollable : TextInput {
             text: root.text;
             font-family: Theme.font-mono;
             font-size: root.font-size * Theme.font-scale;
-            color: Theme.text-terminal;
+            color: Theme.text-primary;
+            read-only: true;
             wrap: word-wrap;
-            overflow: root.text-overflow;
             horizontal-alignment: left;
             vertical-alignment: top;
             horizontal-stretch: 1;
             preferred-width: 0px;
             min-width: 0px;
+            selection-foreground-color: Theme.text-primary;
+            selection-background-color: Theme.selection-bg;
         }
     }
 }

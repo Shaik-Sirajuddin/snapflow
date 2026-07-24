@@ -2,6 +2,7 @@ import { Theme } from "./tokens/theme.slint";
 import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
+import { SelectionFocus } from "./tokens/selection_focus.slint";
 import { IconButton } from "./base/icon_button.slint";
 import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
@@ -10,9 +11,16 @@ import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
 import { AgentBubble } from "./chat-view/components/message/agent_bubble.slint";
 import { QueuedMessageBar } from "./chat-view/components/message/queued_message_bar.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
+import { ToolGroupView } from "./chat-view/components/message/tool_group_view.slint";
 import { PermissionCard } from "./components/permission_card.slint";
-import { TerminalCard } from "./components/terminal_card.slint";
 import { LocalTerminalCard } from "./components/local_terminal_card.slint";
+// PUI-002b: reuse the same boxed-row primitive the @/#/skill mention
+// popups already use (`chat_input_layout.slint`) instead of hand-rolling
+// a new list-row component for the terminals popup.
+import { MentionPickRow } from "./base/mention_pick_row.slint";
+import { ThinScrollbar } from "./base/thin_scrollbar.slint";
+import { ApiCallView } from "./chat-view/components/execution/api_call_view.slint";
+import { TerminalView } from "./chat-view/components/execution/terminal_view.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
 // chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
@@ -61,6 +69,32 @@ export component ChatArea inherits Rectangle {
     // struct" convention `PendingRequestItem` already established.
     in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
+    in-out property <bool> full-view-open: false;
+    in-out property <int> full-view-group-idx: -1;
+    in-out property <string> full-view-title: "";
+    in-out property <string> full-view-raw-input: "";
+    in-out property <string> full-view-raw-output: "";
+    in-out property <bool> full-view-is-terminal: false;
+    in-out property <bool> full-view-is-mcp: false;
+    // One saved level, not an arbitrary-depth stack -- Slint has no
+    // array push/pop/slice/concat to build a real one from `.slint` code
+    // (confirmed: `arr + [x]` and `arr.slice(...)` both fail to compile).
+    // This is enough because the popup structure below only ever reaches
+    // two levels: the group popup (`full-view-group-idx >= 0`, opened
+    // from `ToolGroupView`'s maximize button) can nest one single-call
+    // popup (`full-view-group-idx == -1`, opened via a `ToolEventRow`'s
+    // own `open-full-view`); once there, the modal renders a leaf
+    // `TerminalView`/`ApiCallView` with no further `open-full-view`
+    // trigger of its own, so a third level is structurally unreachable.
+    // If a future popup variant *does* need to nest from within a leaf
+    // view, this would need to become real Rust-backed state instead of
+    // widening this to more scalar fields.
+    property <int> prev-full-view-group-idx: -1;
+    property <string> prev-full-view-title: "";
+    property <string> prev-full-view-raw-input: "";
+    property <string> prev-full-view-raw-output: "";
+    property <bool> prev-full-view-is-terminal: false;
+    property <bool> prev-full-view-is-mcp: false;
     // Phase 14: forwarded to ChatInputLayout.inputs-enabled (false for
     // archived threads -- inputs render disabled, not just inert).
     in property <bool> inputs-enabled: true;
@@ -111,6 +145,17 @@ export component ChatArea inherits Rectangle {
     callback context-view-requested();
     callback send-requested();
     callback stop-requested();
+    // PUI-002a/b: forwarded from ChatInputLayout's terminals chip (see
+    // chat-input := ChatInputLayout below); toggles the terminals popup
+    // owned locally by this component (terminals-popup-open below) since
+    // ChatArea already has the `terminals` list and `expand-terminal`
+    // callback the popup needs -- no reason to thread the list back down
+    // into ChatInputLayout just to render the popup there.
+    callback terminals-clicked();
+    property <bool> terminals-popup-open: false;
+    // PUI-002b: popup's `[x]` kill button -- see app.slint's forwarding
+    // wire and `dispatch_terminal_kill_requested`.
+    callback terminal-kill-requested(string);
     // QueuedMessageBar actions: message-list index of the queued row.
     callback queue-cancel-requested(int);
     callback queue-edit-requested(int);
@@ -122,6 +167,7 @@ export component ChatArea inherits Rectangle {
     callback thread-rename-cancelled();
     callback thread-rename-confirmed(string);
     callback toggle-expanded(int);
+    callback copy-message(string);
     callback approve-request();
     callback reject-request();
     // One-of permission option pick (optionId from ACP / synthetic id).
@@ -148,7 +194,16 @@ export component ChatArea inherits Rectangle {
     // keystrokes failure class TextField.has-focus's doc comment names.
     out property <bool> secondary-text-input-has-focus:
         chat-input.secondary-text-input-has-focus
-        || rename-input.has-focus;
+        || rename-input.has-focus
+        // Selectable message text (read-only TextInputs in markdown_view /
+        // user_bubble / tool_event_row) is focusable: clicking to select
+        // grabs focus. Those live inside `for` repeaters, so they report
+        // through the SelectionFocus global rather than an id reference --
+        // without this, clicking any message text silently dropped every
+        // subsequent keystroke (Ctrl+C on the selection, global shortcuts,
+        // and typing into the composer) until the user clicked back into
+        // the composer. See selection_focus.slint.
+        || SelectionFocus.any-focused;
 
     // --- Demo approval (local one-of card, no ACP round-trip) ------------
     // Type one of these in the compose box and press Send / Enter:
@@ -171,6 +226,43 @@ export component ChatArea inherits Rectangle {
             || t == "/demo-approve "
             || t == "demo permission"
             || t == "demo permission ";
+    }
+
+    pure function is-tool-kind(k: string) -> bool {
+        return k == "tool_use" || k == "mcp_server_call" || k == "skill_use" || k == "skill_load" || k == "terminal";
+    }
+
+    // Group length/membership come straight from `MessageItem.tool-group-
+    // len` (`models::assign_tool_group_lengths`, Rust-computed once per
+    // transcript build) instead of scanning here: Slint `pure function`s
+    // support neither loops nor recursion (a `pure function` calling
+    // itself compiles to a "binding loop" error), so a Slint-side scan
+    // would need a hand-unrolled, arbitrarily-capped `if` ladder that
+    // silently undercounts any run longer than the cap. Plain arithmetic
+    // on the precomputed length has no such limit.
+    pure function in-same-tool-group(msgs: [MessageItem], s: int, c: int) -> bool {
+        return c >= s && c < s + msgs[s].tool-group-len;
+    }
+
+    // Shared by the popup backdrop `TouchArea` and the header `×` button
+    // (previously duplicated inline in both places): a nested full-view
+    // (opened from a tool event inside an already-open group popup) pops
+    // back to that group's popup state; a non-nested one closes outright.
+    function close-full-view() {
+        if (root.prev-full-view-group-idx >= 0) {
+            root.full-view-group-idx = root.prev-full-view-group-idx;
+            root.full-view-title = root.prev-full-view-title;
+            root.full-view-raw-input = root.prev-full-view-raw-input;
+            root.full-view-raw-output = root.prev-full-view-raw-output;
+            root.full-view-is-terminal = root.prev-full-view-is-terminal;
+            root.full-view-is-mcp = root.prev-full-view-is-mcp;
+            root.prev-full-view-group-idx = -1;
+        } else {
+            root.full-view-open = false;
+            root.full-view-title = "";
+            root.full-view-raw-input = "";
+            root.full-view-raw-output = "";
+        }
     }
 
     property <PendingRequestItem> demo-pending: {
@@ -310,6 +402,14 @@ export component ChatArea inherits Rectangle {
     // How far the message Flickable can scroll -- viewport-y ranges from
     // `-msg-max-scroll` (bottom) to 0 (top).
     property <length> msg-max-scroll: Math.max(0px, message-scroll.viewport-height - message-scroll.height);
+    // Independent scroll position for the popup view (not synced with main message scroll)
+    property <length> popup-scroll-y: 0px;
+
+    changed full-view-open => {
+        if (root.full-view-open) {
+            root.popup-scroll-y = 0px;
+        }
+    }
 
     main-layout := VerticalLayout {
         width: parent.width;
@@ -576,8 +676,6 @@ export component ChatArea inherits Rectangle {
                             color: Theme.bg-primary;
                         }
                     }
-                    // PUI-001: top-bar terminal toggle removed (terminal
-                    // access moves to the chat-input affordance, PUI-002).
                 }
             }
         }
@@ -742,6 +840,7 @@ export component ChatArea inherits Rectangle {
                 // chat-items-redesign.md #11: kind switch — user /
                 // agent|thinking / tool-event / legacy MessageCard.
                 for msg[i] in messages : HorizontalLayout {
+                    padding-right: compact ? Metrics.space-2 : Metrics.space-4;
                     property <bool> is-queued: msg.queued;
                     // Phase 18: synthetic awaiting-response row (models.rs
                     // appends kind "pending" while a just-sent user message
@@ -751,16 +850,14 @@ export component ChatArea inherits Rectangle {
                     property <bool> is-user: msg.kind == "user" && !msg.queued;
                     property <bool> is-agent-side: msg.kind == "agent"
                         || msg.kind == "thinking";
-                    property <bool> is-tool-event: msg.kind == "tool_use"
-                        || msg.kind == "mcp_server_call"
-                        || msg.kind == "skill_load"
-                        || msg.kind == "skill_use"
-                        || msg.kind == "terminal";
+                    property <bool> is-tool-event: root.is-tool-kind(msg.kind);
+                    property <bool> is-first-tool-event: is-tool-event && (i == 0 ? true : !root.is-tool-kind(root.messages[i - 1].kind));
                     // Active-session rail on the *latest* row while the
                     // thread is loading (same `sending` state as the
                     // header/sidebar spinner). Pulse *flows* top → bottom.
                     property <bool> is-live-tail:
                         root.sending && i == root.messages.length - 1;
+                    property <int> tool-group-size: msg.tool-group-len;
                     // Fixed gutter widths — never toggle 0↔N when the live
                     // rail appears, or the bubble column jumps horizontally.
                     property <length> rail-w: 3px;
@@ -819,7 +916,7 @@ export component ChatArea inherits Rectangle {
                     }
                     // Gap after rail / user indent — fixed per kind.
                     Rectangle {
-                        width: is-user ? user-indent : rail-gap;
+                        width: is-user ? 36px : rail-gap;
                         horizontal-stretch: 0;
                     }
                     if is-pending : HorizontalLayout {
@@ -866,6 +963,7 @@ export component ChatArea inherits Rectangle {
                         preferred-width: 0px;
                         min-width: 0px;
                         item: msg;
+                        copy-message(text) => { root.copy-message(text); }
                     }
                     if is-agent-side : AgentBubble {
                         link-activated(target) => { root.md-link-activated(target); }
@@ -878,25 +976,48 @@ export component ChatArea inherits Rectangle {
                         // shared toggle-expanded round-trip (same as
                         // ToolEventRow / MessageCard log bodies).
                         toggle-expanded(idx) => { toggle-expanded(idx); }
+                        copy-message(text) => { root.copy-message(text); }
                     }
-                    if is-tool-event : ToolEventRow {
+                    if is-first-tool-event : ToolGroupView {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
-                        vertical-stretch: 0;
-                        kind: msg.kind;
-                        first-use: msg.first-use;
-                        text: msg.text;
-                        cap-height: root.height * 0.3;
-                        // chat-items-remaining-wiring.md #4: execution-view
-                        // content (terminal/api-call) click-to-open state,
-                        // same `expanded`/`index` round-trip `MessageCard`
-                        // already uses for its own log body.
-                        raw-input: msg.raw-input;
-                        raw-output: msg.raw-output;
-                        expanded: msg.expanded;
-                        index: msg.index;
-                        toggle-expanded(idx) => { toggle-expanded(idx); }
+                        label: msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE";
+                        item-count: tool-group-size;
+                        loading: is-live-tail;
+                        default-expanded: (i + tool-group-size) >= root.messages.length;
+                        max-visible-height: min(230px, root.height * 0.35);
+                        open-group-full-view => {
+                            root.full-view-title = (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE") + " EXECUTION (" + tool-group-size + " TOTAL CALLS)";
+                            root.full-view-is-mcp = msg.kind == "mcp_server_call";
+                            root.full-view-group-idx = i;
+                            root.full-view-open = true;
+                        }
+                        for sub-msg[sub-idx] in root.messages : ToolEventRow {
+                            visible: sub-idx >= i && root.in-same-tool-group(root.messages, i, sub-idx);
+                            height: self.visible ? self.preferred-height : 0px;
+                            horizontal-stretch: self.visible ? 1 : 0;
+                            vertical-stretch: 0;
+                            in-group: true;
+                            kind: sub-msg.kind;
+                            first-use: sub-msg.first-use;
+                            text: sub-msg.text;
+                            cap-height: root.height * 0.3;
+                            raw-input: sub-msg.raw-input;
+                            raw-output: sub-msg.raw-output;
+                            expanded: sub-msg.expanded;
+                            index: sub-msg.index;
+                            toggle-expanded(idx) => { toggle-expanded(idx); }
+                            open-full-view(title, input, output, term, mcp) => {
+                                root.full-view-title = title;
+                                root.full-view-raw-input = input;
+                                root.full-view-raw-output = output;
+                                root.full-view-is-terminal = term;
+                                root.full-view-is-mcp = mcp;
+                                root.full-view-group-idx = -1;
+                                root.full-view-open = true;
+                            }
+                        }
                     }
                     if !is-queued && !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
                         horizontal-stretch: 1;
@@ -905,7 +1026,10 @@ export component ChatArea inherits Rectangle {
                         item: msg;
                         toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
-                    Rectangle { width: 0px; }
+                    Rectangle {
+                        width: (is-agent-side || is-first-tool-event) ? 36px : 0px;
+                        horizontal-stretch: 0;
+                    }
                 }
             }
             }
@@ -946,26 +1070,175 @@ export component ChatArea inherits Rectangle {
                     color: Theme.text-on-primary;
                 }
             }
-        }
-        // Terminal-view addition: one bounded max-height card per live/
-        // finished agent-created terminal on the active thread, docked
-        // above the compose bar like the permission card below --
-        // deliberately outside the scrollable message Flickable so a
-        // running command stays visible without scrolling.
-        for term in terminals : Rectangle {
-            background: Theme.bg-chat;
-            HorizontalLayout {
-                padding: compact ? 6px : 10px;
-                TerminalCard {
-                    item: term;
-                    compact: compact;
-                    horizontal-stretch: 1;
-                    preferred-width: 0px;
-                    min-width: 0px;
-                    expand => { expand-terminal(term.terminal-id); }
+
+            // Right-side auto-hiding thin scrollbar for chat view
+            ThinScrollbar {
+                x: parent.width - self.width - 2px;
+                y: 4px;
+                visible-height: parent.height - 8px;
+                viewport-height: message-col.preferred-height;
+                viewport-y <=> message-scroll.viewport-y;
+                thumb-width: 4px;
+                active: !root.stick-to-bottom;
+            }
+
+            // Centered full view overlay popup inside message-area (between top bar & chat input)
+            // Only show full-view backdrop if full-view is explicitly open (not just inherited from popup)
+            if root.full-view-open : Rectangle {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                background: #00000080;
+
+                TouchArea {
+                    // Only close full-view, restoring previous state if nested
+                    clicked => { root.close-full-view(); }
+                }
+
+                Rectangle {
+                    x: max(10px, (parent.width - 720px) / 2);
+                    y: max(10px, (parent.height - 520px) / 2);
+                    width: min(parent.width - 20px, 720px);
+                    height: min(parent.height - 20px, 520px);
+                    background: Theme.bg-sidebar;
+                    border-width: 0px;
+                    border-radius: Theme.radius-lg;
+                    drop-shadow-blur: 16px;
+                    drop-shadow-color: #00000080;
+
+                    TouchArea {
+                        // Intercept clicks on dialog card body so backdrop touch doesn't close
+                    }
+
+                    VerticalLayout {
+                        padding: Metrics.space-6;
+                        spacing: Metrics.space-3;
+
+                        // Header Bar
+                        HorizontalLayout {
+                            spacing: Metrics.space-2;
+                            Icon {
+                                source: root.full-view-is-mcp ? @image-url("./assets/icons/plug-zap.svg") : @image-url("./assets/icons/wrench.svg");
+                                size: 16px;
+                                color: Theme.text-primary;
+                            }
+                            Text {
+                                text: root.full-view-title != "" ? root.full-view-title : "FULL CALL DETAILS & PAYLOAD";
+                                font-family: Theme.font-mono;
+                                font-size: 11px * Theme.font-scale;
+                                font-weight: 700;
+                                color: Theme.text-primary;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; height: 0px; }
+                            TouchArea {
+                                width: 20px;
+                                height: 20px;
+                                mouse-cursor: pointer;
+                                clicked => { root.close-full-view(); }
+                                Text {
+                                    text: "\u{2715}";
+                                    color: Theme.text-muted;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Theme.border-default; }
+
+                        Flickable {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            viewport-height: popup-content.preferred-height;
+                            viewport-y <=> root.popup-scroll-y;
+
+                            popup-content := VerticalLayout {
+                                spacing: Metrics.space-2;
+                                if root.full-view-group-idx >= 0 : VerticalLayout {
+                                    // PUI-009 class: this repeater walks the WHOLE
+                                    // thread and collapses non-group rows to 0px,
+                                    // but a VerticalLayout applies `spacing`
+                                    // between EVERY adjacent child including
+                                    // zero-height ones -- with `spacing:
+                                    // Metrics.space-2` a group deep in a long
+                                    // thread accumulated one gap per message
+                                    // outside it (large empty scroll regions).
+                                    // Same fix as the sidebar lists: no layout
+                                    // spacing, and each visible row carries its
+                                    // own trailing spacer (0px when hidden).
+                                    // ToolGroupView's own body-layout already does
+                                    // this (spacing: 0px).
+                                    spacing: 0px;
+                                    for sub-msg[sub-idx] in root.messages : VerticalLayout {
+                                        property <bool> row-visible: sub-idx >= root.full-view-group-idx && root.in-same-tool-group(root.messages, root.full-view-group-idx, sub-idx);
+                                        spacing: 0px;
+                                        ToolEventRow {
+                                        visible: parent.row-visible;
+                                        height: self.visible ? self.preferred-height : 0px;
+                                        horizontal-stretch: self.visible ? 1 : 0;
+                                        vertical-stretch: 0;
+                                        in-group: true;
+                                        kind: sub-msg.kind;
+                                        first-use: sub-msg.first-use;
+                                        text: sub-msg.text;
+                                        cap-height: 260px;
+                                        raw-input: sub-msg.raw-input;
+                                        raw-output: sub-msg.raw-output;
+                                        expanded: true;
+                                        index: sub-msg.index;
+                                        toggle-expanded(idx) => { toggle-expanded(idx); }
+                                        open-full-view(title, input, output, term, mcp) => {
+                                            // Save current state for nested popup (stack style)
+                                            root.prev-full-view-group-idx = root.full-view-group-idx;
+                                            root.prev-full-view-title = root.full-view-title;
+                                            root.prev-full-view-raw-input = root.full-view-raw-input;
+                                            root.prev-full-view-raw-output = root.full-view-raw-output;
+                                            root.prev-full-view-is-terminal = root.full-view-is-terminal;
+                                            root.prev-full-view-is-mcp = root.full-view-is-mcp;
+                                            // Switch to nested full view
+                                            root.full-view-title = title;
+                                            root.full-view-raw-input = input;
+                                            root.full-view-raw-output = output;
+                                            root.full-view-is-terminal = term;
+                                            root.full-view-is-mcp = mcp;
+                                            root.full-view-group-idx = -1;
+                                            root.full-view-open = true;
+                                        }
+                                        }
+                                        // Per-row trailing gap, 0px when the row
+                                        // is hidden -- replaces layout `spacing`
+                                        // so collapsed rows contribute nothing.
+                                        Rectangle {
+                                            height: parent.row-visible ? Metrics.space-2 : 0px;
+                                        }
+                                    }
+                                }
+                                if root.full-view-group-idx < 0 && root.full-view-is-terminal : TerminalView {
+                                    command: root.full-view-raw-input;
+                                    output: root.full-view-raw-output;
+                                }
+                                if root.full-view-group-idx < 0 && !root.full-view-is-terminal : ApiCallView {
+                                    raw-input: root.full-view-raw-input;
+                                    raw-output: root.full-view-raw-output;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+        // PUI-002c (background-terminals-ui plan): agent-created terminal
+        // cards are no longer always-docked here -- they're opened via
+        // the terminals popup above (chip -> popup -> click item ->
+        // expand-terminal -> TerminalOverlay in app.slint, unchanged).
+        // The docked-by-default `for term in terminals : TerminalCard`
+        // block that used to render every live terminal directly in the
+        // chat view is removed; `TerminalCard` itself is unused now (the
+        // popup's rows are `MentionPickRow`, the full view is
+        // `TerminalOverlay`) but stays imported/defined for that overlay
+        // path's own internals -- see `terminal_card.slint`'s module doc.
         // Client-local PTY terminal card -- same docking spot as the
         // agent-created terminal cards above (outside the scrollable
         // message Flickable), shown whenever the user has toggled it
@@ -1059,13 +1332,74 @@ export component ChatArea inherits Rectangle {
             command-options: command-options;
             mcp-options: mcp-options;
             file-options: file-options;
+            terminal-count: root.terminals.length;
             send-requested => { root.handle-send(); }
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
             profile-selected(id) => { profile-selected(id); }
             context-view-requested => { context-view-requested(); }
+            terminals-clicked => {
+                root.terminals-clicked();
+                root.terminals-popup-open = !root.terminals-popup-open;
+            }
             panel-shortcut(event) => { return panel-shortcut(event); }
+        }
+    }
+    // PUI-002b: boxed-item list popup, anchored above the chip
+    // (chat-input's own bottom-of-composer chip row). A sibling of
+    // `main-layout` (not inside it) -- same "positioned via explicit x/y,
+    // painted outside the managed layout" convention
+    // chat_input_layout.slint's own `/`/`@`/`#` mention popup already
+    // uses, and for the same reason: a managed layout forbids setting
+    // `y` directly on its children. Mirrors that popup's shell (bg-card,
+    // border, radius-md, drop-shadow, high z) rather than inventing new
+    // popup chrome. Each row reuses MentionPickRow (see its own doc
+    // comment on being the shared boxed-list-row primitive) -- status-dot
+    // carries `active`, action-label carries the kill action (same
+    // pattern as the MCP row's inline "Connect" action).
+    if root.terminals-popup-open : Rectangle {
+        x: parent.width - self.width - Metrics.pad-2xl;
+        // Anchored a fixed margin above the bottom edge (the composer
+        // bar's own total height varies with compose-box autosize/
+        // row2-compact, so an exact anchor to the chip's own screen
+        // position needs that position forwarded up from
+        // ChatInputLayout -- left for live-visual-iteration polish per
+        // this plan's own stated approach, not a blind first pass).
+        y: parent.height - self.height - 140px;
+        width: 260px;
+        height: terminals-popup-col.preferred-height;
+        z: 8000;
+        background: Theme.bg-card;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-md;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: #000000.with-alpha(0.45);
+        drop-shadow-offset-y: 2px;
+        clip: true;
+        terminals-popup-col := VerticalLayout {
+            padding: Metrics.pad-sm;
+            spacing: Metrics.space-1;
+            for term in root.terminals : MentionPickRow {
+                title: term.title != "" ? term.title : term.terminal-id;
+                subtitle: term.started-at != "" ? term.last-command + " · " + term.started-at : term.last-command;
+                status-dot: term.active ? "connected" : (term.exit-code == 0 ? "" : "error");
+                action-label: term.active ? "Kill" : "";
+                action-clicked => { root.terminal-kill-requested(term.terminal-id); }
+                clicked => {
+                    root.terminals-popup-open = false;
+                    root.expand-terminal(term.terminal-id);
+                }
+            }
+            if root.terminals.length == 0 : Text {
+                text: "No active terminals";
+                color: Theme.text-muted;
+                font-size: 10px * Theme.font-scale;
+                horizontal-alignment: center;
+                height: 28px;
+                vertical-alignment: center;
+            }
         }
     }
     restore-compose-focus => { chat-input.focus-compose(); }

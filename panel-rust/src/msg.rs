@@ -117,6 +117,11 @@ pub enum TerminalMsg {
     LocalToggle,
     LocalClose,
     LocalKeyInput(Vec<u8>),
+    /// PUI-002b: the terminals popup's `[x]` kill button, for an
+    /// agent-created (`terminal/create`d) terminal -- distinct from
+    /// `LocalClose` (the client-local PTY toggle above), which never
+    /// touches the gateway at all.
+    Kill(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,6 +235,7 @@ pub enum ChromeMsg {
         show_global: bool,
     },
     ToggleExpanded(usize),
+    CopyMessageRequested { text: String },
     ErrorBannerDismissed,
 }
 

@@ -3,6 +3,7 @@
 // they need without a circular dependency on the root window component.
 export struct ThreadItem {
     name: string,
+    relative-time: string,
     status: string, // "idle" | "loading" | "error"
     busy: bool,
     open: bool,
@@ -81,6 +82,11 @@ export struct MarkdownLine {
     indent: int,
     ordinal: int,
     code-block-id: int,
+    // Concatenation of every run's `text` in order -- lets `MarkdownView`
+    // overlay one real (invisible) `TextInput` per line for native
+    // click-drag selection/copy without re-deriving the joined string
+    // from `[MarkdownRun]` in Slint (no reduce/fold over dynamic arrays).
+    plain-text: string,
 }
 
 export struct MessageItem {
@@ -139,6 +145,18 @@ export struct MessageItem {
     // time its skill name appears in the thread (drives ToolEventRow's
     // bright accent). False for repeats and every non-skill kind.
     first-use: bool,
+    // Only meaningful on the *first* row of a contiguous tool-kind run
+    // (chat_area.slint's `is-first-tool-event`): the run's total length,
+    // computed once in Rust (`models::assign_tool_group_lengths`). Lets
+    // `ToolGroupView`'s "N calls" badge/default-expand and the group's
+    // member-visibility check do plain arithmetic (`sub-idx < i +
+    // tool-group-len`) instead of an unrolled/capped Slint scan -- Slint
+    // `pure function`s support neither loops nor recursion (confirmed by
+    // a `pure function` calling itself compiling to a "binding loop"
+    // error), so any such scan needs a hand-unrolled, arbitrarily-capped
+    // ladder of `if`s. 0 for every other row, including non-start members
+    // of the same run.
+    tool-group-len: int,
 }
 
 // One choice in a pending approval — ACP `PermissionOption` shape
@@ -178,16 +196,34 @@ export struct PendingRequestItem {
 
 // Terminal-view addition: one live agent-created terminal known to the
 // currently-displayed thread (`AgentBridge::active_terminal_ids` +
-// `terminal_buffer`, see `agent_bridge.rs`). Rendered as a bounded
-// max-height card docked above the compose bar (mirrors
-// `PendingRequestItem`'s docking convention) with click-to-expand into
-// a full-window floating overlay -- see `terminal_card.slint`.
+// `terminal_buffer`, see `agent_bridge.rs`). PUI-002b (background-
+// terminals-ui plan): opened from the terminals popup rather than always
+// docked -- see `terminal_card.slint`/`chat_area.slint`. `title`/`last-
+// command` both come from the one real `command` string a `terminal/
+// create` request carried (`TerminalBuffer::command`, populated by
+// `AgentEvent::TerminalCreated` -- see `agent_bridge.rs`); kept as two
+// fields (not one) because the popup list row shows a short `title` while
+// a detail view can show the fuller `last-command` (command + args)
+// without the popup needing to reformat one shared string differently
+// per call site. `active` mirrors `PendingRequestItem.active`'s own
+// naming (this struct's own `TerminalBuffer::active()` is the ground
+// source, never re-derived here).
 export struct TerminalItem {
     terminal-id: string,
     output: string,
     truncated: bool,
     has-exited: bool,
     exit-code: int,
+    // Display title for the terminal (the real `command` string from
+    // `TerminalBuffer::command`, populated by `AgentEvent::TerminalCreated`).
+    title: string,
+    // The command that spawned this terminal (command + args), when known.
+    last-command: string,
+    // Start time (RFC 3339), or "" for a terminal restored from a snapshot
+    // persisted before this field existed.
+    started-at: string,
+    // Whether the terminal's command is still running (not exited).
+    active: bool,
 }
 
 // Profile-picker addition: one profile row as returned by
@@ -328,6 +364,13 @@ export struct McpServerOption {
     // list renders no tool section (backend not yet supplying a tool
     // catalog -- always empty today).
     tools: [McpToolOption],
+    // False for built-in, session-injected servers the user cannot delete
+    // (PUI-015: the `snapshotd` daemon MCP, always injected into every
+    // session while the daemon is reachable -- it is not a user registry
+    // entry, so the Settings view hides its "Remove" action). True (the
+    // default for every acpx-registry row) means the user added it and may
+    // remove it.
+    removable: bool,
 }
 
 // Skill-manager sidebar/settings row -- `skill_discovery_backend` phase of

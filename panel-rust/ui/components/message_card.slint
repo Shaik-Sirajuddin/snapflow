@@ -26,10 +26,10 @@ export component MessageCard inherits Rectangle {
     // Agent: subtle Theme.bg-agent-bubble (not primary-container).
     background: is-thinking ? transparent
         : is-user ? Theme.bg-user-bubble
-        : is-tool-call ? Theme.bg-card
-        : is-agent ? Theme.bg-agent-bubble
+        : is-tool-call ? Theme.bg-agent-bubble
+        : is-agent ? Theme.bg-tertiary
         : Theme.bg-primary-container;
-    border-color: is-tool-call ? Theme.border-default : transparent;
+    border-color: is-tool-call ? Theme.border-strong : transparent;
     border-width: is-thinking ? 0px : is-tool-call ? 1px : 0px;
 
     border-top-left-radius: is-thinking ? 0px : Theme.radius-lg;
@@ -72,13 +72,19 @@ export component MessageCard inherits Rectangle {
             }
         }
 
+        // `interactive: false`: this Flickable is a layout boundary
+        // (height == viewport-height, nothing pans), not a scroller --
+        // see markdown_view.slint's overlay doc comment. Releasing its
+        // drag capture lets `body-text`'s native click-drag selection
+        // through.
         if !is-tool-call : Flickable {
+            interactive: false;
             height: body-text.preferred-height;
             viewport-height: body-text.preferred-height;
             horizontal-stretch: 1;
             preferred-width: 0px;
             min-width: 0px;
-            body-text := Text {
+            body-text := TextInput {
                 text: item.text;
                 font-italic: is-thinking;
                 font-family: Theme.font-sans;
@@ -86,11 +92,13 @@ export component MessageCard inherits Rectangle {
                 color: is-user ? Theme.text-user-bubble
                     : is-thinking ? Theme.text-muted
                     : Theme.text-primary;
+                read-only: true;
                 wrap: word-wrap;
-                overflow: elide;
                 horizontal-alignment: left;
                 vertical-alignment: top;
                 width: parent.width;
+                selection-foreground-color: Theme.text-primary;
+                selection-background-color: Theme.selection-bg;
             }
         }
 

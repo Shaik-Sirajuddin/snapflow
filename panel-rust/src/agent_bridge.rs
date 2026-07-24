@@ -67,7 +67,7 @@ use crate::jsonl_store::{
 };
 use crate::protocol_types::{
     AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
-    TerminalOutputEvent,
+    TerminalCreatedEvent, TerminalOutputEvent,
 };
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -238,6 +238,16 @@ struct ThreadSlot {
     /// move an existing session to a new cwd. `None` when no project was
     /// active at creation time (the pre-`active_project_binding` default).
     project_path: Option<PathBuf>,
+    /// PUI-014: `true` for a slot created up front (so it holds its positional
+    /// index in `slots`, preserving the `model.threads[i] <-> slots[i]`
+    /// parallel-array invariant) but whose ACP session attach is deliberately
+    /// DEFERRED until the thread's first message is sent -- keeping the
+    /// provider/profile editable until then. A deferred slot has no
+    /// `spawn_background_attachment` running and no `acp_session_id`;
+    /// [`AgentBridge::attach_deferred_thread`] replaces it in place with a
+    /// freshly-built, eagerly-attached slot bound to the then-current
+    /// provider. `false` for every eagerly-attached or recovered slot.
+    deferred: bool,
 }
 
 #[derive(Default)]
@@ -247,12 +257,39 @@ struct AttachmentState {
 }
 
 /// One terminal's current known state, as last observed via
-/// `AgentEvent::TerminalOutput`. See [`ThreadSlot::terminal_buffers`].
+/// `AgentEvent::TerminalOutput`/`AgentEvent::TerminalCreated`. See
+/// [`ThreadSlot::terminal_buffers`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalBuffer {
     pub output: String,
     pub truncated: bool,
     pub exit_status: Option<(Option<i32>, Option<i32>)>,
+    // PUI-002b (background-terminals-ui plan): populated from the one-shot
+    // `AgentEvent::TerminalCreated` event, which arrives (if at all) before
+    // or interleaved with the first `TerminalOutput` for the same id --
+    // never re-derived from `output` or guessed. `#[serde(default)]` so a
+    // JSONL runtime snapshot persisted before this field existed still
+    // deserializes (older rows just show an empty command/title until the
+    // agent creates a fresh terminal).
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// RFC 3339; empty if `TerminalCreated` was never observed for this id
+    /// (e.g. this buffer was populated by output arriving from a snapshot
+    /// restored before this field existed).
+    #[serde(default)]
+    pub started_at: String,
+}
+
+impl TerminalBuffer {
+    /// `active` is derived, never stored: "still running" is exactly
+    /// "no exit status observed yet" -- keeping a separate stored bool
+    /// in sync with `exit_status` would just be a second source of
+    /// truth that could drift.
+    pub fn active(&self) -> bool {
+        self.exit_status.is_none()
+    }
 }
 
 /// Owns the background runtime, the per-thread agent connections, the
@@ -357,28 +394,81 @@ fn refresh_transcript(slot: &ThreadSlot) {
 const MAX_RETAINED_TERMINALS_PER_THREAD: usize = 8;
 
 fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
-    let is_new = !slot
+    let mut buffers = slot
         .terminal_buffers
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&ev.terminal_id);
+        .unwrap_or_else(|e| e.into_inner());
+    let is_new = !buffers.contains_key(&ev.terminal_id);
     if is_new {
         slot.terminal_order
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(ev.terminal_id.clone());
     }
-    slot.terminal_buffers
+    // Preserve command/args/started_at (set by `store_terminal_created`,
+    // see its doc comment) across every output update -- this event's own
+    // "replace, don't append" contract is about `output`/`truncated`/
+    // `exit_status` only; TerminalOutputEvent carries no creation metadata
+    // at all, so overwriting the whole struct would silently erase it the
+    // moment output arrives after creation.
+    let (command, args, started_at) = buffers
+        .get(&ev.terminal_id)
+        .map(|existing| {
+            (
+                existing.command.clone(),
+                existing.args.clone(),
+                existing.started_at.clone(),
+            )
+        })
+        .unwrap_or_default();
+    buffers.insert(
+        ev.terminal_id.clone(),
+        TerminalBuffer {
+            output: ev.output.clone(),
+            truncated: ev.truncated,
+            exit_status: ev.exit_status,
+            command,
+            args,
+            started_at,
+        },
+    );
+    drop(buffers);
+    evict_exited_terminals_over_cap(slot);
+}
+
+/// One-shot handler for `AgentEvent::TerminalCreated` -- sets
+/// command/args/started_at on the (possibly not-yet-existing) buffer for
+/// this terminal id, without touching output/truncated/exit_status. Order
+/// with `store_terminal_output` is not assumed either way: whichever
+/// arrives first creates the entry, the other fills in its own fields on
+/// top, same "operate on whatever's there" shape as the rest of this
+/// file's per-terminal bookkeeping.
+fn store_terminal_created(slot: &ThreadSlot, ev: &TerminalCreatedEvent) {
+    let mut buffers = slot
+        .terminal_buffers
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            ev.terminal_id.clone(),
-            TerminalBuffer {
-                output: ev.output.clone(),
-                truncated: ev.truncated,
-                exit_status: ev.exit_status,
-            },
-        );
+        .unwrap_or_else(|e| e.into_inner());
+    let is_new = !buffers.contains_key(&ev.terminal_id);
+    if is_new {
+        slot.terminal_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ev.terminal_id.clone());
+    }
+    let entry = buffers
+        .entry(ev.terminal_id.clone())
+        .or_insert_with(|| TerminalBuffer {
+            output: String::new(),
+            truncated: false,
+            exit_status: None,
+            command: String::new(),
+            args: Vec::new(),
+            started_at: String::new(),
+        });
+    entry.command = ev.command.clone();
+    entry.args = ev.args.clone();
+    entry.started_at = ev.started_at.clone();
+    drop(buffers);
     evict_exited_terminals_over_cap(slot);
 }
 
@@ -495,6 +585,9 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
                         output: buffer.output.clone(),
                         truncated: buffer.truncated,
                         exit_status: buffer.exit_status,
+                        command: buffer.command.clone(),
+                        args: buffer.args.clone(),
+                        started_at: buffer.started_at.clone(),
                     })
             })
             .collect(),
@@ -778,21 +871,34 @@ fn snapflowd_mcp_servers_entry(
     project_path: Option<&std::path::Path>,
     provider: &str,
 ) -> Vec<serde_json::Value> {
-    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-    let mut args = vec![
-        "--global-dir".to_string(),
-        global_dir.to_string_lossy().into_owned(),
-    ];
-    if let Some(project_path) = project_path.and_then(|p| p.parent()) {
-        args.push("--project-dir".to_string());
-        args.push(project_path.to_string_lossy().into_owned());
+    let mut entries = Vec::new();
+    // Whether MCP-free, filesystem-only skill delivery is safe for
+    // `provider` (an ACP registry agent id or its short-form alias, see
+    // `normalize_provider`'s own TRANSITIONAL doc comment) now lives in
+    // skills_manager::agent_registry (memory/acpx/gen/plans/acpx-skills/
+    // README.md#agent-skill-convention-registry) -- true only for
+    // vendor_ids a live test actually proved, currently just "codex"/
+    // "codex-acp" (panel-rust/tests/skills_manager_live_discovery_e2e_test.rs,
+    // 4/4 real passes against a real codex-acp backend). "claude" stays on
+    // MCP delivery -- per design_decisions.mcp_removal_gated_not_assumed,
+    // MCP is only removed per-vendor_id once actually verified live.
+    if !crate::skills_manager_adapter::is_live_verified(provider) {
+        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        let mut args = vec![
+            "--global-dir".to_string(),
+            global_dir.to_string_lossy().into_owned(),
+        ];
+        if let Some(project_path) = project_path.and_then(|p| p.parent()) {
+            args.push("--project-dir".to_string());
+            args.push(project_path.to_string_lossy().into_owned());
+        }
+        entries.push(serde_json::json!({
+            "name": "skills",
+            "command": resolve_snapflowd_mcp_bin().to_string_lossy(),
+            "args": args,
+            "env": [],
+        }));
     }
-    let mut entries = vec![serde_json::json!({
-        "name": "skills",
-        "command": resolve_snapflowd_mcp_bin().to_string_lossy(),
-        "args": args,
-        "env": [],
-    })];
     entries.extend(snapshotd_mcp_server_entry(provider));
     entries
 }
@@ -829,11 +935,41 @@ fn snapflowd_mcp_servers_entry(
 /// false}`, consistent with it requiring the Streamable HTTP shape, not
 /// tolerating the classic SSE one as the previous doc comment's
 /// (unverified) claim asserted.
+/// Last known reachability of the snapshotd daemon MCP, cached from the
+/// most recent `snapshotd_mcp_server_entry` probe. PUI-015: the Settings
+/// MCP list (sync.rs) reads this via [`snapshotd_reachable`] to decide
+/// whether to surface the built-in, non-removable `snapshotd` daemon row --
+/// a plain atomic load, safe to call on the UI thread, never the blocking
+/// TCP probe itself. `false` until the first session-creation probe runs,
+/// so the built-in row stays hidden rather than advertising a daemon that
+/// may not be running -- the same ground-truth signal that gates the actual
+/// session injection also gates the Settings row (one source, not a UI
+/// heuristic).
+static SNAPSHOTD_REACHABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Non-blocking read of the cached snapshotd-daemon reachability (see
+/// [`SNAPSHOTD_REACHABLE`]). UI-thread safe.
+pub fn snapshotd_reachable() -> bool {
+    SNAPSHOTD_REACHABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The address the snapshotd daemon MCP is expected on -- shared by the
+/// session-injection entry below and the Settings built-in row (models.rs),
+/// so both name the exact same endpoint (ground-origin, PUI-015).
+pub fn snapshotd_mcp_addr() -> String {
+    std::env::var("SNAPSHOTD_MCP_SSE_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string())
+}
+
 fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
     let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
-    let addr =
-        std::env::var("SNAPSHOTD_MCP_SSE_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string());
-    if !probe_http_endpoint(&addr, "/sse") {
+    let addr = snapshotd_mcp_addr();
+    let reachable = probe_http_endpoint(&addr, "/sse");
+    // Cache the probe result so the Settings MCP list can surface the
+    // built-in daemon row without re-running this blocking probe on the UI
+    // thread (PUI-015).
+    SNAPSHOTD_REACHABLE.store(reachable, std::sync::atomic::Ordering::Relaxed);
+    if !reachable {
         return Vec::new();
     }
     vec![serde_json::json!({
@@ -1879,6 +2015,10 @@ fn spawn_event_forwarder(
                     store_terminal_output(&slot_for_task, term_ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
+                AgentEvent::TerminalCreated(created_ev) => {
+                    store_terminal_created(&slot_for_task, created_ev);
+                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                }
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
                 | AgentEvent::ConfigOptions(_)
@@ -1928,6 +2068,53 @@ fn spawn_background_attachment(
             .as_deref(),
         &slot.provider,
     );
+
+    // Reactive-sync trigger (2) (memory/acpx/gen/plans/acpx-skills/
+    // README.md#reactive-sync): before/at session setup, make sure this
+    // agent's skills are actually propagated to its native skill
+    // directory, catching up anything registered while no session was
+    // open. `None` project_root here means global scope, deliberately
+    // NOT cwd_for_session's current-dir fallback -- an unset session cwd
+    // override should sync global skills only, not whatever directory the
+    // panel-rust process happens to be running from.
+    //
+    // For vendor_ids skills_manager::agent_registry::is_live_verified()
+    // covers -- MCP is no longer sent for them at all (below), so this
+    // sync is the *only* delivery path left. It must complete before
+    // session/new fires, so it runs BLOCKING right here (fast local
+    // sqlite+symlink work, not a network call) rather than on a
+    // fire-and-forget background thread. For every other vendor_id, MCP
+    // remains the real delivery path regardless of this sync's timing, so
+    // it stays a best-effort background thread as before.
+    let vendor_id_for_sync = slot.provider.clone();
+    let project_root_for_sync = session_cwd_override
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if crate::skills_manager_adapter::is_live_verified(&vendor_id_for_sync) {
+        if let Err(error) = crate::skills_manager_adapter::sync_agent_targets(
+            &vendor_id_for_sync,
+            project_root_for_sync.as_deref(),
+        ) {
+            eprintln!(
+                "panel-rust: skills-manager thread-start reactive sync failed for {vendor_id_for_sync} \
+                 (blocking, filesystem-only delivery for this vendor -- session is opening WITHOUT \
+                 skills if this failed): {error}"
+            );
+        }
+    } else {
+        std::thread::spawn(move || {
+            if let Err(error) = crate::skills_manager_adapter::sync_agent_targets(
+                &vendor_id_for_sync,
+                project_root_for_sync.as_deref(),
+            ) {
+                eprintln!(
+                    "panel-rust: skills-manager thread-start reactive sync failed for {vendor_id_for_sync}: {error}"
+                );
+            }
+        });
+    }
+
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
         let cwd = cwd_for_session(&session_cwd_override);
@@ -2255,6 +2442,9 @@ impl AgentBridge {
                                     output: terminal.output.clone(),
                                     truncated: terminal.truncated,
                                     exit_status: terminal.exit_status,
+                                    command: terminal.command.clone(),
+                                    args: terminal.args.clone(),
+                                    started_at: terminal.started_at.clone(),
                                 },
                             )
                         })
@@ -2277,6 +2467,7 @@ impl AgentBridge {
                 // No project can be active yet at construction time --
                 // `session_cwd_override` was just created above, unset.
                 project_path: None,
+                deferred: false,
             });
             slots.push(slot.clone());
 
@@ -2365,66 +2556,39 @@ impl AgentBridge {
     /// Creates a thread using a configured provider when the caller has a
     /// compatible default-agent preference; otherwise preserves the normal
     /// stable provider rotation.
-    pub fn add_thread_with_profile_and_provider(
+    /// PUI-014: shared slot construction for the eager
+    /// ([`Self::add_thread_with_profile_and_provider`]), deferred
+    /// ([`Self::add_thread_deferred`]), and attach-on-first-send
+    /// ([`Self::attach_deferred_thread`]) paths. Builds -- but does NOT push or
+    /// attach -- a `ThreadSlot` for `thread_id`/`provider`, wiring its gateway
+    /// through the same delayed-setter the constructor uses (so building never
+    /// blocks on the gateway). Returns the slot plus everything
+    /// [`spawn_background_attachment`] needs, letting the caller decide whether
+    /// to attach now or defer. `deferred` only sets the slot's flag.
+    #[allow(clippy::type_complexity)]
+    fn build_slot(
         &mut self,
-        name: &str,
-        profile: Option<&str>,
-        preferred_provider: Option<&str>,
-    ) -> Result<usize, BridgeError> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(BridgeError::Gateway("thread name cannot be empty".into()));
-        }
-        let thread_id = slug(name);
-        if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
-            return Err(BridgeError::Gateway(format!(
-                "thread already exists: {name}"
-            )));
-        }
-
-        let idx = self.slots.len();
-        // `thread_provider_model_binding_fix`: a requested provider is
-        // NEVER silently dropped. Any non-empty request normalizes to
-        // one of the two real gateway keys (see `normalize_provider`);
-        // if that gateway genuinely isn't provisioned the caller gets a
-        // real error instead of a thread quietly bound to the rotation's
-        // pick -- the exact "selected claude-acp, codex-acp underneath"
-        // failure reported live on the VNC demo.
-        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
-            Some(requested) => {
-                let normalized = normalize_provider(requested);
-                if !self.gateway_urls.contains_key(normalized) {
-                    return Err(BridgeError::Gateway(format!(
-                        "requested provider {requested:?} (normalized {normalized:?}) has no \
-                         provisioned gateway; refusing to silently bind another provider"
-                    )));
-                }
-                normalized
-            }
-            None => provider_for_index(idx),
-        };
+        thread_id: &str,
+        provider: &str,
+        deferred: bool,
+    ) -> Result<
+        (
+            Arc<ThreadSlot>,
+            Arc<AcpxThreadHandle>,
+            tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+            Option<String>,
+            bool,
+        ),
+        BridgeError,
+    > {
         let base_url =
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
         let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-            seed_thread_from_cache(self.store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
+            seed_thread_from_cache(self.store.as_ref(), thread_id, HISTORY_PAGE_SIZE);
         let has_cached_transcript = !seeded.is_empty();
 
-        // `thread_new_loading_state` phase: `session/new`/`session/resume`
-        // is a real network round trip that must never block the calling
-        // (single-threaded Slint UI) thread -- this used to `self.runtime.
-        // block_on` it inline, which froze the whole UI for the call's
-        // duration. Mirrors the constructor's own async-attachment pattern
-        // instead: hand the gateway over through the same delayed-setter
-        // `spawn_acpx_thread_with_delayed_gateway` uses (so creating the
-        // handle itself never waits on the gateway either), then delegate
-        // the actual session resolution to `spawn_background_attachment`
-        // (the exact function the constructor's own per-thread loop already
-        // uses for this), which sets `attachment`/notifies waiters and
-        // persists the thread record once the session id is known; the
-        // frame input collector observes that binding and the reducer
-        // emits the persistence effect.
         let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
             spawn_acpx_thread_with_delayed_gateway()
@@ -2470,18 +2634,18 @@ impl AgentBridge {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let slot = Arc::new(ThreadSlot {
-            thread_id: thread_id.clone(),
+            thread_id: thread_id.to_string(),
             provider: provider.to_string(),
             handle: handle.clone(),
             transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
-                &thread_id, &seeded,
+                thread_id, &seeded,
             )),
             history: Mutex::new(seeded),
             acp_session_id: Mutex::new(None),
             older_available: Mutex::new(older_available),
             oldest_loaded_index: Mutex::new(oldest_loaded_index),
             pending_requests: Mutex::new(runtime_snapshot.pending_requests),
-                usage: Mutex::new((0, 0)),
+            usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(
                 runtime_snapshot
                     .terminals
@@ -2493,6 +2657,9 @@ impl AgentBridge {
                                 output: terminal.output.clone(),
                                 truncated: terminal.truncated,
                                 exit_status: terminal.exit_status,
+                                command: terminal.command.clone(),
+                                args: terminal.args.clone(),
+                                started_at: terminal.started_at.clone(),
                             },
                         )
                     })
@@ -2513,7 +2680,151 @@ impl AgentBridge {
             closed: Mutex::new(false),
             archived: Mutex::new(runtime_snapshot.archived),
             project_path: project_path_for_slot,
+            deferred,
         });
+        Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
+    }
+
+    /// PUI-014: normalize a caller-requested provider to a provisioned gateway
+    /// key, or fall back to the rotation pick for `idx`. Shared by the eager,
+    /// deferred, and attach paths so a requested provider is never silently
+    /// dropped (see `thread_provider_model_binding_fix`).
+    fn resolve_provider_for<'a>(
+        &self,
+        idx: usize,
+        preferred_provider: Option<&'a str>,
+    ) -> Result<&'a str, BridgeError>
+    where
+        Self: 'a,
+    {
+        match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => {
+                let normalized = normalize_provider(requested);
+                if !self.gateway_urls.contains_key(normalized) {
+                    return Err(BridgeError::Gateway(format!(
+                        "requested provider {requested:?} (normalized {normalized:?}) has no \
+                         provisioned gateway; refusing to silently bind another provider"
+                    )));
+                }
+                Ok(normalized)
+            }
+            None => Ok(provider_for_index(idx)),
+        }
+    }
+
+    /// PUI-014: create thread `name` as a DEFERRED placeholder -- it claims its
+    /// positional slot index (preserving the `model.threads[i] <-> slots[i]`
+    /// parallel-array invariant) but opens NO ACP session yet, so the
+    /// provider/profile stay editable until the first message triggers
+    /// [`Self::attach_deferred_thread`]. Same name/dedup/provider-resolution
+    /// rules as the eager path.
+    pub fn add_thread_deferred(
+        &mut self,
+        name: &str,
+        preferred_provider: Option<&str>,
+    ) -> Result<usize, BridgeError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(BridgeError::Gateway("thread name cannot be empty".into()));
+        }
+        let thread_id = slug(name);
+        if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
+            return Err(BridgeError::Gateway(format!(
+                "thread already exists: {name}"
+            )));
+        }
+        let idx = self.slots.len();
+        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let (slot, _handle, _events_rx, _cached_session_id, _has_cached_transcript) =
+            self.build_slot(&thread_id, provider, true)?;
+        self.slots.push(slot);
+        Ok(idx)
+    }
+
+    /// PUI-014: attach a previously-deferred thread on its first message send,
+    /// binding it to `preferred_provider`/`profile` as they stand NOW (which
+    /// may differ from the creation-time hint if the user changed the picker
+    /// while the thread was still empty). Rebuilds the slot in place for the
+    /// current provider -- preserving its index and the parallel-array
+    /// invariant -- then starts the real background attach. Idempotent: a
+    /// no-op `Ok(())` if `idx` is already attached (not deferred), so a racing
+    /// second send cannot double-attach.
+    pub fn attach_deferred_thread(
+        &mut self,
+        idx: usize,
+        preferred_provider: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<(), BridgeError> {
+        let Some(existing) = self.slots.get(idx) else {
+            return Err(BridgeError::Gateway(format!(
+                "no thread slot at index {idx}"
+            )));
+        };
+        if !existing.deferred {
+            return Ok(());
+        }
+        let thread_id = existing.thread_id.clone();
+        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
+            self.build_slot(&thread_id, provider, false)?;
+        self.slots[idx] = slot.clone();
+        spawn_background_attachment(
+            &self.runtime,
+            slot,
+            handle,
+            events_rx,
+            self.events.clone(),
+            self.store.clone(),
+            idx,
+            cached_session_id,
+            has_cached_transcript,
+            profile.map(str::to_string),
+            Arc::new(tokio::sync::Mutex::new(())),
+            self.session_cwd_override.clone(),
+        );
+        Ok(())
+    }
+
+    pub fn add_thread_with_profile_and_provider(
+        &mut self,
+        name: &str,
+        profile: Option<&str>,
+        preferred_provider: Option<&str>,
+    ) -> Result<usize, BridgeError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(BridgeError::Gateway("thread name cannot be empty".into()));
+        }
+        let thread_id = slug(name);
+        if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
+            return Err(BridgeError::Gateway(format!(
+                "thread already exists: {name}"
+            )));
+        }
+
+        let idx = self.slots.len();
+        // `thread_provider_model_binding_fix`: a requested provider is
+        // NEVER silently dropped. Any non-empty request normalizes to
+        // one of the two real gateway keys (see `normalize_provider`);
+        // if that gateway genuinely isn't provisioned the caller gets a
+        // real error instead of a thread quietly bound to the rotation's
+        // pick -- the exact "selected claude-acp, codex-acp underneath"
+        // failure reported live on the VNC demo.
+        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => {
+                let normalized = normalize_provider(requested);
+                if !self.gateway_urls.contains_key(normalized) {
+                    return Err(BridgeError::Gateway(format!(
+                        "requested provider {requested:?} (normalized {normalized:?}) has no \
+                         provisioned gateway; refusing to silently bind another provider"
+                    )));
+                }
+                normalized
+            }
+            None => provider_for_index(idx),
+        };
+        let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
+            self.build_slot(&thread_id, provider, false)?;
         self.slots.push(slot.clone());
 
         spawn_background_attachment(
@@ -2679,6 +2990,7 @@ impl AgentBridge {
             closed: Mutex::new(false),
             archived: Mutex::new(false),
             project_path: project_path_for_slot,
+            deferred: false,
         });
 
         let cwd = cwd_for_session(&self.session_cwd_override);
@@ -2811,6 +3123,16 @@ impl AgentBridge {
     /// because a preceding thread was deleted.
     pub fn thread_provider(&self, idx: usize) -> Option<String> {
         self.slots.get(idx).map(|slot| slot.provider.clone())
+    }
+
+    /// PUI-014: whether thread `idx`'s slot is a deferred placeholder whose
+    /// session attach has not been started yet (provider still editable, first
+    /// message not yet sent). `false` for a missing slot or any eagerly
+    /// attached / recovered one. Drives the compose provider-picker gate (kept
+    /// interactive while deferred) and the loading-vs-idle row heuristic (a
+    /// deferred slot is idle-ready, not "attach in flight").
+    pub fn is_deferred(&self, idx: usize) -> bool {
+        self.slots.get(idx).is_some_and(|slot| slot.deferred)
     }
 
     /// `thread_item_project_context` phase: the project directory this
@@ -3624,6 +3946,42 @@ impl AgentBridge {
         });
     }
 
+    /// Dispatches `terminal/kill` on the background runtime -- PUI-002b's
+    /// popup `[x]` kill button. Same fire-and-forget shape as
+    /// [`Self::set_mode`]: never `runtime.block_on` on the caller's
+    /// thread (the Settings>Agents freeze this project's own
+    /// `panel-new-thread-blocking-catalog` diagnosed was exactly that
+    /// mistake), a failure surfaces as a queued `AgentEvent::Error`.
+    pub fn kill_terminal(&self, idx: usize, terminal_id: String) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let slot = slot.clone();
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = wait_for_attachment(&slot).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("session attachment failed: {error}")),
+                    });
+                return;
+            }
+            if let Err(e) = handle.kill_terminal(terminal_id).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("terminal/kill failed: {e}")),
+                    });
+            }
+        });
+    }
+
     /// Dispatches `session/set_config_option` on the background
     /// runtime. Unlike [`Self::set_mode`], a successful call's own
     /// response carries the full updated `configOptions[]` -- the actor
@@ -3736,6 +4094,9 @@ mod tests {
             output: "done".to_owned(),
             truncated: false,
             exit_status: Some((Some(0), None)),
+            command: "cargo test".to_owned(),
+            args: Vec::new(),
+            started_at: "2026-07-24T00:00:00.000000000Z".to_owned(),
         }
     }
 
@@ -3744,6 +4105,9 @@ mod tests {
             output: "still going".to_owned(),
             truncated: false,
             exit_status: None,
+            command: "cargo build".to_owned(),
+            args: Vec::new(),
+            started_at: "2026-07-24T00:00:00.000000000Z".to_owned(),
         }
     }
 
@@ -5310,6 +5674,9 @@ mod tests {
                         output: "restored output\n".into(),
                         truncated: true,
                         exit_status: Some((Some(9), None)),
+                        command: "echo".into(),
+                        args: Vec::new(),
+                        started_at: "2026-07-24T00:00:00.000000000Z".into(),
                     }],
                     session_modes: Some(SessionModesEvent {
                         current_mode_id: "ask".into(),
@@ -7113,14 +7480,21 @@ done
     /// inspecting its own startup log -- making real round-trip tests here
     /// flaky on network latency, unrelated to this logic itself).
     #[test]
-    fn snapflowd_mcp_servers_entry_always_includes_the_skills_server() {
+    fn snapflowd_mcp_servers_entry_includes_the_skills_server_for_mcp_backed_providers() {
+        // "claude" stays MCP-backed (skills_manager::agent_registry::
+        // is_live_verified only covers "codex"/"codex-acp") -- was
+        // "codex" before phase 8's MCP removal for
+        // codex specifically; this test's actual point (the "skills"
+        // entry's shape) is unaffected by which still-MCP-backed provider
+        // exercises it.
+        //
         // Not asserting entries.len() == 1: a real snapshotd daemon
         // happening to run on the test host makes snapshotd_mcp_server_
         // entry's liveness probe legitimately append a second "snapshotd"
         // entry (see that function's own doc comment) regardless of
-        // provider -- this test only cares that "skills" is always
-        // present, first, and correctly shaped.
-        let entries = snapflowd_mcp_servers_entry(None, "codex");
+        // provider -- this test only cares that "skills" is present,
+        // first, and correctly shaped, for a provider still on MCP.
+        let entries = snapflowd_mcp_servers_entry(None, "claude");
         assert!(!entries.is_empty());
         assert_eq!(entries[0]["name"], "skills");
         assert!(entries[0]["command"]
@@ -7147,7 +7521,7 @@ done
     /// silently dropped by every real codex-acp session.
     #[test]
     fn snapflowd_mcp_servers_entry_skills_server_includes_the_required_env_field() {
-        let entries = snapflowd_mcp_servers_entry(None, "codex");
+        let entries = snapflowd_mcp_servers_entry(None, "claude");
         assert_eq!(entries[0]["name"], "skills");
         assert!(
             entries[0]["env"].is_array(),
@@ -7160,7 +7534,7 @@ done
     #[test]
     fn snapflowd_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
         let project_file = std::path::Path::new("/tmp/my-project/timeline.mlt");
-        let entries = snapflowd_mcp_servers_entry(Some(project_file), "codex");
+        let entries = snapflowd_mcp_servers_entry(Some(project_file), "claude");
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()
@@ -7171,6 +7545,27 @@ done
             serde_json::Value::String("/tmp/my-project".to_string()),
             "--project-dir must be the project FILE's parent directory, not the file itself"
         );
+    }
+
+    /// Phase 8 of memory/acpx/gen/plans/acpx-skills/meta.json: MCP skill
+    /// delivery is removed ONLY for vendor_ids a live test actually
+    /// proved deliver skills via native filesystem discovery with no MCP
+    /// present -- panel-rust/tests/skills_manager_live_discovery_e2e_test.rs
+    /// ran 4/4 real passes against a real codex-acp backend. "codex" and
+    /// "codex-acp" (both forms `slot.provider` can currently take, see
+    /// `normalize_provider`) must therefore get NO "skills" MCP entry at
+    /// all -- snapshotd's entry (if a live daemon answers) is unaffected,
+    /// this is skills-specific.
+    #[test]
+    fn snapflowd_mcp_servers_entry_omits_the_skills_server_for_live_verified_filesystem_providers() {
+        for provider in ["codex", "codex-acp"] {
+            let entries = snapflowd_mcp_servers_entry(None, provider);
+            assert!(
+                entries.iter().all(|e| e["name"] != "skills"),
+                "provider {provider:?} passed the live filesystem-discovery gate (phase 7) -- \
+                 it must not still be sent the \"skills\" MCP entry, entries: {entries:?}"
+            );
+        }
     }
 
     /// `"type": "http"` was confirmed live to work with both real

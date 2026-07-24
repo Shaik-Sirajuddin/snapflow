@@ -36,12 +36,16 @@ impl std::fmt::Display for EffectError {
 pub enum Effect {
     /// Phase 0: cold-start hydration from `PanelStateStore`.
     LoadInitialState,
-    NewThread {
+    /// PUI-014: create a new thread as a DEFERRED placeholder -- claims its
+    /// positional slot index but opens no ACP session yet, so the provider
+    /// stays editable until the first message triggers the attach (imperatively,
+    /// in the `&mut` send dispatch). Carries only what
+    /// `AgentBridge::add_thread_deferred` needs; profile/permission are read
+    /// from the model thread at attach time.
+    NewThreadDeferred {
         real_index: usize,
         display_name: String,
         provider: String,
-        profile_name: Option<String>,
-        permission_profile: Option<String>,
     },
     CloseThread {
         real_index: usize,
@@ -99,6 +103,13 @@ pub enum Effect {
     LocalTerminalKill,
     LocalTerminalWrite {
         bytes: Vec<u8>,
+    },
+    /// PUI-002b: `terminal/kill` for an agent-created terminal, via
+    /// `AgentBridge::kill_terminal`. Distinct from `LocalTerminalKill`
+    /// (the client-local PTY, no gateway call).
+    KillAgentTerminal {
+        real_index: usize,
+        terminal_id: String,
     },
     SaveSettings {
         input: crate::msg::SettingsSaveInput,
@@ -218,6 +229,13 @@ pub enum EffectResultMsg {
     ExternalEditorOpened(Result<(), EffectError>),
     OsDefaultOpened(Result<(), EffectError>),
     SkillEditorLoaded(Result<crate::model::SkillEditorState, EffectError>),
+    /// One of the 6 reactive-sync trigger call sites (create/promote/
+    /// edit/agent-enable/agent-disable/thread-start) failed to propagate
+    /// a skill to an attached agent -- see memory/acpx/gen/plans/
+    /// acpx-skills/README.md's "reactive-sync failures are invisible to
+    /// the user" gap. Sent alongside (not instead of) the existing
+    /// eprintln! at each call site; best-effort, not retried.
+    SkillReactiveSyncFailed { operation: String, detail: String },
     /// A streamed token/chunk arriving mid-generation -- not a
     /// completion. See 00-plan.md's stale-target no-op contract: if
     /// `thread_id` no longer exists in `Model`, `update()` must no-op.

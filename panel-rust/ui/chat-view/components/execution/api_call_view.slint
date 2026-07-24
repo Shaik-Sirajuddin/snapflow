@@ -20,18 +20,27 @@ export component ApiCallView inherits VerticalLayout {
     in property <string> raw-input;
     in property <string> raw-output;
 
-    spacing: Metrics.space-2;
+    spacing: Metrics.space-3;
     padding: Metrics.space-2;
 
     if raw-input != "" : VerticalLayout {
-        spacing: Metrics.space-1;
-        Text {
-            text: "INPUT";
-            font-family: Theme.font-mono;
-            font-size: 9px * Theme.font-scale;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-            color: Theme.text-muted;
+        spacing: Metrics.space-2;
+        HorizontalLayout {
+            spacing: Metrics.space-2;
+            Rectangle {
+                width: 3px;
+                height: 12px;
+                background: Theme.text-primary;
+                border-radius: 1px;
+            }
+            Text {
+                text: "INPUT PAYLOAD";
+                font-family: Theme.font-mono;
+                font-size: 10px * Theme.font-scale;
+                font-weight: 600;
+                letter-spacing: 0.8px;
+                color: Theme.text-primary;
+            }
         }
         TerminalLogBlock {
             text: root.raw-input;
@@ -39,14 +48,23 @@ export component ApiCallView inherits VerticalLayout {
     }
 
     if raw-output != "" : VerticalLayout {
-        spacing: Metrics.space-1;
-        Text {
-            text: "OUTPUT";
-            font-family: Theme.font-mono;
-            font-size: 9px * Theme.font-scale;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-            color: Theme.text-muted;
+        spacing: Metrics.space-2;
+        HorizontalLayout {
+            spacing: Metrics.space-2;
+            Rectangle {
+                width: 3px;
+                height: 12px;
+                background: Theme.text-primary;
+                border-radius: 1px;
+            }
+            Text {
+                text: "OUTPUT RESPONSE";
+                font-family: Theme.font-mono;
+                font-size: 10px * Theme.font-scale;
+                font-weight: 600;
+                letter-spacing: 0.8px;
+                color: Theme.text-primary;
+            }
         }
         TerminalLogBlock {
             text: root.raw-output;
@@ -56,8 +74,8 @@ export component ApiCallView inherits VerticalLayout {
     if raw-input == "" && raw-output == "" : Text {
         text: "No structured payload available for this call.";
         font-family: Theme.font-sans;
-        font-size: 10px * Theme.font-scale;
+        font-size: 11px * Theme.font-scale;
         font-italic: true;
-        color: Theme.text-muted;
+        color: Theme.text-secondary;
     }
 }

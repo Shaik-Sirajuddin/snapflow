@@ -412,12 +412,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                     row.profile_name = thread.profile_name.clone().unwrap_or_default().into();
                     row.has_session = thread.session_id.is_some();
                 }
+                // PUI-014: a DEFERRED slot (created but intentionally not yet
+                // attached -- provider still editable, no message sent) is idle
+                // and ready for input, NOT an attach-in-flight. Only show the
+                // "Starting new thread..." loading state for a slot whose attach
+                // has actually begun (eager/recovered) but not yet bound.
                 if !row.closed
-                    && self
-                        .panel
-                        .bridge
-                        .as_ref()
-                        .is_some_and(|bridge| bridge.thread_binding(item.real_index).is_none())
+                    && self.panel.bridge.as_ref().is_some_and(|bridge| {
+                        bridge.thread_binding(item.real_index).is_none()
+                            && !bridge.is_deferred(item.real_index)
+                    })
                 {
                     row.status = "loading".into();
                     row.busy = true;
@@ -507,19 +511,14 @@ impl<'a> ExternalSnapshotSource<'a> {
             .map(|id| (id.clone(), bridge.terminal_buffer(real_idx, id)))
             .collect();
         let expanded_id = self.panel.model.borrow().expanded_terminal_id.clone();
+        // Reuses `models::to_terminal_item_rows` (single-element vec)
+        // rather than duplicating its field-population logic here --
+        // this is the same TerminalItem shape the popup/chip's terminals
+        // list uses (see `terminals` a few lines up), just narrowed to
+        // one id (PUI-002c's expanded full-view source).
         let expanded_terminal = expanded_id.and_then(|id| {
-            bridge
-                .terminal_buffer(real_idx, &id)
-                .map(|buffer| crate::TerminalItem {
-                    terminal_id: id.into(),
-                    output: buffer.output.into(),
-                    truncated: buffer.truncated,
-                    has_exited: buffer.exit_status.is_some(),
-                    exit_code: buffer
-                        .exit_status
-                        .and_then(|(code, _signal)| code)
-                        .unwrap_or_default(),
-                })
+            let buffer = bridge.terminal_buffer(real_idx, &id)?;
+            models::to_terminal_item_rows(vec![(id, Some(buffer))]).into_iter().next()
         });
         Some(msg::ThreadFrameSnapshot {
             thread_id: bridge

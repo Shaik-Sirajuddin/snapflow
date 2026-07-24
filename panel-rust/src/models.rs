@@ -19,6 +19,36 @@ use crate::{
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
 
+/// Same taxonomy as `chat_area.slint`'s `is-tool-kind` -- kept in sync by
+/// hand since the Slint side can't import a Rust constant list.
+fn is_tool_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tool_use" | "mcp_server_call" | "skill_use" | "skill_load" | "terminal"
+    )
+}
+
+/// Stamps `MessageItem::tool_group_len` on the first row of every
+/// contiguous tool-kind run (see that field's doc comment in
+/// `types.slint` for why this lives in Rust rather than a Slint
+/// `pure function`: no loops/recursion there, so an unbounded scan isn't
+/// expressible without a hand-unrolled, arbitrarily-capped `if` ladder).
+/// Every other row's `tool_group_len` is left at its literal default (0).
+fn assign_tool_group_lengths(rows: &mut [MessageItem]) {
+    let mut i = 0;
+    while i < rows.len() {
+        if !is_tool_kind(rows[i].kind.as_str()) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < rows.len() && is_tool_kind(rows[i].kind.as_str()) {
+            i += 1;
+        }
+        rows[start].tool_group_len = (i - start) as i32;
+    }
+}
+
 /// Maps `markdown::LineKind` to tags used by `base/markdown_view.slint`.
 fn line_kind_str(kind: LineKind) -> &'static str {
     match kind {
@@ -42,24 +72,28 @@ fn line_kind_str(kind: LineKind) -> &'static str {
 fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
     let rows: Vec<MarkdownLine> = lines
         .into_iter()
-        .map(|line| MarkdownLine {
-            kind: line_kind_str(line.kind).into(),
-            runs: ModelRc::new(VecModel::from(
-                line.runs
-                    .into_iter()
-                    .map(|r| MarkdownRun {
-                        text: r.text.into(),
-                        bold: r.bold,
-                        italic: r.italic,
-                        code: r.code,
-                        strike: r.strike,
-                        link: r.link.into(),
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-            indent: line.indent as i32,
-            ordinal: line.ordinal as i32,
-            code_block_id: line.code_block_id,
+        .map(|line| {
+            let plain_text: String = line.runs.iter().map(|r| r.text.as_str()).collect();
+            MarkdownLine {
+                kind: line_kind_str(line.kind).into(),
+                runs: ModelRc::new(VecModel::from(
+                    line.runs
+                        .into_iter()
+                        .map(|r| MarkdownRun {
+                            text: r.text.into(),
+                            bold: r.bold,
+                            italic: r.italic,
+                            code: r.code,
+                            strike: r.strike,
+                            link: r.link.into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                indent: line.indent as i32,
+                ordinal: line.ordinal as i32,
+                code_block_id: line.code_block_id,
+                plain_text: plain_text.into(),
+            }
         })
         .collect();
     ModelRc::new(VecModel::from(rows))
@@ -227,7 +261,7 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
     // First-use skill tracking: walk the list in order, mark a skill_use
     // row first-use only the first time its tracking name appears.
     let mut seen_skills = std::collections::HashSet::<String>::new();
-    let items: Vec<MessageItem> = msgs
+    let mut items: Vec<MessageItem> = msgs
         .into_iter()
         .enumerate()
         .map(|(i, m)| {
@@ -272,9 +306,11 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                 can_send_now: false,
                 sending: false,
                 first_use,
+                tool_group_len: 0,
             }
         })
         .collect();
+    assign_tool_group_lengths(&mut items);
     ModelRc::new(VecModel::from(items))
 }
 
@@ -339,7 +375,7 @@ pub fn to_message_rows_from_transcript(
 
     let mut index = 0i32;
     let mut seen_skills = std::collections::HashSet::<String>::new();
-    let rows: Vec<MessageItem> = items
+    let mut rows: Vec<MessageItem> = items
         .into_iter()
         .filter_map(|item| {
             // Live tool details: raw_input/raw_output flow from
@@ -424,11 +460,13 @@ pub fn to_message_rows_from_transcript(
                 can_send_now: false,
                 sending: false,
                 first_use,
+                tool_group_len: 0,
             };
             index += 1;
             Some(row)
         })
         .collect();
+    assign_tool_group_lengths(&mut rows);
     rows
 }
 
@@ -469,6 +507,8 @@ pub fn append_send_queue_rows(
             // already shows Stop instead.
             can_send_now: !(generation_in_flight && i == 0),
             first_use: false,
+            // Always "user" kind above -- never a tool-group start.
+            tool_group_len: 0,
         });
     }
 }
@@ -988,6 +1028,7 @@ pub fn build_thread_items<N: AsRef<str>>(
             session_id: None,
             item: ThreadItem {
                 name: name.as_ref().into(),
+                relative_time: String::from("now").into(),
                 // Archived takes precedence over closed: it is the final,
                 // explicitly-chosen state, whereas closed can still precede
                 // an archive action on the same thread.
@@ -1104,27 +1145,41 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
     ModelRc::new(VecModel::from(to_terminal_item_rows(entries)))
 }
 
-/// Builds concrete terminal rows for a reducer-owned thread snapshot.
 pub fn to_terminal_item_rows(entries: Vec<(String, Option<TerminalBuffer>)>) -> Vec<TerminalItem> {
     entries
         .into_iter()
         .map(|(terminal_id, buffer)| match buffer {
-            Some(buffer) => TerminalItem {
-                terminal_id: terminal_id.into(),
-                output: buffer.output.into(),
-                truncated: buffer.truncated,
-                has_exited: buffer.exit_status.is_some(),
-                exit_code: buffer
-                    .exit_status
-                    .and_then(|(code, _signal)| code)
-                    .unwrap_or_default(),
-            },
+            Some(buffer) => {
+                let active = buffer.active();
+                TerminalItem {
+                    terminal_id: terminal_id.into(),
+                    output: buffer.output.into(),
+                    truncated: buffer.truncated,
+                    has_exited: buffer.exit_status.is_some(),
+                    exit_code: buffer
+                        .exit_status
+                        .and_then(|(code, _signal)| code)
+                        .unwrap_or_default(),
+                    title: buffer.command.clone().into(),
+                    last_command: if buffer.args.is_empty() {
+                        buffer.command.clone().into()
+                    } else {
+                        format!("{} {}", buffer.command, buffer.args.join(" ")).into()
+                    },
+                    started_at: buffer.started_at.into(),
+                    active,
+                }
+            }
             None => TerminalItem {
                 terminal_id: terminal_id.into(),
                 output: String::new().into(),
                 truncated: false,
                 has_exited: false,
                 exit_code: 0,
+                title: String::new().into(),
+                last_command: String::new().into(),
+                started_at: String::new().into(),
+                active: true,
             },
         })
         .collect()
@@ -1336,9 +1391,44 @@ pub fn to_mcp_server_option_rows(
                 needs_auth,
                 auth_status: auth.into(),
                 tools: ModelRc::new(VecModel::from(tools)),
+                // Every acpx `mcp_servers/list` row is a user-added registry
+                // entry -- removable. The one non-removable row (the built-in
+                // snapshotd daemon) is prepended separately, see
+                // [`builtin_snapshotd_option`].
+                removable: true,
             }
         })
         .collect()
+}
+
+/// PUI-015: the built-in `snapshotd` daemon MCP row for the Settings list,
+/// or `None` when the daemon is not currently reachable. This is the same
+/// endpoint the panel actually injects into every session's `mcpServers`
+/// array (`agent_bridge::snapshotd_mcp_server_entry`, gated on the same live
+/// probe cached in `agent_bridge::snapshotd_reachable`) -- surfaced here as a
+/// first-class, non-removable row so the always-on daemon server the model
+/// really talks to is visible in Settings, instead of the list showing only
+/// user-added registry servers and hiding the built-in one entirely. Not a
+/// synthetic UI guess: it names the exact `http://<addr>/mcp` endpoint the
+/// injection uses (`agent_bridge::snapshotd_mcp_addr`).
+pub fn builtin_snapshotd_option(reachable: bool) -> Option<McpServerOption> {
+    if !reachable {
+        return None;
+    }
+    let addr = crate::agent_bridge::snapshotd_mcp_addr();
+    Some(McpServerOption {
+        name: "snapshotd".into(),
+        command: String::new().into(),
+        status_line: "built-in daemon · always available".into(),
+        transport: "http".into(),
+        url: format!("http://{addr}/mcp").into(),
+        enabled: true,
+        status: "connected".into(),
+        needs_auth: false,
+        auth_status: String::new().into(),
+        tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
+        removable: false,
+    })
 }
 
 /// Parse a persisted `tools` array from an MCP server registry entry.
@@ -1526,6 +1616,43 @@ pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use slint::Model;
+
+    // PUI-015: the built-in snapshotd daemon row is only produced when the
+    // daemon is reachable, is non-removable, and names the same /mcp
+    // endpoint the session injection uses.
+    #[test]
+    fn builtin_snapshotd_option_is_present_and_non_removable_only_when_reachable() {
+        assert!(
+            builtin_snapshotd_option(false).is_none(),
+            "no built-in row when the daemon is unreachable"
+        );
+        let row = builtin_snapshotd_option(true).expect("row present when reachable");
+        assert_eq!(row.name.as_str(), "snapshotd");
+        assert!(!row.removable, "built-in daemon row must not be removable");
+        assert_eq!(row.transport.as_str(), "http");
+        assert!(
+            row.url.as_str().ends_with("/mcp"),
+            "must point at the streamable-HTTP /mcp endpoint, got {}",
+            row.url
+        );
+        assert!(
+            row.url.contains(&crate::agent_bridge::snapshotd_mcp_addr()),
+            "must name the same address the session injection uses"
+        );
+    }
+
+    // Registry-derived rows stay removable (only the built-in daemon is not).
+    #[test]
+    fn registry_mcp_rows_are_removable() {
+        let entry = crate::protocol_types::McpServerEntry {
+            name: "my-server".to_string(),
+            command: Some("do-thing".to_string()),
+            extra: serde_json::json!({}),
+        };
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].removable, "user-added registry rows are removable");
+    }
 
     const NAMES: &[&str] = &[
         "Fix timeline crash",
@@ -1726,6 +1853,62 @@ mod tests {
         let msgs = vec![chat_msg(MessageKind::ToolCall, "x", Some("completed"))];
         let model = to_message_model(msgs, &[true]);
         assert!(model.row_data(0).unwrap().expanded);
+    }
+
+    // Regression coverage for `chat_area.slint`'s formerly Slint-side,
+    // hand-unrolled-to-10 group scan (undercounted/mis-rendered any
+    // contiguous tool-kind run past that cap) -- `assign_tool_group_lengths`
+    // replaces it with an unbounded Rust pass. 15 > the old cap of 10.
+    #[test]
+    fn tool_group_length_is_not_capped_at_ten() {
+        let mut msgs = vec![chat_msg(MessageKind::User, "start", None)];
+        for _ in 0..15 {
+            msgs.push(chat_msg(MessageKind::ToolCall, "x", Some("completed")));
+        }
+        msgs.push(chat_msg(MessageKind::User, "end", None));
+        let model = to_message_model(msgs, &[]);
+        assert_eq!(model.row_count(), 17);
+        assert_eq!(model.row_data(0).unwrap().tool_group_len, 0);
+        assert_eq!(model.row_data(1).unwrap().tool_group_len, 15);
+        for i in 2..16 {
+            assert_eq!(model.row_data(i).unwrap().tool_group_len, 0);
+        }
+        assert_eq!(model.row_data(16).unwrap().tool_group_len, 0);
+    }
+
+    #[test]
+    fn tool_group_length_handles_multiple_separate_groups() {
+        let msgs = vec![
+            chat_msg(MessageKind::ToolCall, "a", Some("completed")),
+            chat_msg(MessageKind::ToolCall, "b", Some("completed")),
+            chat_msg(MessageKind::User, "between", None),
+            chat_msg(MessageKind::ToolCall, "c", Some("completed")),
+        ];
+        let model = to_message_model(msgs, &[]);
+        assert_eq!(model.row_data(0).unwrap().tool_group_len, 2);
+        assert_eq!(model.row_data(1).unwrap().tool_group_len, 0);
+        assert_eq!(model.row_data(2).unwrap().tool_group_len, 0);
+        assert_eq!(model.row_data(3).unwrap().tool_group_len, 1);
+    }
+
+    #[test]
+    fn terminal_rows_carry_title_active_and_start_time_from_the_buffer() {
+        let rows = to_terminal_item_rows(vec![(
+            "term_7".to_owned(),
+            Some(TerminalBuffer {
+                output: "hi".to_owned(),
+                truncated: false,
+                exit_status: None, // still running -> active
+                command: "cargo test".to_owned(),
+                args: vec!["--lib".to_owned()],
+                started_at: "2026-07-24T05:00:00.000000000Z".to_owned(),
+            }),
+        )]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title.as_str(), "cargo test");
+        assert_eq!(rows[0].last_command.as_str(), "cargo test --lib");
+        assert!(rows[0].active, "a non-exited terminal is active");
+        assert_eq!(rows[0].started_at.as_str(), "2026-07-24T05:00:00.000000000Z");
     }
 
     #[test]
