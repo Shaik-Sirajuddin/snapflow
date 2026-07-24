@@ -250,6 +250,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
 fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
     component.set_active_skill_name(model.active_skill_name.clone().into());
     component.set_active_skill_path(model.active_skill_path.clone().into());
+    component.set_active_skill_md_path(model.active_skill_md_path.clone().into());
     component.set_active_skill_content(model.active_skill_content.clone().into());
     // Phase 27: markdown preview of the active content for the editor's
     // Preview toggle.

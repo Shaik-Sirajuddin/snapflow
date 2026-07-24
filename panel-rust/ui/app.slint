@@ -154,6 +154,10 @@ export component ChatPanel inherits Window {
     in-out property <string> active-pane: "chat";
     in property <string> active-skill-name: "";
     in property <string> active-skill-path: "";
+    // PUI-010: the SKILL.md file, distinct from active-skill-path (the
+    // containing directory) -- content-edited must save to this, not the
+    // directory, or every save hits an EISDIR OS error.
+    in property <string> active-skill-md-path: "";
     in-out property <string> active-skill-content: "";
     // Phase 27: markdown render of active-skill-content (sync-owned)
     // for the skill editor's Preview toggle.
@@ -616,7 +620,11 @@ export component ChatPanel inherits Window {
                     root.skill-open-with-os-default-requested(root.active-skill-path);
                 }
                 content-edited(new-content) => {
-                    root.skill-content-edited(root.active-skill-path, new-content);
+                    // PUI-010: save to the SKILL.md file, not its
+                    // containing directory (root.active-skill-path) --
+                    // writing to the directory path hit EISDIR on every
+                    // save.
+                    root.skill-content-edited(root.active-skill-md-path, new-content);
                 }
                 close-requested => { root.active-pane = "chat"; }
                 changed has-focus => {

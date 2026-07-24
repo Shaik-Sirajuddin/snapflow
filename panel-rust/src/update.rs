@@ -1482,6 +1482,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         EffectResultMsg::SkillEditorLoaded(Ok(state)) => {
             model.active_skill_name = state.name;
             model.active_skill_path = state.path;
+            model.active_skill_md_path = state.content_path;
             model.active_skill_content = state.content;
             model.detected_editors = state.detected_editors;
             model.active_pane = "skill".to_owned();
@@ -4182,6 +4183,35 @@ mod tests {
             effects.as_slice(),
             [Effect::SkillWrite { content, .. }] if content == "old body plus a typed delta"
         ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::SkillEditor)));
+    }
+
+    #[test]
+    fn skill_editor_loaded_keeps_the_directory_and_the_skill_md_file_distinct() {
+        // PUI-010: SkillEditorLoaded used to fold state.path (the skill
+        // DIRECTORY) into the only path the model tracked
+        // (active_skill_path), which app.slint's content-edited handler
+        // then sent straight into Effect::SkillWrite -- every save wrote
+        // to the directory and hit an EISDIR OS error (see
+        // effect_executor::skill_editor_path_tests for the real
+        // filesystem repro of that error). Fixed by tracking the two
+        // paths separately; this proves the reducer keeps them apart.
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(crate::effect::EffectResultMsg::SkillEditorLoaded(Ok(
+                crate::model::SkillEditorState {
+                    name: "demo".to_owned(),
+                    path: "/skills/demo".to_owned(),
+                    content_path: "/skills/demo/SKILL.md".to_owned(),
+                    content: "body".to_owned(),
+                    detected_editors: vec![],
+                },
+            ))),
+        );
+        assert_eq!(model.active_skill_path, "/skills/demo");
+        assert_eq!(model.active_skill_md_path, "/skills/demo/SKILL.md");
+        assert_ne!(model.active_skill_path, model.active_skill_md_path);
         assert!(dirty.iter().any(|d| matches!(d, Dirty::SkillEditor)));
     }
 

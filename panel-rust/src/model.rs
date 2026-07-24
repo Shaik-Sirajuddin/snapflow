@@ -109,7 +109,15 @@ pub struct ThreadModel {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SkillEditorState {
     pub name: String,
+    /// The skill's directory -- what "Copy path"/"Open in editor"/"Open
+    /// with OS default" want (the whole folder, not just SKILL.md).
     pub path: String,
+    /// PUI-010: `path.join("SKILL.md")`, kept as a distinct field so
+    /// `Effect::SkillWrite` (content save) writes the file, not the
+    /// directory. Every skill save wrote directly to `path` (the
+    /// directory) before this field existed, so `std::fs::write` hit
+    /// `ErrorKind::IsADirectory` (EISDIR) on every single save.
+    pub content_path: String,
     pub content: String,
     pub detected_editors: Vec<String>,
 }
@@ -158,6 +166,10 @@ pub struct Model {
     pub toast_seq: i32,
     pub active_skill_name: String,
     pub active_skill_path: String,
+    /// PUI-010: the actual SKILL.md file path (active_skill_path is the
+    /// containing directory) -- content saves must write here, not the
+    /// directory. See SkillEditorState::content_path's doc comment.
+    pub active_skill_md_path: String,
     pub active_skill_content: String,
     /// skills_audit_report §3.1: true while SkillWrite is in flight.
     pub skill_saving: bool,
