@@ -6571,6 +6571,89 @@ done
         );
     }
 
+    /// PUI-003 e2e: proves the compose `/` menu's per-thread isolation
+    /// end to end, not just "by construction". Before this test, only
+    /// `parse_capability_update_recognizes_available_commands_update`
+    /// (`gateway_actor/thread_actor.rs`) covered `available_commands_
+    /// update` at all -- a pure JSON-parse unit test with no real
+    /// backend, no `AgentBridge`, and no second provider, so it could
+    /// never have caught two threads' commands actually bleeding into
+    /// each other. This spins up two real gateway processes (mirroring
+    /// `two_threads_route_to_two_distinct_gateways_by_provider` above),
+    /// each backed by `rui-mock-agent` under a different
+    /// `RUI_MOCK_AGENT_PERSONA`, which now advertises persona-specific
+    /// commands (`codex_*` / `claude_*` -- see `persona_commands` in
+    /// `src/bin/mock_agent.rs`) on each session's first prompt turn.
+    /// Deliberately disjoint command *names* per persona (not just
+    /// disjoint descriptions) mean a cross-wiring regression shows up as
+    /// an unambiguous "wrong command name in this thread's list" failure
+    /// instead of two coincidentally-similar lists passing by luck.
+    #[test]
+    fn two_threads_show_only_their_own_providers_available_commands() {
+        let codex_gateway = TestGateway::spawn_with_persona("codex");
+        let claude_gateway = TestGateway::spawn_with_persona("claude");
+        let codex_url = codex_gateway.base_url.clone();
+        let claude_url = claude_gateway.base_url.clone();
+        let names = ["Codex Thread", "Claude Thread"];
+
+        let bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
+            &names,
+            move |provider| {
+                if provider == "codex" {
+                    Ok(codex_url.clone())
+                } else {
+                    Ok(claude_url.clone())
+                }
+            },
+            None,
+        )
+        .expect("bridge with two distinct gateways");
+
+        // `available_commands_update` is only sent on the mock agent's
+        // first prompt turn (see `persona_commands`'s doc comment in
+        // mock_agent.rs for why session/new itself can't be used), so a
+        // real prompt has to be driven for each thread before polling.
+        bridge.send_prompt(0, "ping".into());
+        bridge.send_prompt(1, "ping".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut commands = [Vec::new(), Vec::new()];
+        while std::time::Instant::now() < deadline
+            && (commands[0].is_empty() || commands[1].is_empty())
+        {
+            for _ in bridge.poll() {}
+            commands[0] = bridge.available_commands(0);
+            commands[1] = bridge.available_commands(1);
+            if commands[0].is_empty() || commands[1].is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        let codex_names: Vec<&str> = commands[0].iter().map(|c| c.name.as_str()).collect();
+        let claude_names: Vec<&str> = commands[1].iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            !codex_names.is_empty(),
+            "codex thread never received any available_commands"
+        );
+        assert!(
+            !claude_names.is_empty(),
+            "claude thread never received any available_commands"
+        );
+        assert!(
+            codex_names.contains(&"codex_plan") && codex_names.contains(&"codex_review"),
+            "codex thread missing its own persona's commands, got: {codex_names:?}"
+        );
+        assert!(
+            claude_names.contains(&"claude_plan") && claude_names.contains(&"claude_summarize"),
+            "claude thread missing its own persona's commands, got: {claude_names:?}"
+        );
+        assert!(
+            !codex_names.iter().any(|n| claude_names.contains(n)),
+            "codex thread's commands leaked into claude thread (or vice versa): \
+             codex={codex_names:?} claude={claude_names:?}"
+        );
+    }
+
     /// Same real stand-in-backend shell-script technique
     /// `acpx-server/tests/agent_request_relay_test.rs` uses, one layer up
     /// the stack: proves the interactive `session/request_permission`

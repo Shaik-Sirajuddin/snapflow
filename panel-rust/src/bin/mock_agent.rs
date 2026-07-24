@@ -18,13 +18,13 @@
 //!   prompt turn would have produced (a stand-in for "replay history").
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk,
-    CancelNotification, DeleteSessionRequest, DeleteSessionResponse, InitializeResponse,
-    ListSessionsResponse, LoadSessionResponse, NewSessionResponse, PromptResponse,
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionId, SessionInfo,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
-    ToolCallUpdate, ToolCallUpdateFields,
+    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CloseSessionRequest,
+    CloseSessionResponse, ContentBlock, ContentChunk, CancelNotification, DeleteSessionRequest,
+    DeleteSessionResponse, InitializeResponse, ListSessionsResponse, LoadSessionResponse,
+    NewSessionResponse, PromptResponse, PermissionOption, PermissionOptionKind,
+    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
+    ResumeSessionResponse, SessionId, SessionInfo, SessionNotification, SessionUpdate,
+    StopReason, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
 use std::collections::HashMap;
@@ -53,6 +53,35 @@ fn persona_prefix() -> String {
     match std::env::var("RUI_MOCK_AGENT_PERSONA") {
         Ok(p) if !p.is_empty() => format!("[{}] ", p.to_uppercase()),
         _ => String::new(),
+    }
+}
+
+/// Per-persona `available_commands_update` payload, PUI-003's compose `/`
+/// menu is fed exclusively from a thread's own ACP `available_commands`
+/// (`sync.rs`'s `sync_commands_model`) -- so two threads bound to two
+/// different gateway processes must see two disjoint command lists if
+/// (and only if) that per-thread isolation genuinely holds end to end.
+/// Command *names* are deliberately persona-prefixed (`codex_*` /
+/// `claude_*`) rather than shared generic names so a cross-wiring bug
+/// (thread A's `/` menu showing thread B's agent's commands) is
+/// unambiguous in a test assertion instead of two identical-looking
+/// lists that happen to pass by coincidence. Unset/unknown persona
+/// advertises no commands at all, matching `persona_prefix`'s own
+/// "direct, non-gateway dev path stays unchanged" convention.
+fn persona_commands() -> Vec<AvailableCommand> {
+    match std::env::var("RUI_MOCK_AGENT_PERSONA").unwrap_or_default().as_str() {
+        "codex" => vec![
+            AvailableCommand::new("codex_plan", "Draft an execution plan (codex persona)"),
+            AvailableCommand::new("codex_review", "Review a diff (codex persona)"),
+        ],
+        "claude" => vec![
+            AvailableCommand::new("claude_plan", "Draft an execution plan (claude persona)"),
+            AvailableCommand::new(
+                "claude_summarize",
+                "Summarize the conversation (claude persona)",
+            ),
+        ],
+        _ => Vec::new(),
     }
 }
 
@@ -199,6 +228,32 @@ async fn main() -> Result<()> {
                     .unwrap_or_default();
                 let session_id = request.session_id.clone();
                 record_gateway_event("session/prompt", Some(session_id.0.as_ref()), &text);
+                // PUI-003 e2e: advertise this persona's slash commands on
+                // the session's first prompt turn -- not `session/new`,
+                // because a notification sent before `NewSessionResponse`
+                // is acknowledged races the client's session_id->thread
+                // bookkeeping (the panel only starts routing a session's
+                // notifications to a thread once it has processed that
+                // response). The first prompt is the earliest point a
+                // real client is guaranteed to already have that mapping
+                // in place, so it's the deterministic point used here.
+                let is_first_turn = with_sessions(|sessions| {
+                    sessions
+                        .get(session_id.0.as_ref())
+                        .map(|s| s.turn_count == 0)
+                        .unwrap_or(true)
+                });
+                if is_first_turn {
+                    let commands = persona_commands();
+                    if !commands.is_empty() {
+                        let _ = connection.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(
+                                commands,
+                            )),
+                        ));
+                    }
+                }
                 // Lowercase, punctuation-free marker: the real host XTEST
                 // driver (`host_e2e_driver.py`) taps unshifted keysyms one
                 // character at a time with no modifier-key support, so an
