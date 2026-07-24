@@ -6530,6 +6530,144 @@ done
         );
     }
 
+    /// SCNA-02: `MAX_RETAINED_TERMINALS_PER_THREAD`/
+    /// `evict_exited_terminals_over_cap_in` have pure-logic unit test
+    /// coverage elsewhere in this file, but never against a real host
+    /// spawning more than the cap. This reuses exactly
+    /// `add_thread_with_profile_unlocks_terminal_access_end_to_end`'s
+    /// stand-in-backend-plus-real-`acpx-server` technique -- no new
+    /// `rui-mock-agent` capability is needed, since acpx-server's own
+    /// `terminal/create` handling (`acpx-core::router`'s
+    /// `handle_terminal_request` + `spawn_terminal_output_stream`) really
+    /// executes the process and really streams `acpx/terminal_output`
+    /// back to this bridge once the client-side relay is approved via
+    /// `respond_to_request` -- just looped past the cap instead of once.
+    #[test]
+    fn terminal_eviction_cap_holds_against_a_real_host_spawning_more_than_the_cap() {
+        let terminal_count = MAX_RETAINED_TERMINALS_PER_THREAD + 2;
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("stand_in_backend.sh");
+        let mut terminal_create_calls = String::new();
+        for i in 0..terminal_count {
+            let req_id = 900 + i;
+            terminal_create_calls.push_str(&format!(
+                r#"  printf '{{"jsonrpc":"2.0","id":{req_id},"method":"terminal/create","params":{{"sessionId":"backend-cap","command":"sh","args":["-c","printf term-{i}"]}}}}\n'
+  while IFS= read -r reply_line; do
+    echo "$reply_line" | grep -q '"id":{req_id}' && break
+  done
+"#,
+            ));
+        }
+        std::fs::write(
+            &script_path,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"session/new"'; then
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"backend-cap"}}}}\n' "$id"
+  elif echo "$line" | grep -q '"method":"session/prompt"'; then
+{terminal_create_calls}    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"stopReason":"end_turn"}}}}\n' "$id"
+  else
+    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"ok":true}}}}\n' "$id"
+  fi
+done
+"#
+            ),
+        )
+        .expect("write stand-in backend script");
+
+        let port = free_port();
+        let mut command = std::process::Command::new(acpx_server_bin());
+        command
+            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+            .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+            .env("ACPX_DEFAULT_AGENT_ID", "terminal-cap-agent")
+            .env("RUST_LOG", "error")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = command.spawn().expect("spawn real acpx-server binary");
+        let base_url = format!("http://127.0.0.1:{port}");
+        for _ in 0..100 {
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                std::time::Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        let gateway = TestGateway { child, base_url };
+
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let client = acpx_client::raw::GatewayClient::new(gateway.base_url.clone());
+            client
+                .call(
+                    "profiles/create",
+                    serde_json::json!({
+                        "name": "cap-enabled",
+                        "agent_id": "terminal-cap-agent",
+                        "allow_terminal_access": true
+                    }),
+                    None,
+                )
+                .await
+                .expect("profiles/create");
+        });
+
+        let mut bridge =
+            bridge_with_single_gateway(&["Seed Thread", "Seed Thread Two"], &gateway, None)
+                .expect("bridge with two seed threads");
+        let idx = bridge
+            .add_thread_with_profile("Cap Thread", Some("cap-enabled"))
+            .expect("add_thread_with_profile");
+        bridge.send_prompt(idx, "spawn many terminals".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut approved = 0usize;
+        while std::time::Instant::now() < deadline && approved < terminal_count {
+            let pending = bridge.pending_requests(idx);
+            if let Some(event) = pending.first() {
+                assert_eq!(event.method, "terminal/create");
+                let response = crate::permission::build_response(event, true);
+                bridge.respond_to_request(idx, &event.relay_id, response);
+                approved += 1;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert_eq!(
+            approved, terminal_count,
+            "expected to approve every one of the {terminal_count} terminal/create relays"
+        );
+
+        // Every approved terminal's real process exits immediately
+        // (`printf` has no wait), so once acpx-server's real
+        // `spawn_terminal_output_stream` delivers each one's final
+        // `acpx/terminal_output` (carrying `exitStatus`), eviction runs
+        // synchronously inside `store_terminal_output` -- poll until the
+        // bridge's own live view settles under the cap instead of
+        // asserting on a single snapshot.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut active = bridge.active_terminals(idx);
+        while std::time::Instant::now() < deadline
+            && active.len() > MAX_RETAINED_TERMINALS_PER_THREAD
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            active = bridge.active_terminals(idx);
+        }
+        assert!(
+            active.len() <= MAX_RETAINED_TERMINALS_PER_THREAD,
+            "active_terminals should have settled at or under the cap ({MAX_RETAINED_TERMINALS_PER_THREAD}), \
+             got {} entries out of {terminal_count} approved -- eviction did not keep up: {active:?}",
+            active.len()
+        );
+    }
+
     /// Coverage-matrix `session/set_mode`/`session/set_config_option`
     /// row: proves (a) a real `session/new` response's `modes`/
     /// `configOptions` fields reach `AgentBridge::session_modes`/

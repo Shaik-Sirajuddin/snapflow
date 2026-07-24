@@ -36,7 +36,8 @@ literal.
 | Restart / reconnect | Host and gateway restart | Resumed session receives next prompt without an implicit close | Proven (`PANEL_HOST_E2E_RESTART=1`) |
 | HTTP degraded fallback | Gateway WS unavailable then restored | Fallback audit state is present; interactive approval is unavailable | Pending |
 | Send-now / steer (state-controller-notification-audit plan) | Two entries queued behind a blocked ("slow ") turn, send-now clicked on the second (non-front) one | The steered entry's text reaches the backend as its own `session/prompt`, the skipped-over entry never does, and a real `session/cancel` for turn 1 is observed | Proven (`host_e2e_mcp_smoke.sh send-now`, MCP-driven -- see below) |
-| Rename round-trip (offload_state_effects_off_ui_thread) | Real Rename thread → type → confirm | Header title element updates to the new name; `panel-state.sqlite3`'s `thread_settings.display_name` matches after the background-thread write completes | Proven (`host_e2e_mcp_smoke.sh rename`, MCP-driven -- see below). The RenameThread *failure* branch (StateEffectFailed → Dirty::Error) is unit-tested only (`update.rs::state_effect_failed_surfaces_as_dirty_error_not_silently_dropped`) -- forcing an already-open rusqlite connection's write to fail on demand has no reliable trigger for this harness |
+| Rename round-trip (offload_state_effects_off_ui_thread) | Real Rename thread → type → confirm | Header title element updates to the new name; `panel-state.sqlite3`'s `thread_settings.display_name` matches after the background-thread write completes | Proven (`host_e2e_mcp_smoke.sh rename`, MCP-driven -- see below) |
+| Mid-session write failure (SCNA-10) | Rename attempted while the state dir is chmod'd read-only mid-session | Real "attempt to write a readonly database" error surfaces as a live "⚠ failed to persist ..." banner; a later write succeeds again once the directory is writable | Proven (`host_e2e_mcp_smoke.sh mid-session-write-failure`, MCP-driven -- see below) |
 
 ## MCP-driven scenarios (`host_e2e_mcp_smoke.sh` / `host_e2e_mcp_driver.py`)
 
@@ -55,7 +56,25 @@ bash tests/host_e2e_mcp_smoke.sh send-now
 bash tests/host_e2e_mcp_smoke.sh fast-track
 bash tests/host_e2e_mcp_smoke.sh rename
 bash tests/host_e2e_mcp_smoke.sh startup-warning
+bash tests/host_e2e_mcp_smoke.sh mid-session-write-failure
 ```
+
+`mid-session-write-failure` (state-controller-followup-issues SCNA-10):
+unlike `startup-warning` (which fails `PanelStateStore::open` itself,
+before this process ever starts), the sqlite connection here is already
+open and has already served at least one successful write -- the driver
+`chmod`s the *containing* `panel/` directory to `0o555` mid-session
+instead. SQLite's default rollback-journal mode needs to create/delete a
+`-journal` sibling file in the same directory on every write even though
+the main `.sqlite3` file itself stays writable, so this reliably fails
+the very next write with a real "attempt to write a readonly database"
+error on an already-open connection -- no test-only production hook
+needed (see the matching Rust-level regression,
+`state_store::tests::a_mid_session_write_fails_when_the_state_dir_becomes_read_only_after_open`).
+The driver restores permissions in a `finally` and then performs a
+second, real rename to prove the store self-heals once the directory is
+writable again -- no code involved in the recovery, only restored
+permissions.
 
 `fast-track` (state-controller-followup-issues SCNA-03): queues one
 message behind a blocked turn, clears the compose box, presses Return with

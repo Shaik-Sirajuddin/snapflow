@@ -359,11 +359,80 @@ def scenario_startup_warning(args):
     print(f"PASS startup_warning scenario: real error banner appeared: {label!r}")
 
 
+def scenario_mid_session_write_failure(args):
+    """SCNA-10: a real, deterministic mid-session PanelStateStore write
+    failure trigger, exercised end to end. Unlike scenario_startup_warning
+    (which fails PanelStateStore::open itself, before this process even
+    starts), the panel-state.sqlite3 connection here is already open and
+    has already served at least one successful write -- this instead makes
+    the *containing directory* read-only mid-session. SQLite's default
+    rollback-journal mode needs to create/delete a `-journal` sibling file
+    on every write even though the main .sqlite3 file itself stays
+    writable, so this reliably fails the very next write with a real
+    "attempt to write a readonly database" error on an already-open
+    connection -- no test-only production hook needed (see the matching
+    Rust-level regression,
+    state_store::tests::a_mid_session_write_fails_when_the_state_dir_becomes_read_only_after_open).
+
+    Exercises effect_executor.rs's Effect::RenameThread failure branch for
+    real: the spawned-thread write fails -> StateEffectFailed -> Dirty::Error
+    -> a live "⚠ failed to persist renamed chat thread: ..." banner, then
+    proves the store self-heals (no code involved, just restored directory
+    permissions) once the directory is writable again.
+    """
+    import os
+    import stat
+
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    panel_dir = args.state_dir / "panel"
+    original_mode = stat.S_IMODE(panel_dir.stat().st_mode)
+    os.chmod(panel_dir, 0o555)
+    try:
+        rename_handle = wait_for_accessible_label(client, root_handle, "Rename thread")
+        click(client, rename_handle)
+        name_input_handle = wait_for_accessible_label(client, root_handle, "Thread name")
+        set_text(client, name_input_handle, "mcp write-failure attempt")
+        press_return(client, window_handle)
+
+        _handle, label = wait_for_accessible_label_prefix(
+            client, root_handle, "⚠ ", timeout=args.timeout
+        )
+        # Whichever StateEffectFailed-producing write loses the race against
+        # the read-only directory first (RenameThread's own write, or a
+        # SetSelectedThread persist fired incidentally by opening the rename
+        # dialog) is equally valid proof of the mechanism: some real,
+        # already-in-flight PanelStateStore write failed mid-session and
+        # reached the live UI as an error banner, not just stderr.
+        if "failed to persist" not in label or "readonly database" not in label:
+            raise RuntimeError(
+                f"error banner appeared but with an unexpected message: {label!r}"
+            )
+    finally:
+        os.chmod(panel_dir, original_mode)
+
+    new_name = "mcp write-failure recovered"
+    rename_handle = wait_for_accessible_label(client, root_handle, "Rename thread")
+    click(client, rename_handle)
+    name_input_handle = wait_for_accessible_label(client, root_handle, "Thread name")
+    set_text(client, name_input_handle, new_name)
+    press_return(client, window_handle)
+    wait_for_accessible_label(client, root_handle, new_name, timeout=args.timeout)
+    print(
+        "PASS mid_session_write_failure scenario: a real mid-session "
+        "PanelStateStore write failure surfaced as a live error banner, "
+        "and a later write succeeded again once the directory was writable"
+    )
+
+
 SCENARIOS = {
     "send-now": scenario_send_now,
     "fast-track": scenario_fast_track,
     "rename": scenario_rename,
     "startup-warning": scenario_startup_warning,
+    "mid-session-write-failure": scenario_mid_session_write_failure,
 }
 
 
@@ -372,6 +441,11 @@ def main():
     parser.add_argument("--mcp-url", default="http://127.0.0.1:18999/mcp")
     parser.add_argument("--event-log", type=pathlib.Path, required=True)
     parser.add_argument("--host-log", type=pathlib.Path)
+    parser.add_argument(
+        "--state-dir",
+        type=pathlib.Path,
+        help="host_e2e_mcp_smoke.sh's state_dir; only mid-session-write-failure needs this",
+    )
     parser.add_argument("--timeout", type=float, default=15)
     parser.add_argument("scenario", choices=sorted(SCENARIOS))
     args = parser.parse_args()

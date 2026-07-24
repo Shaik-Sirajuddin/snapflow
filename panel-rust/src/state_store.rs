@@ -432,6 +432,45 @@ mod tests {
         );
     }
 
+    /// SCNA-10: a real, deterministic mid-session write-failure trigger.
+    /// The store's default rollback-journal mode needs to create/delete a
+    /// `-journal` sibling file in the same directory on every write, even
+    /// though the main .sqlite3 file itself stays writable -- so making
+    /// *just the containing directory* read-only after the connection is
+    /// already open reproduces a real "attempt to write a readonly
+    /// database" failure on an already-open connection, without any
+    /// test-only production hook. Restoring directory permissions heals it
+    /// again with no code changes needed, same as the poison-mutex tests.
+    #[test]
+    fn a_mid_session_write_fails_when_the_state_dir_becomes_read_only_after_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("panel-state.sqlite3");
+        let store = PanelStateStore::open(&db_path).unwrap();
+        // Succeeds while the directory is still writable.
+        store.save_defaults(&PanelDefaults::default()).unwrap();
+
+        let original_mode = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store.save_defaults(&PanelDefaults {
+            profile_name: Some("codex".to_owned()),
+            ..PanelDefaults::default()
+        });
+        assert!(
+            matches!(result, Err(StateStoreError::Sql(_))),
+            "write against a read-only state dir must surface as StateStoreError::Sql, got {result:?}"
+        );
+
+        // Restore so tempdir's own Drop cleanup can remove the directory.
+        std::fs::set_permissions(dir.path(), original_mode).unwrap();
+        assert!(
+            store.save_defaults(&PanelDefaults::default()).is_ok(),
+            "write must succeed again once the directory is writable"
+        );
+    }
+
     #[test]
     fn defaults_and_background_override_restore_without_transcript_data() {
         let store = PanelStateStore::in_memory().unwrap();

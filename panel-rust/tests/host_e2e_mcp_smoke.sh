@@ -22,7 +22,7 @@ display="${PANEL_HOST_E2E_MCP_DISPLAY:-:112}"
 screen="${PANEL_HOST_E2E_MCP_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
-scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|rename|startup-warning>}"
+scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|rename|startup-warning|mid-session-write-failure>}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
 agent_bin="${RUI_MOCK_AGENT_BIN:-$repo_root/panel-rust/target/debug/rui-mock-agent}"
@@ -122,6 +122,7 @@ python3 "$repo_root/panel-rust/tests/host_e2e_mcp_driver.py" \
     --mcp-url "http://127.0.0.1:$mcp_port/mcp" \
     --event-log "$state_dir/acpx/backend-events.jsonl" \
     --host-log "$state_dir/shotcut.stdout.log" \
+    --state-dir "$state_dir" \
     "$scenario"
 
 printf 'backend events: %s/acpx/backend-events.jsonl\n' "$state_dir"
