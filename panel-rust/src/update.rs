@@ -1726,7 +1726,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
             | crate::protocol_types::AgentEvent::CurrentModeChanged(_)
-            | crate::protocol_types::AgentEvent::ConfigOptions(_) => {
+            | crate::protocol_types::AgentEvent::ConfigOptions(_)
+            // PUI-003: the agent's slash commands flow through the per-frame
+            // snapshot fold (thread.available_commands) like other caps.
+            | crate::protocol_types::AgentEvent::AvailableCommands(_) => {
                 dirty.push(Dirty::ThreadRow(target_index));
             }
         }

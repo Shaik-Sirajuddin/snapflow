@@ -194,6 +194,11 @@ struct ThreadSlot {
     /// shown as a dead/always-present control.
     session_modes: Mutex<Option<SessionModesEvent>>,
     config_options: Mutex<Vec<ConfigOptionInfo>>,
+    /// PUI-003: the agent's own built-in slash commands, from
+    /// `available_commands_update`. Replaced wholesale on each push; not
+    /// persisted (the agent re-advertises on session start), so it is not
+    /// part of the runtime snapshot.
+    available_commands: Mutex<Vec<crate::protocol_types::AvailableCommandInfo>>,
     /// Phase 2 step 3 (chat-panel-production-ui/execution-plan.md):
     /// typed, merged conversation view -- `history` above stays the
     /// raw, unmerged, append-only `ChatMessage` feed (JSONL cache
@@ -444,6 +449,12 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
                 .config_options
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = options.clone();
+        }
+        AgentEvent::AvailableCommands(commands) => {
+            *slot
+                .available_commands
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = commands.clone();
         }
         _ => {}
     }
@@ -1870,7 +1881,8 @@ fn spawn_event_forwarder(
                 }
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
-                | AgentEvent::ConfigOptions(_) => {
+                | AgentEvent::ConfigOptions(_)
+                | AgentEvent::AvailableCommands(_) => {
                     store_capability_event(&slot_for_task, &ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
@@ -2257,6 +2269,7 @@ impl AgentBridge {
                 ),
                 session_modes: Mutex::new(runtime_snapshot.session_modes),
                 config_options: Mutex::new(runtime_snapshot.config_options),
+                available_commands: Mutex::new(Vec::new()),
                 attachment: Mutex::new(AttachmentState::default()),
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
@@ -2494,6 +2507,7 @@ impl AgentBridge {
             ),
             session_modes: Mutex::new(runtime_snapshot.session_modes),
             config_options: Mutex::new(runtime_snapshot.config_options),
+            available_commands: Mutex::new(Vec::new()),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
@@ -2656,6 +2670,7 @@ impl AgentBridge {
             terminal_order: Mutex::new(Vec::new()),
             session_modes: Mutex::new(None),
             config_options: Mutex::new(Vec::new()),
+            available_commands: Mutex::new(Vec::new()),
             attachment: Mutex::new(AttachmentState {
                 complete: true,
                 error: None,
