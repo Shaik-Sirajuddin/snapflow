@@ -2328,6 +2328,18 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        let component_weak = panel.component.as_weak();
+        panel.component.on_copy_message(move |text| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_copy_message(panel, text.to_string());
+                }
+            });
+        });
+
         // Phase 3 step 2: invoked by the message Flickable's real top-edge
         // gesture or its accessible fallback action. Slint raises the
         // loading guard before this callback, so reset it on every outcome.

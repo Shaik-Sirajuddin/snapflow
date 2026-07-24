@@ -8,6 +8,7 @@ import { MessageItem } from "../../../types.slint";
 // bare Text that re-introduces stretch-height bugs).
 export component UserBubble inherits Rectangle {
     in property <MessageItem> item;
+    callback copy-message(string);
 
     vertical-stretch: 0;
 
@@ -18,21 +19,46 @@ export component UserBubble inherits Rectangle {
     border-bottom-left-radius: Theme.radius-lg;
     border-bottom-right-radius: Metrics.radius-corner-cut;
 
-    content := VerticalLayout {
-        padding: Metrics.space-4;
-        Flickable {
-            height: bubble-text.preferred-height;
-            viewport-height: bubble-text.preferred-height;
-            bubble-text := Text {
-                text: item.text;
-                font-family: Theme.font-sans;
-                font-size: 12px * Theme.font-scale;
-                color: Theme.text-primary;
-                wrap: word-wrap;
-                overflow: elide;
-                horizontal-alignment: left;
-                vertical-alignment: top;
-                width: parent.width;
+    HorizontalLayout {
+        spacing: 0px;
+        vertical-stretch: 1;
+        content := VerticalLayout {
+            padding: Metrics.space-4;
+            horizontal-stretch: 1;
+            Flickable {
+                height: bubble-text.preferred-height;
+                viewport-height: bubble-text.preferred-height;
+                bubble-text := Text {
+                    text: item.text;
+                    font-family: Theme.font-sans;
+                    font-size: 12px * Theme.font-scale;
+                    color: Theme.text-primary;
+                    wrap: word-wrap;
+                    overflow: elide;
+                    horizontal-alignment: left;
+                    vertical-alignment: top;
+                    width: parent.width;
+                }
+            }
+        }
+        VerticalLayout {
+            padding-right: Metrics.space-3;
+            alignment: end;
+            padding-top: Metrics.space-2;
+            vertical-stretch: 0;
+            TouchArea {
+                width: 20px;
+                height: 20px;
+                mouse-cursor: pointer;
+                clicked => { root.copy-message(item.text); }
+                Text {
+                    text: "📋";
+                    font-size: 12px;
+                    width: 100%;
+                    height: 100%;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
             }
         }
     }

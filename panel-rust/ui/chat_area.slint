@@ -10,9 +10,13 @@ import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
 import { AgentBubble } from "./chat-view/components/message/agent_bubble.slint";
 import { QueuedMessageBar } from "./chat-view/components/message/queued_message_bar.slint";
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
+import { ToolGroupView } from "./chat-view/components/message/tool_group_view.slint";
 import { PermissionCard } from "./components/permission_card.slint";
 import { TerminalCard } from "./components/terminal_card.slint";
 import { LocalTerminalCard } from "./components/local_terminal_card.slint";
+import { ThinScrollbar } from "./base/thin_scrollbar.slint";
+import { ApiCallView } from "./chat-view/components/execution/api_call_view.slint";
+import { TerminalView } from "./chat-view/components/execution/terminal_view.slint";
 
 // Header + message stream + compose bar -- Phase 3 of
 // chat-panel-ui-theme-parity.md. Visual source: ui_html/index.html's
@@ -61,6 +65,20 @@ export component ChatArea inherits Rectangle {
     // struct" convention `PendingRequestItem` already established.
     in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
+    in-out property <bool> full-view-open: false;
+    in-out property <int> full-view-group-idx: -1;
+    in-out property <string> full-view-title: "";
+    in-out property <string> full-view-raw-input: "";
+    in-out property <string> full-view-raw-output: "";
+    in-out property <bool> full-view-is-terminal: false;
+    in-out property <bool> full-view-is-mcp: false;
+    // Stack management for nested full views inside popups
+    property <int> prev-full-view-group-idx: -1;
+    property <string> prev-full-view-title: "";
+    property <string> prev-full-view-raw-input: "";
+    property <string> prev-full-view-raw-output: "";
+    property <bool> prev-full-view-is-terminal: false;
+    property <bool> prev-full-view-is-mcp: false;
     // Phase 14: forwarded to ChatInputLayout.inputs-enabled (false for
     // archived threads -- inputs render disabled, not just inert).
     in property <bool> inputs-enabled: true;
@@ -120,6 +138,7 @@ export component ChatArea inherits Rectangle {
     callback thread-rename-cancelled();
     callback thread-rename-confirmed(string);
     callback toggle-expanded(int);
+    callback copy-message(string);
     callback approve-request();
     callback reject-request();
     // One-of permission option pick (optionId from ACP / synthetic id).
@@ -169,6 +188,40 @@ export component ChatArea inherits Rectangle {
             || t == "/demo-approve "
             || t == "demo permission"
             || t == "demo permission ";
+    }
+
+    pure function is-tool-kind(k: string) -> bool {
+        return k == "tool_use" || k == "mcp_server_call" || k == "skill_use" || k == "skill_load" || k == "terminal";
+    }
+
+    pure function count-tool-group(msgs: [MessageItem], s: int) -> int {
+        if (s >= msgs.length || !is-tool-kind(msgs[s].kind)) { return 0; }
+        if (s + 1 >= msgs.length || !is-tool-kind(msgs[s + 1].kind)) { return 1; }
+        if (s + 2 >= msgs.length || !is-tool-kind(msgs[s + 2].kind)) { return 2; }
+        if (s + 3 >= msgs.length || !is-tool-kind(msgs[s + 3].kind)) { return 3; }
+        if (s + 4 >= msgs.length || !is-tool-kind(msgs[s + 4].kind)) { return 4; }
+        if (s + 5 >= msgs.length || !is-tool-kind(msgs[s + 5].kind)) { return 5; }
+        if (s + 6 >= msgs.length || !is-tool-kind(msgs[s + 6].kind)) { return 6; }
+        if (s + 7 >= msgs.length || !is-tool-kind(msgs[s + 7].kind)) { return 7; }
+        if (s + 8 >= msgs.length || !is-tool-kind(msgs[s + 8].kind)) { return 8; }
+        if (s + 9 >= msgs.length || !is-tool-kind(msgs[s + 9].kind)) { return 9; }
+        return 10;
+    }
+
+    pure function in-same-tool-group(msgs: [MessageItem], s: int, c: int) -> bool {
+        if (c < s || c >= msgs.length) { return false; }
+        let diff = c - s;
+        if (diff == 0) { return is-tool-kind(msgs[s].kind); }
+        if (diff == 1) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind); }
+        if (diff == 2) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind); }
+        if (diff == 3) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind); }
+        if (diff == 4) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind); }
+        if (diff == 5) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind); }
+        if (diff == 6) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind); }
+        if (diff == 7) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind) && is-tool-kind(msgs[s + 7].kind); }
+        if (diff == 8) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind) && is-tool-kind(msgs[s + 7].kind) && is-tool-kind(msgs[s + 8].kind); }
+        if (diff == 9) { return is-tool-kind(msgs[s].kind) && is-tool-kind(msgs[s + 1].kind) && is-tool-kind(msgs[s + 2].kind) && is-tool-kind(msgs[s + 3].kind) && is-tool-kind(msgs[s + 4].kind) && is-tool-kind(msgs[s + 5].kind) && is-tool-kind(msgs[s + 6].kind) && is-tool-kind(msgs[s + 7].kind) && is-tool-kind(msgs[s + 8].kind) && is-tool-kind(msgs[s + 9].kind); }
+        return is-tool-kind(msgs[c].kind);
     }
 
     property <PendingRequestItem> demo-pending: {
@@ -308,6 +361,14 @@ export component ChatArea inherits Rectangle {
     // How far the message Flickable can scroll -- viewport-y ranges from
     // `-msg-max-scroll` (bottom) to 0 (top).
     property <length> msg-max-scroll: Math.max(0px, message-scroll.viewport-height - message-scroll.height);
+    // Independent scroll position for the popup view (not synced with main message scroll)
+    property <length> popup-scroll-y: 0px;
+
+    changed full-view-open => {
+        if (root.full-view-open) {
+            root.popup-scroll-y = 0px;
+        }
+    }
 
     main-layout := VerticalLayout {
         width: parent.width;
@@ -555,18 +616,6 @@ export component ChatArea inherits Rectangle {
                             color: Theme.bg-primary;
                         }
                     }
-                    IconButton {
-                        active: local-terminal.open;
-                        button-accessible-label: "Toggle local terminal";
-                        clicked => { local-terminal-toggle-requested(); }
-                        Text {
-                            text: "\u{2318}";
-                            color: local-terminal.open ? Theme.bg-primary : Theme.text-secondary;
-                            font-size: 12px * Theme.font-scale;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
                 }
             }
         }
@@ -731,6 +780,7 @@ export component ChatArea inherits Rectangle {
                 // chat-items-redesign.md #11: kind switch — user /
                 // agent|thinking / tool-event / legacy MessageCard.
                 for msg[i] in messages : HorizontalLayout {
+                    padding-right: compact ? Metrics.space-2 : Metrics.space-4;
                     property <bool> is-queued: msg.queued;
                     // Phase 18: synthetic awaiting-response row (models.rs
                     // appends kind "pending" while a just-sent user message
@@ -740,16 +790,15 @@ export component ChatArea inherits Rectangle {
                     property <bool> is-user: msg.kind == "user" && !msg.queued;
                     property <bool> is-agent-side: msg.kind == "agent"
                         || msg.kind == "thinking";
-                    property <bool> is-tool-event: msg.kind == "tool_use"
-                        || msg.kind == "mcp_server_call"
-                        || msg.kind == "skill_load"
-                        || msg.kind == "skill_use"
-                        || msg.kind == "terminal";
+                    property <bool> is-tool-event: root.is-tool-kind(msg.kind);
+                    property <bool> is-first-tool-event: is-tool-event && (i == 0 ? true : !root.is-tool-kind(root.messages[i - 1].kind));
                     // Active-session rail on the *latest* row while the
                     // thread is loading (same `sending` state as the
                     // header/sidebar spinner). Pulse *flows* top → bottom.
                     property <bool> is-live-tail:
                         root.sending && i == root.messages.length - 1;
+                    property <int> tool-group-size:
+                        root.count-tool-group(root.messages, i);
                     // Fixed gutter widths — never toggle 0↔N when the live
                     // rail appears, or the bubble column jumps horizontally.
                     property <length> rail-w: 3px;
@@ -808,7 +857,7 @@ export component ChatArea inherits Rectangle {
                     }
                     // Gap after rail / user indent — fixed per kind.
                     Rectangle {
-                        width: is-user ? user-indent : rail-gap;
+                        width: is-user ? 36px : rail-gap;
                         horizontal-stretch: 0;
                     }
                     if is-pending : HorizontalLayout {
@@ -855,6 +904,7 @@ export component ChatArea inherits Rectangle {
                         preferred-width: 0px;
                         min-width: 0px;
                         item: msg;
+                        copy-message(text) => { root.copy-message(text); }
                     }
                     if is-agent-side : AgentBubble {
                         link-activated(target) => { root.md-link-activated(target); }
@@ -867,25 +917,48 @@ export component ChatArea inherits Rectangle {
                         // shared toggle-expanded round-trip (same as
                         // ToolEventRow / MessageCard log bodies).
                         toggle-expanded(idx) => { toggle-expanded(idx); }
+                        copy-message(text) => { root.copy-message(text); }
                     }
-                    if is-tool-event : ToolEventRow {
+                    if is-first-tool-event : ToolGroupView {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
-                        vertical-stretch: 0;
-                        kind: msg.kind;
-                        first-use: msg.first-use;
-                        text: msg.text;
-                        cap-height: root.height * 0.3;
-                        // chat-items-remaining-wiring.md #4: execution-view
-                        // content (terminal/api-call) click-to-open state,
-                        // same `expanded`/`index` round-trip `MessageCard`
-                        // already uses for its own log body.
-                        raw-input: msg.raw-input;
-                        raw-output: msg.raw-output;
-                        expanded: msg.expanded;
-                        index: msg.index;
-                        toggle-expanded(idx) => { toggle-expanded(idx); }
+                        label: msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE";
+                        item-count: tool-group-size;
+                        loading: is-live-tail;
+                        default-expanded: (i + tool-group-size) >= root.messages.length;
+                        max-visible-height: min(230px, root.height * 0.35);
+                        open-group-full-view => {
+                            root.full-view-title = (msg.kind == "mcp_server_call" ? "MCP CALL" : "TOOL USE") + " EXECUTION (" + tool-group-size + " TOTAL CALLS)";
+                            root.full-view-is-mcp = msg.kind == "mcp_server_call";
+                            root.full-view-group-idx = i;
+                            root.full-view-open = true;
+                        }
+                        for sub-msg[sub-idx] in root.messages : ToolEventRow {
+                            visible: sub-idx >= i && root.in-same-tool-group(root.messages, i, sub-idx);
+                            height: self.visible ? self.preferred-height : 0px;
+                            horizontal-stretch: self.visible ? 1 : 0;
+                            vertical-stretch: 0;
+                            in-group: true;
+                            kind: sub-msg.kind;
+                            first-use: sub-msg.first-use;
+                            text: sub-msg.text;
+                            cap-height: root.height * 0.3;
+                            raw-input: sub-msg.raw-input;
+                            raw-output: sub-msg.raw-output;
+                            expanded: sub-msg.expanded;
+                            index: sub-msg.index;
+                            toggle-expanded(idx) => { toggle-expanded(idx); }
+                            open-full-view(title, input, output, term, mcp) => {
+                                root.full-view-title = title;
+                                root.full-view-raw-input = input;
+                                root.full-view-raw-output = output;
+                                root.full-view-is-terminal = term;
+                                root.full-view-is-mcp = mcp;
+                                root.full-view-group-idx = -1;
+                                root.full-view-open = true;
+                            }
+                        }
                     }
                     if !is-queued && !is-user && !is-agent-side && !is-tool-event : card := MessageCard {
                         horizontal-stretch: 1;
@@ -894,7 +967,10 @@ export component ChatArea inherits Rectangle {
                         item: msg;
                         toggle-expanded(idx) => { toggle-expanded(idx); }
                     }
-                    Rectangle { width: 0px; }
+                    Rectangle {
+                        width: (is-agent-side || is-first-tool-event) ? 36px : 0px;
+                        horizontal-stretch: 0;
+                    }
                 }
             }
             }
@@ -933,6 +1009,175 @@ export component ChatArea inherits Rectangle {
                         : @image-url("./assets/icons/arrow-down.svg");
                     size: Metrics.icon-sm;
                     color: Theme.text-on-primary;
+                }
+            }
+
+            // Right-side auto-hiding thin scrollbar for chat view
+            ThinScrollbar {
+                x: parent.width - self.width - 2px;
+                y: 4px;
+                visible-height: parent.height - 8px;
+                viewport-height: message-col.preferred-height;
+                viewport-y <=> message-scroll.viewport-y;
+                thumb-width: 4px;
+                active: !root.stick-to-bottom;
+            }
+
+            // Centered full view overlay popup inside message-area (between top bar & chat input)
+            // Only show full-view backdrop if full-view is explicitly open (not just inherited from popup)
+            if root.full-view-open : Rectangle {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                background: #00000080;
+
+                TouchArea {
+                    // Only close full-view, restoring previous state if nested
+                    clicked => {
+                        if (root.prev-full-view-group-idx >= 0) {
+                            // Restore previous popup state
+                            root.full-view-group-idx = root.prev-full-view-group-idx;
+                            root.full-view-title = root.prev-full-view-title;
+                            root.full-view-raw-input = root.prev-full-view-raw-input;
+                            root.full-view-raw-output = root.prev-full-view-raw-output;
+                            root.full-view-is-terminal = root.prev-full-view-is-terminal;
+                            root.full-view-is-mcp = root.prev-full-view-is-mcp;
+                            root.prev-full-view-group-idx = -1;
+                        } else {
+                            // Close full view completely
+                            root.full-view-open = false;
+                            root.full-view-title = "";
+                            root.full-view-raw-input = "";
+                            root.full-view-raw-output = "";
+                        }
+                    }
+                }
+
+                Rectangle {
+                    x: max(10px, (parent.width - 720px) / 2);
+                    y: max(10px, (parent.height - 520px) / 2);
+                    width: min(parent.width - 20px, 720px);
+                    height: min(parent.height - 20px, 520px);
+                    background: Theme.bg-sidebar;
+                    border-width: 0px;
+                    border-radius: Theme.radius-lg;
+                    drop-shadow-blur: 16px;
+                    drop-shadow-color: #00000080;
+
+                    TouchArea {
+                        // Intercept clicks on dialog card body so backdrop touch doesn't close
+                    }
+
+                    VerticalLayout {
+                        padding: Metrics.space-6;
+                        spacing: Metrics.space-3;
+
+                        // Header Bar
+                        HorizontalLayout {
+                            spacing: Metrics.space-2;
+                            Icon {
+                                source: root.full-view-is-mcp ? @image-url("./assets/icons/plug-zap.svg") : @image-url("./assets/icons/wrench.svg");
+                                size: 16px;
+                                color: Theme.text-primary;
+                            }
+                            Text {
+                                text: root.full-view-title != "" ? root.full-view-title : "FULL CALL DETAILS & PAYLOAD";
+                                font-family: Theme.font-mono;
+                                font-size: 11px * Theme.font-scale;
+                                font-weight: 700;
+                                color: Theme.text-primary;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; height: 0px; }
+                            TouchArea {
+                                width: 20px;
+                                height: 20px;
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (root.prev-full-view-group-idx >= 0) {
+                                        // Restore previous popup state
+                                        root.full-view-group-idx = root.prev-full-view-group-idx;
+                                        root.full-view-title = root.prev-full-view-title;
+                                        root.full-view-raw-input = root.prev-full-view-raw-input;
+                                        root.full-view-raw-output = root.prev-full-view-raw-output;
+                                        root.full-view-is-terminal = root.prev-full-view-is-terminal;
+                                        root.full-view-is-mcp = root.prev-full-view-is-mcp;
+                                        root.prev-full-view-group-idx = -1;
+                                    } else {
+                                        // Close full view completely
+                                        root.full-view-open = false;
+                                        root.full-view-title = "";
+                                        root.full-view-raw-input = "";
+                                        root.full-view-raw-output = "";
+                                    }
+                                }
+                                Text {
+                                    text: "\u{2715}";
+                                    color: Theme.text-muted;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Theme.border-default; }
+
+                        Flickable {
+                            horizontal-stretch: 1;
+                            vertical-stretch: 1;
+                            viewport-height: popup-content.preferred-height;
+                            viewport-y <=> root.popup-scroll-y;
+
+                            popup-content := VerticalLayout {
+                                spacing: Metrics.space-2;
+                                if root.full-view-group-idx >= 0 : VerticalLayout {
+                                    spacing: Metrics.space-2;
+                                    for sub-msg[sub-idx] in root.messages : ToolEventRow {
+                                        visible: sub-idx >= root.full-view-group-idx && root.in-same-tool-group(root.messages, root.full-view-group-idx, sub-idx);
+                                        height: self.visible ? self.preferred-height : 0px;
+                                        horizontal-stretch: self.visible ? 1 : 0;
+                                        vertical-stretch: 0;
+                                        in-group: true;
+                                        kind: sub-msg.kind;
+                                        first-use: sub-msg.first-use;
+                                        text: sub-msg.text;
+                                        cap-height: 260px;
+                                        raw-input: sub-msg.raw-input;
+                                        raw-output: sub-msg.raw-output;
+                                        expanded: true;
+                                        index: sub-msg.index;
+                                        toggle-expanded(idx) => { toggle-expanded(idx); }
+                                        open-full-view(title, input, output, term, mcp) => {
+                                            // Save current state for nested popup (stack style)
+                                            root.prev-full-view-group-idx = root.full-view-group-idx;
+                                            root.prev-full-view-title = root.full-view-title;
+                                            root.prev-full-view-raw-input = root.full-view-raw-input;
+                                            root.prev-full-view-raw-output = root.full-view-raw-output;
+                                            root.prev-full-view-is-terminal = root.full-view-is-terminal;
+                                            root.prev-full-view-is-mcp = root.full-view-is-mcp;
+                                            // Switch to nested full view
+                                            root.full-view-title = title;
+                                            root.full-view-raw-input = input;
+                                            root.full-view-raw-output = output;
+                                            root.full-view-is-terminal = term;
+                                            root.full-view-is-mcp = mcp;
+                                            root.full-view-group-idx = -1;
+                                            root.full-view-open = true;
+                                        }
+                                    }
+                                }
+                                if root.full-view-group-idx < 0 && root.full-view-is-terminal : TerminalView {
+                                    command: root.full-view-raw-input;
+                                    output: root.full-view-raw-output;
+                                }
+                                if root.full-view-group-idx < 0 && !root.full-view-is-terminal : ApiCallView {
+                                    raw-input: root.full-view-raw-input;
+                                    raw-output: root.full-view-raw-output;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

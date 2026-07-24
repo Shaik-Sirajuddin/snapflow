@@ -1213,6 +1213,13 @@ pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
         .any(|item| matches!(item, Dirty::MessagesDiff { .. })));
 }
 
+pub(crate) fn dispatch_copy_message(panel: &PanelSingleton, text: String) {
+    let _ = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Chrome(ChromeMsg::CopyMessageRequested { text })),
+    );
+}
+
 // Host-domain wrapper (tea-slint-model Phase 4, non-Slint-callback FFI
 // entry points -- see 00-plan.md's "Msg source coverage" point 3). Same
 // bridge shape as every UI domain above.

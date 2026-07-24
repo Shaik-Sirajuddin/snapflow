@@ -168,13 +168,22 @@ export component SidebarThreadRow inherits HoverSurface {
                         text: thread.name;
                         color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
                         font-size: 11px * Theme.font-scale;
-                        font-weight: 700;
+                        font-weight: 600;
                         font-family: Theme.font-sans;
                         vertical-alignment: center;
                         overflow: elide;
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
+                    }
+                    if expanded && thread.relative-time != "" && rename-thread-index != index : Text {
+                        text: thread.relative-time;
+                        color: index == selected-thread ? Theme.bg-primary : (thread.relative-time == "now" ? Theme.text-accent-bright : Theme.text-secondary);
+                        font-size: 9px * Theme.font-scale;
+                        font-weight: thread.relative-time == "now" ? 600 : 400;
+                        font-family: Theme.font-mono;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
                     }
                     rename-editor := Rectangle {
                         visible: expanded && rename-thread-index == index;

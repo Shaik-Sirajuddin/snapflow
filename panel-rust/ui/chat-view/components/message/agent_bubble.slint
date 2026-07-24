@@ -18,22 +18,34 @@ export component AgentBubble inherits Rectangle {
     // round-trip through ChromeMsg::ToggleExpanded). Only meaningful for
     // thinking rows; agent rows ignore it.
     callback toggle-expanded(int);
+    callback copy-message(string);
 
     property <bool> is-thinking: item.kind == "thinking";
     property <bool> is-agent: item.kind == "agent";
 
     vertical-stretch: 0;
 
-    // Subtle agent fill (Theme.bg-agent-bubble) — quieter than
-    // primary-container so messages sit softly on bg-chat.
-    background: is-thinking ? transparent : Theme.bg-agent-bubble;
+    // Contrasting agent fill (Theme.bg-tertiary)
+    background: is-thinking ? transparent : Theme.bg-tertiary;
     border-width: 0px;
     border-top-left-radius: is-thinking ? 0px : Theme.radius-lg;
     border-top-right-radius: is-thinking ? 0px : Theme.radius-lg;
     border-bottom-left-radius: is-thinking ? 0px : Metrics.radius-corner-cut;
     border-bottom-right-radius: is-thinking ? 0px : Theme.radius-lg;
 
-    content := VerticalLayout {
+    HorizontalLayout {
+        spacing: 0px;
+        vertical-stretch: 1;
+        if is-agent : Rectangle {
+            width: 3px;
+            height: 14px;
+            background: Theme.md-link;
+            border-radius: 1px;
+            horizontal-stretch: 0;
+            vertical-stretch: 0;
+            y: Metrics.space-4;
+        }
+        content := VerticalLayout {
         // Stretch the body across the full bubble width. MarkdownView
         // left-packs its runs *inside* that full width (see its module
         // comment). Using `alignment: start` here was wrong for the
@@ -129,6 +141,27 @@ export component AgentBubble inherits Rectangle {
                     min-width: 0px;
                     lines: item.markdown-lines;
                     fallback-text: item.text;
+                }
+            }
+        }
+        }
+        if is-agent : VerticalLayout {
+            padding-right: Metrics.space-3;
+            alignment: end;
+            padding-top: Metrics.space-2;
+            vertical-stretch: 0;
+            TouchArea {
+                width: 20px;
+                height: 20px;
+                mouse-cursor: pointer;
+                clicked => { root.copy-message(item.text); }
+                Text {
+                    text: "📋";
+                    font-size: 12px;
+                    width: 100%;
+                    height: 100%;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
                 }
             }
         }

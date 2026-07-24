@@ -1,0 +1,189 @@
+import { Theme } from "../../../tokens/theme.slint";
+import { Metrics } from "../../../tokens/metrics.slint";
+import { Badge } from "../../../base/badge.slint";
+import { Icon } from "../../../base/icon.slint";
+import { DynamicModal } from "../../../base/dynamic_modal.slint";
+
+// Grouped / scrollable container box for tool calls and MCP calls.
+// Provides:
+// 1. Top header label bar: "TOOL USE" / "MCP CALL" + call count badge.
+// 2. Distinct container background (Theme.bg-tertiary) + border (Theme.border-strong).
+// 3. Capped height (defaults to 230px, approx 5 tool calls height), automatically
+//    becoming internally scrollable via Flickable when content exceeds the cap.
+export component ToolGroupView inherits Rectangle {
+    in property <string> label: "TOOL USE";
+    in property <int> item-count: 0;
+    // Capped height for ~5 tool calls (~44px per row * 5 + padding)
+    in property <length> max-visible-height: 230px;
+    in property <length> scrollbar-item-width: 3px;
+    in property <bool> show-header: true;
+    in property <bool> loading: false;
+    in property <bool> default-expanded: false;
+    in-out property <bool> expanded: default-expanded;
+    changed default-expanded => { expanded = default-expanded; }
+    in-out property <bool> maximized: false;
+    callback open-group-full-view();
+
+    // Active tool call index computed from viewport position
+    property <int> current-index: (root.item-count <= 1 || body-layout.preferred-height <= 0px) ? 0 :
+        min(root.item-count - 1, max(0, Math.floor((- flickable.viewport-y + 20px) / (body-layout.preferred-height / max(1, root.item-count)))));
+
+    // Left-rail vertical pulse animation during active loading execution
+    property <float> pulse-opacity: root.loading ? (0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms))) : 0.0;
+
+    background: Theme.bg-agent-bubble;
+    border-color: transparent;
+    border-width: 0px;
+    border-radius: Theme.radius-md;
+    vertical-stretch: 0;
+
+    preferred-height: !root.expanded ? 32px
+        : root.maximized ? (36px + body-layout.preferred-height)
+        : min(36px + body-layout.preferred-height, root.max-visible-height);
+
+    // Left sidebar vertical pulse rail for active loading execution
+    if root.loading : Rectangle {
+        x: 0px;
+        y: Metrics.space-1;
+        width: 3px;
+        height: parent.height - (Metrics.space-1 * 2);
+        border-radius: 1.5px;
+        background: Theme.text-primary;
+        opacity: root.pulse-opacity;
+    }
+
+    VerticalLayout {
+        padding: Metrics.space-2;
+        spacing: Metrics.space-2;
+
+        // Top Header Bar: label + tool count badge + Fullscreen button + Top-Right Expand/Collapse toggle button
+        if root.show-header : HorizontalLayout {
+            spacing: Metrics.space-2;
+
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: root.label == "MCP CALL" ? @image-url("../../../assets/icons/plug-zap.svg") : @image-url("../../../assets/icons/wrench.svg");
+                    size: 14px;
+                    color: Theme.text-primary;
+                }
+            }
+
+            Text {
+                text: root.label;
+                font-family: Theme.font-mono;
+                font-size: 10px * Theme.font-scale;
+                font-weight: 600;
+                letter-spacing: 0.8px;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+
+            // Horizontal spacer
+            Rectangle { horizontal-stretch: 1; height: 0px; }
+
+            if root.item-count > 0 : Badge {
+                label: root.item-count + (root.item-count == 1 ? " call" : " calls");
+                bg: Theme.bg-sidebar;
+                fg: Theme.text-primary;
+                border-col: transparent;
+                border-w: 0px;
+            }
+
+            // Top-right Fullscreen Popup Button in Header
+            TouchArea {
+                width: 22px;
+                height: 22px;
+                mouse-cursor: pointer;
+                clicked => {
+                    root.maximized = !root.maximized;
+                    root.expanded = true;
+                    root.open-group-full-view();
+                }
+
+                Rectangle {
+                    background: root.maximized ? Theme.bg-tertiary : (parent.has-hover ? Theme.bg-sidebar : transparent);
+                    border-radius: Theme.radius-sm;
+                    animate background { duration: 120ms; }
+
+                    Icon {
+                        source: @image-url("../../../assets/icons/maximize-2.svg");
+                        size: 14px;
+                        color: Theme.text-primary;
+                    }
+                }
+            }
+
+            // Top-right Expand / Collapse Toggle Button in Header with smooth rotation animation
+            TouchArea {
+                width: 22px;
+                height: 22px;
+                mouse-cursor: pointer;
+                clicked => { root.expanded = !root.expanded; }
+
+                Rectangle {
+                    background: parent.has-hover ? Theme.bg-sidebar : transparent;
+                    border-radius: Theme.radius-sm;
+                    animate background { duration: 120ms; }
+
+                    Icon {
+                        source: @image-url("../../../assets/icons/arrow-down.svg");
+                        size: 13px;
+                        color: Theme.text-secondary;
+                        transform-rotation: root.expanded ? 0deg : 180deg;
+                        animate transform-rotation { duration: 180ms; easing: ease-in-out; }
+                    }
+                }
+            }
+        }
+
+        // Separator line under header (visible when expanded)
+        if root.show-header && root.expanded : Rectangle {
+            height: 1px;
+            background: Theme.border-default;
+        }
+
+        // Main content area with scrollable Flickable + right-side fixed index scrollbar
+        HorizontalLayout {
+            visible: root.expanded;
+            height: root.expanded ? (root.maximized ? body-layout.preferred-height : min(body-layout.preferred-height, root.max-visible-height)) : 0px;
+            spacing: Metrics.space-2;
+
+            flickable := Flickable {
+                height: parent.height;
+                viewport-height: body-layout.preferred-height;
+                horizontal-stretch: 1;
+
+                body-layout := VerticalLayout {
+                    spacing: 0px;
+                    @children
+                }
+            }
+
+            // Fixed index scrollbar rail mapping directly to each tool call item
+            if root.item-count > 1 : VerticalLayout {
+                width: root.scrollbar-item-width;
+                alignment: center;
+                spacing: 3px;
+
+                for idx in root.item-count : Rectangle {
+                    height: max(6px, min(24px, (root.max-visible-height - (root.item-count * 3px)) / max(1, root.item-count)));
+                    width: root.scrollbar-item-width;
+                    border-radius: 2px;
+                    background: (idx == root.current-index) ? Theme.text-primary : Theme.border-strong;
+                    opacity: (idx == root.current-index) ? 1.0 : 0.45;
+                    animate opacity { duration: 150ms; easing: ease-out; }
+                    animate background { duration: 150ms; easing: ease-out; }
+
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            let step = body-layout.preferred-height / max(1, root.item-count);
+                            flickable.viewport-y = - min(body-layout.preferred-height - root.max-visible-height, idx * step);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -988,6 +988,7 @@ pub fn build_thread_items<N: AsRef<str>>(
             session_id: None,
             item: ThreadItem {
                 name: name.as_ref().into(),
+                relative_time: String::from("now").into(),
                 // Archived takes precedence over closed: it is the final,
                 // explicitly-chosen state, whereas closed can still precede
                 // an archive action on the same thread.

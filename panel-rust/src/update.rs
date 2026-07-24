@@ -114,11 +114,33 @@ pub(crate) fn selected_real_index(model: &Model) -> usize {
 // real-backend test can build the exact row shape production actually
 // produces, rather than hand-crafting a fixture that risks silently
 // drifting from what this function really outputs.
+pub(crate) fn format_relative_time(last_activity: Option<std::time::Instant>, state: &ThreadState) -> String {
+    if matches!(state, ThreadState::Loading | ThreadState::Cancelling) {
+        return "now".to_string();
+    }
+    let Some(t) = last_activity else {
+        return "now".to_string();
+    };
+    let elapsed = t.elapsed().as_secs();
+    if elapsed < 60 {
+        "now".to_string()
+    } else if elapsed < 3600 {
+        format!("{}m", elapsed / 60)
+    } else if elapsed < 86400 {
+        format!("{}h", elapsed / 3600)
+    } else if elapsed < 604800 {
+        format!("{}d", elapsed / 86400)
+    } else {
+        format!("{}w", elapsed / 604800)
+    }
+}
+
 pub(crate) fn visible_thread_row(
     model: &Model,
     real_index: usize,
 ) -> Option<crate::models::VisibleThreadItem> {
     let thread = model.threads.get(real_index)?;
+    let rel_time = format_relative_time(thread.last_activity_time, &thread.state);
     // Prefer durable id; fall back to synthetic so keys always match
     // what ThreadListDiff stored when bridge binding was not yet known.
     let thread_id = if thread.thread_id.is_empty() {
@@ -151,6 +173,7 @@ pub(crate) fn visible_thread_row(
         session_id: thread.session_id.clone(),
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
+            relative_time: rel_time.into(),
             status: status.into(),
             busy: matches!(
                 thread.state,
@@ -667,6 +690,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             thread.error = None;
             thread.state = ThreadState::Loading;
             thread.agent_content_this_turn = false;
+            thread.last_activity_time = Some(std::time::Instant::now());
             // Sending resumes auto-processing after a manual stop.
             thread.send_queue.resume();
             (
@@ -1213,6 +1237,10 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
                 }],
             )
         }
+        ChromeMsg::CopyMessageRequested { text } => (
+            vec![Effect::ClipboardWrite { text }],
+            vec![],
+        ),
         ChromeMsg::ErrorBannerDismissed => {
             let real_idx = selected_real_index(model);
             let Some(thread) = model.threads.get_mut(real_idx) else {
@@ -1656,6 +1684,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 ) {
                     thread.agent_content_this_turn = true;
                 }
+                thread.last_activity_time = Some(std::time::Instant::now());
                 dirty.push(Dirty::MessageAppended {
                     thread_id: thread.thread_id.clone(),
                 });
@@ -1671,6 +1700,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 let was_generating = matches!(thread.state, ThreadState::Loading);
                 thread.state = ThreadState::Idle;
                 thread.error = None;
+                thread.last_activity_time = Some(std::time::Instant::now());
                 crate::trace_host_input(format_args!(
                     "turn ended thread={} reason={:?}",
                     bridge_event.thread_index, reason

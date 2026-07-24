@@ -249,6 +249,7 @@ export component ChatPanel inherits Window {
     callback recover-session-attach(string, string, string);
     callback search-changed(string);
     callback toggle-expanded(int);
+    callback copy-message(string);
     callback approve-request();
     callback reject-request();
     // One-of permission option pick (ACP optionId or synthetic approve/reject).
@@ -548,6 +549,7 @@ export component ChatPanel inherits Window {
                     root.confirm-thread-rename(selected-thread, name);
                 }
                 toggle-expanded(i) => { toggle-expanded(i); }
+                copy-message(text) => { copy-message(text); }
                 pending-request: pending-request;
                 approve-request => { approve-request(); }
                 reject-request => { reject-request(); }

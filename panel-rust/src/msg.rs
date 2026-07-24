@@ -230,6 +230,7 @@ pub enum ChromeMsg {
         show_global: bool,
     },
     ToggleExpanded(usize),
+    CopyMessageRequested { text: String },
     ErrorBannerDismissed,
 }
 

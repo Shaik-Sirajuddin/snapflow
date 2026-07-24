@@ -1,6 +1,8 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
+import { ApiCallView } from "../chat-view/components/execution/api_call_view.slint";
+import { TerminalView } from "../chat-view/components/execution/terminal_view.slint";
 
 // Capped-height + scroll + expand-on-click shell -- chat-items-redesign.md
 // #7 ("execution-view"). Hidden/collapsed by default per the spec's
@@ -13,8 +15,13 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 export component ExpandablePanel {
     in property <length> collapsed-max-height: 140px;
     in property <bool> collapsed-by-default: true;
+    in property <string> raw-input: "";
+    in property <string> raw-output: "";
+    in property <bool> is-terminal: false;
+    in property <string> title: "FULL CALL DETAILS & PAYLOAD";
     property <bool> expanded: !collapsed-by-default;
     callback toggled(bool);
+    callback open-full-view();
 
     VerticalLayout {
         spacing: Metrics.space-2;
@@ -43,21 +50,30 @@ export component ExpandablePanel {
                 accessible-label: expanded ? "Collapse view" : "Open full view";
                 accessible-action-default => {
                     expanded = !expanded;
+                    if (expanded) {
+                        open-full-view();
+                    }
                     toggled(expanded);
                 }
                 clicked => {
                     expanded = !expanded;
+                    if (expanded) {
+                        open-full-view();
+                    }
                     toggled(expanded);
                 }
                 changed has-hover => { CursorHost.kind = self.has-hover ? "pointer" : "default"; }
-            }
-            Text {
-                text: expanded ? "Show less" : "Open full view";
-                color: Theme.text-secondary;
-                font-size: 9px * Theme.font-scale;
-                font-family: Theme.font-mono;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; height: 0px; }
+                    Text {
+                        text: root.expanded ? "Show less" : "Open full view";
+                        color: Theme.text-secondary;
+                        font-size: 9px * Theme.font-scale;
+                        font-family: Theme.font-mono;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                }
             }
         }
     }

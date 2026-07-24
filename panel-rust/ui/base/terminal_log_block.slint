@@ -15,9 +15,9 @@ export component TerminalLogBlock inherits Rectangle {
     in property <bool> scrollable: true;
     in property <TextOverflow> text-overflow: clip;
 
-    background: Theme.bg-terminal;
-    border-color: Theme.border-terminal;
-    border-width: 1px;
+    background: Theme.bg-tertiary;
+    border-color: transparent;
+    border-width: 0px;
     border-radius: Theme.radius-sm;
 
     VerticalLayout {
@@ -30,7 +30,7 @@ export component TerminalLogBlock inherits Rectangle {
                 text: root.text;
                 font-family: Theme.font-mono;
                 font-size: root.font-size * Theme.font-scale;
-                color: Theme.text-terminal;
+                color: Theme.text-primary;
                 wrap: word-wrap;
                 horizontal-alignment: left;
                 vertical-alignment: top;
@@ -41,7 +41,7 @@ export component TerminalLogBlock inherits Rectangle {
             text: root.text;
             font-family: Theme.font-mono;
             font-size: root.font-size * Theme.font-scale;
-            color: Theme.text-terminal;
+            color: Theme.text-primary;
             wrap: word-wrap;
             overflow: root.text-overflow;
             horizontal-alignment: left;

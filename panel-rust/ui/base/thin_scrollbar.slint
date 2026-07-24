@@ -1,0 +1,50 @@
+import { Theme } from "../tokens/theme.slint";
+import { Metrics } from "../tokens/metrics.slint";
+
+// Common reusable auto-hiding thin scrollbar component for chat-view and scrollable blocks.
+// - Width minimized (default 4px)
+// - Fades out smoothly when not actively scrolling or hovered
+// - Drag & click position tracking supported
+export component ThinScrollbar inherits Rectangle {
+    in property <length> viewport-height: 1px;
+    in property <length> visible-height: 1px;
+    in-out property <length> viewport-y: 0px;
+    in property <length> thumb-width: 4px;
+    in property <bool> active: false;
+
+    property <bool> is-overflowing: root.viewport-height > root.visible-height;
+    property <length> thumb-h: max(24px, root.visible-height * (root.visible-height / max(1px, root.viewport-height)));
+    property <length> max-travel: max(1px, root.visible-height - root.thumb-h);
+    property <length> scroll-range: max(1px, root.viewport-height - root.visible-height);
+    property <length> thumb-pos-y: (- root.viewport-y) * (root.max-travel / root.scroll-range);
+
+    width: root.thumb-width;
+    visible: root.is-overflowing;
+
+    // Fades out completely during non-scroll idle
+    opacity: (root.active || touch.has-hover) ? 1.0 : 0.0;
+    animate opacity { duration: 300ms; easing: ease-out; }
+
+    Rectangle {
+        x: 0px;
+        y: min(root.max-travel, max(0px, root.thumb-pos-y));
+        width: root.thumb-width;
+        height: root.thumb-h;
+        border-radius: root.thumb-width / 2;
+        background: touch.has-hover ? Theme.text-primary : Theme.text-muted.with-alpha(0.5);
+        animate background { duration: 150ms; }
+    }
+
+    touch := TouchArea {
+        width: root.thumb-width + 6px;
+        x: - 3px;
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down || event.kind == PointerEventKind.move) {
+                let target-y = self.mouse-y - (root.thumb-h / 2);
+                let ratio = max(0.0, min(1.0, target-y / root.max-travel));
+                root.viewport-y = - (ratio * root.scroll-range);
+            }
+        }
+    }
+}
