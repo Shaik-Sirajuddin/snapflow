@@ -188,6 +188,20 @@ export struct TerminalItem {
     truncated: bool,
     has-exited: bool,
     exit-code: int,
+    // PUI-002 (background-terminals popup): per-terminal metadata shown as a
+    // boxed item in the chip-toggled popup.
+    // Display title for the terminal (currently the terminal-id; a real
+    // command title arrives once acpx-core carries the terminal/create
+    // command into the output stream -- see meta PUI-002 cross_crate_constraint).
+    title: string,
+    // The command that spawned this terminal, when known (empty until the
+    // acpx-core protocol change lands).
+    last-command: string,
+    // Pre-formatted local start time ("HH:MM:SS"), or "" for a terminal
+    // restored from cache (original start time not persisted).
+    started-at: string,
+    // Whether the terminal's command is still running (not exited).
+    active: bool,
 }
 
 // Profile-picker addition: one profile row as returned by

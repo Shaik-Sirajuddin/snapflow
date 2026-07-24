@@ -515,6 +515,10 @@ impl<'a> ExternalSnapshotSource<'a> {
             bridge
                 .terminal_buffer(real_idx, &id)
                 .map(|buffer| crate::TerminalItem {
+                    title: id.clone().into(),
+                    last_command: String::new().into(),
+                    started_at: crate::models::format_terminal_start_time(buffer.started_at).into(),
+                    active: buffer.exit_status.is_none(),
                     terminal_id: id.into(),
                     output: buffer.output.into(),
                     truncated: buffer.truncated,

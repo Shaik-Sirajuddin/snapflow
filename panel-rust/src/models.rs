@@ -1105,11 +1105,35 @@ pub fn to_terminal_items(entries: Vec<(String, Option<TerminalBuffer>)>) -> Mode
 }
 
 /// Builds concrete terminal rows for a reducer-owned thread snapshot.
+/// PUI-002: format a terminal's first-seen unix-millis timestamp as a stable
+/// `HH:MM:SS` clock string (UTC) for the popup's start-time column. Empty for
+/// a terminal with no known start time (restored from cache). UTC keeps it
+/// dependency-free and stable across frames; a real command title/local-time
+/// arrives with the acpx-core change (see meta PUI-002).
+pub fn format_terminal_start_time(started_at: Option<u64>) -> String {
+    match started_at {
+        Some(ms) => {
+            let seconds_of_day = (ms / 1000) % 86_400;
+            format!(
+                "{:02}:{:02}:{:02}",
+                seconds_of_day / 3600,
+                (seconds_of_day % 3600) / 60,
+                seconds_of_day % 60
+            )
+        }
+        None => String::new(),
+    }
+}
+
 pub fn to_terminal_item_rows(entries: Vec<(String, Option<TerminalBuffer>)>) -> Vec<TerminalItem> {
     entries
         .into_iter()
         .map(|(terminal_id, buffer)| match buffer {
             Some(buffer) => TerminalItem {
+                title: terminal_id.clone().into(),
+                last_command: String::new().into(),
+                started_at: format_terminal_start_time(buffer.started_at).into(),
+                active: buffer.exit_status.is_none(),
                 terminal_id: terminal_id.into(),
                 output: buffer.output.into(),
                 truncated: buffer.truncated,
@@ -1120,6 +1144,10 @@ pub fn to_terminal_item_rows(entries: Vec<(String, Option<TerminalBuffer>)>) -> 
                     .unwrap_or_default(),
             },
             None => TerminalItem {
+                title: terminal_id.clone().into(),
+                last_command: String::new().into(),
+                started_at: String::new().into(),
+                active: false,
                 terminal_id: terminal_id.into(),
                 output: String::new().into(),
                 truncated: false,
@@ -1798,6 +1826,31 @@ mod tests {
         let msgs = vec![chat_msg(MessageKind::ToolCall, "x", Some("completed"))];
         let model = to_message_model(msgs, &[true]);
         assert!(model.row_data(0).unwrap().expanded);
+    }
+
+    #[test]
+    fn terminal_start_time_formats_millis_as_hhmmss_and_empty_when_unknown() {
+        // 1h 02m 03s past a UTC midnight = 3723 seconds -> 01:02:03.
+        let ms = (1 * 3600 + 2 * 60 + 3) * 1000;
+        assert_eq!(format_terminal_start_time(Some(ms)), "01:02:03");
+        assert_eq!(format_terminal_start_time(None), "");
+    }
+
+    #[test]
+    fn terminal_rows_carry_title_active_and_start_time_from_the_buffer() {
+        let rows = to_terminal_item_rows(vec![(
+            "term_7".to_owned(),
+            Some(TerminalBuffer {
+                output: "hi".to_owned(),
+                truncated: false,
+                exit_status: None, // still running -> active
+                started_at: Some((5 * 3600) * 1000),
+            }),
+        )]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title.as_str(), "term_7");
+        assert!(rows[0].active, "a non-exited terminal is active");
+        assert_eq!(rows[0].started_at.as_str(), "05:00:00");
     }
 
     #[test]

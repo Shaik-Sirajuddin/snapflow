@@ -263,6 +263,23 @@ pub struct TerminalBuffer {
     pub output: String,
     pub truncated: bool,
     pub exit_status: Option<(Option<i32>, Option<i32>)>,
+    /// PUI-002: unix-millis timestamp of when this terminal was first seen
+    /// (its first `TerminalOutput` event), set once and preserved across
+    /// later output updates -- feeds the background-terminals popup's
+    /// "start-time" column. `None` for a terminal restored from the jsonl
+    /// cache (the original start time is not persisted; `#[serde(default)]`
+    /// keeps old cached buffers loadable) and in unit fixtures.
+    #[serde(default)]
+    pub started_at: Option<u64>,
+}
+
+/// PUI-002: current wall-clock in unix milliseconds (0 on a pre-epoch clock
+/// error, which never happens in practice).
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Owns the background runtime, the per-thread agent connections, the
@@ -372,6 +389,15 @@ fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .contains_key(&ev.terminal_id);
+    // PUI-002: stamp the start time on first sight; preserve it on every
+    // later output update for the same terminal id.
+    let started_at = {
+        let buffers = slot.terminal_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers
+            .get(&ev.terminal_id)
+            .and_then(|existing| existing.started_at)
+            .or_else(|| Some(now_unix_millis()))
+    };
     if is_new {
         slot.terminal_order
             .lock()
@@ -387,6 +413,7 @@ fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
                 output: ev.output.clone(),
                 truncated: ev.truncated,
                 exit_status: ev.exit_status,
+                started_at,
             },
         );
     evict_exited_terminals_over_cap(slot);
@@ -2355,6 +2382,7 @@ impl AgentBridge {
                                     output: terminal.output.clone(),
                                     truncated: terminal.truncated,
                                     exit_status: terminal.exit_status,
+                                    started_at: None,
                                 },
                             )
                         })
@@ -2567,6 +2595,7 @@ impl AgentBridge {
                                 output: terminal.output.clone(),
                                 truncated: terminal.truncated,
                                 exit_status: terminal.exit_status,
+                                started_at: None,
                             },
                         )
                     })
@@ -3965,6 +3994,7 @@ mod tests {
             output: "done".to_owned(),
             truncated: false,
             exit_status: Some((Some(0), None)),
+            started_at: None,
         }
     }
 
@@ -3973,6 +4003,7 @@ mod tests {
             output: "still going".to_owned(),
             truncated: false,
             exit_status: None,
+            started_at: None,
         }
     }
 
