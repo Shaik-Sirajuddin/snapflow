@@ -10,14 +10,17 @@ name: build-linux
 #                  branch via the upstream build-snapflow.sh toolchain
 #                  image -- see scripts/build-snapflow.sh REPOLOCS[7])
 #
-# `panel-rust` and `snapshotd` are fast (minutes) and run on every push/PR.
+# `panel-rust` and `snapshotd` are fast (minutes) and run on every PR.
 # `shotcut-rebrand` recompiles FFmpeg/MLT/x265/etc from source and easily
 # takes 45-90+ minutes, so it's workflow_dispatch/tag-only to keep the
 # ordinary push/PR loop fast.
+#
+# Auto-rebuild on every push to main is paused (ag-pipelines-setup task) --
+# main only rebuilds via a tag push or an explicit workflow_dispatch now,
+# to stop burning CI minutes on every commit.
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch: {}
