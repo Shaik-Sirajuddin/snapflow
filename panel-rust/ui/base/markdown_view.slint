@@ -122,6 +122,39 @@ export component MarkdownView inherits VerticalLayout {
             border-bottom-left-radius: is-code && group-end ? Theme.radius-sm : 0px;
             border-bottom-right-radius: is-code && group-end ? Theme.radius-sm : 0px;
 
+            // Invisible click-drag-select overlay: a real (glyph-transparent)
+            // `TextInput` positioned to match the visual run cluster below,
+            // holding `line.plain-text` (the same characters the colored
+            // `Text` runs render, just unstyled). Plain `Text` never
+            // captures pointer events (see the Slint skill's anti-pattern
+            // #5), so mouse-down/drag on this row falls through to this
+            // `TextInput` underneath and gets native browser-style
+            // click-and-drag selection + Ctrl+C copy + the selection
+            // highlight, without re-deriving rich multi-run selection by
+            // hand. Declared *before* the visual `HorizontalLayout` below
+            // so it paints first (behind); paint/hit-test order in Slint
+            // follows declaration order for same-`z` siblings.
+            if !is-hr : TextInput {
+                x: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);
+                y: is-code ? (group-start ? Metrics.space-3 : 0px) : 0px;
+                width: max(0px, parent.width - self.x - (is-code ? Metrics.space-4 : 0px));
+                height: max(0px, parent.height - self.y - (is-code && group-end ? Metrics.space-3 : 0px));
+                text: line.plain-text;
+                font-family: is-code ? Theme.font-mono : Theme.font-sans;
+                font-size: (is-heading ? root.heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
+                read-only: true;
+                wrap: word-wrap;
+                horizontal-alignment: left;
+                vertical-alignment: top;
+                // Glyphs stay invisible -- the colored `Text` runs painted
+                // on top supply the actual visible characters. Only the
+                // selection highlight (painted behind those runs, which
+                // have no background of their own) shows through.
+                color: transparent;
+                selection-foreground-color: transparent;
+                selection-background-color: #60a5fa80;
+            }
+
             HorizontalLayout {
                 width: 100%;
                 padding-left: line.indent * 14px + (is-code ? Metrics.space-4 : 0px);

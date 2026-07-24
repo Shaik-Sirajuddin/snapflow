@@ -42,24 +42,28 @@ fn line_kind_str(kind: LineKind) -> &'static str {
 fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
     let rows: Vec<MarkdownLine> = lines
         .into_iter()
-        .map(|line| MarkdownLine {
-            kind: line_kind_str(line.kind).into(),
-            runs: ModelRc::new(VecModel::from(
-                line.runs
-                    .into_iter()
-                    .map(|r| MarkdownRun {
-                        text: r.text.into(),
-                        bold: r.bold,
-                        italic: r.italic,
-                        code: r.code,
-                        strike: r.strike,
-                        link: r.link.into(),
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-            indent: line.indent as i32,
-            ordinal: line.ordinal as i32,
-            code_block_id: line.code_block_id,
+        .map(|line| {
+            let plain_text: String = line.runs.iter().map(|r| r.text.as_str()).collect();
+            MarkdownLine {
+                kind: line_kind_str(line.kind).into(),
+                runs: ModelRc::new(VecModel::from(
+                    line.runs
+                        .into_iter()
+                        .map(|r| MarkdownRun {
+                            text: r.text.into(),
+                            bold: r.bold,
+                            italic: r.italic,
+                            code: r.code,
+                            strike: r.strike,
+                            link: r.link.into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                indent: line.indent as i32,
+                ordinal: line.ordinal as i32,
+                code_block_id: line.code_block_id,
+                plain_text: plain_text.into(),
+            }
         })
         .collect();
     ModelRc::new(VecModel::from(rows))

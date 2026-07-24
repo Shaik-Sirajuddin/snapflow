@@ -3,9 +3,14 @@ import { Metrics } from "../../../tokens/metrics.slint";
 import { MessageItem } from "../../../types.slint";
 
 // User bubble — tertiary fill, no border, larger 3-corner radius with
-// LTR outgoing cut (bottom-right). Keeps the proven Flickable + preferred-
-// height body pattern from the working baseline (do not replace with a
-// bare Text that re-introduces stretch-height bugs).
+// LTR outgoing cut (bottom-right). Keeps the Flickable + preferred-height
+// body pattern from the working baseline -- `Flickable` here is load-
+// bearing for layout (a boundary that breaks a `width` binding loop
+// between `bubble-text.width: parent.width` and `content`'s own computed
+// width), not for scrolling (`height == viewport-height`, nothing pans).
+// `interactive: false` keeps that boundary but stops `Flickable`'s own
+// drag-to-pan gesture recognition from capturing the mouse-down-and-drag
+// before it reaches `bubble-text`'s native click-drag selection.
 export component UserBubble inherits Rectangle {
     in property <MessageItem> item;
     callback copy-message(string);
@@ -26,6 +31,7 @@ export component UserBubble inherits Rectangle {
             padding: Metrics.space-4;
             horizontal-stretch: 1;
             Flickable {
+                interactive: false;
                 height: bubble-text.preferred-height;
                 viewport-height: bubble-text.preferred-height;
                 bubble-text := TextInput {

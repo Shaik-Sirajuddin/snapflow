@@ -105,8 +105,20 @@ export component AgentBubble inherits Rectangle {
         }
 
         // Agent body always open; thinking body animates open/closed via
-        // CollapseExpand (real `animate height`, not a Timer).
+        // CollapseExpand (real `animate height`, not a Timer). The
+        // `Flickable` wrapper is load-bearing for layout, not scrolling
+        // (`height == viewport-height` -- there's never anything to pan):
+        // removing it entirely reintroduces a `width` binding loop,
+        // because a bare `MarkdownView` here folds its own width demand
+        // back into `content`'s (the parent `VerticalLayout`'s) computed
+        // width, which this instance's `width: parent.width` also reads
+        // from -- `Flickable` is a layout boundary that breaks that cycle.
+        // `interactive: false` instead keeps the boundary but stops
+        // `Flickable`'s own drag-to-pan gesture from capturing the
+        // mouse-down-and-drag before it reaches the per-line `TextInput`
+        // selection overlays in `MarkdownView` underneath.
         if is-agent : Flickable {
+            interactive: false;
             height: md.preferred-height;
             viewport-height: md.preferred-height;
             horizontal-stretch: 1;
@@ -127,6 +139,7 @@ export component AgentBubble inherits Rectangle {
         if is-thinking : CollapseExpand {
             open: item.expanded;
             Flickable {
+                interactive: false;
                 height: think-md.preferred-height;
                 viewport-height: think-md.preferred-height;
                 horizontal-stretch: 1;

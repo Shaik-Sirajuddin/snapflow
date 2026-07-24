@@ -82,6 +82,11 @@ export struct MarkdownLine {
     indent: int,
     ordinal: int,
     code-block-id: int,
+    // Concatenation of every run's `text` in order -- lets `MarkdownView`
+    // overlay one real (invisible) `TextInput` per line for native
+    // click-drag selection/copy without re-deriving the joined string
+    // from `[MarkdownRun]` in Slint (no reduce/fold over dynamic arrays).
+    plain-text: string,
 }
 
 export struct MessageItem {
