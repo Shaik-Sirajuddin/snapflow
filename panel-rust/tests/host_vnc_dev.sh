@@ -30,7 +30,12 @@ dock_width="${PANEL_VNC_DEV_DOCK_WIDTH:-}"
 default_agent_id="${PANEL_VNC_DEV_AGENT_ID:-codex-acp}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
-shotcut_bin="${SHOTCUT_BIN:-$repo_root/shotcut/build/src/shotcut}"
+# REBRAND-001: default to the rebranded `snapflow` binary (the shippable
+# editor, built by build_freshness.py's `snapflow` preset), not the raw
+# upstream `shotcut` submodule build -- so a dev/e2e launch shows a
+# `snapflow` process, not a residual `shotcut` one. Override SHOTCUT_BIN to
+# point elsewhere (e.g. the raw submodule) when that's specifically wanted.
+shotcut_bin="${SHOTCUT_BIN:-$repo_root/shotcut-rebrand/build-local/src/snapflow}"
 
 for binary in "$server_bin" "$shotcut_bin" Xvfb x11vnc curl xdpyinfo; do
     if ! command -v "$binary" >/dev/null 2>&1 && [[ ! -x "$binary" ]]; then
