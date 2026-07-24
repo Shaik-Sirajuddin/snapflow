@@ -3150,6 +3150,53 @@ impl AgentBridge {
         }
     }
 
+    /// PUI-013: non-blocking Install. `install_agent` above does a
+    /// synchronous `runtime.block_on` on the caller -- which is the Slint
+    /// UI thread -- so the whole panel froze for the duration of the
+    /// `agents/install` round-trip (the reported Settings>Agents freeze).
+    /// This fire-and-forget variant runs the same round-trip on the tokio
+    /// runtime instead; the periodic frame poll re-pulls `list_agents`, so
+    /// the installed status still refreshes on its own. Kept separate from
+    /// `install_agent` so the synchronous, bool-returning method still
+    /// backs the unit tests.
+    pub fn install_agent_async(&self, idx: usize, agent_id: &str) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let handle = slot.handle.clone();
+        let agent_id = agent_id.to_string();
+        self.runtime.spawn(async move {
+            if handle.install_agent(agent_id.clone()).await.is_err() {
+                eprintln!("panel-rust: install_agent({agent_id}) failed (async)");
+            }
+        });
+    }
+
+    /// PUI-013: non-blocking enable/disable -- same rationale as
+    /// `install_agent_async`; `set_agent_enabled`'s `runtime.block_on` also
+    /// ran on the UI thread. Fire-and-forget on the tokio runtime.
+    pub fn set_agent_enabled_async(&self, agent_id: &str, enabled: bool) {
+        let Some((admin_url, admin_token)) = resolve_admin_creds() else {
+            eprintln!(
+                "panel-rust: set_agent_enabled({agent_id}, {enabled}) skipped \
+                 (no admin plane reachable)"
+            );
+            return;
+        };
+        let agent_id = agent_id.to_string();
+        self.runtime.spawn(async move {
+            let client = acpx_client::ext::admin::AdminClient::new(admin_url, admin_token);
+            let ok = if enabled {
+                client.enable_agent(&agent_id).await.is_ok()
+            } else {
+                client.disable_agent(&agent_id).await.is_ok()
+            };
+            if !ok {
+                eprintln!("panel-rust: set_agent_enabled({agent_id}, {enabled}) failed (async)");
+            }
+        });
+    }
+
     /// Opens (or returns the already-open) client-local PTY terminal
     /// for thread `idx` -- see [`crate::local_terminal::LocalTerminal`]'s
     /// doc comment for what "client-local" means (a real shell process
