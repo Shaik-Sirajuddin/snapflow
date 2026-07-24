@@ -921,13 +921,19 @@ export component ChatInputLayout inherits Rectangle {
         if root.terminal-count > 0 : VerticalLayout {
             spacing: Metrics.gap-sm;
             Rectangle { height: 1px; background: Theme.border-default; }
+            // Sized to content (horizontal-stretch: 0 + explicit width) --
+            // a bare TouchArea/Rectangle as a VerticalLayout child
+            // defaults to stretching to the FULL row width (Slint's
+            // stretch-to-fill layout default), which would otherwise make
+            // the whole empty row clickable, not just the visible chip.
             terminals-chip := TouchArea {
+                horizontal-stretch: 0;
+                width: chip-label.preferred-width + 2 * Metrics.pad-sm;
                 height: Metrics.pad-2xl;
                 mouse-cursor: pointer;
                 clicked => { root.terminals-clicked(); }
                 Rectangle {
-                    x: 0;
-                    width: chip-label.preferred-width + 2 * Metrics.pad-sm;
+                    width: 100%;
                     height: 100%;
                     background: terminals-chip.has-hover ? Theme.bg-tertiary : transparent;
                     border-radius: Theme.radius-sm;
