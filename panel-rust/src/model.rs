@@ -121,7 +121,6 @@ pub struct Model {
     pub expanded: Vec<bool>,
     pub displayed_thread: Option<usize>,
     pub expanded_terminal_id: Option<String>,
-    pub local_terminal_last_text: String,
     pub active_project_path: Option<String>,
     pub traced_attachment_threads: HashSet<String>,
     pub appearance: AppearanceState,
