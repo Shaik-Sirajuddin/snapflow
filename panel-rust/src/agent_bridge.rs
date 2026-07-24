@@ -2466,66 +2466,39 @@ impl AgentBridge {
     /// Creates a thread using a configured provider when the caller has a
     /// compatible default-agent preference; otherwise preserves the normal
     /// stable provider rotation.
-    pub fn add_thread_with_profile_and_provider(
+    /// PUI-014: shared slot construction for the eager
+    /// ([`Self::add_thread_with_profile_and_provider`]), deferred
+    /// ([`Self::add_thread_deferred`]), and attach-on-first-send
+    /// ([`Self::attach_deferred_thread`]) paths. Builds -- but does NOT push or
+    /// attach -- a `ThreadSlot` for `thread_id`/`provider`, wiring its gateway
+    /// through the same delayed-setter the constructor uses (so building never
+    /// blocks on the gateway). Returns the slot plus everything
+    /// [`spawn_background_attachment`] needs, letting the caller decide whether
+    /// to attach now or defer. `deferred` only sets the slot's flag.
+    #[allow(clippy::type_complexity)]
+    fn build_slot(
         &mut self,
-        name: &str,
-        profile: Option<&str>,
-        preferred_provider: Option<&str>,
-    ) -> Result<usize, BridgeError> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(BridgeError::Gateway("thread name cannot be empty".into()));
-        }
-        let thread_id = slug(name);
-        if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
-            return Err(BridgeError::Gateway(format!(
-                "thread already exists: {name}"
-            )));
-        }
-
-        let idx = self.slots.len();
-        // `thread_provider_model_binding_fix`: a requested provider is
-        // NEVER silently dropped. Any non-empty request normalizes to
-        // one of the two real gateway keys (see `normalize_provider`);
-        // if that gateway genuinely isn't provisioned the caller gets a
-        // real error instead of a thread quietly bound to the rotation's
-        // pick -- the exact "selected claude-acp, codex-acp underneath"
-        // failure reported live on the VNC demo.
-        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
-            Some(requested) => {
-                let normalized = normalize_provider(requested);
-                if !self.gateway_urls.contains_key(normalized) {
-                    return Err(BridgeError::Gateway(format!(
-                        "requested provider {requested:?} (normalized {normalized:?}) has no \
-                         provisioned gateway; refusing to silently bind another provider"
-                    )));
-                }
-                normalized
-            }
-            None => provider_for_index(idx),
-        };
+        thread_id: &str,
+        provider: &str,
+        deferred: bool,
+    ) -> Result<
+        (
+            Arc<ThreadSlot>,
+            Arc<AcpxThreadHandle>,
+            tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+            Option<String>,
+            bool,
+        ),
+        BridgeError,
+    > {
         let base_url =
             self.gateway_urls.get(provider).cloned().ok_or_else(|| {
                 BridgeError::Gateway(format!("gateway URL missing for {provider}"))
             })?;
         let (seeded, cached_session_id, older_available, oldest_loaded_index, runtime_snapshot) =
-            seed_thread_from_cache(self.store.as_ref(), &thread_id, HISTORY_PAGE_SIZE);
+            seed_thread_from_cache(self.store.as_ref(), thread_id, HISTORY_PAGE_SIZE);
         let has_cached_transcript = !seeded.is_empty();
 
-        // `thread_new_loading_state` phase: `session/new`/`session/resume`
-        // is a real network round trip that must never block the calling
-        // (single-threaded Slint UI) thread -- this used to `self.runtime.
-        // block_on` it inline, which froze the whole UI for the call's
-        // duration. Mirrors the constructor's own async-attachment pattern
-        // instead: hand the gateway over through the same delayed-setter
-        // `spawn_acpx_thread_with_delayed_gateway` uses (so creating the
-        // handle itself never waits on the gateway either), then delegate
-        // the actual session resolution to `spawn_background_attachment`
-        // (the exact function the constructor's own per-thread loop already
-        // uses for this), which sets `attachment`/notifies waiters and
-        // persists the thread record once the session id is known; the
-        // frame input collector observes that binding and the reducer
-        // emits the persistence effect.
         let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
             spawn_acpx_thread_with_delayed_gateway()
@@ -2571,18 +2544,18 @@ impl AgentBridge {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let slot = Arc::new(ThreadSlot {
-            thread_id: thread_id.clone(),
+            thread_id: thread_id.to_string(),
             provider: provider.to_string(),
             handle: handle.clone(),
             transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
-                &thread_id, &seeded,
+                thread_id, &seeded,
             )),
             history: Mutex::new(seeded),
             acp_session_id: Mutex::new(None),
             older_available: Mutex::new(older_available),
             oldest_loaded_index: Mutex::new(oldest_loaded_index),
             pending_requests: Mutex::new(runtime_snapshot.pending_requests),
-                usage: Mutex::new((0, 0)),
+            usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(
                 runtime_snapshot
                     .terminals
@@ -2614,8 +2587,151 @@ impl AgentBridge {
             closed: Mutex::new(false),
             archived: Mutex::new(runtime_snapshot.archived),
             project_path: project_path_for_slot,
-            deferred: false,
+            deferred,
         });
+        Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
+    }
+
+    /// PUI-014: normalize a caller-requested provider to a provisioned gateway
+    /// key, or fall back to the rotation pick for `idx`. Shared by the eager,
+    /// deferred, and attach paths so a requested provider is never silently
+    /// dropped (see `thread_provider_model_binding_fix`).
+    fn resolve_provider_for<'a>(
+        &self,
+        idx: usize,
+        preferred_provider: Option<&'a str>,
+    ) -> Result<&'a str, BridgeError>
+    where
+        Self: 'a,
+    {
+        match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => {
+                let normalized = normalize_provider(requested);
+                if !self.gateway_urls.contains_key(normalized) {
+                    return Err(BridgeError::Gateway(format!(
+                        "requested provider {requested:?} (normalized {normalized:?}) has no \
+                         provisioned gateway; refusing to silently bind another provider"
+                    )));
+                }
+                Ok(normalized)
+            }
+            None => Ok(provider_for_index(idx)),
+        }
+    }
+
+    /// PUI-014: create thread `name` as a DEFERRED placeholder -- it claims its
+    /// positional slot index (preserving the `model.threads[i] <-> slots[i]`
+    /// parallel-array invariant) but opens NO ACP session yet, so the
+    /// provider/profile stay editable until the first message triggers
+    /// [`Self::attach_deferred_thread`]. Same name/dedup/provider-resolution
+    /// rules as the eager path.
+    pub fn add_thread_deferred(
+        &mut self,
+        name: &str,
+        preferred_provider: Option<&str>,
+    ) -> Result<usize, BridgeError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(BridgeError::Gateway("thread name cannot be empty".into()));
+        }
+        let thread_id = slug(name);
+        if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
+            return Err(BridgeError::Gateway(format!(
+                "thread already exists: {name}"
+            )));
+        }
+        let idx = self.slots.len();
+        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let (slot, _handle, _events_rx, _cached_session_id, _has_cached_transcript) =
+            self.build_slot(&thread_id, provider, true)?;
+        self.slots.push(slot);
+        Ok(idx)
+    }
+
+    /// PUI-014: attach a previously-deferred thread on its first message send,
+    /// binding it to `preferred_provider`/`profile` as they stand NOW (which
+    /// may differ from the creation-time hint if the user changed the picker
+    /// while the thread was still empty). Rebuilds the slot in place for the
+    /// current provider -- preserving its index and the parallel-array
+    /// invariant -- then starts the real background attach. Idempotent: a
+    /// no-op `Ok(())` if `idx` is already attached (not deferred), so a racing
+    /// second send cannot double-attach.
+    pub fn attach_deferred_thread(
+        &mut self,
+        idx: usize,
+        preferred_provider: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<(), BridgeError> {
+        let Some(existing) = self.slots.get(idx) else {
+            return Err(BridgeError::Gateway(format!(
+                "no thread slot at index {idx}"
+            )));
+        };
+        if !existing.deferred {
+            return Ok(());
+        }
+        let thread_id = existing.thread_id.clone();
+        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
+            self.build_slot(&thread_id, provider, false)?;
+        self.slots[idx] = slot.clone();
+        spawn_background_attachment(
+            &self.runtime,
+            slot,
+            handle,
+            events_rx,
+            self.events.clone(),
+            self.store.clone(),
+            idx,
+            cached_session_id,
+            has_cached_transcript,
+            profile.map(str::to_string),
+            Arc::new(tokio::sync::Mutex::new(())),
+            self.session_cwd_override.clone(),
+        );
+        Ok(())
+    }
+
+    pub fn add_thread_with_profile_and_provider(
+        &mut self,
+        name: &str,
+        profile: Option<&str>,
+        preferred_provider: Option<&str>,
+    ) -> Result<usize, BridgeError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(BridgeError::Gateway("thread name cannot be empty".into()));
+        }
+        let thread_id = slug(name);
+        if self.slots.iter().any(|slot| slot.thread_id == thread_id) {
+            return Err(BridgeError::Gateway(format!(
+                "thread already exists: {name}"
+            )));
+        }
+
+        let idx = self.slots.len();
+        // `thread_provider_model_binding_fix`: a requested provider is
+        // NEVER silently dropped. Any non-empty request normalizes to
+        // one of the two real gateway keys (see `normalize_provider`);
+        // if that gateway genuinely isn't provisioned the caller gets a
+        // real error instead of a thread quietly bound to the rotation's
+        // pick -- the exact "selected claude-acp, codex-acp underneath"
+        // failure reported live on the VNC demo.
+        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => {
+                let normalized = normalize_provider(requested);
+                if !self.gateway_urls.contains_key(normalized) {
+                    return Err(BridgeError::Gateway(format!(
+                        "requested provider {requested:?} (normalized {normalized:?}) has no \
+                         provisioned gateway; refusing to silently bind another provider"
+                    )));
+                }
+                normalized
+            }
+            None => provider_for_index(idx),
+        };
+        let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
+            self.build_slot(&thread_id, provider, false)?;
         self.slots.push(slot.clone());
 
         spawn_background_attachment(
