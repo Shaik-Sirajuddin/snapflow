@@ -255,6 +255,8 @@ export component ChatPanel inherits Window {
     // One-of permission option pick (ACP optionId or synthetic approve/reject).
     callback permission-option-selected(string);
     callback expand-terminal(string);
+    // PUI-002b: terminals popup's `[x]` kill button.
+    callback terminal-kill-requested(string);
     callback close-terminal-overlay();
     callback local-terminal-toggle-requested();
     callback local-terminal-key-input(string);
@@ -556,6 +558,7 @@ export component ChatPanel inherits Window {
                 permission-option-selected(option-id) => { permission-option-selected(option-id); }
                 terminals: terminals;
                 expand-terminal(id) => { expand-terminal(id); }
+                terminal-kill-requested(id) => { terminal-kill-requested(id); }
                 local-terminal: local-terminal;
                 local-terminal-toggle-requested => { local-terminal-toggle-requested(); }
                 local-terminal-key-input(text) => { local-terminal-key-input(text); }

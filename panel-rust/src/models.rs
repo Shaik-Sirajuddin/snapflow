@@ -1150,22 +1150,37 @@ pub fn to_terminal_item_rows(entries: Vec<(String, Option<TerminalBuffer>)>) -> 
     entries
         .into_iter()
         .map(|(terminal_id, buffer)| match buffer {
-            Some(buffer) => TerminalItem {
-                terminal_id: terminal_id.into(),
-                output: buffer.output.into(),
-                truncated: buffer.truncated,
-                has_exited: buffer.exit_status.is_some(),
-                exit_code: buffer
-                    .exit_status
-                    .and_then(|(code, _signal)| code)
-                    .unwrap_or_default(),
-            },
+            Some(buffer) => {
+                let active = buffer.active();
+                TerminalItem {
+                    terminal_id: terminal_id.into(),
+                    output: buffer.output.into(),
+                    truncated: buffer.truncated,
+                    has_exited: buffer.exit_status.is_some(),
+                    exit_code: buffer
+                        .exit_status
+                        .and_then(|(code, _signal)| code)
+                        .unwrap_or_default(),
+                    title: buffer.command.clone().into(),
+                    last_command: if buffer.args.is_empty() {
+                        buffer.command.clone().into()
+                    } else {
+                        format!("{} {}", buffer.command, buffer.args.join(" ")).into()
+                    },
+                    started_at: buffer.started_at.into(),
+                    active,
+                }
+            }
             None => TerminalItem {
                 terminal_id: terminal_id.into(),
                 output: String::new().into(),
                 truncated: false,
                 has_exited: false,
                 exit_code: 0,
+                title: String::new().into(),
+                last_command: String::new().into(),
+                started_at: String::new().into(),
+                active: true,
             },
         })
         .collect()

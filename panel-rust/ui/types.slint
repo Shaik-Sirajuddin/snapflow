@@ -196,16 +196,28 @@ export struct PendingRequestItem {
 
 // Terminal-view addition: one live agent-created terminal known to the
 // currently-displayed thread (`AgentBridge::active_terminal_ids` +
-// `terminal_buffer`, see `agent_bridge.rs`). Rendered as a bounded
-// max-height card docked above the compose bar (mirrors
-// `PendingRequestItem`'s docking convention) with click-to-expand into
-// a full-window floating overlay -- see `terminal_card.slint`.
+// `terminal_buffer`, see `agent_bridge.rs`). PUI-002b (background-
+// terminals-ui plan): opened from the terminals popup rather than always
+// docked -- see `terminal_card.slint`/`chat_area.slint`. `title`/`last-
+// command` both come from the one real `command` string a `terminal/
+// create` request carried (`TerminalBuffer::command`, populated by
+// `AgentEvent::TerminalCreated` -- see `agent_bridge.rs`); kept as two
+// fields (not one) because the popup list row shows a short `title` while
+// a detail view can show the fuller `last-command` (command + args)
+// without the popup needing to reformat one shared string differently
+// per call site. `active` mirrors `PendingRequestItem.active`'s own
+// naming (this struct's own `TerminalBuffer::active()` is the ground
+// source, never re-derived here).
 export struct TerminalItem {
     terminal-id: string,
     output: string,
     truncated: bool,
     has-exited: bool,
     exit-code: int,
+    title: string,
+    last-command: string,
+    started-at: string,
+    active: bool,
 }
 
 // Profile-picker addition: one profile row as returned by

@@ -100,6 +100,13 @@ pub enum Effect {
     LocalTerminalWrite {
         bytes: Vec<u8>,
     },
+    /// PUI-002b: `terminal/kill` for an agent-created terminal, via
+    /// `AgentBridge::kill_terminal`. Distinct from `LocalTerminalKill`
+    /// (the client-local PTY, no gateway call).
+    KillAgentTerminal {
+        real_index: usize,
+        terminal_id: String,
+    },
     SaveSettings {
         input: crate::msg::SettingsSaveInput,
     },

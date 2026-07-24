@@ -645,6 +645,13 @@ impl PanelSingleton {
             .map(|bridge| bridge.cancel_prompt(real_idx));
     }
 
+    /// Executes the bridge side of `Effect::KillAgentTerminal` (PUI-002b).
+    pub(crate) fn execute_kill_agent_terminal_real(&self, real_idx: usize, terminal_id: String) {
+        self.bridge
+            .as_ref()
+            .map(|bridge| bridge.kill_terminal(real_idx, terminal_id));
+    }
+
     /// Answers the currently-displayed thread's first pending request
     /// with a concrete one-of option id (Zed flat permission model), then
     /// immediately re-renders the request card (which will hide it, since
@@ -2172,6 +2179,23 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_terminal_expand(panel, &component, terminal_id.to_string());
+                }
+            });
+        });
+
+        // PUI-002b: terminals popup's `[x]` kill button.
+        let component_weak = panel.component.as_weak();
+        panel.component.on_terminal_kill_requested(move |terminal_id| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_terminal_kill_requested(
+                        panel,
+                        &component,
+                        terminal_id.to_string(),
+                    );
                 }
             });
         });

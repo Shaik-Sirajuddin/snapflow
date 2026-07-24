@@ -67,7 +67,7 @@ use crate::jsonl_store::{
 };
 use crate::protocol_types::{
     AgentEvent, AgentRequestEvent, ChatMessage, ConfigOptionInfo, SessionModesEvent,
-    TerminalOutputEvent,
+    TerminalCreatedEvent, TerminalOutputEvent,
 };
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -242,12 +242,39 @@ struct AttachmentState {
 }
 
 /// One terminal's current known state, as last observed via
-/// `AgentEvent::TerminalOutput`. See [`ThreadSlot::terminal_buffers`].
+/// `AgentEvent::TerminalOutput`/`AgentEvent::TerminalCreated`. See
+/// [`ThreadSlot::terminal_buffers`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalBuffer {
     pub output: String,
     pub truncated: bool,
     pub exit_status: Option<(Option<i32>, Option<i32>)>,
+    // PUI-002b (background-terminals-ui plan): populated from the one-shot
+    // `AgentEvent::TerminalCreated` event, which arrives (if at all) before
+    // or interleaved with the first `TerminalOutput` for the same id --
+    // never re-derived from `output` or guessed. `#[serde(default)]` so a
+    // JSONL runtime snapshot persisted before this field existed still
+    // deserializes (older rows just show an empty command/title until the
+    // agent creates a fresh terminal).
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// RFC 3339; empty if `TerminalCreated` was never observed for this id
+    /// (e.g. this buffer was populated by output arriving from a snapshot
+    /// restored before this field existed).
+    #[serde(default)]
+    pub started_at: String,
+}
+
+impl TerminalBuffer {
+    /// `active` is derived, never stored: "still running" is exactly
+    /// "no exit status observed yet" -- keeping a separate stored bool
+    /// in sync with `exit_status` would just be a second source of
+    /// truth that could drift.
+    pub fn active(&self) -> bool {
+        self.exit_status.is_none()
+    }
 }
 
 /// Owns the background runtime, the per-thread agent connections, the
@@ -352,28 +379,81 @@ fn refresh_transcript(slot: &ThreadSlot) {
 const MAX_RETAINED_TERMINALS_PER_THREAD: usize = 8;
 
 fn store_terminal_output(slot: &ThreadSlot, ev: &TerminalOutputEvent) {
-    let is_new = !slot
+    let mut buffers = slot
         .terminal_buffers
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_key(&ev.terminal_id);
+        .unwrap_or_else(|e| e.into_inner());
+    let is_new = !buffers.contains_key(&ev.terminal_id);
     if is_new {
         slot.terminal_order
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(ev.terminal_id.clone());
     }
-    slot.terminal_buffers
+    // Preserve command/args/started_at (set by `store_terminal_created`,
+    // see its doc comment) across every output update -- this event's own
+    // "replace, don't append" contract is about `output`/`truncated`/
+    // `exit_status` only; TerminalOutputEvent carries no creation metadata
+    // at all, so overwriting the whole struct would silently erase it the
+    // moment output arrives after creation.
+    let (command, args, started_at) = buffers
+        .get(&ev.terminal_id)
+        .map(|existing| {
+            (
+                existing.command.clone(),
+                existing.args.clone(),
+                existing.started_at.clone(),
+            )
+        })
+        .unwrap_or_default();
+    buffers.insert(
+        ev.terminal_id.clone(),
+        TerminalBuffer {
+            output: ev.output.clone(),
+            truncated: ev.truncated,
+            exit_status: ev.exit_status,
+            command,
+            args,
+            started_at,
+        },
+    );
+    drop(buffers);
+    evict_exited_terminals_over_cap(slot);
+}
+
+/// One-shot handler for `AgentEvent::TerminalCreated` -- sets
+/// command/args/started_at on the (possibly not-yet-existing) buffer for
+/// this terminal id, without touching output/truncated/exit_status. Order
+/// with `store_terminal_output` is not assumed either way: whichever
+/// arrives first creates the entry, the other fills in its own fields on
+/// top, same "operate on whatever's there" shape as the rest of this
+/// file's per-terminal bookkeeping.
+fn store_terminal_created(slot: &ThreadSlot, ev: &TerminalCreatedEvent) {
+    let mut buffers = slot
+        .terminal_buffers
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            ev.terminal_id.clone(),
-            TerminalBuffer {
-                output: ev.output.clone(),
-                truncated: ev.truncated,
-                exit_status: ev.exit_status,
-            },
-        );
+        .unwrap_or_else(|e| e.into_inner());
+    let is_new = !buffers.contains_key(&ev.terminal_id);
+    if is_new {
+        slot.terminal_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ev.terminal_id.clone());
+    }
+    let entry = buffers
+        .entry(ev.terminal_id.clone())
+        .or_insert_with(|| TerminalBuffer {
+            output: String::new(),
+            truncated: false,
+            exit_status: None,
+            command: String::new(),
+            args: Vec::new(),
+            started_at: String::new(),
+        });
+    entry.command = ev.command.clone();
+    entry.args = ev.args.clone();
+    entry.started_at = ev.started_at.clone();
+    drop(buffers);
     evict_exited_terminals_over_cap(slot);
 }
 
@@ -484,6 +564,9 @@ fn persist_runtime_snapshot(store: Option<&JsonlStore>, slot: &ThreadSlot) {
                         output: buffer.output.clone(),
                         truncated: buffer.truncated,
                         exit_status: buffer.exit_status,
+                        command: buffer.command.clone(),
+                        args: buffer.args.clone(),
+                        started_at: buffer.started_at.clone(),
                     })
             })
             .collect(),
@@ -1868,6 +1951,10 @@ fn spawn_event_forwarder(
                     store_terminal_output(&slot_for_task, term_ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
+                AgentEvent::TerminalCreated(created_ev) => {
+                    store_terminal_created(&slot_for_task, created_ev);
+                    persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
+                }
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
                 | AgentEvent::ConfigOptions(_) => {
@@ -2243,6 +2330,9 @@ impl AgentBridge {
                                     output: terminal.output.clone(),
                                     truncated: terminal.truncated,
                                     exit_status: terminal.exit_status,
+                                    command: terminal.command.clone(),
+                                    args: terminal.args.clone(),
+                                    started_at: terminal.started_at.clone(),
                                 },
                             )
                         })
@@ -2480,6 +2570,9 @@ impl AgentBridge {
                                 output: terminal.output.clone(),
                                 truncated: terminal.truncated,
                                 exit_status: terminal.exit_status,
+                                command: terminal.command.clone(),
+                                args: terminal.args.clone(),
+                                started_at: terminal.started_at.clone(),
                             },
                         )
                     })
@@ -3547,6 +3640,42 @@ impl AgentBridge {
         });
     }
 
+    /// Dispatches `terminal/kill` on the background runtime -- PUI-002b's
+    /// popup `[x]` kill button. Same fire-and-forget shape as
+    /// [`Self::set_mode`]: never `runtime.block_on` on the caller's
+    /// thread (the Settings>Agents freeze this project's own
+    /// `panel-new-thread-blocking-catalog` diagnosed was exactly that
+    /// mistake), a failure surfaces as a queued `AgentEvent::Error`.
+    pub fn kill_terminal(&self, idx: usize, terminal_id: String) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let slot = slot.clone();
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = wait_for_attachment(&slot).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("session attachment failed: {error}")),
+                    });
+                return;
+            }
+            if let Err(e) = handle.kill_terminal(terminal_id).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("terminal/kill failed: {e}")),
+                    });
+            }
+        });
+    }
+
     /// Dispatches `session/set_config_option` on the background
     /// runtime. Unlike [`Self::set_mode`], a successful call's own
     /// response carries the full updated `configOptions[]` -- the actor
@@ -3659,6 +3788,9 @@ mod tests {
             output: "done".to_owned(),
             truncated: false,
             exit_status: Some((Some(0), None)),
+            command: "cargo test".to_owned(),
+            args: Vec::new(),
+            started_at: "2026-07-24T00:00:00.000000000Z".to_owned(),
         }
     }
 
@@ -3667,6 +3799,9 @@ mod tests {
             output: "still going".to_owned(),
             truncated: false,
             exit_status: None,
+            command: "cargo build".to_owned(),
+            args: Vec::new(),
+            started_at: "2026-07-24T00:00:00.000000000Z".to_owned(),
         }
     }
 
@@ -5232,6 +5367,9 @@ mod tests {
                         output: "restored output\n".into(),
                         truncated: true,
                         exit_status: Some((Some(9), None)),
+                        command: "echo".into(),
+                        args: Vec::new(),
+                        started_at: "2026-07-24T00:00:00.000000000Z".into(),
                     }],
                     session_modes: Some(SessionModesEvent {
                         current_mode_id: "ask".into(),

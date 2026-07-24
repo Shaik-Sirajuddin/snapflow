@@ -12,8 +12,11 @@ import { QueuedMessageBar } from "./chat-view/components/message/queued_message_
 import { ToolEventRow } from "./chat-view/components/message/tool_event_row.slint";
 import { ToolGroupView } from "./chat-view/components/message/tool_group_view.slint";
 import { PermissionCard } from "./components/permission_card.slint";
-import { TerminalCard } from "./components/terminal_card.slint";
 import { LocalTerminalCard } from "./components/local_terminal_card.slint";
+// PUI-002b: reuse the same boxed-row primitive the @/#/skill mention
+// popups already use (`chat_input_layout.slint`) instead of hand-rolling
+// a new list-row component for the terminals popup.
+import { MentionPickRow } from "./base/mention_pick_row.slint";
 import { ThinScrollbar } from "./base/thin_scrollbar.slint";
 import { ApiCallView } from "./chat-view/components/execution/api_call_view.slint";
 import { TerminalView } from "./chat-view/components/execution/terminal_view.slint";
@@ -139,6 +142,17 @@ export component ChatArea inherits Rectangle {
     callback context-view-requested();
     callback send-requested();
     callback stop-requested();
+    // PUI-002a/b: forwarded from ChatInputLayout's terminals chip (see
+    // chat-input := ChatInputLayout below); toggles the terminals popup
+    // owned locally by this component (terminals-popup-open below) since
+    // ChatArea already has the `terminals` list and `expand-terminal`
+    // callback the popup needs -- no reason to thread the list back down
+    // into ChatInputLayout just to render the popup there.
+    callback terminals-clicked();
+    property <bool> terminals-popup-open: false;
+    // PUI-002b: popup's `[x]` kill button -- see app.slint's forwarding
+    // wire and `dispatch_terminal_kill_requested`.
+    callback terminal-kill-requested(string);
     // QueuedMessageBar actions: message-list index of the queued row.
     callback queue-cancel-requested(int);
     callback queue-edit-requested(int);
@@ -1161,25 +1175,16 @@ export component ChatArea inherits Rectangle {
                 }
             }
         }
-        // Terminal-view addition: one bounded max-height card per live/
-        // finished agent-created terminal on the active thread, docked
-        // above the compose bar like the permission card below --
-        // deliberately outside the scrollable message Flickable so a
-        // running command stays visible without scrolling.
-        for term in terminals : Rectangle {
-            background: Theme.bg-chat;
-            HorizontalLayout {
-                padding: compact ? 6px : 10px;
-                TerminalCard {
-                    item: term;
-                    compact: compact;
-                    horizontal-stretch: 1;
-                    preferred-width: 0px;
-                    min-width: 0px;
-                    expand => { expand-terminal(term.terminal-id); }
-                }
-            }
-        }
+        // PUI-002c (background-terminals-ui plan): agent-created terminal
+        // cards are no longer always-docked here -- they're opened via
+        // the terminals popup above (chip -> popup -> click item ->
+        // expand-terminal -> TerminalOverlay in app.slint, unchanged).
+        // The docked-by-default `for term in terminals : TerminalCard`
+        // block that used to render every live terminal directly in the
+        // chat view is removed; `TerminalCard` itself is unused now (the
+        // popup's rows are `MentionPickRow`, the full view is
+        // `TerminalOverlay`) but stays imported/defined for that overlay
+        // path's own internals -- see `terminal_card.slint`'s module doc.
         // Client-local PTY terminal card -- same docking spot as the
         // agent-created terminal cards above (outside the scrollable
         // message Flickable), shown whenever the user has toggled it
@@ -1272,13 +1277,74 @@ export component ChatArea inherits Rectangle {
             skill-options: skill-options;
             mcp-options: mcp-options;
             file-options: file-options;
+            terminal-count: root.terminals.length;
             send-requested => { root.handle-send(); }
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
             profile-selected(id) => { profile-selected(id); }
             context-view-requested => { context-view-requested(); }
+            terminals-clicked => {
+                root.terminals-clicked();
+                root.terminals-popup-open = !root.terminals-popup-open;
+            }
             panel-shortcut(event) => { return panel-shortcut(event); }
+        }
+    }
+    // PUI-002b: boxed-item list popup, anchored above the chip
+    // (chat-input's own bottom-of-composer chip row). A sibling of
+    // `main-layout` (not inside it) -- same "positioned via explicit x/y,
+    // painted outside the managed layout" convention
+    // chat_input_layout.slint's own `/`/`@`/`#` mention popup already
+    // uses, and for the same reason: a managed layout forbids setting
+    // `y` directly on its children. Mirrors that popup's shell (bg-card,
+    // border, radius-md, drop-shadow, high z) rather than inventing new
+    // popup chrome. Each row reuses MentionPickRow (see its own doc
+    // comment on being the shared boxed-list-row primitive) -- status-dot
+    // carries `active`, action-label carries the kill action (same
+    // pattern as the MCP row's inline "Connect" action).
+    if root.terminals-popup-open : Rectangle {
+        x: parent.width - self.width - Metrics.pad-2xl;
+        // Anchored a fixed margin above the bottom edge (the composer
+        // bar's own total height varies with compose-box autosize/
+        // row2-compact, so an exact anchor to the chip's own screen
+        // position needs that position forwarded up from
+        // ChatInputLayout -- left for live-visual-iteration polish per
+        // this plan's own stated approach, not a blind first pass).
+        y: parent.height - self.height - 140px;
+        width: 260px;
+        height: terminals-popup-col.preferred-height;
+        z: 8000;
+        background: Theme.bg-card;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-md;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: #000000.with-alpha(0.45);
+        drop-shadow-offset-y: 2px;
+        clip: true;
+        terminals-popup-col := VerticalLayout {
+            padding: Metrics.pad-sm;
+            spacing: Metrics.space-1;
+            for term in root.terminals : MentionPickRow {
+                title: term.title != "" ? term.title : term.terminal-id;
+                subtitle: term.started-at != "" ? term.last-command + " · " + term.started-at : term.last-command;
+                status-dot: term.active ? "connected" : (term.exit-code == 0 ? "" : "error");
+                action-label: term.active ? "Kill" : "";
+                action-clicked => { root.terminal-kill-requested(term.terminal-id); }
+                clicked => {
+                    root.terminals-popup-open = false;
+                    root.expand-terminal(term.terminal-id);
+                }
+            }
+            if root.terminals.length == 0 : Text {
+                text: "No active terminals";
+                color: Theme.text-muted;
+                font-size: 10px * Theme.font-scale;
+                horizontal-alignment: center;
+                height: 28px;
+                vertical-alignment: center;
+            }
         }
     }
     restore-compose-focus => { chat-input.focus-compose(); }

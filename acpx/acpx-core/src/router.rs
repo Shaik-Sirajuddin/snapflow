@@ -6221,6 +6221,67 @@ async fn handle_unmatched_frame(
                                 }
                             };
                             if let Some((tenant_id, gateway_session_id)) = resolved {
+                                // One-shot `acpx/terminal_created`
+                                // notification (background-terminals-ui
+                                // plan, PUI-002b): the command/args a
+                                // client needs to show a terminal's title
+                                // are known only here, at the original
+                                // `terminal/create` request -- neither
+                                // `terminal/output` nor
+                                // `spawn_terminal_output_stream`'s polling
+                                // loop below ever sees them again, so this
+                                // is the only point this data can be
+                                // captured and relayed downstream.
+                                // Fire-and-forget (`tokio::spawn`, not
+                                // awaited here) -- this whole match arm
+                                // runs under the caller's held per-process
+                                // `BackendProcess` lock (see
+                                // `read_matching_response_with_idle_
+                                // timeout`'s doc comment), and awaiting
+                                // the publish directly would extend that
+                                // held-lock window for an unrelated
+                                // notification send. Same best-effort,
+                                // no-guaranteed-delivery contract
+                                // `spawn_terminal_output_stream` itself
+                                // already documents.
+                                let command = value
+                                    .get("params")
+                                    .and_then(|p| p.get("command"))
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let args: Vec<String> = value
+                                    .get("params")
+                                    .and_then(|p| p.get("args"))
+                                    .and_then(|a| a.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|v| v.as_str().map(str::to_string))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let hub = ctx.notification_hub.clone();
+                                let created_tenant_id = tenant_id.clone();
+                                let created_gateway_session_id = gateway_session_id.clone();
+                                let created_terminal_id = terminal_id.to_string();
+                                tokio::spawn(async move {
+                                    hub.publish(
+                                        &created_tenant_id,
+                                        &created_gateway_session_id,
+                                        serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "acpx/terminal_created",
+                                            "params": {
+                                                "sessionId": created_gateway_session_id,
+                                                "terminalId": created_terminal_id,
+                                                "command": command,
+                                                "args": args,
+                                                "startedAt": now_rfc3339(),
+                                            }
+                                        }),
+                                    )
+                                    .await;
+                                });
                                 spawn_terminal_output_stream(
                                     std::sync::Arc::clone(&ctx.backend),
                                     ctx.notification_hub.clone(),

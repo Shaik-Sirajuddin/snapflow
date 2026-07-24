@@ -694,6 +694,23 @@ pub(crate) fn dispatch_terminal_expand(
     });
 }
 
+/// Wired from `component.on_terminal_kill_requested` (PUI-002b,
+/// background-terminals-ui plan). See `dispatch_terminal_expand`'s doc
+/// comment for the shared bridge shape -- unlike `Expand`/`CloseOverlay`,
+/// `Kill` produces a real `Effect::KillAgentTerminal`, so this goes
+/// through `execute_effects` (mirrors `dispatch_mode_selected`), not a
+/// bare `FrameInput` refresh.
+pub(crate) fn dispatch_terminal_kill_requested(
+    panel: &PanelSingleton,
+    component: &ChatPanel,
+    terminal_id: String,
+) {
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::Kill(terminal_id))));
+    let _ = component;
+    execute_effects(panel, effects);
+}
+
 /// Wired from `component.on_close_terminal_overlay` (tea-slint-model
 /// Phase 4, Terminal domain). See `dispatch_terminal_expand`'s doc
 /// comment -- same bridge shape.

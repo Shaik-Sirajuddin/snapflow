@@ -64,6 +64,11 @@ export component ChatInputLayout inherits Rectangle {
     in property <[SkillOption]> skill-options: [];
     in property <[McpServerOption]> mcp-options: [];
     in property <[string]> file-options: [];
+    // PUI-002a: live count of the displayed thread's background terminals
+    // (ThreadModel.terminals.length, see chat_area.slint). Drives the
+    // "{terminal-count} terminals" chip below row 2; the chip itself opens
+    // the terminals popup via terminals-clicked (PUI-002b).
+    in property <int> terminal-count: 0;
 
     callback send-requested();
     callback stop-requested();
@@ -71,6 +76,7 @@ export component ChatInputLayout inherits Rectangle {
     callback config-option-selected(string, string);
     callback profile-selected(string);
     callback context-view-requested();
+    callback terminals-clicked();
     // Phase 15: inline OAuth/connect from the @ MCP popup row.
     callback mcp-connect-requested(string);
     // Phase 15: inline enable/disable from the @ MCP popup row.
@@ -902,6 +908,41 @@ export component ChatInputLayout inherits Rectangle {
                 context-view-requested => { root.context-view-requested(); }
             }
         }
+        }
+
+        // PUI-002a: background-terminals chip, own row below the row2
+        // selector strip. Mirrors the hr + chip convention used elsewhere
+        // (e.g. terminal_card.slint's `Rectangle { height: 1px; background:
+        // Theme.border-default; }` divider) rather than inventing a new
+        // one. Hidden when there are no terminals for the displayed
+        // thread -- PUI-018 keeps terminal-count scoped per-ThreadSlot, so
+        // switching threads/agents changes this without any extra wiring
+        // here.
+        if root.terminal-count > 0 : VerticalLayout {
+            spacing: Metrics.gap-sm;
+            Rectangle { height: 1px; background: Theme.border-default; }
+            terminals-chip := TouchArea {
+                height: Metrics.pad-2xl;
+                mouse-cursor: pointer;
+                clicked => { root.terminals-clicked(); }
+                Rectangle {
+                    x: 0;
+                    width: chip-label.preferred-width + 2 * Metrics.pad-sm;
+                    height: 100%;
+                    background: terminals-chip.has-hover ? Theme.bg-tertiary : transparent;
+                    border-radius: Theme.radius-sm;
+                    chip-label := Text {
+                        x: Metrics.pad-sm;
+                        text: root.terminal-count + " terminal" + (root.terminal-count == 1 ? "" : "s");
+                        color: Theme.text-secondary;
+                        font-size: 10px * Theme.font-scale;
+                        font-family: Theme.font-sans;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                    }
+                }
+            }
         }
     }
 

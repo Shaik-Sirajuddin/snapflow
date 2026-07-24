@@ -939,6 +939,7 @@ fn update_request(model: &mut Model, msg: RequestMsg) -> (Vec<Effect>, Vec<Dirty
 }
 
 fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dirty>) {
+    let idx = selected_real_index(model);
     match msg {
         TerminalMsg::Expand(id) => {
             model.expanded_terminal_id = Some(id.clone());
@@ -956,6 +957,20 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
         TerminalMsg::LocalToggle => (vec![Effect::LocalTerminalSpawn], vec![Dirty::LocalTerminal]),
         TerminalMsg::LocalClose => (vec![Effect::LocalTerminalKill], vec![Dirty::LocalTerminal]),
         TerminalMsg::LocalKeyInput(bytes) => (vec![Effect::LocalTerminalWrite { bytes }], vec![]),
+        TerminalMsg::Kill(terminal_id) => {
+            // No model mutation here -- the real exit is observed the
+            // same way any other terminal exit is, via the next
+            // `AgentEvent::TerminalOutput` carrying a non-null
+            // `exitStatus` (see `AcpxThreadHandle::kill_terminal`'s doc
+            // comment). Nothing to mark dirty until that arrives.
+            (
+                vec![Effect::KillAgentTerminal {
+                    real_index: idx,
+                    terminal_id,
+                }],
+                vec![],
+            )
+        }
     }
 }
 
@@ -1754,6 +1769,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
+            | crate::protocol_types::AgentEvent::TerminalCreated(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
             | crate::protocol_types::AgentEvent::CurrentModeChanged(_)
             | crate::protocol_types::AgentEvent::ConfigOptions(_) => {
