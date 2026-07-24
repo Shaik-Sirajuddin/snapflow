@@ -28,16 +28,18 @@ export component UserBubble inherits Rectangle {
             Flickable {
                 height: bubble-text.preferred-height;
                 viewport-height: bubble-text.preferred-height;
-                bubble-text := Text {
+                bubble-text := TextInput {
                     text: item.text;
                     font-family: Theme.font-sans;
                     font-size: 12px * Theme.font-scale;
                     color: Theme.text-primary;
+                    read-only: true;
                     wrap: word-wrap;
-                    overflow: elide;
                     horizontal-alignment: left;
                     vertical-alignment: top;
                     width: parent.width;
+                    selection-foreground-color: Theme.text-primary;
+                    selection-background-color: #60a5fa80;
                 }
             }
         }

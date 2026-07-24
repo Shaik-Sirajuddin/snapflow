@@ -68,11 +68,12 @@ export component MarkdownView inherits VerticalLayout {
         }
     }
 
-    if lines.length == 0 : Text {
+    if lines.length == 0 : TextInput {
         text: fallback-text;
         font-family: Theme.font-sans;
         font-size: 12px * Theme.font-scale;
         color: Theme.text-primary;
+        read-only: true;
         wrap: word-wrap;
         horizontal-alignment: left;
         // Stretch across the bubble; no explicit width (can't combine
@@ -80,6 +81,8 @@ export component MarkdownView inherits VerticalLayout {
         horizontal-stretch: 1;
         preferred-width: 0px;
         min-width: 0px;
+        selection-foreground-color: Theme.text-primary;
+        selection-background-color: #60a5fa80;
     }
 
     for line[i] in lines : VerticalLayout {
