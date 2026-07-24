@@ -778,21 +778,34 @@ fn snapflowd_mcp_servers_entry(
     project_path: Option<&std::path::Path>,
     provider: &str,
 ) -> Vec<serde_json::Value> {
-    let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
-    let mut args = vec![
-        "--global-dir".to_string(),
-        global_dir.to_string_lossy().into_owned(),
-    ];
-    if let Some(project_path) = project_path.and_then(|p| p.parent()) {
-        args.push("--project-dir".to_string());
-        args.push(project_path.to_string_lossy().into_owned());
+    let mut entries = Vec::new();
+    // Whether MCP-free, filesystem-only skill delivery is safe for
+    // `provider` (an ACP registry agent id or its short-form alias, see
+    // `normalize_provider`'s own TRANSITIONAL doc comment) now lives in
+    // skills_manager::agent_registry (memory/acpx/gen/plans/acpx-skills/
+    // README.md#agent-skill-convention-registry) -- true only for
+    // vendor_ids a live test actually proved, currently just "codex"/
+    // "codex-acp" (panel-rust/tests/skills_manager_live_discovery_e2e_test.rs,
+    // 4/4 real passes against a real codex-acp backend). "claude" stays on
+    // MCP delivery -- per design_decisions.mcp_removal_gated_not_assumed,
+    // MCP is only removed per-vendor_id once actually verified live.
+    if !crate::skills_manager_adapter::is_live_verified(provider) {
+        let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
+        let mut args = vec![
+            "--global-dir".to_string(),
+            global_dir.to_string_lossy().into_owned(),
+        ];
+        if let Some(project_path) = project_path.and_then(|p| p.parent()) {
+            args.push("--project-dir".to_string());
+            args.push(project_path.to_string_lossy().into_owned());
+        }
+        entries.push(serde_json::json!({
+            "name": "skills",
+            "command": resolve_snapflowd_mcp_bin().to_string_lossy(),
+            "args": args,
+            "env": [],
+        }));
     }
-    let mut entries = vec![serde_json::json!({
-        "name": "skills",
-        "command": resolve_snapflowd_mcp_bin().to_string_lossy(),
-        "args": args,
-        "env": [],
-    })];
     entries.extend(snapshotd_mcp_server_entry(provider));
     entries
 }
@@ -1928,6 +1941,53 @@ fn spawn_background_attachment(
             .as_deref(),
         &slot.provider,
     );
+
+    // Reactive-sync trigger (2) (memory/acpx/gen/plans/acpx-skills/
+    // README.md#reactive-sync): before/at session setup, make sure this
+    // agent's skills are actually propagated to its native skill
+    // directory, catching up anything registered while no session was
+    // open. `None` project_root here means global scope, deliberately
+    // NOT cwd_for_session's current-dir fallback -- an unset session cwd
+    // override should sync global skills only, not whatever directory the
+    // panel-rust process happens to be running from.
+    //
+    // For vendor_ids skills_manager::agent_registry::is_live_verified()
+    // covers -- MCP is no longer sent for them at all (below), so this
+    // sync is the *only* delivery path left. It must complete before
+    // session/new fires, so it runs BLOCKING right here (fast local
+    // sqlite+symlink work, not a network call) rather than on a
+    // fire-and-forget background thread. For every other vendor_id, MCP
+    // remains the real delivery path regardless of this sync's timing, so
+    // it stays a best-effort background thread as before.
+    let vendor_id_for_sync = slot.provider.clone();
+    let project_root_for_sync = session_cwd_override
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if crate::skills_manager_adapter::is_live_verified(&vendor_id_for_sync) {
+        if let Err(error) = crate::skills_manager_adapter::sync_agent_targets(
+            &vendor_id_for_sync,
+            project_root_for_sync.as_deref(),
+        ) {
+            eprintln!(
+                "panel-rust: skills-manager thread-start reactive sync failed for {vendor_id_for_sync} \
+                 (blocking, filesystem-only delivery for this vendor -- session is opening WITHOUT \
+                 skills if this failed): {error}"
+            );
+        }
+    } else {
+        std::thread::spawn(move || {
+            if let Err(error) = crate::skills_manager_adapter::sync_agent_targets(
+                &vendor_id_for_sync,
+                project_root_for_sync.as_deref(),
+            ) {
+                eprintln!(
+                    "panel-rust: skills-manager thread-start reactive sync failed for {vendor_id_for_sync}: {error}"
+                );
+            }
+        });
+    }
+
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
         let cwd = cwd_for_session(&session_cwd_override);
@@ -7113,14 +7173,21 @@ done
     /// inspecting its own startup log -- making real round-trip tests here
     /// flaky on network latency, unrelated to this logic itself).
     #[test]
-    fn snapflowd_mcp_servers_entry_always_includes_the_skills_server() {
+    fn snapflowd_mcp_servers_entry_includes_the_skills_server_for_mcp_backed_providers() {
+        // "claude" stays MCP-backed (skills_manager::agent_registry::
+        // is_live_verified only covers "codex"/"codex-acp") -- was
+        // "codex" before phase 8's MCP removal for
+        // codex specifically; this test's actual point (the "skills"
+        // entry's shape) is unaffected by which still-MCP-backed provider
+        // exercises it.
+        //
         // Not asserting entries.len() == 1: a real snapshotd daemon
         // happening to run on the test host makes snapshotd_mcp_server_
         // entry's liveness probe legitimately append a second "snapshotd"
         // entry (see that function's own doc comment) regardless of
-        // provider -- this test only cares that "skills" is always
-        // present, first, and correctly shaped.
-        let entries = snapflowd_mcp_servers_entry(None, "codex");
+        // provider -- this test only cares that "skills" is present,
+        // first, and correctly shaped, for a provider still on MCP.
+        let entries = snapflowd_mcp_servers_entry(None, "claude");
         assert!(!entries.is_empty());
         assert_eq!(entries[0]["name"], "skills");
         assert!(entries[0]["command"]
@@ -7147,7 +7214,7 @@ done
     /// silently dropped by every real codex-acp session.
     #[test]
     fn snapflowd_mcp_servers_entry_skills_server_includes_the_required_env_field() {
-        let entries = snapflowd_mcp_servers_entry(None, "codex");
+        let entries = snapflowd_mcp_servers_entry(None, "claude");
         assert_eq!(entries[0]["name"], "skills");
         assert!(
             entries[0]["env"].is_array(),
@@ -7160,7 +7227,7 @@ done
     #[test]
     fn snapflowd_mcp_servers_entry_adds_project_dir_from_the_open_project_files_parent() {
         let project_file = std::path::Path::new("/tmp/my-project/timeline.mlt");
-        let entries = snapflowd_mcp_servers_entry(Some(project_file), "codex");
+        let entries = snapflowd_mcp_servers_entry(Some(project_file), "claude");
         let args = entries[0]["args"].as_array().expect("args is an array");
         let project_dir_idx = args
             .iter()
@@ -7171,6 +7238,27 @@ done
             serde_json::Value::String("/tmp/my-project".to_string()),
             "--project-dir must be the project FILE's parent directory, not the file itself"
         );
+    }
+
+    /// Phase 8 of memory/acpx/gen/plans/acpx-skills/meta.json: MCP skill
+    /// delivery is removed ONLY for vendor_ids a live test actually
+    /// proved deliver skills via native filesystem discovery with no MCP
+    /// present -- panel-rust/tests/skills_manager_live_discovery_e2e_test.rs
+    /// ran 4/4 real passes against a real codex-acp backend. "codex" and
+    /// "codex-acp" (both forms `slot.provider` can currently take, see
+    /// `normalize_provider`) must therefore get NO "skills" MCP entry at
+    /// all -- snapshotd's entry (if a live daemon answers) is unaffected,
+    /// this is skills-specific.
+    #[test]
+    fn snapflowd_mcp_servers_entry_omits_the_skills_server_for_live_verified_filesystem_providers() {
+        for provider in ["codex", "codex-acp"] {
+            let entries = snapflowd_mcp_servers_entry(None, provider);
+            assert!(
+                entries.iter().all(|e| e["name"] != "skills"),
+                "provider {provider:?} passed the live filesystem-discovery gate (phase 7) -- \
+                 it must not still be sent the \"skills\" MCP entry, entries: {entries:?}"
+            );
+        }
     }
 
     /// `"type": "http"` was confirmed live to work with both real

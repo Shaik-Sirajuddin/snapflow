@@ -1450,6 +1450,24 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 },
             }],
         ),
+        // memory/acpx/gen/plans/acpx-skills/ phase 17: one of the 6
+        // reactive-sync trigger call sites (create/promote/edit/agent-
+        // enable/agent-disable/thread-start) failed to propagate a
+        // skill to an attached agent. Best-effort, matching every
+        // reactive-sync call site's own posture: surfaced via toast, not
+        // retried, and deliberately NOT a Dirty::Error banner -- the
+        // skill mutation itself already succeeded (it's on disk, it's in
+        // the UI list), only the downstream agent propagation failed, so
+        // this doesn't belong in the same "something is broken" channel
+        // as an actual save/create/promote failure above.
+        EffectResultMsg::SkillReactiveSyncFailed { operation, detail } => {
+            let toast = show_toast(
+                model,
+                "error",
+                format!("Skill sync to agent failed ({operation}): {detail}"),
+            );
+            (vec![], vec![toast])
+        }
         EffectResultMsg::SkillWritten(Err(err)) => {
             model.skill_saving = false;
             let toast = show_toast(model, "error", format!("Skill save failed: {}", err.message));
@@ -4046,6 +4064,32 @@ mod tests {
         );
         assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
         assert_eq!(model.toast_kind, "info");
+    }
+
+    #[test]
+    fn skill_reactive_sync_failure_surfaces_as_a_toast_not_an_error_banner() {
+        // memory/acpx/gen/plans/acpx-skills/ phase 17: reactive-sync
+        // failures used to be eprintln!-only, invisible to the user.
+        // Deliberately NOT Dirty::Error -- the skill mutation itself
+        // already succeeded (on disk, in the UI list); only the
+        // downstream agent-propagation step failed.
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SkillReactiveSyncFailed {
+                operation: "create".to_owned(),
+                detail: "codex-acp: no such file or directory".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty(), "a toast-only result produces no further effects");
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert!(
+            !dirty.iter().any(|d| matches!(d, Dirty::Error { .. })),
+            "reactive-sync failures are soft/best-effort -- must not also arm the hard error banner"
+        );
+        assert_eq!(model.toast_kind, "error");
+        assert!(model.toast_message.contains("create"));
+        assert!(model.toast_message.contains("codex-acp: no such file or directory"));
     }
 
     #[test]
