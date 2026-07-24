@@ -1336,9 +1336,44 @@ pub fn to_mcp_server_option_rows(
                 needs_auth,
                 auth_status: auth.into(),
                 tools: ModelRc::new(VecModel::from(tools)),
+                // Every acpx `mcp_servers/list` row is a user-added registry
+                // entry -- removable. The one non-removable row (the built-in
+                // snapshotd daemon) is prepended separately, see
+                // [`builtin_snapshotd_option`].
+                removable: true,
             }
         })
         .collect()
+}
+
+/// PUI-015: the built-in `snapshotd` daemon MCP row for the Settings list,
+/// or `None` when the daemon is not currently reachable. This is the same
+/// endpoint the panel actually injects into every session's `mcpServers`
+/// array (`agent_bridge::snapshotd_mcp_server_entry`, gated on the same live
+/// probe cached in `agent_bridge::snapshotd_reachable`) -- surfaced here as a
+/// first-class, non-removable row so the always-on daemon server the model
+/// really talks to is visible in Settings, instead of the list showing only
+/// user-added registry servers and hiding the built-in one entirely. Not a
+/// synthetic UI guess: it names the exact `http://<addr>/mcp` endpoint the
+/// injection uses (`agent_bridge::snapshotd_mcp_addr`).
+pub fn builtin_snapshotd_option(reachable: bool) -> Option<McpServerOption> {
+    if !reachable {
+        return None;
+    }
+    let addr = crate::agent_bridge::snapshotd_mcp_addr();
+    Some(McpServerOption {
+        name: "snapshotd".into(),
+        command: String::new().into(),
+        status_line: "built-in daemon · always available".into(),
+        transport: "http".into(),
+        url: format!("http://{addr}/mcp").into(),
+        enabled: true,
+        status: "connected".into(),
+        needs_auth: false,
+        auth_status: String::new().into(),
+        tools: ModelRc::new(VecModel::from(Vec::<McpToolOption>::new())),
+        removable: false,
+    })
 }
 
 /// Parse a persisted `tools` array from an MCP server registry entry.
@@ -1526,6 +1561,43 @@ pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use slint::Model;
+
+    // PUI-015: the built-in snapshotd daemon row is only produced when the
+    // daemon is reachable, is non-removable, and names the same /mcp
+    // endpoint the session injection uses.
+    #[test]
+    fn builtin_snapshotd_option_is_present_and_non_removable_only_when_reachable() {
+        assert!(
+            builtin_snapshotd_option(false).is_none(),
+            "no built-in row when the daemon is unreachable"
+        );
+        let row = builtin_snapshotd_option(true).expect("row present when reachable");
+        assert_eq!(row.name.as_str(), "snapshotd");
+        assert!(!row.removable, "built-in daemon row must not be removable");
+        assert_eq!(row.transport.as_str(), "http");
+        assert!(
+            row.url.as_str().ends_with("/mcp"),
+            "must point at the streamable-HTTP /mcp endpoint, got {}",
+            row.url
+        );
+        assert!(
+            row.url.contains(&crate::agent_bridge::snapshotd_mcp_addr()),
+            "must name the same address the session injection uses"
+        );
+    }
+
+    // Registry-derived rows stay removable (only the built-in daemon is not).
+    #[test]
+    fn registry_mcp_rows_are_removable() {
+        let entry = crate::protocol_types::McpServerEntry {
+            name: "my-server".to_string(),
+            command: Some("do-thing".to_string()),
+            extra: serde_json::json!({}),
+        };
+        let rows = to_mcp_server_option_rows(vec![entry]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].removable, "user-added registry rows are removable");
+    }
 
     const NAMES: &[&str] = &[
         "Fix timeline crash",

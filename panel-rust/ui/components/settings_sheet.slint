@@ -384,7 +384,11 @@ export component SettingsSheet inherits Rectangle {
                         horizontal-stretch: 1;
                         overflow: elide;
                     }
-                    Button {
+                    // PUI-015: built-in daemon servers (removable == false,
+                    // e.g. snapshotd) show a non-interactive "Built-in" tag
+                    // instead of a Remove action -- the user cannot delete a
+                    // session-injected server.
+                    if server.removable : Button {
                         label: "Remove";
                         button-accessible-label: "Remove MCP server " + server.name;
                         btn-width: 44px;
@@ -394,6 +398,13 @@ export component SettingsSheet inherits Rectangle {
                         bg: Theme.bg-card;
                         fg: Theme.text-secondary;
                         clicked => { root.mcp-server-delete(server.name); }
+                    }
+                    if !server.removable : Text {
+                        text: "Built-in";
+                        color: Theme.text-secondary;
+                        font-size: 9px * Theme.font-scale;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
                     }
                 }
             }

@@ -842,11 +842,41 @@ fn snapflowd_mcp_servers_entry(
 /// false}`, consistent with it requiring the Streamable HTTP shape, not
 /// tolerating the classic SSE one as the previous doc comment's
 /// (unverified) claim asserted.
+/// Last known reachability of the snapshotd daemon MCP, cached from the
+/// most recent `snapshotd_mcp_server_entry` probe. PUI-015: the Settings
+/// MCP list (sync.rs) reads this via [`snapshotd_reachable`] to decide
+/// whether to surface the built-in, non-removable `snapshotd` daemon row --
+/// a plain atomic load, safe to call on the UI thread, never the blocking
+/// TCP probe itself. `false` until the first session-creation probe runs,
+/// so the built-in row stays hidden rather than advertising a daemon that
+/// may not be running -- the same ground-truth signal that gates the actual
+/// session injection also gates the Settings row (one source, not a UI
+/// heuristic).
+static SNAPSHOTD_REACHABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Non-blocking read of the cached snapshotd-daemon reachability (see
+/// [`SNAPSHOTD_REACHABLE`]). UI-thread safe.
+pub fn snapshotd_reachable() -> bool {
+    SNAPSHOTD_REACHABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The address the snapshotd daemon MCP is expected on -- shared by the
+/// session-injection entry below and the Settings built-in row (models.rs),
+/// so both name the exact same endpoint (ground-origin, PUI-015).
+pub fn snapshotd_mcp_addr() -> String {
+    std::env::var("SNAPSHOTD_MCP_SSE_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string())
+}
+
 fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
     let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
-    let addr =
-        std::env::var("SNAPSHOTD_MCP_SSE_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string());
-    if !probe_http_endpoint(&addr, "/sse") {
+    let addr = snapshotd_mcp_addr();
+    let reachable = probe_http_endpoint(&addr, "/sse");
+    // Cache the probe result so the Settings MCP list can surface the
+    // built-in daemon row without re-running this blocking probe on the UI
+    // thread (PUI-015).
+    SNAPSHOTD_REACHABLE.store(reachable, std::sync::atomic::Ordering::Relaxed);
+    if !reachable {
         return Vec::new();
     }
     vec![serde_json::json!({

@@ -733,12 +733,28 @@ fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
         &profile_rows,
     );
 
-    let mcp_rows = crate::models::to_mcp_server_option_rows(model.available_mcp_servers.clone());
-    let mcp_keys: Vec<String> = model
-        .available_mcp_servers
-        .iter()
-        .map(|server| server.name.clone())
-        .collect();
+    // PUI-015: prepend the built-in, non-removable `snapshotd` daemon MCP row
+    // (when the daemon is reachable) ahead of the user-added registry rows.
+    // `snapshotd_reachable()` is a non-blocking atomic load of the last
+    // session-injection probe result -- never the blocking probe itself, so
+    // this stays safe on the UI thread.
+    let mut mcp_rows = Vec::new();
+    let mut mcp_keys: Vec<String> = Vec::new();
+    if let Some(builtin) =
+        crate::models::builtin_snapshotd_option(crate::agent_bridge::snapshotd_reachable())
+    {
+        mcp_keys.push(builtin.name.to_string());
+        mcp_rows.push(builtin);
+    }
+    mcp_rows.extend(crate::models::to_mcp_server_option_rows(
+        model.available_mcp_servers.clone(),
+    ));
+    mcp_keys.extend(
+        model
+            .available_mcp_servers
+            .iter()
+            .map(|server| server.name.clone()),
+    );
     crate::list_model::reconcile(
         &model.mcp_servers_model,
         &mut model.mcp_server_model_keys.borrow_mut(),

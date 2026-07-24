@@ -328,6 +328,13 @@ export struct McpServerOption {
     // list renders no tool section (backend not yet supplying a tool
     // catalog -- always empty today).
     tools: [McpToolOption],
+    // False for built-in, session-injected servers the user cannot delete
+    // (PUI-015: the `snapshotd` daemon MCP, always injected into every
+    // session while the daemon is reachable -- it is not a user registry
+    // entry, so the Settings view hides its "Remove" action). True (the
+    // default for every acpx-registry row) means the user added it and may
+    // remove it.
+    removable: bool,
 }
 
 // Skill-manager sidebar/settings row -- `skill_discovery_backend` phase of
