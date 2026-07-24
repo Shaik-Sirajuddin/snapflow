@@ -238,6 +238,16 @@ struct ThreadSlot {
     /// move an existing session to a new cwd. `None` when no project was
     /// active at creation time (the pre-`active_project_binding` default).
     project_path: Option<PathBuf>,
+    /// PUI-014: `true` for a slot created up front (so it holds its positional
+    /// index in `slots`, preserving the `model.threads[i] <-> slots[i]`
+    /// parallel-array invariant) but whose ACP session attach is deliberately
+    /// DEFERRED until the thread's first message is sent -- keeping the
+    /// provider/profile editable until then. A deferred slot has no
+    /// `spawn_background_attachment` running and no `acp_session_id`;
+    /// [`AgentBridge::attach_deferred_thread`] replaces it in place with a
+    /// freshly-built, eagerly-attached slot bound to the then-current
+    /// provider. `false` for every eagerly-attached or recovered slot.
+    deferred: bool,
 }
 
 #[derive(Default)]
@@ -2367,6 +2377,7 @@ impl AgentBridge {
                 // No project can be active yet at construction time --
                 // `session_cwd_override` was just created above, unset.
                 project_path: None,
+                deferred: false,
             });
             slots.push(slot.clone());
 
@@ -2603,6 +2614,7 @@ impl AgentBridge {
             closed: Mutex::new(false),
             archived: Mutex::new(runtime_snapshot.archived),
             project_path: project_path_for_slot,
+            deferred: false,
         });
         self.slots.push(slot.clone());
 
@@ -2769,6 +2781,7 @@ impl AgentBridge {
             closed: Mutex::new(false),
             archived: Mutex::new(false),
             project_path: project_path_for_slot,
+            deferred: false,
         });
 
         let cwd = cwd_for_session(&self.session_cwd_override);
@@ -2901,6 +2914,16 @@ impl AgentBridge {
     /// because a preceding thread was deleted.
     pub fn thread_provider(&self, idx: usize) -> Option<String> {
         self.slots.get(idx).map(|slot| slot.provider.clone())
+    }
+
+    /// PUI-014: whether thread `idx`'s slot is a deferred placeholder whose
+    /// session attach has not been started yet (provider still editable, first
+    /// message not yet sent). `false` for a missing slot or any eagerly
+    /// attached / recovered one. Drives the compose provider-picker gate (kept
+    /// interactive while deferred) and the loading-vs-idle row heuristic (a
+    /// deferred slot is idle-ready, not "attach in flight").
+    pub fn is_deferred(&self, idx: usize) -> bool {
+        self.slots.get(idx).is_some_and(|slot| slot.deferred)
     }
 
     /// `thread_item_project_context` phase: the project directory this
