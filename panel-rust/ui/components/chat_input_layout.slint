@@ -65,7 +65,10 @@ export component ChatInputLayout inherits Rectangle {
     // PUI-003: the agent's own ACP slash-commands. The `/` menu shows these
     // when the agent advertises any, else falls back to the local skills list.
     in property <[SkillOption]> command-options: [];
-    property <[SkillOption]> slash-source: root.command-options.length > 0 ? root.command-options : root.skill-options;
+    // PUI-003: the `/` menu binds ONLY to the ACP agent's built-in commands
+    // (per the plan: "instead of custom skills"). No skills fallback -- when the
+    // agent advertises none, the menu shows its own empty-state.
+    property <[SkillOption]> slash-source: root.command-options;
     in property <[McpServerOption]> mcp-options: [];
     in property <[string]> file-options: [];
 
@@ -974,7 +977,7 @@ export component ChatInputLayout inherits Rectangle {
                             }
                         }
                         if root.slash-source.length == 0 : Text {
-                            text: "No skills discovered yet";
+                            text: "No commands available";
                             color: Theme.text-muted;
                             font-size: 11px * Theme.font-scale;
                         }
