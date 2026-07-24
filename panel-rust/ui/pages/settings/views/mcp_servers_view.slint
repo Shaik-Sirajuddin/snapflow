@@ -100,9 +100,21 @@ export component McpServersView inherits Rectangle {
                     hint: server.transport == "http" ? server.url : server.command;
                     hint-font-family: Theme.font-mono;
 
+                    // Phase 15 (mcp_skills_control_surface): live
+                    // connection dot -- green connected, red error/
+                    // disconnected, yellow otherwise (auth required...).
+                    // Explicit user direction; supersedes the earlier
+                    // no-status-color convention for MCP surfaces.
+                    if server.status != "" : Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: server.status == "connected" ? #22c55e
+                            : (server.status == "error" || server.status == "disconnected") ? #ef4444
+                            : #eab308;
+                    }
                     // Transport + auth + connection status, combined into one
-                    // muted subtitle instead of three separate trailing items --
-                    // still plain monochrome text, never a colored badge.
+                    // muted subtitle as before (dot above carries the color).
                     if server-block.status-line != "" : Text {
                         text: server-block.status-line;
                         color: Theme.text-muted;

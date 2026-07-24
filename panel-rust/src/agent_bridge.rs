@@ -165,6 +165,10 @@ struct ThreadSlot {
     /// `Option` costs nothing and doesn't assume that invariant holds
     /// for every possible backend.
     pending_requests: Mutex<Vec<AgentRequestEvent>>,
+    /// Phase 18: latest live token usage (used, size) from streaming
+    /// usage_update events -- feeds the compose context ring DURING a
+    /// turn, not only at turn end.
+    usage: Mutex<(i64, i64)>,
     /// Latest live output snapshot per terminal id, keyed by
     /// `terminal_id` -- populated from `AgentEvent::TerminalOutput`
     /// (the gateway's `acpx/terminal_output` push, see
@@ -1848,6 +1852,9 @@ fn spawn_event_forwarder(
                         .unwrap_or_else(|e| e.into_inner())
                         .mark_all_streaming_completed();
                 }
+                AgentEvent::UsageUpdate { used, size } => {
+                    *slot_for_task.usage.lock().expect("usage mutex poisoned") = (*used, *size);
+                }
                 AgentEvent::Error(_) => {}
                 AgentEvent::PermissionRequest(req) => {
                     slot_for_task
@@ -2224,6 +2231,7 @@ impl AgentBridge {
                 older_available: Mutex::new(older_available),
                 oldest_loaded_index: Mutex::new(oldest_loaded_index),
                 pending_requests: Mutex::new(runtime_snapshot.pending_requests),
+                usage: Mutex::new((0, 0)),
                 terminal_buffers: Mutex::new(
                     runtime_snapshot
                         .terminals
@@ -2460,6 +2468,7 @@ impl AgentBridge {
             older_available: Mutex::new(older_available),
             oldest_loaded_index: Mutex::new(oldest_loaded_index),
             pending_requests: Mutex::new(runtime_snapshot.pending_requests),
+                usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(
                 runtime_snapshot
                     .terminals
@@ -2642,6 +2651,7 @@ impl AgentBridge {
             older_available: Mutex::new(false),
             oldest_loaded_index: Mutex::new(0),
             pending_requests: Mutex::new(Vec::new()),
+            usage: Mutex::new((0, 0)),
             terminal_buffers: Mutex::new(HashMap::new()),
             terminal_order: Mutex::new(Vec::new()),
             session_modes: Mutex::new(None),
@@ -2973,10 +2983,16 @@ impl AgentBridge {
     /// restart. Returns `false` for an out-of-range `idx` (nothing to
     /// archive); otherwise always succeeds and is idempotent.
     pub fn archive_thread(&self, idx: usize) -> bool {
+        self.set_thread_archived(idx, true)
+    }
+
+    /// Phase 19: toggle-capable archive state (false = resume from
+    /// archive). Same persistence as archive_thread.
+    pub fn set_thread_archived(&self, idx: usize, archived: bool) -> bool {
         let Some(slot) = self.slots.get(idx) else {
             return false;
         };
-        *slot.archived.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *slot.archived.lock().unwrap_or_else(|e| e.into_inner()) = archived;
         persist_runtime_snapshot(self.store.as_ref(), slot);
         true
     }
@@ -3463,6 +3479,13 @@ impl AgentBridge {
     /// snapshot of [`ThreadSlot::session_modes`], updated by
     /// [`store_capability_event`] as `AgentEvent::SessionModes`/
     /// `CurrentModeChanged` events are drained through `poll()`.
+    pub fn thread_usage(&self, idx: usize) -> (i64, i64) {
+        self.slots
+            .get(idx)
+            .map(|slot| *slot.usage.lock().expect("usage mutex poisoned"))
+            .unwrap_or((0, 0))
+    }
+
     pub fn session_modes(&self, idx: usize) -> Option<SessionModesEvent> {
         let slot = self.slots.get(idx)?;
         slot.session_modes
@@ -4463,6 +4486,7 @@ mod tests {
             connection_status: bridge.transport_status(index),
             session_modes: bridge.session_modes(index),
             config_options: bridge.config_options(index),
+            usage: (0, 0),
         };
         let (_, dirty) = crate::update::update(
             &mut model,

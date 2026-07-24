@@ -768,6 +768,11 @@ fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
         .get("sessionUpdate")
         .and_then(|k| k.as_str())?
     {
+        "usage_update" => {
+            let used = session_update.get("used").and_then(|v| v.as_i64()).unwrap_or(0);
+            let size = session_update.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+            Some(AgentEvent::UsageUpdate { used, size })
+        }
         "current_mode_update" => {
             let mode_id = session_update.get("currentModeId")?.as_str()?.to_string();
             Some(AgentEvent::CurrentModeChanged(mode_id))

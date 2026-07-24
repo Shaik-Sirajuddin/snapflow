@@ -57,7 +57,15 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         Dirty::ThreadRow(idx) => {
             apply_thread_row(model, *idx);
         }
-        Dirty::ThreadListDiff(ops) => apply_thread_ops(model, ops),
+        Dirty::ThreadListDiff(ops) => {
+            apply_thread_ops(model, ops);
+            // Phase 19: section counters (active vs archived) follow every
+            // thread-list rebuild.
+            let archived = model.threads.iter().filter(|t| t.archived && !t.closed).count() as i32;
+            let active = model.threads.iter().filter(|t| !t.archived && !t.closed).count() as i32;
+            component.set_active_thread_count(active);
+            component.set_archived_thread_count(archived);
+        }
         Dirty::MessageAppended { thread_id } => {
             sync_message_snapshot(model, thread_id);
             sync_has_older_messages(model, component, thread_id);
@@ -105,6 +113,11 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             if let Some(thread) = thread_for_id(model, thread_id) {
                 component.set_connection_status(thread.connection_status.clone().into());
             }
+        }
+        Dirty::Toast => {
+            component.set_toast_message(model.toast_message.clone().into());
+            component.set_toast_kind(model.toast_kind.clone().into());
+            component.set_toast_seq(model.toast_seq);
         }
         Dirty::Error { thread_id, detail } => {
             // Match durable thread_id *or* session_id (same contract as
@@ -221,6 +234,14 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 sync_profile_picker(model, component, thread);
                 // Model list after provider resolve so it can filter by agent.
                 sync_model_dropdown_for_provider(model, component, thread);
+                // Phase 18: live token usage -> compose context ring,
+                // streaming DURING a turn (usage folds through the
+                // frame snapshot; Capabilities dirty fires on change).
+                component.set_context_used_tokens(thread.usage.0 as i32);
+                component.set_context_limit_tokens(thread.usage.1 as i32);
+                component.set_context_ratio(if thread.usage.1 > 0 {
+                    (thread.usage.0 as f32 / thread.usage.1 as f32).clamp(0.0, 1.0)
+                } else { 0.0 });
             }
         }
     }
@@ -230,6 +251,11 @@ fn sync_skill_editor_state(model: &Model, component: &ChatPanel) {
     component.set_active_skill_name(model.active_skill_name.clone().into());
     component.set_active_skill_path(model.active_skill_path.clone().into());
     component.set_active_skill_content(model.active_skill_content.clone().into());
+    // Phase 27: markdown preview of the active content for the editor's
+    // Preview toggle.
+    component.set_active_skill_markdown(crate::models::skill_markdown_preview(
+        &model.active_skill_content,
+    ));
     component.set_skill_saving(model.skill_saving);
     let editors = model
         .detected_editors
@@ -842,6 +868,7 @@ mod tests {
     fn thread_row_ops_apply_to_the_persistent_model_and_key_cache() {
         let mut model = Model::default();
         let row = VisibleThreadItem {
+            session_id: None,
             real_index: 7,
             thread_id: "thread-7".to_owned(),
             item: crate::ThreadItem::default(),
@@ -876,6 +903,7 @@ mod tests {
             ..crate::ThreadItem::default()
         };
         let row = VisibleThreadItem {
+            session_id: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: item.clone(),
@@ -921,6 +949,7 @@ mod tests {
             "stale-c".to_owned(),
         ];
         let row = VisibleThreadItem {
+            session_id: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: crate::ThreadItem {
@@ -1031,6 +1060,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..crate::msg::FrameInput::default()
             }),
@@ -1076,6 +1106,7 @@ mod tests {
         *model.thread_model_keys.borrow_mut() = vec!["thread:0".to_owned()];
         model.visible_indices = vec![0];
         model.thread_rows.push(VisibleThreadItem {
+            session_id: None,
             real_index: 0,
             thread_id: "thread:0".to_owned(),
             item: crate::ThreadItem {

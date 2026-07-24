@@ -39,6 +39,15 @@ export component ChatArea inherits Rectangle {
     in-out property <bool> loading-older-messages: false;
     callback load-older-requested();
     in property <string> agent-badge: "agent . ask";
+    // Phase 16 (topbar_project_indicator): the session's connected
+    // project (the snapshotd MCP bound via the agent). Name shown,
+    // full path in the accessible label; the dot is green while the
+    // MCP connection is live, red when disconnected. Live state is the
+    // source of truth; hosts fall back to the session jsonl record only
+    // during load (answered open question 5). Empty name hides it.
+    in property <string> project-name: "";
+    in property <string> project-path: "";
+    in property <bool> project-mcp-live: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
     callback error-banner-dismissed();
@@ -52,6 +61,13 @@ export component ChatArea inherits Rectangle {
     // struct" convention `PendingRequestItem` already established.
     in property <LocalTerminalItem> local-terminal;
     in-out property <string> compose-text: "";
+    // Phase 14: forwarded to ChatInputLayout.inputs-enabled (false for
+    // archived threads -- inputs render disabled, not just inert).
+    in property <bool> inputs-enabled: true;
+    callback mcp-connect-requested(string);
+    callback mcp-enabled-changed(string, bool);
+    // Phase 17: markdown Ctrl+Click link target, host opens it.
+    callback md-link-activated(string);
     // Mode/model selector addition: the *currently displayed* thread's
     // live capability advertisement (`AgentBridge::session_modes`/
     // `config_options`, flattened into domain-neutral `DropdownEntry` rows
@@ -494,6 +510,29 @@ export component ChatArea inherits Rectangle {
                     alignment: end;
                     cross-axis-alignment: center;
 
+                    if root.project-name != "" : HorizontalLayout {
+                        spacing: Metrics.space-1;
+                        horizontal-stretch: 0;
+                        cross-axis-alignment: center;
+                        accessible-role: text;
+                        accessible-label: "Project " + root.project-path
+                            + (root.project-mcp-live ? " (MCP connected)" : " (MCP disconnected)");
+                        Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            background: root.project-mcp-live ? #22c55e : #ef4444;
+                        }
+                        Text {
+                            text: root.project-name;
+                            color: Theme.text-muted;
+                            font-size: (root.match-title-bar ? 9px : 10px) * Theme.font-scale;
+                            font-family: Theme.font-mono;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            max-width: compact ? 70px : 130px;
+                        }
+                    }
                     Text {
                         text: agent-badge;
                         color: Theme.text-primary;
@@ -670,10 +709,34 @@ export component ChatArea inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
+                // Phase 18 empty/loading states: never leave the chat
+                // view blank. While (re)connecting, a blinking loading
+                // line; once live with no messages, a centered starter.
+                if root.messages.length == 0 : VerticalLayout {
+                    height: 160px;
+                    alignment: center;
+                    property <bool> reloading: connection-status == "Connecting...";
+                    property <float> blink: 0.3 + 0.7 * abs(sin(360deg * mod(animation-tick(), 1000ms) / 1000ms));
+                    Text {
+                        text: reloading ? "loading conversation..."
+                            : "Send a message to start the conversation";
+                        color: Theme.text-muted;
+                        opacity: reloading ? blink : 0.8;
+                        font-size: 11px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
                 // chat-items-redesign.md #11: kind switch — user /
                 // agent|thinking / tool-event / legacy MessageCard.
                 for msg[i] in messages : HorizontalLayout {
                     property <bool> is-queued: msg.queued;
+                    // Phase 18: synthetic awaiting-response row (models.rs
+                    // appends kind "pending" while a just-sent user message
+                    // is the transcript tail). Subtle dots, distinct from
+                    // real thinking rows.
+                    property <bool> is-pending: msg.kind == "pending";
                     property <bool> is-user: msg.kind == "user" && !msg.queued;
                     property <bool> is-agent-side: msg.kind == "agent"
                         || msg.kind == "thinking";
@@ -748,6 +811,28 @@ export component ChatArea inherits Rectangle {
                         width: is-user ? user-indent : rail-gap;
                         horizontal-stretch: 0;
                     }
+                    if is-pending : HorizontalLayout {
+                        spacing: Metrics.space-2;
+                        padding-left: rail-w + Metrics.space-2;
+                        height: 20px;
+                        cross-axis-alignment: center;
+                        property <float> pulse: 0.35 + 0.65 * abs(sin(360deg * mod(animation-tick(), 1200ms) / 1200ms));
+                        Text {
+                            text: "\u{2022} \u{2022} \u{2022}";
+                            color: Theme.text-muted;
+                            opacity: parent.pulse;
+                            font-size: 11px * Theme.font-scale;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: "waiting for response";
+                            color: Theme.text-muted;
+                            opacity: 0.7;
+                            font-size: 9px * Theme.font-scale;
+                            font-italic: true;
+                            vertical-alignment: center;
+                        }
+                    }
                     if is-queued : QueuedMessageBar {
                         horizontal-stretch: 1;
                         preferred-width: 0px;
@@ -772,6 +857,7 @@ export component ChatArea inherits Rectangle {
                         item: msg;
                     }
                     if is-agent-side : AgentBubble {
+                        link-activated(target) => { root.md-link-activated(target); }
                         horizontal-stretch: 1;
                         preferred-width: 0px;
                         min-width: 0px;
@@ -933,6 +1019,9 @@ export component ChatArea inherits Rectangle {
         // message Flickable remains the only elastic region (bottom-box
         // cutoff regressions when this band stretched).
         chat-input := ChatInputLayout {
+            inputs-enabled: root.inputs-enabled;
+            mcp-connect-requested(name) => { root.mcp-connect-requested(name); }
+            mcp-enabled-changed(name, enabled) => { root.mcp-enabled-changed(name, enabled); }
             width: 100%;
             horizontal-stretch: 1;
             vertical-stretch: 0;

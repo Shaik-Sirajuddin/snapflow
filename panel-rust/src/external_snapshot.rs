@@ -9,6 +9,27 @@ use crate::{models, msg, AgentBridge, PanelSingleton};
 use slint::ModelRc;
 use std::sync::atomic::Ordering;
 
+/// Phase 27: ~1s throttle for the settings-open skills re-scan (the frame
+/// poll runs per repaint; scanning the skills directories that often is
+/// pure waste). Thread-local because the poll only ever runs on the UI
+/// thread.
+fn skills_rescan_due() -> bool {
+    thread_local! {
+        static LAST_SKILLS_SCAN: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST_SKILLS_SCAN.with(|last| {
+        let now = std::time::Instant::now();
+        let due = last
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(1));
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
 pub(crate) struct ExternalSnapshotSource<'a> {
     panel: &'a PanelSingleton,
 }
@@ -85,7 +106,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                 .then(|| self.collect_settings_preferences_snapshot(None)),
             settings_gateway_snapshot: need_gateway_catalog
                 .then(|| self.collect_settings_gateway_snapshot()),
-            skills_snapshot: None,
+            // Plan phase 27 (skills view reactivity): while Settings is on
+            // screen, re-scan the skills dirs about once a second and fold
+            // the result, so the live skills view tracks filesystem/state
+            // changes (bundled getting-started appearing, dev-mode or
+            // scope flips, external edits) instead of only refreshing
+            // after this panel's own skill effects. Throttled because the
+            // frame poll runs per repaint; the fold diffs by content, so
+            // an unchanged scan dirties nothing.
+            skills_snapshot: (settings_open && skills_rescan_due())
+                .then(|| self.collect_skills_snapshot()),
         }
     }
 
@@ -317,7 +347,7 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .unwrap_or_default()
             })
             .collect();
-        let items = models::build_thread_items(
+        let mut items = models::build_thread_items(
             &names,
             &state,
             &descriptions,
@@ -325,6 +355,17 @@ impl<'a> ExternalSnapshotSource<'a> {
             &closed,
             &archived,
             &query,
+        );
+        // Plan phase 26: the chat view binds to the selected project --
+        // threads recorded against a DIFFERENT project drop out of the
+        // visible list when the editor switches projects (path-less
+        // threads stay). The phase-23 selection re-anchor keeps the
+        // selected index sane across this rewrite.
+        let active_project_path = self.panel.model.borrow().active_project_path.clone();
+        models::retain_items_for_project(
+            &mut items,
+            &thread_project_paths,
+            active_project_path.as_deref(),
         );
         let visible_indices: Vec<usize> = items.iter().map(|item| item.real_index).collect();
         // Profile/session identity live on the TEA ThreadModel, not the
@@ -350,9 +391,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .cloned()
                     .unwrap_or_default()
                     .into();
+                // Phase 26/16: a thread with no recorded session project
+                // path inherits the ACTIVE project for display, so the
+                // top-bar project indicator lights up instead of staying
+                // dark for every pre-project thread (the phase-16 "empty
+                // project fields" defect).
                 let project_path = thread_project_paths
                     .get(item.real_index)
+                    .filter(|path| !path.is_empty())
                     .cloned()
+                    .or_else(|| active_project_path.clone())
                     .unwrap_or_default();
                 row.project_name = std::path::Path::new(&project_path)
                     .file_name()
@@ -373,6 +421,13 @@ impl<'a> ExternalSnapshotSource<'a> {
                 {
                     row.status = "loading".into();
                     row.busy = true;
+                    // Plan phase 30: immediate feedback while the
+                    // background session attach is in flight -- the row
+                    // appears instantly with a spinner (phase 25) and
+                    // this caption instead of sitting silent.
+                    if row.description.is_empty() {
+                        row.description = "Starting new thread...".into();
+                    }
                 }
                 models::VisibleThreadItem {
                     real_index: item.real_index,
@@ -380,6 +435,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                         .get(item.real_index)
                         .cloned()
                         .unwrap_or_else(|| format!("thread:{}", item.real_index)),
+                    // Review-gate fix (phase 32): carry the live bridge
+                    // binding so the frame fold can hydrate
+                    // ThreadModel::session_id once a background attach
+                    // resolves.
+                    session_id: self
+                        .panel
+                        .bridge
+                        .as_ref()
+                        .and_then(|bridge| bridge.thread_binding(item.real_index))
+                        .map(|binding| binding.session_id),
                     item: row,
                 }
             })
@@ -389,6 +454,10 @@ impl<'a> ExternalSnapshotSource<'a> {
             visible_indices,
             visible_thread_ids: rows.iter().map(|row| row.thread_id.clone()).collect(),
             rows,
+            // Review-gate fix (phase 32): bridge-persisted archived flags
+            // for every thread, so restarts hydrate ThreadModel::archived
+            // (sidebar counters + archive pool cap read the model).
+            archived_flags: archived,
         }
     }
 
@@ -476,6 +545,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             ),
             connection_status: bridge.transport_status(real_idx),
             session_modes: bridge.session_modes(real_idx),
+            usage: bridge.thread_usage(real_idx),
             config_options: bridge.config_options(real_idx),
         })
     }

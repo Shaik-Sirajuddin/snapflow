@@ -117,6 +117,10 @@ pub enum AgentEvent {
     /// this variant, same "replace, don't append" contract
     /// [`AgentEvent::TerminalOutput`] documents for its own buffer).
     ConfigOptions(Vec<ConfigOptionInfo>),
+    /// Phase 18: live `usage_update` session/update (used/size tokens)
+    /// -- streams DURING a turn so the compose context ring updates
+    /// actively, not only at turn end.
+    UsageUpdate { used: i64, size: i64 },
 }
 
 /// One mode an ACP agent advertises as selectable for a session. See

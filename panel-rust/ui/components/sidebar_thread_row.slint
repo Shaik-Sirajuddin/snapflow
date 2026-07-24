@@ -73,9 +73,11 @@ export component SidebarThreadRow inherits HoverSurface {
                 // Collapsed: per-thread accent (rose/orange/…).
                 // Expanded: white selection bar (bg-primary) on
                 // the selected row only; transparent otherwise.
+                // Phase 29: archived rows carry NO accent glow in the
+                // collapsed rail -- only live threads get their color.
                 background: expanded
                     ? (index == selected-thread ? Theme.bg-primary : transparent)
-                    : accent-color;
+                    : (thread.archived ? transparent : accent-color);
             }
             VerticalLayout {
                 horizontal-stretch: 1;
@@ -123,27 +125,44 @@ export component SidebarThreadRow inherits HoverSurface {
                     property <angle> load-spin: row-busy
                         ? 360deg * mod(animation-tick(), 800ms) / 800ms
                         : 0deg;
+                    // Phase 25 (thread_row_loading_indicator_fix): two
+                    // live defects here. (1) The spinner/hand were drawn
+                    // `Theme.bg-primary` -- the row's own background color
+                    // on every non-selected row, so the (correctly
+                    // animating) loader was simply invisible: color now
+                    // follows selection like the title text. (2) A fixed
+                    // 14px box top-aligned inside this HorizontalLayout
+                    // (fixed-height children sit at the cross-axis start),
+                    // so the loader rode high against the first-row title;
+                    // each state icon now lives in a height-stretching
+                    // cell whose inner fixed-size child self-centers
+                    // (default x/y center an element in its parent).
                     if row-busy : Rectangle {
                         width: 14px;
-                        height: 14px;
                         Icon {
                             source: @image-url("../assets/icons/loader-circle.svg");
                             size: 14px;
-                            color: Theme.bg-primary;
+                            color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
                             transform-rotation: load-spin;
                             transform-origin: { x: self.width / 2, y: self.height / 2 };
                         }
                     }
-                    if thread.status == "error" : Icon {
-                        source: @image-url("../assets/icons/hand.svg");
-                        size: 14px;
-                        color: Theme.bg-primary;
+                    if thread.status == "error" : Rectangle {
+                        width: 14px;
+                        Icon {
+                            source: @image-url("../assets/icons/hand.svg");
+                            size: 14px;
+                            color: index == selected-thread ? Theme.bg-primary : Theme.text-primary;
+                        }
                     }
                     if !row-busy && thread.status != "error" : Rectangle {
                         width: 6px;
-                        height: 6px;
-                        border-radius: 3px;
-                        background: Theme.text-muted;
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.text-muted;
+                        }
                     }
                     if expanded && rename-thread-index != index : Text {
                         text: thread.name;
@@ -378,7 +397,9 @@ export component SidebarThreadRow inherits HoverSurface {
                         Icon {
                             source: @image-url("../assets/icons/trash-2.svg");
                             size: 13px;
-                            color: Theme.text-muted;
+                            // Phase 29: destructive action reads as such --
+                            // subtle red, not full alert saturation.
+                            color: #ef4444.with-alpha(0.75);
                         }
                     }
                     if expanded && rename-thread-index != index
@@ -408,6 +429,22 @@ export component SidebarThreadRow inherits HoverSurface {
                                 size: 13px;
                                 color: Theme.text-secondary;
                             }
+                        }
+                    }
+                    // Phase 19: resume from archive -- same toggle action,
+                    // shown on archived rows (distinct accessible label).
+                    if expanded && rename-thread-index != index
+                        && thread.archived && (root.has-hover || index == selected-thread) : IconButton {
+                        btn-width: 18px;
+                        btn-height: 18px;
+                        button-accessible-label: "Resume thread " + thread.name;
+                        clicked => { archive-requested(); }
+                        Icon {
+                            source: @image-url("../assets/icons/archive.svg");
+                            size: 13px;
+                            // Phase 29: archive-family action gets its own
+                            // color, distinct from delete's red.
+                            color: #38bdf8;
                         }
                     }
                     if expanded && rename-thread-index != index

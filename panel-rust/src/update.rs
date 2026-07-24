@@ -64,7 +64,11 @@ fn visible_thread_indices(model: &Model) -> Vec<usize> {
 }
 
 fn current_visible_indices(model: &Model) -> Vec<usize> {
-    if model.visible_indices.is_empty() && !model.threads.is_empty() {
+    if model.visible_indices.is_empty() && !model.threads.is_empty() && !model.visible_list_synced {
+        // Pre-first-snapshot fallback only. After a real list sync an
+        // empty visible list is genuine (project scope/search matched
+        // nothing) -- expanding to all threads here silently retargeted
+        // actions at hidden threads (review-gate finding 3).
         (0..model.threads.len()).collect()
     } else {
         model.visible_indices.clone()
@@ -88,6 +92,17 @@ fn current_visible_keys(model: &Model) -> Vec<String> {
 // instead of hand-rolling the visible_indices-empty-fallback logic
 // (current_visible_indices' own reason for existing) a second time and
 // risking it drifting out of sync with this one.
+/// Plan phase 28: arm the shared action-feedback toast (one popup for
+/// error/info/status of user actions) and return its Dirty. `toast_seq`
+/// bumps every call so the UI restarts its auto-hide timer even when the
+/// same message repeats.
+pub(crate) fn show_toast(model: &mut Model, kind: &str, message: impl Into<String>) -> Dirty {
+    model.toast_message = message.into();
+    model.toast_kind = kind.to_owned();
+    model.toast_seq = model.toast_seq.wrapping_add(1);
+    Dirty::Toast
+}
+
 pub(crate) fn selected_real_index(model: &Model) -> usize {
     current_visible_indices(model)
         .get(model.selected_thread)
@@ -133,6 +148,7 @@ pub(crate) fn visible_thread_row(
     Some(crate::models::VisibleThreadItem {
         real_index,
         thread_id,
+        session_id: thread.session_id.clone(),
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
             status: status.into(),
@@ -429,11 +445,46 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);
             };
-            thread.archived = true;
-            (
-                vec![Effect::ArchiveThread { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
-            )
+            // Phase 19: TOGGLE -- the same action resumes an archived
+            // thread (sidebar's archived rows wire it as Resume).
+            let now_archived = !thread.archived;
+            thread.archived = now_archived;
+            let mut effects = vec![Effect::ArchiveThread { real_index: idx, archived: now_archived }];
+            let mut dirty = vec![Dirty::ThreadRow(idx)];
+            // Phase 19 pool cap: at most ARCHIVE_POOL_CAP archived
+            // threads; beyond it the OLDEST archived thread is quietly
+            // dropped -- permanent delete via the existing delete flow
+            // (acpx session close/delete + local purge), per the
+            // defaulted open question 1.
+            const ARCHIVE_POOL_CAP: usize = 10;
+            if now_archived {
+                let archived_indices: Vec<usize> = model
+                    .threads
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.archived && !t.closed)
+                    .map(|(i, _)| i)
+                    .collect();
+                if archived_indices.len() > ARCHIVE_POOL_CAP {
+                    // Oldest = first in model order (creation order). Never
+                    // drop the thread the user JUST archived -- take the
+                    // next-oldest instead (review-gate finding: skipping
+                    // entirely left the pool at cap+1 until the next
+                    // archive).
+                    let drop_idx = archived_indices
+                        .iter()
+                        .copied()
+                        .find(|candidate| *candidate != idx);
+                    if let Some(drop_idx) = drop_idx {
+                        if let Some(oldest) = model.threads.get_mut(drop_idx) {
+                            oldest.closed = true;
+                        }
+                        effects.push(Effect::DeleteThread { real_index: drop_idx });
+                        dirty.push(Dirty::ThreadRow(drop_idx));
+                    }
+                }
+            }
+            (effects, dirty)
         }
         ThreadMsg::RenameRequested(idx, name) => {
             let old_keys = current_visible_keys(model);
@@ -1067,17 +1118,28 @@ fn update_skill(model: &mut Model, msg: SkillMsg) -> (Vec<Effect>, Vec<Dirty>) {
         ),
         SkillMsg::ContentEdited { path, content } => {
             model.skill_saving = true;
+            // Plan phase 27 (skill editing pipeline): the model copy MUST
+            // absorb the edit before Dirty::SkillEditor syncs. Without
+            // this, sync_skill_editor_state pushed the STALE
+            // active_skill_content back into the two-way-bound editor
+            // text on every keystroke -- typing never stuck in the
+            // editor and saves recorded no lasting delta (the live
+            // "user typing doesn't reach the skill section" report).
+            model.active_skill_content = content.clone();
             (
                 vec![Effect::SkillWrite { path, content }],
                 vec![Dirty::SkillEditor],
             )
         }
-        SkillMsg::CopyPathRequested { path } => (
-            vec![Effect::ClipboardWrite {
-                text: path.to_string_lossy().into_owned(),
-            }],
-            vec![],
-        ),
+        SkillMsg::CopyPathRequested { path } => {
+            let toast = show_toast(model, "info", "Path copied to clipboard");
+            (
+                vec![Effect::ClipboardWrite {
+                    text: path.to_string_lossy().into_owned(),
+                }],
+                vec![toast],
+            )
+        }
         SkillMsg::EditorOpenRequested { path } => (vec![Effect::OpenSkillEditor { path }], vec![]),
         SkillMsg::OpenInEditorRequested { editor_name, path } => {
             (vec![Effect::OpenInEditor { editor_name, path }], vec![])
@@ -1357,12 +1419,18 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         // result is folded (see CreateSkill's refresh-before-open
         // order); do not emit an empty SkillsListDiff here -- that
         // would re-push the pre-create list and race the real rescan.
-        EffectResultMsg::SkillCreated(Ok(path)) => (vec![Effect::OpenSkillEditor { path }], vec![]),
+        EffectResultMsg::SkillCreated(Ok(path)) => {
+            let toast = show_toast(model, "status", "Skill created");
+            (vec![Effect::OpenSkillEditor { path }], vec![toast])
+        }
         EffectResultMsg::SkillWritten(Ok(())) => {
             model.skill_saving = false;
             (vec![], vec![Dirty::SkillEditor])
         }
-        EffectResultMsg::SkillPromoted(Ok(())) => (vec![], vec![]),
+        EffectResultMsg::SkillPromoted(Ok(())) => {
+            let toast = show_toast(model, "status", "Skill promoted to global");
+            (vec![], vec![toast])
+        }
         EffectResultMsg::ExternalEditorOpened(Ok(()))
         | EffectResultMsg::OsDefaultOpened(Ok(())) => (vec![], vec![]),
         EffectResultMsg::SkillEditorLoaded(Ok(state)) => {
@@ -1384,10 +1452,12 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         ),
         EffectResultMsg::SkillWritten(Err(err)) => {
             model.skill_saving = false;
+            let toast = show_toast(model, "error", format!("Skill save failed: {}", err.message));
             (
                 vec![],
                 vec![
                     Dirty::SkillEditor,
+                    toast,
                     Dirty::Error {
                         thread_id: String::new(),
                         detail: ErrorDetail {
@@ -1400,15 +1470,24 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
         EffectResultMsg::SkillCreated(Err(err))
         | EffectResultMsg::SkillPromoted(Err(err))
         | EffectResultMsg::ExternalEditorOpened(Err(err))
-        | EffectResultMsg::OsDefaultOpened(Err(err)) => (
-            vec![],
-            vec![Dirty::Error {
-                thread_id: String::new(),
-                detail: ErrorDetail {
-                    message: err.message,
-                },
-            }],
-        ),
+        | EffectResultMsg::OsDefaultOpened(Err(err)) => {
+            // Phase 28: these are exactly the "skills top-bar button
+            // failures show nothing" class -- global (no-thread) action
+            // errors that the per-thread error banner never displayed.
+            let toast = show_toast(model, "error", err.message.clone());
+            (
+                vec![],
+                vec![
+                    toast,
+                    Dirty::Error {
+                        thread_id: String::new(),
+                        detail: ErrorDetail {
+                            message: err.message,
+                        },
+                    },
+                ],
+            )
+        }
         EffectResultMsg::PromptStreamDelta {
             thread_id,
             message_id,
@@ -1493,16 +1572,25 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 }
             }
         }
-        EffectResultMsg::SettingsSaved(Ok(())) => (vec![], vec![Dirty::Settings]),
-        EffectResultMsg::SettingsSaved(Err(err)) => (
-            vec![],
-            vec![Dirty::Error {
-                thread_id: String::new(),
-                detail: ErrorDetail {
-                    message: err.message,
-                },
-            }],
-        ),
+        EffectResultMsg::SettingsSaved(Ok(())) => {
+            let toast = show_toast(model, "status", "Settings saved");
+            (vec![], vec![Dirty::Settings, toast])
+        }
+        EffectResultMsg::SettingsSaved(Err(err)) => {
+            let toast = show_toast(model, "error", format!("Settings save failed: {}", err.message));
+            (
+                vec![],
+                vec![
+                    toast,
+                    Dirty::Error {
+                        thread_id: String::new(),
+                        detail: ErrorDetail {
+                            message: err.message,
+                        },
+                    },
+                ],
+            )
+        }
         EffectResultMsg::GatewayCallCompleted { real_index, result } => match result {
             Ok(()) => (
                 vec![],
@@ -1629,6 +1717,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     },
                 });
             }
+            crate::protocol_types::AgentEvent::UsageUpdate { .. } => {
+                // Live usage flows through the per-frame runtime
+                // snapshot fold below (thread.usage) -- nothing to do
+                // per-event beyond letting the frame refresh.
+            }
             crate::protocol_types::AgentEvent::PermissionRequest(_)
             | crate::protocol_types::AgentEvent::TerminalOutput(_)
             | crate::protocol_types::AgentEvent::SessionModes(_)
@@ -1678,9 +1771,47 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         for row in &snapshot.rows {
             if let Some(thread) = model.threads.get_mut(row.real_index) {
                 thread.thread_id = row.thread_id.clone();
+                // Review-gate fix (phase 32): fold a background-attached
+                // session binding into the model. add_thread attaches in
+                // the background (phase 30), so no SessionAttached fold
+                // ever delivers the session id for `+`-created threads;
+                // without this the profile picker never locks and
+                // Effect::PersistThread never fires.
+                if thread.session_id.is_none() {
+                    if let Some(session_id) = row.session_id.clone() {
+                        thread.session_id = Some(session_id);
+                        effects.push(Effect::PersistThread {
+                            real_index: row.real_index,
+                        });
+                        dirty.push(Dirty::ThreadRow(row.real_index));
+                        dirty.push(Dirty::Capabilities {
+                            thread_id: row.thread_id.clone(),
+                        });
+                    }
+                }
             }
         }
+        // Review-gate fix (phase 32): hydrate bridge-persisted archived
+        // flags (restarts previously left every ThreadModel::archived
+        // false -- wrong sidebar counters, unenforced pool cap).
+        for (idx, archived) in snapshot.archived_flags.iter().enumerate() {
+            if let Some(thread) = model.threads.get_mut(idx) {
+                thread.archived = *archived;
+            }
+        }
+        model.visible_list_synced = true;
         if changed {
+            // `selected_thread` is a *filtered* index into the visible
+            // list, so before the visible order is rewritten (recency
+            // resort on background activity, archive/resume moving rows
+            // between sections, a new thread landing at the top), pin the
+            // thread the user is actually on by durable id and re-anchor
+            // the index afterwards. Without this the stale filtered index
+            // silently retargets whichever thread now occupies that slot,
+            // and the next frame snapshot renders *that* thread's
+            // transcript -- the live "switching threads shows another
+            // thread's messages" leak (plan phase 23).
+            let selected_id = old_keys.get(model.selected_thread).cloned();
             model.visible_indices = snapshot.visible_indices.clone();
             model.thread_rows = snapshot.rows.clone();
             dirty.push(Dirty::ThreadListDiff(crate::dirty::diff_by_id(
@@ -1688,6 +1819,37 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 &snapshot.visible_thread_ids,
                 &snapshot.rows,
             )));
+            let reanchored = selected_id
+                .and_then(|id| snapshot.visible_thread_ids.iter().position(|key| *key == id))
+                .unwrap_or_else(|| {
+                    model
+                        .selected_thread
+                        .min(snapshot.visible_thread_ids.len().saturating_sub(1))
+                });
+            if reanchored != model.selected_thread {
+                model.selected_thread = reanchored;
+                dirty.push(Dirty::Scalar(ScalarField::SelectedThread));
+            }
+            // Review-gate fix (phase 32): a project switch can scope the
+            // visible list down to NOTHING. Without clearing the display,
+            // the previous project's transcript kept rendering next to an
+            // empty sidebar (and index fallbacks retargeted hidden
+            // threads). Same convergence the clear_selected_thread arm
+            // uses: drop displayed_thread and diff the shared model to
+            // empty.
+            if snapshot.visible_thread_ids.is_empty() {
+                let old_keys = model.message_model_keys.borrow().clone();
+                if model.displayed_thread.take().is_some() || !old_keys.is_empty() {
+                    dirty.push(Dirty::MessagesDiff {
+                        thread_id: String::new(),
+                        ops: crate::dirty::diff_by_id(
+                            &old_keys,
+                            &[],
+                            &Vec::<crate::MessageItem>::new(),
+                        ),
+                    });
+                }
+            }
         }
     }
     if let Some(snapshot) = frame.settings_gateway_snapshot {
@@ -1769,9 +1931,26 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         // any global cold-start warning (InitialState::startup_warnings,
         // routed through `Dirty::Error{thread_id: "", ..}` a moment
         // earlier in the same synchronous panel_rust_create call) before
-        // the window is ever shown.
+        // the window is ever shown. Captured before the
+        // `selection_matches`-gated switched_thread below, since that
+        // gate answers a different question (is this snapshot even for
+        // the currently-selected thread) and must not affect this one
+        // (was there a real previous thread to leave, regardless of
+        // whether *this particular* snapshot ends up promoting a switch).
         let had_prior_displayed_thread = model.displayed_thread.is_some();
-        let switched_thread = model.displayed_thread != Some(target_index);
+        // One-frame stale-collection guard (plan phase 23): the snapshot
+        // was collected via `visible_indices[selected_thread]` *before*
+        // this same frame's thread-list fold re-anchored the selection, so
+        // after a visible-order rewrite it can legitimately describe a
+        // thread the user is no longer on. Hydrating that thread's own
+        // cache by durable id (below) stays correct either way, but
+        // *promoting it to the displayed thread* is the message-leak bug:
+        // sync.rs renders whatever `displayed_thread` points at, so only
+        // switch the display when the snapshot is for the thread the user
+        // actually has selected -- otherwise leave the display alone and
+        // let the next tick collect the right thread's snapshot.
+        let selection_matches = target_index == selected_real_index(model);
+        let switched_thread = selection_matches && model.displayed_thread != Some(target_index);
         if switched_thread {
             model.expanded.clear();
             model.displayed_thread = Some(target_index);
@@ -1837,7 +2016,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 switched_thread || thread.connection_status != snapshot.connection_status;
             let capabilities_changed = switched_thread
                 || thread.session_modes != snapshot.session_modes
-                || thread.config_options != snapshot.config_options;
+                || thread.config_options != snapshot.config_options
+                || thread.usage != snapshot.usage;
 
             thread.transcript = snapshot.transcript;
             thread.transcript_keys = new_keys.clone();
@@ -1854,6 +2034,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.connection_status = snapshot.connection_status;
             thread.session_modes = snapshot.session_modes;
             thread.config_options = snapshot.config_options;
+            thread.usage = snapshot.usage;
 
             if transcript_changed {
                 dirty.push(Dirty::MessagesDiff {
@@ -2842,6 +3023,7 @@ mod tests {
                     connection_status: "Unavailable".to_owned(),
                     session_modes: None,
                     config_options: Vec::new(),
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3149,6 +3331,7 @@ mod tests {
             connection_status: String::new(),
             session_modes: None,
             config_options: vec![],
+            usage: (0, 0),
         };
 
         let (_, first_dirty) = update(
@@ -3296,6 +3479,7 @@ mod tests {
                     connection_status: "Live connection".to_owned(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3347,6 +3531,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3368,6 +3553,11 @@ mod tests {
         let mut model = model_with_threads(&["first", "second"]);
         model.threads[0].session_id = Some("thread-0-session".to_owned());
         model.displayed_thread = Some(0);
+        // phase-23's selection_matches gate requires the snapshot's target
+        // to actually be the currently-selected thread, not just any
+        // thread -- otherwise switched_thread is false regardless of this
+        // test's own guard, for an unrelated reason.
+        model.selected_thread = 1;
         let (_, dirty) = update(
             &mut model,
             Msg::Frame(FrameInput {
@@ -3383,6 +3573,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3453,6 +3644,7 @@ mod tests {
                     connection_status: String::new(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3522,6 +3714,7 @@ mod tests {
                     connection_status: "Live".to_owned(),
                     session_modes: None,
                     config_options: vec![],
+                    usage: (0, 0),
                 }),
                 ..FrameInput::default()
             }),
@@ -3667,8 +3860,10 @@ mod tests {
         );
         assert_eq!(effects, vec![Effect::OpenSkillEditor { path }]);
         // Skills list is refreshed by the effect executor *before* this
-        // result is folded; SkillCreated itself only opens the editor.
-        assert!(dirty.is_empty());
+        // result is folded; SkillCreated opens the editor and (phase 28)
+        // arms the shared feedback toast.
+        assert!(dirty.iter().all(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_message, "Skill created");
     }
 
     #[test]
@@ -3677,6 +3872,7 @@ mod tests {
         let row = crate::models::VisibleThreadItem {
             real_index: 4,
             thread_id: "durable-thread-4".to_owned(),
+            session_id: None,
             item: crate::ThreadItem {
                 name: "filtered".into(),
                 ..crate::ThreadItem::default()
@@ -3689,6 +3885,7 @@ mod tests {
                     visible_indices: vec![4],
                     visible_thread_ids: vec!["durable-thread-4".to_owned()],
                     rows: vec![row.clone()],
+                    archived_flags: vec![],
                 }),
                 ..FrameInput::default()
             }),
@@ -3700,5 +3897,290 @@ mod tests {
             [Dirty::ThreadListDiff(ops)]
                 if matches!(ops.as_slice(), [RowOp::Insert { at: 0, .. }])
         ));
+    }
+
+    fn visible_row(real_index: usize, thread_id: &str) -> crate::models::VisibleThreadItem {
+        crate::models::VisibleThreadItem {
+            real_index,
+            thread_id: thread_id.to_owned(),
+            session_id: None,
+            item: crate::ThreadItem::default(),
+        }
+    }
+
+    #[test]
+    fn visible_reorder_reanchors_selection_to_the_same_thread() {
+        // Plan phase 23 (thread-switch message leak): `selected_thread` is
+        // a filtered index, so a visible-order rewrite (recency resort,
+        // archive/resume, new thread on top) used to silently retarget the
+        // selection at whichever thread now occupies that slot -- the next
+        // frame then rendered *that* thread's transcript. The fold must
+        // re-anchor the index to the same durable thread id.
+        let mut model = model_with_threads(&["a", "b", "c"]);
+        model.visible_indices = vec![0, 1, 2];
+        model.selected_thread = 1; // thread-1
+        *model.thread_model_keys.borrow_mut() = vec![
+            "thread-0".to_owned(),
+            "thread-1".to_owned(),
+            "thread-2".to_owned(),
+        ];
+
+        // thread-2 got background activity and resorted to the top;
+        // thread-1 now sits at visible position 2.
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![2, 0, 1],
+                    visible_thread_ids: vec![
+                        "thread-2".to_owned(),
+                        "thread-0".to_owned(),
+                        "thread-1".to_owned(),
+                    ],
+                    rows: vec![
+                        visible_row(2, "thread-2"),
+                        visible_row(0, "thread-0"),
+                        visible_row(1, "thread-1"),
+                    ],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.selected_thread, 2,
+            "selection must follow thread-1 to its new visible slot"
+        );
+        assert_eq!(selected_real_index(&model), 1);
+        assert!(dirty
+            .iter()
+            .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread))));
+    }
+
+    #[test]
+    fn frame_fold_hydrates_a_background_attached_session_binding() {
+        // Phase-32 review finding 1: add_thread attaches in the background
+        // (phase 30), so no SessionAttached fold ever carries the session
+        // id for +-created threads -- the model's session_id stayed None
+        // forever (profile picker never locked, PersistThread never
+        // fired). The thread-list fold now hydrates it from the row.
+        let mut model = model_with_threads(&["a"]);
+        assert!(model.threads[0].session_id.is_none());
+        let mut row = visible_row(0, "thread-0");
+        row.session_id = Some("sess-live".to_owned());
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.threads[0].session_id.as_deref(), Some("sess-live"));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistThread { real_index: 0 })));
+        assert!(dirty
+            .iter()
+            .any(|d| matches!(d, Dirty::Capabilities { thread_id } if thread_id == "thread-0")));
+    }
+
+    #[test]
+    fn frame_fold_hydrates_bridge_archived_flags() {
+        // Phase-32 review finding 2: restarts left every
+        // ThreadModel::archived false while the bridge restored the
+        // persisted flags -- wrong sidebar counters, unenforced pool cap.
+        let mut model = model_with_threads(&["a", "b"]);
+        let (_, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0, 1],
+                    visible_thread_ids: vec!["thread-0".to_owned(), "thread-1".to_owned()],
+                    rows: vec![visible_row(0, "thread-0"), visible_row(1, "thread-1")],
+                    archived_flags: vec![true, false],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(model.threads[0].archived);
+        assert!(!model.threads[1].archived);
+    }
+
+    #[test]
+    fn empty_scoped_visible_list_clears_the_displayed_transcript() {
+        // Phase-32 review finding 3: switching to a project with no
+        // matching threads left the previous project's transcript on
+        // screen and the empty-visible fallback retargeted hidden
+        // threads. The fold now clears the display, and the fallback
+        // stays off once a real list sync has happened.
+        let mut model = model_with_threads(&["a"]);
+        model.visible_indices = vec![0];
+        model.displayed_thread = Some(0);
+        *model.thread_model_keys.borrow_mut() = vec!["thread-0".to_owned()];
+        *model.message_model_keys.borrow_mut() = vec!["assistant:m1".to_owned()];
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![],
+                    visible_thread_ids: vec![],
+                    rows: vec![],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.displayed_thread, None);
+        assert!(dirty.iter().any(|d| matches!(
+            d,
+            Dirty::MessagesDiff { thread_id, ops } if thread_id.is_empty() && !ops.is_empty()
+        )));
+        // Post-sync fallback: an empty visible list is real now.
+        assert!(model.visible_list_synced);
+        assert!(current_visible_indices(&model).is_empty());
+    }
+
+    #[test]
+    fn selection_clamps_when_the_selected_thread_leaves_the_visible_list() {
+        let mut model = model_with_threads(&["a", "b"]);
+        model.visible_indices = vec![0, 1];
+        model.selected_thread = 1;
+        *model.thread_model_keys.borrow_mut() =
+            vec!["thread-0".to_owned(), "thread-1".to_owned()];
+
+        let (_, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![visible_row(0, "thread-0")],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.selected_thread, 0, "gone thread clamps selection");
+    }
+
+    #[test]
+    fn action_results_arm_the_shared_feedback_toast() {
+        // Plan phase 28: skills top-bar failures used to emit only a
+        // global (empty thread_id) Dirty::Error that no surface showed.
+        // Every action-result site now also arms the shared toast.
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SkillCreated(Err(
+                crate::effect::EffectError::new("mkdir failed"),
+            ))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "error");
+        assert_eq!(model.toast_message, "mkdir failed");
+        let seq_after_error = model.toast_seq;
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::SettingsSaved(Ok(()))),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "status");
+        assert_eq!(model.toast_message, "Settings saved");
+        assert_ne!(model.toast_seq, seq_after_error, "seq bumps every show");
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Ui(crate::msg::UiMsg::Skill(
+                crate::msg::SkillMsg::CopyPathRequested {
+                    path: "/skills/demo/SKILL.md".into(),
+                },
+            )),
+        );
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Toast)));
+        assert_eq!(model.toast_kind, "info");
+    }
+
+    #[test]
+    fn skill_content_edit_absorbs_into_the_model_before_sync_runs() {
+        // Plan phase 27: ContentEdited used to emit Dirty::SkillEditor
+        // WITHOUT updating model.active_skill_content -- sync then pushed
+        // the stale content back into the two-way-bound editor text on
+        // every keystroke, so typing never stuck and saves recorded no
+        // lasting delta.
+        let mut model = Model::default();
+        model.active_skill_path = "/skills/demo/SKILL.md".to_owned();
+        model.active_skill_content = "old body".to_owned();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(crate::msg::UiMsg::Skill(crate::msg::SkillMsg::ContentEdited {
+                path: "/skills/demo/SKILL.md".into(),
+                content: "old body plus a typed delta".to_owned(),
+            })),
+        );
+        assert_eq!(model.active_skill_content, "old body plus a typed delta");
+        assert!(model.skill_saving);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::SkillWrite { content, .. }] if content == "old body plus a typed delta"
+        ));
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::SkillEditor)));
+    }
+
+    #[test]
+    fn stale_snapshot_for_an_unselected_thread_never_steals_the_display() {
+        // Plan phase 23, second leg: a selected-thread snapshot is
+        // collected via the *pre-reanchor* index mapping, so for one frame
+        // it can describe a thread the user is no longer on. Its data may
+        // hydrate that thread's own cache (by durable id), but it must not
+        // flip `displayed_thread` -- sync.rs renders whatever
+        // `displayed_thread` points at, and flipping it here was the
+        // visible cross-thread message leak.
+        let mut model = model_with_threads(&["a", "b"]);
+        model.visible_indices = vec![0, 1];
+        model.selected_thread = 0;
+        model.displayed_thread = Some(0);
+
+        let transcript = vec![crate::conversation::TranscriptItem::Assistant {
+            message_id: "other-thread-msg".to_owned(),
+            text: "belongs to thread-1".to_owned(),
+            streaming: false,
+        }];
+        let (_, _) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
+                    real_index: 1,
+                    transcript: transcript.clone(),
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                    usage: (0, 0),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.displayed_thread,
+            Some(0),
+            "a snapshot for an unselected thread must not become the displayed thread"
+        );
+        // Hydration by durable id still lands in the right thread's cache.
+        assert_eq!(model.threads[1].transcript, transcript);
     }
 }

@@ -99,6 +99,8 @@ pub struct ThreadModel {
     pub connection_status: String,
     pub session_modes: Option<SessionModesEvent>,
     pub config_options: Vec<ConfigOptionInfo>,
+    /// Phase 18: live (used, size) token usage for the context ring.
+    pub usage: (i64, i64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -138,6 +140,19 @@ pub struct Model {
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
+    /// Review-gate fix (phase 32): true once a real thread-list snapshot
+    /// has been folded. Before that, an empty `visible_indices` means
+    /// "no filter applied yet" and index helpers fall back to all
+    /// threads; after it, an empty visible list is REAL (e.g. the
+    /// phase-26 project scope matched nothing) and the fallback must not
+    /// silently retarget hidden threads.
+    pub visible_list_synced: bool,
+    /// Plan phase 28: shared action-feedback toast. `toast_seq` bumps on
+    /// every show so the UI can restart its auto-hide timer even for an
+    /// identical message.
+    pub toast_message: String,
+    pub toast_kind: String,
+    pub toast_seq: i32,
     pub active_skill_name: String,
     pub active_skill_path: String,
     pub active_skill_content: String,
@@ -197,6 +212,7 @@ impl Default for ThreadModel {
             connection_status: "Connecting...".to_owned(),
             session_modes: None,
             config_options: Vec::new(),
+            usage: (0, 0),
         }
     }
 }

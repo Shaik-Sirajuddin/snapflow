@@ -4,6 +4,8 @@ import { Icon } from "../../base/icon.slint";
 import { IconButton } from "../../base/icon_button.slint";
 import { TextPillButton } from "../../base/text_pill_button.slint";
 import { CursorHost } from "../../tokens/cursor_host.slint";
+import { MarkdownView } from "../../base/markdown_view.slint";
+import { MarkdownLine } from "../../types.slint";
 
 // Skill editor -- `active_pane_and_editor_view` phase. Replaces
 // `ChatArea` in the main content area (see `app.slint`'s `active-pane`
@@ -27,6 +29,10 @@ export component SkillEditorView inherits Rectangle {
     // skills_audit_report §3.1
     in property <bool> skill-saving: false;
     in property <[string]> detected-editors: [];
+    // Phase 27: markdown-rendered view of skill-content (host-computed,
+    // same renderer as agent chat bodies) behind a Preview toggle.
+    in property <[MarkdownLine]> preview-lines: [];
+    in-out property <bool> show-preview: false;
     callback copy-path-requested();
     callback open-in-editor-requested(string /* editor display name */);
     callback open-with-os-default-requested();
@@ -121,6 +127,12 @@ export component SkillEditorView inherits Rectangle {
                     // Variable-width text actions — token-colored pills
                     // (Button is fixed-width; long "Open in …" labels need flex).
                     TextPillButton {
+                        label: root.show-preview ? "Edit" : "Preview";
+                        button-accessible-label: root.show-preview
+                            ? "Back to editing" : "Preview rendered markdown";
+                        clicked => { root.show-preview = !root.show-preview; }
+                    }
+                    TextPillButton {
                         label: "Copy path";
                         button-accessible-label: "Copy skill path";
                         clicked => { root.copy-path-requested(); }
@@ -153,10 +165,30 @@ export component SkillEditorView inherits Rectangle {
             background: Theme.border-default;
         }
 
-        Flickable {
+        Rectangle {
             vertical-stretch: 1;
             preferred-height: 0px;
             min-height: 0px;
+            // Preview overlay mounts on top; the editor Flickable stays
+            // mounted (visible-toggled, not if-gated) because
+            // `editor-input.has-focus` above must remain a valid id
+            // reference in every state.
+            if root.show-preview : Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-height: max(self.height, preview-md.preferred-height + 2 * Metrics.pad-md);
+                preview-md := MarkdownView {
+                    x: Metrics.pad-md;
+                    y: Metrics.pad-sm;
+                    width: parent.width - 2 * Metrics.pad-md;
+                    lines: root.preview-lines;
+                    fallback-text: root.skill-content;
+                }
+            }
+            editor-flick := Flickable {
+            width: 100%;
+            height: 100%;
+            visible: !root.show-preview;
             viewport-height: max(self.height, editor-input.preferred-height + 2 * Metrics.pad-md);
             editor-input := TextInput {
                 x: Metrics.pad-md;
@@ -181,6 +213,7 @@ export component SkillEditorView inherits Rectangle {
                 text <=> root.skill-content;
                 edited => { root.content-edited(self.text); }
                 changed has-focus => { CursorHost.kind = self.has-focus ? "text" : "default"; }
+            }
             }
         }
     }

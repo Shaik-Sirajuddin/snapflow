@@ -27,10 +27,17 @@ fn execute_effects(panel: &PanelSingleton, effects: Vec<crate::effect::Effect>) 
 /// slot vector is intentionally append-only, so these effects need exclusive
 /// access to the live panel and must re-enter through `SessionAttached` with
 /// the durable binding returned by the bridge.
+/// Returns `None` when the effect completed but produced nothing to fold
+/// yet -- plan phase 30: `AgentBridge::add_thread*` attaches its session in
+/// the BACKGROUND now, so a missing binding right after creation is the
+/// normal pending state (the frame poll folds the binding once
+/// `spawn_background_attachment` resolves), not an error. Folding it as an
+/// error was the new-thread regression: every `+` click flashed
+/// "bridge created a thread without a session binding".
 fn execute_thread_lifecycle_effect(
     panel: &mut PanelSingleton,
     effect: crate::effect::Effect,
-) -> crate::effect::EffectResultMsg {
+) -> Option<crate::effect::EffectResultMsg> {
     match effect {
         crate::effect::Effect::NewThread {
             real_index,
@@ -68,13 +75,9 @@ fn execute_thread_lifecycle_effect(
                             actual_provider,
                             Ok(binding.session_id),
                         ),
-                        None => (
-                            None,
-                            actual_provider,
-                            Err(crate::effect::EffectError::new(
-                                "bridge created a thread without a session binding",
-                            )),
-                        ),
+                        // Background attachment still in flight: nothing to
+                        // fold yet; the frame poll picks the binding up.
+                        None => return None,
                     }
                 }
                 Err(error) => (None, None, Err(error)),
@@ -82,12 +85,12 @@ fn execute_thread_lifecycle_effect(
             let result = result.map_err(|error| {
                 crate::effect::EffectError::new(format!("thread {real_index}: {error}"))
             });
-            crate::effect::EffectResultMsg::SessionAttached {
+            Some(crate::effect::EffectResultMsg::SessionAttached {
                 real_index,
                 thread_id,
                 provider: actual_provider,
                 result,
-            }
+            })
         }
         crate::effect::Effect::RecoverSessionAttach {
             real_index,
@@ -134,12 +137,12 @@ fn execute_thread_lifecycle_effect(
             let result = result.map_err(|error| {
                 crate::effect::EffectError::new(format!("recovery thread {real_index}: {error}"))
             });
-            crate::effect::EffectResultMsg::SessionAttached {
+            Some(crate::effect::EffectResultMsg::SessionAttached {
                 real_index,
                 thread_id,
                 provider: actual_provider,
                 result,
-            }
+            })
         }
         other => panic!("unexpected lifecycle effect: {other:?}"),
     }
@@ -263,9 +266,10 @@ pub(crate) fn dispatch_thread_recover_session_attach(
         crate::effect::Effect::RecoverSessionAttach { real_index, .. } => *real_index,
         _ => return,
     };
-    let result = execute_thread_lifecycle_effect(panel, effect);
-    let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
-    execute_effects(panel, follow_up);
+    if let Some(result) = execute_thread_lifecycle_effect(panel, effect) {
+        let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
+        execute_effects(panel, follow_up);
+    }
     panel.dispatch_frame_input(crate::msg::FrameInput {
         thread_list_snapshot: Some(
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
@@ -300,21 +304,27 @@ pub(crate) fn dispatch_thread_new(panel: &mut PanelSingleton, _component: &ChatP
         crate::effect::Effect::NewThread { real_index, .. } => *real_index,
         _ => return,
     };
-    let result = execute_thread_lifecycle_effect(panel, effect);
-    let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
-    execute_effects(panel, follow_up);
+    if let Some(result) = execute_thread_lifecycle_effect(panel, effect) {
+        let (follow_up, _) = update_persistent(panel, Msg::Effect(result));
+        execute_effects(panel, follow_up);
+    }
+    // Catalog pull ONLY when the profile catalog is actually empty (cold
+    // start, settings never opened): collect_settings_gateway_snapshot is
+    // four BLOCKING gateway round-trips (list_profiles/mcp/agents +
+    // session/list), and doing it unconditionally here froze the UI ~5s
+    // after every `+` click -- the residual new-thread hang measured live
+    // in the phase-33 gate. The periodic frame poll already re-pulls the
+    // catalog whenever it is empty.
+    let need_catalog = panel.model.borrow().available_profiles.is_empty();
     panel.dispatch_frame_input(crate::msg::FrameInput {
         thread_list_snapshot: Some(
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
                 .collect_thread_list_snapshot(),
         ),
-        // Same catalog pull recover_session does: ensures compose Provider
-        // has profiles even if the periodic frame path has not filled them
-        // yet (cold start, settings never opened).
-        settings_gateway_snapshot: Some(
+        settings_gateway_snapshot: need_catalog.then(|| {
             crate::external_snapshot::ExternalSnapshotSource::new(panel)
-                .collect_settings_gateway_snapshot(),
-        ),
+                .collect_settings_gateway_snapshot()
+        }),
         ..crate::msg::FrameInput::default()
     });
 

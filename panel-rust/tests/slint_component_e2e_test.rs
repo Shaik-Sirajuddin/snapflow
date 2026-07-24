@@ -263,6 +263,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         raw_output: "".into(),
         queued: false,
         can_edit: false,
+        can_send_now: false,
         sending: false,
         first_use: false,
     }])));
@@ -1715,6 +1716,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
+                link: "".into(),
             },
             panel_rust::MarkdownRun {
                 text: "agent".into(),
@@ -1722,6 +1724,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
+                link: "".into(),
             },
             panel_rust::MarkdownRun {
                 text: " body".into(),
@@ -1729,6 +1732,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
+                link: "".into(),
             },
         ])),
         indent: 0,

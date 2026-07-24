@@ -101,6 +101,10 @@ export global Theme {
     out property <color> border-tertiary: border-default;
     out property <color> text-tertiary: text-secondary;
     out property <color> text-accent-bright: text-primary;
+    // Phase 17 (markdown_highlight_and_real_links): distinct md colors,
+    // as design tokens (user direction) -- links blue, headings yellow.
+    out property <color> md-link: #60a5fa;
+    out property <color> md-heading: #eab308;
 
     // Permission / approval request surfaces — distinct from bg-card and
     // bg-chat so the one-of select dock is scannable above the compose bar.
