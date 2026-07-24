@@ -2372,6 +2372,44 @@ mod tests {
         assert_eq!(dirty, vec![Dirty::Scalar(ScalarField::SelectedThread)]);
     }
 
+    #[test]
+    fn switching_threads_isolates_per_thread_compose_drafts() {
+        // PUI-020 (panel-ui-task-triage): the compose draft is per-thread.
+        // Typing in thread A then switching to B must save A's draft and
+        // restore B's own (empty) draft -- B must never inherit A's text --
+        // and switching back to A restores A's draft intact. (lib.rs syncs
+        // the live component text into model.compose_text before dispatching
+        // the switch; apply_thread_selection_switch clears displayed_thread,
+        // which the next FrameInput re-promotes -- simulated here.)
+        let mut model = model_with_threads(&["a", "b"]);
+        model.selected_thread = 0;
+        model.displayed_thread = Some(0);
+        model.compose_text = "draft for A".to_owned();
+
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(1))));
+        assert_eq!(
+            model.threads[0].compose_draft, "draft for A",
+            "outgoing thread A's draft must be saved"
+        );
+        assert_eq!(
+            model.compose_text, "",
+            "thread B must not inherit thread A's draft"
+        );
+
+        // Frame promotes B to displayed (real app); then user types into B.
+        model.displayed_thread = Some(1);
+        model.compose_text = "draft for B".to_owned();
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::Selected(0))));
+        assert_eq!(
+            model.threads[1].compose_draft, "draft for B",
+            "outgoing thread B's draft must be saved"
+        );
+        assert_eq!(
+            model.compose_text, "draft for A",
+            "returning to thread A restores A's own draft intact"
+        );
+    }
+
     /// setup-followups plan, provider_fastmode_profile_persistence: the
     /// compose-bar profile picker is only ever meant to be interactive
     /// (per ThreadItem.has-session) while the selected thread has no
