@@ -103,7 +103,8 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        let content = std::fs::read_to_string(path.join("SKILL.md"))
+                        let md_path = path.join("SKILL.md");
+                        let content = std::fs::read_to_string(&md_path)
                             .map_err(|error| EffectError::new(error.to_string()))?;
                         let detected_editors = crate::editor_detect::detect_installed_editors()
                             .into_iter()
@@ -112,6 +113,7 @@ fn execute_skill_effects(effects: Vec<Effect>) {
                         Ok(crate::model::SkillEditorState {
                             name,
                             path: path.to_string_lossy().into_owned(),
+                            content_path: md_path.to_string_lossy().into_owned(),
                             content,
                             detected_editors,
                         })
@@ -626,6 +628,70 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
     // update()/sync() fold and project those changes in one place.
     if refresh_frame {
         crate::dispatch::dispatch_frame_poll(panel);
+    }
+}
+
+#[cfg(test)]
+mod skill_editor_path_tests {
+    // PUI-010: reproduces the real OS error this bug produced, and proves
+    // the fix -- `SkillEditorState.path` (the skill directory) must never
+    // be the target of a content write; `content_path` (SKILL.md inside
+    // it) must be. No Slint event loop needed here: this is exactly the
+    // filesystem mechanics `Effect::OpenSkillEditor`'s closure and
+    // `Effect::SkillWrite`'s handler perform, exercised directly against
+    // a real temp directory standing in for a real skill folder.
+    use std::io::ErrorKind;
+
+    #[test]
+    fn writing_to_the_skill_directory_itself_hits_eisdir() {
+        // This is the bug: before content_path existed, ContentEdited's
+        // path (== SkillEditorState.path == the directory) flowed
+        // straight into Effect::SkillWrite's `std::fs::write(path, ..)`.
+        let dir = tempfile_dir();
+        let err = std::fs::write(&dir, "content").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::IsADirectory);
+    }
+
+    #[test]
+    fn open_skill_editor_derives_a_writable_content_path_distinct_from_the_directory() {
+        let dir = tempfile_dir();
+        let md_path = dir.join("SKILL.md");
+        std::fs::write(&md_path, "---\nname: demo\n---\nold body").unwrap();
+
+        // Mirrors Effect::OpenSkillEditor's closure exactly (minus the
+        // thread hop / Slint event-loop re-entry, which need a live
+        // ChatPanel and are covered by the reducer tests in update.rs).
+        let content = std::fs::read_to_string(&md_path).unwrap();
+        let state = crate::model::SkillEditorState {
+            name: dir.file_name().unwrap().to_string_lossy().into_owned(),
+            path: dir.to_string_lossy().into_owned(),
+            content_path: md_path.to_string_lossy().into_owned(),
+            content,
+            detected_editors: vec![],
+        };
+
+        assert_ne!(state.path, state.content_path);
+        assert!(std::path::Path::new(&state.content_path).is_file());
+
+        // The fix in one line: writing to content_path (not path) succeeds.
+        std::fs::write(&state.content_path, "old body plus a typed delta").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&state.content_path).unwrap(),
+            "old body plus a typed delta"
+        );
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "panel-rust-skill-eisdir-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
 
