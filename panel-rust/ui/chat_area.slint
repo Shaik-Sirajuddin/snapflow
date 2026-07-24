@@ -130,6 +130,8 @@ export component ChatArea inherits Rectangle {
     // One-of permission option pick (optionId from ACP / synthetic id).
     callback permission-option-selected(string);
     callback expand-terminal(string);
+    // PUI-002: background-terminals popup [x] kill.
+    callback kill-terminal(string);
     callback local-terminal-toggle-requested();
     callback local-terminal-key-input(string);
     callback local-terminal-expand-requested();
@@ -1015,6 +1017,27 @@ export component ChatArea inherits Rectangle {
                             font-size: 10px * Theme.font-scale;
                             vertical-alignment: center;
                             horizontal-stretch: 0;
+                        }
+                        // [x] kill -- terminal/kill via the gateway. On top of
+                        // term-hit (declared later within a sibling), so its
+                        // clicks win over the row's open-full-view action.
+                        Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            border-radius: 4px;
+                            horizontal-stretch: 0;
+                            background: kill-hit.has-hover ? Theme.bg-card : transparent;
+                            Text {
+                                text: "✕";
+                                color: Theme.text-secondary;
+                                font-size: 11px * Theme.font-scale;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            kill-hit := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.kill-terminal(term.terminal-id); }
+                            }
                         }
                     }
                 }

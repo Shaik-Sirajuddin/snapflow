@@ -653,6 +653,17 @@ impl PanelSingleton {
     /// `dispatch.rs`'s Request-domain wrapper (tea-slint-model Phase 4)
     /// calls this -- extracted verbatim from the former
     /// `on_load_older_requested` closure's `PANEL.with` body.
+    /// PUI-002: send `terminal/kill` for `terminal_id` on the displayed
+    /// thread -- the background-terminals popup's `[x]` control. Fire-and-
+    /// forget; a failure surfaces as a thread error event.
+    pub(crate) fn dispatch_kill_terminal(&self, terminal_id: String) {
+        let Some(bridge) = &self.bridge else { return };
+        let Some(real_idx) = self.model.borrow().displayed_thread else {
+            return;
+        };
+        bridge.kill_terminal(real_idx, terminal_id);
+    }
+
     pub(crate) fn dispatch_load_older_requested(&self) {
         let Some(bridge) = &self.bridge else { return };
         let Some(real_idx) = self.model.borrow().displayed_thread else {
@@ -2175,6 +2186,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_terminal_expand(panel, &component, terminal_id.to_string());
+                }
+            });
+        });
+
+        // PUI-002: background-terminals popup [x] -> terminal/kill.
+        panel.component.on_kill_terminal(move |terminal_id| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    panel.dispatch_kill_terminal(terminal_id.to_string());
                 }
             });
         });

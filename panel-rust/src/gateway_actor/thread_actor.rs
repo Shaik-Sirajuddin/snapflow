@@ -113,6 +113,14 @@ enum Command {
         background: bool,
         resp: oneshot::Sender<Result<(), AcpxThreadError>>,
     },
+    /// PUI-002: ACP `terminal/kill` for a background terminal by id -- what
+    /// the background-terminals popup's `[x]` control sends. Terminates the
+    /// terminal's child process gateway-side; a `NoActiveSession` error when
+    /// this handle has no open session (nothing to kill against).
+    KillTerminal {
+        terminal_id: String,
+        resp: oneshot::Sender<Result<(), AcpxThreadError>>,
+    },
     /// Real, stable v1 ACP `session/delete` -- permanently removes a
     /// session (backend-forwarded `Proxied` method, see `acpx-core::
     /// router`'s own doc comment on this method's classification).
@@ -380,6 +388,16 @@ impl AcpxThreadHandle {
     /// Explicit `session/close` -- opt-in only, see [`Command::CloseSession`].
     pub async fn close_session(&self, background: bool) -> Result<(), AcpxThreadError> {
         self.call(|resp| Command::CloseSession { background, resp })
+            .await
+    }
+
+    /// PUI-002: `terminal/kill` for a background terminal on this thread.
+    pub async fn kill_terminal(
+        &self,
+        terminal_id: impl Into<String>,
+    ) -> Result<(), AcpxThreadError> {
+        let terminal_id = terminal_id.into();
+        self.call(|resp| Command::KillTerminal { terminal_id, resp })
             .await
     }
 
@@ -1393,6 +1411,16 @@ async fn run_thread_actor(
                     params["_acpx"] = serde_json::json!({ "bg": true });
                 }
                 let result = client.call("session/close", params, None).await;
+                let _ = resp.send(result.map(|_| ()).map_err(Into::into));
+            }
+            Command::KillTerminal { terminal_id, resp } => {
+                let Some(sid) = session_id.clone() else {
+                    let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
+                    continue;
+                };
+                let params =
+                    serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
+                let result = client.call("terminal/kill", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::DeleteSession { resp } => {

@@ -3759,6 +3759,39 @@ impl AgentBridge {
         });
     }
 
+    /// PUI-002: fire-and-forget `terminal/kill` for a background terminal on
+    /// thread `idx` -- the popup's `[x]` control. Errors surface as a thread
+    /// `AgentEvent::Error`, same shape as `send_prompt`.
+    pub fn kill_terminal(&self, idx: usize, terminal_id: String) {
+        let Some(slot) = self.slots.get(idx) else {
+            return;
+        };
+        let slot = slot.clone();
+        let handle = slot.handle.clone();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = wait_for_attachment(&slot).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("session attachment failed: {error}")),
+                    });
+                return;
+            }
+            if let Err(e) = handle.kill_terminal(terminal_id).await {
+                events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(BridgeEvent {
+                        thread_index: idx,
+                        event: AgentEvent::Error(format!("terminal/kill failed: {e}")),
+                    });
+            }
+        });
+    }
+
     /// Dispatches the control operation on the handle's independent cancel
     /// connection. It deliberately does not wait for the prompt task.
     pub fn cancel_prompt(&self, idx: usize) {
