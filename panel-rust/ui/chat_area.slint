@@ -955,17 +955,68 @@ export component ChatArea inherits Rectangle {
         // above the compose bar like the permission card below --
         // deliberately outside the scrollable message Flickable so a
         // running command stays visible without scrolling.
-        for term in terminals : Rectangle {
+        // PUI-002: background terminals are no longer always docked -- they are
+        // revealed by the compose "N terminals" chip. When the chip is toggled
+        // open, each terminal shows as a compact boxed item (active dot, title,
+        // start-time); clicking it opens the full terminal overlay (the same
+        // expand-terminal path the old docked cards used). [x] kill + real
+        // last-command are backend follow-ups (need a gateway terminal/kill
+        // Command and the acpx-core command-carrying change; see meta PUI-002).
+        if root.terminals-popup-open && root.terminals.length > 0 : Rectangle {
             background: Theme.bg-chat;
-            HorizontalLayout {
+            VerticalLayout {
                 padding: compact ? 6px : 10px;
-                TerminalCard {
-                    item: term;
-                    compact: compact;
-                    horizontal-stretch: 1;
-                    preferred-width: 0px;
-                    min-width: 0px;
-                    expand => { expand-terminal(term.terminal-id); }
+                spacing: 6px;
+                for term in root.terminals : Rectangle {
+                    height: 34px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border-default;
+                    background: term-hit.has-hover ? Theme.bg-card : Theme.bg-sidebar;
+                    // Background click-target: open the full terminal view.
+                    term-hit := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.expand-terminal(term.terminal-id);
+                            root.terminals-popup-open = false;
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 8px;
+                        cross-axis-alignment: center;
+                        Rectangle {
+                            width: 8px;
+                            height: 8px;
+                            border-radius: 4px;
+                            horizontal-stretch: 0;
+                            background: term.active ? #22c55e : Theme.text-muted;
+                        }
+                        Text {
+                            text: term.title;
+                            color: Theme.text-primary;
+                            font-size: 11px * Theme.font-scale;
+                            font-family: Theme.font-sans;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: term.active ? "running" : "exited";
+                            color: term.active ? Theme.text-secondary : Theme.text-muted;
+                            font-size: 9px * Theme.font-scale;
+                            vertical-alignment: center;
+                            horizontal-stretch: 0;
+                        }
+                        Text {
+                            text: term.started-at;
+                            color: Theme.text-muted;
+                            font-size: 10px * Theme.font-scale;
+                            vertical-alignment: center;
+                            horizontal-stretch: 0;
+                        }
+                    }
                 }
             }
         }
