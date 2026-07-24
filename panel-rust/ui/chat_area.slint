@@ -2,6 +2,7 @@ import { Theme } from "./tokens/theme.slint";
 import { Metrics } from "./tokens/metrics.slint";
 import { Icon } from "./base/icon.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
+import { SelectionFocus } from "./tokens/selection_focus.slint";
 import { IconButton } from "./base/icon_button.slint";
 import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
@@ -193,7 +194,16 @@ export component ChatArea inherits Rectangle {
     // keystrokes failure class TextField.has-focus's doc comment names.
     out property <bool> secondary-text-input-has-focus:
         chat-input.secondary-text-input-has-focus
-        || rename-input.has-focus;
+        || rename-input.has-focus
+        // Selectable message text (read-only TextInputs in markdown_view /
+        // user_bubble / tool_event_row) is focusable: clicking to select
+        // grabs focus. Those live inside `for` repeaters, so they report
+        // through the SelectionFocus global rather than an id reference --
+        // without this, clicking any message text silently dropped every
+        // subsequent keystroke (Ctrl+C on the selection, global shortcuts,
+        // and typing into the composer) until the user clicked back into
+        // the composer. See selection_focus.slint.
+        || SelectionFocus.any-focused;
 
     // --- Demo approval (local one-of card, no ACP round-trip) ------------
     // Type one of these in the compose box and press Send / Enter:
@@ -1147,9 +1157,25 @@ export component ChatArea inherits Rectangle {
                             popup-content := VerticalLayout {
                                 spacing: Metrics.space-2;
                                 if root.full-view-group-idx >= 0 : VerticalLayout {
-                                    spacing: Metrics.space-2;
-                                    for sub-msg[sub-idx] in root.messages : ToolEventRow {
-                                        visible: sub-idx >= root.full-view-group-idx && root.in-same-tool-group(root.messages, root.full-view-group-idx, sub-idx);
+                                    // PUI-009 class: this repeater walks the WHOLE
+                                    // thread and collapses non-group rows to 0px,
+                                    // but a VerticalLayout applies `spacing`
+                                    // between EVERY adjacent child including
+                                    // zero-height ones -- with `spacing:
+                                    // Metrics.space-2` a group deep in a long
+                                    // thread accumulated one gap per message
+                                    // outside it (large empty scroll regions).
+                                    // Same fix as the sidebar lists: no layout
+                                    // spacing, and each visible row carries its
+                                    // own trailing spacer (0px when hidden).
+                                    // ToolGroupView's own body-layout already does
+                                    // this (spacing: 0px).
+                                    spacing: 0px;
+                                    for sub-msg[sub-idx] in root.messages : VerticalLayout {
+                                        property <bool> row-visible: sub-idx >= root.full-view-group-idx && root.in-same-tool-group(root.messages, root.full-view-group-idx, sub-idx);
+                                        spacing: 0px;
+                                        ToolEventRow {
+                                        visible: parent.row-visible;
                                         height: self.visible ? self.preferred-height : 0px;
                                         horizontal-stretch: self.visible ? 1 : 0;
                                         vertical-stretch: 0;
@@ -1179,6 +1205,13 @@ export component ChatArea inherits Rectangle {
                                             root.full-view-is-mcp = mcp;
                                             root.full-view-group-idx = -1;
                                             root.full-view-open = true;
+                                        }
+                                        }
+                                        // Per-row trailing gap, 0px when the row
+                                        // is hidden -- replaces layout `spacing`
+                                        // so collapsed rows contribute nothing.
+                                        Rectangle {
+                                            height: parent.row-visible ? Metrics.space-2 : 0px;
                                         }
                                     }
                                 }

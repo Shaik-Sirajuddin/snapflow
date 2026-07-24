@@ -1,0 +1,30 @@
+// Layer 1 (tokens) -- shared channel every read-only "selectable text"
+// TextInput reports its focus state through.
+//
+// Why this exists: the chat surfaces render their text as `read-only: true`
+// TextInputs so a user can click-drag to select and copy (see
+// markdown_view/user_bubble/tool_event_row). Those TextInputs are still
+// FOCUSABLE -- clicking to select grabs Slint focus -- and this panel is
+// embedded in a Qt host where EVERY keystroke is routed through
+// `panel_rust_input_key` (lib.rs), which hard-drops the key unless one of
+// compose / local-terminal / `secondary-text-input-has-focus` reads true.
+// So without reporting here, clicking any message text silently killed all
+// keyboard input (global shortcuts, and typing into the composer) until the
+// user clicked back into the composer -- the exact silently-dropped-
+// keystrokes failure class `secondary-text-input-has-focus` exists to
+// prevent, and the same reason `FilterSearchBar.input-has-focus` feeds it.
+//
+// A global (rather than an `out property` chain) because these TextInputs
+// live inside `for` repeaters -- repeated instances cannot be referenced by
+// id from an ancestor -- exactly the situation `CursorHost` was introduced
+// for ("regardless of which one of (potentially many, including
+// dynamically-repeated) component instances currently holds it").
+export global SelectionFocus {
+    // Number of selectable-text TextInputs currently focused. A counter, not
+    // a bool: focus moving directly from one repeated TextInput to another
+    // interleaves the two `changed has-focus` handlers, and a single shared
+    // bool could be left false by the losing element firing last.
+    in-out property <int> focused-count: 0;
+    // True while any selectable text surface holds focus.
+    out property <bool> any-focused: focused-count > 0;
+}

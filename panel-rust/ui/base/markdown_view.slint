@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { SelectionFocus } from "../tokens/selection_focus.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { MarkdownLine, MarkdownRun } from "../types.slint";
 
@@ -74,6 +75,11 @@ export component MarkdownView inherits VerticalLayout {
         font-size: 12px * Theme.font-scale;
         color: Theme.text-primary;
         read-only: true;
+        // Report focus so the host does not drop keystrokes while a
+        // selectable-text surface holds focus (see SelectionFocus).
+        changed has-focus => {
+            SelectionFocus.focused-count += self.has-focus ? 1 : -1;
+        }
         wrap: word-wrap;
         horizontal-alignment: left;
         // Stretch across the bubble; no explicit width (can't combine
@@ -82,7 +88,7 @@ export component MarkdownView inherits VerticalLayout {
         preferred-width: 0px;
         min-width: 0px;
         selection-foreground-color: Theme.text-primary;
-        selection-background-color: #60a5fa80;
+        selection-background-color: Theme.selection-bg;
     }
 
     for line[i] in lines : VerticalLayout {
@@ -143,6 +149,11 @@ export component MarkdownView inherits VerticalLayout {
                 font-family: is-code ? Theme.font-mono : Theme.font-sans;
                 font-size: (is-heading ? root.heading-size(line.kind) : is-code ? 11px : 12px) * Theme.font-scale;
                 read-only: true;
+                // Report focus so the host does not drop keystrokes while a
+                // selectable-text surface holds focus (see SelectionFocus).
+                changed has-focus => {
+                    SelectionFocus.focused-count += self.has-focus ? 1 : -1;
+                }
                 wrap: word-wrap;
                 horizontal-alignment: left;
                 vertical-alignment: top;
@@ -152,7 +163,7 @@ export component MarkdownView inherits VerticalLayout {
                 // have no background of their own) shows through.
                 color: transparent;
                 selection-foreground-color: transparent;
-                selection-background-color: #60a5fa80;
+                selection-background-color: Theme.selection-bg;
             }
 
             HorizontalLayout {

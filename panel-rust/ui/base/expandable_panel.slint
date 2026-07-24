@@ -1,8 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
-import { ApiCallView } from "../chat-view/components/execution/api_call_view.slint";
-import { TerminalView } from "../chat-view/components/execution/terminal_view.slint";
 
 // Capped-height + scroll + expand-on-click shell -- chat-items-redesign.md
 // #7 ("execution-view"). Hidden/collapsed by default per the spec's
@@ -15,9 +13,6 @@ import { TerminalView } from "../chat-view/components/execution/terminal_view.sl
 export component ExpandablePanel {
     in property <length> collapsed-max-height: 140px;
     in property <bool> collapsed-by-default: true;
-    in property <string> raw-input: "";
-    in property <string> raw-output: "";
-    in property <bool> is-terminal: false;
     in property <string> title: "FULL CALL DETAILS & PAYLOAD";
     property <bool> expanded: !collapsed-by-default;
     callback toggled(bool);

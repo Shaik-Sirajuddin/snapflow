@@ -1,4 +1,5 @@
 import { Theme } from "../../../tokens/theme.slint";
+import { SelectionFocus } from "../../../tokens/selection_focus.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { ExpandablePanel } from "../../../base/expandable_panel.slint";
@@ -142,12 +143,17 @@ export component ToolEventRow inherits Rectangle {
                         : (is-skill-use && first-use) ? Theme.text-accent-bright
                         : Theme.text-primary;
                     read-only: true;
+                    // Report focus so the host does not drop keystrokes while a
+                    // selectable-text surface holds focus (see SelectionFocus).
+                    changed has-focus => {
+                        SelectionFocus.focused-count += self.has-focus ? 1 : -1;
+                    }
                     horizontal-alignment: left;
                     vertical-alignment: center;
                     wrap: word-wrap;
                     width: parent.width;
                     selection-foreground-color: Theme.text-primary;
-                    selection-background-color: #60a5fa80;
+                    selection-background-color: Theme.selection-bg;
                 }
             }
 
@@ -229,9 +235,6 @@ export component ToolEventRow inherits Rectangle {
                     if root.is-terminal : ExpandablePanel {
                         collapsed-max-height: root.cap-height * 2;
                         collapsed-by-default: false;
-                        raw-input: root.text;
-                        raw-output: root.raw-output;
-                        is-terminal: true;
                         title: "TERMINAL EXECUTION FULL VIEW";
                         open-full-view => { root.open-full-view("TERMINAL EXECUTION FULL VIEW", root.text, root.raw-output, true, false); }
                         TerminalView {
@@ -246,9 +249,6 @@ export component ToolEventRow inherits Rectangle {
                         // capped preview; user can still "Open full view".
                         collapsed-max-height: root.cap-height * 2;
                         collapsed-by-default: true;
-                        raw-input: root.raw-input;
-                        raw-output: root.raw-output;
-                        is-terminal: false;
                         title: "TOOL CALL PAYLOAD & DETAILS";
                         open-full-view => { root.open-full-view(root.is-mcp ? "MCP CALL PAYLOAD & DETAILS" : "TOOL CALL PAYLOAD & DETAILS", root.raw-input, root.raw-output, false, root.is-mcp); }
                         ApiCallView {

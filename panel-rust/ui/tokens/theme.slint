@@ -74,6 +74,11 @@ export global Theme {
     out property <color> text-primary: is-dark ? ColorScale.dark-text-primary : ColorScale.light-text-primary;
     out property <color> text-secondary: is-dark ? ColorScale.dark-text-secondary : ColorScale.light-text-secondary;
     out property <color> text-muted: is-dark ? ColorScale.dark-text-muted : ColorScale.light-text-muted;
+    // Highlight behind click-drag-selected text in the read-only selectable
+    // surfaces (markdown/user bubble/tool rows/terminal blocks). One token
+    // instead of the same literal repeated at every `selection-background-
+    // color` site, so the selection tint stays consistent and themable.
+    out property <color> selection-bg: #60a5fa80;
     out property <color> bg-primary: is-dark ? ColorScale.day-white : ColorScale.night-black;
     out property <color> bg-primary-container: is-dark ? ColorScale.dark-primary-container : ColorScale.light-primary-container;
     out property <color> text-on-primary: is-dark ? ColorScale.night-black : ColorScale.day-white;

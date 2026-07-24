@@ -47,7 +47,7 @@ export component TerminalLogBlock inherits Rectangle {
                 vertical-alignment: top;
                 width: parent.width;
                 selection-foreground-color: Theme.text-primary;
-                selection-background-color: #60a5fa80;
+                selection-background-color: Theme.selection-bg;
             }
         }
         if !root.scrollable : TextInput {
@@ -63,7 +63,7 @@ export component TerminalLogBlock inherits Rectangle {
             preferred-width: 0px;
             min-width: 0px;
             selection-foreground-color: Theme.text-primary;
-            selection-background-color: #60a5fa80;
+            selection-background-color: Theme.selection-bg;
         }
     }
 }
