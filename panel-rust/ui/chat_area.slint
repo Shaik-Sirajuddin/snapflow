@@ -54,6 +54,9 @@ export component ChatArea inherits Rectangle {
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
+    // PUI-002: whether the background-terminals popup (toggled by the compose
+    // chip) is open. Local view state -- not driven from Rust.
+    property <bool> terminals-popup-open: false;
     // Client-local PTY terminal addition -- see `local_terminal_card.
     // slint`'s doc comment. `local-terminal.open == false` (the
     // all-empty default) hides both the header toggle's active state
@@ -1047,6 +1050,9 @@ export component ChatArea inherits Rectangle {
             profile-dropdown-entries: profile-dropdown-entries;
             profile-trigger-label: profile-trigger-label;
             active-thread-has-session: active-thread-has-session;
+            // PUI-002: background-terminals chip count + toggle.
+            terminal-count: root.terminals.length;
+            terminals-clicked => { root.terminals-popup-open = !root.terminals-popup-open; }
             fast-mode-available: fast-mode-available;
             fast-mode-enabled: fast-mode-enabled;
             fast-mode-option-id: fast-mode-option-id;

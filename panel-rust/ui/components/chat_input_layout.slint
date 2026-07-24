@@ -47,6 +47,11 @@ export component ChatInputLayout inherits Rectangle {
     in property <[DropdownEntry]> profile-dropdown-entries: [];
     in property <string> profile-trigger-label: "";
     in property <bool> active-thread-has-session: false;
+    // PUI-002: number of background terminals for the active thread; drives the
+    // "N terminals" chip below the select-inputs. Chip hidden when 0.
+    in property <int> terminal-count: 0;
+    // Emitted when the terminals chip is clicked -- ChatArea toggles the popup.
+    callback terminals-clicked();
     // Dedicated Fast toggle — binary ACP config option (id typically
     // "fastMode"). Host derives availability/values from configOptions[];
     // the model dropdown deliberately omits this option.
@@ -909,6 +914,47 @@ export component ChatInputLayout inherits Rectangle {
                 context-view-requested => { root.context-view-requested(); }
             }
         }
+        }
+
+        // PUI-002: background-terminals chip -- a thin rule under the select
+        // inputs, then a clickable "{N} terminals" pill. Hidden when the
+        // active thread has no terminals. ChatArea toggles the popup.
+        if root.terminal-count > 0 : VerticalLayout {
+            spacing: Metrics.space-1;
+            Rectangle {
+                height: 1px;
+                background: Theme.border-default;
+            }
+            HorizontalLayout {
+                alignment: start;
+                terminals-chip := Rectangle {
+                    horizontal-stretch: 0;
+                    height: 24px;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border-default;
+                    background: chip-hit.has-hover ? Theme.bg-card : Theme.bg-sidebar;
+                    HorizontalLayout {
+                        padding-left: Metrics.space-2;
+                        padding-right: Metrics.space-2;
+                        spacing: Metrics.space-1;
+                        cross-axis-alignment: center;
+                        Text {
+                            text: root.terminal-count == 1
+                                ? "1 terminal"
+                                : root.terminal-count + " terminals";
+                            color: Theme.text-secondary;
+                            font-size: 10px * Theme.font-scale;
+                            font-family: Theme.font-sans;
+                            vertical-alignment: center;
+                        }
+                    }
+                    chip-hit := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.terminals-clicked(); }
+                    }
+                }
+            }
         }
     }
 
