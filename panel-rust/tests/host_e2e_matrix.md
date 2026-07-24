@@ -57,7 +57,32 @@ bash tests/host_e2e_mcp_smoke.sh fast-track
 bash tests/host_e2e_mcp_smoke.sh rename
 bash tests/host_e2e_mcp_smoke.sh startup-warning
 bash tests/host_e2e_mcp_smoke.sh mid-session-write-failure
+bash tests/host_e2e_mcp_smoke.sh real-agent-smoke  # opt-in, real billed API call -- see below
 ```
+
+`real-agent-smoke` (SCNA-09): the one gap none of this file's automated
+harnesses had closed -- every scenario above talks to `rui-mock-agent`;
+`host_vnc_dev.sh` talks to a real ambient-auth backend but is manual/VNC
+-only with no automated pass/fail. Unlike every other scenario here, this
+one skips `ACPX_BACKEND_CMD` entirely so `acpx-registry`'s real fallback
+registry resolves `ACPX_DEFAULT_AGENT_ID` (default `claude-acp`) for real
+-- an ambient, npx-spawned adapter process using this machine's real
+`~/.claude/.credentials.json` OAuth, same convention as this repo's own
+`ACPX_LIVE_TEST_AMBIENT=1`-gated `acpx-server` tests. Sends exactly one
+short prompt ("Reply with exactly the single word: OK") through the real,
+live embedded panel UI and waits for a real assistant reply element to
+render -- proving the whole host chain (`ChatRustDock` -> panel-rust's
+dispatch/update/sync -> a real gateway -> a real ambient-auth-spawned
+`claude-acp` process -> a real model response -> back through TEA -> a
+real rendered message bubble) works end to end, not just the
+gateway-level path `acpx-server`'s own real-backend tests already cover.
+Makes one real, billed API call -- not run as part of any default/CI
+suite, opt-in only, same posture as this repo's other real-backend tests.
+Verified 2026-07-24: real `session/new`/`session/prompt` round-trip
+recorded in the gateway's own `transcripts` table (provider `claude-acp`,
+real session ids, real token usage -- `totalTokens: 13984`,
+`stopReason: "end_turn"`), and the reply `"OK"` genuinely rendered in the
+live host UI via the Slint MCP server.
 
 `mid-session-write-failure` (state-controller-followup-issues SCNA-10):
 unlike `startup-warning` (which fails `PanelStateStore::open` itself,

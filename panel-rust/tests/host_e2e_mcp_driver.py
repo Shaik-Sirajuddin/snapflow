@@ -427,12 +427,70 @@ def scenario_mid_session_write_failure(args):
     )
 
 
+def scenario_real_agent_smoke(args):
+    """SCNA-09: the one real-agent-backend gap never actually run in this
+    repo's automated (non-interactive) harnesses -- every other MCP/XTEST
+    scenario in this file talks to rui-mock-agent; host_vnc_dev.sh talks to
+    a real ambient-auth backend but is a manual/VNC-only harness with no
+    automated pass/fail. This sends exactly one short prompt (cheapest
+    model, minimal token spend -- same "one real, billed call" posture as
+    this repo's own #[ignore]'d ACPX_LIVE_TEST_AMBIENT=1 acpx-server tests)
+    through the real, live embedded panel UI and confirms a real assistant
+    reply actually renders -- proving the whole host chain (Shotcut's
+    ChatRustDock -> panel-rust's dispatch/update/sync -> a real gateway ->
+    a real ambient-auth-spawned claude-acp process -> a real model
+    response -> back through TEA -> a real rendered message bubble) works
+    end to end, not just the gateway-level path acpx-server's own real-*
+    tests already cover.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    compose_handle = find_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose"
+    )
+    click(client, compose_handle)
+    prompt_text = "Reply with exactly the single word: OK"
+    set_text(client, compose_handle, prompt_text)
+    press_return(client, window_handle)
+
+    # No backend event log for a real agent (that's rui-mock-agent-only
+    # instrumentation) -- wait for a real assistant message element to
+    # appear in the transcript instead, via the live element tree.
+    deadline = time.monotonic() + args.timeout
+    reply_text = None
+    while time.monotonic() < deadline:
+        tree = client.call_tool(
+            "get_element_tree", {"elementHandle": root_handle, "maxElements": 800}
+        )
+        texts = [
+            element.get("accessibleLabel", "")
+            for element in tree.get("elements", [])
+        ]
+        candidates = [
+            text for text in texts
+            if text and text != prompt_text and "OK" in text.upper()
+        ]
+        if candidates:
+            reply_text = candidates[-1]
+            break
+        time.sleep(0.5)
+    if reply_text is None:
+        raise RuntimeError(
+            f"no real assistant reply appeared within {args.timeout}s -- "
+            f"real-agent round trip did not complete"
+        )
+    print(f"PASS real_agent_smoke scenario: real assistant reply observed: {reply_text!r}")
+
+
 SCENARIOS = {
     "send-now": scenario_send_now,
     "fast-track": scenario_fast_track,
     "rename": scenario_rename,
     "startup-warning": scenario_startup_warning,
     "mid-session-write-failure": scenario_mid_session_write_failure,
+    "real-agent-smoke": scenario_real_agent_smoke,
 }
 
 
