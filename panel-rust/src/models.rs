@@ -269,6 +269,7 @@ pub fn to_message_model(msgs: Vec<ChatMessage>, expanded: &[bool]) -> ModelRc<Me
                 // feed -- a message reaching here has already been dispatched.
                 queued: false,
                 can_edit: false,
+                can_send_now: false,
                 sending: false,
                 first_use,
             }
@@ -420,6 +421,7 @@ pub fn to_message_rows_from_transcript(
                 // queue lives outside the merged transcript view.
                 queued: false,
                 can_edit: false,
+                can_send_now: false,
                 sending: false,
                 first_use,
             };
@@ -461,6 +463,11 @@ pub fn append_send_queue_rows(
             // Front entry while a turn is in flight: Stop cancels that turn
             // (and pauses auto-drain). Other entries stay cancel/edit.
             sending: generation_in_flight && i == 0,
+            // Any row that isn't already the one actively being drained can
+            // jump the queue and send immediately (send_queue.rs's
+            // send_now/steer subsystem) -- the front row while generating
+            // already shows Stop instead.
+            can_send_now: !(generation_in_flight && i == 0),
             first_use: false,
         });
     }

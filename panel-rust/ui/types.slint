@@ -130,6 +130,10 @@ export struct MessageItem {
     // as a design decision) -- this struct addition is the schema only.
     queued: bool,
     can-edit: bool,
+    // true for any queued (non-sending) row -- lets the user jump a
+    // message ahead of FIFO order and send it immediately, interrupting
+    // whatever's in flight (send_queue.rs's `send_now`/steer subsystem).
+    can-send-now: bool,
     sending: bool,
     // chat-items-remaining-wiring.md #6: true on a skill_use row the first
     // time its skill name appears in the thread (drives ToolEventRow's

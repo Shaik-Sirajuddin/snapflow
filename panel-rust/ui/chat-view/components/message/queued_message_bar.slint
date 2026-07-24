@@ -5,19 +5,25 @@ import { IconButton } from "../../../base/icon_button.slint";
 
 // A user message still in the send queue -- chat-items-redesign.md #2.
 // Tertiary background (same role as `UserBubble`, since a queued message
-// is still "mine", just not sent yet) with three controls: cancel/drop
-// (x), edit (pencil), stop-sending (x, shown only while actively
-// in-flight). `can-edit` is caller-computed -- the spec's rule is "edit
-// only for the most-recent unqueued message," which depends on the whole
-// queue's order, not anything this component can determine on its own
-// from a single item.
+// is still "mine", just not sent yet) with controls: send-now (paper
+// plane, front-of-queue only), cancel/drop (x), edit (pencil),
+// stop-sending (x, shown only while actively in-flight). `can-edit` is
+// caller-computed -- the spec's rule is "edit only for the most-recent
+// unqueued message," which depends on the whole queue's order, not
+// anything this component can determine on its own from a single item.
+// `can-send-now` is separately caller-computed ("front-of-queue entry,
+// while a turn is in flight" -- see send_queue.rs's steer/fast-track
+// state machine) since that too depends on queue position, not just this
+// row's own state.
 export component QueuedMessageBar inherits Rectangle {
     in property <string> text;
     in property <bool> can-edit: false;
+    in property <bool> can-send-now: false;
     in property <bool> sending: false;
     callback cancel-requested();
     callback edit-requested();
     callback stop-requested();
+    callback send-now-requested();
 
     background: Theme.bg-tertiary;
     border-color: Theme.border-tertiary;
@@ -39,6 +45,17 @@ export component QueuedMessageBar inherits Rectangle {
             horizontal-stretch: 1;
             preferred-width: 0px;
             min-width: 0px;
+        }
+        if can-send-now && !sending : IconButton {
+            btn-width: 18px;
+            btn-height: 18px;
+            button-accessible-label: "Send now";
+            clicked => { send-now-requested(); }
+            Icon {
+                source: @image-url("../../../assets/icons/send.svg");
+                size: 13px;
+                color: Theme.text-secondary;
+            }
         }
         if can-edit && !sending : IconButton {
             btn-width: 18px;

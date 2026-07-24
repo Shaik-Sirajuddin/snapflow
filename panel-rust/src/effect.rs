@@ -235,4 +235,15 @@ pub enum EffectResultMsg {
         real_index: usize,
         result: Result<(), EffectError>,
     },
+    /// A state-mutating effect with no dedicated result variant failed --
+    /// bridge lifecycle calls (`close_thread`/`archive_thread`/
+    /// `delete_thread` returning `false`) and `PanelStateStore` writes
+    /// (`PersistSelectedThread`/`ToggleBackground`/`RenameThread`) that
+    /// previously only `eprintln!`'d on failure. `thread_id` is empty when
+    /// no specific thread could be resolved (matches
+    /// `ThreadRecordPersisted`'s convention).
+    StateEffectFailed {
+        thread_id: String,
+        message: String,
+    },
 }

@@ -226,6 +226,7 @@ export component ChatPanel inherits Window {
     callback stop-requested();
     callback queue-cancel-requested(int);
     callback queue-edit-requested(int);
+    callback queue-send-now-requested(int);
     callback queue-stop-requested();
     callback settings-requested();
     callback settings-scope-changed(string);
@@ -535,6 +536,7 @@ export component ChatPanel inherits Window {
                 stop-requested => { stop-requested(); }
                 queue-cancel-requested(i) => { queue-cancel-requested(i); }
                 queue-edit-requested(i) => { queue-edit-requested(i); }
+                queue-send-now-requested(i) => { queue-send-now-requested(i); }
                 queue-stop-requested => { queue-stop-requested(); }
                 settings-requested => { root.open-settings(); }
                 new-thread-requested => { root.start-new-thread(); }

@@ -331,6 +331,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 provider: provider.clone(),
                 profile_name: profile_name.clone(),
                 permission_profile: permission_profile.clone(),
+                send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
@@ -361,15 +362,17 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             model.compose_text.clear();
             model.search_query.clear();
             let real_index = model.threads.len();
+            let thread_id = thread_id
+                .or_else(|| session_id.clone())
+                .unwrap_or_else(|| format!("thread:{real_index}"));
             model.threads.push(ThreadModel {
-                thread_id: thread_id
-                    .or_else(|| session_id.clone())
-                    .unwrap_or_else(|| format!("thread:{real_index}")),
+                thread_id: thread_id.clone(),
                 display_name,
                 provider,
                 profile_name,
                 permission_profile,
                 session_id,
+                send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
@@ -515,11 +518,14 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
         } => {
             let old_keys = current_visible_keys(model);
             model.search_query.clear();
+            let thread_id =
+                thread_id.unwrap_or_else(|| format!("thread:{}", model.threads.len()));
             model.threads.push(ThreadModel {
-                thread_id: thread_id.unwrap_or_else(|| format!("thread:{}", model.threads.len())),
+                thread_id: thread_id.clone(),
                 display_name: title,
                 provider: provider.clone(),
                 session_id: Some(session_id.clone()),
+                send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
             let at = model.threads.len() - 1;
@@ -572,6 +578,22 @@ fn rebuild_send_queue_projection(
             },
         ],
     )
+}
+
+/// A brand-new thread's send queue, wired to persist to
+/// `<thread_id>.sendqueue.jsonl` going forward -- `send_queue.rs`'s own
+/// module doc describes this persistence, but nothing previously called
+/// `SendQueue::load`/`send_queue_path` outside that file's own tests, so
+/// every `ThreadModel::default()` silently kept `persist_path: None` and
+/// a queued-but-unsent message never survived a restart. Uses
+/// `new_with_path` (no I/O) rather than `load`, since a genuinely new
+/// thread has nothing to load; `Model::from_initial_state`'s cold-start
+/// path is the one that actually restores prior queue content from disk.
+fn new_thread_send_queue(thread_id: &str) -> crate::send_queue::SendQueue {
+    crate::send_queue::SendQueue::new_with_path(crate::send_queue::send_queue_path(
+        &crate::agent_bridge::resolve_cache_dir(),
+        thread_id,
+    ))
 }
 
 fn queue_entry_id_at(
@@ -747,6 +769,70 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
                     dirty.push(Dirty::Scalar(ScalarField::ComposeText));
                     (vec![], dirty)
+                }
+                Ok(None) => (vec![], vec![]),
+                Err(error) => {
+                    let message = error.to_string();
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = Some(message.clone());
+                    (
+                        vec![],
+                        vec![Dirty::Error {
+                            thread_id,
+                            detail: ErrorDetail { message },
+                        }],
+                    )
+                }
+            }
+        }
+        ComposeMsg::QueueSendNow { message_index } => {
+            let (entry_id, is_generating) = {
+                let Some(thread) = model.threads.get(idx) else {
+                    return (vec![], vec![]);
+                };
+                let Some(entry_id) = queue_entry_id_at(thread, message_index) else {
+                    return (vec![], vec![]);
+                };
+                let is_generating = matches!(
+                    thread.state,
+                    ThreadState::Loading | ThreadState::Cancelling
+                );
+                (entry_id, is_generating)
+            };
+            let send_now_result = {
+                let Some(thread) = model.threads.get_mut(idx) else {
+                    return (vec![], vec![]);
+                };
+                thread.send_queue.send_now(entry_id, is_generating)
+            };
+            match send_now_result {
+                Ok(Some(entry)) => {
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = None;
+                    thread.state = ThreadState::Loading;
+                    let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
+                    dirty.push(Dirty::Connection { thread_id });
+                    let mut effects = Vec::with_capacity(2);
+                    if is_generating {
+                        // A turn is already in flight -- cancel it. The
+                        // resulting Stopped/TurnEnded event is absorbed by
+                        // the queue's AbsorbingCancel state (armed by
+                        // send_now above) so it doesn't also auto-drain
+                        // the next entry once send_prompt below starts a
+                        // new one.
+                        effects.push(Effect::CancelGeneration { real_index: idx });
+                    }
+                    effects.push(Effect::SendPrompt {
+                        real_index: idx,
+                        text: entry.text,
+                    });
+                    (effects, dirty)
                 }
                 Ok(None) => (vec![], vec![]),
                 Err(error) => {
@@ -1212,6 +1298,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let agent_catalog_keys = model.agent_catalog_model_keys.borrow().clone();
             let recoverable_session_keys = model.recoverable_session_model_keys.borrow().clone();
             let terminal_keys = model.terminal_model_keys.borrow().clone();
+            let startup_warnings = initial.startup_warnings.clone();
             *model = Model::from_initial_state(initial);
             model.thread_model = thread_model;
             model.messages_model = messages_model;
@@ -1232,13 +1319,20 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let thread_list_dirty = thread_list_dirty_with_keys(model, thread_keys);
             // Cold start: everything is dirty, there is no prior row
             // identity to preserve (see 00-plan.md's known-gap section).
-            (
-                vec![],
-                vec![
-                    thread_list_dirty,
-                    Dirty::Scalar(ScalarField::SelectedThread),
-                ],
-            )
+            let mut dirty = vec![
+                thread_list_dirty,
+                Dirty::Scalar(ScalarField::SelectedThread),
+            ];
+            // Non-fatal cold-start failures (settings load, panel-defaults
+            // sync, thread-record restoration, ...) previously only
+            // reached eprintln! -- surface them the same way any other
+            // Effect failure is surfaced, instead of silently dropping
+            // them once hydration itself otherwise succeeds.
+            dirty.extend(startup_warnings.into_iter().map(|message| Dirty::Error {
+                thread_id: String::new(),
+                detail: ErrorDetail { message },
+            }));
+            (vec![], dirty)
         }
         EffectResultMsg::InitialStateLoaded(Err(err)) => (
             vec![],
@@ -1277,6 +1371,13 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 }],
             ),
         },
+        EffectResultMsg::StateEffectFailed { thread_id, message } => (
+            vec![],
+            vec![Dirty::Error {
+                thread_id,
+                detail: ErrorDetail { message },
+            }],
+        ),
         EffectResultMsg::SessionAttached {
             real_index,
             thread_id,
@@ -2176,6 +2277,47 @@ mod tests {
         assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
     }
 
+    /// send_queue.rs's disk persistence (SendQueue::load/send_queue_path)
+    /// previously had zero call sites outside its own tests -- every
+    /// thread's queue was `SendQueue::default()` (persist_path: None), so
+    /// a queued-but-unsent message was silently lost on restart despite
+    /// the fully-built persistence layer. This proves the wiring actually
+    /// round-trips through a real file, the same way a restart would.
+    #[test]
+    fn a_new_threads_send_queue_persists_and_reloads_after_a_simulated_restart() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let previous = std::env::var("RUI_ACP_CACHE_DIR").ok();
+        unsafe {
+            std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
+        }
+
+        let mut model = Model::default();
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        let thread_id = model.threads[0].thread_id.clone();
+        model.threads[0]
+            .send_queue
+            .enqueue("queued across a restart".to_owned(), false)
+            .expect("enqueue must persist, not silently no-op");
+
+        // Simulate a restart: load a fresh SendQueue for the same
+        // thread_id the same way cold-start hydration does in lib.rs.
+        let path = crate::send_queue::send_queue_path(
+            &crate::agent_bridge::resolve_cache_dir(),
+            &thread_id,
+        );
+        let reloaded = crate::send_queue::SendQueue::load(path).expect("reload queue from disk");
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            reloaded.first().map(|entry| entry.text.as_str()),
+            Some("queued across a restart")
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("RUI_ACP_CACHE_DIR", value) },
+            None => unsafe { std::env::remove_var("RUI_ACP_CACHE_DIR") },
+        }
+    }
+
     #[test]
     fn agent_set_enabled_emits_one_admin_effect() {
         // setup-followups plan, agent_settings_ordering_and_install_
@@ -2639,6 +2781,101 @@ mod tests {
     }
 
     #[test]
+    fn queue_send_now_while_idle_sends_immediately_with_no_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        // Idle: nothing in flight, so send-now is a plain immediate send.
+        model.threads[0]
+            .send_queue
+            .enqueue("go now".to_owned(), false)
+            .expect("queue");
+        let expanded = model.expanded.clone();
+        let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+            model.threads[0].transcript.clone(),
+            &expanded,
+            &model.threads[0].send_queue,
+            false,
+        );
+        model.threads[0].message_rows = rows;
+        model.threads[0].transcript_keys = keys;
+        let last = model.threads[0].transcript_keys.len() - 1;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueSendNow {
+                message_index: last,
+            })),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SendPrompt {
+                real_index: 0,
+                text: "go now".to_owned(),
+            }]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Connection { .. })));
+    }
+
+    #[test]
+    fn queue_send_now_while_generating_cancels_then_sends_and_arms_absorbing_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("front".to_owned(), false)
+            .expect("queue");
+        model.threads[0]
+            .send_queue
+            .enqueue("steer me".to_owned(), false)
+            .expect("queue");
+        let expanded = model.expanded.clone();
+        let (rows, keys) = crate::models::message_rows_for_thread_with_state(
+            model.threads[0].transcript.clone(),
+            &expanded,
+            &model.threads[0].send_queue,
+            true,
+        );
+        model.threads[0].message_rows = rows;
+        model.threads[0].transcript_keys = keys;
+        // The second (non-front) entry: "steer me".
+        let target_index = model.threads[0].transcript_keys.len() - 1;
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueSendNow {
+                message_index: target_index,
+            })),
+        );
+        assert_eq!(
+            effects,
+            vec![
+                Effect::CancelGeneration { real_index: 0 },
+                Effect::SendPrompt {
+                    real_index: 0,
+                    text: "steer me".to_owned(),
+                },
+            ]
+        );
+        // "steer me" was pulled out; only "front" remains queued.
+        assert_eq!(model.threads[0].send_queue.len(), 1);
+        assert_eq!(
+            model.threads[0]
+                .send_queue
+                .first()
+                .map(|entry| entry.text.as_str()),
+            Some("front")
+        );
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        // The eventual TurnEnded from the cancel above must not also
+        // auto-drain "front" -- AbsorbingCancel swallows it once.
+        let popped = model.threads[0]
+            .send_queue
+            .on_generation_stopped(false)
+            .unwrap();
+        assert!(popped.is_none(), "AbsorbingCancel must swallow this Stopped event");
+        assert_eq!(model.threads[0].send_queue.len(), 1);
+    }
+
+    #[test]
     fn queue_stop_pauses_queue_and_cancels_generation() {
         let mut model = model_with_threads(&["a"]);
         model.threads[0].state = ThreadState::Loading;
@@ -2924,6 +3161,28 @@ mod tests {
     }
 
     #[test]
+    fn state_effect_failed_surfaces_as_dirty_error_not_silently_dropped() {
+        let mut model = Model::default();
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::StateEffectFailed {
+                thread_id: "thread-a".to_owned(),
+                message: "failed to toggle background-session override: boom".to_owned(),
+            }),
+        );
+        assert!(effects.is_empty());
+        assert_eq!(
+            dirty,
+            vec![Dirty::Error {
+                thread_id: "thread-a".to_owned(),
+                detail: ErrorDetail {
+                    message: "failed to toggle background-session override: boom".to_owned(),
+                },
+            }]
+        );
+    }
+
+    #[test]
     fn init_host_msg_requests_load_initial_state_effect() {
         let mut model = Model::default();
         let (effects, _) = update(&mut model, Msg::Host(HostMsg::Init));
@@ -2951,6 +3210,8 @@ mod tests {
                     selected_thread_id: None,
                     permission_profiles: vec![],
                     thread_states: vec![],
+                    startup_warnings: vec![],
+                    send_queues: vec![],
                 },
             ))),
         );
@@ -2970,6 +3231,42 @@ mod tests {
             &model.recoverable_sessions_model
         ));
         assert!(!dirty.is_empty());
+    }
+
+    #[test]
+    fn initial_state_loaded_surfaces_startup_warnings_as_dirty_errors() {
+        let mut model = Model::default();
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::InitialStateLoaded(Ok(
+                crate::model::InitialState {
+                    threads: vec![],
+                    thread_ids: vec![],
+                    selected_thread_id: None,
+                    permission_profiles: vec![],
+                    thread_states: vec![],
+                    startup_warnings: vec![
+                        "panel settings persistence unavailable: boom".to_owned(),
+                        "agent bridge unavailable, chat panel is display-only: boom".to_owned(),
+                    ],
+                    send_queues: vec![],
+                },
+            ))),
+        );
+        let errors: Vec<&str> = dirty
+            .iter()
+            .filter_map(|d| match d {
+                Dirty::Error { detail, .. } => Some(detail.message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                "panel settings persistence unavailable: boom",
+                "agent bridge unavailable, chat panel is display-only: boom",
+            ]
+        );
     }
 
     #[test]

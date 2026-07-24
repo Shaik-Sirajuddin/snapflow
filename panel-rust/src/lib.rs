@@ -57,6 +57,7 @@ use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Truncation length for `models::describe_thread`'s sidebar preview --
 /// matches the HTML source's short one-liners (e.g. "Trim clips and add
@@ -249,7 +250,7 @@ fn non_empty(value: String) -> Option<String> {
 
 /// One-shot seed: if the global JSON file is missing but SQLite still has
 /// panel prefs, write them so multi-process peers can read the same values.
-fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore) {
+fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut Vec<String>) {
     let paths = settings_file::SettingsPaths::from_env();
     if paths.global.exists() {
         return;
@@ -273,18 +274,22 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore) {
         dev_mode: None,
     };
     if let Err(error) = settings_file::save_document(&paths.global, &doc) {
-        eprintln!("panel-rust: failed to migrate panel defaults to JSON: {error}");
+        let message = format!("failed to migrate panel defaults to JSON: {error}");
+        eprintln!("panel-rust: {message}");
+        warnings.push(message);
     }
 }
 
 /// Load multi-process panel prefs from JSON (project → global → default).
 /// `selected_thread_id` remains process-local (SQLite) when provided.
-fn load_panel_prefs(selected_thread_id: Option<String>) -> PanelDefaults {
+fn load_panel_prefs(selected_thread_id: Option<String>, warnings: &mut Vec<String>) -> PanelDefaults {
     let paths = settings_file::SettingsPaths::from_env();
     match paths.load_resolved() {
         Ok(resolved) => settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
         Err(error) => {
-            eprintln!("panel-rust: settings file load failed: {error}");
+            let message = format!("settings file load failed: {error}");
+            eprintln!("panel-rust: {message}");
+            warnings.push(message);
             PanelDefaults {
                 selected_thread_id,
                 ..PanelDefaults::default()
@@ -315,10 +320,13 @@ fn scoped_settings_path<'a>(
 fn load_scoped_panel_prefs(
     scope: &str,
     selected_thread_id: Option<String>,
+    warnings: &mut Vec<String>,
 ) -> Option<ScopedPanelPrefs> {
     let paths = settings_file::SettingsPaths::from_env();
     if scoped_settings_path(&paths, scope).is_none() {
-        eprintln!("panel-rust: unavailable settings scope {scope:?}");
+        let message = format!("unavailable settings scope {scope:?}");
+        eprintln!("panel-rust: {message}");
+        warnings.push(message);
         return None;
     }
 
@@ -327,7 +335,9 @@ fn load_scoped_panel_prefs(
         match settings_file::load_document(path) {
             Ok(document) => documents.push(document),
             Err(error) => {
-                eprintln!("panel-rust: bundled settings load failed: {error}");
+                let message = format!("bundled settings load failed: {error}");
+                eprintln!("panel-rust: {message}");
+                warnings.push(message);
                 return None;
             }
         }
@@ -335,7 +345,9 @@ fn load_scoped_panel_prefs(
     match settings_file::load_document(&paths.global) {
         Ok(document) => documents.push(document),
         Err(error) => {
-            eprintln!("panel-rust: global settings load failed: {error}");
+            let message = format!("global settings load failed: {error}");
+            eprintln!("panel-rust: {message}");
+            warnings.push(message);
             return None;
         }
     }
@@ -346,7 +358,9 @@ fn load_scoped_panel_prefs(
         match settings_file::load_document(path) {
             Ok(document) => documents.push(document),
             Err(error) => {
-                eprintln!("panel-rust: project settings load failed: {error}");
+                let message = format!("project settings load failed: {error}");
+                eprintln!("panel-rust: {message}");
+                warnings.push(message);
                 return None;
             }
         }
@@ -488,7 +502,11 @@ struct PanelSingleton {
     width: u32,
     height: u32,
     bridge: Option<AgentBridge>,
-    panel_state: Option<PanelStateStore>,
+    // Arc, not a plain owned value: several Effect handlers in
+    // effect_executor.rs move a clone of this into a std::thread::spawn
+    // closure so the blocking SQLite write happens off the Slint UI
+    // thread (offload_state_effects_off_ui_thread).
+    panel_state: Option<Arc<PanelStateStore>>,
     /// Set by [`settings_file::SettingsWatcher`]; drained on poll to
     /// refresh open settings fields without clobbering dirty edits.
     settings_reload_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -542,7 +560,15 @@ impl PanelSingleton {
             selected_thread_id,
         };
         if let Err(error) = store.save_defaults(&runtime_defaults) {
-            eprintln!("panel-rust: failed to synchronize runtime panel defaults: {error}");
+            let message = format!("failed to synchronize runtime panel defaults: {error}");
+            eprintln!("panel-rust: {message}");
+            let _ = dispatch::update_persistent(
+                self,
+                msg::Msg::Effect(effect::EffectResultMsg::StateEffectFailed {
+                    thread_id: String::new(),
+                    message,
+                }),
+            );
         }
     }
 
@@ -718,7 +744,17 @@ impl PanelSingleton {
                 "failed to save panel settings JSON: {error}"
             )));
         }
-        self.sync_runtime_defaults(&load_panel_prefs(None));
+        let mut warnings = Vec::new();
+        self.sync_runtime_defaults(&load_panel_prefs(None, &mut warnings));
+        for message in warnings {
+            let _ = dispatch::update_persistent(
+                self,
+                msg::Msg::Effect(effect::EffectResultMsg::StateEffectFailed {
+                    thread_id: String::new(),
+                    message,
+                }),
+            );
+        }
         self.settings_ignore_watch_until.set(Some(
             std::time::Instant::now() + std::time::Duration::from_millis(500),
         ));
@@ -934,12 +970,28 @@ impl PanelSingleton {
     pub(crate) fn dispatch_dev_mode_toggled(&self, enabled: bool) {
         let paths = settings_file::SettingsPaths::from_env();
         if let Err(error) = paths.set_dev_mode(enabled) {
-            eprintln!("panel-rust: failed to persist dev mode: {error}");
+            let message = format!("failed to persist dev mode: {error}");
+            eprintln!("panel-rust: {message}");
+            let _ = dispatch::update_persistent(
+                self,
+                msg::Msg::Effect(effect::EffectResultMsg::StateEffectFailed {
+                    thread_id: String::new(),
+                    message,
+                }),
+            );
         }
         if enabled {
             let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
             if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
-                eprintln!("panel-rust: failed to install bundled global skill: {error}");
+                let message = format!("failed to install bundled global skill: {error}");
+                eprintln!("panel-rust: {message}");
+                let _ = dispatch::update_persistent(
+                    self,
+                    msg::Msg::Effect(effect::EffectResultMsg::StateEffectFailed {
+                        thread_id: String::new(),
+                        message,
+                    }),
+                );
             }
         }
     }
@@ -1229,12 +1281,19 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // (RUI_ACPX_<PROVIDER>_URL env override, else a local
         // dev-checkout `acpx-server` auto-spawned against
         // RUI_ACP_AGENT_CMD/the dev-checkout rui-mock-agent path).
+        // Cold-start failures collected here previously only reached
+        // eprintln! -- folded into InitialState::startup_warnings below so
+        // update()'s InitialStateLoaded handler can surface them as
+        // Dirty::Error instead of silently degrading with no UI signal.
+        let mut startup_warnings: Vec<String> = Vec::new();
         let panel_state = {
             let path = resolve_cache_dir().join("panel-state.sqlite3");
             match PanelStateStore::open(path) {
-                Ok(store) => Some(store),
+                Ok(store) => Some(Arc::new(store)),
                 Err(error) => {
-                    eprintln!("panel-rust: panel settings persistence unavailable: {error}");
+                    let message = format!("panel settings persistence unavailable: {error}");
+                    eprintln!("panel-rust: {message}");
+                    startup_warnings.push(message);
                     None
                 }
             }
@@ -1244,7 +1303,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             .and_then(|store| match store.thread_records() {
                 Ok(records) => Some(records),
                 Err(error) => {
-                    eprintln!("panel-rust: failed to restore chat thread records: {error}");
+                    let message = format!("failed to restore chat thread records: {error}");
+                    eprintln!("panel-rust: {message}");
+                    startup_warnings.push(message);
                     None
                 }
             })
@@ -1311,7 +1372,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         let (bridge, bridge_available) = match AgentBridge::new_with_thread_specs(&initial_specs) {
             Ok(b) => (Some(b), true),
             Err(e) => {
-                eprintln!("panel-rust: agent bridge unavailable, chat panel is display-only: {e}");
+                let message = format!("agent bridge unavailable, chat panel is display-only: {e}");
+                eprintln!("panel-rust: {message}");
+                startup_warnings.push(message);
                 (None, false)
             }
         };
@@ -1335,23 +1398,45 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // Cold-start payload is collected once, then folded only through
         // Init -> InitialStateLoaded. The shell Model starts empty so the
         // TEA path owns the first real hydration (no pre-seed + replace).
+        let initial_thread_ids: Vec<String> = restored_records
+            .iter()
+            .map(|record| record.thread_id.clone())
+            .chain(
+                (restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")),
+            )
+            .collect();
+        // Each thread's send queue persists to its own
+        // <thread_id>.sendqueue.jsonl (see send_queue.rs's module doc) --
+        // restore it here (real disk I/O, so it belongs in this cold-start
+        // collection step, never inside update()'s pure reducer). A
+        // missing/corrupt file falls back to an empty queue still wired
+        // to persist going forward, same posture as this function's other
+        // cache reads.
+        let cache_dir = resolve_cache_dir();
+        let initial_send_queues: Vec<send_queue::SendQueue> = initial_thread_ids
+            .iter()
+            .map(|thread_id| {
+                let path = send_queue::send_queue_path(&cache_dir, thread_id);
+                send_queue::SendQueue::load(path.clone()).unwrap_or_else(|error| {
+                    eprintln!(
+                        "panel-rust: failed to restore send queue for thread {thread_id:?}: {error}"
+                    );
+                    send_queue::SendQueue::new_with_path(path)
+                })
+            })
+            .collect();
         let initial = model::InitialState {
             threads: initial_specs.clone(),
-            thread_ids: restored_records
-                .iter()
-                .map(|record| record.thread_id.clone())
-                .chain(
-                    (restored_records.len()..initial_specs.len())
-                        .map(|idx| format!("thread:{idx}")),
-                )
-                .collect(),
+            thread_ids: initial_thread_ids,
             selected_thread_id: initial_selected_thread_id.clone(),
             permission_profiles: initial_permission_profiles.clone(),
+            send_queues: initial_send_queues,
             thread_states: if bridge_available {
                 vec![ThreadState::Idle; initial_specs.len()]
             } else {
                 vec![ThreadState::Error; initial_specs.len()]
             },
+            startup_warnings,
         };
         let mut model = model::Model::default();
         let thread_model = Rc::new(VecModel::default());
@@ -1412,8 +1497,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             ..crate::msg::FrameInput::default()
         });
         // Multi-process prefs live in JSON; selected thread stays in SQLite.
+        let mut post_hydration_warnings: Vec<String> = Vec::new();
         if let Some(store) = panel.panel_state.as_ref() {
-            maybe_migrate_sqlite_defaults_to_json(store);
+            maybe_migrate_sqlite_defaults_to_json(store, &mut post_hydration_warnings);
         }
         let selected_from_sqlite = panel
             .panel_state
@@ -1425,12 +1511,24 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         } else {
             "global"
         };
-        let scoped_prefs = load_scoped_panel_prefs(settings_scope, selected_from_sqlite.clone());
-        let defaults = scoped_prefs
-            .as_ref()
-            .map(|prefs| prefs.defaults.clone())
-            .unwrap_or_else(|| load_panel_prefs(selected_from_sqlite));
+        let scoped_prefs = load_scoped_panel_prefs(
+            settings_scope,
+            selected_from_sqlite.clone(),
+            &mut post_hydration_warnings,
+        );
+        let defaults = scoped_prefs.as_ref().map(|prefs| prefs.defaults.clone()).unwrap_or_else(
+            || load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings),
+        );
         panel.sync_runtime_defaults(&defaults);
+        for message in post_hydration_warnings {
+            let _ = dispatch::update_persistent(
+                &panel,
+                msg::Msg::Effect(effect::EffectResultMsg::StateEffectFailed {
+                    thread_id: String::new(),
+                    message,
+                }),
+            );
+        }
         if let Some(selected_thread_id) = defaults.selected_thread_id {
             if let Some(real_idx) = panel.bridge.as_ref().and_then(|bridge| {
                 (0..panel.model.borrow().threads.len()).find(|idx| {
@@ -1468,7 +1566,15 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             // leaving dev mode on with zero global skills to show.
             let global_dir = crate::skills_state::global_skills_dir(&resolve_cache_dir());
             if let Err(error) = crate::skills_state::ensure_bundled_global_skill(&global_dir) {
-                eprintln!("panel-rust: failed to install bundled global skill at startup: {error}");
+                let message = format!("failed to install bundled global skill at startup: {error}");
+                eprintln!("panel-rust: {message}");
+                let _ = dispatch::update_persistent(
+                    &panel,
+                    msg::Msg::Effect(effect::EffectResultMsg::StateEffectFailed {
+                        thread_id: String::new(),
+                        message,
+                    }),
+                );
             }
             panel.dispatch_frame_input(crate::msg::FrameInput {
                 skills_snapshot: Some(
@@ -1963,6 +2069,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
                     dispatch::dispatch_queue_stop(panel);
+                }
+            });
+        });
+        panel.component.on_queue_send_now_requested(move |message_index| {
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_queue_send_now(panel, message_index as usize);
                 }
             });
         });

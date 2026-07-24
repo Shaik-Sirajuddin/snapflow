@@ -35,6 +35,36 @@ literal.
 | Settings / MCP / agent catalog | Multiple sessions with different overrides | Expected ACPX method/payload reaches the session selected in UI | Pending |
 | Restart / reconnect | Host and gateway restart | Resumed session receives next prompt without an implicit close | Proven (`PANEL_HOST_E2E_RESTART=1`) |
 | HTTP degraded fallback | Gateway WS unavailable then restored | Fallback audit state is present; interactive approval is unavailable | Pending |
+| Send-now / steer (state-controller-notification-audit plan) | Two entries queued behind a blocked ("slow ") turn, send-now clicked on the second (non-front) one | The steered entry's text reaches the backend as its own `session/prompt`, the skipped-over entry never does, and a real `session/cancel` for turn 1 is observed | Proven (`host_e2e_mcp_smoke.sh send-now`, MCP-driven -- see below) |
+| Rename round-trip (offload_state_effects_off_ui_thread) | Real Rename thread → type → confirm | Header title element updates to the new name; `panel-state.sqlite3`'s `thread_settings.display_name` matches after the background-thread write completes | Proven (`host_e2e_mcp_smoke.sh rename`, MCP-driven -- see below). The RenameThread *failure* branch (StateEffectFailed → Dirty::Error) is unit-tested only (`update.rs::state_effect_failed_surfaces_as_dirty_error_not_silently_dropped`) -- forcing an already-open rusqlite connection's write to fail on demand has no reliable trigger for this harness |
+
+## MCP-driven scenarios (`host_e2e_mcp_smoke.sh` / `host_e2e_mcp_driver.py`)
+
+Companion harness to the XTEST-based one above, not a replacement. Talks to
+`i_slint_backend_testing::mcp_server` (enabled via `SLINT_MCP_PORT`) over its
+Streamable HTTP transport instead of simulating raw X11 input --
+`click_element`/`set_element_value`/`dispatch_key_event` target elements by
+qualified id (`ChatInputLayout::compose`) or accessible label ("Send now"),
+so there is no dock-relative pixel math, no `PANEL_HOST_E2E_DOCK_WIDTH`
+dependency, and no fragility to layout/theme changes shifting coordinates.
+Own state dir / display (`:112`) / ports (`18796`, `19099`) so a run never
+collides with a concurrent `host_e2e_smoke.sh` or `host_vnc_dev.sh` run.
+
+```bash
+bash tests/host_e2e_mcp_smoke.sh send-now
+bash tests/host_e2e_mcp_smoke.sh rename
+```
+
+Two lessons from getting the driver working, worth keeping in mind before
+adding a third scenario:
+- `dispatch_key_event`'s `text` field is passed straight through to Slint's
+  `WindowEvent::KeyPressed{text}` -- special keys are their real character
+  code (Return is U+000A / `"\n"`, per `i-slint-common`'s `key_codes.rs`),
+  not their English name ("Return" typed as 6 literal characters the first
+  time this was gotten wrong).
+- `dispatch_key_event` routes to the window's current keyboard focus; a
+  `click_element` on the target `TextInput` first is required, unlike
+  `set_element_value`, which sets content directly regardless of focus.
 
 `PANEL_HOST_E2E_NEW_THREAD=1` and `PANEL_HOST_E2E_PROVIDER_ISOLATION=1` both
 require `PANEL_HOST_E2E_DRIVE=1` in the same invocation (they assert against

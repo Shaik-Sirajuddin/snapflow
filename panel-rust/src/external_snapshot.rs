@@ -169,11 +169,18 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .and_then(|bridge| bridge.thread_binding(idx))
                     .map(|binding| binding.thread_id)
             });
-        let prefs = crate::load_scoped_panel_prefs(scope, selected_thread_id.clone());
+        // Frame-poll path (this snapshot is collected up to 60-90x/sec):
+        // discard warnings here rather than route through Dirty::Error on
+        // every tick -- the once-per-launch cold-start call sites in
+        // lib.rs::panel_rust_create surface the same failures already.
+        let mut discarded_warnings = Vec::new();
+        let prefs =
+            crate::load_scoped_panel_prefs(scope, selected_thread_id.clone(), &mut discarded_warnings);
         let (defaults, default_agent_id) = prefs
             .map(|prefs| (prefs.defaults, prefs.default_agent_id))
             .unwrap_or_else(|| {
-                let defaults = crate::load_panel_prefs(selected_thread_id.clone());
+                let defaults =
+                    crate::load_panel_prefs(selected_thread_id.clone(), &mut discarded_warnings);
                 let default_agent_id = crate::settings_file::SettingsPaths::from_env()
                     .load_resolved()
                     .ok()

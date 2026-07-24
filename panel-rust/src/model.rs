@@ -34,6 +34,20 @@ pub struct InitialState {
     pub selected_thread_id: Option<String>,
     pub permission_profiles: Vec<Option<String>>,
     pub thread_states: Vec<ThreadState>,
+    /// Non-fatal failures collected while assembling cold-start state
+    /// (settings load, panel-defaults sync, dev-mode persistence, bundled
+    /// skill install, chat-thread-record restoration, agent-bridge
+    /// unavailable, ...) that previously only reached `eprintln!`. Folded
+    /// into `Dirty::Error` by `update()`'s `InitialStateLoaded` handler so
+    /// cold-start problems are visible in the UI, not just stderr.
+    pub startup_warnings: Vec<String>,
+    /// Each restored/seeded thread's send queue, already loaded from its
+    /// `<thread_id>.sendqueue.jsonl` (see `send_queue::SendQueue::load`)
+    /// -- loading is real disk I/O, so it happens in `lib.rs` before this
+    /// struct is built, never inside `update()`'s pure reducer. Indexed
+    /// the same as `threads`/`thread_ids`; a missing/short entry falls
+    /// back to an empty in-memory-only queue.
+    pub send_queues: Vec<crate::send_queue::SendQueue>,
 }
 
 /// One thread's `Model`-side state -- the former parallel-array fields in
@@ -236,6 +250,7 @@ impl Model {
                     .cloned()
                     .unwrap_or(ThreadState::Idle),
                 session_id: spec.session_id,
+                send_queue: initial.send_queues.get(idx).cloned().unwrap_or_default(),
                 ..ThreadModel::default()
             })
             .collect();
@@ -269,6 +284,8 @@ mod tests {
             selected_thread_id: None,
             permission_profiles: vec![],
             thread_states: vec![],
+            startup_warnings: vec![],
+            send_queues: vec![],
         });
         assert!(model.threads.is_empty());
         assert_eq!(model.selected_thread, 0);
@@ -295,6 +312,8 @@ mod tests {
             selected_thread_id: Some("sess-2".to_owned()),
             permission_profiles: vec![None, None],
             thread_states: vec![ThreadState::Idle, ThreadState::Idle],
+            startup_warnings: vec![],
+            send_queues: vec![],
         };
         let model = Model::from_initial_state(initial);
         assert_eq!(model.threads.len(), 2);
@@ -323,6 +342,8 @@ mod tests {
             selected_thread_id: None,
             permission_profiles: vec![Some("workspace".to_owned())],
             thread_states: vec![ThreadState::Error],
+            startup_warnings: vec![],
+            send_queues: vec![],
         });
         assert_eq!(model.threads[0].profile_name.as_deref(), Some("balanced"));
         assert_eq!(
