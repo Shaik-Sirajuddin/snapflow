@@ -45,7 +45,7 @@ mod sync;
 mod theme;
 mod update;
 
-use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec};
+use agent_bridge::{resolve_cache_dir, AgentBridge, ThreadSpec, NO_PROVIDER_REQUESTED_FALLBACK};
 use appearance::{ColorScheme, HostAppearance};
 use models::ThreadState;
 use protocol_types::{ChatMessage, MessageKind};
@@ -1376,12 +1376,26 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
                 Err(_) => DEFAULT_THREAD_NAMES.to_vec(),
             };
+            // PROF-1: every cold-start seed thread now shares ONE real
+            // provider -- this machine's configured `default_agent_id`
+            // (settings.global.json / bundled defaults, the same value
+            // the settings sheet's agent picker writes) when one is
+            // set, else the single documented `NO_PROVIDER_REQUESTED_
+            // FALLBACK` -- never an index-parity guess alternating
+            // "codex"/"claude" by thread position, which silently
+            // mis-bound half of every fresh install's default threads to
+            // whichever provider parity happened to land on regardless
+            // of what was actually configured/available.
+            let seed_provider = settings_file::SettingsPaths::from_env()
+                .load_resolved()
+                .ok()
+                .and_then(|resolved| settings_file::non_default_sentinel(resolved.default_agent_id))
+                .unwrap_or_else(|| NO_PROVIDER_REQUESTED_FALLBACK.to_owned());
             seed_names
                 .into_iter()
-                .enumerate()
-                .map(|(idx, name)| ThreadSpec {
+                .map(|name| ThreadSpec {
                     display_name: name.to_owned(),
-                    provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
+                    provider: seed_provider.clone(),
                     session_id: None,
                     profile_name: None,
                 })

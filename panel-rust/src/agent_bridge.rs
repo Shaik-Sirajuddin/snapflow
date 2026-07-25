@@ -116,13 +116,25 @@ pub struct ThreadBinding {
     pub session_id: String,
 }
 
+/// Builds bare `ThreadSpec`s from thread names alone, with no real
+/// per-thread provider binding -- every spec gets
+/// [`NO_PROVIDER_REQUESTED_FALLBACK`]. Real production startup never
+/// calls this: `lib.rs`'s cold-start path builds `ThreadSpec`s directly
+/// (persisted records' own provider, or `default_agent_id` from
+/// settings), and `AgentBridge::new_with_thread_specs` takes those
+/// directly. This helper only backs the name-only test/dev
+/// constructors ([`AgentBridge::new`], [`AgentBridge::new_with_gateway_
+/// url`], [`AgentBridge::new_with_gateway_resolver_and_cache_dir`]),
+/// whose own tests don't care which literal provider string a
+/// synthesized thread gets (most point every provider at one shared
+/// test gateway) -- a test that DOES care about provider identity
+/// builds real `ThreadSpec`s with explicit providers instead.
 fn specs_for_names(thread_names: &[&str]) -> Vec<ThreadSpec> {
     thread_names
         .iter()
-        .enumerate()
-        .map(|(idx, name)| ThreadSpec {
+        .map(|name| ThreadSpec {
             display_name: (*name).to_owned(),
-            provider: provider_for_index(idx).to_owned(),
+            provider: NO_PROVIDER_REQUESTED_FALLBACK.to_owned(),
             session_id: None,
             profile_name: None,
         })
@@ -307,6 +319,22 @@ pub struct AgentBridge {
     // multi-URL-per-provider scenario stays representable without a
     // schema change, even though provider and URL are 1:1 today.
     gateways: Arc<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    // PROF-1: the same per-provider URL resolver the constructor used to
+    // seed `gateway_urls` up front, kept around so a provider nobody
+    // asked for at construction time (any real agent id, not just a
+    // hardcoded pair) can still be provisioned lazily the first time a
+    // thread actually requests it -- see `ensure_gateway_provisioned`.
+    // Never Send/Sync-bounded because it is only ever called from `&mut
+    // self` methods on this bridge's own owning thread, never moved into
+    // a spawned async task itself (only the resulting URL is).
+    resolve_gateway: Box<dyn Fn(&str) -> Result<String, BridgeError>>,
+    // PROF-1: this bridge's own default provider for `add_thread`-family
+    // calls that request no provider at all -- the first thread spec's
+    // already-resolved provider (itself derived upstream from a real
+    // profile's agent id, never an index-based guess). `None` for a
+    // bridge that started with zero threads; see
+    // `NO_PROVIDER_REQUESTED_FALLBACK` for that narrower case.
+    default_provider: Option<String>,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
     // Client-local PTY terminals -- v1 keeps this to at most one per
@@ -735,47 +763,21 @@ fn slug(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Which acpx-gateway-backed provider a UI thread is bound to. v1's fixed
-/// four-thread list (`THREAD_NAMES` in `lib.rs`) alternates codex/claude
-/// by index, so both providers get real, concurrent, isolated coverage
-/// rather than only ever exercising one -- the multi-provider
-/// verification requirement from `chat-panel-acpx-gateway-integration.md`
-/// Phase 3 bullet 5 applies to the *real* running panel, not only its
-/// test suite.
-pub fn provider_for_index(idx: usize) -> &'static str {
-    if idx % 2 == 0 {
-        "codex"
-    } else {
-        "claude"
-    }
-}
-
-/// TRANSITIONAL (`thread_provider_model_binding_fix`): normalizes a
-/// caller-supplied provider/agent identifier to one of the two gateway
-/// keys this bridge currently provisions ("codex"/"claude"). Exists
-/// only because those keys are NOT real acpx registry ids
-/// (registry.fallback.json defines `codex-acp`/`claude-acp`/`gemini`),
-/// so a registry id arriving from settings (a real
-/// settings.global.json carried `default_agent_id: "claude-acp"`) needs
-/// mapping -- and the previous exact-match check silently DROPPED such
-/// ids and fell back to the index-parity rotation, binding an
-/// explicitly-claude thread to codex with no error.
-///
-/// The agreed end-state (recorded in the
-/// worktree-consolidation-and-provider-binding plan) removes this
-/// function entirely: agent-agnostic selection per the ACP protocol
-/// through acpx -- one gateway, thread providers ARE registry agent ids
-/// from `agents/list`, and per-session agent selection goes through
-/// acpx's native `profiles/create {agent_id}` + `session/new
-/// {_acpx.profile}` (proven live by the e2e harness's agent-driven
-/// export phase), with no per-provider string handling anywhere.
-pub fn normalize_provider(id: &str) -> &'static str {
-    if id.to_ascii_lowercase().contains("claude") {
-        "claude"
-    } else {
-        "codex"
-    }
-}
+/// PROF-1 (`profile-only-backend-selection` plan): the one explicit,
+/// documented fallback provider used ONLY when nothing else can name a
+/// real agent id -- a genuinely empty bridge with no persisted thread
+/// records and no `default_agent_id` configured in settings, or a
+/// test/dev call site that only supplies bare thread names (no real
+/// per-thread provider binding at all, see [`specs_for_names`]). This
+/// replaces the old `provider_for_index` index-parity rotation
+/// (alternating "codex"/"claude" by thread position) and the old
+/// `normalize_provider` two-bucket collapse -- both silently mapped
+/// *any* third agent id onto one of those two labels. There is no
+/// longer a rotation or a normalization step: a requested or persisted
+/// agent id now flows through to gateway resolution completely as-is
+/// (see [`AgentBridge::resolve_provider_for`]), and this constant is
+/// reached only in the narrow "nothing to go on yet" case.
+pub const NO_PROVIDER_REQUESTED_FALLBACK: &str = "codex";
 
 /// Resolves the dev-checkout `acpx-server` binary path: `RUI_ACPX_SERVER_BIN`
 /// env override, else a path relative to this crate's own
@@ -873,9 +875,8 @@ fn snapflowd_mcp_servers_entry(
 ) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     // Whether MCP-free, filesystem-only skill delivery is safe for
-    // `provider` (an ACP registry agent id or its short-form alias, see
-    // `normalize_provider`'s own TRANSITIONAL doc comment) now lives in
-    // skills_manager::agent_registry (memory/acpx/gen/plans/acpx-skills/
+    // `provider` (an ACP registry agent id or its short-form alias) now
+    // lives in skills_manager::agent_registry (memory/acpx/gen/plans/acpx-skills/
     // README.md#agent-skill-convention-registry) -- true only for
     // vendor_ids a live test actually proved, currently just "codex"/
     // "codex-acp" (panel-rust/tests/skills_manager_live_discovery_e2e_test.rs,
@@ -2273,7 +2274,7 @@ impl AgentBridge {
     }
 
     /// The real constructor both of the above delegate to: a per-provider
-    /// gateway-URL resolver closure (`provider_for_index`'s output ->
+    /// gateway-URL resolver closure (a `ThreadSpec::provider` agent id ->
     /// already-provisioned `base_url`, matching [`provision_gateway`]'s
     /// own return shape -- callers that want auto-spawn-if-unreachable
     /// pass `provision_gateway` itself, as [`Self::new`] does; callers
@@ -2284,7 +2285,7 @@ impl AgentBridge {
     /// silently picking a directory the caller didn't ask for.
     pub fn new_with_gateway_resolver_and_cache_dir(
         thread_names: &[&str],
-        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError>,
+        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError> + 'static,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, BridgeError> {
         let specs = specs_for_names(thread_names);
@@ -2297,9 +2298,17 @@ impl AgentBridge {
 
     fn new_with_thread_specs_and_gateway_resolver_and_cache_dir(
         thread_specs: &[ThreadSpec],
-        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError>,
+        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError> + 'static,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, BridgeError> {
+        // Boxed immediately so the same resolver this constructor uses to
+        // seed `gateway_urls` up front can also be kept on the struct for
+        // later lazy provisioning (`ensure_gateway_provisioned`) -- one
+        // resolver, one code path, whether a provider is known now or
+        // only requested later.
+        let resolve_gateway: Box<dyn Fn(&str) -> Result<String, BridgeError>> =
+            Box::new(resolve_gateway);
+        let default_provider = thread_specs.first().map(|spec| spec.provider.clone());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2333,18 +2342,16 @@ impl AgentBridge {
                 resolved_urls.insert(provider.clone(), resolve_gateway(&provider)?);
             }
         }
-        // Always resolve both known providers (see provider_for_index), not
-        // just whichever ones happen to appear in thread_specs -- a cold
-        // start with zero initial threads (an empty specs slice is valid
-        // and normal, not just a test fixture) previously left gateway_urls
-        // completely empty, so add_thread_with_profile_and_provider's own
-        // gateway_urls lookup failed for every single new thread with no
-        // existing thread ever able to bootstrap a provider into the map.
-        for provider in ["codex", "claude"] {
-            if !resolved_urls.contains_key(provider) {
-                resolved_urls.insert(provider.to_string(), resolve_gateway(provider)?);
-            }
-        }
+        // PROF-1: a cold start with zero initial threads (an empty specs
+        // slice is valid and normal, not just a test fixture) now leaves
+        // `resolved_urls` genuinely empty rather than pre-seeded with a
+        // hardcoded ["codex", "claude"] pair -- that pair silently assumed
+        // those were the only two agent ids that would ever exist. Every
+        // subsequent `add_thread`-family call resolves (and, if new,
+        // connects) its own provider's gateway on demand instead, via
+        // `resolve_provider_for` -> `ensure_gateway_provisioned`, using
+        // this exact same `resolve_gateway` closure (boxed onto the
+        // struct above) rather than a second, different code path.
 
         // Gateway connection is intentionally deferred. Cached transcript and
         // interaction state below must be observable before any remote
@@ -2508,10 +2515,55 @@ impl AgentBridge {
             events,
             gateway_urls: resolved_urls,
             gateways,
+            resolve_gateway,
+            default_provider,
             store,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_cwd_override,
         })
+    }
+
+    /// PROF-1: provisions `provider`'s gateway URL on demand if this
+    /// bridge hasn't resolved it yet -- replaces the old hardcoded
+    /// `["codex", "claude"]` cold-start pre-seed, which silently assumed
+    /// those were the only two agent ids that would ever need a gateway.
+    /// A brand new agent id (anything real, from acpx's own
+    /// `agents/list`) now gets its own gateway resolved and connected the
+    /// first time a thread actually requests it, through the exact same
+    /// resolver closure the constructor itself uses (env override /
+    /// default-port probe / autospawn -- see `provision_gateway`'s doc
+    /// comment), not a second, different code path. A genuine resolver
+    /// failure (unreachable gateway, spawn failure, ...) is returned as a
+    /// real `BridgeError` here -- this is the mechanism that keeps the
+    /// "a requested provider is never silently dropped" guarantee (see
+    /// `resolve_provider_for`) true even though provisioning is now lazy.
+    ///
+    /// Spawns a fresh `Gateway::connect` task only if no already-known
+    /// provider resolves to the same URL -- the common single-gateway
+    /// production case (every agent id resolves to the one shared
+    /// snapshotd-owned acpx-server, see `resolve_gateway`'s/
+    /// `provision_gateway`'s doc comments) must not open a second,
+    /// redundant connection to a URL this bridge is already connecting
+    /// to or connected to.
+    fn ensure_gateway_provisioned(&mut self, provider: &str) -> Result<(), BridgeError> {
+        if self.gateway_urls.contains_key(provider) {
+            return Ok(());
+        }
+        let url = (self.resolve_gateway)(provider)?;
+        let url_already_known = self.gateway_urls.values().any(|existing| existing == &url);
+        self.gateway_urls.insert(provider.to_string(), url.clone());
+        if !url_already_known {
+            let gateways = self.gateways.clone();
+            let _guard = self.runtime.enter();
+            self.runtime.spawn(async move {
+                let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
+                gateways
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(url, gateway);
+            });
+        }
+        Ok(())
     }
 
     /// `chat_sessions_project_path` phase: called from the FFI-driven
@@ -2685,31 +2737,35 @@ impl AgentBridge {
         Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
     }
 
-    /// PUI-014: normalize a caller-requested provider to a provisioned gateway
-    /// key, or fall back to the rotation pick for `idx`. Shared by the eager,
-    /// deferred, and attach paths so a requested provider is never silently
-    /// dropped (see `thread_provider_model_binding_fix`).
-    fn resolve_provider_for<'a>(
-        &self,
-        idx: usize,
-        preferred_provider: Option<&'a str>,
-    ) -> Result<&'a str, BridgeError>
-    where
-        Self: 'a,
-    {
-        match preferred_provider.filter(|p| !p.trim().is_empty()) {
-            Some(requested) => {
-                let normalized = normalize_provider(requested);
-                if !self.gateway_urls.contains_key(normalized) {
-                    return Err(BridgeError::Gateway(format!(
-                        "requested provider {requested:?} (normalized {normalized:?}) has no \
-                         provisioned gateway; refusing to silently bind another provider"
-                    )));
-                }
-                Ok(normalized)
-            }
-            None => Ok(provider_for_index(idx)),
-        }
+    /// PUI-014 / PROF-1: resolves a caller-requested agent id to a
+    /// provisioned gateway key -- the id flows through completely as-is
+    /// now (no "codex"/"claude" normalization step), and gets lazily
+    /// provisioned via [`Self::ensure_gateway_provisioned`] if this
+    /// bridge hasn't seen it before, so a genuinely new agent id (any
+    /// real id from acpx's own `agents/list`) routes to its own gateway
+    /// with zero code changes here. Shared by the eager, deferred, and
+    /// attach paths so a requested provider is never silently dropped
+    /// (see `thread_provider_model_binding_fix`) -- a real provisioning
+    /// failure (not "unknown provider", an actual resolver error) is
+    /// surfaced as a real `BridgeError` instead of quietly falling back
+    /// to a different provider.
+    ///
+    /// With no request at all, falls back to this bridge's own
+    /// `default_provider` -- the first thread spec's already-resolved
+    /// provider, itself derived upstream from a real profile's agent id
+    /// rather than an index-based guess. A bridge that started with zero
+    /// threads has no such default; [`NO_PROVIDER_REQUESTED_FALLBACK`]
+    /// is the one explicit, documented last resort for that case.
+    fn resolve_provider_for(&mut self, preferred_provider: Option<&str>) -> Result<String, BridgeError> {
+        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => requested.to_string(),
+            None => self
+                .default_provider
+                .clone()
+                .unwrap_or_else(|| NO_PROVIDER_REQUESTED_FALLBACK.to_string()),
+        };
+        self.ensure_gateway_provisioned(&provider)?;
+        Ok(provider)
     }
 
     /// PUI-014: create thread `name` as a DEFERRED placeholder -- it claims its
@@ -2734,9 +2790,9 @@ impl AgentBridge {
             )));
         }
         let idx = self.slots.len();
-        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let provider = self.resolve_provider_for(preferred_provider)?;
         let (slot, _handle, _events_rx, _cached_session_id, _has_cached_transcript) =
-            self.build_slot(&thread_id, provider, true)?;
+            self.build_slot(&thread_id, &provider, true)?;
         self.slots.push(slot);
         Ok(idx)
     }
@@ -2764,9 +2820,9 @@ impl AgentBridge {
             return Ok(());
         }
         let thread_id = existing.thread_id.clone();
-        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let provider = self.resolve_provider_for(preferred_provider)?;
         let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
-            self.build_slot(&thread_id, provider, false)?;
+            self.build_slot(&thread_id, &provider, false)?;
         self.slots[idx] = slot.clone();
         spawn_background_attachment(
             &self.runtime,
@@ -2803,28 +2859,17 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        // `thread_provider_model_binding_fix`: a requested provider is
-        // NEVER silently dropped. Any non-empty request normalizes to
-        // one of the two real gateway keys (see `normalize_provider`);
-        // if that gateway genuinely isn't provisioned the caller gets a
-        // real error instead of a thread quietly bound to the rotation's
-        // pick -- the exact "selected claude-acp, codex-acp underneath"
-        // failure reported live on the VNC demo.
-        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
-            Some(requested) => {
-                let normalized = normalize_provider(requested);
-                if !self.gateway_urls.contains_key(normalized) {
-                    return Err(BridgeError::Gateway(format!(
-                        "requested provider {requested:?} (normalized {normalized:?}) has no \
-                         provisioned gateway; refusing to silently bind another provider"
-                    )));
-                }
-                normalized
-            }
-            None => provider_for_index(idx),
-        };
+        // `thread_provider_model_binding_fix` / PROF-1: a requested
+        // provider is NEVER silently dropped. The agent id flows through
+        // as-is (see `resolve_provider_for`'s own doc comment) and is
+        // lazily provisioned if this bridge hasn't seen it before -- a
+        // genuine provisioning failure is a real error instead of a
+        // thread quietly bound to a different provider, the exact
+        // "selected claude-acp, codex-acp underneath" failure reported
+        // live on the VNC demo.
+        let provider = self.resolve_provider_for(preferred_provider)?;
         let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
-            self.build_slot(&thread_id, provider, false)?;
+            self.build_slot(&thread_id, &provider, false)?;
         self.slots.push(slot.clone());
 
         spawn_background_attachment(
@@ -2893,10 +2938,10 @@ impl AgentBridge {
     /// provisioned gateway (typically the same provider the caller
     /// listed `session_id` from via [`Self::recoverable_sessions`]) --
     /// unlike [`Self::add_thread`]/[`Self::add_thread_with_profile`],
-    /// this does *not* derive the provider from `provider_for_index`
-    /// (a brand-new local thread has no natural index-based provider
-    /// assignment here; the provider is instead exactly whichever
-    /// gateway the recovered session id actually lives on).
+    /// this does *not* fall back to `default_provider` (a brand-new
+    /// local thread has no natural default-provider assignment here;
+    /// the provider is instead exactly whichever gateway the recovered
+    /// session id actually lives on).
     /// `resume_session`'s own real history replay is what populates the
     /// new thread's transcript -- proven at the actor layer already
     /// (`resume_session_replays_history_via_session_load`); this method
@@ -5284,8 +5329,11 @@ mod tests {
     /// load` rather than starting a fresh empty session.
     #[test]
     fn recoverable_sessions_lists_the_orphan_and_attaching_it_replays_its_real_history() {
-        // Persona/agent id must match `provider_for_index(0)` ("codex")
-        // -- `list_sessions_for_agent` selects the backend by this exact
+        // Persona/agent id must match `NO_PROVIDER_REQUESTED_FALLBACK`
+        // ("codex") -- `bridge_with_single_gateway` builds its single
+        // thread via `specs_for_names`, which assigns every synthesized
+        // spec that fallback provider (see its own doc comment) --
+        // `list_sessions_for_agent` selects the backend by this exact
         // registered supervisor key (`_acpx.agentId`), unlike plain
         // `session/new` (no `_acpx.profile`), which routes to whichever
         // single backend a gateway with no profile disambiguation
@@ -6153,26 +6201,21 @@ done
         assert_eq!(slug("Export pipeline bug!"), "export-pipeline-bug");
     }
 
+    /// PROF-1: `specs_for_names` no longer alternates "codex"/"claude" by
+    /// thread position (the old `provider_for_index`) -- every
+    /// synthesized spec gets the one documented fallback, since this
+    /// helper only backs name-only test/dev constructors that don't
+    /// track real per-thread provider identity at all.
     #[test]
-    fn normalize_provider_maps_registry_ids_onto_gateway_keys() {
-        // thread_provider_model_binding_fix: registry ids (the values a
-        // real settings.global.json/default-agent picker persists) must
-        // resolve to the gateway actually serving that family -- the
-        // old exact-match filter dropped them silently and the rotation
-        // bound the thread to whatever parity said.
-        assert_eq!(normalize_provider("claude"), "claude");
-        assert_eq!(normalize_provider("claude-acp"), "claude");
-        assert_eq!(normalize_provider("Claude-ACP"), "claude");
-        assert_eq!(normalize_provider("codex"), "codex");
-        assert_eq!(normalize_provider("codex-acp"), "codex");
-    }
-
-    #[test]
-    fn provider_for_index_alternates_codex_and_claude() {
-        assert_eq!(provider_for_index(0), "codex");
-        assert_eq!(provider_for_index(1), "claude");
-        assert_eq!(provider_for_index(2), "codex");
-        assert_eq!(provider_for_index(3), "claude");
+    fn specs_for_names_assigns_the_documented_fallback_to_every_thread() {
+        let specs = specs_for_names(&["Thread One", "Thread Two", "Thread Three"]);
+        assert_eq!(specs.len(), 3);
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.provider == NO_PROVIDER_REQUESTED_FALLBACK),
+            "got: {specs:?}"
+        );
     }
 
     #[test]
@@ -6501,26 +6544,44 @@ done
         assert_eq!(bridge.history(1)[0].text, "healthy scrollback");
     }
 
-    /// Real multi-provider routing: two distinct threads, resolved to two
-    /// distinct (locally-spawned) `acpx-server` gateway processes by
-    /// `provider_for_index`, each tagging its reply with its own persona
-    /// -- the concrete `AgentBridge`-level version of
-    /// `rui-acpx-client`'s own `two_gateways_stay_isolated_no_cross_provider_bleed`
-    /// test, proving the wiring in *this* crate's constructor (provider
-    /// resolution, per-provider gateway auto-spawn) also keeps threads
-    /// isolated, not just the lower-level transport.
+    /// Real multi-provider routing: two distinct threads, explicitly
+    /// bound to two distinct (locally-spawned) `acpx-server` gateway
+    /// processes via their own `ThreadSpec::provider`, each tagging its
+    /// reply with its own persona -- the concrete `AgentBridge`-level
+    /// version of `rui-acpx-client`'s own `two_gateways_stay_isolated_
+    /// no_cross_provider_bleed` test, proving the wiring in *this*
+    /// crate's constructor (provider resolution, per-provider gateway
+    /// auto-spawn) also keeps threads isolated, not just the lower-level
+    /// transport. PROF-1: deliberately uses real ACP-shaped agent ids
+    /// ("codex-acp"/"claude-acp", not the old bare "codex"/"claude"
+    /// gateway keys) as the `ThreadSpec::provider` value, proving those
+    /// ids now flow straight through to gateway resolution with no
+    /// normalization step collapsing them onto anything else.
     #[test]
     fn two_threads_route_to_two_distinct_gateways_by_provider() {
         let codex_gateway = TestGateway::spawn_with_persona("codex");
         let claude_gateway = TestGateway::spawn_with_persona("claude");
         let codex_url = codex_gateway.base_url.clone();
         let claude_url = claude_gateway.base_url.clone();
-        let names = ["Codex Thread", "Claude Thread"];
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Thread".to_owned(),
+                provider: "codex-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Thread".to_owned(),
+                provider: "claude-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+        ];
 
-        let bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
-            &names,
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
             move |provider| {
-                if provider == "codex" {
+                if provider == "codex-acp" {
                     Ok(codex_url.clone())
                 } else {
                     Ok(claude_url.clone())
@@ -6595,12 +6656,25 @@ done
         let claude_gateway = TestGateway::spawn_with_persona("claude");
         let codex_url = codex_gateway.base_url.clone();
         let claude_url = claude_gateway.base_url.clone();
-        let names = ["Codex Thread", "Claude Thread"];
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Thread".to_owned(),
+                provider: "codex-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Thread".to_owned(),
+                provider: "claude-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+        ];
 
-        let bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
-            &names,
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
             move |provider| {
-                if provider == "codex" {
+                if provider == "codex-acp" {
                     Ok(codex_url.clone())
                 } else {
                     Ok(claude_url.clone())
@@ -6652,6 +6726,101 @@ done
             !codex_names.iter().any(|n| claude_names.contains(n)),
             "codex thread's commands leaked into claude thread (or vice versa): \
              codex={codex_names:?} claude={claude_names:?}"
+        );
+    }
+
+    /// PROF-1's own acceptance test: a THIRD agent id -- neither "codex"
+    /// nor "claude", and not a variant of either name -- must resolve to
+    /// its own gateway, not get silently bucketed into codex the way the
+    /// old `normalize_provider`'s `else { "codex" }` fallback would have
+    /// (any id that didn't contain "claude" fell through to codex,
+    /// including this one). Three real, distinct locally-spawned
+    /// `acpx-server` processes, three distinct `ThreadSpec::provider`
+    /// values, proving "adding a new live agent requires zero
+    /// panel-rust code changes to route to its own gateway."
+    #[test]
+    fn a_third_agent_id_routes_to_its_own_gateway_not_codex() {
+        let codex_gateway = TestGateway::spawn_with_persona("codex");
+        let claude_gateway = TestGateway::spawn_with_persona("claude");
+        let gemini_gateway = TestGateway::spawn_with_persona("gemini");
+        let codex_url = codex_gateway.base_url.clone();
+        let claude_url = claude_gateway.base_url.clone();
+        let gemini_url = gemini_gateway.base_url.clone();
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Thread".to_owned(),
+                provider: "codex-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Thread".to_owned(),
+                provider: "claude-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+            ThreadSpec {
+                display_name: "Gemini Thread".to_owned(),
+                provider: "gemini-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+        ];
+
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            move |provider| match provider {
+                "codex-acp" => Ok(codex_url.clone()),
+                "claude-acp" => Ok(claude_url.clone()),
+                "gemini-acp" => Ok(gemini_url.clone()),
+                other => Err(BridgeError::Gateway(format!(
+                    "resolver received unexpected provider {other:?}"
+                ))),
+            },
+            None,
+        )
+        .expect("bridge with three distinct gateways");
+
+        bridge.send_prompt(0, "ping".into());
+        bridge.send_prompt(1, "ping".into());
+        bridge.send_prompt(2, "ping".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = [false, false, false];
+        while std::time::Instant::now() < deadline && !ended.iter().all(|&done| done) {
+            for ev in bridge.poll() {
+                if let AgentEvent::TurnEnded(_) = ev.event {
+                    if let Some(slot) = ended.get_mut(ev.thread_index) {
+                        *slot = true;
+                    }
+                }
+            }
+            if !ended.iter().all(|&done| done) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            ended.iter().all(|&done| done),
+            "timed out waiting for all three threads' turns to end: {ended:?}"
+        );
+
+        let gemini_reply = bridge
+            .history(2)
+            .into_iter()
+            .find(|m| m.text.contains("PING"))
+            .expect("gemini thread reply");
+        assert!(
+            gemini_reply.text.starts_with("[GEMINI]"),
+            "the third agent id's own gateway/persona must answer its thread, not codex's -- \
+             got: {:?}",
+            gemini_reply.text
+        );
+        assert!(
+            !bridge
+                .history(0)
+                .iter()
+                .any(|m| m.text.starts_with("[GEMINI]")),
+            "the gemini reply must never land on the codex thread"
         );
     }
 
