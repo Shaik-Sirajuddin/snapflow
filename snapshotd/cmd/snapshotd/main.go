@@ -10,11 +10,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,7 +24,6 @@ import (
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
 	"snapshotd/internal/daemonlock"
-	"snapshotd/internal/mcpadapter"
 	"snapshotd/internal/sdp"
 )
 
@@ -52,6 +49,8 @@ func main() {
 		err = cmdList(cfg, os.Args[2:])
 	case "close":
 		err = cmdClose(cfg, os.Args[2:])
+	case "mcp":
+		err = cmdMCP(cfg, os.Args[2:])
 	case "install":
 		err = cmdInstall(cfg, os.Args[2:])
 	case "-h", "--help", "help":
@@ -78,6 +77,13 @@ Usage:
   snapshotd launch <projectId>           convenience wrapper around daemon.launch
   snapshotd list                         list known process instances (bare daemon.list)
   snapshotd close <instanceId>           stop one running process instance (bare daemon.close)
+  snapshotd mcp status                   show the MCP listener's bind address and auth state
+  snapshotd mcp restart [--bind ADDR]    rebind the MCP listener (default 127.0.0.1:7777; a
+                                          non-loopback ADDR, e.g. 0.0.0.0:7777, is refused unless
+                                          mcp auth set has already been run)
+  snapshotd mcp auth set --user U --password P
+                                          set/replace the MCP listener's Basic Auth credentials
+  snapshotd mcp install-config get       print the MCP endpoint + credentials for a client config
   snapshotd install                      print what installing a system service would do (not implemented for real)`)
 }
 
@@ -126,16 +132,13 @@ func cmdServe(cfg config.Config, args []string) error {
 	}()
 	logger.Info("SDP control socket listening", "path", cfg.ControlSocketPath)
 
-	var mcpServer *mcpadapter.SSEServer
-	mcpErrCh := make(chan error, 1)
+	mcpStarted := false
 	if !*noMCP {
-		mcpServer = mcpadapter.NewSSEServer(d, cfg.MCPSSEAddr)
-		go func() {
-			if err := mcpServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				mcpErrCh <- err
-			}
-		}()
-		logger.Info("MCP SSE endpoint listening", "addr", cfg.MCPSSEAddr)
+		if err := d.Mcp.Start(context.Background()); err != nil {
+			return fmt.Errorf("starting MCP listener: %w", err)
+		}
+		mcpStarted = true
+		logger.Info("MCP SSE endpoint listening", "addr", d.Mcp.Status().Addr)
 	}
 
 	// Optional bundled acpx-server: single gateway owner under snapshotd serve.
@@ -179,8 +182,6 @@ func cmdServe(cfg config.Config, args []string) error {
 		if err != nil {
 			logger.Error("SDP server exited", "err", err)
 		}
-	case err := <-mcpErrCh:
-		logger.Error("MCP server exited", "err", err)
 	case <-func() <-chan struct{} {
 		if acpxMgr != nil {
 			return acpxMgr.Done()
@@ -198,8 +199,8 @@ func cmdServe(cfg config.Config, args []string) error {
 			logger.Warn("acpx-server stop", "err", err)
 		}
 	}
-	if mcpServer != nil {
-		_ = mcpServer.Shutdown(shutdownCtx)
+	if mcpStarted {
+		_ = d.Mcp.Stop(shutdownCtx)
 	}
 	_ = sdpServer.Shutdown()
 	return nil
@@ -331,6 +332,109 @@ func cmdClose(cfg config.Config, args []string) error {
 		return fmt.Errorf("daemon.close: %w", err)
 	}
 	fmt.Printf("closed instance %s\n", instanceID)
+	return nil
+}
+
+// cmdMCP dispatches `snapshotd mcp <status|restart|auth|install-config>`.
+func cmdMCP(cfg config.Config, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: snapshotd mcp <status|restart|auth|install-config>")
+	}
+	switch args[0] {
+	case "status":
+		return cmdMCPStatus(cfg, args[1:])
+	case "restart":
+		return cmdMCPRestart(cfg, args[1:])
+	case "auth":
+		return cmdMCPAuth(cfg, args[1:])
+	case "install-config":
+		return cmdMCPInstallConfig(cfg, args[1:])
+	default:
+		return fmt.Errorf("unknown mcp subcommand %q (want status|restart|auth|install-config)", args[0])
+	}
+}
+
+func cmdMCPStatus(cfg config.Config, args []string) error {
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var status map[string]any
+	if err := c.Call("daemon.mcpStatus", map[string]any{}, &status); err != nil {
+		return fmt.Errorf("daemon.mcpStatus: %w", err)
+	}
+	enc, _ := json.MarshalIndent(status, "", "  ")
+	fmt.Println(string(enc))
+	return nil
+}
+
+func cmdMCPRestart(cfg config.Config, args []string) error {
+	fs := flag.NewFlagSet("mcp restart", flag.ExitOnError)
+	bind := fs.String("bind", "", "address to rebind the MCP listener to (default: keep current address); a non-loopback address (e.g. 0.0.0.0:7777) requires `mcp auth set` to have been run first")
+	_ = fs.Parse(args)
+
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var status map[string]any
+	if err := c.Call("daemon.mcpRestart", map[string]any{"bind": *bind}, &status); err != nil {
+		return fmt.Errorf("daemon.mcpRestart: %w", err)
+	}
+	enc, _ := json.MarshalIndent(status, "", "  ")
+	fmt.Println(string(enc))
+	return nil
+}
+
+func cmdMCPAuth(cfg config.Config, args []string) error {
+	if len(args) < 1 || args[0] != "set" {
+		return fmt.Errorf("usage: snapshotd mcp auth set --user U --password P")
+	}
+	fs := flag.NewFlagSet("mcp auth set", flag.ExitOnError)
+	user := fs.String("user", "", "Basic Auth username")
+	password := fs.String("password", "", "Basic Auth password")
+	_ = fs.Parse(args[1:])
+	if *user == "" || *password == "" {
+		return fmt.Errorf("usage: snapshotd mcp auth set --user U --password P (both required)")
+	}
+
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var status map[string]any
+	if err := c.Call("daemon.mcpAuthSet", map[string]any{"user": *user, "password": *password}, &status); err != nil {
+		return fmt.Errorf("daemon.mcpAuthSet: %w", err)
+	}
+	fmt.Println("MCP auth updated; run `snapshotd mcp restart` to bind beyond 127.0.0.1 if desired")
+	enc, _ := json.MarshalIndent(status, "", "  ")
+	fmt.Println(string(enc))
+	return nil
+}
+
+func cmdMCPInstallConfig(cfg config.Config, args []string) error {
+	if len(args) < 1 || args[0] != "get" {
+		return fmt.Errorf("usage: snapshotd mcp install-config get")
+	}
+
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var installConfig map[string]any
+	if err := c.Call("daemon.mcpInstallConfig", map[string]any{}, &installConfig); err != nil {
+		return fmt.Errorf("daemon.mcpInstallConfig: %w", err)
+	}
+	enc, _ := json.MarshalIndent(installConfig, "", "  ")
+	fmt.Println(string(enc))
 	return nil
 }
 

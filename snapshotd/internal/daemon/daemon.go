@@ -20,6 +20,7 @@ import (
 
 	"snapshotd/internal/config"
 	"snapshotd/internal/health"
+	"snapshotd/internal/mcpsupervisor"
 	"snapshotd/internal/procmgr"
 	"snapshotd/internal/registry"
 	"snapshotd/internal/sapproxy"
@@ -39,6 +40,13 @@ type Daemon struct {
 	// uses this.
 	SAP *sapproxy.Router
 	Log *slog.Logger
+
+	// Mcp owns the MCP HTTP listener's live lifecycle (bind address, Basic
+	// Auth) -- see internal/mcpsupervisor's package doc for the
+	// non-loopback-without-auth refusal this enforces. Callers
+	// (cmd/snapshotd's cmdServe) start/stop it explicitly, same as SDP's
+	// own server; Dispatch below just forwards daemon.mcp* calls to it.
+	Mcp *mcpsupervisor.Supervisor
 }
 
 // New wires together a Daemon from configuration: opens the registry,
@@ -68,6 +76,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 		Log:      logger,
 	}
 	d.SAP = sapproxy.NewRouter(d.resolveProjectInstance)
+	d.Mcp = mcpsupervisor.New(d, cfg.HomeDir, cfg.MCPSSEAddr, logger)
 	return d, nil
 }
 
@@ -460,6 +469,42 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return nil, d.CloseInstance(ctx, p.InstanceID)
+
+	// The daemon.mcp* methods below are SDP/CLI-only by design: they are
+	// never registered as MCP tools (see internal/mcpadapter.New's tool
+	// list) -- letting an MCP client reconfigure its own listener's bind
+	// address or auth over that same connection is a foot-gun, not a
+	// feature.
+	case "daemon.mcpStatus":
+		return d.Mcp.Status(), nil
+
+	case "daemon.mcpRestart":
+		var p struct {
+			Bind string `json:"bind"`
+		}
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		if err := d.Mcp.Restart(ctx, p.Bind); err != nil {
+			return nil, err
+		}
+		return d.Mcp.Status(), nil
+
+	case "daemon.mcpAuthSet":
+		var p struct {
+			User     string `json:"user"`
+			Password string `json:"password"`
+		}
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		if err := d.Mcp.SetAuth(ctx, p.User, p.Password); err != nil {
+			return nil, err
+		}
+		return d.Mcp.Status(), nil
+
+	case "daemon.mcpInstallConfig":
+		return d.Mcp.InstallConfig(), nil
 
 	default:
 		return nil, fmt.Errorf("unknown method %q", method)

@@ -2,10 +2,22 @@ package mcpadapter
 
 import (
 	"context"
+	"crypto/subtle"
+	"net"
 	"net/http"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// Credentials is the current HTTP Basic Auth check for an SSEServer. A
+// zero-value Credentials (Enabled == false) disables auth entirely -- the
+// pre-existing, unauthenticated default.
+type Credentials struct {
+	Enabled  bool
+	User     string
+	Password string
+}
 
 // SSEServer wraps mark3labs/mcp-go's SSE and Streamable HTTP transports
 // behind a single listener, with a Start/Shutdown pair matching the rest of
@@ -22,6 +34,9 @@ type SSEServer struct {
 	sse        *server.SSEServer
 	streamable *server.StreamableHTTPServer
 	httpServer *http.Server
+
+	credMu sync.RWMutex
+	creds  Credentials
 }
 
 // NewSSEServer builds an SSE-served MCP adapter listening on addr (e.g.
@@ -37,18 +52,80 @@ func NewSSEServer(h Handler, addr string) *SSEServer {
 	}
 }
 
-// Start blocks serving SSE and Streamable HTTP connections until Shutdown is
-// called.
-func (s *SSEServer) Start() error {
+// SetCredentials updates the Basic Auth check applied to every request,
+// effective immediately (no restart needed) -- checked fresh on each
+// request via credMu, so a supervisor can call this on a live server.
+func (s *SSEServer) SetCredentials(c Credentials) {
+	s.credMu.Lock()
+	s.creds = c
+	s.credMu.Unlock()
+}
+
+func (s *SSEServer) checkAuth(r *http.Request) bool {
+	s.credMu.RLock()
+	c := s.creds
+	s.credMu.RUnlock()
+	if !c.Enabled {
+		return true
+	}
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(c.User)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(c.Password)) == 1
+	return userOK && passOK
+}
+
+func (s *SSEServer) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.checkAuth(r) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="snapshotd MCP"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Handler returns the full auth-wrapped HTTP handler this server would
+// listen with, without binding a socket -- used by Start and directly by
+// tests that want to exercise the auth check via httptest.
+func (s *SSEServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", s.streamable)
 	mux.Handle("/", s.sse)
-	s.httpServer = &http.Server{Addr: s.addr, Handler: mux}
-	err := s.httpServer.ListenAndServe()
+	return s.requireAuth(mux)
+}
+
+// Listen binds the configured address without serving yet, so a caller
+// (e.g. internal/mcpsupervisor) can detect a bind failure (address already
+// in use, permission denied, ...) synchronously before committing to a
+// restart, instead of only finding out asynchronously inside Serve/Start's
+// goroutine.
+func (s *SSEServer) Listen() (net.Listener, error) {
+	return net.Listen("tcp", s.addr)
+}
+
+// Serve blocks serving SSE and Streamable HTTP connections over an
+// already-bound listener (see Listen) until Shutdown is called.
+func (s *SSEServer) Serve(ln net.Listener) error {
+	s.httpServer = &http.Server{Handler: s.Handler()}
+	err := s.httpServer.Serve(ln)
 	if err == http.ErrServerClosed {
 		return nil
 	}
 	return err
+}
+
+// Start binds and blocks serving SSE and Streamable HTTP connections until
+// Shutdown is called. Equivalent to Listen followed by Serve.
+func (s *SSEServer) Start() error {
+	ln, err := s.Listen()
+	if err != nil {
+		return err
+	}
+	return s.Serve(ln)
 }
 
 // Shutdown gracefully stops both transports' listener.
