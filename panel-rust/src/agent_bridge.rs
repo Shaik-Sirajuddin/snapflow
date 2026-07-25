@@ -4159,6 +4159,27 @@ mod tests {
     // the full-reducer real-backend tests below.
     use slint::Model as _;
 
+    /// Serializes every test in this module that mutates a process-global
+    /// env var (`RUI_ACP_AGENT_CMD`, `ACPX_CODEX_AUTH_FILE`,
+    /// `SNAPSHOTD_MCP_SSE_ADDR`, etc). These tests used to rely on an
+    /// undocumented assumption baked into their own SAFETY comments --
+    /// "this whole suite already runs under --test-threads=1" -- which
+    /// was never actually enforced anywhere (no `.cargo/config.toml`
+    /// setting, no harness flag), just a habit of how this crate's CI
+    /// happened to invoke `cargo test`. Once real-process port
+    /// contention was fixed (`spawn_acpx_server_with_retry`'s own doc
+    /// comment) and the suite started actually being run at default
+    /// parallelism, two of these tests (the `snapshotd_mcp_server_entry_*`
+    /// pair, which both mutate `SNAPSHOTD_MCP_SSE_ADDR`) began failing
+    /// nondeterministically -- one test's `set_var` landing between the
+    /// other's `set_var` and its own read, or its `remove_var` firing
+    /// mid-assertion -- a real data race on `std::env`, not a port issue.
+    /// Every env-mutating test below now acquires this lock before
+    /// touching the environment and holds it until the prior value has
+    /// been restored, so at most one such test's mutation is ever live at
+    /// a time, regardless of test-runner parallelism.
+    static ENV_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
     fn exited_buffer() -> TerminalBuffer {
         TerminalBuffer {
             output: "done".to_owned(),
@@ -4365,10 +4386,10 @@ mod tests {
     #[test]
     fn resolve_backend_agent_command_prefers_explicit_override() {
         // SAFETY (env mutation in a test): guarded by restoring the prior
-        // value unconditionally before returning, and this whole suite
-        // already runs under --test-threads=1 per this crate's own
-        // convention for exactly this reason (see module doc references
-        // elsewhere in this file to real-process serialization).
+        // value unconditionally before returning, and serialized against
+        // every other env-mutating test in this module by
+        // `ENV_MUTATION_LOCK` (see its own doc comment).
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
         unsafe {
@@ -4394,6 +4415,7 @@ mod tests {
     /// to a mock or arbitrary command.
     #[test]
     fn resolve_backend_agent_command_ignores_override_without_test_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
         unsafe {
@@ -4421,6 +4443,7 @@ mod tests {
     /// unless someone deliberately asks for the mock.
     #[test]
     fn resolve_backend_agent_command_ignores_mock_binary_without_explicit_opt_in() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior_override = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_opt_in = std::env::var("RUI_USE_DEV_MOCK_AGENT").ok();
         unsafe {
@@ -4467,6 +4490,7 @@ mod tests {
     /// ACPX_CODEX_AUTH_FILE pointing at a disposable temp file instead.
     #[test]
     fn read_codex_api_key_from_auth_file_reads_the_configured_field() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "rui-codex-auth-test-{}-{}",
             std::process::id(),
@@ -4500,6 +4524,7 @@ mod tests {
     /// bogus empty-string "key".
     #[test]
     fn read_codex_api_key_from_auth_file_is_none_on_any_bad_input() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = std::env::temp_dir().join(format!(
             "rui-codex-auth-missing-{}-{}",
             std::process::id(),
@@ -4548,6 +4573,7 @@ mod tests {
     /// model_provider value.
     #[test]
     fn read_codex_model_provider_from_config_reads_top_level_key_only() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "rui-codex-config-test-{}-{}",
             std::process::id(),
@@ -4614,43 +4640,64 @@ mod tests {
         }
     }
 
-    fn free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.local_addr().expect("local_addr").port()
-    }
-
     /// Spawns a real `acpx-server` child process on a fresh ephemeral
-    /// port, retrying the whole pick-port/spawn/wait-for-connect cycle
+    /// port, retrying the whole reserve-port/spawn/wait-for-connect cycle
     /// (bounded at 5 attempts) if the process never becomes reachable
     /// within one attempt's own shorter window.
     ///
-    /// **Why this exists.** `free_port()`'s own "bind a listener, read
-    /// its port, then immediately drop the listener" trick has an
-    /// unavoidable TOCTOU gap: the port is released back to the OS the
-    /// instant the listener drops, and nothing stops a *different*
-    /// concurrently-running test's own `free_port()` call (this crate's
-    /// real-process tests each spawn their own `acpx-server`, and the
-    /// default `cargo test` runner runs many of them in parallel) from
-    /// claiming the exact same port before this function's own spawned
-    /// process gets to bind it. When that race is lost, `acpx-server`
-    /// fails its own bind and exits immediately, and the previous single-
-    /// shot 100x30ms connect-retry loop just spun for its full ~3s doing
-    /// nothing before every caller of it (this function's predecessor)
-    /// silently proceeded anyway with a `base_url` nothing was listening
-    /// on -- surfacing later as a confusing "gateway request timed out"
-    /// failure in whichever test happened to run at the time, not a
-    /// clear "port collision" signal. **Observed directly**: re-running
-    /// this crate's full `--lib` suite back-to-back under the default
-    /// parallel runner rotates which real-process test fails from run to
-    /// run, while every test passes cleanly under `--test-threads=1` --
-    /// exactly the signature of port contention, not a logic bug in any
-    /// one test (documented in this plan's own Progress Log across two
-    /// prior sessions before this fix).
+    /// **Why this exists.** A bare "bind a listener, read its port, then
+    /// immediately drop the listener" trick has an unavoidable TOCTOU
+    /// gap: the port is released back to the OS the instant the listener
+    /// drops, and nothing stops a *different* concurrently-running test's
+    /// own port pick (this crate's real-process tests each spawn their
+    /// own `acpx-server`, and the default `cargo test` runner runs many
+    /// of them in parallel) from claiming the exact same port before this
+    /// function's own spawned process gets to bind it. The gap is wider
+    /// than a spawn's worth of scheduling jitter, too: `acpx-server`'s
+    /// own startup does a real network fetch of the ACP registry
+    /// *before it even attempts its own bind* (see the deadline comment
+    /// below), which measured up to ~1.6s in this sandbox -- a window
+    /// easily long enough for another test's independent port pick to
+    /// land on the same number while ours is still sitting unbound.
+    /// **Observed directly**: re-running this crate's full `--lib` suite
+    /// back-to-back under the default parallel runner rotated which
+    /// real-process test failed, and how many failed (1, then 11, then 3
+    /// on three consecutive runs of an otherwise-identical tree), while
+    /// every run passed cleanly under `--test-threads=1` -- exactly the
+    /// signature of a port race, not a logic bug in any one test.
+    ///
+    /// The fix is the same reserve-then-bind convention `provision_gateway`
+    /// (this module's production gateway-spawn path, non-test code) already
+    /// uses for its own real `acpx-server` children: [`reserve_ephemeral_port`]
+    /// binds an ephemeral port and, in the same call, atomically
+    /// `create_new`s a `rui-acpx-port-<port>.lock` file in the shared
+    /// system temp dir (visible to and honored by every process using this
+    /// convention, including other `cargo test` processes and any other
+    /// worktree's test run on this same host) before dropping its own
+    /// listener -- so a second concurrent reservation for the same port
+    /// number fails outright instead of silently colliding. The lock is
+    /// held for this whole function's reachability-polling window (not
+    /// just through the `spawn()` call), because that ~1.6s registry-fetch
+    /// gap above is exactly the period another reservation could otherwise
+    /// slip in before this attempt's `acpx-server` has actually bound the
+    /// port; only once this attempt is done with the port (reachable, or
+    /// given up on) is the lock file removed so someone else can reuse the
+    /// number.
     fn spawn_acpx_server_with_retry(
         configure: impl Fn(&mut std::process::Command, u16),
     ) -> (std::process::Child, String) {
         for attempt in 0..5 {
-            let port = free_port();
+            let Some((port, lock)) = reserve_ephemeral_port() else {
+                // Only fails if 32 straight ephemeral-port binds all lost
+                // the reserve-file race or the bind itself failed -- rare
+                // enough that a short backoff-and-retry (same shape as the
+                // "server never got reachable" branch below) is the right
+                // response, not a hard panic on this attempt alone.
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+                }
+                continue;
+            };
             let mut command = std::process::Command::new(acpx_server_bin());
             configure(&mut command, port);
             command
@@ -4671,6 +4718,9 @@ mod tests {
             // 1.5s to fail-and-fall-back in this sandbox's network
             // conditions (measured ~1.6s directly). 3s gives real headroom
             // without materially slowing down the common fast-startup case.
+            // `lock` (from `reserve_ephemeral_port` above) is held for
+            // this entire window -- see this function's own doc comment
+            // for why releasing it any earlier would reopen the race.
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
             let mut reachable = false;
             while std::time::Instant::now() < deadline {
@@ -4692,6 +4742,17 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
+            // This attempt is done with `port` either way -- release the
+            // reservation now so a retry (this loop's own next iteration,
+            // or an unrelated concurrently-running test) can claim it.
+            // Once `acpx-server` has actually bound it (the `reachable`
+            // case), the OS itself refuses any other bind for as long as
+            // the child lives, so the advisory lock file has no further
+            // job to do.
+            drop(lock);
+            let _ = std::fs::remove_file(
+                std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
+            );
             if reachable {
                 return (child, format!("http://127.0.0.1:{port}"));
             }
@@ -5789,9 +5850,11 @@ mod tests {
         // isolated env) no shared token file at the derived SNAPSHOTD_HOME,
         // resolve_admin_creds must return None and set_agent_enabled must
         // degrade to `false`, never panic.
-        // SAFETY: guarded by restoring prior values unconditionally, same
-        // convention as this file's other env-mutating tests -- serialized
-        // by this crate's own `--test-threads=1` convention.
+        // SAFETY: guarded by restoring prior values unconditionally, and
+        // serialized against every other env-mutating test in this module
+        // by `ENV_MUTATION_LOCK` (see its own doc comment) -- not a
+        // `--test-threads=1` convention, which was never actually enforced.
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior_home = std::env::var("SNAPSHOTD_HOME").ok();
         let empty_home = tempfile::tempdir().expect("tempdir");
         std::env::set_var("SNAPSHOTD_HOME", empty_home.path());
@@ -7130,29 +7193,21 @@ done
         )
         .expect("write stand-in backend script");
 
-        let port = free_port();
-        let mut command = std::process::Command::new(acpx_server_bin());
-        command
-            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-            .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
-            .env("RUST_LOG", "error")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let child = command.spawn().expect("spawn real acpx-server binary");
-        let base_url = format!("http://127.0.0.1:{port}");
-        for _ in 0..100 {
-            if std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                std::time::Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
+        // Was its own bespoke free_port()+spawn+100x30ms-connect-poll
+        // here, with no reservation lock and no retry -- exactly the
+        // unlocked pattern `spawn_acpx_server_with_retry`'s own doc
+        // comment describes replacing, just not actually routed through
+        // it. This test was the single most consistent failure across
+        // repeated default-parallelism runs of the full suite (present in
+        // every one of three observed flaky runs); reusing the shared,
+        // lock-protected helper here closes the same port race for it.
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
+                .env("RUST_LOG", "error");
+        });
         let gateway = TestGateway { child, base_url };
 
         // Register a profile with allow_terminal_access before either
@@ -7835,6 +7890,14 @@ done
         // doc comment for why "http", not "sse", covers both real
         // adapters), so every provider string must behave identically
         // here.
+        //
+        // Serialized against the sibling test below (and every other
+        // env-mutating test in this module) by `ENV_MUTATION_LOCK` --
+        // both tests mutate this same process-global var, and running
+        // them concurrently was observed to fail nondeterministically
+        // (one test's set_var/remove_var landing mid the other's read)
+        // once the suite actually ran at default parallelism.
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SNAPSHOTD_MCP_SSE_ADDR", "127.0.0.1:1");
         for provider in ["codex", "claude", ""] {
             assert!(
@@ -7856,6 +7919,9 @@ done
     /// silently return.
     #[test]
     fn snapshotd_mcp_server_entry_points_at_the_streamable_http_endpoint_not_sse() {
+        // See the sibling test above for why this is guarded by
+        // `ENV_MUTATION_LOCK` -- both mutate `SNAPSHOTD_MCP_SSE_ADDR`.
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real loopback listener");
         let addr = listener.local_addr().expect("local_addr");
