@@ -14,7 +14,16 @@ fn main() {
         .spawn(|| {
             slint_build::compile_with_config(
                 "ui/app.slint",
-                slint_build::CompilerConfiguration::new().with_debug_info(true),
+                slint_build::CompilerConfiguration::new()
+                    .with_debug_info(true)
+                    // language-switch-sync plan: bundles every `.po` file
+                    // under `translations/<lang>/LC_MESSAGES/panel-rust.po`
+                    // into the compiled binary, so `@tr()` strings (see
+                    // ui/tokens/strings.slint's `Strings` global) can be
+                    // switched live at runtime via
+                    // `slint::select_bundled_translation` -- no loose
+                    // files to ship alongside this crate's staticlib.
+                    .with_bundled_translations("translations"),
             )
             .expect("panel-rust: ui/app.slint failed to compile");
         })
