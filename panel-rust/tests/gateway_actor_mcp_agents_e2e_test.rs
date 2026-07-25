@@ -36,8 +36,6 @@
 //!    now fails -- see
 //!    `snapflowd_mcp_availability_flips_when_the_process_is_killed_mid_turn`.
 
-use acpx_client::ext::admin::AdminClient;
-use acpx_proto::admin::CustomAgentSpec;
 use panel_rust::gateway_actor::spawn_acpx_thread;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -45,98 +43,16 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-fn acpx_server_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
+mod common;
+use common::{free_port, register_stand_in_backend, spawn_acpx_server_with_retry};
 
 fn snapflowd_mcp_bin() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/snapflowd-mcp")
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
-
-/// Same TOCTOU-safe retry wrapper as the sibling e2e test files (see
-/// `gateway_e2e_test.rs`'s copy for the full root-cause doc comment).
-fn spawn_acpx_server_with_retry(configure: impl Fn(&mut Command, u16)) -> (Child, String) {
-    for attempt in 0..5 {
-        let port = free_port();
-        let mut command = Command::new(acpx_server_bin());
-        configure(&mut command, port);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-        let mut reachable = false;
-        while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                reachable = true;
-                break;
-            }
-            if let Ok(Some(_status)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        if reachable {
-            return (child, format!("http://127.0.0.1:{port}"));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-        }
-    }
-    panic!(
-        "acpx-server never became reachable after 5 fresh-port attempts -- \
-         this looks like more than ordinary port contention"
-    );
-}
-
 struct GatewayProcess {
     child: Child,
     base_url: String,
-}
-
-/// PROF-4 (`profile-only-backend-selection` plan): both call sites in this
-/// file that used to register the stand-in shell-script backend via
-/// `ACPX_BACKEND_CMD` + `ACPX_DEFAULT_AGENT_ID = "mcp-agents-test-agent"`
-/// relied on a real mechanism -- `main.rs`'s own startup registers that
-/// env-derived command under exactly the `ACPX_DEFAULT_AGENT_ID` supervisor
-/// key, so any profile whose own `agent_id` field happened to match that
-/// same string resolved to it too, not just a bare native-mode session.
-/// The admin-plane custom-agent route (`POST /admin/agents/custom`, same
-/// mechanism `gateway_actor_e2e_test.rs`'s own `provision_mock_profile`
-/// uses) registers a supervisor entry under an arbitrary id the exact same
-/// way (`Router::ensure_custom_agent_registered` -> `Supervisor::
-/// register`), so every existing `agent_id: "mcp-agents-test-agent"`
-/// profile in this file keeps resolving unchanged -- no test assertion
-/// below needed to change, only how the backend gets registered.
-async fn register_stand_in_backend(admin_port: u16, admin_token: &str, script_path: &std::path::Path) {
-    let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-    while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), admin_token);
-    admin
-        .create_custom_agent(&CustomAgentSpec {
-            id: "mcp-agents-test-agent".to_owned(),
-            name: "mcp-agents-test-agent".to_owned(),
-            command: "sh".to_owned(),
-            args: vec![script_path.to_string_lossy().into_owned()],
-            env: std::collections::BTreeMap::new(),
-            cwd: None,
-        })
-        .await
-        .expect("admin/agents/custom create");
 }
 
 impl GatewayProcess {
@@ -155,7 +71,7 @@ impl GatewayProcess {
                 .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
-        register_stand_in_backend(admin_port, &admin_token, &script_path).await;
+        register_stand_in_backend(admin_port, &admin_token, "mcp-agents-test-agent", &script_path).await;
         GatewayProcess { child, base_url }
     }
 }

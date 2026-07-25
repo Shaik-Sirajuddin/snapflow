@@ -32,6 +32,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port, mock_agent_bin};
+
 fn repo_root() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -39,29 +43,8 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
-fn mock_agent_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent")
-}
-
-fn acpx_server_bin() -> PathBuf {
-    repo_root().join("acpx/target/debug/acpx-server")
-}
-
 fn shotcut_bin() -> PathBuf {
     repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
-}
-
-/// Same "bind an ephemeral port, drop it immediately, hand the number to
-/// the real process" trick `gateway_actor_e2e_test.rs`'s `free_port()`
-/// uses -- has the same inherent TOCTOU gap that helper's own doc comment
-/// documents; acceptable here for the same reason (this is a single,
-/// bounded-once acquisition per test run, not a hot loop).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
 }
 
 fn free_x_display() -> u32 {

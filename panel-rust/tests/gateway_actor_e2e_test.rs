@@ -7,148 +7,16 @@
 //! real binary, don't fake the boundary" testing discipline (see
 //! `panel-rust`'s own headless smoke-test methodology).
 
-use acpx_client::ext::admin::AdminClient;
-use acpx_proto::admin::CustomAgentSpec;
 use panel_rust::gateway_actor::spawn_acpx_thread;
 use panel_rust::protocol_types::AgentEvent;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-/// Resolves the real, already-built `acpx-server` binary next to this
-/// crate's own checkout -- mirrors `panel-rust/src/agent_bridge.rs`'s
-/// `resolve_agent_command`'s dev-checkout-relative-path pattern.
-fn acpx_server_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
-
-fn mock_agent_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/debug/rui-mock-agent")
-}
-
-/// PROF-4 (`profile-only-backend-selection` plan): registers `rui-mock-agent`
-/// as a real, durable admin-plane custom agent (`POST /admin/agents/custom`,
-/// see `acpx-server/src/transport/admin.rs`) and a profile naming it, then
-/// returns that profile's name -- the replacement for setting
-/// `ACPX_BACKEND_CMD` directly on the gateway process (removed from
-/// production in PROF-3; this closes the same gap in this file's own
-/// real-process test harness). Every test that used to call
-/// `handle.open_session(cwd)` against an `ACPX_BACKEND_CMD`-configured
-/// gateway now calls `handle.open_session_with_profile(cwd, &profile_name,
-/// ..)` instead -- the mock backend is selected through the exact same
-/// `_acpx.profile` path a real backend uses, not a shortcut.
-///
-/// `extra_env` layers additional env vars onto the custom agent's own spawn
-/// env (e.g. `RUI_MOCK_AGENT_EVENT_LOG`) -- on top of `RUI_MOCK_AGENT_
-/// PERSONA`, which this helper always sets from `persona`.
-async fn provision_mock_profile(
-    base_url: &str,
-    admin_port: u16,
-    admin_token: &str,
-    persona: &str,
-    extra_env: BTreeMap<String, String>,
-) -> String {
-    let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-    while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), admin_token);
-    let custom_agent_id = format!("mock-{persona}");
-    let mut env = extra_env;
-    env.insert("RUI_MOCK_AGENT_PERSONA".to_owned(), persona.to_owned());
-    admin
-        .create_custom_agent(&CustomAgentSpec {
-            id: custom_agent_id.clone(),
-            name: format!("mock agent ({persona})"),
-            command: mock_agent_bin().to_string_lossy().into_owned(),
-            args: Vec::new(),
-            env,
-            cwd: None,
-        })
-        .await
-        .expect("admin/agents/custom create");
-
-    let handle = spawn_acpx_thread(base_url.to_owned());
-    handle
-        .create_profile(serde_json::json!({
-            "name": persona,
-            "agent_id": custom_agent_id,
-        }))
-        .await
-        .expect("profiles/create for the mock profile");
-    persona.to_owned()
-}
-
-/// Binds an ephemeral TCP port synchronously (std, not tokio -- this
-/// helper runs before any runtime is guaranteed up), then immediately
-/// drops the listener so `acpx-server` can bind the same port itself.
-/// Same "probe a free port, drop it, hand the number to the real process"
-/// trick `acpx-server`'s own tests use.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
-
-/// Spawns a real `acpx-server` child, retrying the whole pick-port/
-/// spawn/wait-for-connect cycle (bounded at 5 attempts) if the process
-/// never becomes reachable within one attempt's own shorter window.
-///
-/// **Why this exists.** `free_port()`'s "bind a listener, read its
-/// port, then drop it" trick has an unavoidable TOCTOU gap: a different
-/// concurrently-running test's own `free_port()` call can claim the
-/// exact same port before this function's spawned process binds it.
-/// When that race is lost, `acpx-server` fails its bind and exits
-/// immediately -- ported verbatim from `panel-rust::agent_bridge`'s
-/// `spawn_acpx_server_with_retry` (see its doc comment for the full
-/// root-cause writeup), whose fix this file's tests never picked up,
-/// which is the confirmed cause of this file's own `resume_session_
-/// replays_history_via_session_load` flake under parallel test load.
-fn spawn_acpx_server_with_retry(
-    configure: impl Fn(&mut Command, u16),
-) -> (Child, String) {
-    for attempt in 0..5 {
-        let port = free_port();
-        let mut command = Command::new(acpx_server_bin());
-        configure(&mut command, port);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-        let mut reachable = false;
-        while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                reachable = true;
-                break;
-            }
-            if let Ok(Some(_status)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        if reachable {
-            return (child, format!("http://127.0.0.1:{port}"));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-        }
-    }
-    panic!(
-        "acpx-server never became reachable after 5 fresh-port attempts -- \
-         this looks like more than ordinary port contention"
-    );
-}
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port, mock_agent_bin, provision_mock_profile, spawn_acpx_server_with_retry};
 
 struct GatewayProcess {
     child: Child,

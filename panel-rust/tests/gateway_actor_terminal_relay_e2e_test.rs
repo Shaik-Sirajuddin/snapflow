@@ -18,108 +18,18 @@
 //! (duplicated helpers rather than shared -- these are independent
 //! test binaries).
 
-use acpx_client::ext::admin::AdminClient;
-use acpx_proto::admin::CustomAgentSpec;
 use panel_rust::gateway_actor::spawn_acpx_thread;
 use panel_rust::protocol_types::AgentEvent;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::Duration;
 
-fn acpx_server_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
-
-/// Same TOCTOU-safe retry wrapper as `gateway_e2e_test.rs`'s copy (see
-/// its doc comment) -- duplicated rather than shared, these are
-/// independent test binaries.
-fn spawn_acpx_server_with_retry(configure: impl Fn(&mut Command, u16)) -> (Child, String) {
-    for attempt in 0..5 {
-        let port = free_port();
-        let mut command = Command::new(acpx_server_bin());
-        configure(&mut command, port);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-        let mut reachable = false;
-        while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                reachable = true;
-                break;
-            }
-            if let Ok(Some(_status)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        if reachable {
-            return (child, format!("http://127.0.0.1:{port}"));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-        }
-    }
-    panic!(
-        "acpx-server never became reachable after 5 fresh-port attempts -- \
-         this looks like more than ordinary port contention"
-    );
-}
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port, register_stand_in_backend, spawn_acpx_server_with_retry};
 
 struct GatewayProcess {
     child: Child,
     base_url: String,
-}
-
-/// PROF-4 (`profile-only-backend-selection` plan): registers
-/// `backend_script` (written to a temp file first -- the admin plane's
-/// `CustomAgent.command`/`args` are separate fields, not a naively
-/// whitespace-split single string the way `ACPX_BACKEND_CMD` was, but a
-/// multi-word inline script still can't be passed as `command` directly)
-/// as a real, durable custom agent under `agent_id` via `POST
-/// /admin/agents/custom` -- the replacement for setting `ACPX_BACKEND_CMD`
-/// + `ACPX_DEFAULT_AGENT_ID` directly on the gateway process (removed from
-/// production in PROF-3). `main.rs`'s own startup used to register the
-/// env-derived command under exactly the `ACPX_DEFAULT_AGENT_ID`
-/// supervisor key, which is why this file's `agent_id: "terminal-relay-
-/// agent"` profile already resolved to it; `Router::ensure_custom_agent_
-/// registered` registers a supervisor entry under an arbitrary id the same
-/// way, so that profile keeps resolving unchanged.
-async fn register_stand_in_backend(
-    admin_port: u16,
-    admin_token: &str,
-    agent_id: &str,
-    script_path: &std::path::Path,
-) {
-    let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-    while std::time::Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), admin_token);
-    admin
-        .create_custom_agent(&CustomAgentSpec {
-            id: agent_id.to_owned(),
-            name: agent_id.to_owned(),
-            command: "sh".to_owned(),
-            args: vec![script_path.to_string_lossy().into_owned()],
-            env: std::collections::BTreeMap::new(),
-            cwd: None,
-        })
-        .await
-        .expect("admin/agents/custom create");
 }
 
 impl GatewayProcess {

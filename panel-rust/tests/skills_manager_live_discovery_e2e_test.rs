@@ -26,14 +26,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-fn acpx_server_bin() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port};
 
 struct GatewayProcess {
     child: Child,
