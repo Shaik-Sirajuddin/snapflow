@@ -658,6 +658,28 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             Effect::SetActiveProjectPath { path } => {
                 panel.apply_active_project_path(path);
             }
+            Effect::RefreshDaemonProjectInstances => {
+                // Real subprocess spawns + (inside the CLI) a real Unix
+                // socket dial -- off the UI thread, per `agent_bridge::
+                // fetch_daemon_project_instances`'s own doc comment.
+                std::thread::spawn(move || {
+                    let result =
+                        crate::agent_bridge::fetch_daemon_project_instances()
+                            .map_err(EffectError::new);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        crate::PANEL.with(|cell| {
+                            let slot = cell.borrow();
+                            let Some(panel) = slot.as_ref() else {
+                                return;
+                            };
+                            let _ = update_persistent(
+                                panel,
+                                Msg::Effect(EffectResultMsg::DaemonProjectInstancesLoaded(result)),
+                            );
+                        });
+                    });
+                });
+            }
             Effect::RenameProjectAssociation { old, new } => {
                 // Synchronous, in-memory only (no I/O) -- must run before
                 // this call returns, not spawned, so the very next poll

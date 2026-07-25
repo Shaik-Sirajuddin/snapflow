@@ -165,6 +165,16 @@ pub struct Model {
     /// happened to be at (see `update_frame`'s `if let Some(snapshot) =
     /// frame.thread_list_snapshot` block).
     pub synced_project_path: Option<String>,
+    /// PISO-8 (project-isolation-mlt-binding plan): every project with a
+    /// currently-live snapshotd instance, as of the last successful
+    /// `Effect::RefreshDaemonProjectInstances` poll (throttled, see
+    /// `FrameInput::daemon_projects_refresh_due`). A failed poll leaves
+    /// this at its previous value rather than clearing it -- see
+    /// `EffectResultMsg::DaemonProjectInstancesLoaded`'s doc comment.
+    /// Read directly (not via a `Dirty`) by `ExternalSnapshotSource::
+    /// collect_thread_list_snapshot`'s next tick, same as `active_
+    /// project_path` itself.
+    pub live_daemon_projects: Vec<crate::agent_bridge::DaemonProjectInstance>,
     pub traced_attachment_threads: HashSet<String>,
     pub appearance: AppearanceState,
     pub theme_variant: String,

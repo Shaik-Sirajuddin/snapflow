@@ -30,6 +30,28 @@ fn skills_rescan_due() -> bool {
     })
 }
 
+/// PISO-8 (project-isolation-mlt-binding plan): throttle for
+/// `Effect::RefreshDaemonProjectInstances` -- same thread-local-timer
+/// mechanism as `skills_rescan_due`, a longer 3s period since this poll
+/// spawns a real subprocess (`snapshotd list`/`listProjects`) rather than
+/// scanning a local directory.
+fn daemon_projects_refresh_due() -> bool {
+    thread_local! {
+        static LAST_DAEMON_PROJECTS_POLL: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST_DAEMON_PROJECTS_POLL.with(|last| {
+        let now = std::time::Instant::now();
+        let due = last
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(3));
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
 pub(crate) struct ExternalSnapshotSource<'a> {
     panel: &'a PanelSingleton,
 }
@@ -116,6 +138,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             // an unchanged scan dirties nothing.
             skills_snapshot: (settings_open && skills_rescan_due())
                 .then(|| self.collect_skills_snapshot()),
+            daemon_projects_refresh_due: daemon_projects_refresh_due(),
         }
     }
 
@@ -406,6 +429,19 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default()
                     .into();
+                // PISO-8 (project-isolation-mlt-binding plan): confirms
+                // the badge above isn't just a stale sqlite-recorded
+                // association -- true only when snapshotd's own
+                // daemon.list/listProjects currently reports a live
+                // ("ready") instance for this exact recorded project, per
+                // `models::thread_project_instance_is_live`'s doc
+                // comment.
+                row.project_instance_live = models::thread_project_instance_is_live(
+                    &project_path,
+                    active_project_path.as_deref(),
+                    &model_snapshot.live_daemon_projects,
+                )
+                .into();
                 row.project_path = project_path.into();
                 if let Some(thread) = model_snapshot.threads.get(item.real_index) {
                     row.profile_name = thread.profile_name.clone().unwrap_or_default().into();

@@ -304,6 +304,14 @@ pub struct FrameInput {
     pub settings_preferences_snapshot: Option<SettingsPreferencesSnapshot>,
     pub settings_gateway_snapshot: Option<SettingsGatewaySnapshot>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
+    /// PISO-8 (project-isolation-mlt-binding plan): true at most once
+    /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors
+    /// `skills_rescan_due`'s thread-local-timer pattern), signaling
+    /// `update_frame` to queue `Effect::RefreshDaemonProjectInstances`.
+    /// Computing the throttle here (cheap, no I/O) rather than doing the
+    /// real subprocess-backed poll itself on the frame-collection path
+    /// keeps that path non-blocking, per the plan's data-path discipline.
+    pub daemon_projects_refresh_due: bool,
 }
 
 /// Read-only bridge/store data for the sidebar. The adapter owns collection;

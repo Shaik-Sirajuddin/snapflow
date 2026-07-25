@@ -875,6 +875,163 @@ fn resolve_snapflowd_mcp_bin() -> PathBuf {
     )
 }
 
+/// Resolves the `snapshotd` daemon CLI binary path (PISO-8, project-
+/// isolation-mlt-binding plan): `RUI_SNAPSHOTD_BIN` env override, else a
+/// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
+/// convention as [`resolve_acpx_server_bin`]/[`resolve_snapflowd_mcp_bin`].
+/// Unlike those two, this binary is a short-lived CLI invocation (`list`/
+/// `listProjects`), not a long-lived spawned server -- see
+/// [`fetch_daemon_project_instances`].
+fn resolve_snapshotd_bin_from(
+    override_bin: Option<&str>,
+    current_exe: Option<&Path>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
+        return PathBuf::from(bin);
+    }
+    if let Some(parent) = current_exe.and_then(Path::parent) {
+        let candidate = parent.join("snapshotd");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    manifest_dir.join("../snapshotd/snapshotd")
+}
+
+fn resolve_snapshotd_bin() -> PathBuf {
+    resolve_snapshotd_bin_from(
+        std::env::var("RUI_SNAPSHOTD_BIN").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+/// PISO-8 (project-isolation-mlt-binding plan): one MLT project path
+/// (project root dir + `MltFileName` joined, matching
+/// `ThreadSlot::project_path`'s own file-path shape) that snapshotd
+/// currently reports a `"ready"` process instance for, and whether that
+/// instance is headless -- i.e. was launched by an agent's own
+/// `daemon.launch` MCP call for a project this panel's own host process
+/// never opened, rather than the panel's normal PISO-1 propagation path.
+/// A thread bound to such a project (see `models::
+/// thread_project_instance_is_live`) is being driven by that live
+/// instance, invisibly, unless the UI surfaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonProjectInstance {
+    pub project_path: String,
+    pub headless: bool,
+}
+
+/// Runs one bare `snapshotd` CLI subcommand (`"list"` or `"listProjects"`)
+/// and returns its stdout, one JSON object per line (see `cmdList`/
+/// `cmdListProjects` in `snapshotd/cmd/snapshotd/main.go` -- both dial the
+/// daemon's SDP control socket and print `daemon.list`/`daemon.
+/// listProjects`'s raw registry rows, no MCP/HTTP involved). Inherits the
+/// caller's environment unmodified, so `SNAPSHOTD_HOME` (relocating which
+/// daemon's control socket the CLI dials, per `config.Default`'s own doc
+/// comment) flows through exactly as a test or production launch already
+/// has it set -- this function never touches `SNAPSHOTD_HOME` itself.
+fn run_snapshotd_subcommand(bin: &Path, subcommand: &str) -> Result<String, String> {
+    let output = std::process::Command::new(bin)
+        .arg(subcommand)
+        .output()
+        .map_err(|error| format!("spawning `snapshotd {subcommand}`: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`snapshotd {subcommand}` exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("`snapshotd {subcommand}` produced non-UTF8 stdout: {error}"))
+}
+
+/// Parses `snapshotd list`'s JSONL stdout (one `registry.ProcessInstance`
+/// per line, PascalCase field names -- see that struct's doc comment for
+/// why: no `json` tags, wire shape deliberately mirrors the Go struct) and
+/// `snapshotd listProjects`'s JSONL stdout (one `registry.Project` per
+/// line) and correlates them into the set of MLT project paths that
+/// currently have a `"ready"` instance. Pure/no I/O -- split out from
+/// [`fetch_daemon_project_instances`] specifically so this correlation
+/// logic is unit-testable without a real daemon.
+fn parse_daemon_list_and_projects(
+    list_jsonl: &str,
+    projects_jsonl: &str,
+) -> Vec<DaemonProjectInstance> {
+    let mut project_paths_by_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in projects_jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let Ok(project) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(id) = project.get("ID").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let root_dir = project
+            .get("RootDir")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let mlt_file_name = project
+            .get("MltFileName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if root_dir.is_empty() || mlt_file_name.is_empty() {
+            continue;
+        }
+        project_paths_by_id.insert(
+            id.to_string(),
+            Path::new(root_dir)
+                .join(mlt_file_name)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let mut live = Vec::new();
+    for line in list_jsonl.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(instance) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if instance.get("Status").and_then(|v| v.as_str()) != Some("ready") {
+            continue;
+        }
+        let Some(project_id) = instance.get("ProjectID").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(project_path) = project_paths_by_id.get(project_id) else {
+            continue;
+        };
+        let headless = instance
+            .get("Headless")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        live.push(DaemonProjectInstance {
+            project_path: project_path.clone(),
+            headless,
+        });
+    }
+    live
+}
+
+/// One full `snapshotd list` + `snapshotd listProjects` round trip,
+/// returning every project with a currently-live (`"ready"`) instance.
+/// Performs real subprocess spawns and (inside the CLI) a real Unix
+/// socket dial -- **never call this from the UI thread or a tokio
+/// worker**; the only production caller is `Effect::
+/// RefreshDaemonProjectInstances`'s background `std::thread::spawn`
+/// (`effect_executor.rs`), matching the project-isolation plan's PISO-8
+/// data-path discipline note.
+pub fn fetch_daemon_project_instances() -> Result<Vec<DaemonProjectInstance>, String> {
+    let bin = resolve_snapshotd_bin();
+    let list_jsonl = run_snapshotd_subcommand(&bin, "list")?;
+    let projects_jsonl = run_snapshotd_subcommand(&bin, "listProjects")?;
+    Ok(parse_daemon_list_and_projects(&list_jsonl, &projects_jsonl))
+}
+
 /// Builds the `mcpServers` array `session/new`/`session/load` now send
 /// (previously always `[]`, see `gateway_actor::thread_actor`'s doc
 /// comments on `Command::OpenSession`/`Command::ResumeSession`) -- one
@@ -8286,6 +8443,62 @@ done
             serde_json::Value::String(format!("http://{addr}/mcp")),
             "must point at the Streamable HTTP endpoint (/mcp), not the legacy SSE one (/sse) -- \
              codex-acp's real MCP client requires this exact shape, confirmed live"
+        );
+    }
+
+    /// PISO-8 (project-isolation-mlt-binding plan): the JSONL shapes below
+    /// are literal `registry.ProcessInstance`/`registry.Project` output as
+    /// produced by `cmdList`/`cmdListProjects` (`snapshotd/cmd/snapshotd/
+    /// main.go`) -- PascalCase, no `json` tags. Only a `"ready"` instance
+    /// whose `ProjectID` resolves through the projects list counts as
+    /// live; a `"closed"` instance and an instance whose project never
+    /// appears in the projects list are both excluded, not defaulted to
+    /// some guessed path.
+    #[test]
+    fn parse_daemon_list_and_projects_joins_ready_instances_to_their_project_path() {
+        let list_jsonl = concat!(
+            r#"{"ID":"inst-a","ProjectID":"proj-a","PID":111,"SocketPath":"/tmp/a.sock","Status":"ready","Headless":true}"#,
+            "\n",
+            r#"{"ID":"inst-b","ProjectID":"proj-b","PID":222,"SocketPath":"/tmp/b.sock","Status":"closed","Headless":false}"#,
+            "\n",
+            r#"{"ID":"inst-c","ProjectID":"proj-unknown","PID":333,"SocketPath":"/tmp/c.sock","Status":"ready","Headless":true}"#,
+        );
+        let projects_jsonl = concat!(
+            r#"{"ID":"proj-a","RootDir":"/home/user/projects/alpha","MltFileName":"project.mlt","Status":"active"}"#,
+            "\n",
+            r#"{"ID":"proj-b","RootDir":"/home/user/projects/beta","MltFileName":"project.mlt","Status":"active"}"#,
+        );
+        let live = parse_daemon_list_and_projects(list_jsonl, projects_jsonl);
+        assert_eq!(
+            live,
+            vec![DaemonProjectInstance {
+                project_path: "/home/user/projects/alpha/project.mlt".to_string(),
+                headless: true,
+            }],
+            "only the ready instance whose ProjectID resolves through the projects list \
+             may appear -- the closed instance and the instance with an unknown project \
+             must both be dropped, not guessed at"
+        );
+    }
+
+    #[test]
+    fn parse_daemon_list_and_projects_returns_empty_for_empty_or_malformed_input() {
+        assert!(parse_daemon_list_and_projects("", "").is_empty());
+        assert!(parse_daemon_list_and_projects("not json\n", "also not json\n").is_empty());
+    }
+
+    #[test]
+    fn parse_daemon_list_and_projects_threads_the_headless_flag_through() {
+        let list_jsonl =
+            r#"{"ID":"inst-a","ProjectID":"proj-a","Status":"ready","Headless":false}"#;
+        let projects_jsonl =
+            r#"{"ID":"proj-a","RootDir":"/p","MltFileName":"project.mlt"}"#;
+        let live = parse_daemon_list_and_projects(list_jsonl, projects_jsonl);
+        assert_eq!(live.len(), 1);
+        assert!(
+            !live[0].headless,
+            "a project the user has open headful (PISO-9's headful-wins reuse) must not be \
+             misreported as headless"
         );
     }
 }

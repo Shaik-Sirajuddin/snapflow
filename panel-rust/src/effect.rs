@@ -216,6 +216,16 @@ pub enum Effect {
         old: String,
         new: String,
     },
+    /// PISO-8 (project-isolation-mlt-binding plan): a throttled background
+    /// poll of snapshotd's `daemon.list`/`daemon.listProjects` CLI
+    /// subcommands, so a thread bound to a project the agent picked via
+    /// its own `daemon.launch` MCP call -- invisibly, in a headless
+    /// instance this panel's own host never opened -- can be flagged as
+    /// actually live rather than merely recorded. Triggered from
+    /// `update_frame` on `FrameInput::daemon_projects_refresh_due`, never
+    /// from the UI thread directly (see `agent_bridge::
+    /// fetch_daemon_project_instances`'s own doc comment).
+    RefreshDaemonProjectInstances,
 }
 
 /// Results feeding back into `Msg::Effect` -- one variant per `Effect`
@@ -275,4 +285,13 @@ pub enum EffectResultMsg {
         thread_id: String,
         message: String,
     },
+    /// PISO-8: result of `Effect::RefreshDaemonProjectInstances`. `Err`
+    /// (daemon unreachable, `snapshotd` binary missing, malformed
+    /// output, ...) is a best-effort miss, not a user-facing error --
+    /// `update()` leaves the previously cached instances in place rather
+    /// than surfacing a toast for a background poll the user never
+    /// triggered and cannot act on.
+    DaemonProjectInstancesLoaded(
+        Result<Vec<crate::agent_bridge::DaemonProjectInstance>, EffectError>,
+    ),
 }

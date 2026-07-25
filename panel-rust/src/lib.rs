@@ -57,6 +57,12 @@ mod sync;
 // internal surface.
 pub mod test_support {
     pub use crate::agent_bridge::{reserve_ephemeral_port, reserve_port};
+    // PISO-8 (project-isolation-mlt-binding plan): lets a real e2e test
+    // (a separate crate, same `pub`-only visibility rule as above) drive
+    // the actual `snapshotd list`/`listProjects` subprocess round trip
+    // against a real spawned daemon, rather than only exercising the
+    // pure JSONL-parsing helper via `agent_bridge`'s own unit tests.
+    pub use crate::agent_bridge::{fetch_daemon_project_instances, DaemonProjectInstance};
 }
 mod theme;
 mod update;
@@ -3553,6 +3559,7 @@ mod keyboard_shortcut_tests {
             model: "".into(),
             project_name: "".into(),
             project_path: "".into(),
+            project_instance_live: false,
             profile_name: "".into(),
             has_session: false,
             relative_time: "now".into(),

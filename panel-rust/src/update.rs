@@ -206,6 +206,10 @@ pub(crate) fn visible_thread_row(
                 .as_ref()
                 .map(|c| c.project_name.clone())
                 .unwrap_or_default(),
+            project_instance_live: cached
+                .as_ref()
+                .map(|c| c.project_instance_live)
+                .unwrap_or(false),
         },
     })
 }
@@ -1745,6 +1749,21 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                 }],
             ),
         },
+        EffectResultMsg::DaemonProjectInstancesLoaded(result) => {
+            // Best-effort background poll (PISO-8) -- a miss (daemon not
+            // running, `snapshotd` binary missing, malformed output, ...)
+            // leaves the previously cached instances in place rather than
+            // clearing a real signal or surfacing a toast/error for a
+            // background poll the user never triggered and cannot act
+            // on. No `Dirty` needed either way: the very next frame's
+            // `ThreadListSnapshot` collection already reads `model.
+            // live_daemon_projects` fresh and its own row-content diff
+            // (`update_frame`'s `changed` check) picks up the change.
+            if let Ok(instances) = result {
+                model.live_daemon_projects = instances;
+            }
+            (vec![], vec![])
+        }
     }
 }
 
@@ -1885,6 +1904,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
     }
     if frame.settings_reload_pending {
         dirty.push(Dirty::Settings);
+    }
+    if frame.daemon_projects_refresh_due {
+        // PISO-8 (project-isolation-mlt-binding plan): a real subprocess
+        // spawn + Unix socket dial, executed off the UI thread by
+        // `effect_executor.rs` -- see `Effect::
+        // RefreshDaemonProjectInstances`'s own doc comment.
+        effects.push(Effect::RefreshDaemonProjectInstances);
     }
     if frame.prepend_expanded_rows > 0 {
         let mut expanded = vec![false; frame.prepend_expanded_rows];
@@ -3634,6 +3660,64 @@ mod tests {
         assert!(effects.is_empty());
     }
 
+    // PISO-8 (project-isolation-mlt-binding plan): the throttle flag is the
+    // ONLY thing that queues the background poll -- update_frame must
+    // never spawn it on every tick (that would mean a real subprocess
+    // spawn 60-90x/sec, exactly what the plan's data-path discipline note
+    // forbids on this path).
+    #[test]
+    fn daemon_projects_refresh_due_queues_the_refresh_effect_only_when_true() {
+        let mut model = Model::default();
+        let (effects, _) = update(
+            &mut model,
+            Msg::Frame(crate::msg::FrameInput {
+                daemon_projects_refresh_due: true,
+                ..crate::msg::FrameInput::default()
+            }),
+        );
+        assert_eq!(effects, vec![Effect::RefreshDaemonProjectInstances]);
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Frame(crate::msg::FrameInput {
+                daemon_projects_refresh_due: false,
+                ..crate::msg::FrameInput::default()
+            }),
+        );
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn daemon_project_instances_loaded_replaces_model_on_ok_and_keeps_previous_on_err() {
+        let mut model = Model::default();
+        let instance = crate::agent_bridge::DaemonProjectInstance {
+            project_path: "/work/b/project.mlt".to_string(),
+            headless: true,
+        };
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::DaemonProjectInstancesLoaded(Ok(vec![
+                instance.clone(),
+            ]))),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert_eq!(model.live_daemon_projects, vec![instance.clone()]);
+
+        // A failed poll (daemon unreachable, ...) must not clear the
+        // previously cached instances or surface an error toast for a
+        // background poll the user never triggered.
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Effect(EffectResultMsg::DaemonProjectInstancesLoaded(Err(
+                crate::effect::EffectError::new("connection refused"),
+            ))),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert_eq!(model.live_daemon_projects, vec![instance]);
+    }
+
     #[test]
     fn frame_tick_marks_only_the_external_snapshots_that_changed() {
         let mut model = Model::default();
@@ -3652,6 +3736,7 @@ mod tests {
                 settings_gateway_snapshot: None,
                 settings_preferences_snapshot: None,
                 skills_snapshot: None,
+                daemon_projects_refresh_due: false,
             }),
         );
         assert!(effects.is_empty());
