@@ -36,6 +36,8 @@
 //!    now fails -- see
 //!    `snapflowd_mcp_availability_flips_when_the_process_is_killed_mid_turn`.
 
+use acpx_client::ext::admin::AdminClient;
+use acpx_proto::admin::CustomAgentSpec;
 use panel_rust::gateway_actor::spawn_acpx_thread;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -101,17 +103,59 @@ struct GatewayProcess {
     base_url: String,
 }
 
+/// PROF-4 (`profile-only-backend-selection` plan): both call sites in this
+/// file that used to register the stand-in shell-script backend via
+/// `ACPX_BACKEND_CMD` + `ACPX_DEFAULT_AGENT_ID = "mcp-agents-test-agent"`
+/// relied on a real mechanism -- `main.rs`'s own startup registers that
+/// env-derived command under exactly the `ACPX_DEFAULT_AGENT_ID` supervisor
+/// key, so any profile whose own `agent_id` field happened to match that
+/// same string resolved to it too, not just a bare native-mode session.
+/// The admin-plane custom-agent route (`POST /admin/agents/custom`, same
+/// mechanism `gateway_actor_e2e_test.rs`'s own `provision_mock_profile`
+/// uses) registers a supervisor entry under an arbitrary id the exact same
+/// way (`Router::ensure_custom_agent_registered` -> `Supervisor::
+/// register`), so every existing `agent_id: "mcp-agents-test-agent"`
+/// profile in this file keeps resolving unchanged -- no test assertion
+/// below needed to change, only how the backend gets registered.
+async fn register_stand_in_backend(admin_port: u16, admin_token: &str, script_path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(3000);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), admin_token);
+    admin
+        .create_custom_agent(&CustomAgentSpec {
+            id: "mcp-agents-test-agent".to_owned(),
+            name: "mcp-agents-test-agent".to_owned(),
+            command: "sh".to_owned(),
+            args: vec![script_path.to_string_lossy().into_owned()],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+        })
+        .await
+        .expect("admin/agents/custom create");
+}
+
 impl GatewayProcess {
-    fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
+    async fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
         let script_path = script_dir.join("stand_in_backend.sh");
         std::fs::write(&script_path, backend_script).expect("write stand-in backend script");
-        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+        let db_path = script_dir.join("acpx.sqlite3");
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
+        let admin_token_for_env = admin_token.clone();
+        let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-                .env("ACPX_DEFAULT_AGENT_ID", "mcp-agents-test-agent")
+                .env("ACPX_DB_PATH", &db_path)
+                .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+                .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
+        register_stand_in_backend(admin_port, &admin_token, &script_path).await;
         GatewayProcess { child, base_url }
     }
 }
@@ -169,7 +213,7 @@ async fn wait_for_message_containing(
 #[tokio::test]
 async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     // Starts empty -- no MCP servers registered yet on a fresh gateway.
@@ -217,7 +261,7 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
 #[tokio::test]
 async fn profile_referencing_a_central_mcp_server_reaches_the_real_backend_session_new() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     handle
@@ -273,7 +317,7 @@ async fn profile_referencing_a_central_mcp_server_reaches_the_real_backend_sessi
 #[tokio::test]
 async fn agent_catalog_list_status_and_install_reach_the_real_registry() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     // `agents/list` draws from `acpx-registry`'s live-fetch-or-bundled-
@@ -326,7 +370,7 @@ async fn agent_catalog_list_status_and_install_reach_the_real_registry() {
 #[tokio::test]
 async fn profiles_crud_round_trips_through_the_thread_actor() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     // Starts with no profiles named after this test's fixture -- a
