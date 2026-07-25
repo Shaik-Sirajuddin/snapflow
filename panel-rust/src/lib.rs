@@ -1376,13 +1376,30 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             })
             .unwrap_or_default();
         // Cold-start seed when panel-state has no prior threads.
-        // RUI_SEED_THREADS:
-        //   unset  -> DEFAULT_THREAD_NAMES (product v1 fixtures)
-        //   "0"    -> single empty "Chat" (dev/VNC: no fake stale-looking titles)
-        //   "1".."N" -> first N of DEFAULT_THREAD_NAMES (capped)
-        // setup-followups stale_threads_not_torn_down_after_testing: VNC
-        // harnesses must set RUI_SEED_THREADS=0 so restarts don't look like
-        // leftover work ("Fix timeline crash" et al.) and only open one session.
+        // PISO-13 (user report, 2026-07-25): "stale 4 threads bundled in
+        // production ... we don't want these at all in production ...
+        // user chooses the threads". Prior to this fix, an UNSET
+        // RUI_SEED_THREADS defaulted to the full DEFAULT_THREAD_NAMES
+        // fixture set on EVERY build, including a real production launch --
+        // there was no signal at all that distinguished "a dev/QA harness
+        // that wants demo content" from "a real user's first launch", so a
+        // production install unconditionally got 4 threads named "Fix
+        // timeline crash" etc. that nobody created and nobody asked for.
+        // The prior comment here already correctly diagnosed the surface
+        // symptom (these look like leftover work on any restore-empty
+        // launch) but the prescribed fix -- "VNC harnesses must set
+        // RUI_SEED_THREADS=0" -- was aspirational and never actually done
+        // anywhere in this repo (grepped: zero scripts set it), so the
+        // fixture set kept shipping to everyone by default regardless.
+        // RUI_SEED_THREADS now:
+        //   unset    -> single empty "Chat" (the real default: no fixture
+        //                content, the user creates their own threads)
+        //   "0"      -> same as unset, kept for any caller that already
+        //                passes it explicitly
+        //   "1".."N" -> first N of DEFAULT_THREAD_NAMES (capped) -- now an
+        //                explicit OPT-IN for dev/QA/demo harnesses that
+        //                genuinely want named fixture content, not
+        //                something a real launch falls into by default.
         let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
@@ -1390,7 +1407,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     let n = v.trim().parse::<usize>().unwrap_or(DEFAULT_THREAD_NAMES.len());
                     DEFAULT_THREAD_NAMES.iter().copied().take(n).collect()
                 }
-                Err(_) => DEFAULT_THREAD_NAMES.to_vec(),
+                Err(_) => vec!["Chat"],
             };
             seed_names
                 .into_iter()
