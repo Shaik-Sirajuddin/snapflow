@@ -1297,8 +1297,23 @@ pub fn to_profile_option_rows(
 /// `ProfileSelected` / session open keep working); `value` carries the
 /// agent/provider id for model filtering. Label prefers `agent_id`.
 /// `current` is the thread's `profile_name` (maps to that profile's agent).
+///
+/// PROF-10 (`profile-only-backend-selection` plan): also filters OUT
+/// providers whose agent is not actually live, using the exact same
+/// liveness marker PROF-7's `agent_detected_for_profile` reads --
+/// `agents` (a real `agents/list` catalog) reporting the profile's
+/// `agent_id` as `Installed`/`InstalledNoSession`. Without this, the
+/// picker listed every profile regardless of whether its agent was ever
+/// installed, letting a user pick a provider session/new can't open.
+/// Same fail-open posture as PROF-7 throughout: a profile with no
+/// `agent_id` (native/unmanaged mode, nothing to check) or whose
+/// `agent_id` isn't in `agents` yet (an incomplete/still-loading catalog
+/// read, not evidence the agent is missing) is kept, not hidden -- only a
+/// catalog hit that's genuinely NOT `Installed`/`InstalledNoSession`
+/// excludes the row.
 pub fn to_profile_dropdown_entries(
     profiles: &[ProfileOption],
+    agents: &[crate::protocol_types::AgentCatalogEntry],
     current: &str,
 ) -> ModelRc<DropdownEntry> {
     let current_agent = profiles
@@ -1307,10 +1322,29 @@ pub fn to_profile_dropdown_entries(
         .map(|p| p.agent_id.to_string())
         .unwrap_or_default();
 
+    let is_live = |agent_id: &str| -> bool {
+        if agent_id.is_empty() {
+            return true;
+        }
+        agents
+            .iter()
+            .find(|a| a.id == agent_id)
+            .is_none_or(|entry| {
+                matches!(
+                    entry.status,
+                    crate::protocol_types::AgentStatus::Installed
+                        | crate::protocol_types::AgentStatus::InstalledNoSession
+                )
+            })
+    };
+
     let mut seen_agents = std::collections::HashSet::<String>::new();
     let mut items: Vec<DropdownEntry> = Vec::new();
     for p in profiles {
         let agent = p.agent_id.to_string();
+        if !is_live(&agent) {
+            continue;
+        }
         let key = if agent.is_empty() {
             p.name.to_string()
         } else {
@@ -2463,7 +2497,10 @@ mod transcript_model_tests {
                 fs_enabled: false,
             },
         ];
-        let entries = to_profile_dropdown_entries(&profiles, "work");
+        // Empty catalog: PROF-10's fail-open posture (catalog not loaded
+        // yet is not evidence an agent is missing), so nothing is filtered
+        // here -- exercised on its own below.
+        let entries = to_profile_dropdown_entries(&profiles, &[], "work");
         assert_eq!(entries.row_count(), 2); // one per agent
         assert_eq!(entries.row_data(0).unwrap().label.as_str(), "codex-acp");
         assert_eq!(entries.row_data(0).unwrap().value.as_str(), "codex-acp");
@@ -2498,6 +2535,71 @@ mod transcript_model_tests {
         // header + one value
         assert_eq!(filtered.row_count(), 2);
         assert_eq!(filtered.row_data(1).unwrap().value.as_str(), "codex-acp/gpt-5");
+    }
+
+    /// PROF-10: a provider whose agent the catalog genuinely reports as
+    /// NOT `Installed`/`InstalledNoSession` must not appear in the
+    /// compose-bar picker at all -- but a profile with no `agent_id`
+    /// (native/unmanaged mode) and one whose `agent_id` isn't in the
+    /// catalog yet (still-loading read) must both still be listed, same
+    /// fail-open posture as `agent_detected_for_profile`.
+    #[test]
+    fn provider_dropdown_hides_providers_the_catalog_reports_as_not_live() {
+        let profiles = vec![
+            ProfileOption {
+                name: "work".into(),
+                agent_id: "codex-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "gone".into(),
+                agent_id: "vanished-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "still-loading".into(),
+                agent_id: "unknown-to-catalog-yet".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "native".into(),
+                agent_id: "".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+        ];
+        // Inlined rather than reusing `models::tests::catalog_entry` --
+        // this test lives in `transcript_model_tests`, a sibling module
+        // that helper is private to.
+        let agent_catalog_entry = |id: &str, status: crate::protocol_types::AgentStatus| {
+            crate::protocol_types::AgentCatalogEntry {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                version: String::new(),
+                status,
+                enabled: true,
+            }
+        };
+        let agents = [
+            agent_catalog_entry("codex-acp", crate::protocol_types::AgentStatus::Installed),
+            agent_catalog_entry(
+                "vanished-acp",
+                crate::protocol_types::AgentStatus::NotInstalled,
+            ),
+        ];
+        let entries = to_profile_dropdown_entries(&profiles, &agents, "work");
+        let labels: Vec<String> = (0..entries.row_count())
+            .filter_map(|i| entries.row_data(i))
+            .map(|e| e.label.to_string())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["codex-acp".to_owned(), "unknown-to-catalog-yet".to_owned(), "native".to_owned()],
+            "vanished-acp must be hidden; still-loading and native must fail open and stay visible"
+        );
     }
 
     fn model_option(values: &[(&str, &str)]) -> Vec<ConfigOptionInfo> {

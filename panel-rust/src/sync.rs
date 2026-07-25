@@ -701,6 +701,7 @@ fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::mod
     let current = thread.profile_name.as_deref().unwrap_or("");
     component.set_profile_dropdown_entries(crate::models::to_profile_dropdown_entries(
         &profile_rows,
+        &model.agent_catalog,
         current,
     ));
     // Compose trigger shows provider/agent id, not raw profile name.
