@@ -1024,6 +1024,29 @@ fn probe_http_endpoint(addr: &str, path: &str) -> bool {
 // "dev/test context" signal by itself -- that debug binary exists in any
 // checkout that has ever run `cargo build`/`cargo test`, including one
 // verifying real end-to-end acpx behavior.
+//
+// KNOWN ACCEPTED GAP, not an oversight: with no `_acpx.profile` requested
+// AND nothing configured anywhere (no persisted thread record, no
+// `default_agent_id` in settings -- the genuine blank-slate case), a
+// thread still opens in native/unmanaged mode, which falls through to
+// the autospawned acpx-server's own built-in default (codex-only, see
+// `acpx-server/src/config.rs`'s bare `ACPX_BACKEND_CMD` fallback). This
+// was investigated and deliberately left as-is: auto-picking a live
+// `profiles/list` entry at session-open time (the obvious panel-side
+// fix) was rejected because `acpx-core::detect::detect` marks an
+// npx-distributed registry agent "Installed" purely from `node`/`npm`
+// being on `PATH`, which is true on essentially any dev/CI machine --
+// that would make session selection silently PATH/registry-order
+// dependent, including in this crate's own tests. The real fix belongs
+// one layer down, in acpx-server's own native-mode default resolution
+// (make it consult its own seeded-profile result instead of a hardcoded
+// string) -- tracked as PROF-14, a separate cross-repo phase, blocked on
+// an unrelated worktree (agents-install-runtime, PROF-13) merging first
+// since it already has uncommitted changes to the exact acpx-core/
+// acpx-server files that fix would touch, including the
+// ACPX_BACKEND_CMD -> ACPX_DEFAULT_ACP_COMMAND rename. Do not "fix" this
+// gap by reintroducing an env-var write here -- that is the one thing
+// this whole plan exists to prevent.
 
 /// Reads `CODEX_API_KEY` out of the Codex CLI's own on-disk login
 /// (`~/.codex/auth.json`, overrideable via `ACPX_CODEX_AUTH_FILE`), the
