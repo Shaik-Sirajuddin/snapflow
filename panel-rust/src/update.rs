@@ -1791,6 +1791,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 let was_generating = matches!(thread.state, ThreadState::Loading);
                 thread.state = ThreadState::Idle;
                 thread.error = None;
+                // PROF-8: a turn that actually completed is proof the
+                // agent is authenticated now (retried successfully, or an
+                // operator fixed the profile) -- clear the persistent
+                // banner rather than requiring manual dismissal.
+                thread.unauthenticated = false;
                 thread.last_activity_time = Some(std::time::Instant::now());
                 crate::trace_host_input(format_args!(
                     "turn ended thread={} reason={:?}",
@@ -1831,6 +1836,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             crate::protocol_types::AgentEvent::Error(error) => {
                 thread.state = ThreadState::Error;
                 thread.error = Some(error.clone());
+                // PROF-8: same event, a second real per-thread signal --
+                // see `models::is_backend_requires_authentication_error`'s
+                // doc comment for why this is a substring match and what
+                // guards it.
+                thread.unauthenticated =
+                    crate::models::is_backend_requires_authentication_error(error);
                 dirty.push(Dirty::Error {
                     thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {

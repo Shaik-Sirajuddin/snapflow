@@ -1044,6 +1044,39 @@ pub fn agent_detected_for_profile(
     ))
 }
 
+/// PROF-8 (`profile-only-backend-selection` plan): detects whether an
+/// `AgentEvent::Error` message text is acpx-core's
+/// `RouterError::BackendRequiresAuthentication` (acpx-core/src/router.rs)
+/// -- "the agent is reachable but not authenticated" -- rather than any
+/// other session/new or turn failure.
+///
+/// **This is fragile by design, not by oversight, and the team decided to
+/// accept that rather than reach into acpx-core right now.** acpx-server's
+/// own transport maps EVERY `RouterError` variant to the same generic
+/// JSON-RPC code -32000 (see acpx-server/src/transport/http.rs's
+/// `json_rpc_error`) -- there is no distinct code or structured field for
+/// "needs auth" to match on instead, so the exact `Display` text of
+/// `RouterError::BackendRequiresAuthentication` ("backend requires
+/// authentication before session/new") is the only signal that exists.
+/// Nothing keeps that string in sync between the two crates -- a future
+/// acpx-core wording change breaks this silently, with no compile error
+/// anywhere. `agent_bridge.rs`'s
+/// `open_session_fails_with_a_detectable_authentication_required_message`
+/// test is the tripwire for that: it runs a real acpx-server against a
+/// real backend that advertises `authMethods` with no `auth_method_id`
+/// configured, and asserts the REAL error text this function is matching
+/// against still contains the substring below -- so a wording drift fails
+/// that test loudly instead of this detector silently going dark.
+///
+/// A real acpx-core fix (a distinct error code/field) belongs in the same
+/// class as PROF-14's acpx-side fix: deferred, not attempted here, because
+/// acpx-core/acpx-server are mid-rewrite in the uncommitted
+/// agents-install-runtime worktree and touching them now risks a
+/// guaranteed merge conflict for no benefit today.
+pub fn is_backend_requires_authentication_error(message: &str) -> bool {
+    message.contains("backend requires authentication before session/new")
+}
+
 /// Builds the sidebar's thread-list items from `names`/`state`
 /// (parallel slices, same convention as `PanelSingleton::thread_state`),
 /// optionally narrowed by a case-insensitive substring `query` --

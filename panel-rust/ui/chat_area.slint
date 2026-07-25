@@ -59,6 +59,11 @@ export component ChatArea inherits Rectangle {
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
     callback error-banner-dismissed();
+    // PROF-8: persistent (not dismissible) yellow strip -- the displayed
+    // thread's agent is reachable but not authenticated. Clears itself
+    // once a turn completes (update.rs's TurnEnded handling), unlike
+    // last-error which the user dismisses by hand.
+    in property <bool> agent-unauthenticated: false;
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
@@ -685,6 +690,35 @@ export component ChatArea inherits Rectangle {
             // HTML's `border-b border-sys-border`.
             height: 1px;
             background: Theme.border-default;
+        }
+        // PROF-8: yellow "reachable but not authenticated" strip,
+        // directly below the top bar (ahead of the red error banner
+        // below, which is dismissible -- this one isn't, it clears
+        // itself once a turn actually completes).
+        if root.agent-unauthenticated : Rectangle {
+            height: auth-banner-text.preferred-height + 2 * Metrics.space-3;
+            background: #422006;
+            border-color: #eab308;
+            border-width: 1px;
+            HorizontalLayout {
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
+                padding-top: Metrics.space-3;
+                padding-bottom: Metrics.space-3;
+                spacing: Metrics.space-3;
+                auth-banner-text := Text {
+                    text: "⚠ Agent is reachable but not authenticated. Configure an auth method for this profile.";
+                    color: #eab308;
+                    font-size: 10px * Theme.font-scale;
+                    font-family: Theme.font-mono;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                    preferred-width: 0px;
+                    min-width: 0px;
+                    accessible-role: text;
+                    accessible-label: self.text;
+                }
+            }
         }
         // Send/session-attach failure banner. Previously this only ever
         // surfaced as a small "Error: ..." sidebar subtitle under the

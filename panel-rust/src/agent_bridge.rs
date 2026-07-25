@@ -6842,6 +6842,68 @@ done
     /// option it actually received, so `bridge.history` is the
     /// observable proof the live answer -- not the auto-policy fallback
     /// -- reached the backend.
+    /// PROF-8 (`profile-only-backend-selection` plan) canary: the tripwire
+    /// `models::is_backend_requires_authentication_error`'s own doc
+    /// comment names. Real acpx-server, a real stand-in backend that
+    /// advertises `authMethods` on `initialize` with no
+    /// `auth_method_id` configured -- exactly what makes acpx-core's
+    /// `Router::resolve_profile`/`ensure_backend_initialized` return
+    /// `RouterError::BackendRequiresAuthentication` instead of proceeding
+    /// to `session/new`. Asserts the REAL error text panel-rust receives
+    /// over the wire still contains the substring
+    /// `is_backend_requires_authentication_error` matches on, so a future
+    /// acpx-core wording change fails this test loudly instead of that
+    /// detector silently going dark (see its own doc comment for the full
+    /// "this is fragile by design" reasoning this test exists to guard).
+    #[test]
+    fn open_session_fails_with_a_detectable_authentication_required_message() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("requires_auth_backend.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[{"id":"api-key","name":"API Key"}]}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#,
+        )
+        .expect("write requires-auth stand-in backend script");
+        let gateway = TestGateway::spawn_with_backend_cmd(
+            &format!("sh {}", script_path.display()),
+            "requires-auth-test",
+            None,
+        );
+
+        let names = ["Needs Auth Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut error_message = None;
+        while std::time::Instant::now() < deadline && error_message.is_none() {
+            for ev in bridge.poll() {
+                if let AgentEvent::Error(message) = ev.event {
+                    error_message = Some(message);
+                }
+            }
+            if error_message.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let error_message =
+            error_message.expect("expected a real BackendRequiresAuthentication error");
+        assert!(
+            crate::models::is_backend_requires_authentication_error(&error_message),
+            "the real acpx-core error text no longer matches \
+             is_backend_requires_authentication_error's substring -- update the detector \
+             (and its doc comment) to track acpx-core's actual wording, got: {error_message:?}"
+        );
+    }
+
     #[test]
     fn permission_request_relay_round_trips_through_the_bridge() {
         // Written to a real temp file (rather than passed as `sh -c

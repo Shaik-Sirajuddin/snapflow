@@ -97,6 +97,12 @@ export component ChatPanel inherits Window {
     // the thread list. Rendered as a dismissible banner in chat_area.
     in property <string> last-error: "";
     callback error-banner-dismissed();
+    // PROF-8: the displayed thread's agent is reachable but not
+    // authenticated (acpx-core's BackendRequiresAuthentication) --
+    // persistent yellow strip, not a dismissible failure banner; clears
+    // itself once a turn actually completes (see update.rs's TurnEnded
+    // handling).
+    in property <bool> agent-unauthenticated: false;
     // Phase 28: shared action-feedback toast (one popup for error/info/
     // status of user actions -- sync.rs's Dirty::Toast arm drives these).
     // `toast-seq` bumps on every show so the auto-hide timer restarts
@@ -546,6 +552,7 @@ export component ChatPanel inherits Window {
                 connection-status: connection-status;
                 last-error: last-error;
                 error-banner-dismissed => { error-banner-dismissed(); }
+                agent-unauthenticated: agent-unauthenticated;
                 sending: threads.length > 0
                     ? threads[selected-thread].status == "loading"
                         || threads[selected-thread].status == "cancelling"

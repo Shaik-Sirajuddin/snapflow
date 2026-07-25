@@ -132,6 +132,20 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 });
             if for_displayed {
                 component.set_last_error(detail.message.clone().into());
+                // PROF-8: same displayed-thread gate as last_error above --
+                // read fresh from the model (not carried on `detail`,
+                // unlike the message text) since `thread.unauthenticated`
+                // is set alongside `thread.error` in update.rs but this
+                // Dirty variant predates that field.
+                let unauthenticated = if thread_id.is_empty() {
+                    model
+                        .displayed_thread
+                        .and_then(|idx| model.threads.get(idx))
+                        .is_some_and(|thread| thread.unauthenticated)
+                } else {
+                    thread_for_id(model, thread_id).is_some_and(|thread| thread.unauthenticated)
+                };
+                component.set_agent_unauthenticated(unauthenticated);
             }
         }
         Dirty::PendingRequest { thread_id } => {
