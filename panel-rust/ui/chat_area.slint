@@ -4,7 +4,7 @@ import { Icon } from "./base/icon.slint";
 import { CursorHost } from "./tokens/cursor_host.slint";
 import { SelectionFocus } from "./tokens/selection_focus.slint";
 import { IconButton } from "./base/icon_button.slint";
-import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption } from "./types.slint";
+import { MessageItem, PendingRequestItem, TerminalItem, DropdownEntry, LocalTerminalItem, SkillOption, McpServerOption, PlanEntryItem } from "./types.slint";
 import { MessageCard } from "./components/message_card.slint";
 import { ChatInputLayout } from "./components/chat_input_layout.slint";
 import { UserBubble } from "./chat-view/components/message/user_bubble.slint";
@@ -64,6 +64,21 @@ export component ChatArea inherits Rectangle {
     // once a turn completes (update.rs's TurnEnded handling), unlike
     // last-error which the user dismisses by hand.
     in property <bool> agent-unauthenticated: false;
+    // PROF-11: the agent's most recently pushed execution plan/todo list
+    // (`AgentBridge::plan`, a live ACP `plan` session/update). Empty
+    // hides the panel entirely -- most agents never send one.
+    in property <[PlanEntryItem]> plan-entries: [];
+    // PROF-11: the most recently pushed live session title (`session_
+    // info_update`), deliberately kept separate from the durable,
+    // user-editable `active-thread-name` above -- shown as a small
+    // suffix on the header only when present and different, never
+    // replacing what the user named the thread.
+    in property <string> live-session-title: "";
+    // Computed once so the header `Text` below doesn't reference
+    // `active-thread-name` twice in one expression (generated Rust
+    // codegen moved the first `SharedString` use out from under the
+    // second in that shape).
+    property <string> header-title: active-thread-name != "" ? active-thread-name : "No thread";
     in property <bool> sending: false;
     in property <PendingRequestItem> pending-request;
     in property <[TerminalItem]> terminals: [];
@@ -543,7 +558,14 @@ export component ChatArea inherits Rectangle {
                         }
                     }
                     if !root.rename-editing : Text {
-                        text: active-thread-name != "" ? active-thread-name : "No thread";
+                        // PROF-11: an agent-pushed live title is appended
+                        // as a small suffix, not swapped in for the
+                        // durable name -- see `live-session-title`'s doc
+                        // comment for why the two must never merge.
+                        text: root.header-title
+                            + (root.live-session-title != "" && root.live-session-title != root.header-title
+                                ? "  ·  " + root.live-session-title
+                                : "");
                         color: Theme.text-primary;
                         // Match sidebar "Chats" title when rail collapsed.
                         font-size: (root.match-title-bar ? 14px
@@ -717,6 +739,47 @@ export component ChatArea inherits Rectangle {
                     min-width: 0px;
                     accessible-role: text;
                     accessible-label: self.text;
+                }
+            }
+        }
+        // PROF-11: the agent's self-reported execution plan/todo list.
+        // Hidden entirely when empty (`plan-entries.length == 0`) --
+        // most agents never send one, so this must never look like a
+        // dead/always-present control.
+        if root.plan-entries.length > 0 : Rectangle {
+            height: plan-list.preferred-height + 2 * Metrics.space-3;
+            background: Theme.bg-card;
+            border-color: Theme.border-default;
+            border-width: 1px;
+            plan-list := VerticalLayout {
+                padding-left: Metrics.space-6;
+                padding-right: Metrics.space-6;
+                padding-top: Metrics.space-3;
+                padding-bottom: Metrics.space-3;
+                spacing: Metrics.space-1;
+                for entry[i] in root.plan-entries : HorizontalLayout {
+                    spacing: Metrics.space-2;
+                    Text {
+                        text: entry.status == "completed" ? "✓"
+                            : entry.status == "in_progress" ? "▶" : "○";
+                        color: entry.status == "completed" ? Theme.text-muted
+                            : Theme.text-primary;
+                        font-size: 10px * Theme.font-scale;
+                        font-family: Theme.font-mono;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: entry.content;
+                        color: entry.status == "completed" ? Theme.text-muted : Theme.text-primary;
+                        font-size: 10px * Theme.font-scale;
+                        font-family: Theme.font-mono;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                        preferred-width: 0px;
+                        min-width: 0px;
+                        accessible-role: text;
+                        accessible-label: "Plan entry, " + entry.priority + " priority, " + entry.status + ": " + entry.content;
+                    }
                 }
             }
         }

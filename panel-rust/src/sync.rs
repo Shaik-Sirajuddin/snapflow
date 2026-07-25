@@ -264,6 +264,15 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 component.set_context_ratio(if thread.usage.1 > 0 {
                     (thread.usage.0 as f32 / thread.usage.1 as f32).clamp(0.0, 1.0)
                 } else { 0.0 });
+                // PROF-11: agent-reported execution plan/todo list, and
+                // any live-pushed session title -- see `ChatArea.plan-
+                // entries`/`.live-session-title`'s doc comments.
+                component.set_plan_entries(slint::ModelRc::new(slint::VecModel::from(
+                    crate::models::to_plan_entry_rows(thread.plan.clone()),
+                )));
+                component.set_live_session_title(
+                    thread.session_title.clone().unwrap_or_default().into(),
+                );
             }
         }
     }
@@ -1149,6 +1158,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
                     available_commands: vec![],
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..crate::msg::FrameInput::default()

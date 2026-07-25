@@ -646,3 +646,65 @@ async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
         "expected the slow turn to end with stopReason \"cancelled\" after cancel_session(), got {stop_reason:?}"
     );
 }
+
+/// PROF-11 (`profile-only-backend-selection` plan): proves the two real
+/// gaps that phase closed -- `plan` and `session_info_update` session/
+/// updates -- actually reach `AgentEvent` through a REAL gateway +
+/// `rui-mock-agent` backend, not just a unit-level parse test on a
+/// hand-built JSON fixture (`parse_capability_update_recognizes_plan`/
+/// `..._recognizes_session_info_update` in `thread_actor.rs` cover the
+/// parse layer in isolation; this covers the whole wire round trip).
+/// `rui-mock-agent` only sends these for a `"plan "`-prefixed prompt (see
+/// its own doc comment on that branch) so unrelated e2e tests' message-
+/// count assumptions are undisturbed.
+#[tokio::test]
+async fn plan_and_session_info_update_round_trip_through_a_real_gateway() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
+
+    let mut handle = spawn_acpx_thread(gateway.base_url.clone());
+    let mut events_rx = handle.take_events();
+    handle
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
+        .await
+        .expect("open_session_with_profile");
+
+    handle
+        .send_prompt("plan hello gateway")
+        .await
+        .expect("send_prompt");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut plan_entries = None;
+    let mut session_title = None;
+    while tokio::time::Instant::now() < deadline
+        && (plan_entries.is_none() || session_title.is_none())
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.min(Duration::from_millis(200)), events_rx.recv())
+            .await
+        {
+            Ok(Some(AgentEvent::PlanUpdate(entries))) => plan_entries = Some(entries),
+            Ok(Some(AgentEvent::SessionInfoUpdate { title, .. })) => session_title = title,
+            _ => {}
+        }
+    }
+
+    let plan_entries = plan_entries.expect(
+        "expected a real AgentEvent::PlanUpdate to arrive via the gateway for a \"plan \"-prefixed prompt",
+    );
+    assert_eq!(plan_entries.len(), 2);
+    assert_eq!(plan_entries[0].content, "Read the file");
+    assert_eq!(plan_entries[0].status, "completed");
+    assert_eq!(plan_entries[1].status, "in_progress");
+
+    assert_eq!(
+        session_title.as_deref(),
+        Some("Fixing the login bug"),
+        "expected a real AgentEvent::SessionInfoUpdate with the mock agent's title to arrive via the gateway"
+    );
+}

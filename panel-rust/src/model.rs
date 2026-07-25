@@ -123,6 +123,19 @@ pub struct ThreadModel {
     pub available_commands: Vec<AvailableCommandInfo>,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
+    /// PROF-11: the agent's most recently pushed execution plan/todo
+    /// list, from a live ACP `plan` session/update. Empty means no plan
+    /// notification has arrived yet (or the backend never sends one),
+    /// same capability-gating convention as `config_options`/
+    /// `available_commands` above.
+    pub plan: Vec<crate::protocol_types::PlanEntryInfo>,
+    /// PROF-11: the most recently pushed live session title, from a
+    /// `session_info_update` session/update. Deliberately separate from
+    /// the durable, user-editable `display_name` above -- see
+    /// `crate::agent_bridge::ThreadSlot::session_title`'s doc comment for
+    /// why an agent-pushed title must never silently overwrite what the
+    /// user typed.
+    pub session_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -271,6 +284,8 @@ impl Default for ThreadModel {
             config_options: Vec::new(),
             available_commands: Vec::new(),
             usage: (0, 0),
+            plan: Vec::new(),
+            session_title: None,
         }
     }
 }

@@ -1,5 +1,5 @@
 import { Theme } from "tokens/theme.slint";
-import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
+import { MarkdownLine, ThreadItem, MessageItem, PendingRequestItem, PermissionOptionItem, TerminalItem, ProfileOption, ModeOption, PlanEntryItem, ConfigOptionRow, DropdownEntry, McpServerOption, AgentCatalogEntry, LocalTerminalItem, RemoteSessionOption, SkillOption } from "types.slint";
 import { Sidebar } from "components/sidebar.slint";
 import { ChatArea } from "chat_area.slint";
 import { TerminalOverlay } from "components/terminal_card.slint";
@@ -103,6 +103,13 @@ export component ChatPanel inherits Window {
     // itself once a turn actually completes (see update.rs's TurnEnded
     // handling).
     in property <bool> agent-unauthenticated: false;
+    // PROF-11: the displayed thread's agent-reported execution plan/todo
+    // list and any live-pushed session title -- see
+    // `ChatArea.plan-entries`/`ChatArea.live-session-title`'s doc
+    // comments for the wire origin and why the title is a suffix, never
+    // a replacement for the durable thread name.
+    in property <[PlanEntryItem]> plan-entries: [];
+    in property <string> live-session-title: "";
     // Phase 28: shared action-feedback toast (one popup for error/info/
     // status of user actions -- sync.rs's Dirty::Toast arm drives these).
     // `toast-seq` bumps on every show so the auto-hide timer restarts
@@ -553,6 +560,8 @@ export component ChatPanel inherits Window {
                 last-error: last-error;
                 error-banner-dismissed => { error-banner-dismissed(); }
                 agent-unauthenticated: agent-unauthenticated;
+                plan-entries: plan-entries;
+                live-session-title: live-session-title;
                 sending: threads.length > 0
                     ? threads[selected-thread].status == "loading"
                         || threads[selected-thread].status == "cancelling"

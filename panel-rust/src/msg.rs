@@ -364,6 +364,10 @@ pub struct ThreadFrameSnapshot {
     pub available_commands: Vec<crate::protocol_types::AvailableCommandInfo>,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
+    /// PROF-11: the agent's most recently pushed execution plan/todo list.
+    pub plan: Vec<crate::protocol_types::PlanEntryInfo>,
+    /// PROF-11: the most recently pushed live session title.
+    pub session_title: Option<String>,
 }
 
 #[cfg(test)]

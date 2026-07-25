@@ -13,8 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
-    McpServerOption, McpToolOption, MessageItem, ProfileOption, SkillOption, TerminalItem,
-    ThreadItem,
+    McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption, SkillOption,
+    TerminalItem, ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -1670,6 +1670,23 @@ pub fn to_agent_catalog_entry_rows(
             version: entry.version.into(),
             status: entry.status.as_wire_str().into(),
             enabled: entry.enabled,
+        })
+        .collect()
+}
+
+/// PROF-11: builds the compose-header plan panel's row model from a real
+/// `plan` session/update (`AgentBridge::plan`). Order is preserved
+/// verbatim -- ACP's `Plan.entries` is already the agent's own intended
+/// display order, not something this layer should re-sort.
+pub fn to_plan_entry_rows(
+    entries: Vec<crate::protocol_types::PlanEntryInfo>,
+) -> Vec<PlanEntryItem> {
+    entries
+        .into_iter()
+        .map(|entry| PlanEntryItem {
+            content: entry.content.into(),
+            priority: entry.priority.into(),
+            status: entry.status.into(),
         })
         .collect()
 }

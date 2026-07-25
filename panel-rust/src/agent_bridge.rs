@@ -211,6 +211,23 @@ struct ThreadSlot {
     /// persisted (the agent re-advertises on session start), so it is not
     /// part of the runtime snapshot.
     available_commands: Mutex<Vec<crate::protocol_types::AvailableCommandInfo>>,
+    /// PROF-11: the agent's most recently pushed execution plan/todo
+    /// list, from a live `plan` session/update
+    /// ([`AgentEvent::PlanUpdate`]'s doc comment). Replaced wholesale on
+    /// each push (ACP's `Plan` is always-the-complete-plan, never a
+    /// delta); not persisted -- same "the agent re-advertises, this is
+    /// ephemeral capability state" reasoning as `available_commands`
+    /// above.
+    plan: Mutex<Vec<crate::protocol_types::PlanEntryInfo>>,
+    /// PROF-11: the most recently pushed live session title, from a
+    /// `session_info_update` session/update
+    /// ([`AgentEvent::SessionInfoUpdate`]'s doc comment). Deliberately
+    /// separate from the durable, user-editable `ThreadModel::
+    /// display_name` -- an agent-pushed title is a live signal, not a
+    /// rename the user asked for, so it must never silently overwrite
+    /// what the user typed. `None` until the backend sends one; not
+    /// persisted, same ephemeral-capability-state reasoning as `plan`.
+    session_title: Mutex<Option<String>>,
     /// Phase 2 step 3 (chat-panel-production-ui/execution-plan.md):
     /// typed, merged conversation view -- `history` above stays the
     /// raw, unmerged, append-only `ChatMessage` feed (JSONL cache
@@ -573,6 +590,24 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
                 .available_commands
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = commands.clone();
+        }
+        AgentEvent::PlanUpdate(entries) => {
+            *slot.plan.lock().unwrap_or_else(|e| e.into_inner()) = entries.clone();
+        }
+        AgentEvent::SessionInfoUpdate { title, .. } => {
+            // Only `title` is kept -- `updated_at` has no reader today
+            // (see `AgentEvent::SessionInfoUpdate`'s doc comment); a
+            // `None` title (field absent/explicit-null on the wire) is
+            // deliberately NOT stored as a clear, since this collapsed
+            // representation can't tell "no change" from "agent cleared
+            // it" apart -- clearing a live title on an ambiguous signal
+            // would be worse than leaving a stale one showing.
+            if let Some(title) = title {
+                *slot
+                    .session_title
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(title.clone());
+            }
         }
         _ => {}
     }
@@ -1981,7 +2016,9 @@ fn spawn_event_forwarder(
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
                 | AgentEvent::ConfigOptions(_)
-                | AgentEvent::AvailableCommands(_) => {
+                | AgentEvent::AvailableCommands(_)
+                | AgentEvent::PlanUpdate(_)
+                | AgentEvent::SessionInfoUpdate { .. } => {
                     store_capability_event(&slot_for_task, &ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
@@ -2425,6 +2462,8 @@ impl AgentBridge {
                 session_modes: Mutex::new(runtime_snapshot.session_modes),
                 config_options: Mutex::new(runtime_snapshot.config_options),
                 available_commands: Mutex::new(Vec::new()),
+                plan: Mutex::new(Vec::new()),
+                session_title: Mutex::new(None),
                 attachment: Mutex::new(AttachmentState::default()),
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
@@ -2685,6 +2724,8 @@ impl AgentBridge {
             session_modes: Mutex::new(runtime_snapshot.session_modes),
             config_options: Mutex::new(runtime_snapshot.config_options),
             available_commands: Mutex::new(Vec::new()),
+            plan: Mutex::new(Vec::new()),
+            session_title: Mutex::new(None),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
@@ -2985,6 +3026,8 @@ impl AgentBridge {
             session_modes: Mutex::new(None),
             config_options: Mutex::new(Vec::new()),
             available_commands: Mutex::new(Vec::new()),
+            plan: Mutex::new(Vec::new()),
+            session_title: Mutex::new(None),
             attachment: Mutex::new(AttachmentState {
                 complete: true,
                 error: None,
@@ -3904,6 +3947,30 @@ impl AgentBridge {
             return Vec::new();
         };
         slot.available_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// PROF-11: the agent's most recently pushed execution plan/todo
+    /// list for thread `idx` (from a live `plan` session/update). Empty
+    /// until the backend sends one -- same "empty means no plan
+    /// notification yet, capability-gate on it" reasoning as
+    /// [`Self::config_options`].
+    pub fn plan(&self, idx: usize) -> Vec<crate::protocol_types::PlanEntryInfo> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        slot.plan.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// PROF-11: the most recently pushed live session title for thread
+    /// `idx` (from a `session_info_update`), distinct from the durable
+    /// `ThreadModel::display_name` -- see [`ThreadSlot::session_title`]'s
+    /// doc comment for why the two are never merged.
+    pub fn session_title(&self, idx: usize) -> Option<String> {
+        let slot = self.slots.get(idx)?;
+        slot.session_title
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -4864,6 +4931,8 @@ mod tests {
             session_modes: bridge.session_modes(index),
             config_options: bridge.config_options(index),
             available_commands: bridge.available_commands(index),
+            plan: vec![],
+            session_title: None,
             usage: (0, 0),
         };
         let (_, dirty) = crate::update::update(

@@ -253,6 +253,20 @@ export struct ModeOption {
     description: string,
 }
 
+// PROF-11: one row of the currently selected thread's live `plan`
+// session/update (`AgentBridge::plan`, see `protocol_types::
+// PlanEntryInfo`). `priority`/`status` are the exact ACP v1 wire tags
+// verbatim (e.g. "high"/"medium"/"low", "pending"/"in_progress"/
+// "completed") -- Rust round-trips them through untouched rather than
+// mapping to a closed enum, same "an unrecognized future value still
+// displays as literal text" posture the rest of this crate's capability
+// rows follow.
+export struct PlanEntryItem {
+    content: string,
+    priority: string,
+    status: string,
+}
+
 // Mode/config selector addition: one *row* of the currently selected
 // thread's live `configOptions[]` advertisement (`AgentBridge::
 // config_options`, see `rui_acp_client::ConfigOptionInfo`). Slint has no

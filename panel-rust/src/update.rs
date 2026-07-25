@@ -1920,7 +1920,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::ConfigOptions(_)
             // PUI-003: the agent's slash commands flow through the per-frame
             // snapshot fold (thread.available_commands) like other caps.
-            | crate::protocol_types::AgentEvent::AvailableCommands(_) => {
+            | crate::protocol_types::AgentEvent::AvailableCommands(_)
+            // PROF-11: the agent's plan/todo list and any live session
+            // title flow through the same per-frame snapshot fold
+            // (thread.plan / thread.session_title).
+            | crate::protocol_types::AgentEvent::PlanUpdate(_)
+            | crate::protocol_types::AgentEvent::SessionInfoUpdate { .. } => {
                 dirty.push(Dirty::ThreadRow(target_index));
             }
         }
@@ -2202,7 +2207,9 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             let capabilities_changed = switched_thread
                 || thread.session_modes != snapshot.session_modes
                 || thread.config_options != snapshot.config_options
-                || thread.usage != snapshot.usage;
+                || thread.usage != snapshot.usage
+                || thread.plan != snapshot.plan
+                || thread.session_title != snapshot.session_title;
 
             thread.transcript = snapshot.transcript;
             thread.transcript_keys = new_keys.clone();
@@ -2222,6 +2229,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.config_options = snapshot.config_options;
             thread.available_commands = snapshot.available_commands;
             thread.usage = snapshot.usage;
+            thread.plan = snapshot.plan;
+            thread.session_title = snapshot.session_title;
 
             if transcript_changed {
                 dirty.push(Dirty::MessagesDiff {
@@ -3306,6 +3315,8 @@ mod tests {
                     session_modes: None,
                     config_options: Vec::new(),
                     available_commands: Vec::new(),
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3616,6 +3627,8 @@ mod tests {
             session_modes: None,
             config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
             usage: (0, 0),
         };
 
@@ -3766,6 +3779,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3849,6 +3864,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3921,6 +3938,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -4631,6 +4650,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
