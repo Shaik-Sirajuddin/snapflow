@@ -15,12 +15,17 @@
 # convention.
 set -euo pipefail
 
+# shellcheck source=host_e2e_admin_provision.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_e2e_admin_provision.sh"
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state_dir="${PANEL_HOST_E2E_MCP_STATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/panel-host-e2e-mcp.XXXXXX")}"
 keep_state="${PANEL_HOST_E2E_MCP_KEEP_STATE:-0}"
 display="${PANEL_HOST_E2E_MCP_DISPLAY:-:112}"
 screen="${PANEL_HOST_E2E_MCP_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
+admin_port="${PANEL_HOST_E2E_MCP_ADMIN_PORT:-18797}"
+admin_token="panel-host-e2e-mcp-admin-token-$$"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
 scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|rename>}"
 
@@ -72,9 +77,10 @@ done
 xdpyinfo -display "$display" >/dev/null
 
 ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
-ACPX_BACKEND_CMD="$agent_bin" \
 ACPX_DEFAULT_AGENT_ID="codex" \
 ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+ACPX_ADMIN_TOKEN="$admin_token" \
+ACPX_ADMIN_BIND="127.0.0.1:$admin_port" \
 RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
 "$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
 server_pid="$!"
@@ -86,6 +92,10 @@ for _ in $(seq 1 80); do
     sleep 0.1
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
+
+# PROF-4 (profile-only-backend-selection plan): see
+# host_e2e_admin_provision.sh's own doc comment for the full mechanism.
+provision_mock_profile_via_admin "$gateway_port" "$admin_port" "$admin_token" "$agent_bin" "$state_dir"
 
 env \
 SLINT_MCP_PORT="$mcp_port" \

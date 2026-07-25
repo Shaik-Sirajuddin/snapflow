@@ -30,6 +30,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port, mock_agent_bin, provision_mock_profile};
+
 fn repo_root() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -37,29 +41,8 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
-fn mock_agent_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent")
-}
-
-fn acpx_server_bin() -> PathBuf {
-    repo_root().join("acpx/target/debug/acpx-server")
-}
-
 fn shotcut_bin() -> PathBuf {
     repo_root().join("shotcut/build/cc-debug-linux/src/shotcut")
-}
-
-/// Same "bind an ephemeral port, drop it immediately, hand the number to
-/// the real process" trick `gateway_actor_e2e_test.rs`'s `free_port()`
-/// uses -- has the same inherent TOCTOU gap that helper's own doc comment
-/// documents; acceptable here for the same reason (this is a single,
-/// bounded-once acquisition per test run, not a hot loop).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
 }
 
 fn free_x_display() -> u32 {
@@ -152,15 +135,14 @@ impl LiveUiHarness {
 
         let gateway_port = free_port();
         let persona = "codex";
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
         let acpx_server = Command::new(acpx_server_bin())
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{gateway_port}"))
-            .env(
-                "ACPX_BACKEND_CMD",
-                mock_agent_bin().to_string_lossy().to_string(),
-            )
             .env("ACPX_DEFAULT_AGENT_ID", persona)
             .env("ACPX_DB_PATH", state_dir.join("acpx/gateway.sqlite3"))
-            .env("RUI_MOCK_AGENT_PERSONA", persona)
+            .env("ACPX_ADMIN_TOKEN", &admin_token)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
             .env("RUST_LOG", "error")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -185,6 +167,39 @@ impl LiveUiHarness {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+
+        // PROF-4 (`profile-only-backend-selection` plan): the panel used to
+        // reach `rui-mock-agent` via `ACPX_BACKEND_CMD` + native/unmanaged
+        // mode (removed from production in PROF-3). Replaced with a real
+        // profile: `provision_mock_profile` registers `rui-mock-agent` as a
+        // durable custom agent under `"mock-codex"` (deliberately NOT
+        // `persona` itself -- acpx-server's own `main.rs` unconditionally
+        // pre-registers a supervisor entry under `ACPX_DEFAULT_AGENT_ID` at
+        // startup using its bare npx-codex-acp default, so reusing that
+        // exact id here would 409 with "custom agent id codex conflicts
+        // with an existing registered backend") and creates a profile
+        // literally named `persona` ("codex") pointing at it. The
+        // settings.global.json written below (before shotcut starts) sets
+        // `default_agent_id: "codex"`, which the panel's own cold-start
+        // seed binds as `_acpx.profile` (`lib.rs`'s `cold_start_thread_
+        // specs`) -- so this panel run never touches native mode at all.
+        let base_url = format!("http://127.0.0.1:{gateway_port}");
+        provision_mock_profile(
+            &base_url,
+            admin_port,
+            &admin_token,
+            persona,
+            std::collections::BTreeMap::new(),
+        )
+        .await;
+
+        let settings_dir = state_dir.join("panel-settings");
+        std::fs::create_dir_all(&settings_dir).expect("create panel settings dir");
+        std::fs::write(
+            settings_dir.join("settings.global.json"),
+            format!(r#"{{"schema_version":1,"default_agent_id":"{persona}"}}"#),
+        )
+        .expect("write settings.global.json");
 
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())

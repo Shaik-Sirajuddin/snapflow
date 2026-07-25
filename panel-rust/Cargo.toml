@@ -70,6 +70,21 @@ i-slint-backend-testing = "1.17.1"
 # why production code goes through the transport-neutral `Gateway`
 # facade, not raw HTTP).
 reqwest = { version = "0.12", features = ["json"] }
+# PROF-4 (profile-only-backend-selection plan): e2e harnesses provision
+# their mock backend as a real admin-plane custom agent + profile now,
+# instead of the removed ACPX_BACKEND_CMD env-var write (see
+# agent_bridge.rs's own PROF-3 comment) -- `acpx_client::ext::admin::
+# AdminClient::create_custom_agent` takes an `acpx_proto::admin::
+# CustomAgentSpec` by value, so that type needs to be nameable here too.
+acpx-proto = { path = "../acpx/acpx-proto" }
+# PROF-5: the ACPX_BACKEND_CMD/ACPX_DEFAULT_ACP_COMMAND regression guard
+# (tests/backend_cmd_env_write_regression_test.rs) matches on the real
+# `.env("NAME", ...)` call shape, not a bare substring, so legitimate
+# prose mentions (doc comments explaining the history/rationale) don't
+# fail it -- and that shape can span multiple lines (found live: one real
+# call site was exactly this and fooled an earlier hand-rolled grep), so
+# the match needs `\s*` between tokens, not literal adjacency.
+regex = "1"
 
 [build-dependencies]
 slint-build = "1.17.1"

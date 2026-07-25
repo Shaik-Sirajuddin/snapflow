@@ -110,6 +110,21 @@ pub(crate) fn selected_real_index(model: &Model) -> usize {
         .unwrap_or(model.selected_thread)
 }
 
+// PROF-9 (`profile-only-backend-selection` plan): a thread's agent is
+// "usable" for the purposes of granting it NEW MCP capability -- i.e. not
+// ThreadState::Stale (PROF-7: agent_detected_for_profile came back false at
+// attach time) and not ThreadModel.unauthenticated (PROF-8: the backend's
+// initialize advertised auth methods and none is configured). Fails open
+// (returns true) when idx is out of range, matching the fail-open posture
+// of agent_detected_for_profile itself -- an unresolvable thread should
+// never block an action, only a positively-confirmed-bad one should.
+fn thread_agent_usable(model: &Model, idx: usize) -> bool {
+    let Some(thread) = model.threads.get(idx) else {
+        return true;
+    };
+    !matches!(thread.state, ThreadState::Stale) && !thread.unauthenticated
+}
+
 // setup-followups plan, archive_thread_backend_verify: pub(crate) so a
 // real-backend test can build the exact row shape production actually
 // produces, rather than hand-crafting a fixture that risks silently
@@ -171,6 +186,11 @@ pub(crate) fn visible_thread_row(
         real_index,
         thread_id,
         session_id: thread.session_id.clone(),
+        // Not the external_snapshot collection path (this helper builds a
+        // single row from already-folded model state, used by e.g. the
+        // sidebar single-row refresh) -- no new agents/list read happens
+        // here, so no new detection info either.
+        agent_detected: None,
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
             relative_time: rel_time.into(),
@@ -309,29 +329,23 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let real_index = model.threads.len();
             let thread_id = format!("thread:{real_index}");
             let display_name = format!("New thread {}", real_index + 1);
-            // Auto-detected by family rather than an enumerated literal
-            // list: `gateway_urls`/`spawn_gateway_process` only ever
-            // recognize two provider keys today ("codex"/"claude" --
-            // see AgentBridge's constructor, which resolves exactly
-            // these two), so any agent id naming the claude family (the
-            // short label "claude" this reducer's own gateway wiring
-            // uses elsewhere, the real registry id "claude-acp", a
-            // hypothetical "claude-code", ...) maps to it; anything else
-            // defaults to codex, same as before. Found live via a real
-            // settings.global.json with default_agent_id: "claude-acp"
-            // (plausibly persisted by a picker backed by the agent
-            // catalog's real registry ids, not the short label), which
-            // an exact-match list previously silently routed to codex.
-            let provider = if model
-                .default_agent_id
-                .to_ascii_lowercase()
-                .contains("claude")
-            {
-                "claude"
+            // PROF-1/PROF-2: the agent id flows through as-is now, same
+            // as `AgentBridge::resolve_provider_for` -- no more collapsing
+            // every id down to "codex"/"claude" by a `contains("claude")`
+            // guess (the exact `normalize_provider` shape PROF-1 deleted
+            // from agent_bridge.rs, just reimplemented independently here
+            // and missed in that pass: a real third agent id such as
+            // "gemini-acp" would still have been forced onto "codex" at
+            // this call site even after agent_bridge.rs itself stopped
+            // normalizing). `model.default_agent_id` is used directly when
+            // set; the same documented last-resort fallback
+            // (`NO_PROVIDER_REQUESTED_FALLBACK`) applies when nothing is
+            // configured at all, never an index/contains-based guess.
+            let provider = if model.default_agent_id.is_empty() {
+                crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK.to_owned()
             } else {
-                "codex"
-            }
-            .to_owned();
+                model.default_agent_id.clone()
+            };
             // The literal string "default" is a reserved sentinel, never a
             // real profile name -- see settings_file.rs's
             // non_default_sentinel and acpxmgr.go's WriteConfig doc
@@ -346,9 +360,25 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             // on `session/new` and makes acpx-server try to dial a
             // nonexistent "default" agent forever ("agent default is in
             // crash backoff"). Guard at the point of use too.
+            //
+            // PROF-2: when no named profile is configured, fall back to
+            // `default_agent_id` as the profile name -- acpx's own
+            // `Router::ensure_default_profiles_seeded` auto-fills exactly
+            // one profile per installed registry agent, named after that
+            // agent's own id (`profile.name == agent.id`), specifically so
+            // `_acpx.profile` never requires setup for the common case
+            // (acpx-core/src/profile.rs's `ProfileSource` doc comment).
+            // Without this, a thread with a real `default_agent_id` but no
+            // hand-picked profile silently fell all the way through to
+            // acpx-server's own native/unmanaged-mode default backend
+            // (config.rs's bare `ACPX_BACKEND_CMD` fallback) instead of
+            // the agent the user actually configured -- the "profile name
+            // -> _acpx.profile" wiring the compose picker itself already
+            // relies on, just never reached for the auto-picked case.
             let profile_name = (!model.default_profile.is_empty()
                 && model.default_profile != "default")
-                .then(|| model.default_profile.clone());
+                .then(|| model.default_profile.clone())
+                .or_else(|| (!model.default_agent_id.is_empty()).then(|| model.default_agent_id.clone()));
             let permission_profile = (!model.permission_profile.is_empty()
                 && model.permission_profile != "default")
                 .then(|| model.permission_profile.clone());
@@ -1108,14 +1138,36 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.dev_mode = enabled;
             (vec![Effect::SaveDevMode { enabled }], vec![Dirty::Settings])
         }
-        SettingsMsg::McpServerCreate { name, command } => (
-            vec![Effect::McpServerCreate {
-                real_index: idx,
-                name,
-                command,
-            }],
-            vec![Dirty::Settings],
-        ),
+        // PROF-9 (`profile-only-backend-selection` plan): block MCP-server
+        // actions that would make NEW capabilities available to an agent
+        // that cannot serve them (create, or turning something on) when
+        // the selected thread's agent is Stale (PROF-7) or unauthenticated
+        // (PROF-8) -- so the user cannot drive MCP against an agent that
+        // cannot serve it. Deliberately NOT blocked: delete (cleanup must
+        // always be reachable, especially precisely when something is
+        // broken), turning something OFF (same reasoning), and
+        // authenticate (that flow is the MCP SERVER's own credentials --
+        // orthogonal to whether the ACP AGENT itself is reachable/
+        // authenticated, and blocking it here would trap a user trying to
+        // fix the MCP side first).
+        SettingsMsg::McpServerCreate { name, command } => {
+            if !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't add an MCP server: this thread's agent is stale or unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
+            (
+                vec![Effect::McpServerCreate {
+                    real_index: idx,
+                    name,
+                    command,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerDelete { name } => (
             vec![Effect::McpServerDelete {
                 real_index: idx,
@@ -1123,14 +1175,25 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             }],
             vec![Dirty::Settings],
         ),
-        SettingsMsg::McpServerEnabledChanged { name, enabled } => (
-            vec![Effect::McpServerEnabledChanged {
-                real_index: idx,
-                name,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
+        SettingsMsg::McpServerEnabledChanged { name, enabled } => {
+            if enabled && !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't enable this MCP server: this thread's agent is stale or \
+                     unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
+            (
+                vec![Effect::McpServerEnabledChanged {
+                    real_index: idx,
+                    name,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerAuthenticate { name } => (
             vec![Effect::McpServerAuthenticate {
                 real_index: idx,
@@ -1142,15 +1205,25 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             server_name,
             tool_name,
             enabled,
-        } => (
-            vec![Effect::McpServerToolEnabledChanged {
-                real_index: idx,
-                server_name,
-                tool_name,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
+        } => {
+            if enabled && !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't enable this tool: this thread's agent is stale or unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
+            (
+                vec![Effect::McpServerToolEnabledChanged {
+                    real_index: idx,
+                    server_name,
+                    tool_name,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::ProfileCreate {
             name,
             agent_id,
@@ -1820,6 +1893,11 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 let was_generating = matches!(thread.state, ThreadState::Loading);
                 thread.state = ThreadState::Idle;
                 thread.error = None;
+                // PROF-8: a turn that actually completed is proof the
+                // agent is authenticated now (retried successfully, or an
+                // operator fixed the profile) -- clear the persistent
+                // banner rather than requiring manual dismissal.
+                thread.unauthenticated = false;
                 thread.last_activity_time = Some(std::time::Instant::now());
                 crate::trace_host_input(format_args!(
                     "turn ended thread={} reason={:?}",
@@ -1860,6 +1938,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             crate::protocol_types::AgentEvent::Error(error) => {
                 thread.state = ThreadState::Error;
                 thread.error = Some(error.clone());
+                // PROF-8: same event, a second real per-thread signal --
+                // see `models::is_backend_requires_authentication_error`'s
+                // doc comment for why this is a substring match and what
+                // guards it.
+                thread.unauthenticated =
+                    crate::models::is_backend_requires_authentication_error(error);
                 dirty.push(Dirty::Error {
                     thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {
@@ -1880,7 +1964,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             | crate::protocol_types::AgentEvent::ConfigOptions(_)
             // PUI-003: the agent's slash commands flow through the per-frame
             // snapshot fold (thread.available_commands) like other caps.
-            | crate::protocol_types::AgentEvent::AvailableCommands(_) => {
+            | crate::protocol_types::AgentEvent::AvailableCommands(_)
+            // PROF-11: the agent's plan/todo list and any live session
+            // title flow through the same per-frame snapshot fold
+            // (thread.plan / thread.session_title).
+            | crate::protocol_types::AgentEvent::PlanUpdate(_)
+            | crate::protocol_types::AgentEvent::SessionInfoUpdate { .. } => {
                 dirty.push(Dirty::ThreadRow(target_index));
             }
         }
@@ -1941,6 +2030,15 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 if thread.session_id.is_none() {
                     if let Some(session_id) = row.session_id.clone() {
                         thread.session_id = Some(session_id);
+                        // PROF-7: same transition, real per-thread state
+                        // (not a render-time heuristic) -- row.agent_detected
+                        // is only ever Some(..) on exactly this fold (see
+                        // external_snapshot's own collection condition), so
+                        // this can't re-fire or clobber a later legitimate
+                        // state change.
+                        if row.agent_detected == Some(false) {
+                            thread.state = ThreadState::Stale;
+                        }
                         effects.push(Effect::PersistThread {
                             real_index: row.real_index,
                         });
@@ -2195,7 +2293,9 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             let capabilities_changed = switched_thread
                 || thread.session_modes != snapshot.session_modes
                 || thread.config_options != snapshot.config_options
-                || thread.usage != snapshot.usage;
+                || thread.usage != snapshot.usage
+                || thread.plan != snapshot.plan
+                || thread.session_title != snapshot.session_title;
 
             thread.transcript = snapshot.transcript;
             thread.transcript_keys = new_keys.clone();
@@ -2215,6 +2315,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.config_options = snapshot.config_options;
             thread.available_commands = snapshot.available_commands;
             thread.usage = snapshot.usage;
+            thread.plan = snapshot.plan;
+            thread.session_title = snapshot.session_title;
 
             if transcript_changed {
                 dirty.push(Dirty::MessagesDiff {
@@ -2656,36 +2758,71 @@ mod tests {
     }
 
     #[test]
-    fn new_thread_provider_matching_auto_detects_any_claude_family_agent_id() {
-        // Regression test: a real settings.global.json found live this
+    fn new_thread_provider_passes_any_configured_agent_id_through_unchanged() {
+        // PROF-1/PROF-2: a real settings.global.json found live this
         // session had default_agent_id: "claude-acp" (the real registry
         // agent id, plausibly from a picker backed by the agent catalog)
-        // rather than the short "claude" label this reducer's own
-        // gateway wiring uses everywhere else -- an exact-match list only
+        // rather than the short "claude" label this reducer's gateway
+        // wiring used to special-case -- an exact-match list only
         // recognizing "claude"/"claude-code" silently routed everything
-        // else, including "claude-acp", to codex. Substring-matching the
-        // claude family instead of enumerating every literal variant
-        // means a *hypothetical future* id ("Claude-Opus-Next", picked
-        // case-insensitively) is covered automatically too, without this
-        // match needing to grow a new arm every time one shows up.
-        for agent_id in [
-            "claude",
-            "claude-code",
-            "claude-acp",
-            "Claude-Opus-Next", // not a real id -- proves this generalizes, not just today's known set
-        ] {
+        // else, including "claude-acp", to codex. The fix is no longer a
+        // bigger substring-match list (that still special-cases exactly
+        // one family and mis-routes everyone else, e.g. "gemini-acp"
+        // would still have landed on codex); `provider` now passes
+        // `default_agent_id` through completely unchanged, matching
+        // `AgentBridge::resolve_provider_for`'s own pass-through
+        // contract, so any agent id -- claude family, gemini, or
+        // anything not yet invented -- reaches its own gateway with zero
+        // code changes here.
+        for agent_id in ["claude", "claude-code", "claude-acp", "gemini-acp", "Claude-Opus-Next"] {
             let mut model = model_with_threads(&[]);
             model.default_agent_id = agent_id.to_owned();
             let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
             assert!(
                 matches!(
                     effects.as_slice(),
-                    [Effect::NewThreadDeferred { provider, .. }] if provider == "claude"
+                    [Effect::NewThreadDeferred { provider, .. }] if provider == agent_id
                 ),
-                "default_agent_id {agent_id:?} must route new threads to the claude provider, \
+                "default_agent_id {agent_id:?} must pass through unchanged as the provider, \
                  got: {effects:?}"
             );
         }
+    }
+
+    #[test]
+    fn new_thread_with_no_default_profile_falls_back_to_default_agent_id_as_the_profile() {
+        // PROF-2: `Router::ensure_default_profiles_seeded` auto-fills one
+        // profile per installed registry agent, named after that agent's
+        // own id -- so once a real `default_agent_id` is configured but
+        // no profile has been hand-picked, using that same id as
+        // `_acpx.profile` resolves without any `profiles/create` setup.
+        // Before this, an unset `default_profile` always meant
+        // native/unmanaged mode (`profile_name: None`) even when a real
+        // default agent WAS configured, silently ignoring it for session
+        // binding purposes.
+        let mut model = model_with_threads(&[]);
+        model.default_agent_id = "codex-acp".to_owned();
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert_eq!(
+            model.threads[0].profile_name.as_deref(),
+            Some("codex-acp"),
+            "with no explicit default_profile, the configured default_agent_id must be used \
+             as the profile name"
+        );
+    }
+
+    #[test]
+    fn new_thread_with_neither_default_profile_nor_default_agent_id_stays_unprofiled() {
+        // The genuine "nothing configured at all" case: no known agent id
+        // to request a profile for, so the session must still open
+        // native/unmanaged (profile_name stays None) rather than guessing
+        // -- passing the bare gateway-routing fallback label
+        // (`NO_PROVIDER_REQUESTED_FALLBACK`, not a real registry agent
+        // id) as `_acpx.profile` would make session/new fail outright
+        // instead of degrading gracefully.
+        let mut model = model_with_threads(&[]);
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert_eq!(model.threads[0].profile_name, None);
     }
 
     #[test]
@@ -2762,11 +2899,19 @@ mod tests {
             }],
         );
         // PUI-014: the profile/permission are now read from the model thread at
-        // attach time, so the "default" sentinel must be filtered to None BEFORE
+        // attach time, so the "default" sentinel must be filtered out BEFORE
         // it is stored -- otherwise it would reach session/new at first send.
+        // PROF-2: the sentinel being filtered doesn't mean `profile_name`
+        // stays `None` here -- `default_agent_id` ("codex", a real,
+        // non-sentinel value) is the documented fallback once the
+        // explicit `default_profile` is filtered out, so the thread still
+        // gets a usable profile binding instead of silently falling back
+        // to native/unmanaged mode.
         assert_eq!(
-            model.threads[1].profile_name, None,
-            "a literal \"default\" profile must never be stored (would reach session/new)"
+            model.threads[1].profile_name.as_deref(),
+            Some("codex"),
+            "the literal \"default\" sentinel must never be stored, but default_agent_id is a \
+             real fallback and must still be used"
         );
         assert_eq!(
             model.threads[1].permission_profile, None,
@@ -3256,6 +3401,8 @@ mod tests {
                     session_modes: None,
                     config_options: Vec::new(),
                     available_commands: Vec::new(),
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3567,6 +3714,8 @@ mod tests {
             session_modes: None,
             config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
             usage: (0, 0),
         };
 
@@ -3777,6 +3926,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3860,6 +4011,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -3932,6 +4085,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()
@@ -4091,6 +4246,7 @@ mod tests {
             real_index: 4,
             thread_id: "durable-thread-4".to_owned(),
             session_id: None,
+            agent_detected: None,
             item: crate::ThreadItem {
                 name: "filtered".into(),
                 ..crate::ThreadItem::default()
@@ -4118,11 +4274,208 @@ mod tests {
         ));
     }
 
+    /// PROF-7: the actual state-setting deliverable -- when the frame fold
+    /// hydrates a just-attached thread's `session_id` (the same
+    /// `session_id.is_none()` transition `frame_thread_list_snapshot_uses_
+    /// durable_ids_as_row_keys` above exercises) and the row's
+    /// `agent_detected` says the bound agent was NOT found installed, the
+    /// thread's state becomes `ThreadState::Stale` -- a real per-thread
+    /// state written once at attach time, not a render-time heuristic.
+    #[test]
+    fn session_attach_with_agent_not_detected_marks_the_thread_stale() {
+        let mut model = model_with_threads(&["Restored Thread"]);
+        assert_eq!(model.threads[0].session_id, None);
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+
+        let row = crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("real-session-id".to_owned()),
+            agent_detected: Some(false),
+            item: crate::ThreadItem::default(),
+        };
+        update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.threads[0].session_id.as_deref(), Some("real-session-id"));
+        assert_eq!(
+            model.threads[0].state,
+            ThreadState::Stale,
+            "an attach whose agent_detected read false must mark the thread Stale"
+        );
+    }
+
+    /// Companion: the SAME transition, but `agent_detected: Some(true)`
+    /// (or `None`, e.g. native/unmanaged mode) must leave the thread's
+    /// state alone -- Stale is only ever set, never assumed.
+    #[test]
+    fn session_attach_with_agent_detected_or_unknown_does_not_mark_stale() {
+        for agent_detected in [Some(true), None] {
+            let mut model = model_with_threads(&["Restored Thread"]);
+            let row = crate::models::VisibleThreadItem {
+                real_index: 0,
+                thread_id: "thread-0".to_owned(),
+                session_id: Some("real-session-id".to_owned()),
+                agent_detected,
+                item: crate::ThreadItem::default(),
+            };
+            update(
+                &mut model,
+                Msg::Frame(FrameInput {
+                    thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                        visible_indices: vec![0],
+                        visible_thread_ids: vec!["thread-0".to_owned()],
+                        rows: vec![row],
+                        archived_flags: vec![],
+                    }),
+                    ..FrameInput::default()
+                }),
+            );
+            assert_eq!(
+                model.threads[0].state,
+                ThreadState::Idle,
+                "agent_detected={agent_detected:?} must never produce Stale"
+            );
+        }
+    }
+
+    /// PROF-9: creating an MCP server, or turning one (or a tool) ON, must
+    /// be blocked with a toast -- not sent as a real Effect -- when the
+    /// selected thread's agent is Stale or unauthenticated. Delete,
+    /// turning something OFF, and Authenticate must NOT be blocked (see
+    /// the doc comment on the McpServer* match arms in `update_settings`
+    /// for why).
+    #[test]
+    fn mcp_server_create_and_enable_are_blocked_for_a_stale_or_unauthenticated_thread() {
+        for make_unusable in [
+            (|t: &mut ThreadModel| t.state = ThreadState::Stale) as fn(&mut ThreadModel),
+            (|t: &mut ThreadModel| t.unauthenticated = true) as fn(&mut ThreadModel),
+        ] {
+            let mut model = model_with_threads(&["Thread"]);
+            make_unusable(&mut model.threads[0]);
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
+                    name: "srv".to_owned(),
+                    command: "cmd".to_owned(),
+                })),
+            );
+            assert!(
+                effects.is_empty(),
+                "McpServerCreate must not reach a real Effect when the agent is unusable"
+            );
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+            assert_eq!(model.toast_kind, "error");
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
+                    name: "srv".to_owned(),
+                    enabled: true,
+                })),
+            );
+            assert!(effects.is_empty(), "enabling must be blocked when the agent is unusable");
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+                    server_name: "srv".to_owned(),
+                    tool_name: "tool".to_owned(),
+                    enabled: true,
+                })),
+            );
+            assert!(
+                effects.is_empty(),
+                "enabling a tool must be blocked when the agent is unusable"
+            );
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+        }
+    }
+
+    /// Companion: a healthy thread (Idle, not unauthenticated) must never
+    /// be blocked, and delete / disable / authenticate must always pass
+    /// through regardless of thread health.
+    #[test]
+    fn mcp_server_actions_pass_through_for_a_healthy_thread_and_delete_disable_authenticate_always_pass() {
+        let mut model = model_with_threads(&["Thread"]);
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        assert!(!model.threads[0].unauthenticated);
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
+                name: "srv".to_owned(),
+                command: "cmd".to_owned(),
+            })),
+        );
+        assert!(matches!(effects.as_slice(), [Effect::McpServerCreate { .. }]));
+
+        // Now make the thread unusable and confirm delete/disable/authenticate
+        // still go through as real Effects.
+        model.threads[0].state = ThreadState::Stale;
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerDelete { name: "srv".to_owned() })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerDelete { .. }]),
+            "delete must always be reachable, even for an unusable agent"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
+                name: "srv".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerEnabledChanged { .. }]),
+            "turning a server OFF must always be reachable"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+                server_name: "srv".to_owned(),
+                tool_name: "tool".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerToolEnabledChanged { .. }]),
+            "turning a tool OFF must always be reachable"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerAuthenticate { name: "srv".to_owned() })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerAuthenticate { .. }]),
+            "authenticate is the MCP server's own credentials, orthogonal to agent health"
+        );
+    }
+
     fn visible_row(real_index: usize, thread_id: &str) -> crate::models::VisibleThreadItem {
         crate::models::VisibleThreadItem {
             real_index,
             thread_id: thread_id.to_owned(),
             session_id: None,
+            agent_detected: None,
             item: crate::ThreadItem::default(),
         }
     }
@@ -4550,6 +4903,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
             available_commands: vec![],
+            plan: vec![],
+            session_title: None,
                     usage: (0, 0),
                 }),
                 ..FrameInput::default()

@@ -20,59 +20,12 @@
 
 use panel_rust::gateway_actor::spawn_acpx_thread;
 use panel_rust::protocol_types::AgentEvent;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::Duration;
 
-fn acpx_server_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
-
-/// Same TOCTOU-safe retry wrapper as `gateway_e2e_test.rs`'s copy (see
-/// its doc comment) -- duplicated rather than shared, these are
-/// independent test binaries.
-fn spawn_acpx_server_with_retry(configure: impl Fn(&mut Command, u16)) -> (Child, String) {
-    for attempt in 0..5 {
-        let port = free_port();
-        let mut command = Command::new(acpx_server_bin());
-        configure(&mut command, port);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-        let mut reachable = false;
-        while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                reachable = true;
-                break;
-            }
-            if let Ok(Some(_status)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        if reachable {
-            return (child, format!("http://127.0.0.1:{port}"));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-        }
-    }
-    panic!(
-        "acpx-server never became reachable after 5 fresh-port attempts -- \
-         this looks like more than ordinary port contention"
-    );
-}
+mod common;
+#[allow(unused_imports)]
+use common::{acpx_server_bin, free_port, register_stand_in_backend, spawn_acpx_server_with_retry};
 
 struct GatewayProcess {
     child: Child,
@@ -80,21 +33,23 @@ struct GatewayProcess {
 }
 
 impl GatewayProcess {
-    /// Spawns a real `acpx-server` with `backend_script`'s contents as
-    /// its `ACPX_BACKEND_CMD` (written to a temp file first --
-    /// `ACPX_BACKEND_CMD` is parsed by naive whitespace-splitting, see
-    /// `acpx-server/src/config.rs`, so an inline multi-word script
-    /// cannot be passed directly).
     async fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
         let script_path = script_dir.join("stand_in_backend.sh");
         std::fs::write(&script_path, backend_script).expect("write stand-in backend script");
-        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+        let db_path = script_dir.join("acpx.sqlite3");
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
+        let admin_token_for_env = admin_token.clone();
+        let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-                .env("ACPX_DEFAULT_AGENT_ID", "terminal-relay-agent")
+                .env("ACPX_DB_PATH", &db_path)
+                .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+                .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
+        register_stand_in_backend(admin_port, &admin_token, "terminal-relay-agent", &script_path)
+            .await;
         GatewayProcess { child, base_url }
     }
 }

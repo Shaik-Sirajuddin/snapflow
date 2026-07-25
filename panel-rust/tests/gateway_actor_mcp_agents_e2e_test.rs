@@ -43,57 +43,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-fn acpx_server_bin() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
-}
+mod common;
+use common::{free_port, register_stand_in_backend, spawn_acpx_server_with_retry};
 
 fn snapflowd_mcp_bin() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/snapflowd-mcp")
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local_addr").port()
-}
-
-/// Same TOCTOU-safe retry wrapper as the sibling e2e test files (see
-/// `gateway_e2e_test.rs`'s copy for the full root-cause doc comment).
-fn spawn_acpx_server_with_retry(configure: impl Fn(&mut Command, u16)) -> (Child, String) {
-    for attempt in 0..5 {
-        let port = free_port();
-        let mut command = Command::new(acpx_server_bin());
-        configure(&mut command, port);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().expect("spawn real acpx-server binary for test");
-
-        let deadline = std::time::Instant::now() + Duration::from_millis(3000);
-        let mut reachable = false;
-        while std::time::Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                reachable = true;
-                break;
-            }
-            if let Ok(Some(_status)) = child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-        if reachable {
-            return (child, format!("http://127.0.0.1:{port}"));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-        }
-    }
-    panic!(
-        "acpx-server never became reachable after 5 fresh-port attempts -- \
-         this looks like more than ordinary port contention"
-    );
 }
 
 struct GatewayProcess {
@@ -102,16 +56,22 @@ struct GatewayProcess {
 }
 
 impl GatewayProcess {
-    fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
+    async fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
         let script_path = script_dir.join("stand_in_backend.sh");
         std::fs::write(&script_path, backend_script).expect("write stand-in backend script");
-        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+        let db_path = script_dir.join("acpx.sqlite3");
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
+        let admin_token_for_env = admin_token.clone();
+        let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-                .env("ACPX_DEFAULT_AGENT_ID", "mcp-agents-test-agent")
+                .env("ACPX_DB_PATH", &db_path)
+                .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+                .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
+        register_stand_in_backend(admin_port, &admin_token, "mcp-agents-test-agent", &script_path).await;
         GatewayProcess { child, base_url }
     }
 }
@@ -169,7 +129,7 @@ async fn wait_for_message_containing(
 #[tokio::test]
 async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     // Starts empty -- no MCP servers registered yet on a fresh gateway.
@@ -217,7 +177,7 @@ async fn mcp_servers_crud_round_trips_through_the_thread_actor() {
 #[tokio::test]
 async fn profile_referencing_a_central_mcp_server_reaches_the_real_backend_session_new() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     handle
@@ -273,7 +233,7 @@ async fn profile_referencing_a_central_mcp_server_reaches_the_real_backend_sessi
 #[tokio::test]
 async fn agent_catalog_list_status_and_install_reach_the_real_registry() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     // `agents/list` draws from `acpx-registry`'s live-fetch-or-bundled-
@@ -326,7 +286,7 @@ async fn agent_catalog_list_status_and_install_reach_the_real_registry() {
 #[tokio::test]
 async fn profiles_crud_round_trips_through_the_thread_actor() {
     let script_dir = tempfile::tempdir().expect("script tempdir");
-    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path());
+    let gateway = GatewayProcess::spawn(MCP_OBSERVING_BACKEND_SCRIPT, script_dir.path()).await;
     let handle = spawn_acpx_thread(gateway.base_url.clone());
 
     // Starts with no profiles named after this test's fixture -- a

@@ -21,10 +21,11 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CloseSessionRequest,
     CloseSessionResponse, ContentBlock, ContentChunk, CancelNotification, DeleteSessionRequest,
     DeleteSessionResponse, InitializeResponse, ListSessionsResponse, LoadSessionResponse,
-    NewSessionResponse, PromptResponse, PermissionOption, PermissionOptionKind,
-    RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-    ResumeSessionResponse, SessionId, SessionInfo, SessionNotification, SessionUpdate,
-    StopReason, TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+    NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptResponse,
+    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest,
+    ResumeSessionRequest, ResumeSessionResponse, SessionId, SessionInfo, SessionInfoUpdate,
+    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
 use std::collections::HashMap;
@@ -261,6 +262,39 @@ async fn main() -> Result<()> {
                             )),
                         ));
                     }
+                }
+                // PROF-11 e2e marker (same lowercase-plain-word convention
+                // as `"slow "` below): a `"plan "`-prefixed prompt gets a
+                // real `plan` session/update (two entries, one completed
+                // one in-progress -- exercising both `PlanEntryStatus`
+                // values a single notification could plausibly carry) and
+                // a real `session_info_update` pushing a live title,
+                // BEFORE the usual thought/tool_call/message-chunk turn --
+                // gated behind this marker (not sent on every turn) so it
+                // doesn't perturb the message-count/ordering assumptions
+                // every other existing e2e test already depends on.
+                if text.starts_with("plan ") {
+                    let _ = connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::Plan(Plan::new(vec![
+                            PlanEntry::new(
+                                "Read the file",
+                                PlanEntryPriority::High,
+                                PlanEntryStatus::Completed,
+                            ),
+                            PlanEntry::new(
+                                "Fix the bug",
+                                PlanEntryPriority::Medium,
+                                PlanEntryStatus::InProgress,
+                            ),
+                        ])),
+                    ));
+                    let _ = connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::SessionInfoUpdate(
+                            SessionInfoUpdate::new().title("Fixing the login bug"),
+                        ),
+                    ));
                 }
                 // Lowercase, punctuation-free marker: the real host XTEST
                 // driver (`host_e2e_driver.py`) taps unshifted keysyms one

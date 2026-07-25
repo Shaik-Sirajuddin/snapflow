@@ -468,6 +468,33 @@ impl<'a> ExternalSnapshotSource<'a> {
                         row.description = "Starting new thread...".into();
                     }
                 }
+                let new_session_id = self
+                    .panel
+                    .bridge
+                    .as_ref()
+                    .and_then(|bridge| bridge.thread_binding(item.real_index))
+                    .map(|binding| binding.session_id);
+                // PROF-7: only probe agents/list at the exact frame a
+                // session-attach transition (None -> Some) is about to be
+                // folded -- matches update.rs's own `if
+                // thread.session_id.is_none() { ... }` fold condition, so
+                // this never runs on an already-attached thread's every
+                // subsequent frame (agents/list is a real RPC).
+                let already_attached = model_snapshot
+                    .threads
+                    .get(item.real_index)
+                    .is_some_and(|thread| thread.session_id.is_some());
+                let agent_detected = if !already_attached && new_session_id.is_some() {
+                    self.panel.bridge.as_ref().and_then(|bridge| {
+                        models::agent_detected_for_profile(
+                            &bridge.list_profiles(item.real_index),
+                            &bridge.list_agents(item.real_index),
+                            &row.profile_name,
+                        )
+                    })
+                } else {
+                    None
+                };
                 models::VisibleThreadItem {
                     real_index: item.real_index,
                     thread_id: thread_ids
@@ -478,12 +505,8 @@ impl<'a> ExternalSnapshotSource<'a> {
                     // binding so the frame fold can hydrate
                     // ThreadModel::session_id once a background attach
                     // resolves.
-                    session_id: self
-                        .panel
-                        .bridge
-                        .as_ref()
-                        .and_then(|bridge| bridge.thread_binding(item.real_index))
-                        .map(|binding| binding.session_id),
+                    session_id: new_session_id,
+                    agent_detected,
                     item: row,
                 }
             })
@@ -606,6 +629,8 @@ impl<'a> ExternalSnapshotSource<'a> {
             usage: bridge.thread_usage(real_idx),
             config_options: bridge.config_options(real_idx),
             available_commands: bridge.available_commands(real_idx),
+            plan: bridge.plan(real_idx),
+            session_title: bridge.session_title(real_idx),
         })
     }
 

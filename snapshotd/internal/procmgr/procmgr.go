@@ -38,6 +38,13 @@ import (
 	"snapshotd/internal/registry"
 )
 
+// liveInstanceHealthTimeout bounds the socket-health probe Launch performs
+// against an already-registered instance before deciding to reuse it --
+// separate from ConnectTimeout (which bounds waiting for a *freshly spawned*
+// child to come up); reusing an existing instance should be fast, not
+// subject to a cold-start-sized timeout.
+const liveInstanceHealthTimeout = 500 * time.Millisecond
+
 // ErrBinaryNotFound is returned by Launch when the configured child binary
 // does not exist on disk. sap-rust (the child binary this points at) is
 // developed independently and may simply not be built yet in this
@@ -104,6 +111,31 @@ type Manager struct {
 
 	mu   sync.Mutex
 	cmds map[string]*exec.Cmd // instance id -> running command, for Close()
+
+	// launchMu serializes the "is a live instance already registered for
+	// this project" check together with the spawn that follows it, per
+	// project -- PISO-9's concurrency requirement. A single Manager-wide
+	// mutex would also work but would serialize unrelated projects'
+	// launches against each other for no reason; keying by project id
+	// keeps concurrent launches of DIFFERENT projects independent while
+	// still making "check-then-spawn" atomic for the SAME project, which
+	// is the actual race being closed (two goroutines both seeing "no live
+	// instance yet" and both spawning). sync.Map, not a plain map+mutex,
+	// because entries are created lazily and never removed (a launched-once
+	// project keeps its lock slot for the Manager's lifetime -- cheap, and
+	// simpler than reference-counted cleanup for what is at most one entry
+	// per project ever launched).
+	launchMu sync.Map // project id -> *sync.Mutex
+}
+
+// lockProject acquires (creating if necessary) the per-project launch lock
+// and returns the unlock function. See launchMu's own doc comment for why
+// this is keyed per-project rather than being one Manager-wide lock.
+func (m *Manager) lockProject(projectID string) func() {
+	lockAny, _ := m.launchMu.LoadOrStore(projectID, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
 }
 
 // New constructs a Manager with sane defaults for unset fields.
@@ -172,24 +204,84 @@ func randomShortID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// findLiveInstance returns the newest actually-healthy "ready" instance for
+// projectID, or nil if none exists. "Actually healthy" means both PID-alive
+// and socket-responsive -- a registry row can say "ready" while the process
+// behind it is long gone (crashed with no reconciliation sweep having run
+// since), and PISO-9 requires such a dead-but-registered row not to block a
+// genuine relaunch. Any "ready" row found NOT actually healthy along the way
+// is marked crashed here (self-healing, same check reconcile.go's own
+// Reconciler performs at startup), so a dead row does not keep failing this
+// check forever on every subsequent launch attempt.
+func (m *Manager) findLiveInstance(projectID string) (*registry.ProcessInstance, error) {
+	instances, err := m.Reg.ListProcessInstancesByProject(projectID) // newest first
+	if err != nil {
+		return nil, err
+	}
+	for i := range instances {
+		row := instances[i]
+		if row.Status != registry.StatusReady {
+			continue
+		}
+		if health.PIDAlive(row.PID) && health.SocketResponsive(row.SocketPath, liveInstanceHealthTimeout) {
+			return &row, nil
+		}
+		// Registered ready but not actually alive: mark crashed so it stops
+		// shadowing a real relaunch attempt on every future Launch call too.
+		_ = m.Reg.UpdateProcessInstanceStatus(row.ID, registry.StatusCrashed)
+		_ = m.Reg.Audit(row.ProjectID, registry.AuditCrash, "launch dedup check: registered ready but not actually alive")
+	}
+	return nil, nil
+}
+
 // Launch resolves the child binary, spawns it with the SAP env vars set,
 // poll-connects to its socket to confirm it is listening, and persists a
-// ProcessInstance row.
-func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptions) (registry.ProcessInstance, error) {
+// ProcessInstance row -- UNLESS a healthy instance for this project already
+// exists, in which case that instance is returned unchanged and nothing is
+// spawned (PISO-9: "a project's instance existence is a single choice, and
+// it is live exactly once, in exactly one mode" -- daemon.launch is a
+// request for the project to be live, not a command to spawn a process).
+// This also gives "headful wins" for free: an existing instance is reused
+// regardless of which mode (headless/headful) THIS call asked for, so a
+// headless agent launch against a project the user already has open
+// headful never shadows or replaces that headful instance with a second,
+// competing process. The reverse (an existing headless instance, a headful
+// request arriving later) is handled the same non-destructive way -- reused,
+// not killed-and-replaced -- since upgrading a live instance's mode by
+// killing it is a materially riskier operation the brief didn't ask for;
+// the returned Reused flag + the instance's own Headless field tell the
+// caller it got an existing instance rather than the fresh one it may have
+// expected, without this crate ever destroying a running process based on
+// an inference.
+//
+// The existence check and the spawn it may fall through to are one atomic
+// section per project (see lockProject/launchMu) specifically so two
+// concurrent Launch calls for the SAME project cannot both observe "no live
+// instance" and both spawn.
+func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptions) (registry.ProcessInstance, bool, error) {
+	unlock := m.lockProject(projectID)
+	defer unlock()
+
+	if live, err := m.findLiveInstance(projectID); err != nil {
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: checking for a live instance: %w", err)
+	} else if live != nil {
+		return *live, true, nil
+	}
+
 	if _, err := os.Stat(m.BinPath); err != nil {
 		if os.IsNotExist(err) {
-			return registry.ProcessInstance{}, fmt.Errorf("%w: %s", ErrBinaryNotFound, m.BinPath)
+			return registry.ProcessInstance{}, false, fmt.Errorf("%w: %s", ErrBinaryNotFound, m.BinPath)
 		}
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: stat %s: %w", m.BinPath, err)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: stat %s: %w", m.BinPath, err)
 	}
 
 	if err := os.MkdirAll(m.RunDir, 0o755); err != nil {
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: mkdir run dir: %w", err)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: mkdir run dir: %w", err)
 	}
 
 	token, err := randomToken()
 	if err != nil {
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: generate token: %w", err)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: generate token: %w", err)
 	}
 
 	// Instance/socket ids are a short random hex string, not e.g. the full
@@ -199,13 +291,13 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// portion short matters in practice, not just in theory.
 	shortID, err := randomShortID()
 	if err != nil {
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: generate instance id: %w", err)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: generate instance id: %w", err)
 	}
 	instanceID := shortID
 	sockPath := filepath.Join(m.RunDir, shortID+".sock")
 	const maxSockPathLen = 100 // conservative margin under the ~108-byte sun_path limit
 	if len(sockPath) > maxSockPathLen {
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: socket path %q exceeds Unix domain socket path length limits; configure a shorter RunDir", sockPath)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: socket path %q exceeds Unix domain socket path length limits; configure a shorter RunDir", sockPath)
 	}
 
 	// The real Qt binary reads $HOME to locate its QSettings config
@@ -226,7 +318,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	// problems.
 	qtHomeDir := filepath.Join(m.RunDir, "homes", projectID)
 	if err := os.MkdirAll(qtHomeDir, 0o755); err != nil {
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: mkdir qt home dir: %w", err)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: mkdir qt home dir: %w", err)
 	}
 
 	// Deliberately exec.Command, not exec.CommandContext(ctx, ...): ctx here
@@ -282,12 +374,12 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	var logFile *os.File
 	if m.LogDir != "" {
 		if err := os.MkdirAll(m.LogDir, 0o755); err != nil {
-			return registry.ProcessInstance{}, fmt.Errorf("procmgr: mkdir log dir: %w", err)
+			return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: mkdir log dir: %w", err)
 		}
 		logPath := filepath.Join(m.LogDir, instanceID+".log")
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 		if err != nil {
-			return registry.ProcessInstance{}, fmt.Errorf("procmgr: open log file %s: %w", logPath, err)
+			return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: open log file %s: %w", logPath, err)
 		}
 		logFile = f
 		// Both streams into one file: the real child's own diagnostics
@@ -305,7 +397,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 	}
 
 	if err := cmd.Start(); err != nil {
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: start child: %w", err)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: start child: %w", err)
 	}
 
 	if !m.waitForSocket(ctx, sockPath) {
@@ -314,7 +406,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		if logFile != nil {
 			_ = logFile.Close()
 		}
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: child did not open %s within %s", sockPath, m.ConnectTimeout)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: child did not open %s within %s", sockPath, m.ConnectTimeout)
 	}
 
 	pi := registry.ProcessInstance{
@@ -325,6 +417,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		Token:            token,
 		DaemonInstanceID: m.DaemonInstanceID,
 		Status:           registry.StatusReady,
+		Headless:         opts.Headless,
 	}
 	if err := m.Reg.CreateProcessInstance(&pi); err != nil {
 		_ = cmd.Process.Kill()
@@ -332,7 +425,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		if logFile != nil {
 			_ = logFile.Close()
 		}
-		return registry.ProcessInstance{}, fmt.Errorf("procmgr: persist instance: %w", err)
+		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: persist instance: %w", err)
 	}
 	_ = m.Reg.Audit(projectID, registry.AuditLaunch, "launched pid="+fmt.Sprint(pi.PID))
 
@@ -349,7 +442,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		}
 	}()
 
-	return pi, nil
+	return pi, false, nil
 }
 
 func (m *Manager) waitForSocket(ctx context.Context, path string) bool {

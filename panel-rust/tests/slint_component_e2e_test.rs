@@ -27,6 +27,10 @@ fn settle_sidebar_expand(panel: &ChatPanel) {
 fn sample_open_thread(name: &str) -> ThreadItem {
     ThreadItem {
         name: name.into(),
+        // Added to ThreadItem after this fixture was written; the field is
+        // required, so this target stopped compiling. It went unnoticed
+        // because `cargo test --lib` and single-target runs never build it.
+        relative_time: "now".into(),
         status: "idle".into(),
         busy: false,
         open: true,
@@ -253,6 +257,12 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     // A streamed transcript projection changes the message model beneath the
     // composer. It must never focus the new message/card and interrupt input.
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        can_send_now: false,
+        tool_group_len: 0,
         kind: "agent".into(),
         text: "streamed response".into(),
         markdown_lines: Default::default(),
@@ -322,6 +332,14 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     assert_eq!(selected_permission_option.take(), "reject");
 
     panel.set_terminals(ModelRc::new(VecModel::from(vec![TerminalItem {
+        title: "".into(),
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        last_command: "".into(),
+        started_at: "".into(),
+        active: false,
         terminal_id: "build-42".into(),
         output: "building\n".into(),
         truncated: false,
@@ -336,6 +354,14 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     assert_eq!(expanded_terminal.take(), "build-42");
 
     panel.set_expanded_terminal(TerminalItem {
+        title: "".into(),
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        last_command: "".into(),
+        started_at: "".into(),
+        active: false,
         terminal_id: "build-42".into(),
         output: "building\n".into(),
         truncated: false,
@@ -579,6 +605,11 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         fs_enabled: true,
     }])));
     panel.set_available_mcp_servers(ModelRc::new(VecModel::from(vec![McpServerOption {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        removable: false,
         name: "media-fs".into(),
         command: "node server.js".into(),
         status_line: "".into(),
@@ -1123,6 +1154,11 @@ fn thread_search_box_accepts_real_typed_keystrokes_and_dispatches_search_changed
     panel.window().set_size(slint::LogicalSize::new(900.0, 700.0));
     panel.set_sidebar_expanded(true);
     panel.set_threads(ModelRc::new(VecModel::from(vec![ThreadItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        relative_time: "now".into(),
         name: "Fix timeline crash".into(),
         status: "idle".into(),
         busy: false,
@@ -1522,6 +1558,12 @@ fn thinking_block_is_collapsed_by_default_and_expands_on_click() {
     }
 
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        can_send_now: false,
+        tool_group_len: 0,
         kind: "thinking".into(),
         text: "I should check the timeline first".into(),
         expanded: false,
@@ -1542,6 +1584,12 @@ fn thinking_block_is_collapsed_by_default_and_expands_on_click() {
     // Simulate the reducer flipping expanded (same path ChromeMsg::
     // ToggleExpanded takes) and prove the control label swaps to Collapse.
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        can_send_now: false,
+        tool_group_len: 0,
         kind: "thinking".into(),
         text: "I should check the timeline first".into(),
         expanded: true,
@@ -1707,9 +1755,11 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
     // Real markdown-lines path (not just fallback text): bold run mixed
     // with plain so MarkdownView's per-run HorizontalLayout is exercised.
     let lines = VecModel::from(vec![panel_rust::MarkdownLine {
+                plain_text: "".into(),
         kind: "p".into(),
         runs: ModelRc::new(VecModel::from(vec![
             panel_rust::MarkdownRun {
+                link: "".into(),
                 text: "Hello ".into(),
                 bold: false,
                 italic: false,
@@ -1717,6 +1767,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 strike: false,
             },
             panel_rust::MarkdownRun {
+                link: "".into(),
                 text: "agent".into(),
                 bold: true,
                 italic: false,
@@ -1724,6 +1775,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 strike: false,
             },
             panel_rust::MarkdownRun {
+                link: "".into(),
                 text: " body".into(),
                 bold: false,
                 italic: false,
@@ -1736,6 +1788,12 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
         code_block_id: -1,
     }]);
     panel.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
+        // Fields added to the UI struct after this fixture was written.
+        // This target had rotted out of compiling entirely; it is not built
+        // by `cargo test --lib` nor by any single-target run, so the drift
+        // accumulated silently.
+        can_send_now: false,
+        tool_group_len: 0,
         kind: "agent".into(),
         text: "Hello agent body".into(),
         markdown_lines: ModelRc::new(lines),

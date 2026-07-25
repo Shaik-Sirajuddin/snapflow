@@ -814,8 +814,59 @@ fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
             let commands = parse_available_commands(session_update.get("availableCommands")?);
             Some(AgentEvent::AvailableCommands(commands))
         }
+        // PROF-11: the agent's self-reported execution plan/todo list.
+        // Wire field is `entries: [{content, priority, status}]` -- the
+        // stable, always-replace `Plan` shape, not the unstable
+        // `plan_update`/`plan_removed` partial-mutation variants (this
+        // crate does not enable ACP's `unstable_plan_operations`
+        // feature, so those are never sent). An entries array that's
+        // present-but-empty still produces `Some(vec![])`, meaningfully
+        // different from "no plan notification at all" for a UI
+        // deciding whether to show a plan panel.
+        "plan" => {
+            let entries = parse_plan_entries(session_update.get("entries")?);
+            Some(AgentEvent::PlanUpdate(entries))
+        }
+        // PROF-11: a live session title/updated_at push. Both wire
+        // fields are ACP's 3-state `MaybeUndefined` (present-with-value
+        // / present-null / field-absent); collapsed here to a plain
+        // `Option<String>` (absent and explicit-null both read `None`)
+        // -- see `AgentEvent::SessionInfoUpdate`'s doc comment for why
+        // that's an accepted simplification for now.
+        "session_info_update" => Some(AgentEvent::SessionInfoUpdate {
+            title: session_update
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+            updated_at: session_update
+                .get("updatedAt")
+                .and_then(|t| t.as_str())
+                .map(str::to_string),
+        }),
         _ => None,
     }
+}
+
+/// PROF-11: parse a `plan` session/update's `entries` array into
+/// [`PlanEntryInfo`]s. Same tolerant convention as
+/// `parse_available_commands`: skip any entry missing `content`,
+/// `priority`, or `status` rather than failing the whole parse.
+fn parse_plan_entries(value: &serde_json::Value) -> Vec<crate::protocol_types::PlanEntryInfo> {
+    value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(crate::protocol_types::PlanEntryInfo {
+                        content: entry.get("content")?.as_str()?.to_string(),
+                        priority: entry.get("priority")?.as_str()?.to_string(),
+                        status: entry.get("status")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// PUI-003: parse an `available_commands_update`'s `availableCommands`
@@ -1786,14 +1837,96 @@ mod capability_parsing_tests {
         }
     }
 
+    // PROF-11: this used to assert `"plan"` parsed to None -- that was the
+    // real gap this phase closed (see `parse_capability_update_recognizes_
+    // plan` below), so the fixture here now uses a genuinely unrecognized
+    // tag instead of a since-implemented one, to keep proving the
+    // fallthrough `_ => None` arm actually still exists.
     #[test]
     fn parse_capability_update_ignores_unrelated_session_updates() {
         let update = json!({
             "jsonrpc": "2.0",
             "method": "session/update",
-            "params": {"sessionId": "s1", "update": {"sessionUpdate": "plan"}}
+            "params": {"sessionId": "s1", "update": {"sessionUpdate": "some_future_unrecognized_update"}}
         });
         assert!(parse_capability_update(&update).is_none());
+    }
+
+    #[test]
+    fn parse_capability_update_recognizes_plan() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "plan",
+                "entries": [
+                    {"content": "Read the file", "priority": "high", "status": "completed"},
+                    {"content": "Fix the bug", "priority": "medium", "status": "in_progress"}
+                ]
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::PlanUpdate(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].content, "Read the file");
+                assert_eq!(entries[0].priority, "high");
+                assert_eq!(entries[0].status, "completed");
+                assert_eq!(entries[1].status, "in_progress");
+            }
+            other => panic!("expected PlanUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_plan_with_empty_entries_is_some_empty_not_none() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "plan",
+                "entries": []
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::PlanUpdate(entries) => assert!(entries.is_empty()),
+            other => panic!("expected PlanUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_recognizes_session_info_update() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "session_info_update",
+                "title": "Fixing the login bug",
+                "updatedAt": "2026-07-25T00:00:00Z"
+            }}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::SessionInfoUpdate { title, updated_at } => {
+                assert_eq!(title.as_deref(), Some("Fixing the login bug"));
+                assert_eq!(updated_at.as_deref(), Some("2026-07-25T00:00:00Z"));
+            }
+            other => panic!("expected SessionInfoUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_capability_update_session_info_update_with_no_fields_is_still_some() {
+        let update = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {"sessionUpdate": "session_info_update"}}
+        });
+        match parse_capability_update(&update).expect("parses") {
+            AgentEvent::SessionInfoUpdate { title, updated_at } => {
+                assert_eq!(title, None);
+                assert_eq!(updated_at, None);
+            }
+            other => panic!("expected SessionInfoUpdate, got {other:?}"),
+        }
     }
 
     #[test]

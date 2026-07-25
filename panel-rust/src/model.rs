@@ -66,6 +66,19 @@ pub struct ThreadModel {
     pub state: ThreadState,
     pub last_activity_time: Option<std::time::Instant>,
     pub error: Option<String>,
+    /// PROF-8 (`profile-only-backend-selection` plan): the agent is
+    /// reachable but its backend advertised ACP `authMethods` with no
+    /// `auth_method_id` configured for the session's profile -- acpx-core
+    /// rejects `session/new` outright rather than proceeding
+    /// (`RouterError::BackendRequiresAuthentication`). Distinct from
+    /// `error`/`ThreadState::Error`: this is a persistent condition the
+    /// chat top bar shows as a yellow strip (not a dismissible red
+    /// failure banner), and it clears itself once a turn actually
+    /// completes, not on manual dismissal. See
+    /// `models::is_backend_requires_authentication_error`'s doc comment
+    /// for how it's detected and why that detection is fragile by
+    /// necessity.
+    pub unauthenticated: bool,
     /// Whether any *visible agent output* (an agent message or tool call
     /// -- deliberately not thinking/thought chunks) has arrived since
     /// this thread's latest prompt was sent. Lets `update()`'s
@@ -110,6 +123,19 @@ pub struct ThreadModel {
     pub available_commands: Vec<AvailableCommandInfo>,
     /// Phase 18: live (used, size) token usage for the context ring.
     pub usage: (i64, i64),
+    /// PROF-11: the agent's most recently pushed execution plan/todo
+    /// list, from a live ACP `plan` session/update. Empty means no plan
+    /// notification has arrived yet (or the backend never sends one),
+    /// same capability-gating convention as `config_options`/
+    /// `available_commands` above.
+    pub plan: Vec<crate::protocol_types::PlanEntryInfo>,
+    /// PROF-11: the most recently pushed live session title, from a
+    /// `session_info_update` session/update. Deliberately separate from
+    /// the durable, user-editable `display_name` above -- see
+    /// `crate::agent_bridge::ThreadSlot::session_title`'s doc comment for
+    /// why an agent-pushed title must never silently overwrite what the
+    /// user typed.
+    pub session_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -264,6 +290,7 @@ impl Default for ThreadModel {
             state: ThreadState::Idle,
             last_activity_time: Some(std::time::Instant::now()),
             error: None,
+            unauthenticated: false,
             agent_content_this_turn: false,
             send_queue: SendQueue::default(),
             compose_draft: String::new(),
@@ -284,6 +311,8 @@ impl Default for ThreadModel {
             config_options: Vec::new(),
             available_commands: Vec::new(),
             usage: (0, 0),
+            plan: Vec::new(),
+            session_title: None,
         }
     }
 }

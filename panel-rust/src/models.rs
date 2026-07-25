@@ -13,8 +13,8 @@ use crate::protocol_types::{ChatMessage, ConfigOptionInfo, MessageKind, SessionM
 use crate::skills_state::SkillEntry;
 use crate::{
     AgentCatalogEntry, DropdownEntry, LocalTerminalItem, MarkdownLine, MarkdownRun,
-    McpServerOption, McpToolOption, MessageItem, ProfileOption, SkillOption, TerminalItem,
-    ThreadItem,
+    McpServerOption, McpToolOption, MessageItem, PlanEntryItem, ProfileOption, SkillOption,
+    TerminalItem, ThreadItem,
 };
 use slint::platform::Key;
 use slint::{ModelRc, VecModel};
@@ -138,6 +138,18 @@ pub enum ThreadState {
     Loading,
     Cancelling,
     Error,
+    /// PROF-7 (`profile-only-backend-selection` plan): a real per-thread
+    /// state, not a render-time heuristic -- set once, at the moment a
+    /// thread's session attach completes (see `external_snapshot`'s
+    /// `agent_detected` collection and `update.rs`'s fold of it), when the
+    /// thread's bound profile names an agent id that acpx's own
+    /// `agents/list` reports as NOT `Installed`/`InstalledNoSession`
+    /// (typically a restored thread whose agent is no longer present on
+    /// this machine). A thread with no bound profile (native/unmanaged
+    /// mode) is never marked Stale -- there is no registry agent id to
+    /// check it against, so "can't determine" fails open rather than
+    /// guessing.
+    Stale,
 }
 
 impl ThreadState {
@@ -147,6 +159,7 @@ impl ThreadState {
             ThreadState::Loading => "loading",
             ThreadState::Cancelling => "cancelling",
             ThreadState::Error => "error",
+            ThreadState::Stale => "stale",
         }
     }
 }
@@ -991,7 +1004,77 @@ pub struct VisibleThreadItem {
     /// into `ThreadModel::session_id` (add_thread attaches async now, so
     /// no `SessionAttached` fold ever carries it).
     pub session_id: Option<String>,
+    /// PROF-7: whether the thread's bound profile's agent id is
+    /// `Installed`/`InstalledNoSession` per a real `agents/list` catalog
+    /// read, collected ONLY at the same session-attach-completion
+    /// transition `session_id` above is collected for (never every frame
+    /// -- `agents/list` is a real RPC, and every other frame this stays
+    /// `None`, meaning "no new information this frame", not "not
+    /// detected"). `None` also covers native/unmanaged-mode threads (no
+    /// bound profile to check) and the profile/catalog lookup failing to
+    /// resolve -- both fail open rather than guessing Stale.
+    pub agent_detected: Option<bool>,
     pub item: ThreadItem,
+}
+
+/// PROF-7: resolves whether `profile_name`'s bound agent id is genuinely
+/// present on this machine, from real `profiles/list` + `agents/list`
+/// reads (never a guess). Pure so it's directly testable without a real
+/// bridge: `None` (fail open, not "not detected") when `profile_name` is
+/// empty (native/unmanaged mode has no agent id to check), when no
+/// profile with that name is found (a real profiles/list race/lag, not
+/// evidence of anything), or when the profile's `agent_id` doesn't appear
+/// in the catalog at all (an incomplete/still-loading catalog read, same
+/// reasoning). `Some(false)` only when the catalog genuinely reports the
+/// bound agent id as something other than `Installed`/`InstalledNoSession`.
+pub fn agent_detected_for_profile(
+    profiles: &[crate::gateway_actor::ProfileSummary],
+    agents: &[crate::protocol_types::AgentCatalogEntry],
+    profile_name: &str,
+) -> Option<bool> {
+    if profile_name.is_empty() {
+        return None;
+    }
+    let agent_id = &profiles.iter().find(|p| p.name == profile_name)?.agent_id;
+    let entry = agents.iter().find(|a| &a.id == agent_id)?;
+    Some(matches!(
+        entry.status,
+        crate::protocol_types::AgentStatus::Installed
+            | crate::protocol_types::AgentStatus::InstalledNoSession
+    ))
+}
+
+/// PROF-8 (`profile-only-backend-selection` plan): detects whether an
+/// `AgentEvent::Error` message text is acpx-core's
+/// `RouterError::BackendRequiresAuthentication` (acpx-core/src/router.rs)
+/// -- "the agent is reachable but not authenticated" -- rather than any
+/// other session/new or turn failure.
+///
+/// **This is fragile by design, not by oversight, and the team decided to
+/// accept that rather than reach into acpx-core right now.** acpx-server's
+/// own transport maps EVERY `RouterError` variant to the same generic
+/// JSON-RPC code -32000 (see acpx-server/src/transport/http.rs's
+/// `json_rpc_error`) -- there is no distinct code or structured field for
+/// "needs auth" to match on instead, so the exact `Display` text of
+/// `RouterError::BackendRequiresAuthentication` ("backend requires
+/// authentication before session/new") is the only signal that exists.
+/// Nothing keeps that string in sync between the two crates -- a future
+/// acpx-core wording change breaks this silently, with no compile error
+/// anywhere. `agent_bridge.rs`'s
+/// `open_session_fails_with_a_detectable_authentication_required_message`
+/// test is the tripwire for that: it runs a real acpx-server against a
+/// real backend that advertises `authMethods` with no `auth_method_id`
+/// configured, and asserts the REAL error text this function is matching
+/// against still contains the substring below -- so a wording drift fails
+/// that test loudly instead of this detector silently going dark.
+///
+/// A real acpx-core fix (a distinct error code/field) belongs in the same
+/// class as PROF-14's acpx-side fix: deferred, not attempted here, because
+/// acpx-core/acpx-server are mid-rewrite in the uncommitted
+/// agents-install-runtime worktree and touching them now risks a
+/// guaranteed merge conflict for no benefit today.
+pub fn is_backend_requires_authentication_error(message: &str) -> bool {
+    message.contains("backend requires authentication before session/new")
 }
 
 /// Builds the sidebar's thread-list items from `names`/`state`
@@ -1026,6 +1109,7 @@ pub fn build_thread_items<N: AsRef<str>>(
             // Post-populated by real_index in external_snapshot, same as
             // provider/model.
             session_id: None,
+            agent_detected: None,
             item: ThreadItem {
                 name: name.as_ref().into(),
                 relative_time: String::from("now").into(),
@@ -1259,8 +1343,23 @@ pub fn to_profile_option_rows(
 /// `ProfileSelected` / session open keep working); `value` carries the
 /// agent/provider id for model filtering. Label prefers `agent_id`.
 /// `current` is the thread's `profile_name` (maps to that profile's agent).
+///
+/// PROF-10 (`profile-only-backend-selection` plan): also filters OUT
+/// providers whose agent is not actually live, using the exact same
+/// liveness marker PROF-7's `agent_detected_for_profile` reads --
+/// `agents` (a real `agents/list` catalog) reporting the profile's
+/// `agent_id` as `Installed`/`InstalledNoSession`. Without this, the
+/// picker listed every profile regardless of whether its agent was ever
+/// installed, letting a user pick a provider session/new can't open.
+/// Same fail-open posture as PROF-7 throughout: a profile with no
+/// `agent_id` (native/unmanaged mode, nothing to check) or whose
+/// `agent_id` isn't in `agents` yet (an incomplete/still-loading catalog
+/// read, not evidence the agent is missing) is kept, not hidden -- only a
+/// catalog hit that's genuinely NOT `Installed`/`InstalledNoSession`
+/// excludes the row.
 pub fn to_profile_dropdown_entries(
     profiles: &[ProfileOption],
+    agents: &[crate::protocol_types::AgentCatalogEntry],
     current: &str,
 ) -> ModelRc<DropdownEntry> {
     let current_agent = profiles
@@ -1269,10 +1368,29 @@ pub fn to_profile_dropdown_entries(
         .map(|p| p.agent_id.to_string())
         .unwrap_or_default();
 
+    let is_live = |agent_id: &str| -> bool {
+        if agent_id.is_empty() {
+            return true;
+        }
+        agents
+            .iter()
+            .find(|a| a.id == agent_id)
+            .is_none_or(|entry| {
+                matches!(
+                    entry.status,
+                    crate::protocol_types::AgentStatus::Installed
+                        | crate::protocol_types::AgentStatus::InstalledNoSession
+                )
+            })
+    };
+
     let mut seen_agents = std::collections::HashSet::<String>::new();
     let mut items: Vec<DropdownEntry> = Vec::new();
     for p in profiles {
         let agent = p.agent_id.to_string();
+        if !is_live(&agent) {
+            continue;
+        }
         let key = if agent.is_empty() {
             p.name.to_string()
         } else {
@@ -1602,6 +1720,23 @@ pub fn to_agent_catalog_entry_rows(
         .collect()
 }
 
+/// PROF-11: builds the compose-header plan panel's row model from a real
+/// `plan` session/update (`AgentBridge::plan`). Order is preserved
+/// verbatim -- ACP's `Plan.entries` is already the agent's own intended
+/// display order, not something this layer should re-sort.
+pub fn to_plan_entry_rows(
+    entries: Vec<crate::protocol_types::PlanEntryInfo>,
+) -> Vec<PlanEntryItem> {
+    entries
+        .into_iter()
+        .map(|entry| PlanEntryItem {
+            content: entry.content.into(),
+            priority: entry.priority.into(),
+            status: entry.status.into(),
+        })
+        .collect()
+}
+
 /// Builds the `LocalTerminalItem` Slint property from a real
 /// `AgentBridge::local_terminal_snapshot` result -- `None` (no terminal
 /// open for this thread) becomes the all-default/`open: false` struct,
@@ -1662,6 +1797,109 @@ pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use slint::Model;
+
+    // PROF-7: agent_detected_for_profile is the pure decision function the
+    // real per-thread Stale state is built on -- exercised directly here so
+    // its fail-open cases (empty profile, unknown profile, agent id absent
+    // from the catalog) don't depend on a real bridge/gateway to prove.
+    fn catalog_entry(
+        id: &str,
+        status: crate::protocol_types::AgentStatus,
+    ) -> crate::protocol_types::AgentCatalogEntry {
+        crate::protocol_types::AgentCatalogEntry {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            version: String::new(),
+            status,
+            enabled: true,
+        }
+    }
+
+    fn profile_summary(name: &str, agent_id: &str) -> crate::gateway_actor::ProfileSummary {
+        crate::gateway_actor::ProfileSummary {
+            name: name.to_owned(),
+            agent_id: agent_id.to_owned(),
+            allow_terminal_access: false,
+            allow_fs_access: false,
+        }
+    }
+
+    #[test]
+    fn agent_detected_for_profile_true_when_catalog_says_installed() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::Installed,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_false_when_catalog_says_not_installed() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::NotInstalled,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(false),
+            "a real registry hit that isn't Installed/InstalledNoSession must read as not \
+             detected"
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_installed_no_session_still_counts_as_detected() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::InstalledNoSession,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_on_empty_profile_name() {
+        // Native/unmanaged mode: no bound profile, so no agent id to check
+        // against the registry at all -- must never guess Stale.
+        assert_eq!(agent_detected_for_profile(&[], &[], ""), None);
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_when_profile_name_not_found() {
+        let profiles = [profile_summary("other-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::NotInstalled,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "missing-profile"),
+            None,
+            "a profiles/list that hasn't caught up yet must fail open, not read as not detected"
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_when_agent_id_absent_from_catalog() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        // Catalog present but doesn't (yet) include this agent id -- an
+        // incomplete/still-loading read, not evidence the agent is gone.
+        let agents = [catalog_entry(
+            "claude-acp",
+            crate::protocol_types::AgentStatus::Installed,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            None
+        );
+    }
 
     // PUI-015: the built-in snapshotd daemon row is only produced when the
     // daemon is reachable, is non-removable, and names the same /mcp
@@ -2322,7 +2560,10 @@ mod transcript_model_tests {
                 fs_enabled: false,
             },
         ];
-        let entries = to_profile_dropdown_entries(&profiles, "work");
+        // Empty catalog: PROF-10's fail-open posture (catalog not loaded
+        // yet is not evidence an agent is missing), so nothing is filtered
+        // here -- exercised on its own below.
+        let entries = to_profile_dropdown_entries(&profiles, &[], "work");
         assert_eq!(entries.row_count(), 2); // one per agent
         assert_eq!(entries.row_data(0).unwrap().label.as_str(), "codex-acp");
         assert_eq!(entries.row_data(0).unwrap().value.as_str(), "codex-acp");
@@ -2357,6 +2598,71 @@ mod transcript_model_tests {
         // header + one value
         assert_eq!(filtered.row_count(), 2);
         assert_eq!(filtered.row_data(1).unwrap().value.as_str(), "codex-acp/gpt-5");
+    }
+
+    /// PROF-10: a provider whose agent the catalog genuinely reports as
+    /// NOT `Installed`/`InstalledNoSession` must not appear in the
+    /// compose-bar picker at all -- but a profile with no `agent_id`
+    /// (native/unmanaged mode) and one whose `agent_id` isn't in the
+    /// catalog yet (still-loading read) must both still be listed, same
+    /// fail-open posture as `agent_detected_for_profile`.
+    #[test]
+    fn provider_dropdown_hides_providers_the_catalog_reports_as_not_live() {
+        let profiles = vec![
+            ProfileOption {
+                name: "work".into(),
+                agent_id: "codex-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "gone".into(),
+                agent_id: "vanished-acp".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "still-loading".into(),
+                agent_id: "unknown-to-catalog-yet".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+            ProfileOption {
+                name: "native".into(),
+                agent_id: "".into(),
+                terminal_enabled: true,
+                fs_enabled: true,
+            },
+        ];
+        // Inlined rather than reusing `models::tests::catalog_entry` --
+        // this test lives in `transcript_model_tests`, a sibling module
+        // that helper is private to.
+        let agent_catalog_entry = |id: &str, status: crate::protocol_types::AgentStatus| {
+            crate::protocol_types::AgentCatalogEntry {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                version: String::new(),
+                status,
+                enabled: true,
+            }
+        };
+        let agents = [
+            agent_catalog_entry("codex-acp", crate::protocol_types::AgentStatus::Installed),
+            agent_catalog_entry(
+                "vanished-acp",
+                crate::protocol_types::AgentStatus::NotInstalled,
+            ),
+        ];
+        let entries = to_profile_dropdown_entries(&profiles, &agents, "work");
+        let labels: Vec<String> = (0..entries.row_count())
+            .filter_map(|i| entries.row_data(i))
+            .map(|e| e.label.to_string())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["codex-acp".to_owned(), "unknown-to-catalog-yet".to_owned(), "native".to_owned()],
+            "vanished-acp must be hidden; still-loading and native must fail open and stay visible"
+        );
     }
 
     fn model_option(values: &[(&str, &str)]) -> Vec<ConfigOptionInfo> {
@@ -2447,6 +2753,7 @@ mod transcript_model_tests {
                 real_index,
                 thread_id: format!("thread:{real_index}"),
                 session_id: None,
+                agent_detected: None,
                 item: ThreadItem::default(),
             })
             .collect()

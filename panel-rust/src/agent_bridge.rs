@@ -124,13 +124,25 @@ pub struct ThreadBinding {
     pub session_id: String,
 }
 
+/// Builds bare `ThreadSpec`s from thread names alone, with no real
+/// per-thread provider binding -- every spec gets
+/// [`NO_PROVIDER_REQUESTED_FALLBACK`]. Real production startup never
+/// calls this: `lib.rs`'s cold-start path builds `ThreadSpec`s directly
+/// (persisted records' own provider, or `default_agent_id` from
+/// settings), and `AgentBridge::new_with_thread_specs` takes those
+/// directly. This helper only backs the name-only test/dev
+/// constructors ([`AgentBridge::new`], [`AgentBridge::new_with_gateway_
+/// url`], [`AgentBridge::new_with_gateway_resolver_and_cache_dir`]),
+/// whose own tests don't care which literal provider string a
+/// synthesized thread gets (most point every provider at one shared
+/// test gateway) -- a test that DOES care about provider identity
+/// builds real `ThreadSpec`s with explicit providers instead.
 fn specs_for_names(thread_names: &[&str]) -> Vec<ThreadSpec> {
     thread_names
         .iter()
-        .enumerate()
-        .map(|(idx, name)| ThreadSpec {
+        .map(|name| ThreadSpec {
             display_name: (*name).to_owned(),
-            provider: provider_for_index(idx).to_owned(),
+            provider: NO_PROVIDER_REQUESTED_FALLBACK.to_owned(),
             session_id: None,
             profile_name: None,
             project_path: None,
@@ -208,6 +220,23 @@ struct ThreadSlot {
     /// persisted (the agent re-advertises on session start), so it is not
     /// part of the runtime snapshot.
     available_commands: Mutex<Vec<crate::protocol_types::AvailableCommandInfo>>,
+    /// PROF-11: the agent's most recently pushed execution plan/todo
+    /// list, from a live `plan` session/update
+    /// ([`AgentEvent::PlanUpdate`]'s doc comment). Replaced wholesale on
+    /// each push (ACP's `Plan` is always-the-complete-plan, never a
+    /// delta); not persisted -- same "the agent re-advertises, this is
+    /// ephemeral capability state" reasoning as `available_commands`
+    /// above.
+    plan: Mutex<Vec<crate::protocol_types::PlanEntryInfo>>,
+    /// PROF-11: the most recently pushed live session title, from a
+    /// `session_info_update` session/update
+    /// ([`AgentEvent::SessionInfoUpdate`]'s doc comment). Deliberately
+    /// separate from the durable, user-editable `ThreadModel::
+    /// display_name` -- an agent-pushed title is a live signal, not a
+    /// rename the user asked for, so it must never silently overwrite
+    /// what the user typed. `None` until the backend sends one; not
+    /// persisted, same ephemeral-capability-state reasoning as `plan`.
+    session_title: Mutex<Option<String>>,
     /// Phase 2 step 3 (chat-panel-production-ui/execution-plan.md):
     /// typed, merged conversation view -- `history` above stays the
     /// raw, unmerged, append-only `ChatMessage` feed (JSONL cache
@@ -342,6 +371,22 @@ pub struct AgentBridge {
     // multi-URL-per-provider scenario stays representable without a
     // schema change, even though provider and URL are 1:1 today.
     gateways: Arc<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    // PROF-1: the same per-provider URL resolver the constructor used to
+    // seed `gateway_urls` up front, kept around so a provider nobody
+    // asked for at construction time (any real agent id, not just a
+    // hardcoded pair) can still be provisioned lazily the first time a
+    // thread actually requests it -- see `ensure_gateway_provisioned`.
+    // Never Send/Sync-bounded because it is only ever called from `&mut
+    // self` methods on this bridge's own owning thread, never moved into
+    // a spawned async task itself (only the resulting URL is).
+    resolve_gateway: Box<dyn Fn(&str) -> Result<String, BridgeError>>,
+    // PROF-1: this bridge's own default provider for `add_thread`-family
+    // calls that request no provider at all -- the first thread spec's
+    // already-resolved provider (itself derived upstream from a real
+    // profile's agent id, never an index-based guess). `None` for a
+    // bridge that started with zero threads; see
+    // `NO_PROVIDER_REQUESTED_FALLBACK` for that narrower case.
+    default_provider: Option<String>,
     #[allow(dead_code)] // kept alive for its Drop / for future direct use
     store: Option<JsonlStore>,
     // Client-local PTY terminals -- v1 keeps this to at most one per
@@ -581,6 +626,24 @@ fn store_capability_event(slot: &ThreadSlot, ev: &AgentEvent) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = commands.clone();
         }
+        AgentEvent::PlanUpdate(entries) => {
+            *slot.plan.lock().unwrap_or_else(|e| e.into_inner()) = entries.clone();
+        }
+        AgentEvent::SessionInfoUpdate { title, .. } => {
+            // Only `title` is kept -- `updated_at` has no reader today
+            // (see `AgentEvent::SessionInfoUpdate`'s doc comment); a
+            // `None` title (field absent/explicit-null on the wire) is
+            // deliberately NOT stored as a clear, since this collapsed
+            // representation can't tell "no change" from "agent cleared
+            // it" apart -- clearing a live title on an ambiguous signal
+            // would be worse than leaving a stale one showing.
+            if let Some(title) = title {
+                *slot
+                    .session_title
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(title.clone());
+            }
+        }
         _ => {}
     }
 }
@@ -770,47 +833,21 @@ fn slug(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Which acpx-gateway-backed provider a UI thread is bound to. v1's fixed
-/// four-thread list (`THREAD_NAMES` in `lib.rs`) alternates codex/claude
-/// by index, so both providers get real, concurrent, isolated coverage
-/// rather than only ever exercising one -- the multi-provider
-/// verification requirement from `chat-panel-acpx-gateway-integration.md`
-/// Phase 3 bullet 5 applies to the *real* running panel, not only its
-/// test suite.
-pub fn provider_for_index(idx: usize) -> &'static str {
-    if idx % 2 == 0 {
-        "codex"
-    } else {
-        "claude"
-    }
-}
-
-/// TRANSITIONAL (`thread_provider_model_binding_fix`): normalizes a
-/// caller-supplied provider/agent identifier to one of the two gateway
-/// keys this bridge currently provisions ("codex"/"claude"). Exists
-/// only because those keys are NOT real acpx registry ids
-/// (registry.fallback.json defines `codex-acp`/`claude-acp`/`gemini`),
-/// so a registry id arriving from settings (a real
-/// settings.global.json carried `default_agent_id: "claude-acp"`) needs
-/// mapping -- and the previous exact-match check silently DROPPED such
-/// ids and fell back to the index-parity rotation, binding an
-/// explicitly-claude thread to codex with no error.
-///
-/// The agreed end-state (recorded in the
-/// worktree-consolidation-and-provider-binding plan) removes this
-/// function entirely: agent-agnostic selection per the ACP protocol
-/// through acpx -- one gateway, thread providers ARE registry agent ids
-/// from `agents/list`, and per-session agent selection goes through
-/// acpx's native `profiles/create {agent_id}` + `session/new
-/// {_acpx.profile}` (proven live by the e2e harness's agent-driven
-/// export phase), with no per-provider string handling anywhere.
-pub fn normalize_provider(id: &str) -> &'static str {
-    if id.to_ascii_lowercase().contains("claude") {
-        "claude"
-    } else {
-        "codex"
-    }
-}
+/// PROF-1 (`profile-only-backend-selection` plan): the one explicit,
+/// documented fallback provider used ONLY when nothing else can name a
+/// real agent id -- a genuinely empty bridge with no persisted thread
+/// records and no `default_agent_id` configured in settings, or a
+/// test/dev call site that only supplies bare thread names (no real
+/// per-thread provider binding at all, see [`specs_for_names`]). This
+/// replaces the old `provider_for_index` index-parity rotation
+/// (alternating "codex"/"claude" by thread position) and the old
+/// `normalize_provider` two-bucket collapse -- both silently mapped
+/// *any* third agent id onto one of those two labels. There is no
+/// longer a rotation or a normalization step: a requested or persisted
+/// agent id now flows through to gateway resolution completely as-is
+/// (see [`AgentBridge::resolve_provider_for`]), and this constant is
+/// reached only in the narrow "nothing to go on yet" case.
+pub const NO_PROVIDER_REQUESTED_FALLBACK: &str = "codex";
 
 /// Resolves the dev-checkout `acpx-server` binary path: `RUI_ACPX_SERVER_BIN`
 /// env override, else a path relative to this crate's own
@@ -1065,9 +1102,8 @@ fn snapflowd_mcp_servers_entry(
 ) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     // Whether MCP-free, filesystem-only skill delivery is safe for
-    // `provider` (an ACP registry agent id or its short-form alias, see
-    // `normalize_provider`'s own TRANSITIONAL doc comment) now lives in
-    // skills_manager::agent_registry (memory/acpx/gen/plans/acpx-skills/
+    // `provider` (an ACP registry agent id or its short-form alias) now
+    // lives in skills_manager::agent_registry (memory/acpx/gen/plans/acpx-skills/
     // README.md#agent-skill-convention-registry) -- true only for
     // vendor_ids a live test actually proved, currently just "codex"/
     // "codex-acp" (panel-rust/tests/skills_manager_live_discovery_e2e_test.rs,
@@ -1200,91 +1236,44 @@ fn probe_http_endpoint(addr: &str, path: &str) -> bool {
     matches!(stream.read(&mut buf), Ok(n) if n > 0)
 }
 
-/// Resolves the mock backend agent binary the locally-spawned gateway
-/// should proxy to: `RUI_ACP_AGENT_CMD` env override (a real
-/// ACP-compliant agent binary/command) if set, else the dev-checkout
-/// `rui-mock-agent` binary this crate itself builds (`src/bin/
-/// mock_agent.rs`, ported directly from the former `rui-acp-client`
-/// crate's own `[[bin]]` of the same name -- Phase 2, chat-panel-
-/// production-ui/execution-plan.md) *only if `RUI_USE_DEV_MOCK_AGENT=1`
-/// is also set* -- the acpx-gateway's own default backend for dev/test.
-///
-/// Returns `None` (previously always returned a `String`, unconditionally)
-/// when neither applies -- a real production install: no operator has set
-/// `RUI_ACP_AGENT_CMD`, and `<CARGO_MANIFEST_DIR>/target/debug/
-/// rui-mock-agent` is a compile-time-baked dev-checkout path that doesn't
-/// exist on an end user's machine at all. The old code returned that
-/// nonexistent path anyway, and [`spawn_gateway_process`] set
-/// `ACPX_BACKEND_CMD` to it *unconditionally* -- so a real release install
-/// with no operator-started acpx-server never reached a real agent on this
-/// autospawn path at all: acpx-server would try to exec a garbage path
-/// instead of falling back to its own real, working default
-/// (`npx -y @agentclientprotocol/codex-acp@1.1.2`, see
-/// `acpx-server/src/config.rs`'s `ServerConfig::from_env`). Found via
-/// `/verify-impl`'s production-build lens (this session); see
-/// designa-v2-plan-order.meta.json's skill_injection_verification/
-/// runtime_and_edge_pass `verified[]` entries for the original finding.
-///
-/// **Second real bug this closes** (found live against a real running
-/// instance, not just by re-reading the code): checking only
-/// `dev_mock_agent.is_file()` is not actually a "is this a dev/test
-/// context" signal -- that debug binary exists on disk in ANY checkout
-/// that has ever run `cargo build`/`cargo test` once, including a
-/// checkout being used specifically to verify real end-to-end acpx
-/// behavior. That meant every new (non-resumed) chat session silently
-/// talked to the mock agent instead of the real gateway default, with no
-/// way to tell short of reading source -- exactly the "new sessions don't
-/// go through real acpx" symptom observed live. Now gated behind an
-/// explicit `RUI_USE_DEV_MOCK_AGENT=1` opt-in so the file's mere existence
-/// is never sufficient by itself.
-///
-/// `RUI_TEST_MODE=1` is the single source of truth gating this entire
-/// function: neither `RUI_ACP_AGENT_CMD` nor `RUI_USE_DEV_MOCK_AGENT` has
-/// any effect without it, even if set. Found live: an ordinary interactive
-/// dev launch (a person running `./snapflow` directly, not a test harness)
-/// has no reason to ever route a real chat session to a mock/overridden
-/// backend, and a leaked/inherited env var from an unrelated shell or CI
-/// context was enough to silently do exactly that with no error, no log,
-/// and no way to tell short of reading source -- the same class of bug as
-/// the dev_mock_agent-existence issue above, just one layer up. Automated
-/// tests and explicit local mock-agent workflows must set `RUI_TEST_MODE=1`
-/// themselves; a plain dev/production launch must never need to.
-fn resolve_backend_agent_command() -> Option<String> {
-    if std::env::var("RUI_TEST_MODE").as_deref() != Ok("1") {
-        return None;
-    }
-    if let Ok(cmd) = std::env::var("RUI_ACP_AGENT_CMD") {
-        return Some(cmd);
-    }
-    if std::env::var("RUI_USE_DEV_MOCK_AGENT").as_deref() != Ok("1") {
-        return None;
-    }
-    let dev_mock_agent =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent");
-    if dev_mock_agent.is_file() {
-        return Some(dev_mock_agent.to_string_lossy().into_owned());
-    }
-    None
-}
-
-/// `ServerConfig::from_env`'s own `ACPX_BACKEND_CMD` fallback
-/// (`acpx-server/src/config.rs`) is unconditionally `codex-acp` -- it has
-/// no notion of `provider`/`ACPX_DEFAULT_AGENT_ID` at all, that field is
-/// display-only. So when [`resolve_backend_agent_command`] found no
-/// explicit override, a "claude" persona gateway was *still* silently
-/// spawning the real `codex-acp` adapter as its backend: found live
-/// (chat-panel-live-fixes.md phase 4) via a running instance's actual
-/// spawned child-process list, not by re-reading the code. Mirrors the
-/// per-provider default `acpx/scripts/openhands-acpx-claude.sh` already
-/// documents and tests for exactly this integration point.
-fn default_backend_command_for_provider(provider: &str) -> Option<&'static str> {
-    match provider {
-        "claude" => Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1"),
-        // "codex" (and anything else) already matches acpx-server's own
-        // built-in default -- nothing to override.
-        _ => None,
-    }
-}
+// PROF-3 (`profile-only-backend-selection` plan): `resolve_backend_agent_
+// command`/`default_backend_command_for_provider` used to live here,
+// computing a value for `spawn_gateway_process` to write into
+// ACPX_BACKEND_CMD -- an exported-command-string bootstrap backend, the
+// exact shape this plan eliminates. Removed along with that write (see
+// `spawn_gateway_process`'s own comment for why a real profile now covers
+// the case `default_backend_command_for_provider("claude")` used to
+// patch). If either is reintroduced for a legitimate PROF-4 test-harness
+// need, keep both historical bugs their doc comments recorded in mind:
+// (a) unconditionally writing a compile-time dev-checkout path meant a
+// real release install with no operator-started acpx-server never
+// reached a real agent at all; (b) `dev_mock_agent.is_file()` is not a
+// "dev/test context" signal by itself -- that debug binary exists in any
+// checkout that has ever run `cargo build`/`cargo test`, including one
+// verifying real end-to-end acpx behavior.
+//
+// KNOWN ACCEPTED GAP, not an oversight: with no `_acpx.profile` requested
+// AND nothing configured anywhere (no persisted thread record, no
+// `default_agent_id` in settings -- the genuine blank-slate case), a
+// thread still opens in native/unmanaged mode, which falls through to
+// the autospawned acpx-server's own built-in default (codex-only, see
+// `acpx-server/src/config.rs`'s bare `ACPX_BACKEND_CMD` fallback). This
+// was investigated and deliberately left as-is: auto-picking a live
+// `profiles/list` entry at session-open time (the obvious panel-side
+// fix) was rejected because `acpx-core::detect::detect` marks an
+// npx-distributed registry agent "Installed" purely from `node`/`npm`
+// being on `PATH`, which is true on essentially any dev/CI machine --
+// that would make session selection silently PATH/registry-order
+// dependent, including in this crate's own tests. The real fix belongs
+// one layer down, in acpx-server's own native-mode default resolution
+// (make it consult its own seeded-profile result instead of a hardcoded
+// string) -- tracked as PROF-14, a separate cross-repo phase, blocked on
+// an unrelated worktree (agents-install-runtime, PROF-13) merging first
+// since it already has uncommitted changes to the exact acpx-core/
+// acpx-server files that fix would touch, including the
+// ACPX_BACKEND_CMD -> ACPX_DEFAULT_ACP_COMMAND rename. Do not "fix" this
+// gap by reintroducing an env-var write here -- that is the one thing
+// this whole plan exists to prevent.
 
 /// Reads `CODEX_API_KEY` out of the Codex CLI's own on-disk login
 /// (`~/.codex/auth.json`, overrideable via `ACPX_CODEX_AUTH_FILE`), the
@@ -1814,30 +1803,35 @@ fn spawn_gateway_process(
             cmd.stderr(std::process::Stdio::null());
         }
     }
-    // Only set ACPX_BACKEND_CMD when we have a real command to point it
-    // at (an explicit override, or a dev-checkout mock binary confirmed
-    // to actually exist) -- leaving it unset lets acpx-server fall back
-    // to its own real, working default (a genuine LLM-backed ACP adapter)
-    // instead of being pointed at a nonexistent path. See
-    // resolve_backend_agent_command's doc comment for the full story.
-    if let Some(backend_cmd) = resolve_backend_agent_command() {
-        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
-    } else if let Some(backend_cmd) = default_backend_command_for_provider(provider) {
-        // No explicit override: acpx-server's own built-in default is
-        // codex-only (see default_backend_command_for_provider's doc
-        // comment), so a non-codex provider needs its real adapter
-        // spelled out here instead of silently getting codex-acp anyway.
-        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
-    }
-    // Independent of which ACPX_BACKEND_CMD branch above fired --
-    // found live via /verify-impl-style subagent review: this used to be
-    // an else-if off the branches above, so an explicit RUI_ACP_AGENT_CMD/
-    // RUI_USE_DEV_MOCK_AGENT override (still legitimately codex-acp
-    // underneath, e.g. an operator pinning a specific npx version) would
-    // silently skip this auth wiring and reintroduce the original
-    // -32000 auth error with no diagnostic. A real backend-command
-    // override for a non-codex adapter is harmless to check here too --
-    // the provider == "codex" guard keeps it a no-op in that case.
+    // PROF-3 (`profile-only-backend-selection` plan): this autospawned
+    // gateway process's own ACPX_BACKEND_CMD is now NEVER set here.
+    // Previously this branched on an explicit RUI_ACP_AGENT_CMD/
+    // RUI_USE_DEV_MOCK_AGENT dev override, else a hardcoded
+    // `npx claude-agent-acp` string for `provider == "claude"` (acpx-
+    // server's own bare default is codex-only) -- both are exactly the
+    // "an exported command string defines the backend" shape this plan
+    // exists to eliminate. A bootstrap backend for a non-default agent
+    // must now come from a real, resolvable profile instead: PROF-2
+    // already made any thread with a real configured `default_agent_id`
+    // carry a matching `_acpx.profile`, which resolves through
+    // `Router::resolve_profile` -> `crate::launch::build_launch_env`
+    // (acpx-core) -- a path that reads the real registry-listed spawn
+    // command for that agent id directly, with no dependency on this
+    // gateway process's own env at all. So leaving ACPX_BACKEND_CMD
+    // unset here no longer reintroduces the old "claude" native-mode
+    // bug (`default_backend_command_for_provider`'s own removed doc
+    // comment): that gap is only reachable when NOTHING is configured
+    // anywhere, and in that genuine blank-slate case `provider` is
+    // already `NO_PROVIDER_REQUESTED_FALLBACK` ("codex"), which matches
+    // acpx-server's own bare default with nothing left to override.
+    //
+    // Test harnesses that legitimately need an arbitrary/mock backend
+    // command (`RUI_ACP_AGENT_CMD`/`RUI_USE_DEV_MOCK_AGENT`, or a
+    // `TestGateway` spawned directly in this module's own tests) are
+    // out of this phase's scope -- they never called through this
+    // function to begin with (`TestGateway` builds its own `Command`),
+    // and any equivalent production-adjacent dev workflow this removed
+    // is a PROF-4 concern, not reintroduced here.
     if provider == "codex" {
         // acpx-server's own default already resolves to the real
         // codex-acp adapter; give it a noninteractive path to this
@@ -2368,7 +2362,9 @@ fn spawn_event_forwarder(
                 AgentEvent::SessionModes(_)
                 | AgentEvent::CurrentModeChanged(_)
                 | AgentEvent::ConfigOptions(_)
-                | AgentEvent::AvailableCommands(_) => {
+                | AgentEvent::AvailableCommands(_)
+                | AgentEvent::PlanUpdate(_)
+                | AgentEvent::SessionInfoUpdate { .. } => {
                     store_capability_event(&slot_for_task, &ev);
                     persist_runtime_snapshot(store_for_task.as_ref(), &slot_for_task);
                 }
@@ -2632,7 +2628,7 @@ impl AgentBridge {
     }
 
     /// The real constructor both of the above delegate to: a per-provider
-    /// gateway-URL resolver closure (`provider_for_index`'s output ->
+    /// gateway-URL resolver closure (a `ThreadSpec::provider` agent id ->
     /// already-provisioned `base_url`, matching [`provision_gateway`]'s
     /// own return shape -- callers that want auto-spawn-if-unreachable
     /// pass `provision_gateway` itself, as [`Self::new`] does; callers
@@ -2643,7 +2639,7 @@ impl AgentBridge {
     /// silently picking a directory the caller didn't ask for.
     pub fn new_with_gateway_resolver_and_cache_dir(
         thread_names: &[&str],
-        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError>,
+        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError> + 'static,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, BridgeError> {
         let specs = specs_for_names(thread_names);
@@ -2656,9 +2652,17 @@ impl AgentBridge {
 
     fn new_with_thread_specs_and_gateway_resolver_and_cache_dir(
         thread_specs: &[ThreadSpec],
-        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError>,
+        resolve_gateway: impl Fn(&str) -> Result<String, BridgeError> + 'static,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self, BridgeError> {
+        // Boxed immediately so the same resolver this constructor uses to
+        // seed `gateway_urls` up front can also be kept on the struct for
+        // later lazy provisioning (`ensure_gateway_provisioned`) -- one
+        // resolver, one code path, whether a provider is known now or
+        // only requested later.
+        let resolve_gateway: Box<dyn Fn(&str) -> Result<String, BridgeError>> =
+            Box::new(resolve_gateway);
+        let default_provider = thread_specs.first().map(|spec| spec.provider.clone());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2692,18 +2696,16 @@ impl AgentBridge {
                 resolved_urls.insert(provider.clone(), resolve_gateway(&provider)?);
             }
         }
-        // Always resolve both known providers (see provider_for_index), not
-        // just whichever ones happen to appear in thread_specs -- a cold
-        // start with zero initial threads (an empty specs slice is valid
-        // and normal, not just a test fixture) previously left gateway_urls
-        // completely empty, so add_thread_with_profile_and_provider's own
-        // gateway_urls lookup failed for every single new thread with no
-        // existing thread ever able to bootstrap a provider into the map.
-        for provider in ["codex", "claude"] {
-            if !resolved_urls.contains_key(provider) {
-                resolved_urls.insert(provider.to_string(), resolve_gateway(provider)?);
-            }
-        }
+        // PROF-1: a cold start with zero initial threads (an empty specs
+        // slice is valid and normal, not just a test fixture) now leaves
+        // `resolved_urls` genuinely empty rather than pre-seeded with a
+        // hardcoded ["codex", "claude"] pair -- that pair silently assumed
+        // those were the only two agent ids that would ever exist. Every
+        // subsequent `add_thread`-family call resolves (and, if new,
+        // connects) its own provider's gateway on demand instead, via
+        // `resolve_provider_for` -> `ensure_gateway_provisioned`, using
+        // this exact same `resolve_gateway` closure (boxed onto the
+        // struct above) rather than a second, different code path.
 
         // Gateway connection is intentionally deferred. Cached transcript and
         // interaction state below must be observable before any remote
@@ -2819,6 +2821,8 @@ impl AgentBridge {
                 session_modes: Mutex::new(runtime_snapshot.session_modes),
                 config_options: Mutex::new(runtime_snapshot.config_options),
                 available_commands: Mutex::new(Vec::new()),
+                plan: Mutex::new(Vec::new()),
+                session_title: Mutex::new(None),
                 attachment: Mutex::new(AttachmentState::default()),
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
@@ -2876,10 +2880,55 @@ impl AgentBridge {
             events,
             gateway_urls: resolved_urls,
             gateways,
+            resolve_gateway,
+            default_provider,
             store,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_cwd_override,
         })
+    }
+
+    /// PROF-1: provisions `provider`'s gateway URL on demand if this
+    /// bridge hasn't resolved it yet -- replaces the old hardcoded
+    /// `["codex", "claude"]` cold-start pre-seed, which silently assumed
+    /// those were the only two agent ids that would ever need a gateway.
+    /// A brand new agent id (anything real, from acpx's own
+    /// `agents/list`) now gets its own gateway resolved and connected the
+    /// first time a thread actually requests it, through the exact same
+    /// resolver closure the constructor itself uses (env override /
+    /// default-port probe / autospawn -- see `provision_gateway`'s doc
+    /// comment), not a second, different code path. A genuine resolver
+    /// failure (unreachable gateway, spawn failure, ...) is returned as a
+    /// real `BridgeError` here -- this is the mechanism that keeps the
+    /// "a requested provider is never silently dropped" guarantee (see
+    /// `resolve_provider_for`) true even though provisioning is now lazy.
+    ///
+    /// Spawns a fresh `Gateway::connect` task only if no already-known
+    /// provider resolves to the same URL -- the common single-gateway
+    /// production case (every agent id resolves to the one shared
+    /// snapshotd-owned acpx-server, see `resolve_gateway`'s/
+    /// `provision_gateway`'s doc comments) must not open a second,
+    /// redundant connection to a URL this bridge is already connecting
+    /// to or connected to.
+    fn ensure_gateway_provisioned(&mut self, provider: &str) -> Result<(), BridgeError> {
+        if self.gateway_urls.contains_key(provider) {
+            return Ok(());
+        }
+        let url = (self.resolve_gateway)(provider)?;
+        let url_already_known = self.gateway_urls.values().any(|existing| existing == &url);
+        self.gateway_urls.insert(provider.to_string(), url.clone());
+        if !url_already_known {
+            let gateways = self.gateways.clone();
+            let _guard = self.runtime.enter();
+            self.runtime.spawn(async move {
+                let gateway = Arc::new(acpx_client::Gateway::connect(url.clone()).await);
+                gateways
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(url, gateway);
+            });
+        }
+        Ok(())
     }
 
     /// `chat_sessions_project_path` phase: called from the FFI-driven
@@ -3089,6 +3138,8 @@ impl AgentBridge {
             session_modes: Mutex::new(runtime_snapshot.session_modes),
             config_options: Mutex::new(runtime_snapshot.config_options),
             available_commands: Mutex::new(Vec::new()),
+            plan: Mutex::new(Vec::new()),
+            session_title: Mutex::new(None),
             attachment: Mutex::new(AttachmentState::default()),
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
@@ -3099,31 +3150,35 @@ impl AgentBridge {
         Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
     }
 
-    /// PUI-014: normalize a caller-requested provider to a provisioned gateway
-    /// key, or fall back to the rotation pick for `idx`. Shared by the eager,
-    /// deferred, and attach paths so a requested provider is never silently
-    /// dropped (see `thread_provider_model_binding_fix`).
-    fn resolve_provider_for<'a>(
-        &self,
-        idx: usize,
-        preferred_provider: Option<&'a str>,
-    ) -> Result<&'a str, BridgeError>
-    where
-        Self: 'a,
-    {
-        match preferred_provider.filter(|p| !p.trim().is_empty()) {
-            Some(requested) => {
-                let normalized = normalize_provider(requested);
-                if !self.gateway_urls.contains_key(normalized) {
-                    return Err(BridgeError::Gateway(format!(
-                        "requested provider {requested:?} (normalized {normalized:?}) has no \
-                         provisioned gateway; refusing to silently bind another provider"
-                    )));
-                }
-                Ok(normalized)
-            }
-            None => Ok(provider_for_index(idx)),
-        }
+    /// PUI-014 / PROF-1: resolves a caller-requested agent id to a
+    /// provisioned gateway key -- the id flows through completely as-is
+    /// now (no "codex"/"claude" normalization step), and gets lazily
+    /// provisioned via [`Self::ensure_gateway_provisioned`] if this
+    /// bridge hasn't seen it before, so a genuinely new agent id (any
+    /// real id from acpx's own `agents/list`) routes to its own gateway
+    /// with zero code changes here. Shared by the eager, deferred, and
+    /// attach paths so a requested provider is never silently dropped
+    /// (see `thread_provider_model_binding_fix`) -- a real provisioning
+    /// failure (not "unknown provider", an actual resolver error) is
+    /// surfaced as a real `BridgeError` instead of quietly falling back
+    /// to a different provider.
+    ///
+    /// With no request at all, falls back to this bridge's own
+    /// `default_provider` -- the first thread spec's already-resolved
+    /// provider, itself derived upstream from a real profile's agent id
+    /// rather than an index-based guess. A bridge that started with zero
+    /// threads has no such default; [`NO_PROVIDER_REQUESTED_FALLBACK`]
+    /// is the one explicit, documented last resort for that case.
+    fn resolve_provider_for(&mut self, preferred_provider: Option<&str>) -> Result<String, BridgeError> {
+        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
+            Some(requested) => requested.to_string(),
+            None => self
+                .default_provider
+                .clone()
+                .unwrap_or_else(|| NO_PROVIDER_REQUESTED_FALLBACK.to_string()),
+        };
+        self.ensure_gateway_provisioned(&provider)?;
+        Ok(provider)
     }
 
     /// PUI-014: create thread `name` as a DEFERRED placeholder -- it claims its
@@ -3148,9 +3203,9 @@ impl AgentBridge {
             )));
         }
         let idx = self.slots.len();
-        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let provider = self.resolve_provider_for(preferred_provider)?;
         let (slot, _handle, _events_rx, _cached_session_id, _has_cached_transcript) =
-            self.build_slot(&thread_id, provider, true)?;
+            self.build_slot(&thread_id, &provider, true)?;
         self.slots.push(slot);
         Ok(idx)
     }
@@ -3178,9 +3233,9 @@ impl AgentBridge {
             return Ok(());
         }
         let thread_id = existing.thread_id.clone();
-        let provider = self.resolve_provider_for(idx, preferred_provider)?;
+        let provider = self.resolve_provider_for(preferred_provider)?;
         let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
-            self.build_slot(&thread_id, provider, false)?;
+            self.build_slot(&thread_id, &provider, false)?;
         self.slots[idx] = slot.clone();
         spawn_background_attachment(
             &self.runtime,
@@ -3217,28 +3272,17 @@ impl AgentBridge {
         }
 
         let idx = self.slots.len();
-        // `thread_provider_model_binding_fix`: a requested provider is
-        // NEVER silently dropped. Any non-empty request normalizes to
-        // one of the two real gateway keys (see `normalize_provider`);
-        // if that gateway genuinely isn't provisioned the caller gets a
-        // real error instead of a thread quietly bound to the rotation's
-        // pick -- the exact "selected claude-acp, codex-acp underneath"
-        // failure reported live on the VNC demo.
-        let provider = match preferred_provider.filter(|p| !p.trim().is_empty()) {
-            Some(requested) => {
-                let normalized = normalize_provider(requested);
-                if !self.gateway_urls.contains_key(normalized) {
-                    return Err(BridgeError::Gateway(format!(
-                        "requested provider {requested:?} (normalized {normalized:?}) has no \
-                         provisioned gateway; refusing to silently bind another provider"
-                    )));
-                }
-                normalized
-            }
-            None => provider_for_index(idx),
-        };
+        // `thread_provider_model_binding_fix` / PROF-1: a requested
+        // provider is NEVER silently dropped. The agent id flows through
+        // as-is (see `resolve_provider_for`'s own doc comment) and is
+        // lazily provisioned if this bridge hasn't seen it before -- a
+        // genuine provisioning failure is a real error instead of a
+        // thread quietly bound to a different provider, the exact
+        // "selected claude-acp, codex-acp underneath" failure reported
+        // live on the VNC demo.
+        let provider = self.resolve_provider_for(preferred_provider)?;
         let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
-            self.build_slot(&thread_id, provider, false)?;
+            self.build_slot(&thread_id, &provider, false)?;
         self.slots.push(slot.clone());
 
         spawn_background_attachment(
@@ -3307,10 +3351,10 @@ impl AgentBridge {
     /// provisioned gateway (typically the same provider the caller
     /// listed `session_id` from via [`Self::recoverable_sessions`]) --
     /// unlike [`Self::add_thread`]/[`Self::add_thread_with_profile`],
-    /// this does *not* derive the provider from `provider_for_index`
-    /// (a brand-new local thread has no natural index-based provider
-    /// assignment here; the provider is instead exactly whichever
-    /// gateway the recovered session id actually lives on).
+    /// this does *not* fall back to `default_provider` (a brand-new
+    /// local thread has no natural default-provider assignment here;
+    /// the provider is instead exactly whichever gateway the recovered
+    /// session id actually lives on).
     /// `resume_session`'s own real history replay is what populates the
     /// new thread's transcript -- proven at the actor layer already
     /// (`resume_session_replays_history_via_session_load`); this method
@@ -3396,6 +3440,8 @@ impl AgentBridge {
             session_modes: Mutex::new(None),
             config_options: Mutex::new(Vec::new()),
             available_commands: Mutex::new(Vec::new()),
+            plan: Mutex::new(Vec::new()),
+            session_title: Mutex::new(None),
             attachment: Mutex::new(AttachmentState {
                 complete: true,
                 error: None,
@@ -4329,6 +4375,30 @@ impl AgentBridge {
             .clone()
     }
 
+    /// PROF-11: the agent's most recently pushed execution plan/todo
+    /// list for thread `idx` (from a live `plan` session/update). Empty
+    /// until the backend sends one -- same "empty means no plan
+    /// notification yet, capability-gate on it" reasoning as
+    /// [`Self::config_options`].
+    pub fn plan(&self, idx: usize) -> Vec<crate::protocol_types::PlanEntryInfo> {
+        let Some(slot) = self.slots.get(idx) else {
+            return Vec::new();
+        };
+        slot.plan.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// PROF-11: the most recently pushed live session title for thread
+    /// `idx` (from a `session_info_update`), distinct from the durable
+    /// `ThreadModel::display_name` -- see [`ThreadSlot::session_title`]'s
+    /// doc comment for why the two are never merged.
+    pub fn session_title(&self, idx: usize) -> Option<String> {
+        let slot = self.slots.get(idx)?;
+        slot.session_title
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Dispatches `session/set_mode` on the background runtime. Fire-
     /// and-forget like [`Self::send_prompt`]/[`Self::cancel_prompt`]:
     /// the caller is the synchronous UI thread, and a failure surfaces
@@ -4498,6 +4568,40 @@ impl Drop for AgentBridge {
         }
     }
 }
+
+// PROF5-GUARD-ALLOW-START -- see tests/backend_cmd_env_write_regression_test.rs.
+// Everything between this line and the matching END marker below is the
+// one place `"ACPX_BACKEND_CMD"`/`"ACPX_DEFAULT_ACP_COMMAND"` may legally
+// appear in this crate's `src/`. Do not widen this block casually -- the
+// regression guard fails the build the moment either literal shows up
+// anywhere else, which is the entire point.
+/// PROF-5 (`profile-only-backend-selection` plan): the ONE sanctioned way
+/// to write `ACPX_BACKEND_CMD` in this crate. `#[cfg(test)]`-gated, so
+/// calling it from any production code path is a compile error, not a
+/// convention someone has to remember -- and
+/// `tests/backend_cmd_env_write_regression_test.rs` asserts the literal
+/// string `"ACPX_BACKEND_CMD"` (and `"ACPX_DEFAULT_ACP_COMMAND"`, its
+/// planned rename arriving via the agents-install-runtime worktree) never
+/// appears anywhere in `src/` outside this one function's own definition,
+/// so a second ad hoc write anywhere -- including inside another test --
+/// fails that guard immediately rather than silently reintroducing the
+/// pattern PROF-3 removed from production.
+///
+/// Every call site is an in-crate unit test hand-spawning its OWN
+/// `acpx-server` subprocess directly, inside this file's own
+/// `#[cfg(test)] mod tests` -- structurally unreachable from
+/// `spawn_gateway_process` or any production path (verified in
+/// PROF-3/PROF-4: production never even builds this function in, since it
+/// is compiled out entirely outside `cfg(test)`). Real backend selection
+/// in production goes through a profile (`_acpx.profile`), never this.
+#[cfg(test)]
+pub(crate) fn test_only_set_backend_cmd_env<'a>(
+    command: &'a mut std::process::Command,
+    value: impl AsRef<std::ffi::OsStr>,
+) -> &'a mut std::process::Command {
+    command.env("ACPX_BACKEND_CMD", value)
+}
+// PROF5-GUARD-ALLOW-END
 
 #[cfg(test)]
 mod tests {
@@ -4873,114 +4977,12 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
     }
 
-    /// `RUI_ACP_AGENT_CMD` (a real override) always wins over the
-    /// dev-checkout mock-agent fallback -- the production-build regression
-    /// found this session was resolve_backend_agent_command silently
-    /// defaulting to a nonexistent path when NEITHER applies (see its own
-    /// doc comment); this specific override-wins branch is unaffected by
-    /// that fix but is the one part of this function cheaply testable
-    /// without touching the real dev_mock_agent build artifact every other
-    /// real-process test in this file also depends on existing.
-    #[test]
-    fn resolve_backend_agent_command_prefers_explicit_override() {
-        // SAFETY (env mutation in a test): guarded by restoring the prior
-        // value unconditionally before returning, and serialized against
-        // every other env-mutating test in this module by
-        // `ENV_MUTATION_LOCK` (see its own doc comment).
-        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
-        let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
-        unsafe {
-            std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
-            std::env::set_var("RUI_TEST_MODE", "1");
-        }
-        let resolved = resolve_backend_agent_command();
-        match prior {
-            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
-            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
-        }
-        match prior_test_mode {
-            Some(value) => unsafe { std::env::set_var("RUI_TEST_MODE", value) },
-            None => unsafe { std::env::remove_var("RUI_TEST_MODE") },
-        }
-        assert_eq!(resolved.as_deref(), Some("/some/real/agent --flag"));
-    }
-
-    /// `RUI_TEST_MODE` is the sole gate for the whole function -- an
-    /// explicit `RUI_ACP_AGENT_CMD` override must be inert without it, so a
-    /// leaked/inherited env var from an unrelated shell or CI context can
-    /// never silently redirect a real interactive launch's chat sessions
-    /// to a mock or arbitrary command.
-    #[test]
-    fn resolve_backend_agent_command_ignores_override_without_test_mode() {
-        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
-        let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
-        unsafe {
-            std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
-            std::env::remove_var("RUI_TEST_MODE");
-        }
-        let resolved = resolve_backend_agent_command();
-        match prior {
-            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
-            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
-        }
-        match prior_test_mode {
-            Some(value) => unsafe { std::env::set_var("RUI_TEST_MODE", value) },
-            None => unsafe { std::env::remove_var("RUI_TEST_MODE") },
-        }
-        assert_eq!(resolved, None);
-    }
-
-    /// The real bug found live this session: a debug build of
-    /// `rui-mock-agent` merely existing on disk (true in any dev checkout
-    /// that has ever run `cargo build`/`cargo test`) must NOT by itself
-    /// route new sessions to the mock agent -- only an explicit
-    /// `RUI_USE_DEV_MOCK_AGENT=1` opt-in may do that, so a dev checkout
-    /// used to verify real acpx behavior gets the real gateway default
-    /// unless someone deliberately asks for the mock.
-    #[test]
-    fn resolve_backend_agent_command_ignores_mock_binary_without_explicit_opt_in() {
-        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prior_override = std::env::var("RUI_ACP_AGENT_CMD").ok();
-        let prior_opt_in = std::env::var("RUI_USE_DEV_MOCK_AGENT").ok();
-        unsafe {
-            std::env::remove_var("RUI_ACP_AGENT_CMD");
-            std::env::remove_var("RUI_USE_DEV_MOCK_AGENT");
-        }
-        let resolved = resolve_backend_agent_command();
-        match prior_override {
-            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
-            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
-        }
-        match prior_opt_in {
-            Some(value) => unsafe { std::env::set_var("RUI_USE_DEV_MOCK_AGENT", value) },
-            None => unsafe { std::env::remove_var("RUI_USE_DEV_MOCK_AGENT") },
-        }
-        // Even though target/debug/rui-mock-agent genuinely exists in this
-        // checkout (every other real-process test in this file depends on
-        // it), resolve_backend_agent_command must still return None here.
-        assert_eq!(resolved, None);
-    }
-
-    /// acpx-server's own ACPX_BACKEND_CMD default is codex-only (see this
-    /// function's own doc comment) -- "claude" is the one provider that
-    /// genuinely needs an explicit override; every other provider string
-    /// (including "codex" itself and anything unrecognized) must return
-    /// None so spawn_gateway_process leaves ACPX_BACKEND_CMD unset and
-    /// falls through to that real default instead.
-    #[test]
-    fn default_backend_command_for_provider_only_overrides_claude() {
-        assert_eq!(
-            default_backend_command_for_provider("claude"),
-            Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1")
-        );
-        assert_eq!(default_backend_command_for_provider("codex"), None);
-        assert_eq!(
-            default_backend_command_for_provider("unknown-provider"),
-            None
-        );
-    }
+    // PROF-3: `resolve_backend_agent_command_prefers_explicit_override`,
+    // `resolve_backend_agent_command_ignores_override_without_test_mode`,
+    // `resolve_backend_agent_command_ignores_mock_binary_without_explicit_
+    // opt_in`, and `default_backend_command_for_provider_only_overrides_
+    // claude` used to live here, testing the two functions removed above
+    // this module's own doc comment for why. Removed along with them.
 
     /// read_codex_api_key_from_auth_file's real, only call site
     /// (spawn_gateway_process) requires this to be correct without ever
@@ -5306,9 +5308,8 @@ mod tests {
             db_path: Option<&std::path::Path>,
         ) -> Self {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", backend_cmd)
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
                     .env("RUST_LOG", "error");
@@ -5332,9 +5333,8 @@ mod tests {
         ) -> Self {
             let backend_cmd = mock_agent_bin().to_string_lossy().into_owned();
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", &backend_cmd)
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, &backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
                     .env("RUI_MOCK_AGENT_EVENT_LOG", event_log_path)
@@ -5657,6 +5657,8 @@ mod tests {
             session_modes: bridge.session_modes(index),
             config_options: bridge.config_options(index),
             available_commands: bridge.available_commands(index),
+            plan: vec![],
+            session_title: None,
             usage: (0, 0),
         };
         let (_, dirty) = crate::update::update(
@@ -5979,20 +5981,22 @@ mod tests {
             |command, _port| {
                 // acpx-server's own bare default is codex-only
                 // (config.rs's `ACPX_BACKEND_CMD` fallback is literally
-                // `npx ... codex-acp`) -- exactly the real bug
-                // `default_backend_command_for_provider`/
-                // `spawn_gateway_process` exists to close. Without this
-                // override, a "claude" test/thread silently gets a real
+                // `npx ... codex-acp`). This test drives a raw
+                // `_acpx.profile`-less native-mode session directly
+                // against a hand-spawned test gateway (not through
+                // `AgentBridge`/`spawn_gateway_process`, which no longer
+                // ever sets this env var in production -- see PROF-3),
+                // so it still needs its own explicit override here or a
+                // "claude" test/thread would silently get a real
                 // codex-acp reply instead (confirmed live: this test
-                // timed out because the spawned backend was codex-acp,
-                // which never received the config expected of it).
-                // No ACPX_NATIVE_AUTH_METHOD_ID: unlike codex-acp's
+                // once timed out because the spawned backend was
+                // codex-acp, which never received the config expected of
+                // it). No ACPX_NATIVE_AUTH_METHOD_ID: unlike codex-acp's
                 // explicit API-key exchange, claude-acp's ambient auth
                 // (~/.claude/.credentials.json) doesn't need one.
-                command.env(
-                    "ACPX_BACKEND_CMD",
-                    default_backend_command_for_provider("claude")
-                        .expect("claude must have a real backend command override"),
+                test_only_set_backend_cmd_env(
+                    command,
+                    "npx -y @agentclientprotocol/claude-agent-acp@0.58.1",
                 );
             },
             Some("haiku"),
@@ -6012,8 +6016,11 @@ mod tests {
     /// load` rather than starting a fresh empty session.
     #[test]
     fn recoverable_sessions_lists_the_orphan_and_attaching_it_replays_its_real_history() {
-        // Persona/agent id must match `provider_for_index(0)` ("codex")
-        // -- `list_sessions_for_agent` selects the backend by this exact
+        // Persona/agent id must match `NO_PROVIDER_REQUESTED_FALLBACK`
+        // ("codex") -- `bridge_with_single_gateway` builds its single
+        // thread via `specs_for_names`, which assigns every synthesized
+        // spec that fallback provider (see its own doc comment) --
+        // `list_sessions_for_agent` selects the backend by this exact
         // registered supervisor key (`_acpx.agentId`), unlike plain
         // `session/new` (no `_acpx.profile`), which routes to whichever
         // single backend a gateway with no profile disambiguation
@@ -6883,26 +6890,21 @@ done
         assert_eq!(slug("Export pipeline bug!"), "export-pipeline-bug");
     }
 
+    /// PROF-1: `specs_for_names` no longer alternates "codex"/"claude" by
+    /// thread position (the old `provider_for_index`) -- every
+    /// synthesized spec gets the one documented fallback, since this
+    /// helper only backs name-only test/dev constructors that don't
+    /// track real per-thread provider identity at all.
     #[test]
-    fn normalize_provider_maps_registry_ids_onto_gateway_keys() {
-        // thread_provider_model_binding_fix: registry ids (the values a
-        // real settings.global.json/default-agent picker persists) must
-        // resolve to the gateway actually serving that family -- the
-        // old exact-match filter dropped them silently and the rotation
-        // bound the thread to whatever parity said.
-        assert_eq!(normalize_provider("claude"), "claude");
-        assert_eq!(normalize_provider("claude-acp"), "claude");
-        assert_eq!(normalize_provider("Claude-ACP"), "claude");
-        assert_eq!(normalize_provider("codex"), "codex");
-        assert_eq!(normalize_provider("codex-acp"), "codex");
-    }
-
-    #[test]
-    fn provider_for_index_alternates_codex_and_claude() {
-        assert_eq!(provider_for_index(0), "codex");
-        assert_eq!(provider_for_index(1), "claude");
-        assert_eq!(provider_for_index(2), "codex");
-        assert_eq!(provider_for_index(3), "claude");
+    fn specs_for_names_assigns_the_documented_fallback_to_every_thread() {
+        let specs = specs_for_names(&["Thread One", "Thread Two", "Thread Three"]);
+        assert_eq!(specs.len(), 3);
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.provider == NO_PROVIDER_REQUESTED_FALLBACK),
+            "got: {specs:?}"
+        );
     }
 
     #[test]
@@ -7231,26 +7233,46 @@ done
         assert_eq!(bridge.history(1)[0].text, "healthy scrollback");
     }
 
-    /// Real multi-provider routing: two distinct threads, resolved to two
-    /// distinct (locally-spawned) `acpx-server` gateway processes by
-    /// `provider_for_index`, each tagging its reply with its own persona
-    /// -- the concrete `AgentBridge`-level version of
-    /// `rui-acpx-client`'s own `two_gateways_stay_isolated_no_cross_provider_bleed`
-    /// test, proving the wiring in *this* crate's constructor (provider
-    /// resolution, per-provider gateway auto-spawn) also keeps threads
-    /// isolated, not just the lower-level transport.
+    /// Real multi-provider routing: two distinct threads, explicitly
+    /// bound to two distinct (locally-spawned) `acpx-server` gateway
+    /// processes via their own `ThreadSpec::provider`, each tagging its
+    /// reply with its own persona -- the concrete `AgentBridge`-level
+    /// version of `rui-acpx-client`'s own `two_gateways_stay_isolated_
+    /// no_cross_provider_bleed` test, proving the wiring in *this*
+    /// crate's constructor (provider resolution, per-provider gateway
+    /// auto-spawn) also keeps threads isolated, not just the lower-level
+    /// transport. PROF-1: deliberately uses real ACP-shaped agent ids
+    /// ("codex-acp"/"claude-acp", not the old bare "codex"/"claude"
+    /// gateway keys) as the `ThreadSpec::provider` value, proving those
+    /// ids now flow straight through to gateway resolution with no
+    /// normalization step collapsing them onto anything else.
     #[test]
     fn two_threads_route_to_two_distinct_gateways_by_provider() {
         let codex_gateway = TestGateway::spawn_with_persona("codex");
         let claude_gateway = TestGateway::spawn_with_persona("claude");
         let codex_url = codex_gateway.base_url.clone();
         let claude_url = claude_gateway.base_url.clone();
-        let names = ["Codex Thread", "Claude Thread"];
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Thread".to_owned(),
+                provider: "codex-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Thread".to_owned(),
+                provider: "claude-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
 
-        let bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
-            &names,
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
             move |provider| {
-                if provider == "codex" {
+                if provider == "codex-acp" {
                     Ok(codex_url.clone())
                 } else {
                     Ok(claude_url.clone())
@@ -7325,12 +7347,27 @@ done
         let claude_gateway = TestGateway::spawn_with_persona("claude");
         let codex_url = codex_gateway.base_url.clone();
         let claude_url = claude_gateway.base_url.clone();
-        let names = ["Codex Thread", "Claude Thread"];
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Thread".to_owned(),
+                provider: "codex-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Thread".to_owned(),
+                provider: "claude-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
 
-        let bridge = AgentBridge::new_with_gateway_resolver_and_cache_dir(
-            &names,
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
             move |provider| {
-                if provider == "codex" {
+                if provider == "codex-acp" {
                     Ok(codex_url.clone())
                 } else {
                     Ok(claude_url.clone())
@@ -7385,6 +7422,217 @@ done
         );
     }
 
+    /// PROF-1's own acceptance test: a THIRD agent id -- neither "codex"
+    /// nor "claude", and not a variant of either name -- must resolve to
+    /// its own gateway, not get silently bucketed into codex the way the
+    /// old `normalize_provider`'s `else { "codex" }` fallback would have
+    /// (any id that didn't contain "claude" fell through to codex,
+    /// including this one). Three real, distinct locally-spawned
+    /// `acpx-server` processes, three distinct `ThreadSpec::provider`
+    /// values, proving "adding a new live agent requires zero
+    /// panel-rust code changes to route to its own gateway."
+    #[test]
+    fn a_third_agent_id_routes_to_its_own_gateway_not_codex() {
+        let codex_gateway = TestGateway::spawn_with_persona("codex");
+        let claude_gateway = TestGateway::spawn_with_persona("claude");
+        let gemini_gateway = TestGateway::spawn_with_persona("gemini");
+        let codex_url = codex_gateway.base_url.clone();
+        let claude_url = claude_gateway.base_url.clone();
+        let gemini_url = gemini_gateway.base_url.clone();
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Thread".to_owned(),
+                provider: "codex-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Thread".to_owned(),
+                provider: "claude-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+            ThreadSpec {
+                display_name: "Gemini Thread".to_owned(),
+                provider: "gemini-acp".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            move |provider| match provider {
+                "codex-acp" => Ok(codex_url.clone()),
+                "claude-acp" => Ok(claude_url.clone()),
+                "gemini-acp" => Ok(gemini_url.clone()),
+                other => Err(BridgeError::Gateway(format!(
+                    "resolver received unexpected provider {other:?}"
+                ))),
+            },
+            None,
+        )
+        .expect("bridge with three distinct gateways");
+
+        bridge.send_prompt(0, "ping".into());
+        bridge.send_prompt(1, "ping".into());
+        bridge.send_prompt(2, "ping".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ended = [false, false, false];
+        while std::time::Instant::now() < deadline && !ended.iter().all(|&done| done) {
+            for ev in bridge.poll() {
+                if let AgentEvent::TurnEnded(_) = ev.event {
+                    if let Some(slot) = ended.get_mut(ev.thread_index) {
+                        *slot = true;
+                    }
+                }
+            }
+            if !ended.iter().all(|&done| done) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            ended.iter().all(|&done| done),
+            "timed out waiting for all three threads' turns to end: {ended:?}"
+        );
+
+        let gemini_reply = bridge
+            .history(2)
+            .into_iter()
+            .find(|m| m.text.contains("PING"))
+            .expect("gemini thread reply");
+        assert!(
+            gemini_reply.text.starts_with("[GEMINI]"),
+            "the third agent id's own gateway/persona must answer its thread, not codex's -- \
+             got: {:?}",
+            gemini_reply.text
+        );
+        assert!(
+            !bridge
+                .history(0)
+                .iter()
+                .any(|m| m.text.starts_with("[GEMINI]")),
+            "the gemini reply must never land on the codex thread"
+        );
+    }
+
+    /// PROF-6 (`profile-only-backend-selection` plan): real-gateway pin for
+    /// PUI-014's lazy-attach path -- `add_thread_deferred` claims a slot
+    /// with no session open yet, and the provider/profile it actually binds
+    /// to are read fresh from the model at FIRST SEND
+    /// (`dispatch::dispatch_compose_send_maybe_attach`), not at creation
+    /// time. The plan doc flagged this as a real risk: if seeding/wiring
+    /// between PROF-2's default-profile fallback and this attach call had a
+    /// gap, a first message could attach with no profile (silently falling
+    /// through to native mode) or the wrong one, and nothing at the reducer
+    /// level (which only proves `profile_name` gets computed correctly, not
+    /// that it reaches a real `session/new`) would catch it.
+    ///
+    /// Two distinct real gateways/personas, deliberately the opposite of
+    /// the bridge's own first (index 0, "codex") seed thread, so a bug that
+    /// silently reused the seed thread's own provider/gateway instead of
+    /// the one set at attach time shows up as an unambiguous wrong-persona
+    /// reply ([CODEX] instead of [CLAUDE]), not a coincidental pass.
+    #[test]
+    fn deferred_thread_attaches_with_the_profile_and_provider_set_at_first_send() {
+        let codex_gateway = TestGateway::spawn_with_persona("codex");
+        let claude_gateway = TestGateway::spawn_with_persona("claude");
+        let codex_url = codex_gateway.base_url.clone();
+        let claude_url = claude_gateway.base_url.clone();
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Seed".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Seed".to_owned(),
+                provider: "claude".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let mut bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            move |provider| {
+                if provider == "codex" {
+                    Ok(codex_url.clone())
+                } else {
+                    Ok(claude_url.clone())
+                }
+            },
+            None,
+        )
+        .expect("bridge with two distinct gateways");
+
+        // Real profile on the claude gateway, created via thread 1 (the
+        // claude seed)'s own handle so it lands on the right gateway.
+        assert!(
+            bridge.create_profile(
+                1,
+                serde_json::json!({
+                    "name": "lazy-claude-profile",
+                    "agent_id": "claude",
+                }),
+            ),
+            "expected profiles/create against the claude gateway (thread 1) to succeed"
+        );
+
+        // PUI-014: create the thread DEFERRED -- no session opens yet, the
+        // provider/profile picker stays editable.
+        let idx = bridge
+            .add_thread_deferred("Lazy Thread", Some("claude"))
+            .expect("add_thread_deferred");
+        assert!(
+            bridge.is_deferred(idx),
+            "thread must still be deferred before first send"
+        );
+
+        // First send: mirrors dispatch_compose_send_maybe_attach's exact
+        // call shape (provider + profile read from the model at send time,
+        // not from anything captured at creation).
+        bridge
+            .attach_deferred_thread(idx, Some("claude"), Some("lazy-claude-profile"))
+            .expect("attach_deferred_thread");
+        assert!(
+            !bridge.is_deferred(idx),
+            "thread must no longer be deferred after attach"
+        );
+
+        bridge.send_prompt(idx, "which persona are you".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reply = None;
+        while std::time::Instant::now() < deadline && reply.is_none() {
+            for ev in bridge.poll() {
+                if ev.thread_index == idx {
+                    if let AgentEvent::Message(msg) = ev.event {
+                        if msg.text.contains("WHICH PERSONA ARE YOU") {
+                            reply = Some(msg.text);
+                        }
+                    }
+                }
+            }
+            if reply.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let reply = reply.expect("expected a reply from the lazily attached thread");
+        assert!(
+            reply.starts_with("[CLAUDE]"),
+            "expected the deferred thread's first-send attach to bind the claude \
+             provider/profile set at send time, not silently fall back to the seed thread's \
+             own codex provider or to native mode -- got: {reply:?}"
+        );
+    }
+
     /// Same real stand-in-backend shell-script technique
     /// `acpx-server/tests/agent_request_relay_test.rs` uses, one layer up
     /// the stack: proves the interactive `session/request_permission`
@@ -7400,6 +7648,68 @@ done
     /// option it actually received, so `bridge.history` is the
     /// observable proof the live answer -- not the auto-policy fallback
     /// -- reached the backend.
+    /// PROF-8 (`profile-only-backend-selection` plan) canary: the tripwire
+    /// `models::is_backend_requires_authentication_error`'s own doc
+    /// comment names. Real acpx-server, a real stand-in backend that
+    /// advertises `authMethods` on `initialize` with no
+    /// `auth_method_id` configured -- exactly what makes acpx-core's
+    /// `Router::resolve_profile`/`ensure_backend_initialized` return
+    /// `RouterError::BackendRequiresAuthentication` instead of proceeding
+    /// to `session/new`. Asserts the REAL error text panel-rust receives
+    /// over the wire still contains the substring
+    /// `is_backend_requires_authentication_error` matches on, so a future
+    /// acpx-core wording change fails this test loudly instead of that
+    /// detector silently going dark (see its own doc comment for the full
+    /// "this is fragile by design" reasoning this test exists to guard).
+    #[test]
+    fn open_session_fails_with_a_detectable_authentication_required_message() {
+        let script_dir = tempfile::tempdir().expect("script tempdir");
+        let script_path = script_dir.path().join("requires_auth_backend.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(echo "$line" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+  if echo "$line" | grep -q '"method":"initialize"'; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"authMethods":[{"id":"api-key","name":"API Key"}]}}\n' "$id"
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#,
+        )
+        .expect("write requires-auth stand-in backend script");
+        let gateway = TestGateway::spawn_with_backend_cmd(
+            &format!("sh {}", script_path.display()),
+            "requires-auth-test",
+            None,
+        );
+
+        let names = ["Needs Auth Thread"];
+        let bridge = bridge_with_single_gateway(&names, &gateway, None).expect("bridge");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut error_message = None;
+        while std::time::Instant::now() < deadline && error_message.is_none() {
+            for ev in bridge.poll() {
+                if let AgentEvent::Error(message) = ev.event {
+                    error_message = Some(message);
+                }
+            }
+            if error_message.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let error_message =
+            error_message.expect("expected a real BackendRequiresAuthentication error");
+        assert!(
+            crate::models::is_backend_requires_authentication_error(&error_message),
+            "the real acpx-core error text no longer matches \
+             is_backend_requires_authentication_error's substring -- update the detector \
+             (and its doc comment) to track acpx-core's actual wording, got: {error_message:?}"
+        );
+    }
+
     #[test]
     fn permission_request_relay_round_trips_through_the_bridge() {
         // Written to a real temp file (rather than passed as `sh -c
@@ -7434,9 +7744,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "relay-test")
                     .env("RUST_LOG", "error");
             });
@@ -7601,9 +7910,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "cancel-test")
                     .env("RUST_LOG", "error");
             });
@@ -7699,10 +8007,13 @@ done
         // repeated default-parallelism runs of the full suite (present in
         // every one of three observed flaky runs); reusing the shared,
         // lock-protected helper here closes the same port race for it.
+        // PROF-5's compile-enforced guard requires ACPX_BACKEND_CMD to be
+        // set only via test_only_set_backend_cmd_env, never a direct
+        // .env("ACPX_BACKEND_CMD", ...) call -- both fixes composed here
+        // rather than picking one over the other.
         let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-            command
-                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+            command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+            test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                 .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
                 .env("RUST_LOG", "error");
         });
@@ -7831,9 +8142,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "mode-config-test")
                     .env("RUST_LOG", "error");
             });
@@ -8111,9 +8421,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "stream-merge-test")
                     .env("RUST_LOG", "error");
             });

@@ -4486,12 +4486,14 @@ name = "panel-rust"
 version = "0.1.0"
 dependencies = [
  "acpx-client",
+ "acpx-proto",
  "agent-client-protocol",
  "i-slint-backend-testing",
  "notify",
  "opener",
  "portable-pty",
  "pulldown-cmark 0.12.2",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

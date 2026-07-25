@@ -132,6 +132,20 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 });
             if for_displayed {
                 component.set_last_error(detail.message.clone().into());
+                // PROF-8: same displayed-thread gate as last_error above --
+                // read fresh from the model (not carried on `detail`,
+                // unlike the message text) since `thread.unauthenticated`
+                // is set alongside `thread.error` in update.rs but this
+                // Dirty variant predates that field.
+                let unauthenticated = if thread_id.is_empty() {
+                    model
+                        .displayed_thread
+                        .and_then(|idx| model.threads.get(idx))
+                        .is_some_and(|thread| thread.unauthenticated)
+                } else {
+                    thread_for_id(model, thread_id).is_some_and(|thread| thread.unauthenticated)
+                };
+                component.set_agent_unauthenticated(unauthenticated);
             }
         }
         Dirty::PendingRequest { thread_id } => {
@@ -250,6 +264,15 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 component.set_context_ratio(if thread.usage.1 > 0 {
                     (thread.usage.0 as f32 / thread.usage.1 as f32).clamp(0.0, 1.0)
                 } else { 0.0 });
+                // PROF-11: agent-reported execution plan/todo list, and
+                // any live-pushed session title -- see `ChatArea.plan-
+                // entries`/`.live-session-title`'s doc comments.
+                component.set_plan_entries(slint::ModelRc::new(slint::VecModel::from(
+                    crate::models::to_plan_entry_rows(thread.plan.clone()),
+                )));
+                component.set_live_session_title(
+                    thread.session_title.clone().unwrap_or_default().into(),
+                );
             }
         }
     }
@@ -688,6 +711,7 @@ fn sync_profile_picker(model: &Model, component: &ChatPanel, thread: &crate::mod
     let current = thread.profile_name.as_deref().unwrap_or("");
     component.set_profile_dropdown_entries(crate::models::to_profile_dropdown_entries(
         &profile_rows,
+        &model.agent_catalog,
         current,
     ));
     // Compose trigger shows provider/agent id, not raw profile name.
@@ -939,6 +963,7 @@ mod tests {
         let mut model = Model::default();
         let row = VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 7,
             thread_id: "thread-7".to_owned(),
             item: crate::ThreadItem::default(),
@@ -974,6 +999,7 @@ mod tests {
         };
         let row = VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: item.clone(),
@@ -1020,6 +1046,7 @@ mod tests {
         ];
         let row = VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: crate::ThreadItem {
@@ -1132,6 +1159,8 @@ mod tests {
                     session_modes: None,
                     config_options: vec![],
                     available_commands: vec![],
+                    plan: vec![],
+                    session_title: None,
                     usage: (0, 0),
                 }),
                 ..crate::msg::FrameInput::default()
@@ -1179,6 +1208,7 @@ mod tests {
         model.visible_indices = vec![0];
         model.thread_rows.push(VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 0,
             thread_id: "thread:0".to_owned(),
             item: crate::ThreadItem {
