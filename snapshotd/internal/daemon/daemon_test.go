@@ -153,3 +153,38 @@ func TestDaemon_Dispatch_RoutesAllDaemonMethods(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestDaemon_StopRequest covers the cross-platform stop path added to
+// replace `snapshotd stop` signaling a PID directly: (*os.Process).Signal
+// doesn't support SIGTERM on Windows, so daemon.stop/RequestStop/
+// StopRequested is the only mechanism `snapshotd stop` can rely on there.
+func TestDaemon_StopRequest(t *testing.T) {
+	fixtureBin := buildFixture(t)
+	d := newTestDaemon(t, fixtureBin)
+	ctx := context.Background()
+
+	select {
+	case <-d.StopRequested():
+		t.Fatalf("StopRequested channel should not be closed before RequestStop/daemon.stop")
+	default:
+	}
+
+	result, err := d.Dispatch(ctx, "daemon.stop", nil)
+	if err != nil {
+		t.Fatalf("dispatch daemon.stop: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("expected a non-nil result from daemon.stop")
+	}
+
+	select {
+	case <-d.StopRequested():
+	default:
+		t.Fatalf("expected StopRequested channel to be closed after daemon.stop")
+	}
+
+	// A second call must not panic (sync.Once-guarded close).
+	if _, err := d.Dispatch(ctx, "daemon.stop", nil); err != nil {
+		t.Fatalf("second dispatch daemon.stop: %v", err)
+	}
+}
