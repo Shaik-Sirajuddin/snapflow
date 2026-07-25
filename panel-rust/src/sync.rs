@@ -176,6 +176,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
         }
         Dirty::Appearance => sync_appearance(model, component),
         Dirty::Theme => sync_theme_variant(component, &model.theme_variant),
+        Dirty::Language => sync_language(&model.language),
         Dirty::Settings => {
             component.set_settings_scope(model.settings_scope.clone().into());
             component.set_default_profile(model.default_profile.clone().into());
@@ -869,6 +870,28 @@ fn sync_appearance(model: &Model, component: &ChatPanel) {
 
 pub(crate) fn sync_theme_variant(component: &ChatPanel, theme: &str) {
     crate::Theme::get(component).set_theme(theme.into());
+}
+
+/// language-switch-sync plan: switches the active gettext catalog
+/// bundled at build time (`build.rs`'s `with_bundled_translations`) --
+/// every `@tr()`-bound `Strings.*` property is a reactive Slint binding,
+/// so this alone live-updates every translated string already on
+/// screen, no per-property setter needed (unlike `sync_theme_variant`
+/// above). `language` is expected to be one of the locale codes Qt's
+/// own language menu offers (see `tests/language_coverage_test.rs`);
+/// an unrecognized/unbundled code is a real but non-fatal condition --
+/// logged, `@tr()` falls back to its literal English source text rather
+/// than panicking or leaving stale translated text on screen.
+pub(crate) fn sync_language(language: &str) {
+    if language.is_empty() {
+        return;
+    }
+    if let Err(error) = slint::select_bundled_translation(language) {
+        eprintln!(
+            "panel-rust: select_bundled_translation({language:?}) failed: {error} -- \
+             falling back to the @tr() source (English) strings"
+        );
+    }
 }
 
 pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {

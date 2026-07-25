@@ -1311,6 +1311,10 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
             };
             (vec![], vec![Dirty::Theme])
         }
+        HostMsg::LanguageChanged(language) => {
+            model.language = language;
+            (vec![], vec![Dirty::Language])
+        }
         HostMsg::ProjectPathChanged(path) => {
             model.active_project_path = path.clone();
             (

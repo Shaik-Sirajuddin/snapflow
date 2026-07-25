@@ -248,6 +248,12 @@ pub enum HostMsg {
     AppearanceChanged(crate::appearance::AppearanceState),
     ThemeChanged(String),
     ProjectPathChanged(Option<String>),
+    // language-switch-sync plan: a QSettings "language" locale code (e.g.
+    // "fr", "zh_CN") pushed live from Qt's Settings > Language picker --
+    // see MainWindow::languageChanged's doc comment for why this is a
+    // real live signal (mirroring producerOpened), not construction-time
+    // only (the theme precedent's known gap).
+    LanguageChanged(String),
     /// Cold-start hydration trigger -- see 00-plan.md Phase 0. Carries
     /// whatever `panel_rust_create` already has in hand *before* any
     /// `Effect` runs (window size, requested defaults); the actual
