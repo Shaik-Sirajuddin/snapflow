@@ -52,6 +52,14 @@ type ProcessInstance struct {
 	StartedAt         time.Time
 	LastHealthCheckAt time.Time
 	Status            string // "starting" | "ready" | "crashed" | "closed"
+	// Headless records the mode this instance was actually launched in
+	// (PISO-9: per-project launch dedup). A project is live in exactly one
+	// mode at a time -- once an instance exists, later daemon.launch calls
+	// for the same project reuse it regardless of what mode they asked for,
+	// so a caller needs this (together with LaunchResult.Reused) to know
+	// whether it actually got the visible/headful instance it may have
+	// wanted or is attaching to an existing headless one instead.
+	Headless bool
 }
 
 func (ProcessInstance) TableName() string { return "process_instances" }

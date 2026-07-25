@@ -197,32 +197,49 @@ type LaunchParams struct {
 	Headless *bool `json:"headless,omitempty"`
 }
 
-func (d *Daemon) Launch(ctx context.Context, p LaunchParams) (registry.ProcessInstance, error) {
+// LaunchResult is daemon.launch's response shape. ProcessInstance is
+// embedded (not nested under an `instance` key) so every existing caller
+// reading e.g. result.ID/result.Status/result.SocketPath, and every
+// existing JSON consumer unmarshaling the response straight into a bare
+// registry.ProcessInstance, keeps working unchanged -- Reused is simply an
+// additional top-level field. See PISO-9: a caller needs this (together
+// with the embedded ProcessInstance.Headless) to tell whether it got a
+// freshly spawned instance or was handed the project's already-live one.
+type LaunchResult struct {
+	registry.ProcessInstance
+	Reused bool `json:"reused"`
+}
+
+func (d *Daemon) Launch(ctx context.Context, p LaunchParams) (LaunchResult, error) {
 	projectID := p.ProjectID
 	if projectID == "" {
 		if p.ProjectPath == "" {
-			return registry.ProcessInstance{}, fmt.Errorf("daemon: launch: one of projectId or projectPath is required")
+			return LaunchResult{}, fmt.Errorf("daemon: launch: one of projectId or projectPath is required")
 		}
 		proj, err := d.resolveOrRegisterProjectByPath(p.ProjectPath)
 		if err != nil {
-			return registry.ProcessInstance{}, err
+			return LaunchResult{}, err
 		}
 		projectID = proj.ID
 	}
 	proj, err := d.Reg.GetProject(projectID)
 	if err != nil {
-		return registry.ProcessInstance{}, fmt.Errorf("daemon: launch: %w", err)
+		return LaunchResult{}, fmt.Errorf("daemon: launch: %w", err)
 	}
 	headless := true
 	if p.Headless != nil {
 		headless = *p.Headless
 	}
-	return d.Proc.Launch(ctx, projectID, procmgr.LaunchOptions{
+	pi, reused, err := d.Proc.Launch(ctx, projectID, procmgr.LaunchOptions{
 		Headless:     headless,
 		ProjectRoot:  proj.RootDir,
 		MltFileName:  proj.MltFileName,
 		AudioEnabled: d.Cfg.AudioEnabled,
 	})
+	if err != nil {
+		return LaunchResult{}, err
+	}
+	return LaunchResult{ProcessInstance: pi, Reused: reused}, nil
 }
 
 // AudioNamespaceEnabled exposes the daemon-wide capability toggle to MCP
