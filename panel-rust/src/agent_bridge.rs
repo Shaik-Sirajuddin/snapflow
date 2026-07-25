@@ -1933,6 +1933,30 @@ fn cwd_for_session(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// The project directory a THREAD's own MCP servers and skills-sync must
+/// be scoped to (PISO-4 extension): `snapflowd_mcp_servers_entry`'s
+/// `--project-dir` argument and the reactive skills sync both need this,
+/// and must agree with each other and with `cwd_for_session` above on
+/// which project a given thread belongs to -- so this is the one place
+/// that resolves it, rather than three independent reads of the global
+/// that could each observe a different value if the active project
+/// changes mid-flight. Same slot-first, then-global fallback as
+/// `cwd_for_session`, but deliberately stops there: no `current_dir()`
+/// last resort, since an MCP server or skills sync must never be rooted
+/// at wherever panel-rust happened to launch from just because no project
+/// is known -- `None` means global scope, not a directory guess.
+fn thread_project_dir(
+    thread_project_path: Option<&std::path::Path>,
+    session_cwd_override: &Mutex<Option<PathBuf>>,
+) -> Option<PathBuf> {
+    thread_project_path.map(PathBuf::from).or_else(|| {
+        session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    })
+}
+
 fn replay_matches_cached_position(
     history: &[ChatMessage],
     cached_index: &mut usize,
@@ -2083,28 +2107,31 @@ fn spawn_background_attachment(
     // timeouts. This function itself is a plain sync fn, so the blocking
     // call here is no different from provision_gateway's own pre-existing
     // synchronous network probes at construction time.
-    let mcp_servers = snapflowd_mcp_servers_entry(
-        session_cwd_override
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_deref(),
-        &slot.provider,
-    );
+    // Shared by both uses below (`snapflowd_mcp_servers_entry` and the
+    // skills reactive-sync) since they must agree with each other and
+    // with the session's own `cwd` (fixed further down) on which project
+    // this thread is scoped to; reading the global independently at each
+    // site risked three different answers for one thread (PISO-4). See
+    // `thread_project_dir`'s own doc comment for the fallback shape.
+    let thread_project_dir = thread_project_dir(slot.project_path.as_deref(), &session_cwd_override);
+    // `snapflowd_mcp_servers_entry` turns `thread_project_dir` into the
+    // skills MCP server's `--project-dir <parent of the project file>`
+    // argument (see `snapflowd_mcp_servers_entry_adds_project_dir_from_
+    // the_open_project_files_parent`) -- reading the process-global here
+    // instead would hand this thread's MCP tools a different project's
+    // directory than the `cwd` it now correctly attaches with, which is
+    // the half of this leak that actually lets an agent read/write the
+    // wrong project's files.
+    let mcp_servers = snapflowd_mcp_servers_entry(thread_project_dir.as_deref(), &slot.provider);
 
     // Reactive-sync trigger (2) (memory/acpx/gen/plans/acpx-skills/
     // README.md#reactive-sync): before/at session setup, make sure this
     // agent's skills are actually propagated to its native skill
     // directory, catching up anything registered while no session was
-    // open. Prefers this thread's own `slot.project_path`, same reasoning
-    // as `cwd_for_session` below (PISO-4) -- the global `session_cwd_
-    // override` can point at a different project than the one this
-    // thread's session is actually being opened against, and skills
-    // synced to the wrong project's native directory would be just as
-    // real a leak as a wrong `cwd`. `None` (from both) means global
-    // scope, deliberately NOT cwd_for_session's current-dir fallback --
-    // a thread with no known project should sync global skills only, not
-    // whatever directory the panel-rust process happens to be running
-    // from.
+    // open. `None` project_root here means global scope, deliberately
+    // NOT cwd_for_session's current-dir fallback -- an unset session cwd
+    // override should sync global skills only, not whatever directory the
+    // panel-rust process happens to be running from.
     //
     // For vendor_ids skills_manager::agent_registry::is_live_verified()
     // covers -- MCP is no longer sent for them at all (below), so this
@@ -2115,12 +2142,7 @@ fn spawn_background_attachment(
     // remains the real delivery path regardless of this sync's timing, so
     // it stays a best-effort background thread as before.
     let vendor_id_for_sync = slot.provider.clone();
-    let project_root_for_sync = slot.project_path.clone().or_else(|| {
-        session_cwd_override
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    });
+    let project_root_for_sync = thread_project_dir;
     if crate::skills_manager_adapter::is_live_verified(&vendor_id_for_sync) {
         if let Err(error) = crate::skills_manager_adapter::sync_agent_targets(
             &vendor_id_for_sync,
@@ -3033,17 +3055,13 @@ impl AgentBridge {
         });
 
         // `slot.project_path` (not `self.session_cwd_override` directly) so
-        // this cwd can never disagree with what was just recorded on the
-        // slot two lines above (PISO-4) -- both trace back to the same
-        // `project_path_for_slot` snapshot taken before construction.
+        // this cwd -- and the MCP `--project-dir` below -- can never
+        // disagree with what was just recorded on the slot a few lines
+        // above (PISO-4): both trace back to the same `project_path_for_
+        // slot` snapshot taken before construction, not an independent
+        // re-read of the global that could have moved since.
         let cwd = cwd_for_session(slot.project_path.as_deref(), &self.session_cwd_override);
-        let mcp_servers = snapflowd_mcp_servers_entry(
-            self.session_cwd_override
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_deref(),
-            provider,
-        );
+        let mcp_servers = snapflowd_mcp_servers_entry(slot.project_path.as_deref(), provider);
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
@@ -3181,12 +3199,21 @@ impl AgentBridge {
     /// `thread_item_project_context` phase: the project directory this
     /// thread's session was opened against (see `ThreadSlot::project_path`'s
     /// doc comment) -- `None` when no project was active at creation time,
-    /// distinct from `Some("")`, which never occurs here.
+    /// distinct from `Some("")`, which never occurs here. The FFI boundary
+    /// (`panel_rust_set_project_path`) already normalizes a closed/empty
+    /// project to `None` before it ever reaches `session_cwd_override`, so
+    /// this should be unreachable in practice -- the `filter` is a second,
+    /// cheap line of defense at PISO-3's own persistence chokepoint (this
+    /// is what both `ThreadRecord`-collecting call sites in
+    /// `external_snapshot.rs` persist verbatim), so an empty string can
+    /// never round-trip into sqlite and be mistaken later for a real
+    /// project a thread is scoped to.
     pub fn thread_project_path(&self, idx: usize) -> Option<String> {
         self.slots.get(idx).and_then(|slot| {
             slot.project_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned())
+                .filter(|path| !path.is_empty())
         })
     }
 
@@ -4218,6 +4245,39 @@ mod tests {
         let expected =
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         assert_eq!(cwd_for_session(None, &session_cwd_override), expected);
+    }
+
+    /// PISO-4 extension: a thread whose slot is bound to project A must
+    /// get an MCP `--project-dir` pointed at A's parent even while the
+    /// process-global `session_cwd_override` (whatever project is active
+    /// right now) is B -- otherwise the thread's `cwd` would be fixed but
+    /// its MCP tools would still read/write B's files, the half of the
+    /// isolation leak that actually matters. `thread_project_dir` is the
+    /// shared resolver both `snapflowd_mcp_servers_entry` and the skills
+    /// reactive-sync go through; this proves the slot wins over the
+    /// global end to end through that real MCP-entry builder, not just at
+    /// the resolver in isolation.
+    #[test]
+    fn thread_project_dir_feeds_the_threads_own_project_into_the_mcp_project_dir_not_the_globals(
+    ) {
+        let session_cwd_override: Mutex<Option<PathBuf>> =
+            Mutex::new(Some(PathBuf::from("/projects/b/timeline.mlt")));
+        let thread_a_project = PathBuf::from("/projects/a/timeline.mlt");
+
+        let resolved = thread_project_dir(Some(thread_a_project.as_path()), &session_cwd_override);
+        assert_eq!(resolved, Some(thread_a_project));
+
+        let entries = snapflowd_mcp_servers_entry(resolved.as_deref(), "claude");
+        let args = entries[0]["args"].as_array().expect("args is an array");
+        let project_dir_idx = args
+            .iter()
+            .position(|a| a == "--project-dir")
+            .expect("--project-dir must be present when a project is open");
+        assert_eq!(
+            args[project_dir_idx + 1],
+            serde_json::Value::String("/projects/a".to_string()),
+            "--project-dir must be thread A's own project parent, not the global's (B)"
+        );
     }
 
     #[test]
