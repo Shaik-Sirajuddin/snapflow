@@ -3270,15 +3270,22 @@ mod lifecycle_tests {
         let port = listener.local_addr().expect("local_addr").port();
         drop(listener);
         let mut command = std::process::Command::new(acpx_server_bin_for_lifecycle_test());
-        command
-            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", mock_agent.to_string_lossy().into_owned())
-            .env("ACPX_DEFAULT_AGENT_ID", "codex")
-            .env("RUI_MOCK_AGENT_PERSONA", "codex")
-            .env("RUST_LOG", "error")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+        // PROF-5: routed through the crate's one sanctioned in-crate-test
+        // exemption (see agent_bridge.rs's own doc comment on
+        // `test_only_set_backend_cmd_env`) instead of a raw `.env(...)`
+        // write, so the backend_cmd_env_write_regression_test guard has
+        // exactly one call site to recognize.
+        crate::agent_bridge::test_only_set_backend_cmd_env(
+            &mut command,
+            mock_agent.to_string_lossy().into_owned(),
+        )
+        .env("ACPX_DEFAULT_AGENT_ID", "codex")
+        .env("RUI_MOCK_AGENT_PERSONA", "codex")
+        .env("RUST_LOG", "error")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
         let mut child = command.spawn().expect("spawn real acpx-server for test");
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
         let mut reachable = false;

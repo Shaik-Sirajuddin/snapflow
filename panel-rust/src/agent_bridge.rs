@@ -4079,6 +4079,40 @@ impl Drop for AgentBridge {
     }
 }
 
+// PROF5-GUARD-ALLOW-START -- see tests/backend_cmd_env_write_regression_test.rs.
+// Everything between this line and the matching END marker below is the
+// one place `"ACPX_BACKEND_CMD"`/`"ACPX_DEFAULT_ACP_COMMAND"` may legally
+// appear in this crate's `src/`. Do not widen this block casually -- the
+// regression guard fails the build the moment either literal shows up
+// anywhere else, which is the entire point.
+/// PROF-5 (`profile-only-backend-selection` plan): the ONE sanctioned way
+/// to write `ACPX_BACKEND_CMD` in this crate. `#[cfg(test)]`-gated, so
+/// calling it from any production code path is a compile error, not a
+/// convention someone has to remember -- and
+/// `tests/backend_cmd_env_write_regression_test.rs` asserts the literal
+/// string `"ACPX_BACKEND_CMD"` (and `"ACPX_DEFAULT_ACP_COMMAND"`, its
+/// planned rename arriving via the agents-install-runtime worktree) never
+/// appears anywhere in `src/` outside this one function's own definition,
+/// so a second ad hoc write anywhere -- including inside another test --
+/// fails that guard immediately rather than silently reintroducing the
+/// pattern PROF-3 removed from production.
+///
+/// Every call site is an in-crate unit test hand-spawning its OWN
+/// `acpx-server` subprocess directly, inside this file's own
+/// `#[cfg(test)] mod tests` -- structurally unreachable from
+/// `spawn_gateway_process` or any production path (verified in
+/// PROF-3/PROF-4: production never even builds this function in, since it
+/// is compiled out entirely outside `cfg(test)`). Real backend selection
+/// in production goes through a profile (`_acpx.profile`), never this.
+#[cfg(test)]
+pub(crate) fn test_only_set_backend_cmd_env<'a>(
+    command: &'a mut std::process::Command,
+    value: impl AsRef<std::ffi::OsStr>,
+) -> &'a mut std::process::Command {
+    command.env("ACPX_BACKEND_CMD", value)
+}
+// PROF5-GUARD-ALLOW-END
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4481,9 +4515,8 @@ mod tests {
             db_path: Option<&std::path::Path>,
         ) -> Self {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", backend_cmd)
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
                     .env("RUST_LOG", "error");
@@ -4507,9 +4540,8 @@ mod tests {
         ) -> Self {
             let backend_cmd = mock_agent_bin().to_string_lossy().into_owned();
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", &backend_cmd)
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, &backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
                     .env("RUI_MOCK_AGENT_EVENT_LOG", event_log_path)
@@ -5167,8 +5199,8 @@ mod tests {
                 // it). No ACPX_NATIVE_AUTH_METHOD_ID: unlike codex-acp's
                 // explicit API-key exchange, claude-acp's ambient auth
                 // (~/.claude/.credentials.json) doesn't need one.
-                command.env(
-                    "ACPX_BACKEND_CMD",
+                test_only_set_backend_cmd_env(
+                    command,
                     "npx -y @agentclientprotocol/claude-agent-acp@0.58.1",
                 );
             },
@@ -6733,9 +6765,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "relay-test")
                     .env("RUST_LOG", "error");
             });
@@ -6900,9 +6931,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "cancel-test")
                     .env("RUST_LOG", "error");
             });
@@ -6992,9 +7022,8 @@ done
 
         let port = free_port();
         let mut command = std::process::Command::new(acpx_server_bin());
-        command
-            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+        test_only_set_backend_cmd_env(&mut command, format!("sh {}", script_path.display()))
             .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
             .env("RUST_LOG", "error")
             .stdin(std::process::Stdio::null())
@@ -7138,9 +7167,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "mode-config-test")
                     .env("RUST_LOG", "error");
             });
@@ -7418,9 +7446,8 @@ done
 
         let gateway = {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
-                command
-                    .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                command.env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"));
+                test_only_set_backend_cmd_env(command, format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "stream-merge-test")
                     .env("RUST_LOG", "error");
             });

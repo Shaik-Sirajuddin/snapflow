@@ -4493,6 +4493,7 @@ dependencies = [
  "opener",
  "portable-pty",
  "pulldown-cmark 0.12.2",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
