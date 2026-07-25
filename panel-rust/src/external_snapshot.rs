@@ -596,6 +596,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                     profile_name: thread.profile_name.clone(),
                     permission_profile: thread.permission_profile.clone(),
                     background_session: None,
+                    // PISO-3: persist the same project this thread's
+                    // session was actually opened against (see
+                    // `ThreadSlot::project_path`'s doc comment), not the
+                    // currently-active project -- that distinction is the
+                    // whole point of the durable association.
+                    project_path: bridge.thread_project_path(idx),
                 })
             })
             .collect()
@@ -617,6 +623,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             profile_name: thread.profile_name,
             permission_profile: thread.permission_profile,
             background_session: None,
+            project_path: bridge.thread_project_path(real_idx),
         })
     }
 }

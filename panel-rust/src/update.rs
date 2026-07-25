@@ -3376,6 +3376,7 @@ mod tests {
                         provider: "codex".to_owned(),
                         session_id: None,
                         profile_name: None,
+                        project_path: None,
                     }],
                     thread_ids: vec!["thread-1".to_owned()],
                     selected_thread_id: None,
@@ -3556,6 +3557,7 @@ mod tests {
             profile_name: None,
             permission_profile: None,
             background_session: None,
+            project_path: None,
         };
         let input = FrameInput {
             thread_record_snapshots: vec![record.clone()],

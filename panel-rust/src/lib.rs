@@ -1384,6 +1384,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
                     session_id: None,
                     profile_name: None,
+                    // Cold-start seed threads: nothing persisted yet, so
+                    // there is no stored association to hydrate from.
+                    project_path: None,
                 })
                 .collect()
         } else {
@@ -1409,6 +1412,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     profile_name: settings_file::non_default_sentinel(
                         record.profile_name.clone(),
                     ),
+                    // PISO-3: hydrate the durable per-thread project
+                    // association straight from the persisted record, so
+                    // `AgentBridge::new_with_thread_specs` can bind the
+                    // restored slot's `project_path` to what this thread
+                    // was actually created under -- not whatever project
+                    // happens to be active at this restart.
+                    project_path: record.project_path.clone(),
                 })
                 .collect()
         };

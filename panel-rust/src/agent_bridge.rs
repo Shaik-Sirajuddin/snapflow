@@ -107,6 +107,14 @@ pub struct ThreadSpec {
     pub provider: String,
     pub session_id: Option<String>,
     pub profile_name: Option<String>,
+    /// PISO-3: the durable `ThreadRecord::project_path` this thread was
+    /// last persisted against, if any -- carried through so the restored
+    /// slot's `project_path` (below) hydrates from what was actually
+    /// stored rather than starting `None` and silently inheriting
+    /// whatever project happens to be active at this restart (the leak
+    /// this phase closes). `None` for a freshly-seeded default thread
+    /// (nothing persisted yet) and for a legacy pre-migration record.
+    pub project_path: Option<String>,
 }
 
 /// The resolved binding returned once a thread has opened or resumed.
@@ -125,6 +133,7 @@ fn specs_for_names(thread_names: &[&str]) -> Vec<ThreadSpec> {
             provider: provider_for_index(idx).to_owned(),
             session_id: None,
             profile_name: None,
+            project_path: None,
         })
         .collect()
 }
@@ -1897,17 +1906,30 @@ fn now_token() -> String {
     format!("unix:{secs}")
 }
 
-/// The `cwd` argument ACP's `session/new` wants. `chat_sessions_project_path`
-/// phase: prefers the active MLT project's path (see
-/// `AgentBridge::set_active_project_path`) when one is known, since that's
-/// the directory a skill/session should actually be scoped to; falls back
-/// to the process's own working directory (with `.` as a last resort) when
-/// no project is open, matching this function's pre-existing behavior.
-fn cwd_for_session(session_cwd_override: &Mutex<Option<PathBuf>>) -> PathBuf {
-    session_cwd_override
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+/// The `cwd` argument ACP's `session/new` wants. `project_isolation_mlt_
+/// binding` phase (PISO-4): prefers the attaching THREAD's own
+/// `ThreadSlot::project_path` -- captured once when that slot was created
+/// or restored -- over the process-global `session_cwd_override`. The
+/// global only ever reflects whichever MLT project happens to be active
+/// RIGHT NOW; using it here was the isolation leak this phase closes,
+/// since attaching thread A after the user has switched to project B would
+/// hand acpx B's directory for an A-scoped session. Falls back to the
+/// global override only when the slot itself carries no project (a thread
+/// created/attached with nothing open at the time), and to the process's
+/// own working directory (`.` as a last resort) only when neither is
+/// known -- matching this function's pre-existing behavior for that case.
+fn cwd_for_session(
+    thread_project_path: Option<&std::path::Path>,
+    session_cwd_override: &Mutex<Option<PathBuf>>,
+) -> PathBuf {
+    thread_project_path
+        .map(PathBuf::from)
+        .or_else(|| {
+            session_cwd_override
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
@@ -2073,10 +2095,16 @@ fn spawn_background_attachment(
     // README.md#reactive-sync): before/at session setup, make sure this
     // agent's skills are actually propagated to its native skill
     // directory, catching up anything registered while no session was
-    // open. `None` project_root here means global scope, deliberately
-    // NOT cwd_for_session's current-dir fallback -- an unset session cwd
-    // override should sync global skills only, not whatever directory the
-    // panel-rust process happens to be running from.
+    // open. Prefers this thread's own `slot.project_path`, same reasoning
+    // as `cwd_for_session` below (PISO-4) -- the global `session_cwd_
+    // override` can point at a different project than the one this
+    // thread's session is actually being opened against, and skills
+    // synced to the wrong project's native directory would be just as
+    // real a leak as a wrong `cwd`. `None` (from both) means global
+    // scope, deliberately NOT cwd_for_session's current-dir fallback --
+    // a thread with no known project should sync global skills only, not
+    // whatever directory the panel-rust process happens to be running
+    // from.
     //
     // For vendor_ids skills_manager::agent_registry::is_live_verified()
     // covers -- MCP is no longer sent for them at all (below), so this
@@ -2087,10 +2115,12 @@ fn spawn_background_attachment(
     // remains the real delivery path regardless of this sync's timing, so
     // it stays a best-effort background thread as before.
     let vendor_id_for_sync = slot.provider.clone();
-    let project_root_for_sync = session_cwd_override
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let project_root_for_sync = slot.project_path.clone().or_else(|| {
+        session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    });
     if crate::skills_manager_adapter::is_live_verified(&vendor_id_for_sync) {
         if let Err(error) = crate::skills_manager_adapter::sync_agent_targets(
             &vendor_id_for_sync,
@@ -2117,7 +2147,7 @@ fn spawn_background_attachment(
 
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
-        let cwd = cwd_for_session(&session_cwd_override);
+        let cwd = cwd_for_session(slot.project_path.as_deref(), &session_cwd_override);
         let result = if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
@@ -2464,9 +2494,18 @@ impl AgentBridge {
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
                 archived: Mutex::new(runtime_snapshot.archived),
-                // No project can be active yet at construction time --
-                // `session_cwd_override` was just created above, unset.
-                project_path: None,
+                // PISO-3: hydrate from the durable per-thread association
+                // (`ThreadSpec::project_path`, sourced from `ThreadRecord`
+                // via lib.rs's cold-start restore) rather than always
+                // starting `None` here. `session_cwd_override` (the
+                // process-global "whatever project is active now" value)
+                // was just created above, unset either way -- this must
+                // NOT read from it, since that is exactly the leak PISO-3
+                // exists to close: a restored thread's binding is what it
+                // was persisted with, not whatever happens to be open at
+                // this restart. `None` for a freshly-seeded default thread
+                // or a legacy pre-migration record, same as before.
+                project_path: spec.project_path.as_deref().map(PathBuf::from),
                 deferred: false,
             });
             slots.push(slot.clone());
@@ -2993,7 +3032,11 @@ impl AgentBridge {
             deferred: false,
         });
 
-        let cwd = cwd_for_session(&self.session_cwd_override);
+        // `slot.project_path` (not `self.session_cwd_override` directly) so
+        // this cwd can never disagree with what was just recorded on the
+        // slot two lines above (PISO-4) -- both trace back to the same
+        // `project_path_for_slot` snapshot taken before construction.
+        let cwd = cwd_for_session(slot.project_path.as_deref(), &self.session_cwd_override);
         let mcp_servers = snapflowd_mcp_servers_entry(
             self.session_cwd_override
                 .lock()
@@ -4109,6 +4152,72 @@ mod tests {
             args: Vec::new(),
             started_at: "2026-07-24T00:00:00.000000000Z".to_owned(),
         }
+    }
+
+    /// PISO-4: two threads whose slots carry different `project_path`s
+    /// must each resolve their OWN project directory from
+    /// `cwd_for_session`, and a later change to the process-global
+    /// `session_cwd_override` (whatever project the user has since
+    /// switched to) must not retroactively change either answer -- that
+    /// global is only ever a fallback for a slot with no project of its
+    /// own, never an override for one that has one.
+    #[test]
+    fn cwd_for_session_prefers_the_threads_own_slot_over_the_global_override() {
+        let session_cwd_override: Mutex<Option<PathBuf>> =
+            Mutex::new(Some(PathBuf::from("/projects/initial")));
+
+        let thread_a_project = PathBuf::from("/projects/a");
+        let thread_b_project = PathBuf::from("/projects/b");
+
+        assert_eq!(
+            cwd_for_session(Some(thread_a_project.as_path()), &session_cwd_override),
+            thread_a_project
+        );
+        assert_eq!(
+            cwd_for_session(Some(thread_b_project.as_path()), &session_cwd_override),
+            thread_b_project
+        );
+
+        // The user switches the active project after both threads were
+        // already attached -- neither thread's own answer may move.
+        *session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PathBuf::from("/projects/c"));
+
+        assert_eq!(
+            cwd_for_session(Some(thread_a_project.as_path()), &session_cwd_override),
+            thread_a_project
+        );
+        assert_eq!(
+            cwd_for_session(Some(thread_b_project.as_path()), &session_cwd_override),
+            thread_b_project
+        );
+    }
+
+    /// PISO-4: a slot with no project of its own (created/attached with
+    /// nothing open) still falls back to the global `session_cwd_override`
+    /// -- that fallback chain is deliberately preserved, not collapsed
+    /// away by the slot-first change above.
+    #[test]
+    fn cwd_for_session_falls_back_to_the_global_override_when_the_slot_has_none() {
+        let session_cwd_override: Mutex<Option<PathBuf>> =
+            Mutex::new(Some(PathBuf::from("/projects/global")));
+        assert_eq!(
+            cwd_for_session(None, &session_cwd_override),
+            PathBuf::from("/projects/global")
+        );
+    }
+
+    /// PISO-4: with neither the slot nor the global override carrying a
+    /// project, `cwd_for_session` falls back to the process's own working
+    /// directory -- the pre-existing last-resort behavior this phase must
+    /// not disturb.
+    #[test]
+    fn cwd_for_session_falls_back_to_the_process_cwd_when_nothing_is_known() {
+        let session_cwd_override: Mutex<Option<PathBuf>> = Mutex::new(None);
+        let expected =
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        assert_eq!(cwd_for_session(None, &session_cwd_override), expected);
     }
 
     #[test]

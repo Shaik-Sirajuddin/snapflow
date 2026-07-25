@@ -47,6 +47,33 @@ pub struct ThreadRecord {
     pub profile_name: Option<String>,
     pub permission_profile: Option<String>,
     pub background_session: Option<bool>,
+    /// PISO-3 (project-isolation-mlt-binding plan): the MLT project *file
+    /// path* this thread's session was opened/resumed against, mirroring
+    /// `ThreadSlot::project_path`'s own doc comment -- captured once at
+    /// session-open time and never updated afterward. `None` for a thread
+    /// created before this column existed, or one created with no MLT
+    /// project open at all; both are treated identically as "unscoped",
+    /// shown regardless of which project is active (see
+    /// `models::retain_items_for_project`). Legacy rows never gain a value
+    /// retroactively -- there is no way to know after the fact which
+    /// project a pre-migration thread belonged to.
+    ///
+    /// Stored as a PATH, not a synthesized project id, deliberately: every
+    /// existing consumer (`AgentBridge::session_cwd_override`,
+    /// `PanelModel::active_project_path`, `cwd_for_session`,
+    /// `retain_items_for_project`) already compares raw MLT project file
+    /// paths, so a path needs no new lookup table and stays comparable
+    /// with zero translation at every call site. The known cost: a
+    /// Save-As or on-disk rename changes the path out from under an
+    /// already-recorded row, and this phase does not detect or reconcile
+    /// that -- the row simply keeps its old path (same "stranded" outcome
+    /// `ThreadSlot::project_path`'s capture-once design already accepts
+    /// for the live in-memory value; this durable copy inherits the same
+    /// limitation rather than introducing a new one). A future phase
+    /// (PISO-1 propagates Save-As/rename from the host) can add
+    /// rename-aware rebinding on top of this column without a schema
+    /// change.
+    pub project_path: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,7 +139,14 @@ impl PanelStateStore {
         Self::add_column_if_missing(&connection, "display_name", "TEXT")?;
         Self::add_column_if_missing(&connection, "provider", "TEXT")?;
         Self::add_defaults_column_if_missing(&connection, "selected_thread_id", "TEXT")?;
-        connection.execute_batch("PRAGMA user_version = 3;")?;
+        // PISO-3: durable thread<->project association. An existing
+        // database from before this column existed migrates in place via
+        // `add_column_if_missing` -- every pre-existing row simply reads
+        // back with `project_path = NULL` (see `ThreadRecord::project_path`'s
+        // doc comment for why that is the correct, permanent state for
+        // those rows rather than a value to backfill).
+        Self::add_column_if_missing(&connection, "project_path", "TEXT")?;
+        connection.execute_batch("PRAGMA user_version = 4;")?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -258,7 +292,7 @@ impl PanelStateStore {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let mut statement = connection.prepare(
             "SELECT thread_id, display_name, provider, session_id,
-                    profile_name, permission_profile, background_session
+                    profile_name, permission_profile, background_session, project_path
              FROM thread_settings
              WHERE display_name IS NOT NULL
                AND provider IS NOT NULL
@@ -274,6 +308,7 @@ impl PanelStateStore {
                 profile_name: row.get(4)?,
                 permission_profile: row.get(5)?,
                 background_session: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+                project_path: row.get(7)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -313,9 +348,14 @@ impl PanelStateStore {
         let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         connection.execute(
             "UPDATE thread_settings
-             SET display_name = ?2, provider = ?3
+             SET display_name = ?2, provider = ?3, project_path = ?4
              WHERE thread_id = ?1",
-            params![record.thread_id, record.display_name, record.provider],
+            params![
+                record.thread_id,
+                record.display_name,
+                record.provider,
+                record.project_path,
+            ],
         )?;
         Ok(())
     }
@@ -469,6 +509,7 @@ mod tests {
             profile_name: None,
             permission_profile: None,
             background_session: None,
+            project_path: None,
         };
         store.save_thread_record(&record).unwrap();
         record.session_id = "session-2".to_owned();
@@ -507,6 +548,7 @@ mod tests {
             profile_name: Some("review".to_owned()),
             permission_profile: None,
             background_session: None,
+            project_path: Some("/projects/timeline.mlt".to_owned()),
         };
         let second = ThreadRecord {
             thread_id: "filters".to_owned(),
@@ -516,6 +558,7 @@ mod tests {
             profile_name: None,
             permission_profile: Some("confirm".to_owned()),
             background_session: Some(true),
+            project_path: None,
         };
         store.save_thread_record(&first).unwrap();
         store
@@ -552,6 +595,7 @@ mod tests {
             profile_name: Some("default".to_owned()),
             permission_profile: Some("default".to_owned()),
             background_session: None,
+            project_path: None,
         };
         let real = ThreadRecord {
             thread_id: "real-thread".to_owned(),
@@ -561,6 +605,7 @@ mod tests {
             profile_name: Some("my-real-profile".to_owned()),
             permission_profile: Some("workspace".to_owned()),
             background_session: None,
+            project_path: None,
         };
         store.save_thread_record(&poisoned).unwrap();
         store.save_thread_record(&real).unwrap();
@@ -606,6 +651,7 @@ mod tests {
             profile_name: Some("review".to_owned()),
             permission_profile: None,
             background_session: None,
+            project_path: None,
         };
         store.save_thread_record(&record).unwrap();
         store
@@ -661,5 +707,90 @@ mod tests {
         );
         assert!(store.thread_records().unwrap().is_empty());
         assert_eq!(store.defaults().unwrap().selected_thread_id, None);
+    }
+
+    /// PISO-3: a database created by a build before the `project_path`
+    /// column existed (v3 shape -- `display_name`/`provider` present,
+    /// `project_path` absent) must open, migrate in place via
+    /// `add_column_if_missing`, and keep every existing row -- not error,
+    /// and not silently wipe the thread the user already had open.
+    #[test]
+    fn an_old_v3_database_without_project_path_migrates_and_keeps_its_row() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE panel_defaults (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    profile_name TEXT,
+                    permission_profile TEXT,
+                    background_session INTEGER NOT NULL CHECK (background_session IN (0, 1)),
+                    selected_thread_id TEXT
+                );
+                CREATE TABLE thread_settings (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT,
+                    profile_name TEXT,
+                    permission_profile TEXT,
+                    background_session INTEGER CHECK (background_session IN (0, 1)),
+                    display_name TEXT,
+                    provider TEXT
+                );
+                INSERT INTO thread_settings
+                    (thread_id, session_id, profile_name, permission_profile,
+                     background_session, display_name, provider)
+                VALUES ('pre-migration-thread', 'session-pre', 'codex', 'review',
+                        1, 'Pre-migration thread', 'codex');
+                PRAGMA user_version = 3;
+                ",
+            )
+            .unwrap();
+
+        let store = PanelStateStore::from_connection(connection).unwrap();
+
+        // The row survives the migration, and -- being from before this
+        // column existed -- reads back with `project_path: None`, which is
+        // the documented "unscoped, visible everywhere" state, not an
+        // error or a dropped row.
+        assert_eq!(
+            store.thread_records().unwrap(),
+            vec![ThreadRecord {
+                thread_id: "pre-migration-thread".to_owned(),
+                display_name: "Pre-migration thread".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: "session-pre".to_owned(),
+                profile_name: Some("codex".to_owned()),
+                permission_profile: Some("review".to_owned()),
+                background_session: Some(true),
+                project_path: None,
+            }]
+        );
+
+        // A fresh write on the migrated table exercises the new column end
+        // to end, proving the ALTER TABLE actually took (not just that the
+        // old row happens to still be readable).
+        store
+            .save_thread_record(&ThreadRecord {
+                thread_id: "pre-migration-thread".to_owned(),
+                display_name: "Pre-migration thread".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: "session-pre".to_owned(),
+                profile_name: Some("codex".to_owned()),
+                permission_profile: Some("review".to_owned()),
+                background_session: Some(true),
+                project_path: Some("/projects/pre-migration.mlt".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .thread_records()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .project_path
+                .as_deref(),
+            Some("/projects/pre-migration.mlt")
+        );
     }
 }
