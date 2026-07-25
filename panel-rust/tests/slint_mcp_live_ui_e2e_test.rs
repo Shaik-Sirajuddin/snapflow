@@ -25,8 +25,6 @@
 //! (already proven end to end there via manual `curl`; this is that same
 //! sequence promoted to real, checked-in test code).
 
-use acpx_client::ext::admin::AdminClient;
-use acpx_proto::admin::CustomAgentSpec;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -34,7 +32,7 @@ use std::time::Duration;
 
 mod common;
 #[allow(unused_imports)]
-use common::{acpx_server_bin, free_port, mock_agent_bin};
+use common::{acpx_server_bin, free_port, mock_agent_bin, provision_mock_profile};
 
 fn repo_root() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -170,37 +168,38 @@ impl LiveUiHarness {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // PROF-4 (`profile-only-backend-selection` plan): the real panel
-        // this harness drives opens its cold-start seed threads in
-        // native/unmanaged mode (no configured `default_agent_id`, so no
-        // `_acpx.profile` -- see `lib.rs`'s `cold_start_thread_specs`),
-        // which resolves against this gateway's own `ACPX_DEFAULT_AGENT_ID`
-        // ("codex") supervisor entry. That entry used to come from
-        // `ACPX_BACKEND_CMD` (removed from production in PROF-3); the
-        // admin-plane custom-agent route (`POST /admin/agents/custom`)
-        // registers the exact same supervisor key durably instead, so
-        // native mode keeps resolving to `rui-mock-agent` unchanged.
-        let admin_deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < admin_deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), &admin_token);
-        let mut mock_env = std::collections::BTreeMap::new();
-        mock_env.insert("RUI_MOCK_AGENT_PERSONA".to_owned(), persona.to_owned());
-        admin
-            .create_custom_agent(&CustomAgentSpec {
-                id: persona.to_owned(),
-                name: persona.to_owned(),
-                command: mock_agent_bin().to_string_lossy().into_owned(),
-                args: Vec::new(),
-                env: mock_env,
-                cwd: None,
-            })
-            .await
-            .expect("admin/agents/custom create");
+        // PROF-4 (`profile-only-backend-selection` plan): the panel used to
+        // reach `rui-mock-agent` via `ACPX_BACKEND_CMD` + native/unmanaged
+        // mode (removed from production in PROF-3). Replaced with a real
+        // profile: `provision_mock_profile` registers `rui-mock-agent` as a
+        // durable custom agent under `"mock-codex"` (deliberately NOT
+        // `persona` itself -- acpx-server's own `main.rs` unconditionally
+        // pre-registers a supervisor entry under `ACPX_DEFAULT_AGENT_ID` at
+        // startup using its bare npx-codex-acp default, so reusing that
+        // exact id here would 409 with "custom agent id codex conflicts
+        // with an existing registered backend") and creates a profile
+        // literally named `persona` ("codex") pointing at it. The
+        // settings.global.json written below (before shotcut starts) sets
+        // `default_agent_id: "codex"`, which the panel's own cold-start
+        // seed binds as `_acpx.profile` (`lib.rs`'s `cold_start_thread_
+        // specs`) -- so this panel run never touches native mode at all.
+        let base_url = format!("http://127.0.0.1:{gateway_port}");
+        provision_mock_profile(
+            &base_url,
+            admin_port,
+            &admin_token,
+            persona,
+            std::collections::BTreeMap::new(),
+        )
+        .await;
+
+        let settings_dir = state_dir.join("panel-settings");
+        std::fs::create_dir_all(&settings_dir).expect("create panel settings dir");
+        std::fs::write(
+            settings_dir.join("settings.global.json"),
+            format!(r#"{{"schema_version":1,"default_agent_id":"{persona}"}}"#),
+        )
+        .expect("write settings.global.json");
 
         let mcp_port = free_port();
         let shotcut = Command::new(shotcut_bin())

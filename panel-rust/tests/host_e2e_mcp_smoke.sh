@@ -21,6 +21,8 @@ keep_state="${PANEL_HOST_E2E_MCP_KEEP_STATE:-0}"
 display="${PANEL_HOST_E2E_MCP_DISPLAY:-:112}"
 screen="${PANEL_HOST_E2E_MCP_SCREEN:-1280x800x24}"
 gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
+admin_port="${PANEL_HOST_E2E_MCP_ADMIN_PORT:-18797}"
+admin_token="panel-host-e2e-mcp-admin-token-$$"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
 scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|rename>}"
 
@@ -72,9 +74,10 @@ done
 xdpyinfo -display "$display" >/dev/null
 
 ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
-ACPX_BACKEND_CMD="$agent_bin" \
 ACPX_DEFAULT_AGENT_ID="codex" \
 ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+ACPX_ADMIN_TOKEN="$admin_token" \
+ACPX_ADMIN_BIND="127.0.0.1:$admin_port" \
 RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
 "$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
 server_pid="$!"
@@ -86,6 +89,36 @@ for _ in $(seq 1 80); do
     sleep 0.1
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
+
+# PROF-4 (profile-only-backend-selection plan): see host_e2e_smoke.sh's own
+# comment on this same block for the full rationale -- registers
+# rui-mock-agent as a durable admin-plane custom agent under "mock-codex"
+# (deliberately not "codex" -- acpx-server's own main.rs unconditionally
+# pre-registers a supervisor entry under ACPX_DEFAULT_AGENT_ID at startup,
+# so reusing that id here would 409 with a "conflicts with an existing
+# registered backend" error), then a profile literally named "codex"
+# pointing at it, then a settings.global.json setting default_agent_id so
+# the panel's own cold-start seed binds that profile as its _acpx.profile
+# instead of ever touching native mode.
+for _ in $(seq 1 80); do
+    if curl --fail --silent -o /dev/null "http://127.0.0.1:$admin_port/admin/agents" \
+        -H "Authorization: Bearer $admin_token"; then
+        break
+    fi
+    sleep 0.1
+done
+curl --fail --silent -X POST "http://127.0.0.1:$admin_port/admin/agents/custom" \
+    -H "Authorization: Bearer $admin_token" \
+    -H "Content-Type: application/json" \
+    -d "$(printf '{"id":"mock-codex","name":"mock-codex","command":"%s","args":[],"env":{"RUI_MOCK_AGENT_PERSONA":"codex"},"cwd":null}' "$agent_bin")" \
+    >/dev/null
+curl --fail --silent -X POST "http://127.0.0.1:$gateway_port/rpc" \
+    -H "Content-Type: application/json" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"profiles/create","params":{"name":"codex","agent_id":"mock-codex"}}' \
+    >/dev/null
+
+mkdir -p "$state_dir/panel-settings"
+printf '{"schema_version":1,"default_agent_id":"codex"}' >"$state_dir/panel-settings/settings.global.json"
 
 env \
 SLINT_MCP_PORT="$mcp_port" \
