@@ -76,6 +76,97 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
     "Export pipeline bug",
 ];
 
+/// PROF-1/PROF-2: builds the cold-start `ThreadSpec`s for a fresh install
+/// (`restored_records.is_empty()`) -- pulled out of the giant window-setup
+/// function purely so this rule is unit-testable on its own.
+///
+/// `configured_agent_id` is this machine's real, non-sentinel
+/// `default_agent_id` from resolved settings, if any (settings.global.json
+/// / bundled defaults, the same value the settings sheet's agent picker
+/// writes) -- `None` means genuinely nothing is configured yet.
+///
+/// Every seed thread shares ONE real provider: `configured_agent_id` when
+/// set, else the single documented [`NO_PROVIDER_REQUESTED_FALLBACK`] --
+/// never an index-parity guess alternating "codex"/"claude" by thread
+/// position, which silently mis-bound half of every fresh install's
+/// default threads to whichever provider parity happened to land on
+/// regardless of what was actually configured/available.
+///
+/// `profile_name` (PROF-2) is bound to `configured_agent_id` too, but
+/// ONLY when it's real -- never to the `NO_PROVIDER_REQUESTED_FALLBACK`
+/// label, which is a bare gateway-routing key, not a real registry agent
+/// id. acpx's `Router::ensure_default_profiles_seeded` auto-fills exactly
+/// one profile per installed registry agent, named after that agent's own
+/// id, so this name resolves without requiring any `profiles/create`
+/// setup first (see `ProfileSource`'s own doc comment in
+/// acpx-core/src/profile.rs) -- without this, a thread with a real
+/// `default_agent_id` configured but no hand-picked profile silently fell
+/// all the way through to acpx-server's own native/unmanaged-mode default
+/// backend instead of the agent actually configured. Passing the bare
+/// fallback label as `_acpx.profile` would instead make every
+/// unconfigured-fresh-install `session/new` fail outright
+/// (`RouterError::UnknownProfile`) -- strictly worse than today's
+/// graceful native/unmanaged degrade -- so with nothing configured at
+/// all, `profile_name` stays `None`.
+fn cold_start_thread_specs(seed_names: &[&str], configured_agent_id: Option<String>) -> Vec<ThreadSpec> {
+    let seed_provider = configured_agent_id
+        .clone()
+        .unwrap_or_else(|| NO_PROVIDER_REQUESTED_FALLBACK.to_owned());
+    seed_names
+        .iter()
+        .map(|name| ThreadSpec {
+            display_name: (*name).to_owned(),
+            provider: seed_provider.clone(),
+            session_id: None,
+            profile_name: configured_agent_id.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cold_start_thread_specs_tests {
+    use super::cold_start_thread_specs;
+
+    /// PROF-2's own acceptance question: on a clean cache dir with no
+    /// `default_agent_id` configured (the real "nothing set anywhere"
+    /// case `cold_start_thread_specs` is called with when
+    /// `settings_file::SettingsPaths::load_resolved` finds nothing), the
+    /// seed threads get the one documented routing fallback for
+    /// `provider` and stay unprofiled (`profile_name: None`) rather than
+    /// guessing a profile name that would make `session/new` fail
+    /// outright. This is an honest degrade to native/unmanaged mode, not
+    /// a "usable default profile" -- see the written PROF-2 answer this
+    /// test backs up.
+    #[test]
+    fn with_nothing_configured_seed_threads_use_the_fallback_provider_and_stay_unprofiled() {
+        let specs = cold_start_thread_specs(&["Fix timeline crash", "Add fade transition"], None);
+        assert_eq!(specs.len(), 2);
+        for spec in &specs {
+            assert_eq!(spec.provider, super::NO_PROVIDER_REQUESTED_FALLBACK);
+            assert_eq!(spec.profile_name, None, "got: {specs:?}");
+        }
+    }
+
+    /// With a real, configured `default_agent_id` (settings.global.json /
+    /// bundled defaults), the first thread genuinely binds to a usable
+    /// profile: `provider` AND `profile_name` both carry the real agent
+    /// id, so `session/new`'s `_acpx.profile` resolves against acpx's own
+    /// `ensure_default_profiles_seeded` auto-fill with zero
+    /// `profiles/create` setup required.
+    #[test]
+    fn with_a_configured_default_agent_id_every_seed_thread_binds_to_it_as_its_profile() {
+        let specs = cold_start_thread_specs(
+            &["Fix timeline crash", "Add fade transition", "Refactor filters"],
+            Some("codex-acp".to_owned()),
+        );
+        assert_eq!(specs.len(), 3);
+        for spec in &specs {
+            assert_eq!(spec.provider, "codex-acp");
+            assert_eq!(spec.profile_name.as_deref(), Some("codex-acp"), "got: {specs:?}");
+        }
+    }
+}
+
 /// Maps a Qt key event (`QKeyEvent::key()`'s `int` plus `QKeyEvent::text()`)
 /// to a Slint key-event `SharedString`. Qt::Key special codes below are the
 /// stable `qnamespace.h` values for the handful of editing/navigation keys
@@ -1376,30 +1467,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                 }
                 Err(_) => DEFAULT_THREAD_NAMES.to_vec(),
             };
-            // PROF-1: every cold-start seed thread now shares ONE real
-            // provider -- this machine's configured `default_agent_id`
-            // (settings.global.json / bundled defaults, the same value
-            // the settings sheet's agent picker writes) when one is
-            // set, else the single documented `NO_PROVIDER_REQUESTED_
-            // FALLBACK` -- never an index-parity guess alternating
-            // "codex"/"claude" by thread position, which silently
-            // mis-bound half of every fresh install's default threads to
-            // whichever provider parity happened to land on regardless
-            // of what was actually configured/available.
-            let seed_provider = settings_file::SettingsPaths::from_env()
+            let configured_agent_id = settings_file::SettingsPaths::from_env()
                 .load_resolved()
                 .ok()
-                .and_then(|resolved| settings_file::non_default_sentinel(resolved.default_agent_id))
-                .unwrap_or_else(|| NO_PROVIDER_REQUESTED_FALLBACK.to_owned());
-            seed_names
-                .into_iter()
-                .map(|name| ThreadSpec {
-                    display_name: name.to_owned(),
-                    provider: seed_provider.clone(),
-                    session_id: None,
-                    profile_name: None,
-                })
-                .collect()
+                .and_then(|resolved| settings_file::non_default_sentinel(resolved.default_agent_id));
+            cold_start_thread_specs(&seed_names, configured_agent_id)
         } else {
             restored_records
                 .iter()

@@ -305,29 +305,23 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let real_index = model.threads.len();
             let thread_id = format!("thread:{real_index}");
             let display_name = format!("New thread {}", real_index + 1);
-            // Auto-detected by family rather than an enumerated literal
-            // list: `gateway_urls`/`spawn_gateway_process` only ever
-            // recognize two provider keys today ("codex"/"claude" --
-            // see AgentBridge's constructor, which resolves exactly
-            // these two), so any agent id naming the claude family (the
-            // short label "claude" this reducer's own gateway wiring
-            // uses elsewhere, the real registry id "claude-acp", a
-            // hypothetical "claude-code", ...) maps to it; anything else
-            // defaults to codex, same as before. Found live via a real
-            // settings.global.json with default_agent_id: "claude-acp"
-            // (plausibly persisted by a picker backed by the agent
-            // catalog's real registry ids, not the short label), which
-            // an exact-match list previously silently routed to codex.
-            let provider = if model
-                .default_agent_id
-                .to_ascii_lowercase()
-                .contains("claude")
-            {
-                "claude"
+            // PROF-1/PROF-2: the agent id flows through as-is now, same
+            // as `AgentBridge::resolve_provider_for` -- no more collapsing
+            // every id down to "codex"/"claude" by a `contains("claude")`
+            // guess (the exact `normalize_provider` shape PROF-1 deleted
+            // from agent_bridge.rs, just reimplemented independently here
+            // and missed in that pass: a real third agent id such as
+            // "gemini-acp" would still have been forced onto "codex" at
+            // this call site even after agent_bridge.rs itself stopped
+            // normalizing). `model.default_agent_id` is used directly when
+            // set; the same documented last-resort fallback
+            // (`NO_PROVIDER_REQUESTED_FALLBACK`) applies when nothing is
+            // configured at all, never an index/contains-based guess.
+            let provider = if model.default_agent_id.is_empty() {
+                crate::agent_bridge::NO_PROVIDER_REQUESTED_FALLBACK.to_owned()
             } else {
-                "codex"
-            }
-            .to_owned();
+                model.default_agent_id.clone()
+            };
             // The literal string "default" is a reserved sentinel, never a
             // real profile name -- see settings_file.rs's
             // non_default_sentinel and acpxmgr.go's WriteConfig doc
@@ -342,9 +336,25 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             // on `session/new` and makes acpx-server try to dial a
             // nonexistent "default" agent forever ("agent default is in
             // crash backoff"). Guard at the point of use too.
+            //
+            // PROF-2: when no named profile is configured, fall back to
+            // `default_agent_id` as the profile name -- acpx's own
+            // `Router::ensure_default_profiles_seeded` auto-fills exactly
+            // one profile per installed registry agent, named after that
+            // agent's own id (`profile.name == agent.id`), specifically so
+            // `_acpx.profile` never requires setup for the common case
+            // (acpx-core/src/profile.rs's `ProfileSource` doc comment).
+            // Without this, a thread with a real `default_agent_id` but no
+            // hand-picked profile silently fell all the way through to
+            // acpx-server's own native/unmanaged-mode default backend
+            // (config.rs's bare `ACPX_BACKEND_CMD` fallback) instead of
+            // the agent the user actually configured -- the "profile name
+            // -> _acpx.profile" wiring the compose picker itself already
+            // relies on, just never reached for the auto-picked case.
             let profile_name = (!model.default_profile.is_empty()
                 && model.default_profile != "default")
-                .then(|| model.default_profile.clone());
+                .then(|| model.default_profile.clone())
+                .or_else(|| (!model.default_agent_id.is_empty()).then(|| model.default_agent_id.clone()));
             let permission_profile = (!model.permission_profile.is_empty()
                 && model.permission_profile != "default")
                 .then(|| model.permission_profile.clone());
@@ -2570,36 +2580,71 @@ mod tests {
     }
 
     #[test]
-    fn new_thread_provider_matching_auto_detects_any_claude_family_agent_id() {
-        // Regression test: a real settings.global.json found live this
+    fn new_thread_provider_passes_any_configured_agent_id_through_unchanged() {
+        // PROF-1/PROF-2: a real settings.global.json found live this
         // session had default_agent_id: "claude-acp" (the real registry
         // agent id, plausibly from a picker backed by the agent catalog)
-        // rather than the short "claude" label this reducer's own
-        // gateway wiring uses everywhere else -- an exact-match list only
+        // rather than the short "claude" label this reducer's gateway
+        // wiring used to special-case -- an exact-match list only
         // recognizing "claude"/"claude-code" silently routed everything
-        // else, including "claude-acp", to codex. Substring-matching the
-        // claude family instead of enumerating every literal variant
-        // means a *hypothetical future* id ("Claude-Opus-Next", picked
-        // case-insensitively) is covered automatically too, without this
-        // match needing to grow a new arm every time one shows up.
-        for agent_id in [
-            "claude",
-            "claude-code",
-            "claude-acp",
-            "Claude-Opus-Next", // not a real id -- proves this generalizes, not just today's known set
-        ] {
+        // else, including "claude-acp", to codex. The fix is no longer a
+        // bigger substring-match list (that still special-cases exactly
+        // one family and mis-routes everyone else, e.g. "gemini-acp"
+        // would still have landed on codex); `provider` now passes
+        // `default_agent_id` through completely unchanged, matching
+        // `AgentBridge::resolve_provider_for`'s own pass-through
+        // contract, so any agent id -- claude family, gemini, or
+        // anything not yet invented -- reaches its own gateway with zero
+        // code changes here.
+        for agent_id in ["claude", "claude-code", "claude-acp", "gemini-acp", "Claude-Opus-Next"] {
             let mut model = model_with_threads(&[]);
             model.default_agent_id = agent_id.to_owned();
             let (effects, _) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
             assert!(
                 matches!(
                     effects.as_slice(),
-                    [Effect::NewThreadDeferred { provider, .. }] if provider == "claude"
+                    [Effect::NewThreadDeferred { provider, .. }] if provider == agent_id
                 ),
-                "default_agent_id {agent_id:?} must route new threads to the claude provider, \
+                "default_agent_id {agent_id:?} must pass through unchanged as the provider, \
                  got: {effects:?}"
             );
         }
+    }
+
+    #[test]
+    fn new_thread_with_no_default_profile_falls_back_to_default_agent_id_as_the_profile() {
+        // PROF-2: `Router::ensure_default_profiles_seeded` auto-fills one
+        // profile per installed registry agent, named after that agent's
+        // own id -- so once a real `default_agent_id` is configured but
+        // no profile has been hand-picked, using that same id as
+        // `_acpx.profile` resolves without any `profiles/create` setup.
+        // Before this, an unset `default_profile` always meant
+        // native/unmanaged mode (`profile_name: None`) even when a real
+        // default agent WAS configured, silently ignoring it for session
+        // binding purposes.
+        let mut model = model_with_threads(&[]);
+        model.default_agent_id = "codex-acp".to_owned();
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert_eq!(
+            model.threads[0].profile_name.as_deref(),
+            Some("codex-acp"),
+            "with no explicit default_profile, the configured default_agent_id must be used \
+             as the profile name"
+        );
+    }
+
+    #[test]
+    fn new_thread_with_neither_default_profile_nor_default_agent_id_stays_unprofiled() {
+        // The genuine "nothing configured at all" case: no known agent id
+        // to request a profile for, so the session must still open
+        // native/unmanaged (profile_name stays None) rather than guessing
+        // -- passing the bare gateway-routing fallback label
+        // (`NO_PROVIDER_REQUESTED_FALLBACK`, not a real registry agent
+        // id) as `_acpx.profile` would make session/new fail outright
+        // instead of degrading gracefully.
+        let mut model = model_with_threads(&[]);
+        update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert_eq!(model.threads[0].profile_name, None);
     }
 
     #[test]
@@ -2676,11 +2721,19 @@ mod tests {
             }],
         );
         // PUI-014: the profile/permission are now read from the model thread at
-        // attach time, so the "default" sentinel must be filtered to None BEFORE
+        // attach time, so the "default" sentinel must be filtered out BEFORE
         // it is stored -- otherwise it would reach session/new at first send.
+        // PROF-2: the sentinel being filtered doesn't mean `profile_name`
+        // stays `None` here -- `default_agent_id` ("codex", a real,
+        // non-sentinel value) is the documented fallback once the
+        // explicit `default_profile` is filtered out, so the thread still
+        // gets a usable profile binding instead of silently falling back
+        // to native/unmanaged mode.
         assert_eq!(
-            model.threads[1].profile_name, None,
-            "a literal \"default\" profile must never be stored (would reach session/new)"
+            model.threads[1].profile_name.as_deref(),
+            Some("codex"),
+            "the literal \"default\" sentinel must never be stored, but default_agent_id is a \
+             real fallback and must still be used"
         );
         assert_eq!(
             model.threads[1].permission_profile, None,
