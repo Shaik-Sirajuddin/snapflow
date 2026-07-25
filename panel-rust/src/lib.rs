@@ -42,6 +42,22 @@ pub mod skills_state;
 mod skills_manager_adapter;
 mod state_store;
 mod sync;
+// `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
+// crates from this one, unable to see anything less than `pub` -- can
+// reuse `agent_bridge`'s TOCTOU-safe ephemeral-port reservation instead
+// of each keeping its own unsynchronized `free_port()` copy. Found live
+// (worktree-project-isolation's own test-flakiness investigation,
+// 2026-07-25): `free_port()` was duplicated into five separate
+// `tests/*.rs` e2e harnesses, each with the same bind-then-drop-then-
+// hope-nobody-else-grabs-it gap that `agent_bridge.rs`'s own unit tests
+// used to have before switching onto `reserve_ephemeral_port`'s
+// lock-file convention -- see that function's doc comment for the full
+// root-cause writeup. `agent_bridge` itself stays `mod` (private): only
+// this narrow reservation helper is meant to be public, not its whole
+// internal surface.
+pub mod test_support {
+    pub use crate::agent_bridge::{reserve_ephemeral_port, reserve_port};
+}
 mod theme;
 mod update;
 

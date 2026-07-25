@@ -1383,12 +1383,22 @@ fn probe_acpx_gateway_for_agent(port: u16, expected_agent: Option<&str>) -> bool
 /// trick this workspace's own `rui-acpx-client`/`acpx-server` test suites
 /// use, reused here so a colliding fixed default port (see
 /// `probe_acpx_gateway`'s doc comment) never blocks startup.
-fn reserve_port(port: u16) -> io::Result<File> {
+///
+/// `pub`, not private, even though `agent_bridge` itself is a private
+/// module: `lib.rs`'s `test_support` re-exports this and
+/// [`reserve_ephemeral_port`] so `tests/*.rs` integration tests
+/// (separate crates from this one, unable to see anything less than
+/// `pub`, and unable to re-export anything less than `pub` even through
+/// a `pub use`) can share this exact implementation instead of each
+/// keeping their own unsynchronized copy of the same reserve-a-port
+/// trick -- see `test_support`'s own doc comment for the full history.
+pub fn reserve_port(port: u16) -> io::Result<File> {
     let path = std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock"));
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-fn reserve_ephemeral_port() -> Option<(u16, File)> {
+/// See [`reserve_port`]'s doc comment for why this is `pub`.
+pub fn reserve_ephemeral_port() -> Option<(u16, File)> {
     for _ in 0..32 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let port = listener.local_addr().ok()?.port();
