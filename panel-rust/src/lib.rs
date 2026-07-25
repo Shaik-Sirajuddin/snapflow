@@ -2853,6 +2853,48 @@ pub extern "C" fn panel_rust_set_project_path(
     })
 }
 
+/// PISO-7 (project-isolation-mlt-binding plan) FFI crossing point --
+/// mirrors `panel_rust_set_project_path`'s byte-buffer shape, but takes
+/// TWO strings (old path, then new path) since a rename is a pair, not a
+/// single value. `ChatRustDock` should call this instead of
+/// `panel_rust_set_project_path` specifically for an MLT Save-As (where
+/// Shotcut knows both the path being replaced and its replacement);
+/// every other project-path change (open, close, first save of an
+/// untitled project) keeps going through `panel_rust_set_project_path`
+/// as before. Passing a zero-length `old` buffer is equivalent to "not a
+/// rename" and is a no-op on the Rust side (see `HostMsg::
+/// ProjectPathRenamed`'s doc comment) -- callers with no old path should
+/// call `panel_rust_set_project_path` instead of this function.
+#[no_mangle]
+pub extern "C" fn panel_rust_rename_project_path(
+    _handle: *mut PanelHandle,
+    old_path_ptr: *const c_uchar,
+    old_path_len: usize,
+    new_path_ptr: *const c_uchar,
+    new_path_len: usize,
+) -> bool {
+    let old_path = if old_path_ptr.is_null() || old_path_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(old_path_ptr, old_path_len) };
+        std::str::from_utf8(bytes).unwrap_or_default().to_owned()
+    };
+    let new_path = if new_path_ptr.is_null() || new_path_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(new_path_ptr, new_path_len) };
+        std::str::from_utf8(bytes).unwrap_or_default().to_owned()
+    };
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        dispatch::dispatch_project_path_renamed(panel, old_path, new_path);
+        true
+    })
+}
+
 /// Applies a generation-ordered host appearance snapshot. The host owns only
 /// selector values; the panel retains its component palette and tokens.
 #[no_mangle]

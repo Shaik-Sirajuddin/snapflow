@@ -658,6 +658,32 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
             Effect::SetActiveProjectPath { path } => {
                 panel.apply_active_project_path(path);
             }
+            Effect::RenameProjectAssociation { old, new } => {
+                // Synchronous, in-memory only (no I/O) -- must run before
+                // this call returns, not spawned, so the very next poll
+                // tick already sees the rebind and the running session's
+                // sidebar self-heals without waiting on the sqlite write
+                // below. See `AgentBridge::rebind_project_path`'s doc
+                // comment for why sqlite alone isn't enough on its own.
+                if let Some(bridge) = panel.bridge.as_ref() {
+                    bridge.rebind_project_path(&old, &new);
+                }
+                // Durable half: survives a restart. Best-effort/fire-and-
+                // forget like RenameThread's own display-name persist
+                // just above -- the live session is already correct by
+                // the time this completes, so a failure here only risks
+                // the association not surviving a restart, logged rather
+                // than surfaced as a user-facing error.
+                if let Some(store) = panel.panel_state.clone() {
+                    std::thread::spawn(move || {
+                        if let Err(error) = store.rename_project_path(&old, &new) {
+                            eprintln!(
+                                "panel-rust: failed to persist project rename {old:?} -> {new:?}: {error}"
+                            );
+                        }
+                    });
+                }
+            }
             Effect::CloseThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     // The actual wiring for this thread's own "background"

@@ -261,6 +261,19 @@ pub enum HostMsg {
     AppearanceChanged(crate::appearance::AppearanceState),
     ThemeChanged(String),
     ProjectPathChanged(Option<String>),
+    /// PISO-7 (project-isolation-mlt-binding plan): an explicit host
+    /// signal for an MLT Save-As, carrying BOTH the old and new project
+    /// file paths -- deliberately a separate variant from
+    /// `ProjectPathChanged` rather than something inferred from two
+    /// consecutive values of it. `old`/`new` alone cannot distinguish
+    /// "Save-As A -> B" from "close A, open B" (both look like the
+    /// active path changing from A to B), and treating them alike would
+    /// rebind B's own pre-existing threads onto A's history -- merging
+    /// two real projects. Only the host genuinely knows which happened,
+    /// so it must say so explicitly. `old` empty means "this project was
+    /// untitled and is being saved for the first time", which is NOT a
+    /// rename (see `update_host`'s handler).
+    ProjectPathRenamed { old: String, new: String },
     /// Cold-start hydration trigger -- see 00-plan.md Phase 0. Carries
     /// whatever `panel_rust_create` already has in hand *before* any
     /// `Effect` runs (window size, requested defaults); the actual

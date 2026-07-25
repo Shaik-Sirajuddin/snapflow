@@ -1357,6 +1357,31 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
                 vec![Dirty::ProjectPath, Dirty::SkillsListDiff(vec![])],
             )
         }
+        HostMsg::ProjectPathRenamed { old, new } => {
+            // PISO-7: this is a SEPARATE branch from ProjectPathChanged
+            // above, by design -- rebinding on a bare active-path change
+            // would be unable to tell "Save-As A -> B" apart from "close
+            // A, open B" and would merge two real projects' thread
+            // histories. Only this explicit signal, which the host emits
+            // exclusively for an actual rename, may issue the rebind
+            // effect below.
+            let new_path = (!new.is_empty()).then(|| new.clone());
+            model.active_project_path = new_path.clone();
+            let mut effects = vec![Effect::SetActiveProjectPath { path: new_path }];
+            // "old empty" means this project was untitled and is being
+            // saved for the first time -- those threads were created
+            // unscoped on purpose (see `ThreadRecord::project_path`'s doc
+            // comment) and must stay unscoped, not get retro-bound to the
+            // new path just because it's the first path they've ever
+            // had. That is NOT a rename of anything, so no rebind fires.
+            if !old.is_empty() && !new.is_empty() {
+                effects.push(Effect::RenameProjectAssociation { old, new });
+            }
+            (
+                effects,
+                vec![Dirty::ProjectPath, Dirty::SkillsListDiff(vec![])],
+            )
+        }
         HostMsg::Init => (vec![Effect::LoadInitialState], vec![]),
     }
 }

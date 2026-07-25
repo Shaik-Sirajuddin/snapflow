@@ -441,6 +441,33 @@ impl PanelStateStore {
             .and_then(|settings| settings.background_session)
             .unwrap_or(self.defaults()?.background_session))
     }
+
+    /// PISO-7 (project-isolation-mlt-binding plan): the durable half of a
+    /// Save-As rebind -- rewrites every row whose `project_path` equals
+    /// `old` to `new`. Rows recorded against a DIFFERENT project, or with
+    /// no recorded project at all (`project_path IS NULL`, the SQL
+    /// equality below never matches those either way), are untouched.
+    ///
+    /// This alone only takes effect on the NEXT restart: the live
+    /// session's visible thread list reads `AgentBridge::thread_project_
+    /// path`, which reads each `ThreadSlot`'s own in-memory copy, not
+    /// sqlite -- `AgentBridge::rebind_project_path` is the matching live
+    /// half, and both must be called together (see the `Effect::
+    /// RenameProjectAssociation` handler, the only caller of either).
+    ///
+    /// Callers must never pass an empty `old`: that would mean "every
+    /// legacy/never-scoped row", and an untitled project's first save is
+    /// NOT a rename of anything (those threads were created unscoped on
+    /// purpose and must stay that way) -- `update_host`'s `ProjectPath
+    /// Renamed` handler guards this before it ever reaches here.
+    pub fn rename_project_path(&self, old: &str, new: &str) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "UPDATE thread_settings SET project_path = ?2 WHERE project_path = ?1",
+            params![old, new],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -664,6 +691,105 @@ mod tests {
                 display_name: "Repair timeline".to_owned(),
                 ..record
             }]
+        );
+    }
+
+    /// PISO-7: the durable half of a Save-As rebind. Two threads on
+    /// different projects plus one unscoped thread -- renaming A -> B
+    /// must move only A's row, leave B's alone, and leave the unscoped
+    /// row's NULL untouched (an untitled project's first save is not a
+    /// rename of anything).
+    #[test]
+    fn rename_project_path_rewrites_only_matching_rows() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let on_a = ThreadRecord {
+            thread_id: "on-a".to_owned(),
+            display_name: "On A".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-a".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: Some("/projects/a/timeline.mlt".to_owned()),
+        };
+        let on_b = ThreadRecord {
+            thread_id: "on-b".to_owned(),
+            display_name: "On B".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-b".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: Some("/projects/b/timeline.mlt".to_owned()),
+        };
+        let unscoped = ThreadRecord {
+            thread_id: "unscoped".to_owned(),
+            display_name: "Unscoped".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-u".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: None,
+        };
+        store.save_thread_record(&on_a).unwrap();
+        store.save_thread_record(&on_b).unwrap();
+        store.save_thread_record(&unscoped).unwrap();
+
+        store
+            .rename_project_path(
+                "/projects/a/timeline.mlt",
+                "/projects/a-renamed/timeline.mlt",
+            )
+            .unwrap();
+
+        let records = store.thread_records().unwrap();
+        let by_id = |id: &str| records.iter().find(|r| r.thread_id == id).unwrap();
+        assert_eq!(
+            by_id("on-a").project_path.as_deref(),
+            Some("/projects/a-renamed/timeline.mlt"),
+            "the renamed project's thread must follow it"
+        );
+        assert_eq!(
+            by_id("on-b").project_path.as_deref(),
+            Some("/projects/b/timeline.mlt"),
+            "an unrelated project's thread must never move"
+        );
+        assert_eq!(
+            by_id("unscoped").project_path,
+            None,
+            "an unscoped thread must stay unscoped"
+        );
+    }
+
+    /// PISO-7: an empty `old` must never match every legacy/unscoped row
+    /// -- the caller-side contract (`update_host`'s `ProjectPathRenamed`
+    /// handler must never issue the rename effect for an empty old path
+    /// at all) is backed here by proving the SQL itself can't retro-bind
+    /// unscoped rows even if that guard were somehow bypassed.
+    #[test]
+    fn rename_project_path_with_an_empty_old_path_touches_no_row() {
+        let store = PanelStateStore::in_memory().unwrap();
+        let unscoped = ThreadRecord {
+            thread_id: "unscoped".to_owned(),
+            display_name: "Unscoped".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: "session-u".to_owned(),
+            profile_name: None,
+            permission_profile: None,
+            background_session: None,
+            project_path: None,
+        };
+        store.save_thread_record(&unscoped).unwrap();
+
+        store
+            .rename_project_path("", "/projects/untitled-saved-as.mlt")
+            .unwrap();
+
+        assert_eq!(
+            store.thread_records().unwrap()[0].project_path,
+            None,
+            "an unscoped thread must never be retro-bound via an empty old path"
         );
     }
 

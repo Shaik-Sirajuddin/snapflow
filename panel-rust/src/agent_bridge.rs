@@ -243,10 +243,23 @@ struct ThreadSlot {
     /// `thread_item_project_context` phase: the project directory this
     /// thread's session was actually opened/resumed/reattached against
     /// (the `cwd` passed to ACP at creation time -- see `cwd_for_session`),
-    /// captured once and never updated afterward, since ACP has no way to
-    /// move an existing session to a new cwd. `None` when no project was
-    /// active at creation time (the pre-`active_project_binding` default).
-    project_path: Option<PathBuf>,
+    /// captured once and normally never updated afterward, since ACP has
+    /// no way to move an existing session to a new cwd. `None` when no
+    /// project was active at creation time (the pre-`active_project_
+    /// binding` default).
+    ///
+    /// PISO-7 (project-isolation-mlt-binding plan) is the one deliberate
+    /// exception: an MLT Save-As renames the project file out from under
+    /// every thread that was recorded against the old path, without
+    /// touching any ACP session at all -- the session's real `cwd` on
+    /// disk hasn't moved, only the panel's own bookkeeping of which
+    /// project it belongs to needs to follow. `Mutex`, not a plain field,
+    /// so `AgentBridge::rebind_project_path` can update matching slots'
+    /// values in place for the live session (sqlite alone only fixes the
+    /// NEXT restart -- see that method's doc comment); every other
+    /// consumer keeps treating a lock+clone as if it were still a
+    /// captured-once, effectively-immutable read.
+    project_path: Mutex<Option<PathBuf>>,
     /// PUI-014: `true` for a slot created up front (so it holds its positional
     /// index in `slots`, preserving the `model.threads[i] <-> slots[i]`
     /// parallel-array invariant) but whose ACP session attach is deliberately
@@ -257,6 +270,19 @@ struct ThreadSlot {
     /// freshly-built, eagerly-attached slot bound to the then-current
     /// provider. `false` for every eagerly-attached or recovered slot.
     deferred: bool,
+}
+
+impl ThreadSlot {
+    /// A point-in-time copy of `project_path`. Every consumer already
+    /// treated the (formerly plain) field as a single value read once per
+    /// use, so this is the one place that lock+clone lives rather than
+    /// repeating it at each of the several call sites below.
+    fn project_path_snapshot(&self) -> Option<PathBuf> {
+        self.project_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 #[derive(Default)]
@@ -2123,7 +2149,8 @@ fn spawn_background_attachment(
     // this thread is scoped to; reading the global independently at each
     // site risked three different answers for one thread (PISO-4). See
     // `thread_project_dir`'s own doc comment for the fallback shape.
-    let thread_project_dir = thread_project_dir(slot.project_path.as_deref(), &session_cwd_override);
+    let slot_project_path = slot.project_path_snapshot();
+    let thread_project_dir = thread_project_dir(slot_project_path.as_deref(), &session_cwd_override);
     // `snapflowd_mcp_servers_entry` turns `thread_project_dir` into the
     // skills MCP server's `--project-dir <parent of the project file>`
     // argument (see `snapflowd_mcp_servers_entry_adds_project_dir_from_
@@ -2179,7 +2206,13 @@ fn spawn_background_attachment(
 
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
-        let cwd = cwd_for_session(slot.project_path.as_deref(), &session_cwd_override);
+        // Re-snapshotted here rather than reusing `slot_project_path`
+        // above -- this runs later, on a worker thread, after whatever
+        // delay `attachment_gate` imposes, so re-reading picks up a
+        // PISO-7 rebind that landed in that window instead of attaching
+        // with an already-stale path.
+        let slot_project_path = slot.project_path_snapshot();
+        let cwd = cwd_for_session(slot_project_path.as_deref(), &session_cwd_override);
         let result = if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
@@ -2537,7 +2570,7 @@ impl AgentBridge {
                 // was persisted with, not whatever happens to be open at
                 // this restart. `None` for a freshly-seeded default thread
                 // or a legacy pre-migration record, same as before.
-                project_path: spec.project_path.as_deref().map(PathBuf::from),
+                project_path: Mutex::new(spec.project_path.as_deref().map(PathBuf::from)),
                 deferred: false,
             });
             slots.push(slot.clone());
@@ -2596,6 +2629,52 @@ impl AgentBridge {
             .session_cwd_override
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = path;
+    }
+
+    /// PISO-7 (project-isolation-mlt-binding plan): the live half of a
+    /// Save-As rebind. `state_store::PanelStateStore::rename_project_path`
+    /// rewrites `thread_settings.project_path` durably, but that alone
+    /// only takes effect on the NEXT restart -- `retain_items_for_project`
+    /// (the visible-list scoping) reads `thread_project_path`, which reads
+    /// each `ThreadSlot`'s own in-memory `project_path`, not sqlite. Without
+    /// this, a user who does Save-As mid-session would watch their entire
+    /// pre-save chat history vanish from the sidebar until they restart
+    /// the panel -- a fix that only works after a restart is not a fix
+    /// for that bug.
+    ///
+    /// Updates every slot whose current `project_path` equals `old` to
+    /// `new`; every other slot (a different project, or none at all) is
+    /// untouched. Deliberately called ONLY from the effect handling
+    /// `HostMsg::ProjectPathRenamed` (an explicit host-driven rename
+    /// signal), never from a bare active-project-path change -- "Save-As
+    /// A->B" and "close A, open B" are indistinguishable from an old/new
+    /// path pair alone, and rebinding on the latter would merge two
+    /// genuinely different projects' thread histories. Callers must also
+    /// never pass an empty `old`: an untitled/never-saved project's
+    /// threads are unscoped (`project_path: None`), not associated with
+    /// `Some("")`, so an empty `old` would (correctly) match nothing here
+    /// -- but see `update_host`'s `ProjectPathRenamed` handler, which
+    /// guards this earlier and more explicitly, treating "first save of
+    /// an untitled project" as NOT a rename at all.
+    ///
+    /// Synchronous and in-memory only (no I/O) -- called directly from the
+    /// effect executor on the UI thread, not spawned, so the very next
+    /// poll tick already reflects the rebind.
+    pub fn rebind_project_path(&self, old: &str, new: &str) {
+        if old.is_empty() {
+            return;
+        }
+        let old_path = std::path::Path::new(old);
+        let new_path = PathBuf::from(new);
+        for slot in &self.slots {
+            let mut guard = slot
+                .project_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.as_deref() == Some(old_path) {
+                *guard = Some(new_path.clone());
+            }
+        }
     }
 
     /// Adds one open thread using the already-provisioned provider gateway.
@@ -2750,7 +2829,7 @@ impl AgentBridge {
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             archived: Mutex::new(runtime_snapshot.archived),
-            project_path: project_path_for_slot,
+            project_path: Mutex::new(project_path_for_slot),
             deferred,
         });
         Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
@@ -3060,7 +3139,7 @@ impl AgentBridge {
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             archived: Mutex::new(false),
-            project_path: project_path_for_slot,
+            project_path: Mutex::new(project_path_for_slot),
             deferred: false,
         });
 
@@ -3070,8 +3149,9 @@ impl AgentBridge {
         // above (PISO-4): both trace back to the same `project_path_for_
         // slot` snapshot taken before construction, not an independent
         // re-read of the global that could have moved since.
-        let cwd = cwd_for_session(slot.project_path.as_deref(), &self.session_cwd_override);
-        let mcp_servers = snapflowd_mcp_servers_entry(slot.project_path.as_deref(), provider);
+        let slot_project_path = slot.project_path_snapshot();
+        let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
+        let mcp_servers = snapflowd_mcp_servers_entry(slot_project_path.as_deref(), provider);
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
@@ -3220,8 +3300,7 @@ impl AgentBridge {
     /// project a thread is scoped to.
     pub fn thread_project_path(&self, idx: usize) -> Option<String> {
         self.slots.get(idx).and_then(|slot| {
-            slot.project_path
-                .as_ref()
+            slot.project_path_snapshot()
                 .map(|path| path.to_string_lossy().into_owned())
                 .filter(|path| !path.is_empty())
         })
@@ -4308,6 +4387,107 @@ mod tests {
             args[project_dir_idx + 1],
             serde_json::Value::String("/projects/a".to_string()),
             "--project-dir must be thread A's own project parent, not the global's (B)"
+        );
+    }
+
+    /// PISO-7: the live half of a Save-As rebind. Two threads on
+    /// different projects (plus one unscoped, pre-project thread) --
+    /// renaming A -> B must move only A's thread, leave B's alone, and
+    /// leave the unscoped thread unscoped. Proves the rebind is visible
+    /// through `thread_project_path` immediately, with no restart and no
+    /// sqlite round-trip involved (this constructor uses no cache dir).
+    #[test]
+    fn rebind_project_path_moves_only_the_renamed_projects_threads() {
+        let specs = vec![
+            ThreadSpec {
+                display_name: "on-a".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/a/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "on-b".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/b/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "unscoped".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        assert_eq!(
+            bridge.thread_project_path(0).as_deref(),
+            Some("/projects/a/timeline.mlt")
+        );
+        assert_eq!(
+            bridge.thread_project_path(1).as_deref(),
+            Some("/projects/b/timeline.mlt")
+        );
+        assert_eq!(bridge.thread_project_path(2), None);
+
+        bridge.rebind_project_path(
+            "/projects/a/timeline.mlt",
+            "/projects/a-renamed/timeline.mlt",
+        );
+
+        assert_eq!(
+            bridge.thread_project_path(0).as_deref(),
+            Some("/projects/a-renamed/timeline.mlt"),
+            "thread on the renamed project must follow it"
+        );
+        assert_eq!(
+            bridge.thread_project_path(1).as_deref(),
+            Some("/projects/b/timeline.mlt"),
+            "an unrelated project's thread must never move"
+        );
+        assert_eq!(
+            bridge.thread_project_path(2),
+            None,
+            "an unscoped thread must stay unscoped, not get retro-bound"
+        );
+    }
+
+    /// PISO-7: an empty `old` must never be treated as "every unscoped
+    /// thread" -- an untitled project's first save is not a rename.
+    /// `rebind_project_path` itself no-ops on an empty `old` as a second
+    /// line of defense (the primary guard lives in `update_host`'s
+    /// `ProjectPathRenamed` handler, which must never call this at all in
+    /// that case).
+    #[test]
+    fn rebind_project_path_with_an_empty_old_path_touches_no_thread() {
+        let specs = vec![ThreadSpec {
+            display_name: "unscoped".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: None,
+            profile_name: None,
+            project_path: None,
+        }];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        bridge.rebind_project_path("", "/projects/untitled-saved-as.mlt");
+
+        assert_eq!(
+            bridge.thread_project_path(0),
+            None,
+            "an unscoped thread must never be retro-bound via an empty `old`"
         );
     }
 

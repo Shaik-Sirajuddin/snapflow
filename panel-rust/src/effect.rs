@@ -205,6 +205,17 @@ pub enum Effect {
     SetActiveProjectPath {
         path: Option<String>,
     },
+    /// PISO-7: the ONLY caller of both `AgentBridge::rebind_project_path`
+    /// (live, in-memory, self-heals the running session immediately) and
+    /// `PanelStateStore::rename_project_path` (durable, survives a
+    /// restart) -- issued exclusively from `HostMsg::ProjectPathRenamed`'s
+    /// handler, never from a bare `ProjectPathChanged`. See both of those
+    /// methods' doc comments for why a sqlite-only or bridge-only rewrite
+    /// each leave half the bug unfixed.
+    RenameProjectAssociation {
+        old: String,
+        new: String,
+    },
 }
 
 /// Results feeding back into `Msg::Effect` -- one variant per `Effect`
