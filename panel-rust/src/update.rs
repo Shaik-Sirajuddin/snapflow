@@ -110,6 +110,21 @@ pub(crate) fn selected_real_index(model: &Model) -> usize {
         .unwrap_or(model.selected_thread)
 }
 
+// PROF-9 (`profile-only-backend-selection` plan): a thread's agent is
+// "usable" for the purposes of granting it NEW MCP capability -- i.e. not
+// ThreadState::Stale (PROF-7: agent_detected_for_profile came back false at
+// attach time) and not ThreadModel.unauthenticated (PROF-8: the backend's
+// initialize advertised auth methods and none is configured). Fails open
+// (returns true) when idx is out of range, matching the fail-open posture
+// of agent_detected_for_profile itself -- an unresolvable thread should
+// never block an action, only a positively-confirmed-bad one should.
+fn thread_agent_usable(model: &Model, idx: usize) -> bool {
+    let Some(thread) = model.threads.get(idx) else {
+        return true;
+    };
+    !matches!(thread.state, ThreadState::Stale) && !thread.unauthenticated
+}
+
 // setup-followups plan, archive_thread_backend_verify: pub(crate) so a
 // real-backend test can build the exact row shape production actually
 // produces, rather than hand-crafting a fixture that risks silently
@@ -1119,14 +1134,36 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             model.dev_mode = enabled;
             (vec![Effect::SaveDevMode { enabled }], vec![Dirty::Settings])
         }
-        SettingsMsg::McpServerCreate { name, command } => (
-            vec![Effect::McpServerCreate {
-                real_index: idx,
-                name,
-                command,
-            }],
-            vec![Dirty::Settings],
-        ),
+        // PROF-9 (`profile-only-backend-selection` plan): block MCP-server
+        // actions that would make NEW capabilities available to an agent
+        // that cannot serve them (create, or turning something on) when
+        // the selected thread's agent is Stale (PROF-7) or unauthenticated
+        // (PROF-8) -- so the user cannot drive MCP against an agent that
+        // cannot serve it. Deliberately NOT blocked: delete (cleanup must
+        // always be reachable, especially precisely when something is
+        // broken), turning something OFF (same reasoning), and
+        // authenticate (that flow is the MCP SERVER's own credentials --
+        // orthogonal to whether the ACP AGENT itself is reachable/
+        // authenticated, and blocking it here would trap a user trying to
+        // fix the MCP side first).
+        SettingsMsg::McpServerCreate { name, command } => {
+            if !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't add an MCP server: this thread's agent is stale or unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
+            (
+                vec![Effect::McpServerCreate {
+                    real_index: idx,
+                    name,
+                    command,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerDelete { name } => (
             vec![Effect::McpServerDelete {
                 real_index: idx,
@@ -1134,14 +1171,25 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             }],
             vec![Dirty::Settings],
         ),
-        SettingsMsg::McpServerEnabledChanged { name, enabled } => (
-            vec![Effect::McpServerEnabledChanged {
-                real_index: idx,
-                name,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
+        SettingsMsg::McpServerEnabledChanged { name, enabled } => {
+            if enabled && !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't enable this MCP server: this thread's agent is stale or \
+                     unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
+            (
+                vec![Effect::McpServerEnabledChanged {
+                    real_index: idx,
+                    name,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::McpServerAuthenticate { name } => (
             vec![Effect::McpServerAuthenticate {
                 real_index: idx,
@@ -1153,15 +1201,25 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             server_name,
             tool_name,
             enabled,
-        } => (
-            vec![Effect::McpServerToolEnabledChanged {
-                real_index: idx,
-                server_name,
-                tool_name,
-                enabled,
-            }],
-            vec![Dirty::Settings],
-        ),
+        } => {
+            if enabled && !thread_agent_usable(model, idx) {
+                let toast = show_toast(
+                    model,
+                    "error",
+                    "Can't enable this tool: this thread's agent is stale or unauthenticated",
+                );
+                return (vec![], vec![toast]);
+            }
+            (
+                vec![Effect::McpServerToolEnabledChanged {
+                    real_index: idx,
+                    server_name,
+                    tool_name,
+                    enabled,
+                }],
+                vec![Dirty::Settings],
+            )
+        }
         SettingsMsg::ProfileCreate {
             name,
             agent_id,
@@ -4122,6 +4180,127 @@ mod tests {
                 "agent_detected={agent_detected:?} must never produce Stale"
             );
         }
+    }
+
+    /// PROF-9: creating an MCP server, or turning one (or a tool) ON, must
+    /// be blocked with a toast -- not sent as a real Effect -- when the
+    /// selected thread's agent is Stale or unauthenticated. Delete,
+    /// turning something OFF, and Authenticate must NOT be blocked (see
+    /// the doc comment on the McpServer* match arms in `update_settings`
+    /// for why).
+    #[test]
+    fn mcp_server_create_and_enable_are_blocked_for_a_stale_or_unauthenticated_thread() {
+        for make_unusable in [
+            (|t: &mut ThreadModel| t.state = ThreadState::Stale) as fn(&mut ThreadModel),
+            (|t: &mut ThreadModel| t.unauthenticated = true) as fn(&mut ThreadModel),
+        ] {
+            let mut model = model_with_threads(&["Thread"]);
+            make_unusable(&mut model.threads[0]);
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
+                    name: "srv".to_owned(),
+                    command: "cmd".to_owned(),
+                })),
+            );
+            assert!(
+                effects.is_empty(),
+                "McpServerCreate must not reach a real Effect when the agent is unusable"
+            );
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+            assert_eq!(model.toast_kind, "error");
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
+                    name: "srv".to_owned(),
+                    enabled: true,
+                })),
+            );
+            assert!(effects.is_empty(), "enabling must be blocked when the agent is unusable");
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+
+            let (effects, dirty) = update(
+                &mut model,
+                Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+                    server_name: "srv".to_owned(),
+                    tool_name: "tool".to_owned(),
+                    enabled: true,
+                })),
+            );
+            assert!(
+                effects.is_empty(),
+                "enabling a tool must be blocked when the agent is unusable"
+            );
+            assert!(matches!(dirty.as_slice(), [Dirty::Toast]));
+        }
+    }
+
+    /// Companion: a healthy thread (Idle, not unauthenticated) must never
+    /// be blocked, and delete / disable / authenticate must always pass
+    /// through regardless of thread health.
+    #[test]
+    fn mcp_server_actions_pass_through_for_a_healthy_thread_and_delete_disable_authenticate_always_pass() {
+        let mut model = model_with_threads(&["Thread"]);
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+        assert!(!model.threads[0].unauthenticated);
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerCreate {
+                name: "srv".to_owned(),
+                command: "cmd".to_owned(),
+            })),
+        );
+        assert!(matches!(effects.as_slice(), [Effect::McpServerCreate { .. }]));
+
+        // Now make the thread unusable and confirm delete/disable/authenticate
+        // still go through as real Effects.
+        model.threads[0].state = ThreadState::Stale;
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerDelete { name: "srv".to_owned() })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerDelete { .. }]),
+            "delete must always be reachable, even for an unusable agent"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerEnabledChanged {
+                name: "srv".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerEnabledChanged { .. }]),
+            "turning a server OFF must always be reachable"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerToolEnabledChanged {
+                server_name: "srv".to_owned(),
+                tool_name: "tool".to_owned(),
+                enabled: false,
+            })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerToolEnabledChanged { .. }]),
+            "turning a tool OFF must always be reachable"
+        );
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Settings(SettingsMsg::McpServerAuthenticate { name: "srv".to_owned() })),
+        );
+        assert!(
+            matches!(effects.as_slice(), [Effect::McpServerAuthenticate { .. }]),
+            "authenticate is the MCP server's own credentials, orthogonal to agent health"
+        );
     }
 
     fn visible_row(real_index: usize, thread_id: &str) -> crate::models::VisibleThreadItem {
