@@ -171,6 +171,11 @@ pub(crate) fn visible_thread_row(
         real_index,
         thread_id,
         session_id: thread.session_id.clone(),
+        // Not the external_snapshot collection path (this helper builds a
+        // single row from already-folded model state, used by e.g. the
+        // sidebar single-row refresh) -- no new agents/list read happens
+        // here, so no new detection info either.
+        agent_detected: None,
         item: crate::ThreadItem {
             name: thread.display_name.clone().into(),
             relative_time: rel_time.into(),
@@ -1900,6 +1905,15 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 if thread.session_id.is_none() {
                     if let Some(session_id) = row.session_id.clone() {
                         thread.session_id = Some(session_id);
+                        // PROF-7: same transition, real per-thread state
+                        // (not a render-time heuristic) -- row.agent_detected
+                        // is only ever Some(..) on exactly this fold (see
+                        // external_snapshot's own collection condition), so
+                        // this can't re-fire or clobber a later legitimate
+                        // state change.
+                        if row.agent_detected == Some(false) {
+                            thread.state = ThreadState::Stale;
+                        }
                         effects.push(Effect::PersistThread {
                             real_index: row.real_index,
                         });
@@ -3997,6 +4011,7 @@ mod tests {
             real_index: 4,
             thread_id: "durable-thread-4".to_owned(),
             session_id: None,
+            agent_detected: None,
             item: crate::ThreadItem {
                 name: "filtered".into(),
                 ..crate::ThreadItem::default()
@@ -4023,11 +4038,87 @@ mod tests {
         ));
     }
 
+    /// PROF-7: the actual state-setting deliverable -- when the frame fold
+    /// hydrates a just-attached thread's `session_id` (the same
+    /// `session_id.is_none()` transition `frame_thread_list_snapshot_uses_
+    /// durable_ids_as_row_keys` above exercises) and the row's
+    /// `agent_detected` says the bound agent was NOT found installed, the
+    /// thread's state becomes `ThreadState::Stale` -- a real per-thread
+    /// state written once at attach time, not a render-time heuristic.
+    #[test]
+    fn session_attach_with_agent_not_detected_marks_the_thread_stale() {
+        let mut model = model_with_threads(&["Restored Thread"]);
+        assert_eq!(model.threads[0].session_id, None);
+        assert_eq!(model.threads[0].state, ThreadState::Idle);
+
+        let row = crate::models::VisibleThreadItem {
+            real_index: 0,
+            thread_id: "thread-0".to_owned(),
+            session_id: Some("real-session-id".to_owned()),
+            agent_detected: Some(false),
+            item: crate::ThreadItem::default(),
+        };
+        update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: vec![row],
+                    archived_flags: vec![],
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(model.threads[0].session_id.as_deref(), Some("real-session-id"));
+        assert_eq!(
+            model.threads[0].state,
+            ThreadState::Stale,
+            "an attach whose agent_detected read false must mark the thread Stale"
+        );
+    }
+
+    /// Companion: the SAME transition, but `agent_detected: Some(true)`
+    /// (or `None`, e.g. native/unmanaged mode) must leave the thread's
+    /// state alone -- Stale is only ever set, never assumed.
+    #[test]
+    fn session_attach_with_agent_detected_or_unknown_does_not_mark_stale() {
+        for agent_detected in [Some(true), None] {
+            let mut model = model_with_threads(&["Restored Thread"]);
+            let row = crate::models::VisibleThreadItem {
+                real_index: 0,
+                thread_id: "thread-0".to_owned(),
+                session_id: Some("real-session-id".to_owned()),
+                agent_detected,
+                item: crate::ThreadItem::default(),
+            };
+            update(
+                &mut model,
+                Msg::Frame(FrameInput {
+                    thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                        visible_indices: vec![0],
+                        visible_thread_ids: vec!["thread-0".to_owned()],
+                        rows: vec![row],
+                        archived_flags: vec![],
+                    }),
+                    ..FrameInput::default()
+                }),
+            );
+            assert_eq!(
+                model.threads[0].state,
+                ThreadState::Idle,
+                "agent_detected={agent_detected:?} must never produce Stale"
+            );
+        }
+    }
+
     fn visible_row(real_index: usize, thread_id: &str) -> crate::models::VisibleThreadItem {
         crate::models::VisibleThreadItem {
             real_index,
             thread_id: thread_id.to_owned(),
             session_id: None,
+            agent_detected: None,
             item: crate::ThreadItem::default(),
         }
     }

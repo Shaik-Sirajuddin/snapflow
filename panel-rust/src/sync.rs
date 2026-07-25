@@ -938,6 +938,7 @@ mod tests {
         let mut model = Model::default();
         let row = VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 7,
             thread_id: "thread-7".to_owned(),
             item: crate::ThreadItem::default(),
@@ -973,6 +974,7 @@ mod tests {
         };
         let row = VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: item.clone(),
@@ -1019,6 +1021,7 @@ mod tests {
         ];
         let row = VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 0,
             thread_id: "thread-0".to_owned(),
             item: crate::ThreadItem {
@@ -1178,6 +1181,7 @@ mod tests {
         model.visible_indices = vec![0];
         model.thread_rows.push(VisibleThreadItem {
             session_id: None,
+            agent_detected: None,
             real_index: 0,
             thread_id: "thread:0".to_owned(),
             item: crate::ThreadItem {

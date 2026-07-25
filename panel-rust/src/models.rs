@@ -138,6 +138,18 @@ pub enum ThreadState {
     Loading,
     Cancelling,
     Error,
+    /// PROF-7 (`profile-only-backend-selection` plan): a real per-thread
+    /// state, not a render-time heuristic -- set once, at the moment a
+    /// thread's session attach completes (see `external_snapshot`'s
+    /// `agent_detected` collection and `update.rs`'s fold of it), when the
+    /// thread's bound profile names an agent id that acpx's own
+    /// `agents/list` reports as NOT `Installed`/`InstalledNoSession`
+    /// (typically a restored thread whose agent is no longer present on
+    /// this machine). A thread with no bound profile (native/unmanaged
+    /// mode) is never marked Stale -- there is no registry agent id to
+    /// check it against, so "can't determine" fails open rather than
+    /// guessing.
+    Stale,
 }
 
 impl ThreadState {
@@ -147,6 +159,7 @@ impl ThreadState {
             ThreadState::Loading => "loading",
             ThreadState::Cancelling => "cancelling",
             ThreadState::Error => "error",
+            ThreadState::Stale => "stale",
         }
     }
 }
@@ -991,7 +1004,44 @@ pub struct VisibleThreadItem {
     /// into `ThreadModel::session_id` (add_thread attaches async now, so
     /// no `SessionAttached` fold ever carries it).
     pub session_id: Option<String>,
+    /// PROF-7: whether the thread's bound profile's agent id is
+    /// `Installed`/`InstalledNoSession` per a real `agents/list` catalog
+    /// read, collected ONLY at the same session-attach-completion
+    /// transition `session_id` above is collected for (never every frame
+    /// -- `agents/list` is a real RPC, and every other frame this stays
+    /// `None`, meaning "no new information this frame", not "not
+    /// detected"). `None` also covers native/unmanaged-mode threads (no
+    /// bound profile to check) and the profile/catalog lookup failing to
+    /// resolve -- both fail open rather than guessing Stale.
+    pub agent_detected: Option<bool>,
     pub item: ThreadItem,
+}
+
+/// PROF-7: resolves whether `profile_name`'s bound agent id is genuinely
+/// present on this machine, from real `profiles/list` + `agents/list`
+/// reads (never a guess). Pure so it's directly testable without a real
+/// bridge: `None` (fail open, not "not detected") when `profile_name` is
+/// empty (native/unmanaged mode has no agent id to check), when no
+/// profile with that name is found (a real profiles/list race/lag, not
+/// evidence of anything), or when the profile's `agent_id` doesn't appear
+/// in the catalog at all (an incomplete/still-loading catalog read, same
+/// reasoning). `Some(false)` only when the catalog genuinely reports the
+/// bound agent id as something other than `Installed`/`InstalledNoSession`.
+pub fn agent_detected_for_profile(
+    profiles: &[crate::gateway_actor::ProfileSummary],
+    agents: &[crate::protocol_types::AgentCatalogEntry],
+    profile_name: &str,
+) -> Option<bool> {
+    if profile_name.is_empty() {
+        return None;
+    }
+    let agent_id = &profiles.iter().find(|p| p.name == profile_name)?.agent_id;
+    let entry = agents.iter().find(|a| &a.id == agent_id)?;
+    Some(matches!(
+        entry.status,
+        crate::protocol_types::AgentStatus::Installed
+            | crate::protocol_types::AgentStatus::InstalledNoSession
+    ))
 }
 
 /// Builds the sidebar's thread-list items from `names`/`state`
@@ -1026,6 +1076,7 @@ pub fn build_thread_items<N: AsRef<str>>(
             // Post-populated by real_index in external_snapshot, same as
             // provider/model.
             session_id: None,
+            agent_detected: None,
             item: ThreadItem {
                 name: name.as_ref().into(),
                 relative_time: String::from("now").into(),
@@ -1616,6 +1667,109 @@ pub fn translate_local_terminal_key(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
     use slint::Model;
+
+    // PROF-7: agent_detected_for_profile is the pure decision function the
+    // real per-thread Stale state is built on -- exercised directly here so
+    // its fail-open cases (empty profile, unknown profile, agent id absent
+    // from the catalog) don't depend on a real bridge/gateway to prove.
+    fn catalog_entry(
+        id: &str,
+        status: crate::protocol_types::AgentStatus,
+    ) -> crate::protocol_types::AgentCatalogEntry {
+        crate::protocol_types::AgentCatalogEntry {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            version: String::new(),
+            status,
+            enabled: true,
+        }
+    }
+
+    fn profile_summary(name: &str, agent_id: &str) -> crate::gateway_actor::ProfileSummary {
+        crate::gateway_actor::ProfileSummary {
+            name: name.to_owned(),
+            agent_id: agent_id.to_owned(),
+            allow_terminal_access: false,
+            allow_fs_access: false,
+        }
+    }
+
+    #[test]
+    fn agent_detected_for_profile_true_when_catalog_says_installed() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::Installed,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_false_when_catalog_says_not_installed() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::NotInstalled,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(false),
+            "a real registry hit that isn't Installed/InstalledNoSession must read as not \
+             detected"
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_installed_no_session_still_counts_as_detected() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::InstalledNoSession,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_on_empty_profile_name() {
+        // Native/unmanaged mode: no bound profile, so no agent id to check
+        // against the registry at all -- must never guess Stale.
+        assert_eq!(agent_detected_for_profile(&[], &[], ""), None);
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_when_profile_name_not_found() {
+        let profiles = [profile_summary("other-profile", "codex-acp")];
+        let agents = [catalog_entry(
+            "codex-acp",
+            crate::protocol_types::AgentStatus::NotInstalled,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "missing-profile"),
+            None,
+            "a profiles/list that hasn't caught up yet must fail open, not read as not detected"
+        );
+    }
+
+    #[test]
+    fn agent_detected_for_profile_fails_open_when_agent_id_absent_from_catalog() {
+        let profiles = [profile_summary("codex-profile", "codex-acp")];
+        // Catalog present but doesn't (yet) include this agent id -- an
+        // incomplete/still-loading read, not evidence the agent is gone.
+        let agents = [catalog_entry(
+            "claude-acp",
+            crate::protocol_types::AgentStatus::Installed,
+        )];
+        assert_eq!(
+            agent_detected_for_profile(&profiles, &agents, "codex-profile"),
+            None
+        );
+    }
 
     // PUI-015: the built-in snapshotd daemon row is only produced when the
     // daemon is reachable, is non-removable, and names the same /mcp
@@ -2401,6 +2555,7 @@ mod transcript_model_tests {
                 real_index,
                 thread_id: format!("thread:{real_index}"),
                 session_id: None,
+                agent_detected: None,
                 item: ThreadItem::default(),
             })
             .collect()
