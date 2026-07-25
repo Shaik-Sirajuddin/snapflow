@@ -118,6 +118,14 @@ func TestCLI_ListAndClose_AgainstRealDaemon(t *testing.T) {
 		t.Fatalf("expected list output to contain launched instance id %q, got: %q", launched.ID, listOut)
 	}
 
+	// PISO-8: listProjects is the other half of correlating an instance to
+	// a real, displayable project path -- ProcessInstance only carries a
+	// ProjectID, not a RootDir, so the panel needs both bare subcommands.
+	listProjectsOut := runCLI(t, snapshotdBin, homeDir, "listProjects")
+	if !strings.Contains(listProjectsOut, projectDir) {
+		t.Fatalf("expected listProjects output to contain the launched project's root dir %q, got: %q", projectDir, listProjectsOut)
+	}
+
 	// close the instance, then list reflects it's no longer live.
 	closeOut := runCLI(t, snapshotdBin, homeDir, "close", launched.ID)
 	if !strings.Contains(closeOut, launched.ID) {
