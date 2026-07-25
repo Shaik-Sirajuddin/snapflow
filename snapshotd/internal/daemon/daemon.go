@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,6 +48,28 @@ type Daemon struct {
 	// (cmd/snapshotd's cmdServe) start/stop it explicitly, same as SDP's
 	// own server; Dispatch below just forwards daemon.mcp* calls to it.
 	Mcp *mcpsupervisor.Supervisor
+
+	// stopCh is closed by RequestStop, which Dispatch's "daemon.stop" case
+	// calls. cmdServe's shutdown select loop watches StopRequested() as an
+	// alternative to an OS signal: `snapshotd stop` triggers it over the
+	// already-open SDP control socket rather than sending SIGTERM to a PID.
+	// This is the only cross-platform way to ask this process to shut down
+	// gracefully -- (*os.Process).Signal on Windows supports neither
+	// SIGTERM nor any other POSIX signal delivered from a separate process,
+	// so a PID+signal-based `stop` command can never work there.
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+// RequestStop signals StopRequested's channel exactly once (idempotent --
+// a second call is a no-op, not a panic-on-double-close).
+func (d *Daemon) RequestStop() {
+	d.stopOnce.Do(func() { close(d.stopCh) })
+}
+
+// StopRequested is closed once RequestStop has been called.
+func (d *Daemon) StopRequested() <-chan struct{} {
+	return d.stopCh
 }
 
 // New wires together a Daemon from configuration: opens the registry,
@@ -74,6 +97,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 		Sessions: session.NewMemory(30 * time.Second),
 		Proc:     pm,
 		Log:      logger,
+		stopCh:   make(chan struct{}),
 	}
 	d.SAP = sapproxy.NewRouter(d.resolveProjectInstance)
 	d.Mcp = mcpsupervisor.New(d, cfg.HomeDir, cfg.MCPSSEAddr, logger)
@@ -505,6 +529,18 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 
 	case "daemon.mcpInstallConfig":
 		return d.Mcp.InstallConfig(), nil
+
+	// daemon.stop is the cross-platform replacement for signaling the
+	// serve process's PID directly: it works identically on every
+	// platform, since it rides the same already-open SDP control-socket
+	// connection `snapshotd stop` used to confirm the daemon is reachable
+	// in the first place, instead of relying on OS signal delivery (which
+	// (*os.Process).Signal cannot do for SIGTERM on Windows). Not exposed
+	// as an MCP tool -- an MCP client should not be able to shut down the
+	// whole daemon it's talking through.
+	case "daemon.stop":
+		d.RequestStop()
+		return map[string]any{"stopping": true}, nil
 
 	default:
 		return nil, fmt.Errorf("unknown method %q", method)

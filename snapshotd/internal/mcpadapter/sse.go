@@ -68,6 +68,16 @@ func (s *SSEServer) checkAuth(r *http.Request) bool {
 	if !c.Enabled {
 		return true
 	}
+	// Fail closed on a malformed/corrupted credential state rather than
+	// silently accepting blank Basic Auth credentials: a config with
+	// Enabled=true but an empty user or password should never occur via
+	// SetAuth (which requires both non-empty), but a hand-edited or
+	// partially-written mcp_config.json could produce it, and without this
+	// check that state would let an empty-user/empty-password request
+	// through ConstantTimeCompare's equal-empty-slices match.
+	if c.User == "" || c.Password == "" {
+		return false
+	}
 	user, pass, ok := r.BasicAuth()
 	if !ok {
 		return false

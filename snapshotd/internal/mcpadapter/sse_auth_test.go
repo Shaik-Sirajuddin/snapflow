@@ -58,3 +58,21 @@ func TestSSEServer_BasicAuth(t *testing.T) {
 		t.Fatalf("expected auth to pass with correct credentials, got 401")
 	}
 }
+
+// TestSSEServer_BasicAuth_FailsClosedOnEmptyCredentials guards against a
+// corrupted/hand-edited persisted config (Enabled=true but an empty user or
+// password) turning into an open door: without this, a request with blank
+// Basic Auth credentials (user="", pass="") would match empty stored
+// values via ConstantTimeCompare and be let through.
+func TestSSEServer_BasicAuth_FailsClosedOnEmptyCredentials(t *testing.T) {
+	s := mcpadapter.NewSSEServer(noopHandler{}, "127.0.0.1:0")
+	s.SetCredentials(mcpadapter.Credentials{Enabled: true, User: "", Password: ""})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/does-not-exist", nil)
+	req.SetBasicAuth("", "")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for blank credentials against an empty-credential Enabled config, got %d", rec.Code)
+	}
+}

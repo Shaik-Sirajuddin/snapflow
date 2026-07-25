@@ -95,9 +95,15 @@ func TestCLI_MCPStatusRestartAuthInstallConfig(t *testing.T) {
 		t.Fatalf("expected auth set output to mention the user, got: %q", authOut)
 	}
 
-	// restart to the same non-loopback bind now succeeds.
+	// restart to the same non-loopback bind now succeeds, and warns on
+	// stderr that this is still plaintext HTTP (stdout/stderr are merged by
+	// the runCLI test helper for diagnostics; a real caller piping only
+	// stdout gets clean JSON, which is what's asserted below).
 	restartOut := runCLI(t, snapshotdBin, homeDir, "mcp", "restart", "--bind", nonLoopback)
-	if err := json.Unmarshal([]byte(restartOut), &status); err != nil {
+	if !strings.Contains(restartOut, "WARNING") || !strings.Contains(restartOut, "not encrypted") {
+		t.Fatalf("expected a plaintext-HTTP warning on a successful non-loopback restart, got: %q", restartOut)
+	}
+	if err := json.Unmarshal([]byte(restartOut[strings.IndexByte(restartOut, '{'):]), &status); err != nil {
 		t.Fatalf("unmarshal restart output %q: %v", restartOut, err)
 	}
 	if !status.Listening || !status.AuthEnabled {

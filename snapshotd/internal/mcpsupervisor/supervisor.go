@@ -89,10 +89,11 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	return s.bindLocked(cfg)
 }
 
-// bindLocked binds and starts serving cfg.BindAddr with cfg's auth. Caller
-// must hold s.mu. Does not stop any prior listener -- callers that are
-// replacing a live listener must Shutdown it themselves first.
-func (s *Supervisor) bindLocked(cfg mcpauth.Config) error {
+// bindNew constructs a listener for cfg without touching any existing live
+// listener, so a caller can confirm the new address actually binds before
+// retiring whatever was running before -- see Restart's comment for why
+// that ordering matters.
+func (s *Supervisor) bindNew(cfg mcpauth.Config) (*mcpadapter.SSEServer, net.Listener, error) {
 	srv := mcpadapter.NewSSEServer(s.h, cfg.BindAddr)
 	srv.SetCredentials(mcpadapter.Credentials{
 		Enabled:  cfg.AuthEnabled,
@@ -101,8 +102,14 @@ func (s *Supervisor) bindLocked(cfg mcpauth.Config) error {
 	})
 	ln, err := srv.Listen()
 	if err != nil {
-		return fmt.Errorf("mcpsupervisor: bind %s: %w", cfg.BindAddr, err)
+		return nil, nil, fmt.Errorf("mcpsupervisor: bind %s: %w", cfg.BindAddr, err)
 	}
+	return srv, ln, nil
+}
+
+// commitLocked makes srv/ln the live listener and starts serving. Caller
+// must hold s.mu and have already retired any prior listener.
+func (s *Supervisor) commitLocked(cfg mcpauth.Config, srv *mcpadapter.SSEServer, ln net.Listener) {
 	s.srv = srv
 	s.listening = true
 	s.boundAddr = ln.Addr().String()
@@ -111,14 +118,31 @@ func (s *Supervisor) bindLocked(cfg mcpauth.Config) error {
 			s.log.Error("mcp listener exited", "addr", cfg.BindAddr, "err", err)
 		}
 	}()
+}
+
+// bindLocked binds and starts serving cfg.BindAddr with cfg's auth. Caller
+// must hold s.mu. Only used by Start, where there is no prior listener to
+// preserve on failure.
+func (s *Supervisor) bindLocked(cfg mcpauth.Config) error {
+	srv, ln, err := s.bindNew(cfg)
+	if err != nil {
+		return err
+	}
+	s.commitLocked(cfg, srv, ln)
 	return nil
 }
 
-// Restart stops the current listener (if any) and starts a new one. An
-// empty bindAddr means "keep the current address" (useful for picking up
-// an auth change without moving the port). Refuses to bind a non-loopback
-// address unless auth is already enabled -- either from a prior SetAuth
-// call, or already true in the persisted config.
+// Restart binds a new listener for bindAddr (or the current address, if
+// bindAddr is empty -- useful for picking up an auth change without moving
+// the port) and only then retires whatever was running before. That
+// ordering is deliberate: binding first means a bad address (typo, port
+// already in use, permission denied) fails without tearing down a
+// perfectly good existing listener -- callers get "the address you asked
+// for didn't work" instead of "the server you had is now gone too".
+//
+// Refuses to bind a non-loopback address unless auth is already enabled --
+// either from a prior SetAuth call, or already true in the persisted
+// config.
 func (s *Supervisor) Restart(ctx context.Context, bindAddr string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,16 +161,18 @@ func (s *Supervisor) Restart(ctx context.Context, bindAddr string) error {
 		)
 	}
 
-	if s.srv != nil {
-		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		_ = s.srv.Shutdown(shutdownCtx)
-		s.listening = false
-	}
-
-	if err := s.bindLocked(newCfg); err != nil {
+	newSrv, ln, err := s.bindNew(newCfg)
+	if err != nil {
 		return err
 	}
+
+	if s.srv != nil {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_ = s.srv.Shutdown(shutdownCtx)
+		cancel()
+	}
+
+	s.commitLocked(newCfg, newSrv, ln)
 	s.cfg = newCfg
 	return mcpauth.Save(s.homeDir, newCfg)
 }
@@ -231,9 +257,15 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
-// isLoopbackAddr reports whether addr's host portion is a loopback address
+// IsLoopbackAddr reports whether addr's host portion is a loopback address
 // (127.0.0.1, ::1, localhost). An empty host (e.g. ":7777", meaning "all
-// interfaces") and 0.0.0.0 are both treated as non-loopback.
+// interfaces") and 0.0.0.0 are both treated as non-loopback. Exported so
+// cmd/snapshotd can decide whether to print the plaintext-HTTP warning
+// after a successful restart, using the exact same rule Restart enforces.
+func IsLoopbackAddr(addr string) bool {
+	return isLoopbackAddr(addr)
+}
+
 func isLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {

@@ -3,6 +3,7 @@ package mcpsupervisor
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -81,6 +82,58 @@ func TestSupervisor_SetAuthThenRestartToNonLoopbackSucceeds(t *testing.T) {
 	}
 	if persisted.BindAddr == "" {
 		t.Fatalf("expected bind addr persisted")
+	}
+}
+
+// TestSupervisor_RestartToUnbindableAddrLeavesOldListenerRunning guards
+// against a bad --bind value (typo, port already taken, permission denied)
+// taking down a perfectly good existing listener: Restart must bind the
+// new address successfully before it retires the old one.
+func TestSupervisor_RestartToUnbindableAddrLeavesOldListenerRunning(t *testing.T) {
+	home := t.TempDir()
+	s := New(noopHandler{}, home, "127.0.0.1:0", nil)
+	ctx := context.Background()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+	if err := s.SetAuth(ctx, "alice", "s3cret"); err != nil {
+		t.Fatalf("set auth: %v", err)
+	}
+	before := s.Status()
+
+	// Occupy a port so restarting onto it fails to bind.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy a port: %v", err)
+	}
+	defer occupied.Close()
+	occupiedAddr := occupied.Addr().String()
+
+	if err := s.Restart(ctx, occupiedAddr); err == nil {
+		t.Fatalf("expected restart onto an already-bound port to fail")
+	}
+
+	after := s.Status()
+	if !after.Listening {
+		t.Fatalf("expected original listener to remain up after a failed restart, got: %+v", after)
+	}
+	if after.Addr != before.Addr {
+		t.Fatalf("expected original address to be unchanged after a failed restart: before=%q after=%q", before.Addr, after.Addr)
+	}
+
+	// And the original listener genuinely still serves requests.
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest(http.MethodGet, "http://"+after.Addr+"/mcp", nil)
+	req.SetBasicAuth("alice", "s3cret")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request to original listener after failed restart: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("expected original listener to still work with its own credentials, got 401")
 	}
 }
 
