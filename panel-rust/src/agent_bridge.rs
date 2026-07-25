@@ -1611,6 +1611,21 @@ fn spawn_gateway_process(
         .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
+    // PISO-11: "codex installed but not detected" -- acpx-core's detect()
+    // (agents/list) resolves an npx-distributed agent's status purely from
+    // `which("node")`/`which("npm")` on PATH, and Command::new(...).env(...)
+    // (no env_clear()) makes this spawned acpx-server inherit THIS process's
+    // own PATH -- i.e. whatever snapflow itself launched with. A terminal
+    // launch sources shell rc files (nvm's PATH export lives there); a
+    // desktop-launcher/dock-icon launch does not, so node/npm installed via
+    // nvm are genuinely on PATH for the user and genuinely absent from this
+    // spawned gateway's environment, and detect() reports RuntimeMissing
+    // for an agent that is, in fact, installed. Augmenting PATH here with a
+    // real login shell's resolved PATH (once per process, cached) closes
+    // that gap without needing the operator to launch from a terminal.
+    if let Some(path) = augmented_gateway_path() {
+        cmd.env("PATH", path);
+    }
     // Gateway stderr goes to a per-provider log file in the cache dir,
     // NOT /dev/null: acpx-server's tracing output AND every backend
     // adapter's inherited stderr flow through it (acpx-conductor spawns
@@ -1882,6 +1897,98 @@ const DAEMON_ADMIN_URL: &str = "http://127.0.0.1:8791";
 
 static SELF_SPAWNED_ADMIN_CREDS: std::sync::OnceLock<Mutex<HashMap<String, (String, String)>>> =
     std::sync::OnceLock::new();
+
+/// This process's PATH, augmented with whatever a real login shell resolves
+/// PATH to -- see the PISO-11 comment at its call site in
+/// `spawn_gateway_process` for why this exists. Computed once per process
+/// (a login shell spawn is real subprocess overhead, not something to pay
+/// on every gateway launch) and cached, including the "nothing extra to
+/// add" case so a broken `$SHELL` doesn't retry on every call.
+///
+/// Windows is deliberately excluded: PATH there is a per-user/per-machine
+/// environment value set outside any shell-rc-file mechanism, so it is
+/// already inherited correctly regardless of how snapflow was launched --
+/// this specific gap does not exist on that platform.
+#[cfg(unix)]
+fn augmented_gateway_path() -> Option<String> {
+    static AUGMENTED_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    AUGMENTED_PATH
+        .get_or_init(|| {
+            let current = std::env::var("PATH").unwrap_or_default();
+            merge_path_entries(&current, login_shell_path_entries())
+        })
+        .clone()
+}
+
+/// Pure merge: current PATH's own entries first (so an operator's explicit
+/// PATH always wins on conflicting binaries), then whatever `extra` entries
+/// (from a login shell) aren't already present, in order, deduped. `None`
+/// only when there is nothing at all to set PATH to. Split out from
+/// `augmented_gateway_path` so the merge/dedup/ordering logic is testable
+/// without a real subprocess or the process-global OnceLock cache.
+fn merge_path_entries(current: &str, extra: Vec<String>) -> Option<String> {
+    // split_paths("") yields one empty PathBuf rather than zero entries --
+    // filtered out so an unset/empty current PATH doesn't leave a stray
+    // leading ":" in the merged result or a spurious Some("").
+    let mut entries: Vec<String> = std::env::split_paths(current)
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let existing: std::collections::HashSet<String> = entries.iter().cloned().collect();
+    for entry in extra {
+        if !existing.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(":"))
+    }
+}
+
+/// Resolves PATH the same way an interactive login shell would (sourcing
+/// `.bashrc`/`.zshrc`/`.profile`/etc, where nvm/uv/etc typically export
+/// their bin dirs) rather than trusting whatever PATH this process itself
+/// happened to inherit. Best-effort: any failure (no `$SHELL`, the shell
+/// exits non-zero, output isn't valid UTF-8) yields an empty list, which
+/// makes `augmented_gateway_path()` a no-op rather than a hard error --
+/// this is a detection-quality improvement, not something a gateway launch
+/// should ever fail over.
+#[cfg(unix)]
+fn login_shell_path_entries() -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+    // `-l` alone (login, non-interactive) sources /etc/profile + the first
+    // of ~/.bash_profile/~/.bash_login/~/.profile -- NOT ~/.bashrc, which
+    // bash only auto-sources for INTERACTIVE shells. Confirmed live on this
+    // box: nvm's PATH export lives only in ~/.bashrc (a very common nvm
+    // install-script default), so `-lc` alone silently found nothing while
+    // a real terminal (which IS interactive) sees it fine. `-lic` sources
+    // both chains, matching what a user's actual terminal actually runs.
+    // stdin is nulled (some rc files probe it) and stderr discarded (an
+    // interactive shell with no real tty logs harmless "no job control"/
+    // "cannot set terminal process group" warnings there that must not be
+    // mistaken for PATH output, which is stdout-only via printf below).
+    let output = std::process::Command::new(&shell)
+        .arg("-lic")
+        .arg("printf '%s' \"$PATH\"")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout)
+            .map(|s| s.split(':').map(str::to_owned).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Windows has no equivalent shell-rc-file PATH gap (see
+/// `augmented_gateway_path`'s doc comment) -- always a no-op there.
+#[cfg(not(unix))]
+fn augmented_gateway_path() -> Option<String> {
+    None
+}
 
 fn self_spawned_admin_creds() -> &'static Mutex<HashMap<String, (String, String)>> {
     SELF_SPAWNED_ADMIN_CREDS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -4268,6 +4375,50 @@ mod tests {
     /// been restored, so at most one such test's mutation is ever live at
     /// a time, regardless of test-runner parallelism.
     static ENV_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+    // PISO-11: "codex installed but not detected" -- see
+    // merge_path_entries's own doc comment for why this is split out as a
+    // pure function. These tests exercise only the merge/dedup/ordering
+    // logic; they never touch the real process env or spawn a shell.
+    #[test]
+    fn merge_path_entries_appends_new_login_shell_dirs() {
+        let merged = merge_path_entries(
+            "/usr/bin:/bin",
+            vec!["/home/u/.nvm/versions/node/v20/bin".to_owned()],
+        );
+        assert_eq!(
+            merged,
+            Some("/usr/bin:/bin:/home/u/.nvm/versions/node/v20/bin".to_owned())
+        );
+    }
+
+    #[test]
+    fn merge_path_entries_dedupes_already_present_dirs() {
+        let merged = merge_path_entries("/usr/bin:/bin", vec!["/usr/bin".to_owned()]);
+        assert_eq!(merged, Some("/usr/bin:/bin".to_owned()));
+    }
+
+    #[test]
+    fn merge_path_entries_current_dirs_come_first() {
+        // An operator's own explicit PATH must win on conflicting binaries
+        // -- login-shell-resolved dirs are strictly additive, never
+        // reordered ahead of what the process already had.
+        let merged = merge_path_entries("/opt/custom/bin", vec!["/usr/bin".to_owned()]);
+        assert_eq!(merged, Some("/opt/custom/bin:/usr/bin".to_owned()));
+    }
+
+    #[test]
+    fn merge_path_entries_empty_current_and_extra_yields_none() {
+        assert_eq!(merge_path_entries("", Vec::new()), None);
+    }
+
+    #[test]
+    fn merge_path_entries_empty_current_still_uses_extra() {
+        assert_eq!(
+            merge_path_entries("", vec!["/usr/bin".to_owned()]),
+            Some("/usr/bin".to_owned())
+        );
+    }
 
     fn exited_buffer() -> TerminalBuffer {
         TerminalBuffer {
