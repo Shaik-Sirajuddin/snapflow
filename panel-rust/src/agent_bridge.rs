@@ -6716,6 +6716,117 @@ done
         );
     }
 
+    /// PROF-6 (`profile-only-backend-selection` plan): real-gateway pin for
+    /// PUI-014's lazy-attach path -- `add_thread_deferred` claims a slot
+    /// with no session open yet, and the provider/profile it actually binds
+    /// to are read fresh from the model at FIRST SEND
+    /// (`dispatch::dispatch_compose_send_maybe_attach`), not at creation
+    /// time. The plan doc flagged this as a real risk: if seeding/wiring
+    /// between PROF-2's default-profile fallback and this attach call had a
+    /// gap, a first message could attach with no profile (silently falling
+    /// through to native mode) or the wrong one, and nothing at the reducer
+    /// level (which only proves `profile_name` gets computed correctly, not
+    /// that it reaches a real `session/new`) would catch it.
+    ///
+    /// Two distinct real gateways/personas, deliberately the opposite of
+    /// the bridge's own first (index 0, "codex") seed thread, so a bug that
+    /// silently reused the seed thread's own provider/gateway instead of
+    /// the one set at attach time shows up as an unambiguous wrong-persona
+    /// reply ([CODEX] instead of [CLAUDE]), not a coincidental pass.
+    #[test]
+    fn deferred_thread_attaches_with_the_profile_and_provider_set_at_first_send() {
+        let codex_gateway = TestGateway::spawn_with_persona("codex");
+        let claude_gateway = TestGateway::spawn_with_persona("claude");
+        let codex_url = codex_gateway.base_url.clone();
+        let claude_url = claude_gateway.base_url.clone();
+        let specs = vec![
+            ThreadSpec {
+                display_name: "Codex Seed".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+            ThreadSpec {
+                display_name: "Claude Seed".to_owned(),
+                provider: "claude".to_owned(),
+                session_id: None,
+                profile_name: None,
+            },
+        ];
+        let mut bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            move |provider| {
+                if provider == "codex" {
+                    Ok(codex_url.clone())
+                } else {
+                    Ok(claude_url.clone())
+                }
+            },
+            None,
+        )
+        .expect("bridge with two distinct gateways");
+
+        // Real profile on the claude gateway, created via thread 1 (the
+        // claude seed)'s own handle so it lands on the right gateway.
+        assert!(
+            bridge.create_profile(
+                1,
+                serde_json::json!({
+                    "name": "lazy-claude-profile",
+                    "agent_id": "claude",
+                }),
+            ),
+            "expected profiles/create against the claude gateway (thread 1) to succeed"
+        );
+
+        // PUI-014: create the thread DEFERRED -- no session opens yet, the
+        // provider/profile picker stays editable.
+        let idx = bridge
+            .add_thread_deferred("Lazy Thread", Some("claude"))
+            .expect("add_thread_deferred");
+        assert!(
+            bridge.is_deferred(idx),
+            "thread must still be deferred before first send"
+        );
+
+        // First send: mirrors dispatch_compose_send_maybe_attach's exact
+        // call shape (provider + profile read from the model at send time,
+        // not from anything captured at creation).
+        bridge
+            .attach_deferred_thread(idx, Some("claude"), Some("lazy-claude-profile"))
+            .expect("attach_deferred_thread");
+        assert!(
+            !bridge.is_deferred(idx),
+            "thread must no longer be deferred after attach"
+        );
+
+        bridge.send_prompt(idx, "which persona are you".into());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reply = None;
+        while std::time::Instant::now() < deadline && reply.is_none() {
+            for ev in bridge.poll() {
+                if ev.thread_index == idx {
+                    if let AgentEvent::Message(msg) = ev.event {
+                        if msg.text.contains("WHICH PERSONA ARE YOU") {
+                            reply = Some(msg.text);
+                        }
+                    }
+                }
+            }
+            if reply.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let reply = reply.expect("expected a reply from the lazily attached thread");
+        assert!(
+            reply.starts_with("[CLAUDE]"),
+            "expected the deferred thread's first-send attach to bind the claude \
+             provider/profile set at send time, not silently fall back to the seed thread's \
+             own codex provider or to native mode -- got: {reply:?}"
+        );
+    }
+
     /// Same real stand-in-backend shell-script technique
     /// `acpx-server/tests/agent_request_relay_test.rs` uses, one layer up
     /// the stack: proves the interactive `session/request_permission`
