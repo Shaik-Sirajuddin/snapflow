@@ -10,6 +10,9 @@
 # captures screenshots.
 set -euo pipefail
 
+# shellcheck source=host_e2e_admin_provision.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_e2e_admin_provision.sh"
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state_dir="${PANEL_HOST_E2E_STATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/panel-host-e2e.XXXXXX")}"
 keep_state="${PANEL_HOST_E2E_KEEP_STATE:-0}"
@@ -78,42 +81,12 @@ for _ in $(seq 1 80); do
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
 
-# PROF-4 (profile-only-backend-selection plan): the panel used to reach
-# rui-mock-agent by setting ACPX_BACKEND_CMD on the gateway process (removed
-# from production in PROF-3) and relying on native/unmanaged mode (no
-# _acpx.profile). Replaced with the real profile path: register
-# rui-mock-agent as a durable admin-plane custom agent (POST
-# /admin/agents/custom, acpx-server/src/transport/admin.rs) under an id of
-# its own ("mock-codex", deliberately NOT "codex" -- acpx-server's own
-# main.rs unconditionally pre-registers a supervisor entry under
-# ACPX_DEFAULT_AGENT_ID at startup, using its bare npx-codex-acp default
-# when ACPX_BACKEND_CMD is unset, so reusing that exact id here would 409
-# with "custom agent id codex conflicts with an existing registered
-# backend"), then a profile named "codex" pointing at it. The panel's own
-# settings.global.json (written below, before shotcut starts) sets
-# default_agent_id: "codex", which the cold-start seed threads then bind as
-# their _acpx.profile (see lib.rs's cold_start_thread_specs) -- so this
-# panel run never touches native mode at all, sidestepping the id-conflict
-# entirely rather than working around it.
-for _ in $(seq 1 80); do
-    if curl --fail --silent -o /dev/null "http://127.0.0.1:$admin_port/admin/agents" \
-        -H "Authorization: Bearer $admin_token"; then
-        break
-    fi
-    sleep 0.1
-done
-curl --fail --silent -X POST "http://127.0.0.1:$admin_port/admin/agents/custom" \
-    -H "Authorization: Bearer $admin_token" \
-    -H "Content-Type: application/json" \
-    -d "$(printf '{"id":"mock-codex","name":"mock-codex","command":"%s","args":[],"env":{"RUI_MOCK_AGENT_PERSONA":"codex"},"cwd":null}' "$agent_bin")" \
-    >/dev/null
-curl --fail --silent -X POST "http://127.0.0.1:$gateway_port/rpc" \
-    -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"profiles/create","params":{"name":"codex","agent_id":"mock-codex"}}' \
-    >/dev/null
-
-mkdir -p "$state_dir/panel-settings"
-printf '{"schema_version":1,"default_agent_id":"codex"}' >"$state_dir/panel-settings/settings.global.json"
+# PROF-4 (profile-only-backend-selection plan): registers rui-mock-agent as
+# a real admin-plane profile and points the panel's own settings at it,
+# replacing the old ACPX_BACKEND_CMD + native-mode approach -- see
+# host_e2e_admin_provision.sh's own doc comment for the full mechanism and
+# why it can't just reuse ACPX_DEFAULT_AGENT_ID's "codex" id directly.
+provision_mock_profile_via_admin "$gateway_port" "$admin_port" "$admin_token" "$agent_bin" "$state_dir"
 
 start_shotcut() {
     shotcut_run=$((shotcut_run + 1))

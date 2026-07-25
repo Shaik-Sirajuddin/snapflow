@@ -15,6 +15,9 @@
 # convention.
 set -euo pipefail
 
+# shellcheck source=host_e2e_admin_provision.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_e2e_admin_provision.sh"
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state_dir="${PANEL_HOST_E2E_MCP_STATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/panel-host-e2e-mcp.XXXXXX")}"
 keep_state="${PANEL_HOST_E2E_MCP_KEEP_STATE:-0}"
@@ -90,35 +93,9 @@ for _ in $(seq 1 80); do
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
 
-# PROF-4 (profile-only-backend-selection plan): see host_e2e_smoke.sh's own
-# comment on this same block for the full rationale -- registers
-# rui-mock-agent as a durable admin-plane custom agent under "mock-codex"
-# (deliberately not "codex" -- acpx-server's own main.rs unconditionally
-# pre-registers a supervisor entry under ACPX_DEFAULT_AGENT_ID at startup,
-# so reusing that id here would 409 with a "conflicts with an existing
-# registered backend" error), then a profile literally named "codex"
-# pointing at it, then a settings.global.json setting default_agent_id so
-# the panel's own cold-start seed binds that profile as its _acpx.profile
-# instead of ever touching native mode.
-for _ in $(seq 1 80); do
-    if curl --fail --silent -o /dev/null "http://127.0.0.1:$admin_port/admin/agents" \
-        -H "Authorization: Bearer $admin_token"; then
-        break
-    fi
-    sleep 0.1
-done
-curl --fail --silent -X POST "http://127.0.0.1:$admin_port/admin/agents/custom" \
-    -H "Authorization: Bearer $admin_token" \
-    -H "Content-Type: application/json" \
-    -d "$(printf '{"id":"mock-codex","name":"mock-codex","command":"%s","args":[],"env":{"RUI_MOCK_AGENT_PERSONA":"codex"},"cwd":null}' "$agent_bin")" \
-    >/dev/null
-curl --fail --silent -X POST "http://127.0.0.1:$gateway_port/rpc" \
-    -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"profiles/create","params":{"name":"codex","agent_id":"mock-codex"}}' \
-    >/dev/null
-
-mkdir -p "$state_dir/panel-settings"
-printf '{"schema_version":1,"default_agent_id":"codex"}' >"$state_dir/panel-settings/settings.global.json"
+# PROF-4 (profile-only-backend-selection plan): see
+# host_e2e_admin_provision.sh's own doc comment for the full mechanism.
+provision_mock_profile_via_admin "$gateway_port" "$admin_port" "$admin_token" "$agent_bin" "$state_dir"
 
 env \
 SLINT_MCP_PORT="$mcp_port" \
