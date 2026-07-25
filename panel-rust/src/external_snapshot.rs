@@ -461,6 +461,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             // for every thread, so restarts hydrate ThreadModel::archived
             // (sidebar counters + archive pool cap read the model).
             archived_flags: archived,
+            // PISO-2: tag with the SAME value `retain_items_for_project`
+            // just filtered against above, not a fresh re-read -- the two
+            // must never disagree about which project this snapshot's
+            // shape reflects.
+            active_project_path,
         }
     }
 

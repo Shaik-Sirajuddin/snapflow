@@ -1910,7 +1910,24 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             }
         }
         model.visible_list_synced = true;
-        if changed {
+        // PISO-2 (project-isolation-mlt-binding plan) stale-async guard:
+        // this snapshot was collected against `snapshot.active_project_
+        // path`, tagged at collection time (see `ThreadListSnapshot::
+        // active_project_path`'s doc comment). `HostMsg::ProjectPathChanged`
+        // updates `model.active_project_path` synchronously, a full
+        // reducer turn before any poll tick can re-collect a snapshot
+        // against the new value -- so a snapshot whose tag disagrees with
+        // the model's CURRENT value describes a project the user has
+        // already left. Applying its visible-list SHAPE would show that
+        // old project's threads next to the new project's indicator, the
+        // exact cross-project leak this plan exists to close. Drop it and
+        // wait for the next tick's snapshot instead of assuming this one
+        // "usually" arrives in order. The per-row hydration above
+        // (session id, archived flags) is thread-scoped, not
+        // project-scoped, so it stays safe to apply unconditionally.
+        let snapshot_matches_active_project =
+            snapshot.active_project_path == model.active_project_path;
+        if changed && snapshot_matches_active_project {
             // `selected_thread` is a *filtered* index into the visible
             // list, so before the visible order is rewritten (recency
             // resort on background activity, archive/resume moving rows
@@ -1929,12 +1946,27 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 &snapshot.visible_thread_ids,
                 &snapshot.rows,
             )));
+            // PISO-2: the first snapshot folded in after a project switch
+            // deliberately starts the user at that project's FIRST
+            // thread, rather than clamping to whichever numeric filtered
+            // index the OLD, unrelated project's selection happened to
+            // sit at (that clamp is still the right fallback for a
+            // same-project list change -- deletion/archive/resort -- so
+            // it stays the default; only a genuine project switch
+            // overrides it). See `Model::synced_project_path`'s doc
+            // comment. An empty new list falls through to the
+            // display-clearing arm below regardless of this choice.
+            let project_switched = model.synced_project_path != snapshot.active_project_path;
             let reanchored = selected_id
                 .and_then(|id| snapshot.visible_thread_ids.iter().position(|key| *key == id))
                 .unwrap_or_else(|| {
-                    model
-                        .selected_thread
-                        .min(snapshot.visible_thread_ids.len().saturating_sub(1))
+                    if project_switched {
+                        0
+                    } else {
+                        model
+                            .selected_thread
+                            .min(snapshot.visible_thread_ids.len().saturating_sub(1))
+                    }
                 });
             if reanchored != model.selected_thread {
                 model.selected_thread = reanchored;
@@ -1960,6 +1992,9 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     });
                 }
             }
+        }
+        if snapshot_matches_active_project {
+            model.synced_project_path = snapshot.active_project_path.clone();
         }
     }
     if let Some(snapshot) = frame.settings_gateway_snapshot {
@@ -3959,6 +3994,7 @@ mod tests {
                     visible_thread_ids: vec!["durable-thread-4".to_owned()],
                     rows: vec![row.clone()],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4016,6 +4052,7 @@ mod tests {
                         visible_row(1, "thread-1"),
                     ],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4050,6 +4087,7 @@ mod tests {
                     visible_thread_ids: vec!["thread-0".to_owned()],
                     rows: vec![row],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4077,6 +4115,7 @@ mod tests {
                     visible_thread_ids: vec!["thread-0".to_owned(), "thread-1".to_owned()],
                     rows: vec![visible_row(0, "thread-0"), visible_row(1, "thread-1")],
                     archived_flags: vec![true, false],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4106,6 +4145,7 @@ mod tests {
                     visible_thread_ids: vec![],
                     rows: vec![],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4136,12 +4176,113 @@ mod tests {
                     visible_thread_ids: vec!["thread-0".to_owned()],
                     rows: vec![visible_row(0, "thread-0")],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
         );
 
         assert_eq!(model.selected_thread, 0, "gone thread clamps selection");
+    }
+
+    // PISO-2 (project-isolation-mlt-binding plan): rebind the visible
+    // thread list and the active chat on a project switch.
+
+    #[test]
+    fn project_switch_reanchors_selection_to_the_new_projects_first_thread_not_a_numeric_clamp() {
+        // Four threads, two per project. Project A is active with
+        // thread-1 (filtered index 1) selected. Switching to project B
+        // must land on thread-2 (B's first thread, filtered index 0) --
+        // NOT on thread-3, which is what a plain `selected_thread.min(new
+        // len - 1)` clamp (1.min(1) == 1) would have picked, purely
+        // because 1 was the old numeric position.
+        let mut model = model_with_threads(&["a", "b", "c", "d"]);
+        model.active_project_path = Some("/work/a/project.mlt".to_owned());
+        model.synced_project_path = Some("/work/a/project.mlt".to_owned());
+        model.visible_indices = vec![0, 1];
+        model.selected_thread = 1; // thread-1
+        *model.thread_model_keys.borrow_mut() =
+            vec!["thread-0".to_owned(), "thread-1".to_owned()];
+
+        // The user switches the open MLT project to B.
+        model.active_project_path = Some("/work/b/project.mlt".to_owned());
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![2, 3],
+                    visible_thread_ids: vec!["thread-2".to_owned(), "thread-3".to_owned()],
+                    rows: vec![visible_row(2, "thread-2"), visible_row(3, "thread-3")],
+                    archived_flags: vec![],
+                    active_project_path: Some("/work/b/project.mlt".to_owned()),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.selected_thread, 0,
+            "must land on B's first thread (thread-2), not a numeric clamp"
+        );
+        assert_eq!(selected_real_index(&model), 2);
+        assert_eq!(
+            model.synced_project_path.as_deref(),
+            Some("/work/b/project.mlt")
+        );
+        assert!(dirty
+            .iter()
+            .any(|item| matches!(item, Dirty::Scalar(ScalarField::SelectedThread))));
+    }
+
+    #[test]
+    fn a_thread_list_snapshot_collected_for_an_already_left_project_is_dropped() {
+        // The snapshot was collected while project A was active, but by
+        // the time it's folded in the user has already switched to B (a
+        // later `HostMsg::ProjectPathChanged` updated `active_project_
+        // path` first). Applying A's visible-list shape now would show A's
+        // threads under B's indicator -- the cross-project leak this plan
+        // exists to close. The fold must drop it, not assume it "usually"
+        // arrives before the switch.
+        let mut model = model_with_threads(&["a", "b"]);
+        model.active_project_path = Some("/work/b/project.mlt".to_owned());
+        model.synced_project_path = Some("/work/b/project.mlt".to_owned());
+        model.visible_indices = vec![1];
+        model.selected_thread = 0; // thread-1, B's only thread
+        *model.thread_model_keys.borrow_mut() = vec!["thread-1".to_owned()];
+        let stale_rows = vec![visible_row(0, "thread-0")];
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0],
+                    visible_thread_ids: vec!["thread-0".to_owned()],
+                    rows: stale_rows,
+                    archived_flags: vec![],
+                    active_project_path: Some("/work/a/project.mlt".to_owned()),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+
+        assert_eq!(
+            model.visible_indices,
+            vec![1],
+            "stale project-A snapshot must not overwrite B's visible list"
+        );
+        assert_eq!(model.selected_thread, 0);
+        assert_eq!(
+            model.synced_project_path.as_deref(),
+            Some("/work/b/project.mlt"),
+            "a dropped snapshot must not mark B as synced against A's shape"
+        );
+        assert!(
+            !dirty
+                .iter()
+                .any(|item| matches!(item, Dirty::ThreadListDiff(_))),
+            "no list diff should be emitted for a snapshot that was dropped"
+        );
     }
 
     #[test]

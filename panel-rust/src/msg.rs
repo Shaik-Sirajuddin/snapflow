@@ -305,6 +305,19 @@ pub struct ThreadListSnapshot {
     /// hydration for `ThreadModel::archived`, which the sidebar counters
     /// and the archive pool cap read. Empty = no data (tests).
     pub archived_flags: Vec<bool>,
+    /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
+    /// path` this snapshot's `visible_indices`/`rows` were filtered
+    /// against (`ExternalSnapshotSource::collect_thread_list_snapshot`
+    /// tags it with the exact value `retain_items_for_project` used, not
+    /// a fresh re-read). `update_frame`'s stale-snapshot guard compares
+    /// this against `Model::active_project_path` at APPLY time and drops
+    /// the whole list-shape update on a mismatch -- a snapshot collected
+    /// for a project the user has since switched away from must never
+    /// overwrite the (by-then-already-updated) visible list, even though
+    /// today's single-threaded synchronous poll loop makes that window
+    /// vanishingly unlikely to hit in practice; this makes the guarantee
+    /// explicit and independent of that timing accident.
+    pub active_project_path: Option<String>,
 }
 
 /// Read-only settings data collected from the selected gateway for one

@@ -148,6 +148,23 @@ pub struct Model {
     pub open_terminal_ids: Vec<String>,
     pub local_terminal_last_text: String,
     pub active_project_path: Option<String>,
+    /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
+    /// path` value the currently-applied thread list (`visible_indices`/
+    /// `thread_rows`) was actually synced against -- distinct from
+    /// `active_project_path` itself, which flips the INSTANT `HostMsg::
+    /// ProjectPathChanged` arrives, one full reducer turn before the next
+    /// poll tick's `ThreadListSnapshot` (collected against the new value)
+    /// can land and get folded in. `update_frame`'s stale-snapshot guard
+    /// compares an incoming snapshot's own tagged `active_project_path`
+    /// against `Model::active_project_path` (drop if they disagree -- an
+    /// in-flight fetch for a project the user has since left); this field
+    /// is compared instead against the snapshot's tag to detect "this
+    /// fold is the first one for a NEW project" so the selection reanchor
+    /// can jump to that project's first thread instead of clamping to
+    /// whatever numeric index the old, unrelated project's selection
+    /// happened to be at (see `update_frame`'s `if let Some(snapshot) =
+    /// frame.thread_list_snapshot` block).
+    pub synced_project_path: Option<String>,
     pub traced_attachment_threads: HashSet<String>,
     pub appearance: AppearanceState,
     pub theme_variant: String,
