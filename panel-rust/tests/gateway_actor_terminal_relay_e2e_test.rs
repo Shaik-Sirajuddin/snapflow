@@ -18,6 +18,8 @@
 //! (duplicated helpers rather than shared -- these are independent
 //! test binaries).
 
+use acpx_client::ext::admin::AdminClient;
+use acpx_proto::admin::CustomAgentSpec;
 use panel_rust::gateway_actor::spawn_acpx_thread;
 use panel_rust::protocol_types::AgentEvent;
 use std::path::PathBuf;
@@ -79,22 +81,65 @@ struct GatewayProcess {
     base_url: String,
 }
 
+/// PROF-4 (`profile-only-backend-selection` plan): registers
+/// `backend_script` (written to a temp file first -- the admin plane's
+/// `CustomAgent.command`/`args` are separate fields, not a naively
+/// whitespace-split single string the way `ACPX_BACKEND_CMD` was, but a
+/// multi-word inline script still can't be passed as `command` directly)
+/// as a real, durable custom agent under `agent_id` via `POST
+/// /admin/agents/custom` -- the replacement for setting `ACPX_BACKEND_CMD`
+/// + `ACPX_DEFAULT_AGENT_ID` directly on the gateway process (removed from
+/// production in PROF-3). `main.rs`'s own startup used to register the
+/// env-derived command under exactly the `ACPX_DEFAULT_AGENT_ID`
+/// supervisor key, which is why this file's `agent_id: "terminal-relay-
+/// agent"` profile already resolved to it; `Router::ensure_custom_agent_
+/// registered` registers a supervisor entry under an arbitrary id the same
+/// way, so that profile keeps resolving unchanged.
+async fn register_stand_in_backend(
+    admin_port: u16,
+    admin_token: &str,
+    agent_id: &str,
+    script_path: &std::path::Path,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(3000);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), admin_token);
+    admin
+        .create_custom_agent(&CustomAgentSpec {
+            id: agent_id.to_owned(),
+            name: agent_id.to_owned(),
+            command: "sh".to_owned(),
+            args: vec![script_path.to_string_lossy().into_owned()],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+        })
+        .await
+        .expect("admin/agents/custom create");
+}
+
 impl GatewayProcess {
-    /// Spawns a real `acpx-server` with `backend_script`'s contents as
-    /// its `ACPX_BACKEND_CMD` (written to a temp file first --
-    /// `ACPX_BACKEND_CMD` is parsed by naive whitespace-splitting, see
-    /// `acpx-server/src/config.rs`, so an inline multi-word script
-    /// cannot be passed directly).
     async fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
         let script_path = script_dir.join("stand_in_backend.sh");
         std::fs::write(&script_path, backend_script).expect("write stand-in backend script");
-        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+        let db_path = script_dir.join("acpx.sqlite3");
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
+        let admin_token_for_env = admin_token.clone();
+        let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-                .env("ACPX_DEFAULT_AGENT_ID", "terminal-relay-agent")
+                .env("ACPX_DB_PATH", &db_path)
+                .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+                .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
+        register_stand_in_backend(admin_port, &admin_token, "terminal-relay-agent", &script_path)
+            .await;
         GatewayProcess { child, base_url }
     }
 }
