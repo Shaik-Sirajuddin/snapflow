@@ -77,17 +77,28 @@ Use Snapflow itself as an MCP server so other agents/tools can drive the editor:
 One command installs everything — the `snapflow` editor and the `snapflowd` agent
 daemon it talks to:
 
+**Linux / macOS:**
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.sh | bash
 ```
 
-This detects your OS/arch, downloads the matching release bundle from
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/Shaik-Sirajuddin/snapflow/main/scripts/install.ps1 | iex
+```
+
+Each detects your OS/arch, downloads the matching release bundle from
 [Releases](https://github.com/Shaik-Sirajuddin/snapflow/releases) with a live progress
 bar, verifies its checksum, and installs both `snapflow` and `snapflowd` (on Linux, a
 desktop launcher entry is also added to your applications menu; on macOS,
-`Snapflow.app` is installed to `/Applications`). Linux and macOS (x86_64) are supported
-today; Windows builds are in progress. See [scripts/install.sh](scripts/install.sh) for
-details/env overrides, or grab a release archive manually from the Releases page.
+`Snapflow.app` is installed to `/Applications`). All three platforms (Linux, macOS,
+Windows; x86_64) are supported. See [scripts/install.sh](scripts/install.sh) /
+[scripts/install.ps1](scripts/install.ps1) for details/env overrides, or grab a release
+archive manually from the Releases page. Windows service auto-start isn't wired up yet
+(`install.ps1` installs the binaries and PATH but not a Scheduled Task) -- run
+`snapflowd.exe serve` manually for now.
 
 To build from source instead, see "How to build" below.
 

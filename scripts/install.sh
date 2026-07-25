@@ -31,7 +31,7 @@ case "$os" in
   Linux)  platform="linux" ;;
   Darwin) platform="macos" ;;
   *)
-    die "unsupported OS: $os. Only Linux and macOS builds are published (see .github/workflows/); on Windows, download a release asset manually from https://github.com/$REPO/releases"
+    die "unsupported OS: $os. On Windows, use scripts/install.ps1 instead: irm https://raw.githubusercontent.com/$REPO/main/scripts/install.ps1 | iex"
     ;;
 esac
 
