@@ -330,6 +330,7 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
                 || existing.model != row.item.model
                 || existing.project_path != row.item.project_path
                 || existing.project_name != row.item.project_name
+                || existing.project_instance_live != row.item.project_instance_live
                 || existing.profile_name != row.item.profile_name
                 || existing.has_session != row.item.has_session
         })

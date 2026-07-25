@@ -107,6 +107,14 @@ pub struct ThreadSpec {
     pub provider: String,
     pub session_id: Option<String>,
     pub profile_name: Option<String>,
+    /// PISO-3: the durable `ThreadRecord::project_path` this thread was
+    /// last persisted against, if any -- carried through so the restored
+    /// slot's `project_path` (below) hydrates from what was actually
+    /// stored rather than starting `None` and silently inheriting
+    /// whatever project happens to be active at this restart (the leak
+    /// this phase closes). `None` for a freshly-seeded default thread
+    /// (nothing persisted yet) and for a legacy pre-migration record.
+    pub project_path: Option<String>,
 }
 
 /// The resolved binding returned once a thread has opened or resumed.
@@ -125,6 +133,7 @@ fn specs_for_names(thread_names: &[&str]) -> Vec<ThreadSpec> {
             provider: provider_for_index(idx).to_owned(),
             session_id: None,
             profile_name: None,
+            project_path: None,
         })
         .collect()
 }
@@ -234,10 +243,23 @@ struct ThreadSlot {
     /// `thread_item_project_context` phase: the project directory this
     /// thread's session was actually opened/resumed/reattached against
     /// (the `cwd` passed to ACP at creation time -- see `cwd_for_session`),
-    /// captured once and never updated afterward, since ACP has no way to
-    /// move an existing session to a new cwd. `None` when no project was
-    /// active at creation time (the pre-`active_project_binding` default).
-    project_path: Option<PathBuf>,
+    /// captured once and normally never updated afterward, since ACP has
+    /// no way to move an existing session to a new cwd. `None` when no
+    /// project was active at creation time (the pre-`active_project_
+    /// binding` default).
+    ///
+    /// PISO-7 (project-isolation-mlt-binding plan) is the one deliberate
+    /// exception: an MLT Save-As renames the project file out from under
+    /// every thread that was recorded against the old path, without
+    /// touching any ACP session at all -- the session's real `cwd` on
+    /// disk hasn't moved, only the panel's own bookkeeping of which
+    /// project it belongs to needs to follow. `Mutex`, not a plain field,
+    /// so `AgentBridge::rebind_project_path` can update matching slots'
+    /// values in place for the live session (sqlite alone only fixes the
+    /// NEXT restart -- see that method's doc comment); every other
+    /// consumer keeps treating a lock+clone as if it were still a
+    /// captured-once, effectively-immutable read.
+    project_path: Mutex<Option<PathBuf>>,
     /// PUI-014: `true` for a slot created up front (so it holds its positional
     /// index in `slots`, preserving the `model.threads[i] <-> slots[i]`
     /// parallel-array invariant) but whose ACP session attach is deliberately
@@ -248,6 +270,19 @@ struct ThreadSlot {
     /// freshly-built, eagerly-attached slot bound to the then-current
     /// provider. `false` for every eagerly-attached or recovered slot.
     deferred: bool,
+}
+
+impl ThreadSlot {
+    /// A point-in-time copy of `project_path`. Every consumer already
+    /// treated the (formerly plain) field as a single value read once per
+    /// use, so this is the one place that lock+clone lives rather than
+    /// repeating it at each of the several call sites below.
+    fn project_path_snapshot(&self) -> Option<PathBuf> {
+        self.project_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
 }
 
 #[derive(Default)]
@@ -840,6 +875,163 @@ fn resolve_snapflowd_mcp_bin() -> PathBuf {
     )
 }
 
+/// Resolves the `snapshotd` daemon CLI binary path (PISO-8, project-
+/// isolation-mlt-binding plan): `RUI_SNAPSHOTD_BIN` env override, else a
+/// path relative to this crate's own `CARGO_MANIFEST_DIR`, same
+/// convention as [`resolve_acpx_server_bin`]/[`resolve_snapflowd_mcp_bin`].
+/// Unlike those two, this binary is a short-lived CLI invocation (`list`/
+/// `listProjects`), not a long-lived spawned server -- see
+/// [`fetch_daemon_project_instances`].
+fn resolve_snapshotd_bin_from(
+    override_bin: Option<&str>,
+    current_exe: Option<&Path>,
+    manifest_dir: &Path,
+) -> PathBuf {
+    if let Some(bin) = override_bin.filter(|bin| !bin.is_empty()) {
+        return PathBuf::from(bin);
+    }
+    if let Some(parent) = current_exe.and_then(Path::parent) {
+        let candidate = parent.join("snapshotd");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    manifest_dir.join("../snapshotd/snapshotd")
+}
+
+fn resolve_snapshotd_bin() -> PathBuf {
+    resolve_snapshotd_bin_from(
+        std::env::var("RUI_SNAPSHOTD_BIN").ok().as_deref(),
+        std::env::current_exe().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+/// PISO-8 (project-isolation-mlt-binding plan): one MLT project path
+/// (project root dir + `MltFileName` joined, matching
+/// `ThreadSlot::project_path`'s own file-path shape) that snapshotd
+/// currently reports a `"ready"` process instance for, and whether that
+/// instance is headless -- i.e. was launched by an agent's own
+/// `daemon.launch` MCP call for a project this panel's own host process
+/// never opened, rather than the panel's normal PISO-1 propagation path.
+/// A thread bound to such a project (see `models::
+/// thread_project_instance_is_live`) is being driven by that live
+/// instance, invisibly, unless the UI surfaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonProjectInstance {
+    pub project_path: String,
+    pub headless: bool,
+}
+
+/// Runs one bare `snapshotd` CLI subcommand (`"list"` or `"listProjects"`)
+/// and returns its stdout, one JSON object per line (see `cmdList`/
+/// `cmdListProjects` in `snapshotd/cmd/snapshotd/main.go` -- both dial the
+/// daemon's SDP control socket and print `daemon.list`/`daemon.
+/// listProjects`'s raw registry rows, no MCP/HTTP involved). Inherits the
+/// caller's environment unmodified, so `SNAPSHOTD_HOME` (relocating which
+/// daemon's control socket the CLI dials, per `config.Default`'s own doc
+/// comment) flows through exactly as a test or production launch already
+/// has it set -- this function never touches `SNAPSHOTD_HOME` itself.
+fn run_snapshotd_subcommand(bin: &Path, subcommand: &str) -> Result<String, String> {
+    let output = std::process::Command::new(bin)
+        .arg(subcommand)
+        .output()
+        .map_err(|error| format!("spawning `snapshotd {subcommand}`: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`snapshotd {subcommand}` exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("`snapshotd {subcommand}` produced non-UTF8 stdout: {error}"))
+}
+
+/// Parses `snapshotd list`'s JSONL stdout (one `registry.ProcessInstance`
+/// per line, PascalCase field names -- see that struct's doc comment for
+/// why: no `json` tags, wire shape deliberately mirrors the Go struct) and
+/// `snapshotd listProjects`'s JSONL stdout (one `registry.Project` per
+/// line) and correlates them into the set of MLT project paths that
+/// currently have a `"ready"` instance. Pure/no I/O -- split out from
+/// [`fetch_daemon_project_instances`] specifically so this correlation
+/// logic is unit-testable without a real daemon.
+fn parse_daemon_list_and_projects(
+    list_jsonl: &str,
+    projects_jsonl: &str,
+) -> Vec<DaemonProjectInstance> {
+    let mut project_paths_by_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in projects_jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let Ok(project) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(id) = project.get("ID").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let root_dir = project
+            .get("RootDir")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let mlt_file_name = project
+            .get("MltFileName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if root_dir.is_empty() || mlt_file_name.is_empty() {
+            continue;
+        }
+        project_paths_by_id.insert(
+            id.to_string(),
+            Path::new(root_dir)
+                .join(mlt_file_name)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    let mut live = Vec::new();
+    for line in list_jsonl.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(instance) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if instance.get("Status").and_then(|v| v.as_str()) != Some("ready") {
+            continue;
+        }
+        let Some(project_id) = instance.get("ProjectID").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(project_path) = project_paths_by_id.get(project_id) else {
+            continue;
+        };
+        let headless = instance
+            .get("Headless")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        live.push(DaemonProjectInstance {
+            project_path: project_path.clone(),
+            headless,
+        });
+    }
+    live
+}
+
+/// One full `snapshotd list` + `snapshotd listProjects` round trip,
+/// returning every project with a currently-live (`"ready"`) instance.
+/// Performs real subprocess spawns and (inside the CLI) a real Unix
+/// socket dial -- **never call this from the UI thread or a tokio
+/// worker**; the only production caller is `Effect::
+/// RefreshDaemonProjectInstances`'s background `std::thread::spawn`
+/// (`effect_executor.rs`), matching the project-isolation plan's PISO-8
+/// data-path discipline note.
+pub fn fetch_daemon_project_instances() -> Result<Vec<DaemonProjectInstance>, String> {
+    let bin = resolve_snapshotd_bin();
+    let list_jsonl = run_snapshotd_subcommand(&bin, "list")?;
+    let projects_jsonl = run_snapshotd_subcommand(&bin, "listProjects")?;
+    Ok(parse_daemon_list_and_projects(&list_jsonl, &projects_jsonl))
+}
+
 /// Builds the `mcpServers` array `session/new`/`session/load` now send
 /// (previously always `[]`, see `gateway_actor::thread_actor`'s doc
 /// comments on `Command::OpenSession`/`Command::ResumeSession`) -- one
@@ -1374,12 +1566,22 @@ fn probe_acpx_gateway_for_agent(port: u16, expected_agent: Option<&str>) -> bool
 /// trick this workspace's own `rui-acpx-client`/`acpx-server` test suites
 /// use, reused here so a colliding fixed default port (see
 /// `probe_acpx_gateway`'s doc comment) never blocks startup.
-fn reserve_port(port: u16) -> io::Result<File> {
+///
+/// `pub`, not private, even though `agent_bridge` itself is a private
+/// module: `lib.rs`'s `test_support` re-exports this and
+/// [`reserve_ephemeral_port`] so `tests/*.rs` integration tests
+/// (separate crates from this one, unable to see anything less than
+/// `pub`, and unable to re-export anything less than `pub` even through
+/// a `pub use`) can share this exact implementation instead of each
+/// keeping their own unsynchronized copy of the same reserve-a-port
+/// trick -- see `test_support`'s own doc comment for the full history.
+pub fn reserve_port(port: u16) -> io::Result<File> {
     let path = std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock"));
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-fn reserve_ephemeral_port() -> Option<(u16, File)> {
+/// See [`reserve_port`]'s doc comment for why this is `pub`.
+pub fn reserve_ephemeral_port() -> Option<(u16, File)> {
     for _ in 0..32 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let port = listener.local_addr().ok()?.port();
@@ -1566,6 +1768,21 @@ fn spawn_gateway_process(
         .env("ACPX_STARTUP_SESSION_RECOVERY_ENABLED", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
+    // PISO-11: "codex installed but not detected" -- acpx-core's detect()
+    // (agents/list) resolves an npx-distributed agent's status purely from
+    // `which("node")`/`which("npm")` on PATH, and Command::new(...).env(...)
+    // (no env_clear()) makes this spawned acpx-server inherit THIS process's
+    // own PATH -- i.e. whatever snapflow itself launched with. A terminal
+    // launch sources shell rc files (nvm's PATH export lives there); a
+    // desktop-launcher/dock-icon launch does not, so node/npm installed via
+    // nvm are genuinely on PATH for the user and genuinely absent from this
+    // spawned gateway's environment, and detect() reports RuntimeMissing
+    // for an agent that is, in fact, installed. Augmenting PATH here with a
+    // real login shell's resolved PATH (once per process, cached) closes
+    // that gap without needing the operator to launch from a terminal.
+    if let Some(path) = augmented_gateway_path() {
+        cmd.env("PATH", path);
+    }
     // Gateway stderr goes to a per-provider log file in the cache dir,
     // NOT /dev/null: acpx-server's tracing output AND every backend
     // adapter's inherited stderr flow through it (acpx-conductor spawns
@@ -1838,6 +2055,98 @@ const DAEMON_ADMIN_URL: &str = "http://127.0.0.1:8791";
 static SELF_SPAWNED_ADMIN_CREDS: std::sync::OnceLock<Mutex<HashMap<String, (String, String)>>> =
     std::sync::OnceLock::new();
 
+/// This process's PATH, augmented with whatever a real login shell resolves
+/// PATH to -- see the PISO-11 comment at its call site in
+/// `spawn_gateway_process` for why this exists. Computed once per process
+/// (a login shell spawn is real subprocess overhead, not something to pay
+/// on every gateway launch) and cached, including the "nothing extra to
+/// add" case so a broken `$SHELL` doesn't retry on every call.
+///
+/// Windows is deliberately excluded: PATH there is a per-user/per-machine
+/// environment value set outside any shell-rc-file mechanism, so it is
+/// already inherited correctly regardless of how snapflow was launched --
+/// this specific gap does not exist on that platform.
+#[cfg(unix)]
+fn augmented_gateway_path() -> Option<String> {
+    static AUGMENTED_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    AUGMENTED_PATH
+        .get_or_init(|| {
+            let current = std::env::var("PATH").unwrap_or_default();
+            merge_path_entries(&current, login_shell_path_entries())
+        })
+        .clone()
+}
+
+/// Pure merge: current PATH's own entries first (so an operator's explicit
+/// PATH always wins on conflicting binaries), then whatever `extra` entries
+/// (from a login shell) aren't already present, in order, deduped. `None`
+/// only when there is nothing at all to set PATH to. Split out from
+/// `augmented_gateway_path` so the merge/dedup/ordering logic is testable
+/// without a real subprocess or the process-global OnceLock cache.
+fn merge_path_entries(current: &str, extra: Vec<String>) -> Option<String> {
+    // split_paths("") yields one empty PathBuf rather than zero entries --
+    // filtered out so an unset/empty current PATH doesn't leave a stray
+    // leading ":" in the merged result or a spurious Some("").
+    let mut entries: Vec<String> = std::env::split_paths(current)
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let existing: std::collections::HashSet<String> = entries.iter().cloned().collect();
+    for entry in extra {
+        if !existing.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(":"))
+    }
+}
+
+/// Resolves PATH the same way an interactive login shell would (sourcing
+/// `.bashrc`/`.zshrc`/`.profile`/etc, where nvm/uv/etc typically export
+/// their bin dirs) rather than trusting whatever PATH this process itself
+/// happened to inherit. Best-effort: any failure (no `$SHELL`, the shell
+/// exits non-zero, output isn't valid UTF-8) yields an empty list, which
+/// makes `augmented_gateway_path()` a no-op rather than a hard error --
+/// this is a detection-quality improvement, not something a gateway launch
+/// should ever fail over.
+#[cfg(unix)]
+fn login_shell_path_entries() -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+    // `-l` alone (login, non-interactive) sources /etc/profile + the first
+    // of ~/.bash_profile/~/.bash_login/~/.profile -- NOT ~/.bashrc, which
+    // bash only auto-sources for INTERACTIVE shells. Confirmed live on this
+    // box: nvm's PATH export lives only in ~/.bashrc (a very common nvm
+    // install-script default), so `-lc` alone silently found nothing while
+    // a real terminal (which IS interactive) sees it fine. `-lic` sources
+    // both chains, matching what a user's actual terminal actually runs.
+    // stdin is nulled (some rc files probe it) and stderr discarded (an
+    // interactive shell with no real tty logs harmless "no job control"/
+    // "cannot set terminal process group" warnings there that must not be
+    // mistaken for PATH output, which is stdout-only via printf below).
+    let output = std::process::Command::new(&shell)
+        .arg("-lic")
+        .arg("printf '%s' \"$PATH\"")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout)
+            .map(|s| s.split(':').map(str::to_owned).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Windows has no equivalent shell-rc-file PATH gap (see
+/// `augmented_gateway_path`'s doc comment) -- always a no-op there.
+#[cfg(not(unix))]
+fn augmented_gateway_path() -> Option<String> {
+    None
+}
+
 fn self_spawned_admin_creds() -> &'static Mutex<HashMap<String, (String, String)>> {
     SELF_SPAWNED_ADMIN_CREDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -1897,18 +2206,55 @@ fn now_token() -> String {
     format!("unix:{secs}")
 }
 
-/// The `cwd` argument ACP's `session/new` wants. `chat_sessions_project_path`
-/// phase: prefers the active MLT project's path (see
-/// `AgentBridge::set_active_project_path`) when one is known, since that's
-/// the directory a skill/session should actually be scoped to; falls back
-/// to the process's own working directory (with `.` as a last resort) when
-/// no project is open, matching this function's pre-existing behavior.
-fn cwd_for_session(session_cwd_override: &Mutex<Option<PathBuf>>) -> PathBuf {
-    session_cwd_override
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+/// The `cwd` argument ACP's `session/new` wants. `project_isolation_mlt_
+/// binding` phase (PISO-4): prefers the attaching THREAD's own
+/// `ThreadSlot::project_path` -- captured once when that slot was created
+/// or restored -- over the process-global `session_cwd_override`. The
+/// global only ever reflects whichever MLT project happens to be active
+/// RIGHT NOW; using it here was the isolation leak this phase closes,
+/// since attaching thread A after the user has switched to project B would
+/// hand acpx B's directory for an A-scoped session. Falls back to the
+/// global override only when the slot itself carries no project (a thread
+/// created/attached with nothing open at the time), and to the process's
+/// own working directory (`.` as a last resort) only when neither is
+/// known -- matching this function's pre-existing behavior for that case.
+fn cwd_for_session(
+    thread_project_path: Option<&std::path::Path>,
+    session_cwd_override: &Mutex<Option<PathBuf>>,
+) -> PathBuf {
+    thread_project_path
+        .map(PathBuf::from)
+        .or_else(|| {
+            session_cwd_override
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// The project directory a THREAD's own MCP servers and skills-sync must
+/// be scoped to (PISO-4 extension): `snapflowd_mcp_servers_entry`'s
+/// `--project-dir` argument and the reactive skills sync both need this,
+/// and must agree with each other and with `cwd_for_session` above on
+/// which project a given thread belongs to -- so this is the one place
+/// that resolves it, rather than three independent reads of the global
+/// that could each observe a different value if the active project
+/// changes mid-flight. Same slot-first, then-global fallback as
+/// `cwd_for_session`, but deliberately stops there: no `current_dir()`
+/// last resort, since an MCP server or skills sync must never be rooted
+/// at wherever panel-rust happened to launch from just because no project
+/// is known -- `None` means global scope, not a directory guess.
+fn thread_project_dir(
+    thread_project_path: Option<&std::path::Path>,
+    session_cwd_override: &Mutex<Option<PathBuf>>,
+) -> Option<PathBuf> {
+    thread_project_path.map(PathBuf::from).or_else(|| {
+        session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    })
 }
 
 fn replay_matches_cached_position(
@@ -2061,13 +2407,23 @@ fn spawn_background_attachment(
     // timeouts. This function itself is a plain sync fn, so the blocking
     // call here is no different from provision_gateway's own pre-existing
     // synchronous network probes at construction time.
-    let mcp_servers = snapflowd_mcp_servers_entry(
-        session_cwd_override
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_deref(),
-        &slot.provider,
-    );
+    // Shared by both uses below (`snapflowd_mcp_servers_entry` and the
+    // skills reactive-sync) since they must agree with each other and
+    // with the session's own `cwd` (fixed further down) on which project
+    // this thread is scoped to; reading the global independently at each
+    // site risked three different answers for one thread (PISO-4). See
+    // `thread_project_dir`'s own doc comment for the fallback shape.
+    let slot_project_path = slot.project_path_snapshot();
+    let thread_project_dir = thread_project_dir(slot_project_path.as_deref(), &session_cwd_override);
+    // `snapflowd_mcp_servers_entry` turns `thread_project_dir` into the
+    // skills MCP server's `--project-dir <parent of the project file>`
+    // argument (see `snapflowd_mcp_servers_entry_adds_project_dir_from_
+    // the_open_project_files_parent`) -- reading the process-global here
+    // instead would hand this thread's MCP tools a different project's
+    // directory than the `cwd` it now correctly attaches with, which is
+    // the half of this leak that actually lets an agent read/write the
+    // wrong project's files.
+    let mcp_servers = snapflowd_mcp_servers_entry(thread_project_dir.as_deref(), &slot.provider);
 
     // Reactive-sync trigger (2) (memory/acpx/gen/plans/acpx-skills/
     // README.md#reactive-sync): before/at session setup, make sure this
@@ -2087,10 +2443,7 @@ fn spawn_background_attachment(
     // remains the real delivery path regardless of this sync's timing, so
     // it stays a best-effort background thread as before.
     let vendor_id_for_sync = slot.provider.clone();
-    let project_root_for_sync = session_cwd_override
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let project_root_for_sync = thread_project_dir;
     if crate::skills_manager_adapter::is_live_verified(&vendor_id_for_sync) {
         if let Err(error) = crate::skills_manager_adapter::sync_agent_targets(
             &vendor_id_for_sync,
@@ -2117,7 +2470,13 @@ fn spawn_background_attachment(
 
     runtime.spawn(async move {
         let attachment_guard = attachment_gate.lock().await;
-        let cwd = cwd_for_session(&session_cwd_override);
+        // Re-snapshotted here rather than reusing `slot_project_path`
+        // above -- this runs later, on a worker thread, after whatever
+        // delay `attachment_gate` imposes, so re-reading picks up a
+        // PISO-7 rebind that landed in that window instead of attaching
+        // with an already-stale path.
+        let slot_project_path = slot.project_path_snapshot();
+        let cwd = cwd_for_session(slot_project_path.as_deref(), &session_cwd_override);
         let result = if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
@@ -2464,9 +2823,18 @@ impl AgentBridge {
                 attachment_ready: tokio::sync::Notify::new(),
                 closed: Mutex::new(false),
                 archived: Mutex::new(runtime_snapshot.archived),
-                // No project can be active yet at construction time --
-                // `session_cwd_override` was just created above, unset.
-                project_path: None,
+                // PISO-3: hydrate from the durable per-thread association
+                // (`ThreadSpec::project_path`, sourced from `ThreadRecord`
+                // via lib.rs's cold-start restore) rather than always
+                // starting `None` here. `session_cwd_override` (the
+                // process-global "whatever project is active now" value)
+                // was just created above, unset either way -- this must
+                // NOT read from it, since that is exactly the leak PISO-3
+                // exists to close: a restored thread's binding is what it
+                // was persisted with, not whatever happens to be open at
+                // this restart. `None` for a freshly-seeded default thread
+                // or a legacy pre-migration record, same as before.
+                project_path: Mutex::new(spec.project_path.as_deref().map(PathBuf::from)),
                 deferred: false,
             });
             slots.push(slot.clone());
@@ -2525,6 +2893,52 @@ impl AgentBridge {
             .session_cwd_override
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = path;
+    }
+
+    /// PISO-7 (project-isolation-mlt-binding plan): the live half of a
+    /// Save-As rebind. `state_store::PanelStateStore::rename_project_path`
+    /// rewrites `thread_settings.project_path` durably, but that alone
+    /// only takes effect on the NEXT restart -- `retain_items_for_project`
+    /// (the visible-list scoping) reads `thread_project_path`, which reads
+    /// each `ThreadSlot`'s own in-memory `project_path`, not sqlite. Without
+    /// this, a user who does Save-As mid-session would watch their entire
+    /// pre-save chat history vanish from the sidebar until they restart
+    /// the panel -- a fix that only works after a restart is not a fix
+    /// for that bug.
+    ///
+    /// Updates every slot whose current `project_path` equals `old` to
+    /// `new`; every other slot (a different project, or none at all) is
+    /// untouched. Deliberately called ONLY from the effect handling
+    /// `HostMsg::ProjectPathRenamed` (an explicit host-driven rename
+    /// signal), never from a bare active-project-path change -- "Save-As
+    /// A->B" and "close A, open B" are indistinguishable from an old/new
+    /// path pair alone, and rebinding on the latter would merge two
+    /// genuinely different projects' thread histories. Callers must also
+    /// never pass an empty `old`: an untitled/never-saved project's
+    /// threads are unscoped (`project_path: None`), not associated with
+    /// `Some("")`, so an empty `old` would (correctly) match nothing here
+    /// -- but see `update_host`'s `ProjectPathRenamed` handler, which
+    /// guards this earlier and more explicitly, treating "first save of
+    /// an untitled project" as NOT a rename at all.
+    ///
+    /// Synchronous and in-memory only (no I/O) -- called directly from the
+    /// effect executor on the UI thread, not spawned, so the very next
+    /// poll tick already reflects the rebind.
+    pub fn rebind_project_path(&self, old: &str, new: &str) {
+        if old.is_empty() {
+            return;
+        }
+        let old_path = std::path::Path::new(old);
+        let new_path = PathBuf::from(new);
+        for slot in &self.slots {
+            let mut guard = slot
+                .project_path
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if guard.as_deref() == Some(old_path) {
+                *guard = Some(new_path.clone());
+            }
+        }
     }
 
     /// Adds one open thread using the already-provisioned provider gateway.
@@ -2679,7 +3093,7 @@ impl AgentBridge {
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             archived: Mutex::new(runtime_snapshot.archived),
-            project_path: project_path_for_slot,
+            project_path: Mutex::new(project_path_for_slot),
             deferred,
         });
         Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
@@ -2989,18 +3403,19 @@ impl AgentBridge {
             attachment_ready: tokio::sync::Notify::new(),
             closed: Mutex::new(false),
             archived: Mutex::new(false),
-            project_path: project_path_for_slot,
+            project_path: Mutex::new(project_path_for_slot),
             deferred: false,
         });
 
-        let cwd = cwd_for_session(&self.session_cwd_override);
-        let mcp_servers = snapflowd_mcp_servers_entry(
-            self.session_cwd_override
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_deref(),
-            provider,
-        );
+        // `slot.project_path` (not `self.session_cwd_override` directly) so
+        // this cwd -- and the MCP `--project-dir` below -- can never
+        // disagree with what was just recorded on the slot a few lines
+        // above (PISO-4): both trace back to the same `project_path_for_
+        // slot` snapshot taken before construction, not an independent
+        // re-read of the global that could have moved since.
+        let slot_project_path = slot.project_path_snapshot();
+        let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
+        let mcp_servers = snapflowd_mcp_servers_entry(slot_project_path.as_deref(), provider);
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
@@ -3138,12 +3553,20 @@ impl AgentBridge {
     /// `thread_item_project_context` phase: the project directory this
     /// thread's session was opened against (see `ThreadSlot::project_path`'s
     /// doc comment) -- `None` when no project was active at creation time,
-    /// distinct from `Some("")`, which never occurs here.
+    /// distinct from `Some("")`, which never occurs here. The FFI boundary
+    /// (`panel_rust_set_project_path`) already normalizes a closed/empty
+    /// project to `None` before it ever reaches `session_cwd_override`, so
+    /// this should be unreachable in practice -- the `filter` is a second,
+    /// cheap line of defense at PISO-3's own persistence chokepoint (this
+    /// is what both `ThreadRecord`-collecting call sites in
+    /// `external_snapshot.rs` persist verbatim), so an empty string can
+    /// never round-trip into sqlite and be mistaken later for a real
+    /// project a thread is scoped to.
     pub fn thread_project_path(&self, idx: usize) -> Option<String> {
         self.slots.get(idx).and_then(|slot| {
-            slot.project_path
-                .as_ref()
+            slot.project_path_snapshot()
                 .map(|path| path.to_string_lossy().into_owned())
+                .filter(|path| !path.is_empty())
         })
     }
 
@@ -4089,6 +4512,71 @@ mod tests {
     // the full-reducer real-backend tests below.
     use slint::Model as _;
 
+    /// Serializes every test in this module that mutates a process-global
+    /// env var (`RUI_ACP_AGENT_CMD`, `ACPX_CODEX_AUTH_FILE`,
+    /// `SNAPSHOTD_MCP_SSE_ADDR`, etc). These tests used to rely on an
+    /// undocumented assumption baked into their own SAFETY comments --
+    /// "this whole suite already runs under --test-threads=1" -- which
+    /// was never actually enforced anywhere (no `.cargo/config.toml`
+    /// setting, no harness flag), just a habit of how this crate's CI
+    /// happened to invoke `cargo test`. Once real-process port
+    /// contention was fixed (`spawn_acpx_server_with_retry`'s own doc
+    /// comment) and the suite started actually being run at default
+    /// parallelism, two of these tests (the `snapshotd_mcp_server_entry_*`
+    /// pair, which both mutate `SNAPSHOTD_MCP_SSE_ADDR`) began failing
+    /// nondeterministically -- one test's `set_var` landing between the
+    /// other's `set_var` and its own read, or its `remove_var` firing
+    /// mid-assertion -- a real data race on `std::env`, not a port issue.
+    /// Every env-mutating test below now acquires this lock before
+    /// touching the environment and holds it until the prior value has
+    /// been restored, so at most one such test's mutation is ever live at
+    /// a time, regardless of test-runner parallelism.
+    static ENV_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+    // PISO-11: "codex installed but not detected" -- see
+    // merge_path_entries's own doc comment for why this is split out as a
+    // pure function. These tests exercise only the merge/dedup/ordering
+    // logic; they never touch the real process env or spawn a shell.
+    #[test]
+    fn merge_path_entries_appends_new_login_shell_dirs() {
+        let merged = merge_path_entries(
+            "/usr/bin:/bin",
+            vec!["/home/u/.nvm/versions/node/v20/bin".to_owned()],
+        );
+        assert_eq!(
+            merged,
+            Some("/usr/bin:/bin:/home/u/.nvm/versions/node/v20/bin".to_owned())
+        );
+    }
+
+    #[test]
+    fn merge_path_entries_dedupes_already_present_dirs() {
+        let merged = merge_path_entries("/usr/bin:/bin", vec!["/usr/bin".to_owned()]);
+        assert_eq!(merged, Some("/usr/bin:/bin".to_owned()));
+    }
+
+    #[test]
+    fn merge_path_entries_current_dirs_come_first() {
+        // An operator's own explicit PATH must win on conflicting binaries
+        // -- login-shell-resolved dirs are strictly additive, never
+        // reordered ahead of what the process already had.
+        let merged = merge_path_entries("/opt/custom/bin", vec!["/usr/bin".to_owned()]);
+        assert_eq!(merged, Some("/opt/custom/bin:/usr/bin".to_owned()));
+    }
+
+    #[test]
+    fn merge_path_entries_empty_current_and_extra_yields_none() {
+        assert_eq!(merge_path_entries("", Vec::new()), None);
+    }
+
+    #[test]
+    fn merge_path_entries_empty_current_still_uses_extra() {
+        assert_eq!(
+            merge_path_entries("", vec!["/usr/bin".to_owned()]),
+            Some("/usr/bin".to_owned())
+        );
+    }
+
     fn exited_buffer() -> TerminalBuffer {
         TerminalBuffer {
             output: "done".to_owned(),
@@ -4109,6 +4597,206 @@ mod tests {
             args: Vec::new(),
             started_at: "2026-07-24T00:00:00.000000000Z".to_owned(),
         }
+    }
+
+    /// PISO-4: two threads whose slots carry different `project_path`s
+    /// must each resolve their OWN project directory from
+    /// `cwd_for_session`, and a later change to the process-global
+    /// `session_cwd_override` (whatever project the user has since
+    /// switched to) must not retroactively change either answer -- that
+    /// global is only ever a fallback for a slot with no project of its
+    /// own, never an override for one that has one.
+    #[test]
+    fn cwd_for_session_prefers_the_threads_own_slot_over_the_global_override() {
+        let session_cwd_override: Mutex<Option<PathBuf>> =
+            Mutex::new(Some(PathBuf::from("/projects/initial")));
+
+        let thread_a_project = PathBuf::from("/projects/a");
+        let thread_b_project = PathBuf::from("/projects/b");
+
+        assert_eq!(
+            cwd_for_session(Some(thread_a_project.as_path()), &session_cwd_override),
+            thread_a_project
+        );
+        assert_eq!(
+            cwd_for_session(Some(thread_b_project.as_path()), &session_cwd_override),
+            thread_b_project
+        );
+
+        // The user switches the active project after both threads were
+        // already attached -- neither thread's own answer may move.
+        *session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PathBuf::from("/projects/c"));
+
+        assert_eq!(
+            cwd_for_session(Some(thread_a_project.as_path()), &session_cwd_override),
+            thread_a_project
+        );
+        assert_eq!(
+            cwd_for_session(Some(thread_b_project.as_path()), &session_cwd_override),
+            thread_b_project
+        );
+    }
+
+    /// PISO-4: a slot with no project of its own (created/attached with
+    /// nothing open) still falls back to the global `session_cwd_override`
+    /// -- that fallback chain is deliberately preserved, not collapsed
+    /// away by the slot-first change above.
+    #[test]
+    fn cwd_for_session_falls_back_to_the_global_override_when_the_slot_has_none() {
+        let session_cwd_override: Mutex<Option<PathBuf>> =
+            Mutex::new(Some(PathBuf::from("/projects/global")));
+        assert_eq!(
+            cwd_for_session(None, &session_cwd_override),
+            PathBuf::from("/projects/global")
+        );
+    }
+
+    /// PISO-4: with neither the slot nor the global override carrying a
+    /// project, `cwd_for_session` falls back to the process's own working
+    /// directory -- the pre-existing last-resort behavior this phase must
+    /// not disturb.
+    #[test]
+    fn cwd_for_session_falls_back_to_the_process_cwd_when_nothing_is_known() {
+        let session_cwd_override: Mutex<Option<PathBuf>> = Mutex::new(None);
+        let expected =
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        assert_eq!(cwd_for_session(None, &session_cwd_override), expected);
+    }
+
+    /// PISO-4 extension: a thread whose slot is bound to project A must
+    /// get an MCP `--project-dir` pointed at A's parent even while the
+    /// process-global `session_cwd_override` (whatever project is active
+    /// right now) is B -- otherwise the thread's `cwd` would be fixed but
+    /// its MCP tools would still read/write B's files, the half of the
+    /// isolation leak that actually matters. `thread_project_dir` is the
+    /// shared resolver both `snapflowd_mcp_servers_entry` and the skills
+    /// reactive-sync go through; this proves the slot wins over the
+    /// global end to end through that real MCP-entry builder, not just at
+    /// the resolver in isolation.
+    #[test]
+    fn thread_project_dir_feeds_the_threads_own_project_into_the_mcp_project_dir_not_the_globals(
+    ) {
+        let session_cwd_override: Mutex<Option<PathBuf>> =
+            Mutex::new(Some(PathBuf::from("/projects/b/timeline.mlt")));
+        let thread_a_project = PathBuf::from("/projects/a/timeline.mlt");
+
+        let resolved = thread_project_dir(Some(thread_a_project.as_path()), &session_cwd_override);
+        assert_eq!(resolved, Some(thread_a_project));
+
+        let entries = snapflowd_mcp_servers_entry(resolved.as_deref(), "claude");
+        let args = entries[0]["args"].as_array().expect("args is an array");
+        let project_dir_idx = args
+            .iter()
+            .position(|a| a == "--project-dir")
+            .expect("--project-dir must be present when a project is open");
+        assert_eq!(
+            args[project_dir_idx + 1],
+            serde_json::Value::String("/projects/a".to_string()),
+            "--project-dir must be thread A's own project parent, not the global's (B)"
+        );
+    }
+
+    /// PISO-7: the live half of a Save-As rebind. Two threads on
+    /// different projects (plus one unscoped, pre-project thread) --
+    /// renaming A -> B must move only A's thread, leave B's alone, and
+    /// leave the unscoped thread unscoped. Proves the rebind is visible
+    /// through `thread_project_path` immediately, with no restart and no
+    /// sqlite round-trip involved (this constructor uses no cache dir).
+    #[test]
+    fn rebind_project_path_moves_only_the_renamed_projects_threads() {
+        let specs = vec![
+            ThreadSpec {
+                display_name: "on-a".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/a/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "on-b".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: Some("/projects/b/timeline.mlt".to_owned()),
+            },
+            ThreadSpec {
+                display_name: "unscoped".to_owned(),
+                provider: "codex".to_owned(),
+                session_id: None,
+                profile_name: None,
+                project_path: None,
+            },
+        ];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        assert_eq!(
+            bridge.thread_project_path(0).as_deref(),
+            Some("/projects/a/timeline.mlt")
+        );
+        assert_eq!(
+            bridge.thread_project_path(1).as_deref(),
+            Some("/projects/b/timeline.mlt")
+        );
+        assert_eq!(bridge.thread_project_path(2), None);
+
+        bridge.rebind_project_path(
+            "/projects/a/timeline.mlt",
+            "/projects/a-renamed/timeline.mlt",
+        );
+
+        assert_eq!(
+            bridge.thread_project_path(0).as_deref(),
+            Some("/projects/a-renamed/timeline.mlt"),
+            "thread on the renamed project must follow it"
+        );
+        assert_eq!(
+            bridge.thread_project_path(1).as_deref(),
+            Some("/projects/b/timeline.mlt"),
+            "an unrelated project's thread must never move"
+        );
+        assert_eq!(
+            bridge.thread_project_path(2),
+            None,
+            "an unscoped thread must stay unscoped, not get retro-bound"
+        );
+    }
+
+    /// PISO-7: an empty `old` must never be treated as "every unscoped
+    /// thread" -- an untitled project's first save is not a rename.
+    /// `rebind_project_path` itself no-ops on an empty `old` as a second
+    /// line of defense (the primary guard lives in `update_host`'s
+    /// `ProjectPathRenamed` handler, which must never call this at all in
+    /// that case).
+    #[test]
+    fn rebind_project_path_with_an_empty_old_path_touches_no_thread() {
+        let specs = vec![ThreadSpec {
+            display_name: "unscoped".to_owned(),
+            provider: "codex".to_owned(),
+            session_id: None,
+            profile_name: None,
+            project_path: None,
+        }];
+        let bridge = AgentBridge::new_with_thread_specs_and_gateway_resolver_and_cache_dir(
+            &specs,
+            |_provider| Ok("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .expect("bridge construction does not require a reachable gateway");
+
+        bridge.rebind_project_path("", "/projects/untitled-saved-as.mlt");
+
+        assert_eq!(
+            bridge.thread_project_path(0),
+            None,
+            "an unscoped thread must never be retro-bound via an empty `old`"
+        );
     }
 
     #[test]
@@ -4196,10 +4884,10 @@ mod tests {
     #[test]
     fn resolve_backend_agent_command_prefers_explicit_override() {
         // SAFETY (env mutation in a test): guarded by restoring the prior
-        // value unconditionally before returning, and this whole suite
-        // already runs under --test-threads=1 per this crate's own
-        // convention for exactly this reason (see module doc references
-        // elsewhere in this file to real-process serialization).
+        // value unconditionally before returning, and serialized against
+        // every other env-mutating test in this module by
+        // `ENV_MUTATION_LOCK` (see its own doc comment).
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
         unsafe {
@@ -4225,6 +4913,7 @@ mod tests {
     /// to a mock or arbitrary command.
     #[test]
     fn resolve_backend_agent_command_ignores_override_without_test_mode() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
         unsafe {
@@ -4252,6 +4941,7 @@ mod tests {
     /// unless someone deliberately asks for the mock.
     #[test]
     fn resolve_backend_agent_command_ignores_mock_binary_without_explicit_opt_in() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior_override = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_opt_in = std::env::var("RUI_USE_DEV_MOCK_AGENT").ok();
         unsafe {
@@ -4298,6 +4988,7 @@ mod tests {
     /// ACPX_CODEX_AUTH_FILE pointing at a disposable temp file instead.
     #[test]
     fn read_codex_api_key_from_auth_file_reads_the_configured_field() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "rui-codex-auth-test-{}-{}",
             std::process::id(),
@@ -4331,6 +5022,7 @@ mod tests {
     /// bogus empty-string "key".
     #[test]
     fn read_codex_api_key_from_auth_file_is_none_on_any_bad_input() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = std::env::temp_dir().join(format!(
             "rui-codex-auth-missing-{}-{}",
             std::process::id(),
@@ -4379,6 +5071,7 @@ mod tests {
     /// model_provider value.
     #[test]
     fn read_codex_model_provider_from_config_reads_top_level_key_only() {
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "rui-codex-config-test-{}-{}",
             std::process::id(),
@@ -4445,43 +5138,64 @@ mod tests {
         }
     }
 
-    fn free_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        listener.local_addr().expect("local_addr").port()
-    }
-
     /// Spawns a real `acpx-server` child process on a fresh ephemeral
-    /// port, retrying the whole pick-port/spawn/wait-for-connect cycle
+    /// port, retrying the whole reserve-port/spawn/wait-for-connect cycle
     /// (bounded at 5 attempts) if the process never becomes reachable
     /// within one attempt's own shorter window.
     ///
-    /// **Why this exists.** `free_port()`'s own "bind a listener, read
-    /// its port, then immediately drop the listener" trick has an
-    /// unavoidable TOCTOU gap: the port is released back to the OS the
-    /// instant the listener drops, and nothing stops a *different*
-    /// concurrently-running test's own `free_port()` call (this crate's
-    /// real-process tests each spawn their own `acpx-server`, and the
-    /// default `cargo test` runner runs many of them in parallel) from
-    /// claiming the exact same port before this function's own spawned
-    /// process gets to bind it. When that race is lost, `acpx-server`
-    /// fails its own bind and exits immediately, and the previous single-
-    /// shot 100x30ms connect-retry loop just spun for its full ~3s doing
-    /// nothing before every caller of it (this function's predecessor)
-    /// silently proceeded anyway with a `base_url` nothing was listening
-    /// on -- surfacing later as a confusing "gateway request timed out"
-    /// failure in whichever test happened to run at the time, not a
-    /// clear "port collision" signal. **Observed directly**: re-running
-    /// this crate's full `--lib` suite back-to-back under the default
-    /// parallel runner rotates which real-process test fails from run to
-    /// run, while every test passes cleanly under `--test-threads=1` --
-    /// exactly the signature of port contention, not a logic bug in any
-    /// one test (documented in this plan's own Progress Log across two
-    /// prior sessions before this fix).
+    /// **Why this exists.** A bare "bind a listener, read its port, then
+    /// immediately drop the listener" trick has an unavoidable TOCTOU
+    /// gap: the port is released back to the OS the instant the listener
+    /// drops, and nothing stops a *different* concurrently-running test's
+    /// own port pick (this crate's real-process tests each spawn their
+    /// own `acpx-server`, and the default `cargo test` runner runs many
+    /// of them in parallel) from claiming the exact same port before this
+    /// function's own spawned process gets to bind it. The gap is wider
+    /// than a spawn's worth of scheduling jitter, too: `acpx-server`'s
+    /// own startup does a real network fetch of the ACP registry
+    /// *before it even attempts its own bind* (see the deadline comment
+    /// below), which measured up to ~1.6s in this sandbox -- a window
+    /// easily long enough for another test's independent port pick to
+    /// land on the same number while ours is still sitting unbound.
+    /// **Observed directly**: re-running this crate's full `--lib` suite
+    /// back-to-back under the default parallel runner rotated which
+    /// real-process test failed, and how many failed (1, then 11, then 3
+    /// on three consecutive runs of an otherwise-identical tree), while
+    /// every run passed cleanly under `--test-threads=1` -- exactly the
+    /// signature of a port race, not a logic bug in any one test.
+    ///
+    /// The fix is the same reserve-then-bind convention `provision_gateway`
+    /// (this module's production gateway-spawn path, non-test code) already
+    /// uses for its own real `acpx-server` children: [`reserve_ephemeral_port`]
+    /// binds an ephemeral port and, in the same call, atomically
+    /// `create_new`s a `rui-acpx-port-<port>.lock` file in the shared
+    /// system temp dir (visible to and honored by every process using this
+    /// convention, including other `cargo test` processes and any other
+    /// worktree's test run on this same host) before dropping its own
+    /// listener -- so a second concurrent reservation for the same port
+    /// number fails outright instead of silently colliding. The lock is
+    /// held for this whole function's reachability-polling window (not
+    /// just through the `spawn()` call), because that ~1.6s registry-fetch
+    /// gap above is exactly the period another reservation could otherwise
+    /// slip in before this attempt's `acpx-server` has actually bound the
+    /// port; only once this attempt is done with the port (reachable, or
+    /// given up on) is the lock file removed so someone else can reuse the
+    /// number.
     fn spawn_acpx_server_with_retry(
         configure: impl Fn(&mut std::process::Command, u16),
     ) -> (std::process::Child, String) {
         for attempt in 0..5 {
-            let port = free_port();
+            let Some((port, lock)) = reserve_ephemeral_port() else {
+                // Only fails if 32 straight ephemeral-port binds all lost
+                // the reserve-file race or the bind itself failed -- rare
+                // enough that a short backoff-and-retry (same shape as the
+                // "server never got reachable" branch below) is the right
+                // response, not a hard panic on this attempt alone.
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+                }
+                continue;
+            };
             let mut command = std::process::Command::new(acpx_server_bin());
             configure(&mut command, port);
             command
@@ -4502,6 +5216,9 @@ mod tests {
             // 1.5s to fail-and-fall-back in this sandbox's network
             // conditions (measured ~1.6s directly). 3s gives real headroom
             // without materially slowing down the common fast-startup case.
+            // `lock` (from `reserve_ephemeral_port` above) is held for
+            // this entire window -- see this function's own doc comment
+            // for why releasing it any earlier would reopen the race.
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
             let mut reachable = false;
             while std::time::Instant::now() < deadline {
@@ -4523,6 +5240,17 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
+            // This attempt is done with `port` either way -- release the
+            // reservation now so a retry (this loop's own next iteration,
+            // or an unrelated concurrently-running test) can claim it.
+            // Once `acpx-server` has actually bound it (the `reachable`
+            // case), the OS itself refuses any other bind for as long as
+            // the child lives, so the advisory lock file has no further
+            // job to do.
+            drop(lock);
+            let _ = std::fs::remove_file(
+                std::env::temp_dir().join(format!("rui-acpx-port-{port}.lock")),
+            );
             if reachable {
                 return (child, format!("http://127.0.0.1:{port}"));
             }
@@ -5620,9 +6348,11 @@ mod tests {
         // isolated env) no shared token file at the derived SNAPSHOTD_HOME,
         // resolve_admin_creds must return None and set_agent_enabled must
         // degrade to `false`, never panic.
-        // SAFETY: guarded by restoring prior values unconditionally, same
-        // convention as this file's other env-mutating tests -- serialized
-        // by this crate's own `--test-threads=1` convention.
+        // SAFETY: guarded by restoring prior values unconditionally, and
+        // serialized against every other env-mutating test in this module
+        // by `ENV_MUTATION_LOCK` (see its own doc comment) -- not a
+        // `--test-threads=1` convention, which was never actually enforced.
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior_home = std::env::var("SNAPSHOTD_HOME").ok();
         let empty_home = tempfile::tempdir().expect("tempdir");
         std::env::set_var("SNAPSHOTD_HOME", empty_home.path());
@@ -6961,29 +7691,21 @@ done
         )
         .expect("write stand-in backend script");
 
-        let port = free_port();
-        let mut command = std::process::Command::new(acpx_server_bin());
-        command
-            .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
-            .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
-            .env("RUST_LOG", "error")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let child = command.spawn().expect("spawn real acpx-server binary");
-        let base_url = format!("http://127.0.0.1:{port}");
-        for _ in 0..100 {
-            if std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-                std::time::Duration::from_millis(100),
-            )
-            .is_ok()
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
+        // Was its own bespoke free_port()+spawn+100x30ms-connect-poll
+        // here, with no reservation lock and no retry -- exactly the
+        // unlocked pattern `spawn_acpx_server_with_retry`'s own doc
+        // comment describes replacing, just not actually routed through
+        // it. This test was the single most consistent failure across
+        // repeated default-parallelism runs of the full suite (present in
+        // every one of three observed flaky runs); reusing the shared,
+        // lock-protected helper here closes the same port race for it.
+        let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
+            command
+                .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
+                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
+                .env("RUST_LOG", "error");
+        });
         let gateway = TestGateway { child, base_url };
 
         // Register a profile with allow_terminal_access before either
@@ -7666,6 +8388,14 @@ done
         // doc comment for why "http", not "sse", covers both real
         // adapters), so every provider string must behave identically
         // here.
+        //
+        // Serialized against the sibling test below (and every other
+        // env-mutating test in this module) by `ENV_MUTATION_LOCK` --
+        // both tests mutate this same process-global var, and running
+        // them concurrently was observed to fail nondeterministically
+        // (one test's set_var/remove_var landing mid the other's read)
+        // once the suite actually ran at default parallelism.
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("SNAPSHOTD_MCP_SSE_ADDR", "127.0.0.1:1");
         for provider in ["codex", "claude", ""] {
             assert!(
@@ -7687,6 +8417,9 @@ done
     /// silently return.
     #[test]
     fn snapshotd_mcp_server_entry_points_at_the_streamable_http_endpoint_not_sse() {
+        // See the sibling test above for why this is guarded by
+        // `ENV_MUTATION_LOCK` -- both mutate `SNAPSHOTD_MCP_SSE_ADDR`.
+        let _env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind a real loopback listener");
         let addr = listener.local_addr().expect("local_addr");
@@ -7710,6 +8443,62 @@ done
             serde_json::Value::String(format!("http://{addr}/mcp")),
             "must point at the Streamable HTTP endpoint (/mcp), not the legacy SSE one (/sse) -- \
              codex-acp's real MCP client requires this exact shape, confirmed live"
+        );
+    }
+
+    /// PISO-8 (project-isolation-mlt-binding plan): the JSONL shapes below
+    /// are literal `registry.ProcessInstance`/`registry.Project` output as
+    /// produced by `cmdList`/`cmdListProjects` (`snapshotd/cmd/snapshotd/
+    /// main.go`) -- PascalCase, no `json` tags. Only a `"ready"` instance
+    /// whose `ProjectID` resolves through the projects list counts as
+    /// live; a `"closed"` instance and an instance whose project never
+    /// appears in the projects list are both excluded, not defaulted to
+    /// some guessed path.
+    #[test]
+    fn parse_daemon_list_and_projects_joins_ready_instances_to_their_project_path() {
+        let list_jsonl = concat!(
+            r#"{"ID":"inst-a","ProjectID":"proj-a","PID":111,"SocketPath":"/tmp/a.sock","Status":"ready","Headless":true}"#,
+            "\n",
+            r#"{"ID":"inst-b","ProjectID":"proj-b","PID":222,"SocketPath":"/tmp/b.sock","Status":"closed","Headless":false}"#,
+            "\n",
+            r#"{"ID":"inst-c","ProjectID":"proj-unknown","PID":333,"SocketPath":"/tmp/c.sock","Status":"ready","Headless":true}"#,
+        );
+        let projects_jsonl = concat!(
+            r#"{"ID":"proj-a","RootDir":"/home/user/projects/alpha","MltFileName":"project.mlt","Status":"active"}"#,
+            "\n",
+            r#"{"ID":"proj-b","RootDir":"/home/user/projects/beta","MltFileName":"project.mlt","Status":"active"}"#,
+        );
+        let live = parse_daemon_list_and_projects(list_jsonl, projects_jsonl);
+        assert_eq!(
+            live,
+            vec![DaemonProjectInstance {
+                project_path: "/home/user/projects/alpha/project.mlt".to_string(),
+                headless: true,
+            }],
+            "only the ready instance whose ProjectID resolves through the projects list \
+             may appear -- the closed instance and the instance with an unknown project \
+             must both be dropped, not guessed at"
+        );
+    }
+
+    #[test]
+    fn parse_daemon_list_and_projects_returns_empty_for_empty_or_malformed_input() {
+        assert!(parse_daemon_list_and_projects("", "").is_empty());
+        assert!(parse_daemon_list_and_projects("not json\n", "also not json\n").is_empty());
+    }
+
+    #[test]
+    fn parse_daemon_list_and_projects_threads_the_headless_flag_through() {
+        let list_jsonl =
+            r#"{"ID":"inst-a","ProjectID":"proj-a","Status":"ready","Headless":false}"#;
+        let projects_jsonl =
+            r#"{"ID":"proj-a","RootDir":"/p","MltFileName":"project.mlt"}"#;
+        let live = parse_daemon_list_and_projects(list_jsonl, projects_jsonl);
+        assert_eq!(live.len(), 1);
+        assert!(
+            !live[0].headless,
+            "a project the user has open headful (PISO-9's headful-wins reuse) must not be \
+             misreported as headless"
         );
     }
 }

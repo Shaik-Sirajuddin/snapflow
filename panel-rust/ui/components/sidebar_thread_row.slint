@@ -264,6 +264,26 @@ export component SidebarThreadRow inherits HoverSurface {
                     // of a "logo" image, matching the
                     // established text-label-for-missing-icon
                     // precedent from active_pane_and_editor_view.
+                    // PISO-8 (project-isolation-mlt-binding plan): a small
+                    // live-instance dot, shown ONLY alongside the badge
+                    // below (never alone) and only when snapshotd
+                    // confirms this thread's recorded project actually
+                    // has a live process instance right now -- not merely
+                    // a stale sqlite-recorded association. Same missing-
+                    // icon precedent as the badge itself: a tiny colored
+                    // dot rather than a dedicated asset, matching the
+                    // busy-status dot above.
+                    if expanded && rename-thread-index != index
+                        && thread.project-path != "" && thread.project-path != active-project-path
+                        && thread.project-instance-live : Rectangle {
+                        width: 6px;
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            background: Theme.text-accent-bright;
+                        }
+                    }
                     if expanded && rename-thread-index != index
                         && thread.project-path != "" && thread.project-path != active-project-path : Text {
                         text: thread.project-name;

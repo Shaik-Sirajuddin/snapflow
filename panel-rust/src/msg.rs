@@ -261,6 +261,19 @@ pub enum HostMsg {
     AppearanceChanged(crate::appearance::AppearanceState),
     ThemeChanged(String),
     ProjectPathChanged(Option<String>),
+    /// PISO-7 (project-isolation-mlt-binding plan): an explicit host
+    /// signal for an MLT Save-As, carrying BOTH the old and new project
+    /// file paths -- deliberately a separate variant from
+    /// `ProjectPathChanged` rather than something inferred from two
+    /// consecutive values of it. `old`/`new` alone cannot distinguish
+    /// "Save-As A -> B" from "close A, open B" (both look like the
+    /// active path changing from A to B), and treating them alike would
+    /// rebind B's own pre-existing threads onto A's history -- merging
+    /// two real projects. Only the host genuinely knows which happened,
+    /// so it must say so explicitly. `old` empty means "this project was
+    /// untitled and is being saved for the first time", which is NOT a
+    /// rename (see `update_host`'s handler).
+    ProjectPathRenamed { old: String, new: String },
     /// Cold-start hydration trigger -- see 00-plan.md Phase 0. Carries
     /// whatever `panel_rust_create` already has in hand *before* any
     /// `Effect` runs (window size, requested defaults); the actual
@@ -291,6 +304,14 @@ pub struct FrameInput {
     pub settings_preferences_snapshot: Option<SettingsPreferencesSnapshot>,
     pub settings_gateway_snapshot: Option<SettingsGatewaySnapshot>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
+    /// PISO-8 (project-isolation-mlt-binding plan): true at most once
+    /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors
+    /// `skills_rescan_due`'s thread-local-timer pattern), signaling
+    /// `update_frame` to queue `Effect::RefreshDaemonProjectInstances`.
+    /// Computing the throttle here (cheap, no I/O) rather than doing the
+    /// real subprocess-backed poll itself on the frame-collection path
+    /// keeps that path non-blocking, per the plan's data-path discipline.
+    pub daemon_projects_refresh_due: bool,
 }
 
 /// Read-only bridge/store data for the sidebar. The adapter owns collection;
@@ -305,6 +326,19 @@ pub struct ThreadListSnapshot {
     /// hydration for `ThreadModel::archived`, which the sidebar counters
     /// and the archive pool cap read. Empty = no data (tests).
     pub archived_flags: Vec<bool>,
+    /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
+    /// path` this snapshot's `visible_indices`/`rows` were filtered
+    /// against (`ExternalSnapshotSource::collect_thread_list_snapshot`
+    /// tags it with the exact value `retain_items_for_project` used, not
+    /// a fresh re-read). `update_frame`'s stale-snapshot guard compares
+    /// this against `Model::active_project_path` at APPLY time and drops
+    /// the whole list-shape update on a mismatch -- a snapshot collected
+    /// for a project the user has since switched away from must never
+    /// overwrite the (by-then-already-updated) visible list, even though
+    /// today's single-threaded synchronous poll loop makes that window
+    /// vanishingly unlikely to hit in practice; this makes the guarantee
+    /// explicit and independent of that timing accident.
+    pub active_project_path: Option<String>,
 }
 
 /// Read-only settings data collected from the selected gateway for one

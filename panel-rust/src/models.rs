@@ -1062,6 +1062,7 @@ pub fn build_thread_items<N: AsRef<str>>(
                 // as provider/model above.
                 project_path: String::new().into(),
                 project_name: String::new().into(),
+                project_instance_live: false,
                 profile_name: String::new().into(),
                 has_session: false,
             },
@@ -1091,6 +1092,51 @@ pub fn retain_items_for_project(
             .unwrap_or("");
         recorded.is_empty() || recorded == active
     });
+}
+
+/// PISO-5 (project-isolation-mlt-binding plan): the project path to show on
+/// a thread row's project indicator/chip -- STRICTLY the thread's own
+/// recorded association (`ThreadRecord::project_path`, hydrated durably as
+/// of PISO-3), never a guess. `""` when the thread has none, meaning the
+/// indicator stays dark.
+///
+/// This retires the former "no recorded path -> show whatever project is
+/// ACTIVE right now" fallback. That fallback was added (phase 16/26) back
+/// when a restored thread's recorded path was always empty regardless of
+/// its real history -- borrowing the active project was the only way to
+/// light the indicator at all. PISO-3 fixed the underlying data (restored
+/// threads now carry their real recorded path), which makes the fallback
+/// actively wrong instead of merely redundant: it would relabel an
+/// intentionally-unscoped thread with whatever project a user happens to
+/// have open, the exact "guess the association" pattern this whole plan
+/// exists to delete (see `retain_items_for_project`'s doc comment -- an
+/// empty recorded path already means "visible/neutral everywhere", not
+/// "assume the active project").
+pub fn display_project_path(recorded: Option<&str>) -> String {
+    recorded.filter(|path| !path.is_empty()).unwrap_or("").to_owned()
+}
+
+/// PISO-8 (project-isolation-mlt-binding plan): true only when
+/// `thread_project_path` (the same value that gates `display_project_
+/// path`'s badge above) is CONFIRMED live right now via snapshotd's
+/// `daemon.list`/`daemon.listProjects` -- an agent-launched, possibly
+/// headless, instance for a project this panel's own host process never
+/// opened -- rather than merely a stale sqlite-recorded association from
+/// a session that has long since closed. Mirrors `display_project_path`'s
+/// own precedent: derives purely from the thread's OWN recorded value,
+/// never a guess, and never lights up for a thread whose project never
+/// changed (empty or equal to the active project).
+pub fn thread_project_instance_is_live(
+    thread_project_path: &str,
+    active_project_path: Option<&str>,
+    live_daemon_projects: &[crate::agent_bridge::DaemonProjectInstance],
+) -> bool {
+    if thread_project_path.is_empty() || Some(thread_project_path) == active_project_path {
+        return false;
+    }
+    live_daemon_projects.iter().any(|instance| {
+        std::path::Path::new(&instance.project_path) == std::path::Path::new(thread_project_path)
+    })
 }
 
 /// The current value of a thread's `"model"` config option, or "" when the
@@ -2431,6 +2477,81 @@ mod transcript_model_tests {
         let mut items = project_items(2);
         retain_items_for_project(&mut items, &paths, Some(""));
         assert_eq!(items.len(), 2);
+    }
+
+    // PISO-5: the indicator must show ONLY a thread's own recorded
+    // project, never a live guess at whatever is currently active.
+    #[test]
+    fn display_project_path_shows_the_threads_own_recorded_project() {
+        assert_eq!(
+            display_project_path(Some("/work/b/project.mlt")),
+            "/work/b/project.mlt"
+        );
+    }
+
+    #[test]
+    fn display_project_path_stays_dark_for_an_unscoped_thread() {
+        // Pre-PISO-5 the caller fell back to whatever project happened to
+        // be active -- this function deliberately takes no such fallback
+        // input at all: an unscoped thread must never appear to belong to
+        // a project it was never actually bound to.
+        assert_eq!(display_project_path(None), "");
+        assert_eq!(display_project_path(Some("")), "");
+    }
+
+    fn daemon_instance(path: &str, headless: bool) -> crate::agent_bridge::DaemonProjectInstance {
+        crate::agent_bridge::DaemonProjectInstance {
+            project_path: path.to_string(),
+            headless,
+        }
+    }
+
+    #[test]
+    fn thread_project_instance_is_live_false_for_an_unscoped_thread() {
+        let live = vec![daemon_instance("/work/b/project.mlt", true)];
+        assert!(!thread_project_instance_is_live(
+            "",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
+    }
+
+    // PISO-8's negative case: a thread whose project never changed (equal
+    // to the panel's own active project) must never show any indicator,
+    // even if that same project happens to also have a live daemon
+    // instance (e.g. the user's own headful instance).
+    #[test]
+    fn thread_project_instance_is_live_false_when_thread_project_equals_active() {
+        let live = vec![daemon_instance("/work/a/project.mlt", false)];
+        assert!(!thread_project_instance_is_live(
+            "/work/a/project.mlt",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
+    }
+
+    #[test]
+    fn thread_project_instance_is_live_false_when_recorded_but_not_actually_live() {
+        // Differs from active (so the existing project-name badge WOULD
+        // show) but snapshotd reports no live instance for it -- a stale
+        // sqlite-recorded association from a session that has since
+        // closed, not something the agent is actually driving right now.
+        let live = vec![daemon_instance("/work/c/project.mlt", true)];
+        assert!(!thread_project_instance_is_live(
+            "/work/b/project.mlt",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
+    }
+
+    #[test]
+    fn thread_project_instance_is_live_true_for_a_confirmed_live_headless_instance() {
+        let live = vec![daemon_instance("/work/b/project.mlt", true)];
+        assert!(thread_project_instance_is_live(
+            "/work/b/project.mlt",
+            Some("/work/a/project.mlt"),
+            &live
+        ));
     }
 
     #[test]

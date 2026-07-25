@@ -42,6 +42,28 @@ pub mod skills_state;
 mod skills_manager_adapter;
 mod state_store;
 mod sync;
+// `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
+// crates from this one, unable to see anything less than `pub` -- can
+// reuse `agent_bridge`'s TOCTOU-safe ephemeral-port reservation instead
+// of each keeping its own unsynchronized `free_port()` copy. Found live
+// (worktree-project-isolation's own test-flakiness investigation,
+// 2026-07-25): `free_port()` was duplicated into five separate
+// `tests/*.rs` e2e harnesses, each with the same bind-then-drop-then-
+// hope-nobody-else-grabs-it gap that `agent_bridge.rs`'s own unit tests
+// used to have before switching onto `reserve_ephemeral_port`'s
+// lock-file convention -- see that function's doc comment for the full
+// root-cause writeup. `agent_bridge` itself stays `mod` (private): only
+// this narrow reservation helper is meant to be public, not its whole
+// internal surface.
+pub mod test_support {
+    pub use crate::agent_bridge::{reserve_ephemeral_port, reserve_port};
+    // PISO-8 (project-isolation-mlt-binding plan): lets a real e2e test
+    // (a separate crate, same `pub`-only visibility rule as above) drive
+    // the actual `snapshotd list`/`listProjects` subprocess round trip
+    // against a real spawned daemon, rather than only exercising the
+    // pure JSONL-parsing helper via `agent_bridge`'s own unit tests.
+    pub use crate::agent_bridge::{fetch_daemon_project_instances, DaemonProjectInstance};
+}
 mod theme;
 mod update;
 
@@ -1360,13 +1382,30 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             })
             .unwrap_or_default();
         // Cold-start seed when panel-state has no prior threads.
-        // RUI_SEED_THREADS:
-        //   unset  -> DEFAULT_THREAD_NAMES (product v1 fixtures)
-        //   "0"    -> single empty "Chat" (dev/VNC: no fake stale-looking titles)
-        //   "1".."N" -> first N of DEFAULT_THREAD_NAMES (capped)
-        // setup-followups stale_threads_not_torn_down_after_testing: VNC
-        // harnesses must set RUI_SEED_THREADS=0 so restarts don't look like
-        // leftover work ("Fix timeline crash" et al.) and only open one session.
+        // PISO-13 (user report, 2026-07-25): "stale 4 threads bundled in
+        // production ... we don't want these at all in production ...
+        // user chooses the threads". Prior to this fix, an UNSET
+        // RUI_SEED_THREADS defaulted to the full DEFAULT_THREAD_NAMES
+        // fixture set on EVERY build, including a real production launch --
+        // there was no signal at all that distinguished "a dev/QA harness
+        // that wants demo content" from "a real user's first launch", so a
+        // production install unconditionally got 4 threads named "Fix
+        // timeline crash" etc. that nobody created and nobody asked for.
+        // The prior comment here already correctly diagnosed the surface
+        // symptom (these look like leftover work on any restore-empty
+        // launch) but the prescribed fix -- "VNC harnesses must set
+        // RUI_SEED_THREADS=0" -- was aspirational and never actually done
+        // anywhere in this repo (grepped: zero scripts set it), so the
+        // fixture set kept shipping to everyone by default regardless.
+        // RUI_SEED_THREADS now:
+        //   unset    -> single empty "Chat" (the real default: no fixture
+        //                content, the user creates their own threads)
+        //   "0"      -> same as unset, kept for any caller that already
+        //                passes it explicitly
+        //   "1".."N" -> first N of DEFAULT_THREAD_NAMES (capped) -- now an
+        //                explicit OPT-IN for dev/QA/demo harnesses that
+        //                genuinely want named fixture content, not
+        //                something a real launch falls into by default.
         let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
@@ -1374,7 +1413,7 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     let n = v.trim().parse::<usize>().unwrap_or(DEFAULT_THREAD_NAMES.len());
                     DEFAULT_THREAD_NAMES.iter().copied().take(n).collect()
                 }
-                Err(_) => DEFAULT_THREAD_NAMES.to_vec(),
+                Err(_) => vec!["Chat"],
             };
             seed_names
                 .into_iter()
@@ -1384,6 +1423,9 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     provider: if idx % 2 == 0 { "codex" } else { "claude" }.to_owned(),
                     session_id: None,
                     profile_name: None,
+                    // Cold-start seed threads: nothing persisted yet, so
+                    // there is no stored association to hydrate from.
+                    project_path: None,
                 })
                 .collect()
         } else {
@@ -1409,6 +1451,13 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
                     profile_name: settings_file::non_default_sentinel(
                         record.profile_name.clone(),
                     ),
+                    // PISO-3: hydrate the durable per-thread project
+                    // association straight from the persisted record, so
+                    // `AgentBridge::new_with_thread_specs` can bind the
+                    // restored slot's `project_path` to what this thread
+                    // was actually created under -- not whatever project
+                    // happens to be active at this restart.
+                    project_path: record.project_path.clone(),
                 })
                 .collect()
         };
@@ -2827,6 +2876,48 @@ pub extern "C" fn panel_rust_set_project_path(
     })
 }
 
+/// PISO-7 (project-isolation-mlt-binding plan) FFI crossing point --
+/// mirrors `panel_rust_set_project_path`'s byte-buffer shape, but takes
+/// TWO strings (old path, then new path) since a rename is a pair, not a
+/// single value. `ChatRustDock` should call this instead of
+/// `panel_rust_set_project_path` specifically for an MLT Save-As (where
+/// Shotcut knows both the path being replaced and its replacement);
+/// every other project-path change (open, close, first save of an
+/// untitled project) keeps going through `panel_rust_set_project_path`
+/// as before. Passing a zero-length `old` buffer is equivalent to "not a
+/// rename" and is a no-op on the Rust side (see `HostMsg::
+/// ProjectPathRenamed`'s doc comment) -- callers with no old path should
+/// call `panel_rust_set_project_path` instead of this function.
+#[no_mangle]
+pub extern "C" fn panel_rust_rename_project_path(
+    _handle: *mut PanelHandle,
+    old_path_ptr: *const c_uchar,
+    old_path_len: usize,
+    new_path_ptr: *const c_uchar,
+    new_path_len: usize,
+) -> bool {
+    let old_path = if old_path_ptr.is_null() || old_path_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(old_path_ptr, old_path_len) };
+        std::str::from_utf8(bytes).unwrap_or_default().to_owned()
+    };
+    let new_path = if new_path_ptr.is_null() || new_path_len == 0 {
+        String::new()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(new_path_ptr, new_path_len) };
+        std::str::from_utf8(bytes).unwrap_or_default().to_owned()
+    };
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        dispatch::dispatch_project_path_renamed(panel, old_path, new_path);
+        true
+    })
+}
+
 /// Applies a generation-ordered host appearance snapshot. The host owns only
 /// selector values; the panel retains its component palette and tokens.
 #[no_mangle]
@@ -3468,6 +3559,7 @@ mod keyboard_shortcut_tests {
             model: "".into(),
             project_name: "".into(),
             project_path: "".into(),
+            project_instance_live: false,
             profile_name: "".into(),
             has_session: false,
             relative_time: "now".into(),

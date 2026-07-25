@@ -141,11 +141,20 @@ def press_return(client, window_handle):
 def prompt_events(event_log: pathlib.Path):
     if not event_log.exists():
         return []
-    return [
-        json.loads(line)
-        for line in event_log.read_text().splitlines()
-        if line.strip()
-    ]
+    events = []
+    for line in event_log.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A concurrent writer can be mid-flush on the last line when
+            # this reads the file -- every caller here already polls in
+            # a loop (wait_for_prompt_texts and friends), so skipping one
+            # still-partial line for one read is harmless; the next poll
+            # sees it complete. Only ever the tail line in practice.
+            continue
+    return events
 
 
 def wait_for_prompt_texts(event_log, expected_texts, timeout=10):

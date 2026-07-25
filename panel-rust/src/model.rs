@@ -148,6 +148,33 @@ pub struct Model {
     pub open_terminal_ids: Vec<String>,
     pub local_terminal_last_text: String,
     pub active_project_path: Option<String>,
+    /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
+    /// path` value the currently-applied thread list (`visible_indices`/
+    /// `thread_rows`) was actually synced against -- distinct from
+    /// `active_project_path` itself, which flips the INSTANT `HostMsg::
+    /// ProjectPathChanged` arrives, one full reducer turn before the next
+    /// poll tick's `ThreadListSnapshot` (collected against the new value)
+    /// can land and get folded in. `update_frame`'s stale-snapshot guard
+    /// compares an incoming snapshot's own tagged `active_project_path`
+    /// against `Model::active_project_path` (drop if they disagree -- an
+    /// in-flight fetch for a project the user has since left); this field
+    /// is compared instead against the snapshot's tag to detect "this
+    /// fold is the first one for a NEW project" so the selection reanchor
+    /// can jump to that project's first thread instead of clamping to
+    /// whatever numeric index the old, unrelated project's selection
+    /// happened to be at (see `update_frame`'s `if let Some(snapshot) =
+    /// frame.thread_list_snapshot` block).
+    pub synced_project_path: Option<String>,
+    /// PISO-8 (project-isolation-mlt-binding plan): every project with a
+    /// currently-live snapshotd instance, as of the last successful
+    /// `Effect::RefreshDaemonProjectInstances` poll (throttled, see
+    /// `FrameInput::daemon_projects_refresh_due`). A failed poll leaves
+    /// this at its previous value rather than clearing it -- see
+    /// `EffectResultMsg::DaemonProjectInstancesLoaded`'s doc comment.
+    /// Read directly (not via a `Dirty`) by `ExternalSnapshotSource::
+    /// collect_thread_list_snapshot`'s next tick, same as `active_
+    /// project_path` itself.
+    pub live_daemon_projects: Vec<crate::agent_bridge::DaemonProjectInstance>,
     pub traced_attachment_threads: HashSet<String>,
     pub appearance: AppearanceState,
     pub theme_variant: String,
@@ -344,12 +371,14 @@ mod tests {
                     provider: "codex".to_owned(),
                     session_id: Some("sess-1".to_owned()),
                     profile_name: None,
+                    project_path: None,
                 },
                 ThreadSpec {
                     display_name: "Refactor filters".to_owned(),
                     provider: "claude".to_owned(),
                     session_id: Some("sess-2".to_owned()),
                     profile_name: Some("default".to_owned()),
+                    project_path: None,
                 },
             ],
             thread_ids: vec!["thread-1".to_owned(), "thread-2".to_owned()],
@@ -381,6 +410,7 @@ mod tests {
                 provider: "codex".to_owned(),
                 session_id: Some("sess-1".to_owned()),
                 profile_name: Some("balanced".to_owned()),
+                project_path: None,
             }],
             thread_ids: vec!["thread-1".to_owned()],
             selected_thread_id: None,

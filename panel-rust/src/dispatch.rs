@@ -1297,6 +1297,16 @@ pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option
     execute_effects(panel, effects);
 }
 
+/// PISO-7: the explicit Save-As rename signal, kept as its own dispatch
+/// function rather than folded into `dispatch_project_path_changed` --
+/// see `HostMsg::ProjectPathRenamed`'s doc comment for why only the host
+/// (never an inferred pair of `ProjectPathChanged` calls) may say "this
+/// was a rename".
+pub(crate) fn dispatch_project_path_renamed(panel: &PanelSingleton, old: String, new: String) {
+    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::ProjectPathRenamed { old, new }));
+    execute_effects(panel, effects);
+}
+
 pub(crate) fn dispatch_theme_changed(panel: &PanelSingleton, theme: String) {
     let _ = update_persistent(panel, Msg::Host(HostMsg::ThemeChanged(theme)));
 }

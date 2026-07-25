@@ -30,6 +30,28 @@ fn skills_rescan_due() -> bool {
     })
 }
 
+/// PISO-8 (project-isolation-mlt-binding plan): throttle for
+/// `Effect::RefreshDaemonProjectInstances` -- same thread-local-timer
+/// mechanism as `skills_rescan_due`, a longer 3s period since this poll
+/// spawns a real subprocess (`snapshotd list`/`listProjects`) rather than
+/// scanning a local directory.
+fn daemon_projects_refresh_due() -> bool {
+    thread_local! {
+        static LAST_DAEMON_PROJECTS_POLL: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST_DAEMON_PROJECTS_POLL.with(|last| {
+        let now = std::time::Instant::now();
+        let due = last
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(3));
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
 pub(crate) struct ExternalSnapshotSource<'a> {
     panel: &'a PanelSingleton,
 }
@@ -116,6 +138,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             // an unchanged scan dirties nothing.
             skills_snapshot: (settings_open && skills_rescan_due())
                 .then(|| self.collect_skills_snapshot()),
+            daemon_projects_refresh_due: daemon_projects_refresh_due(),
         }
     }
 
@@ -391,22 +414,34 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .cloned()
                     .unwrap_or_default()
                     .into();
-                // Phase 26/16: a thread with no recorded session project
-                // path inherits the ACTIVE project for display, so the
-                // top-bar project indicator lights up instead of staying
-                // dark for every pre-project thread (the phase-16 "empty
-                // project fields" defect).
-                let project_path = thread_project_paths
-                    .get(item.real_index)
-                    .filter(|path| !path.is_empty())
-                    .cloned()
-                    .or_else(|| active_project_path.clone())
-                    .unwrap_or_default();
+                // PISO-5 (project-isolation-mlt-binding plan): the row's
+                // project indicator shows ONLY this thread's own recorded
+                // association -- see `models::display_project_path`'s doc
+                // comment for why the former "inherit the active project
+                // when unrecorded" fallback (phase 26/16) was retired
+                // rather than kept now that PISO-3 supplies a real
+                // recorded value for restored threads.
+                let project_path = models::display_project_path(
+                    thread_project_paths.get(item.real_index).map(String::as_str),
+                );
                 row.project_name = std::path::Path::new(&project_path)
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default()
                     .into();
+                // PISO-8 (project-isolation-mlt-binding plan): confirms
+                // the badge above isn't just a stale sqlite-recorded
+                // association -- true only when snapshotd's own
+                // daemon.list/listProjects currently reports a live
+                // ("ready") instance for this exact recorded project, per
+                // `models::thread_project_instance_is_live`'s doc
+                // comment.
+                row.project_instance_live = models::thread_project_instance_is_live(
+                    &project_path,
+                    active_project_path.as_deref(),
+                    &model_snapshot.live_daemon_projects,
+                )
+                .into();
                 row.project_path = project_path.into();
                 if let Some(thread) = model_snapshot.threads.get(item.real_index) {
                     row.profile_name = thread.profile_name.clone().unwrap_or_default().into();
@@ -462,6 +497,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             // for every thread, so restarts hydrate ThreadModel::archived
             // (sidebar counters + archive pool cap read the model).
             archived_flags: archived,
+            // PISO-2: tag with the SAME value `retain_items_for_project`
+            // just filtered against above, not a fresh re-read -- the two
+            // must never disagree about which project this snapshot's
+            // shape reflects.
+            active_project_path,
         }
     }
 
@@ -596,6 +636,12 @@ impl<'a> ExternalSnapshotSource<'a> {
                     profile_name: thread.profile_name.clone(),
                     permission_profile: thread.permission_profile.clone(),
                     background_session: None,
+                    // PISO-3: persist the same project this thread's
+                    // session was actually opened against (see
+                    // `ThreadSlot::project_path`'s doc comment), not the
+                    // currently-active project -- that distinction is the
+                    // whole point of the durable association.
+                    project_path: bridge.thread_project_path(idx),
                 })
             })
             .collect()
@@ -617,6 +663,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             profile_name: thread.profile_name,
             permission_profile: thread.permission_profile,
             background_session: None,
+            project_path: bridge.thread_project_path(real_idx),
         })
     }
 }

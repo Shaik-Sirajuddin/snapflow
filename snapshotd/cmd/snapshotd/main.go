@@ -48,6 +48,8 @@ func main() {
 		err = cmdLaunch(cfg, os.Args[2:])
 	case "list":
 		err = cmdList(cfg, os.Args[2:])
+	case "listProjects":
+		err = cmdListProjects(cfg, os.Args[2:])
 	case "close":
 		err = cmdClose(cfg, os.Args[2:])
 	case "mcp":
@@ -77,6 +79,7 @@ Usage:
   snapshotd stop                         ask a running daemon to shut down gracefully
   snapshotd launch <projectId>           convenience wrapper around daemon.launch
   snapshotd list                         list known process instances (bare daemon.list)
+  snapshotd listProjects                 list known projects (bare daemon.listProjects)
   snapshotd close <instanceId>           stop one running process instance (bare daemon.close)
   snapshotd mcp status                   show the MCP listener's bind address and auth state
   snapshotd mcp restart [--bind ADDR]    rebind the MCP listener (default 127.0.0.1:7777; a
@@ -311,6 +314,29 @@ func cmdList(cfg config.Config, args []string) error {
 	}
 	for _, in := range instances {
 		enc, _ := json.Marshal(in)
+		fmt.Println(string(enc))
+	}
+	return nil
+}
+
+// cmdListProjects mirrors cmdList exactly, for daemon.listProjects instead
+// of daemon.list -- PISO-8: the panel needs both (an instance's ProjectID
+// alone has no display path/name; that lives on the Project row, per
+// registry.Project's RootDir) to show which real project a live instance
+// is actually for.
+func cmdListProjects(cfg config.Config, args []string) error {
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var projects []map[string]any
+	if err := c.Call("daemon.listProjects", map[string]any{}, &projects); err != nil {
+		return fmt.Errorf("daemon.listProjects: %w", err)
+	}
+	for _, p := range projects {
+		enc, _ := json.Marshal(p)
 		fmt.Println(string(enc))
 	}
 	return nil
