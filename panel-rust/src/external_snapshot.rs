@@ -391,17 +391,16 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .cloned()
                     .unwrap_or_default()
                     .into();
-                // Phase 26/16: a thread with no recorded session project
-                // path inherits the ACTIVE project for display, so the
-                // top-bar project indicator lights up instead of staying
-                // dark for every pre-project thread (the phase-16 "empty
-                // project fields" defect).
-                let project_path = thread_project_paths
-                    .get(item.real_index)
-                    .filter(|path| !path.is_empty())
-                    .cloned()
-                    .or_else(|| active_project_path.clone())
-                    .unwrap_or_default();
+                // PISO-5 (project-isolation-mlt-binding plan): the row's
+                // project indicator shows ONLY this thread's own recorded
+                // association -- see `models::display_project_path`'s doc
+                // comment for why the former "inherit the active project
+                // when unrecorded" fallback (phase 26/16) was retired
+                // rather than kept now that PISO-3 supplies a real
+                // recorded value for restored threads.
+                let project_path = models::display_project_path(
+                    thread_project_paths.get(item.real_index).map(String::as_str),
+                );
                 row.project_name = std::path::Path::new(&project_path)
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())

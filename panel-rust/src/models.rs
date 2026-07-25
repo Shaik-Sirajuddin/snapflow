@@ -1093,6 +1093,28 @@ pub fn retain_items_for_project(
     });
 }
 
+/// PISO-5 (project-isolation-mlt-binding plan): the project path to show on
+/// a thread row's project indicator/chip -- STRICTLY the thread's own
+/// recorded association (`ThreadRecord::project_path`, hydrated durably as
+/// of PISO-3), never a guess. `""` when the thread has none, meaning the
+/// indicator stays dark.
+///
+/// This retires the former "no recorded path -> show whatever project is
+/// ACTIVE right now" fallback. That fallback was added (phase 16/26) back
+/// when a restored thread's recorded path was always empty regardless of
+/// its real history -- borrowing the active project was the only way to
+/// light the indicator at all. PISO-3 fixed the underlying data (restored
+/// threads now carry their real recorded path), which makes the fallback
+/// actively wrong instead of merely redundant: it would relabel an
+/// intentionally-unscoped thread with whatever project a user happens to
+/// have open, the exact "guess the association" pattern this whole plan
+/// exists to delete (see `retain_items_for_project`'s doc comment -- an
+/// empty recorded path already means "visible/neutral everywhere", not
+/// "assume the active project").
+pub fn display_project_path(recorded: Option<&str>) -> String {
+    recorded.filter(|path| !path.is_empty()).unwrap_or("").to_owned()
+}
+
 /// The current value of a thread's `"model"` config option, or "" when the
 /// backend advertises no such option (or no current value) -- the sidebar's
 /// Phase 8 model label. Reads the same `configOptions[]` feed the compose
@@ -2431,6 +2453,26 @@ mod transcript_model_tests {
         let mut items = project_items(2);
         retain_items_for_project(&mut items, &paths, Some(""));
         assert_eq!(items.len(), 2);
+    }
+
+    // PISO-5: the indicator must show ONLY a thread's own recorded
+    // project, never a live guess at whatever is currently active.
+    #[test]
+    fn display_project_path_shows_the_threads_own_recorded_project() {
+        assert_eq!(
+            display_project_path(Some("/work/b/project.mlt")),
+            "/work/b/project.mlt"
+        );
+    }
+
+    #[test]
+    fn display_project_path_stays_dark_for_an_unscoped_thread() {
+        // Pre-PISO-5 the caller fell back to whatever project happened to
+        // be active -- this function deliberately takes no such fallback
+        // input at all: an unscoped thread must never appear to belong to
+        // a project it was never actually bound to.
+        assert_eq!(display_project_path(None), "");
+        assert_eq!(display_project_path(Some("")), "");
     }
 
     #[test]
