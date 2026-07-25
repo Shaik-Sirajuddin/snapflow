@@ -1009,91 +1009,21 @@ fn probe_http_endpoint(addr: &str, path: &str) -> bool {
     matches!(stream.read(&mut buf), Ok(n) if n > 0)
 }
 
-/// Resolves the mock backend agent binary the locally-spawned gateway
-/// should proxy to: `RUI_ACP_AGENT_CMD` env override (a real
-/// ACP-compliant agent binary/command) if set, else the dev-checkout
-/// `rui-mock-agent` binary this crate itself builds (`src/bin/
-/// mock_agent.rs`, ported directly from the former `rui-acp-client`
-/// crate's own `[[bin]]` of the same name -- Phase 2, chat-panel-
-/// production-ui/execution-plan.md) *only if `RUI_USE_DEV_MOCK_AGENT=1`
-/// is also set* -- the acpx-gateway's own default backend for dev/test.
-///
-/// Returns `None` (previously always returned a `String`, unconditionally)
-/// when neither applies -- a real production install: no operator has set
-/// `RUI_ACP_AGENT_CMD`, and `<CARGO_MANIFEST_DIR>/target/debug/
-/// rui-mock-agent` is a compile-time-baked dev-checkout path that doesn't
-/// exist on an end user's machine at all. The old code returned that
-/// nonexistent path anyway, and [`spawn_gateway_process`] set
-/// `ACPX_BACKEND_CMD` to it *unconditionally* -- so a real release install
-/// with no operator-started acpx-server never reached a real agent on this
-/// autospawn path at all: acpx-server would try to exec a garbage path
-/// instead of falling back to its own real, working default
-/// (`npx -y @agentclientprotocol/codex-acp@1.1.2`, see
-/// `acpx-server/src/config.rs`'s `ServerConfig::from_env`). Found via
-/// `/verify-impl`'s production-build lens (this session); see
-/// designa-v2-plan-order.meta.json's skill_injection_verification/
-/// runtime_and_edge_pass `verified[]` entries for the original finding.
-///
-/// **Second real bug this closes** (found live against a real running
-/// instance, not just by re-reading the code): checking only
-/// `dev_mock_agent.is_file()` is not actually a "is this a dev/test
-/// context" signal -- that debug binary exists on disk in ANY checkout
-/// that has ever run `cargo build`/`cargo test` once, including a
-/// checkout being used specifically to verify real end-to-end acpx
-/// behavior. That meant every new (non-resumed) chat session silently
-/// talked to the mock agent instead of the real gateway default, with no
-/// way to tell short of reading source -- exactly the "new sessions don't
-/// go through real acpx" symptom observed live. Now gated behind an
-/// explicit `RUI_USE_DEV_MOCK_AGENT=1` opt-in so the file's mere existence
-/// is never sufficient by itself.
-///
-/// `RUI_TEST_MODE=1` is the single source of truth gating this entire
-/// function: neither `RUI_ACP_AGENT_CMD` nor `RUI_USE_DEV_MOCK_AGENT` has
-/// any effect without it, even if set. Found live: an ordinary interactive
-/// dev launch (a person running `./snapflow` directly, not a test harness)
-/// has no reason to ever route a real chat session to a mock/overridden
-/// backend, and a leaked/inherited env var from an unrelated shell or CI
-/// context was enough to silently do exactly that with no error, no log,
-/// and no way to tell short of reading source -- the same class of bug as
-/// the dev_mock_agent-existence issue above, just one layer up. Automated
-/// tests and explicit local mock-agent workflows must set `RUI_TEST_MODE=1`
-/// themselves; a plain dev/production launch must never need to.
-fn resolve_backend_agent_command() -> Option<String> {
-    if std::env::var("RUI_TEST_MODE").as_deref() != Ok("1") {
-        return None;
-    }
-    if let Ok(cmd) = std::env::var("RUI_ACP_AGENT_CMD") {
-        return Some(cmd);
-    }
-    if std::env::var("RUI_USE_DEV_MOCK_AGENT").as_deref() != Ok("1") {
-        return None;
-    }
-    let dev_mock_agent =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/rui-mock-agent");
-    if dev_mock_agent.is_file() {
-        return Some(dev_mock_agent.to_string_lossy().into_owned());
-    }
-    None
-}
-
-/// `ServerConfig::from_env`'s own `ACPX_BACKEND_CMD` fallback
-/// (`acpx-server/src/config.rs`) is unconditionally `codex-acp` -- it has
-/// no notion of `provider`/`ACPX_DEFAULT_AGENT_ID` at all, that field is
-/// display-only. So when [`resolve_backend_agent_command`] found no
-/// explicit override, a "claude" persona gateway was *still* silently
-/// spawning the real `codex-acp` adapter as its backend: found live
-/// (chat-panel-live-fixes.md phase 4) via a running instance's actual
-/// spawned child-process list, not by re-reading the code. Mirrors the
-/// per-provider default `acpx/scripts/openhands-acpx-claude.sh` already
-/// documents and tests for exactly this integration point.
-fn default_backend_command_for_provider(provider: &str) -> Option<&'static str> {
-    match provider {
-        "claude" => Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1"),
-        // "codex" (and anything else) already matches acpx-server's own
-        // built-in default -- nothing to override.
-        _ => None,
-    }
-}
+// PROF-3 (`profile-only-backend-selection` plan): `resolve_backend_agent_
+// command`/`default_backend_command_for_provider` used to live here,
+// computing a value for `spawn_gateway_process` to write into
+// ACPX_BACKEND_CMD -- an exported-command-string bootstrap backend, the
+// exact shape this plan eliminates. Removed along with that write (see
+// `spawn_gateway_process`'s own comment for why a real profile now covers
+// the case `default_backend_command_for_provider("claude")` used to
+// patch). If either is reintroduced for a legitimate PROF-4 test-harness
+// need, keep both historical bugs their doc comments recorded in mind:
+// (a) unconditionally writing a compile-time dev-checkout path meant a
+// real release install with no operator-started acpx-server never
+// reached a real agent at all; (b) `dev_mock_agent.is_file()` is not a
+// "dev/test context" signal by itself -- that debug binary exists in any
+// checkout that has ever run `cargo build`/`cargo test`, including one
+// verifying real end-to-end acpx behavior.
 
 /// Reads `CODEX_API_KEY` out of the Codex CLI's own on-disk login
 /// (`~/.codex/auth.json`, overrideable via `ACPX_CODEX_AUTH_FILE`), the
@@ -1598,30 +1528,35 @@ fn spawn_gateway_process(
             cmd.stderr(std::process::Stdio::null());
         }
     }
-    // Only set ACPX_BACKEND_CMD when we have a real command to point it
-    // at (an explicit override, or a dev-checkout mock binary confirmed
-    // to actually exist) -- leaving it unset lets acpx-server fall back
-    // to its own real, working default (a genuine LLM-backed ACP adapter)
-    // instead of being pointed at a nonexistent path. See
-    // resolve_backend_agent_command's doc comment for the full story.
-    if let Some(backend_cmd) = resolve_backend_agent_command() {
-        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
-    } else if let Some(backend_cmd) = default_backend_command_for_provider(provider) {
-        // No explicit override: acpx-server's own built-in default is
-        // codex-only (see default_backend_command_for_provider's doc
-        // comment), so a non-codex provider needs its real adapter
-        // spelled out here instead of silently getting codex-acp anyway.
-        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
-    }
-    // Independent of which ACPX_BACKEND_CMD branch above fired --
-    // found live via /verify-impl-style subagent review: this used to be
-    // an else-if off the branches above, so an explicit RUI_ACP_AGENT_CMD/
-    // RUI_USE_DEV_MOCK_AGENT override (still legitimately codex-acp
-    // underneath, e.g. an operator pinning a specific npx version) would
-    // silently skip this auth wiring and reintroduce the original
-    // -32000 auth error with no diagnostic. A real backend-command
-    // override for a non-codex adapter is harmless to check here too --
-    // the provider == "codex" guard keeps it a no-op in that case.
+    // PROF-3 (`profile-only-backend-selection` plan): this autospawned
+    // gateway process's own ACPX_BACKEND_CMD is now NEVER set here.
+    // Previously this branched on an explicit RUI_ACP_AGENT_CMD/
+    // RUI_USE_DEV_MOCK_AGENT dev override, else a hardcoded
+    // `npx claude-agent-acp` string for `provider == "claude"` (acpx-
+    // server's own bare default is codex-only) -- both are exactly the
+    // "an exported command string defines the backend" shape this plan
+    // exists to eliminate. A bootstrap backend for a non-default agent
+    // must now come from a real, resolvable profile instead: PROF-2
+    // already made any thread with a real configured `default_agent_id`
+    // carry a matching `_acpx.profile`, which resolves through
+    // `Router::resolve_profile` -> `crate::launch::build_launch_env`
+    // (acpx-core) -- a path that reads the real registry-listed spawn
+    // command for that agent id directly, with no dependency on this
+    // gateway process's own env at all. So leaving ACPX_BACKEND_CMD
+    // unset here no longer reintroduces the old "claude" native-mode
+    // bug (`default_backend_command_for_provider`'s own removed doc
+    // comment): that gap is only reachable when NOTHING is configured
+    // anywhere, and in that genuine blank-slate case `provider` is
+    // already `NO_PROVIDER_REQUESTED_FALLBACK` ("codex"), which matches
+    // acpx-server's own bare default with nothing left to override.
+    //
+    // Test harnesses that legitimately need an arbitrary/mock backend
+    // command (`RUI_ACP_AGENT_CMD`/`RUI_USE_DEV_MOCK_AGENT`, or a
+    // `TestGateway` spawned directly in this module's own tests) are
+    // out of this phase's scope -- they never called through this
+    // function to begin with (`TestGateway` builds its own `Command`),
+    // and any equivalent production-adjacent dev workflow this removed
+    // is a PROF-4 concern, not reintroduced here.
     if provider == "codex" {
         // acpx-server's own default already resolves to the real
         // codex-acp adapter; give it a noninteractive path to this
@@ -4230,112 +4165,12 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../acpx/target/debug/acpx-server")
     }
 
-    /// `RUI_ACP_AGENT_CMD` (a real override) always wins over the
-    /// dev-checkout mock-agent fallback -- the production-build regression
-    /// found this session was resolve_backend_agent_command silently
-    /// defaulting to a nonexistent path when NEITHER applies (see its own
-    /// doc comment); this specific override-wins branch is unaffected by
-    /// that fix but is the one part of this function cheaply testable
-    /// without touching the real dev_mock_agent build artifact every other
-    /// real-process test in this file also depends on existing.
-    #[test]
-    fn resolve_backend_agent_command_prefers_explicit_override() {
-        // SAFETY (env mutation in a test): guarded by restoring the prior
-        // value unconditionally before returning, and this whole suite
-        // already runs under --test-threads=1 per this crate's own
-        // convention for exactly this reason (see module doc references
-        // elsewhere in this file to real-process serialization).
-        let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
-        let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
-        unsafe {
-            std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
-            std::env::set_var("RUI_TEST_MODE", "1");
-        }
-        let resolved = resolve_backend_agent_command();
-        match prior {
-            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
-            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
-        }
-        match prior_test_mode {
-            Some(value) => unsafe { std::env::set_var("RUI_TEST_MODE", value) },
-            None => unsafe { std::env::remove_var("RUI_TEST_MODE") },
-        }
-        assert_eq!(resolved.as_deref(), Some("/some/real/agent --flag"));
-    }
-
-    /// `RUI_TEST_MODE` is the sole gate for the whole function -- an
-    /// explicit `RUI_ACP_AGENT_CMD` override must be inert without it, so a
-    /// leaked/inherited env var from an unrelated shell or CI context can
-    /// never silently redirect a real interactive launch's chat sessions
-    /// to a mock or arbitrary command.
-    #[test]
-    fn resolve_backend_agent_command_ignores_override_without_test_mode() {
-        let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
-        let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
-        unsafe {
-            std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
-            std::env::remove_var("RUI_TEST_MODE");
-        }
-        let resolved = resolve_backend_agent_command();
-        match prior {
-            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
-            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
-        }
-        match prior_test_mode {
-            Some(value) => unsafe { std::env::set_var("RUI_TEST_MODE", value) },
-            None => unsafe { std::env::remove_var("RUI_TEST_MODE") },
-        }
-        assert_eq!(resolved, None);
-    }
-
-    /// The real bug found live this session: a debug build of
-    /// `rui-mock-agent` merely existing on disk (true in any dev checkout
-    /// that has ever run `cargo build`/`cargo test`) must NOT by itself
-    /// route new sessions to the mock agent -- only an explicit
-    /// `RUI_USE_DEV_MOCK_AGENT=1` opt-in may do that, so a dev checkout
-    /// used to verify real acpx behavior gets the real gateway default
-    /// unless someone deliberately asks for the mock.
-    #[test]
-    fn resolve_backend_agent_command_ignores_mock_binary_without_explicit_opt_in() {
-        let prior_override = std::env::var("RUI_ACP_AGENT_CMD").ok();
-        let prior_opt_in = std::env::var("RUI_USE_DEV_MOCK_AGENT").ok();
-        unsafe {
-            std::env::remove_var("RUI_ACP_AGENT_CMD");
-            std::env::remove_var("RUI_USE_DEV_MOCK_AGENT");
-        }
-        let resolved = resolve_backend_agent_command();
-        match prior_override {
-            Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
-            None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
-        }
-        match prior_opt_in {
-            Some(value) => unsafe { std::env::set_var("RUI_USE_DEV_MOCK_AGENT", value) },
-            None => unsafe { std::env::remove_var("RUI_USE_DEV_MOCK_AGENT") },
-        }
-        // Even though target/debug/rui-mock-agent genuinely exists in this
-        // checkout (every other real-process test in this file depends on
-        // it), resolve_backend_agent_command must still return None here.
-        assert_eq!(resolved, None);
-    }
-
-    /// acpx-server's own ACPX_BACKEND_CMD default is codex-only (see this
-    /// function's own doc comment) -- "claude" is the one provider that
-    /// genuinely needs an explicit override; every other provider string
-    /// (including "codex" itself and anything unrecognized) must return
-    /// None so spawn_gateway_process leaves ACPX_BACKEND_CMD unset and
-    /// falls through to that real default instead.
-    #[test]
-    fn default_backend_command_for_provider_only_overrides_claude() {
-        assert_eq!(
-            default_backend_command_for_provider("claude"),
-            Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1")
-        );
-        assert_eq!(default_backend_command_for_provider("codex"), None);
-        assert_eq!(
-            default_backend_command_for_provider("unknown-provider"),
-            None
-        );
-    }
+    // PROF-3: `resolve_backend_agent_command_prefers_explicit_override`,
+    // `resolve_backend_agent_command_ignores_override_without_test_mode`,
+    // `resolve_backend_agent_command_ignores_mock_binary_without_explicit_
+    // opt_in`, and `default_backend_command_for_provider_only_overrides_
+    // claude` used to live here, testing the two functions removed above
+    // this module's own doc comment for why. Removed along with them.
 
     /// read_codex_api_key_from_auth_file's real, only call site
     /// (spawn_gateway_process) requires this to be correct without ever
@@ -5296,20 +5131,22 @@ mod tests {
             |command, _port| {
                 // acpx-server's own bare default is codex-only
                 // (config.rs's `ACPX_BACKEND_CMD` fallback is literally
-                // `npx ... codex-acp`) -- exactly the real bug
-                // `default_backend_command_for_provider`/
-                // `spawn_gateway_process` exists to close. Without this
-                // override, a "claude" test/thread silently gets a real
+                // `npx ... codex-acp`). This test drives a raw
+                // `_acpx.profile`-less native-mode session directly
+                // against a hand-spawned test gateway (not through
+                // `AgentBridge`/`spawn_gateway_process`, which no longer
+                // ever sets this env var in production -- see PROF-3),
+                // so it still needs its own explicit override here or a
+                // "claude" test/thread would silently get a real
                 // codex-acp reply instead (confirmed live: this test
-                // timed out because the spawned backend was codex-acp,
-                // which never received the config expected of it).
-                // No ACPX_NATIVE_AUTH_METHOD_ID: unlike codex-acp's
+                // once timed out because the spawned backend was
+                // codex-acp, which never received the config expected of
+                // it). No ACPX_NATIVE_AUTH_METHOD_ID: unlike codex-acp's
                 // explicit API-key exchange, claude-acp's ambient auth
                 // (~/.claude/.credentials.json) doesn't need one.
                 command.env(
                     "ACPX_BACKEND_CMD",
-                    default_backend_command_for_provider("claude")
-                        .expect("claude must have a real backend command override"),
+                    "npx -y @agentclientprotocol/claude-agent-acp@0.58.1",
                 );
             },
             Some("haiku"),
