@@ -988,7 +988,15 @@ mod skill_editor_path_tests {
     }
 }
 
-fn write_clipboard_text(text: &str) -> Result<(), String> {
+/// PUI select-and-copy: also the delegate target for `SpikePlatform::
+/// set_clipboard_text` (`lib.rs`) -- Slint's built-in Ctrl+C inside a
+/// `TextInput` calls `Platform::set_clipboard_text` directly (see
+/// `i-slint-core`'s `text.rs::copy_clipboard`), and this custom software-
+/// rendering platform has no OS clipboard integration of its own, so
+/// without that delegation a real selection's Ctrl+C was a silent no-op.
+/// `pub(crate)` (not `pub`) since only this crate's own platform impl and
+/// `Effect::ClipboardWrite` above call it.
+pub(crate) fn write_clipboard_text(text: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
     for (bin, args) in [

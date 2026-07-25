@@ -122,6 +122,19 @@ pub enum TerminalMsg {
     /// `LocalClose` (the client-local PTY toggle above), which never
     /// touches the gateway at all.
     Kill(String),
+    /// Terminal-tabs phase: switch which already-open tab is active,
+    /// fired by clicking a tab inside the full-view overlay itself (not
+    /// the popup -- that still goes through `Expand`, which both opens
+    /// AND activates). A stray id (already closed/never opened) is
+    /// ignored rather than treated as an implicit re-open, so a tab strip
+    /// racing a close never resurrects a tab the user just dismissed.
+    SelectTab(String),
+    /// Terminal-tabs phase: dismiss one tab from the overlay's open set
+    /// without touching the underlying terminal (no kill effect -- the
+    /// process, if still running, keeps running and stays reachable via
+    /// the popup). If the closed tab was active, activates its neighbor;
+    /// closing the last open tab is equivalent to `CloseOverlay`.
+    CloseTab(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -334,6 +347,15 @@ pub struct ThreadFrameSnapshot {
     pub pending_request: crate::PendingRequestItem,
     pub terminals: Vec<crate::TerminalItem>,
     pub expanded_terminal: Option<crate::TerminalItem>,
+    /// Phase (terminal-tabs): every terminal currently pinned open as a
+    /// full-view tab, resolved from `Model::open_terminal_ids` and kept in
+    /// that list's insertion order (NOT `terminals`' order, which can
+    /// reorder/refresh independently) so the tab strip doesn't shuffle
+    /// under the user. `expanded_terminal` above stays the single
+    /// *active* tab's item (unchanged contract, still what the overlay's
+    /// content pane renders); this is the full open set the tab strip
+    /// renders alongside it.
+    pub open_terminals: Vec<crate::TerminalItem>,
     pub local_terminal: crate::LocalTerminalItem,
     pub connection_status: String,
     pub session_modes: Option<crate::protocol_types::SessionModesEvent>,
@@ -405,6 +427,8 @@ mod tests {
         "skill_open_with_os_default_requested",
         "skill_promote_to_global",
         "stop_requested",
+        "terminal_tab_closed",
+        "terminal_tab_selected",
         "thread_close_requested",
         "thread_delete_requested",
         "thread_navigation_requested",
@@ -448,6 +472,8 @@ mod tests {
             | "load_older_requested" => "request",
             "expand_terminal"
             | "close_terminal_overlay"
+            | "terminal_tab_selected"
+            | "terminal_tab_closed"
             | "local_terminal_toggle_requested"
             | "local_terminal_close_requested"
             | "local_terminal_key_input" => "terminal",

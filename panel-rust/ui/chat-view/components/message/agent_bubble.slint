@@ -164,6 +164,9 @@ export component AgentBubble inherits Rectangle {
             padding-top: Metrics.space-2;
             vertical-stretch: 0;
             TouchArea {
+                accessible-role: button;
+                accessible-label: "Copy message text";
+                accessible-action-default => { self.clicked(); }
                 width: 20px;
                 height: 20px;
                 mouse-cursor: pointer;

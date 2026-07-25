@@ -213,6 +213,12 @@ export component ChatPanel inherits Window {
     // is shown. Cleared (terminal-id: "") by the overlay's own close
     // callback.
     in-out property <TerminalItem> expanded-terminal: { terminal-id: "" };
+    // Terminal-tabs phase: every terminal currently pinned open as a
+    // full-view tab (Rust-side `Model::open_terminal_ids`, resolved to
+    // full items). `expanded-terminal` above stays the single *active*
+    // tab's item -- unchanged contract, still what the overlay's content
+    // pane renders -- this is the full open set the tab strip renders.
+    in-out property <[TerminalItem]> open-terminal-tabs: [];
 
     callback thread-selected(int);
     // Relative move in the filtered thread list -- +1/-1 for next/previous,
@@ -264,6 +270,10 @@ export component ChatPanel inherits Window {
     // PUI-002b: terminals popup's `[x]` kill button.
     callback terminal-kill-requested(string);
     callback close-terminal-overlay();
+    // Terminal-tabs phase: fired from the overlay's own tab strip, not the
+    // popup (which still goes through `expand-terminal` above).
+    callback terminal-tab-selected(string);
+    callback terminal-tab-closed(string);
     callback local-terminal-toggle-requested();
     callback local-terminal-key-input(string);
     callback local-terminal-close-requested();
@@ -663,6 +673,7 @@ export component ChatPanel inherits Window {
         }
         if expanded-terminal.terminal-id != "" : TerminalOverlay {
             item: expanded-terminal;
+            open-tabs: root.open-terminal-tabs;
             container-width: root.width;
             container-height: root.height;
             close => {
@@ -670,6 +681,8 @@ export component ChatPanel inherits Window {
                 close-terminal-overlay();
                 chat-area.restore-compose-focus();
             }
+            tab-selected(id) => { root.terminal-tab-selected(id); }
+            tab-closed(id) => { root.terminal-tab-closed(id); }
         }
         local-terminal-overlay := LocalTerminalOverlay {
             visible: local-terminal-overlay-open;

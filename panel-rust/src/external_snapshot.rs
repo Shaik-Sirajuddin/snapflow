@@ -520,6 +520,24 @@ impl<'a> ExternalSnapshotSource<'a> {
             let buffer = bridge.terminal_buffer(real_idx, &id)?;
             models::to_terminal_item_rows(vec![(id, Some(buffer))]).into_iter().next()
         });
+        // Terminal-tabs phase: resolve every currently-open tab id the same
+        // way, in `open_terminal_ids`' own order (not `terminals`' order --
+        // see `ThreadFrameSnapshot::open_terminals`'s doc comment). A stale
+        // id whose buffer has since disappeared (e.g. `AgentBridge` dropped
+        // it on thread teardown) still gets a row -- `to_terminal_item_rows`
+        // renders a `None` buffer as an empty/inert placeholder item rather
+        // than dropping it, same as the `terminals` list above -- so the
+        // tab itself doesn't vanish out from under the user, it just goes
+        // blank (closable the normal way).
+        let open_ids = self.panel.model.borrow().open_terminal_ids.clone();
+        let open_terminal_pairs = open_ids
+            .into_iter()
+            .map(|id| {
+                let buffer = bridge.terminal_buffer(real_idx, &id);
+                (id, buffer)
+            })
+            .collect();
+        let open_terminals = models::to_terminal_item_rows(open_terminal_pairs);
         Some(msg::ThreadFrameSnapshot {
             thread_id: bridge
                 .thread_binding(real_idx)
@@ -539,6 +557,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             pending_request,
             terminals: crate::models::to_terminal_item_rows(terminals),
             expanded_terminal,
+            open_terminals,
             local_terminal: crate::models::to_local_terminal_item(
                 bridge.local_terminal_snapshot(real_idx),
             ),

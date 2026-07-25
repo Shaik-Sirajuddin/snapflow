@@ -945,11 +945,50 @@ fn update_terminal(model: &mut Model, msg: TerminalMsg) -> (Vec<Effect>, Vec<Dir
     let idx = selected_real_index(model);
     match msg {
         TerminalMsg::Expand(id) => {
+            // Opens (if not already open) AND activates -- the popup row
+            // that fires this is the one path that can introduce a brand
+            // new tab; the tab strip itself only ever fires `SelectTab`
+            // for ids already in `open_terminal_ids`.
+            if !model.open_terminal_ids.contains(&id) {
+                model.open_terminal_ids.push(id.clone());
+            }
             model.expanded_terminal_id = Some(id.clone());
             (vec![], vec![Dirty::Terminal { id }])
         }
+        TerminalMsg::SelectTab(id) => {
+            // Ignore a stray id rather than implicitly re-opening a tab
+            // the user already dismissed (e.g. a tab-strip click racing a
+            // `CloseTab` for the same id).
+            if model.open_terminal_ids.contains(&id) {
+                model.expanded_terminal_id = Some(id.clone());
+            }
+            (vec![], vec![Dirty::Terminal { id }])
+        }
+        TerminalMsg::CloseTab(id) => {
+            if let Some(pos) = model.open_terminal_ids.iter().position(|open| *open == id) {
+                model.open_terminal_ids.remove(pos);
+                if model.expanded_terminal_id.as_deref() == Some(id.as_str()) {
+                    // Prefer the tab that slid into the closed one's slot
+                    // (what used to be its right-hand neighbor); fall back
+                    // to the one before it; `None` if the list is now
+                    // empty (last tab closed == whole overlay closed).
+                    model.expanded_terminal_id = model
+                        .open_terminal_ids
+                        .get(pos)
+                        .or_else(|| pos.checked_sub(1).and_then(|prev| model.open_terminal_ids.get(prev)))
+                        .cloned();
+                }
+            }
+            (
+                vec![],
+                vec![Dirty::Terminal {
+                    id: model.expanded_terminal_id.clone().unwrap_or_default(),
+                }],
+            )
+        }
         TerminalMsg::CloseOverlay => {
             let id = model.expanded_terminal_id.take();
+            model.open_terminal_ids.clear();
             (
                 vec![],
                 vec![id
@@ -2059,7 +2098,8 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 switched_thread || thread.pending_request != snapshot.pending_request;
             let terminals_changed = switched_thread
                 || thread.terminals != snapshot.terminals
-                || thread.expanded_terminal != snapshot.expanded_terminal;
+                || thread.expanded_terminal != snapshot.expanded_terminal
+                || thread.open_terminals != snapshot.open_terminals;
             let local_terminal_changed =
                 switched_thread || thread.local_terminal != snapshot.local_terminal;
             let local_terminal_output_changed =
@@ -2082,6 +2122,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             thread.pending_request = snapshot.pending_request;
             thread.terminals = snapshot.terminals;
             thread.expanded_terminal = snapshot.expanded_terminal;
+            thread.open_terminals = snapshot.open_terminals;
             thread.local_terminal = snapshot.local_terminal;
             thread.connection_status = snapshot.connection_status;
             thread.session_modes = snapshot.session_modes;
@@ -3123,6 +3164,7 @@ mod tests {
                     pending_request: crate::PendingRequestItem::default(),
                     terminals: Vec::new(),
                     expanded_terminal: None,
+                    open_terminals: vec![],
                     local_terminal: crate::LocalTerminalItem::default(),
                     connection_status: "Unavailable".to_owned(),
                     session_modes: None,
@@ -3432,6 +3474,7 @@ mod tests {
             pending_request: crate::PendingRequestItem::default(),
             terminals: vec![],
             expanded_terminal: None,
+                    open_terminals: vec![],
             local_terminal: crate::LocalTerminalItem::default(),
             connection_status: String::new(),
             session_modes: None,
@@ -3581,6 +3624,7 @@ mod tests {
                     pending_request: crate::PendingRequestItem::default(),
                     terminals: vec![],
                     expanded_terminal: None,
+                    open_terminals: vec![],
                     local_terminal: crate::LocalTerminalItem::default(),
                     connection_status: "Live connection".to_owned(),
                     session_modes: None,
@@ -3663,6 +3707,7 @@ mod tests {
                     pending_request: crate::PendingRequestItem::default(),
                     terminals: vec![],
                     expanded_terminal: None,
+                    open_terminals: vec![],
                     local_terminal: crate::LocalTerminalItem::default(),
                     connection_status: String::new(),
                     session_modes: None,
@@ -3734,6 +3779,7 @@ mod tests {
                     pending_request: crate::PendingRequestItem::default(),
                     terminals: vec![],
                     expanded_terminal: None,
+                    open_terminals: vec![],
                     local_terminal: crate::LocalTerminalItem::default(),
                     connection_status: "Live".to_owned(),
                     session_modes: None,
@@ -4245,6 +4291,7 @@ mod tests {
                     pending_request: crate::PendingRequestItem::default(),
                     terminals: vec![],
                     expanded_terminal: None,
+                    open_terminals: vec![],
                     local_terminal: crate::LocalTerminalItem::default(),
                     connection_status: String::new(),
                     session_modes: None,
@@ -4263,5 +4310,140 @@ mod tests {
         );
         // Hydration by durable id still lands in the right thread's cache.
         assert_eq!(model.threads[1].transcript, transcript);
+    }
+
+    // Terminal-tabs phase: `update_terminal`'s `Expand`/`SelectTab`/
+    // `CloseTab`/`CloseOverlay` arms are pure reducer logic over
+    // `Model::open_terminal_ids`/`expanded_terminal_id`, so they're
+    // testable directly through `update()` without a live `ChatPanel`
+    // (see `sync_commands_model`'s doc comment in `sync.rs` for the same
+    // "extract so it's testable without the platform" reasoning).
+
+    #[test]
+    fn terminal_expand_opens_a_new_tab_and_activates_it() {
+        let mut model = model_with_threads(&["a"]);
+        assert!(model.open_terminal_ids.is_empty());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand("t1".to_owned()))));
+
+        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned()]);
+        assert_eq!(model.expanded_terminal_id, Some("t1".to_owned()));
+    }
+
+    #[test]
+    fn terminal_expand_on_an_already_open_tab_activates_it_without_duplicating() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
+        model.expanded_terminal_id = Some("t2".to_owned());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::Expand("t1".to_owned()))));
+
+        assert_eq!(
+            model.open_terminal_ids,
+            vec!["t1".to_owned(), "t2".to_owned()],
+            "re-expanding an already-open tab must not push a duplicate entry"
+        );
+        assert_eq!(model.expanded_terminal_id, Some("t1".to_owned()));
+    }
+
+    #[test]
+    fn terminal_select_tab_switches_active_among_open_tabs() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
+        model.expanded_terminal_id = Some("t1".to_owned());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab("t2".to_owned()))));
+
+        assert_eq!(model.expanded_terminal_id, Some("t2".to_owned()));
+        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned(), "t2".to_owned()]);
+    }
+
+    #[test]
+    fn terminal_select_tab_ignores_an_id_that_is_not_open() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned()];
+        model.expanded_terminal_id = Some("t1".to_owned());
+
+        update(
+            &mut model,
+            Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab("never-opened".to_owned()))),
+        );
+
+        assert_eq!(
+            model.expanded_terminal_id,
+            Some("t1".to_owned()),
+            "a stray tab-strip id (e.g. racing a close) must not become active"
+        );
+        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned()]);
+    }
+
+    #[test]
+    fn terminal_close_tab_activates_the_tab_that_slides_into_its_slot() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned(), "t3".to_owned()];
+        model.expanded_terminal_id = Some("t2".to_owned());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))));
+
+        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned(), "t3".to_owned()]);
+        assert_eq!(
+            model.expanded_terminal_id,
+            Some("t3".to_owned()),
+            "closing the active tab should land on its former right-hand neighbor"
+        );
+    }
+
+    #[test]
+    fn terminal_close_tab_falls_back_to_the_previous_tab_when_closing_the_last_one() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
+        model.expanded_terminal_id = Some("t2".to_owned());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))));
+
+        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned()]);
+        assert_eq!(model.expanded_terminal_id, Some("t1".to_owned()));
+    }
+
+    #[test]
+    fn terminal_close_tab_that_is_not_active_leaves_active_untouched() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned()];
+        model.expanded_terminal_id = Some("t1".to_owned());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t2".to_owned()))));
+
+        assert_eq!(model.open_terminal_ids, vec!["t1".to_owned()]);
+        assert_eq!(model.expanded_terminal_id, Some("t1".to_owned()));
+    }
+
+    #[test]
+    fn terminal_close_the_last_open_tab_clears_the_active_id_entirely() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned()];
+        model.expanded_terminal_id = Some("t1".to_owned());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab("t1".to_owned()))));
+
+        assert!(model.open_terminal_ids.is_empty());
+        assert_eq!(
+            model.expanded_terminal_id, None,
+            "closing the only open tab must fully close the overlay, not leave a dangling active id"
+        );
+    }
+
+    #[test]
+    fn terminal_close_overlay_clears_every_open_tab_not_just_the_active_one() {
+        let mut model = model_with_threads(&["a"]);
+        model.open_terminal_ids = vec!["t1".to_owned(), "t2".to_owned(), "t3".to_owned()];
+        model.expanded_terminal_id = Some("t2".to_owned());
+
+        update(&mut model, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseOverlay)));
+
+        assert!(
+            model.open_terminal_ids.is_empty(),
+            "the overlay-wide Close/Escape path must close every tab, not just the active one"
+        );
+        assert_eq!(model.expanded_terminal_id, None);
     }
 }

@@ -16,7 +16,23 @@ export global ColorScale {
     out property <color> day-white: #ffffff;
 
     // sys-sidebar / sys-card dark vs light
-    out property <color> dark-surface-1: #09090b;
+    //
+    // `dark-surface-1` is snapflow's own Qt window colour, so the docked panel
+    // reads as part of the editor rather than a darker rectangle pasted into
+    // it. Source of truth: MainWindow::changeTheme()'s dark branch in our
+    // snapflow (shotcut-rebrand/src/mainwindow.cpp), which sets
+    // `palette.setColor(QPalette::Window, QColor(50, 50, 50))` -- i.e. #323232.
+    // It was #09090b (near-black), which left a visible seam between the chat
+    // dock and the surrounding Qt chrome.
+    //
+    // Deliberately changed at the PRIMITIVE, not per component: `bg-sidebar`
+    // and `bg-card` both derive from it (theme.slint), so every surface that
+    // should sit flush with the window follows automatically and cannot drift
+    // one component at a time. If the Qt dark palette is ever retuned, update
+    // this one value to match -- or, better, plumb the real QPalette window
+    // colour through `panel_rust_set_theme` so it tracks automatically (see the
+    // THEME_match_qt_window_color phase notes).
+    out property <color> dark-surface-1: #323232;
     out property <color> light-surface-1: #f4f4f7;
 
     // sys-chat dark vs light
@@ -40,7 +56,13 @@ export global ColorScale {
     out property <color> light-text-secondary: #555558;
 
     // sys-text-muted dark vs light
-    out property <color> dark-text-muted: #636366;
+    // Lightened alongside `dark-surface-1`'s move to the Qt window colour
+    // (#09090b -> #323232): the old #636366 measured 3.32:1 against the
+    // near-black surface but only 2.14:1 against #323232, i.e. it fell below
+    // even the 3.0:1 large/secondary-text floor once the background lightened.
+    // #8a8a8e restores 3.73:1. (text-primary 11.49:1 and text-secondary 4.98:1
+    // both still pass on the new surface and are unchanged.)
+    out property <color> dark-text-muted: #8a8a8e;
     out property <color> light-text-muted: #8a8a8f;
 
     // sys-primary-container dark vs light

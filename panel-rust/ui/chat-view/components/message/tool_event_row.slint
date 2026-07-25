@@ -159,6 +159,9 @@ export component ToolEventRow inherits Rectangle {
 
             // Maximize / Open full view button right on the call title line
             if has-execution-content : TouchArea {
+                accessible-role: button;
+                accessible-label: root.expanded ? "Collapse tool call details" : "Expand tool call details";
+                accessible-action-default => { self.clicked(); }
                 width: 22px;
                 height: 22px;
                 mouse-cursor: pointer;

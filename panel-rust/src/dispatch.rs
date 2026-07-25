@@ -745,6 +745,35 @@ pub(crate) fn dispatch_terminal_close_overlay(panel: &PanelSingleton) {
     });
 }
 
+/// Wired from `component.on_terminal_tab_selected` (terminal-tabs phase).
+/// See `dispatch_terminal_expand`'s doc comment -- same bridge shape;
+/// switching the active tab never touches which ids are open, only which
+/// one's content the overlay currently renders.
+pub(crate) fn dispatch_terminal_tab_selected(panel: &PanelSingleton, terminal_id: String) {
+    let (_effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab(terminal_id))));
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_selected_thread_snapshot(),
+        ..crate::msg::FrameInput::default()
+    });
+}
+
+/// Wired from `component.on_terminal_tab_closed` (terminal-tabs phase).
+/// Dismisses one tab from the open set -- no `Effect::KillAgentTerminal`
+/// here (that stays `dispatch_terminal_kill_requested`'s job, a distinct
+/// user action); the terminal itself is untouched, just no longer pinned
+/// open as a tab.
+pub(crate) fn dispatch_terminal_tab_closed(panel: &PanelSingleton, terminal_id: String) {
+    let (_effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab(terminal_id))));
+    panel.dispatch_frame_input(crate::msg::FrameInput {
+        selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
+            .collect_selected_thread_snapshot(),
+        ..crate::msg::FrameInput::default()
+    });
+}
+
 /// Wired from `component.on_local_terminal_toggle_requested`
 /// (tea-slint-model Phase 4, Terminal domain). See
 /// `dispatch_terminal_expand`'s doc comment -- same bridge shape.

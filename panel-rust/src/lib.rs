@@ -466,7 +466,56 @@ impl Platform for SpikePlatform {
         }
         Some(Box::new(SpikeEventLoopProxy))
     }
+
+    // Select-and-copy fix: the default `Platform::set_clipboard_text` is a
+    // no-op, so a real user selection's Ctrl+C inside any `TextInput`
+    // (compose box, read-only message text, terminal) silently went
+    // nowhere -- `i-slint-core`'s `TextInput::copy_clipboard` calls this
+    // hook directly and has no other path to a real OS clipboard. Delegate
+    // to the SAME `write_clipboard_text` helper the existing whole-message
+    // copy buttons already use via `Effect::ClipboardWrite`
+    // (`effect_executor.rs`), so both paths land on the real system
+    // clipboard through the identical wl-copy/xclip/xsel fallback chain.
+    // Spawned on its own thread rather than called inline: it shells out
+    // to a subprocess and waits for it, and this bridge's key-event
+    // dispatch runs on the single UI thread (see this module's own
+    // "this crate's one Rust thread" doc comments) -- blocking that
+    // thread on a subprocess round trip for every Ctrl+C would be a real,
+    // if usually small, UI stall. Not clipboard-kind-aware (routes both
+    // `Clipboard::DefaultClipboard` -- Ctrl+C/Ctrl+V -- and
+    // `Clipboard::SelectionClipboard` -- X11 primary-selection
+    // auto-copy-on-select -- through the same system clipboard): this
+    // platform only has one real clipboard integration, and landing a
+    // primary-selection copy in the real clipboard too is strictly better
+    // than the previous silent no-op.
+    fn set_clipboard_text(&self, text: &str, _clipboard: slint::platform::Clipboard) {
+        // Test-only observation hook: this environment has no real X11/
+        // Wayland display (confirmed: `xclip`/`wl-copy`/`xsel` all fail
+        // with "can't open display" headlessly here), so a test cannot
+        // honestly assert against the real system clipboard. Recording
+        // the exact string synchronously, on the same thread this method
+        // is called on (before the real write is handed off to its own
+        // thread below), lets a test prove the full real path -- a real
+        // Ctrl+C key event, dispatched through the actual `panel_rust_
+        // input_key` FFI bridge, on a real Slint text selection -- reaches
+        // this platform hook with exactly the selected substring, without
+        // needing a working clipboard helper to observe it.
+        #[cfg(test)]
+        {
+            *LAST_CLIPBOARD_WRITE_FOR_TEST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text.to_owned());
+        }
+        let text = text.to_owned();
+        std::thread::spawn(move || {
+            let _ = effect_executor::write_clipboard_text(&text);
+        });
+    }
 }
+
+#[cfg(test)]
+static LAST_CLIPBOARD_WRITE_FOR_TEST: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
 
 static EVENT_LOOP_QUEUE: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(Vec::new());
@@ -2208,6 +2257,33 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
+        // Terminal-tabs phase: switch the active tab / dismiss one tab
+        // from the overlay's open set, both fired from the tab strip
+        // inside `TerminalOverlay` itself (not the popup).
+        let component_weak = panel.component.as_weak();
+        panel.component.on_terminal_tab_selected(move |terminal_id| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_terminal_tab_selected(panel, terminal_id.to_string());
+                }
+            });
+        });
+
+        let component_weak = panel.component.as_weak();
+        panel.component.on_terminal_tab_closed(move |terminal_id| {
+            let Some(_component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_terminal_tab_closed(panel, terminal_id.to_string());
+                }
+            });
+        });
+
         // Client-local PTY terminal addition -- toggle open/closed,
         // forward keyboard input, and an explicit kill action. Real
         // `LocalTerminal::spawn`/`close_local_terminal`, no simulation
@@ -3628,6 +3704,63 @@ mod keyboard_shortcut_tests {
             component.get_sidebar_expanded(),
             "Ctrl+B's real control-character text (\\u{{2}}) must still toggle the sidebar \
              once map_qt_key recovers the plain letter"
+        );
+    }
+
+    /// Select-and-copy regression test: before `SpikePlatform::
+    /// set_clipboard_text` was implemented, a real Ctrl+C on a real
+    /// selection was a silent no-op (the default `Platform` impl drops
+    /// the text on the floor -- see that method's own doc comment).
+    /// Drives the actual bug's repro end to end through the real FFI
+    /// bridge: focus the compose box, select all its text with a real
+    /// Ctrl+A chord (proving the selection itself is real, not poked in
+    /// directly), then a real Ctrl+C chord -- both `panel_rust_input_key`
+    /// calls take the same control-character-recovery path `map_qt_key`
+    /// already normalizes Ctrl+B through in the test above. Asserts the
+    /// exact selected text reached `Platform::set_clipboard_text`, via
+    /// this environment's only honest observation point: there is no
+    /// real X11/Wayland display here (confirmed: `xclip`/`wl-copy`/`xsel`
+    /// all fail "can't open display"), so the real system clipboard
+    /// itself cannot be asserted against headlessly -- see `set_clipboard_
+    /// text`'s own doc comment for why `LAST_CLIPBOARD_WRITE_FOR_TEST`
+    /// exists as the substitute.
+    #[test]
+    fn ctrl_c_on_a_real_selection_reaches_the_platform_clipboard_hook() {
+        const QT_KEY_A: c_int = 0x41;
+        const QT_KEY_C: c_int = 0x43;
+
+        let panel = TestPanel::new();
+        let component = panel.component();
+        component.set_compose_text("select and copy me".into());
+
+        let compose = ElementHandle::find_by_accessible_label(&component, "Compose message")
+            .next()
+            .expect("compose input must be accessible");
+        let position = compose.absolute_position();
+        let size = compose.size();
+        assert!(panel_rust_input_click(
+            panel.handle,
+            (position.x + size.width / 2.0) as c_uint,
+            (position.y + size.height / 2.0) as c_uint,
+        ));
+        assert!(component.get_compose_has_focus());
+        *LAST_CLIPBOARD_WRITE_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        panel.press_only(QT_KEY_CONTROL);
+        panel.press_and_release(QT_KEY_A, "\u{1}");
+        panel.press_and_release(QT_KEY_C, "\u{3}");
+        panel.release_only(QT_KEY_CONTROL);
+
+        assert_eq!(
+            LAST_CLIPBOARD_WRITE_FOR_TEST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+            Some("select and copy me".to_owned()),
+            "a real Ctrl+A-then-Ctrl+C chord on the compose box's full selection must reach \
+             SpikePlatform::set_clipboard_text with exactly the selected text"
         );
     }
 }

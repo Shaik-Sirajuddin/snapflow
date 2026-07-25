@@ -147,6 +147,10 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 if let Some(thread) = model.threads.get(idx) {
                     reconcile_terminals(model, &thread.terminals);
                     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
+                    reconcile_open_terminals(model, &thread.open_terminals);
+                    component.set_open_terminal_tabs(slint::ModelRc::from(
+                        model.open_terminals_model.clone(),
+                    ));
                     if let Some(expanded) = &thread.expanded_terminal {
                         component.set_expanded_terminal(expanded.clone());
                     } else {
@@ -157,6 +161,10 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 // Transition clear before the new thread's snapshot lands.
                 reconcile_terminals(model, &[]);
                 component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
+                reconcile_open_terminals(model, &[]);
+                component.set_open_terminal_tabs(slint::ModelRc::from(
+                    model.open_terminals_model.clone(),
+                ));
                 component.set_expanded_terminal(crate::TerminalItem::default());
             }
         }
@@ -651,6 +659,22 @@ fn reconcile_terminals(model: &Model, terminals: &[crate::TerminalItem]) {
     );
 }
 
+/// Terminal-tabs phase: same reconcile-in-place contract as
+/// `reconcile_terminals` above, applied to the open-tabs list instead of
+/// the full terminals popup list.
+fn reconcile_open_terminals(model: &Model, open_terminals: &[crate::TerminalItem]) {
+    let new_keys: Vec<String> = open_terminals
+        .iter()
+        .map(|term| term.terminal_id.to_string())
+        .collect();
+    crate::list_model::reconcile(
+        &model.open_terminals_model,
+        &mut model.open_terminal_model_keys.borrow_mut(),
+        &new_keys,
+        open_terminals,
+    );
+}
+
 /// setup-followups plan, provider_fastmode_profile_persistence: refreshes
 /// the compose-bar profile picker for `thread` -- its dropdown model
 /// (`model.available_profiles`, the same data Settings > Agents' profile
@@ -703,9 +727,21 @@ fn sync_model_dropdown_for_provider(
     component.set_config_trigger_label(
         crate::models::current_config_trigger_label(&thread.config_options).into(),
     );
-    // PUI-003: feed the compose `/` menu from this thread's ACP
-    // available_commands (projected as SkillOption rows). Empty when the
-    // agent advertises none, so the `/` menu falls back to local skills.
+    sync_commands_model(model, thread);
+    component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
+}
+
+/// PUI-003: feed the compose `/` menu ONLY from this thread's ACP
+/// available_commands (projected as SkillOption rows). When the agent
+/// advertises none, the model is left empty and the `/` menu shows
+/// "No commands available" -- there is deliberately NO fallback to
+/// local skills here (explicit user decision: "the fallback is not good
+/// remove that"). Skills remain reachable through their own
+/// sidebar/settings surface; conflating them with agent slash-commands
+/// was the bug this removed. Split out from `sync_model_dropdown_for_provider`
+/// so the no-fallback behavior is unit-testable without constructing a
+/// live `ChatPanel` (see this module's tests for the regression pin).
+fn sync_commands_model(model: &Model, thread: &crate::model::ThreadModel) {
     model.commands_model.set_vec(
         thread
             .available_commands
@@ -717,7 +753,6 @@ fn sync_model_dropdown_for_provider(
             })
             .collect::<Vec<_>>(),
     );
-    component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
 }
 
 fn reconcile_settings_models(model: &Model, component: &ChatPanel) {
@@ -877,6 +912,7 @@ pub(crate) fn sync_initial_models(model: &Model, component: &ChatPanel) {
     component.set_available_skills(slint::ModelRc::from(model.skills_model.clone()));
     component.set_available_commands(slint::ModelRc::from(model.commands_model.clone()));
     component.set_terminals(slint::ModelRc::from(model.terminals_model.clone()));
+    component.set_open_terminal_tabs(slint::ModelRc::from(model.open_terminals_model.clone()));
     reconcile_settings_models(model, component);
 }
 
@@ -1089,6 +1125,7 @@ mod tests {
                     pending_request: crate::PendingRequestItem::default(),
                     terminals: vec![],
                     expanded_terminal: None,
+                    open_terminals: vec![],
                     local_terminal: crate::LocalTerminalItem::default(),
                     connection_status: String::new(),
                     session_modes: None,
@@ -1392,5 +1429,76 @@ mod tests {
         assert!(std::rc::Rc::ptr_eq(&model_identity, &model.messages_model));
         assert_eq!(*model.message_model_keys.borrow(), vec!["assistant:m-1"]);
         assert_eq!(model.messages_model.row_data(0).unwrap().text, "updated");
+    }
+
+    #[test]
+    fn commands_model_stays_empty_when_thread_advertises_no_commands_even_with_skills_present() {
+        // Regression test for the deliberately-removed skills fallback
+        // (explicit user decision: "the fallback is not good remove
+        // that"). The `/` menu must be fed ONLY by this thread's ACP
+        // `available_commands` -- never repopulated from local skills
+        // just because the agent advertised nothing. Seed `model.skills`
+        // with real entries so a reintroduced fallback would have
+        // something to leak in, then prove it doesn't.
+        let mut model = Model::default();
+        model.skills = vec![
+            crate::skills_state::SkillEntry {
+                name: "some-local-skill".to_owned(),
+                description: "a skill from the sidebar, not an ACP command".to_owned(),
+                path: std::path::PathBuf::from("/tmp/some-local-skill"),
+                scope: crate::skills_state::SkillScope::Global,
+                started_from: None,
+            },
+            crate::skills_state::SkillEntry {
+                name: "another-skill".to_owned(),
+                description: "also must not leak into the / menu".to_owned(),
+                path: std::path::PathBuf::from("/tmp/another-skill"),
+                scope: crate::skills_state::SkillScope::Project,
+                started_from: None,
+            },
+        ];
+        let thread = crate::model::ThreadModel {
+            available_commands: vec![],
+            ..crate::model::ThreadModel::default()
+        };
+
+        sync_commands_model(&model, &thread);
+
+        assert_eq!(
+            model.commands_model.row_count(),
+            0,
+            "an agent advertising no commands must leave the / menu empty, \
+             not fall back to local skills"
+        );
+    }
+
+    #[test]
+    fn commands_model_reflects_only_this_threads_advertised_commands() {
+        // Companion to the empty-state pin above: when the agent DOES
+        // advertise commands, those (and only those) must land in the
+        // projected model -- confirms the mapping isn't accidentally
+        // unioning in `model.skills` on the populated path either.
+        let mut model = Model::default();
+        model.skills = vec![crate::skills_state::SkillEntry {
+            name: "some-local-skill".to_owned(),
+            description: "sidebar skill".to_owned(),
+            path: std::path::PathBuf::from("/tmp/some-local-skill"),
+            scope: crate::skills_state::SkillScope::Global,
+            started_from: None,
+        }];
+        let thread = crate::model::ThreadModel {
+            available_commands: vec![crate::protocol_types::AvailableCommandInfo {
+                name: "codex_plan".to_owned(),
+                description: "plan a change".to_owned(),
+            }],
+            ..crate::model::ThreadModel::default()
+        };
+
+        sync_commands_model(&model, &thread);
+
+        assert_eq!(model.commands_model.row_count(), 1);
+        let row = model.commands_model.row_data(0).unwrap();
+        assert_eq!(row.name, "codex_plan");
+        assert_eq!(row.description, "plan a change");
     }
 }

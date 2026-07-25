@@ -94,6 +94,11 @@ export component ToolGroupView inherits Rectangle {
                 width: 22px;
                 height: 22px;
                 mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: root.maximized
+                    ? "Close full view of tool group"
+                    : "Open tool group in full view";
+                accessible-action-default => { self.clicked(); }
                 clicked => {
                     root.maximized = !root.maximized;
                     root.expanded = true;
@@ -118,6 +123,9 @@ export component ToolGroupView inherits Rectangle {
                 width: 22px;
                 height: 22px;
                 mouse-cursor: pointer;
+                accessible-role: button;
+                accessible-label: root.expanded ? "Collapse tool group" : "Expand tool group";
+                accessible-action-default => { self.clicked(); }
                 clicked => { root.expanded = !root.expanded; }
 
                 Rectangle {
@@ -162,7 +170,16 @@ export component ToolGroupView inherits Rectangle {
                 interactive: false;
                 height: parent.height;
                 viewport-height: body-layout.preferred-height;
+                // Shrink trio: without `min-width: 0px`, this Flickable
+                // couldn't be compressed below `body-layout`'s natural
+                // (unbounded) content width -- a long tool argument/path
+                // inside `@children` (ToolEventRow's title,
+                // ExpandablePanel's body, etc.) pushed the whole group
+                // box wider than its chat-row parent instead of wrapping
+                // or eliding within it.
                 horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
 
                 body-layout := VerticalLayout {
                     spacing: 0px;
@@ -187,6 +204,9 @@ export component ToolGroupView inherits Rectangle {
 
                     TouchArea {
                         mouse-cursor: pointer;
+                        accessible-role: button;
+                        accessible-label: "Scroll to tool call " + (idx + 1);
+                        accessible-action-default => { self.clicked(); }
                         clicked => {
                             let step = body-layout.preferred-height / max(1, root.item-count);
                             flickable.viewport-y = - min(body-layout.preferred-height - root.max-visible-height, idx * step);

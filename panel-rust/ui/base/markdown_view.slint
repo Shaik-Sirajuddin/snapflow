@@ -230,6 +230,39 @@ export component MarkdownView inherits VerticalLayout {
                         horizontal-alignment: left;
                         vertical-alignment: top;
                         horizontal-stretch: 0;
+                        // `markdown.rs`'s `wrap_runs` already breaks
+                        // *between* runs/words to fit its column
+                        // estimate, but it never splits a single word
+                        // (a long URL, file path, or minified-JSON
+                        // token) that alone exceeds that estimate --
+                        // greedy word-wrap only inserts breaks at space
+                        // boundaries. Before this, that one oversized
+                        // run rendered at its full natural width,
+                        // unconstrained (this cluster is
+                        // horizontal-stretch: 0, sized to content), and
+                        // got silently clipped by the ancestor
+                        // `Flickable` in `agent_bubble.slint` with no
+                        // ellipsis -- the worst case: unreadable AND no
+                        // sign anything was cut.
+                        // `wrap: word-wrap` + a `max-width` bound is
+                        // safe to apply per-run (unlike wrapping the
+                        // whole multi-run line declaratively, which the
+                        // module comment above rules out): it only
+                        // engages when *this one run alone* would
+                        // exceed the row's width, and Slint's
+                        // `word-wrap` falls back to breaking mid-word
+                        // when a single word has nowhere else to break,
+                        // same as CSS `overflow-wrap: break-word`. Runs
+                        // that already fit (the common case, since the
+                        // Rust side already wrapped the line) are
+                        // unaffected -- max-width only caps growth, it
+                        // does not force every run to that width.
+                        wrap: word-wrap;
+                        max-width: max(24px, root.width
+                            - line.indent * 14px
+                            - (is-code ? Metrics.space-4 * 2 : 0px)
+                            - (is-quote ? 2px + Metrics.space-2 : 0px)
+                            - (is-li ? 14px + Metrics.space-2 : 0px));
                         // Ctrl+Click opens the target.
                         if run.link != "" : TouchArea {
                             mouse-cursor: pointer;

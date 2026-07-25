@@ -106,7 +106,18 @@ export component MentionPickRow inherits Rectangle {
             font-family: root.title-font-family;
             font-weight: root.title-font-weight;
             vertical-alignment: center;
-            horizontal-stretch: 0;
+            // `overflow: elide` only takes effect once this Text is
+            // actually forced narrower than its content -- `min-width`
+            // defaults to the text's own natural width, which blocks the
+            // layout from ever compressing it, so long titles were
+            // truncating via the row's `clip: true` with NO ellipsis
+            // rendered, leaving the user unable to tell anything was cut.
+            // `preferred-width` is left at its default (the text's own
+            // natural size) -- only `min-width` needs clearing so the
+            // layout is free to compress this Text below that natural
+            // size under space pressure instead of refusing to.
+            horizontal-stretch: root.subtitle == "" ? 1 : 0;
+            min-width: 0px;
             overflow: elide;
         }
         if root.subtitle != "" : Text {
@@ -116,6 +127,8 @@ export component MentionPickRow inherits Rectangle {
             font-family: Theme.font-sans;
             vertical-alignment: center;
             horizontal-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
             overflow: elide;
         }
     }

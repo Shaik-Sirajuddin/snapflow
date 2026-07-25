@@ -96,6 +96,12 @@ pub struct ThreadModel {
     pub pending_request: crate::PendingRequestItem,
     pub terminals: Vec<crate::TerminalItem>,
     pub expanded_terminal: Option<crate::TerminalItem>,
+    /// Terminal-tabs phase: resolved `TerminalItem`s for every id in
+    /// `Model::open_terminal_ids`, kept in that list's order -- see
+    /// `ThreadFrameSnapshot::open_terminals`'s doc comment (this is the
+    /// same field, just folded from the snapshot into the persistent
+    /// per-thread model like `expanded_terminal` already is).
+    pub open_terminals: Vec<crate::TerminalItem>,
     pub local_terminal: crate::LocalTerminalItem,
     pub connection_status: String,
     pub session_modes: Option<SessionModesEvent>,
@@ -132,6 +138,14 @@ pub struct Model {
     pub expanded: Vec<bool>,
     pub displayed_thread: Option<usize>,
     pub expanded_terminal_id: Option<String>,
+    /// Terminal-tabs phase: every terminal id currently pinned open as a
+    /// full-view tab, in the order tabs were first opened (not
+    /// insertion-into-`terminals` order, which can shuffle independently
+    /// on refresh). `expanded_terminal_id` above is the *active* one --
+    /// always a member of this list while the overlay is open, and always
+    /// `None`/empty together (see `update_terminal`'s `Expand`/
+    /// `CloseTab`/`CloseOverlay` arms, which keep the two in lockstep).
+    pub open_terminal_ids: Vec<String>,
     pub local_terminal_last_text: String,
     pub active_project_path: Option<String>,
     pub traced_attachment_threads: HashSet<String>,
@@ -201,6 +215,14 @@ pub struct Model {
     /// in place so streaming output does not tear down row delegates.
     pub terminals_model: Rc<VecModel<crate::TerminalItem>>,
     pub terminal_model_keys: RefCell<Vec<String>>,
+    /// Terminal-tabs phase: the currently displayed thread's open tab set
+    /// (`ThreadModel::open_terminals`), reconciled the same way as
+    /// `terminals_model` above so a streaming output update to one tab
+    /// doesn't tear down and rebuild every tab's row delegate (which would
+    /// reset the very per-tab `Flickable` scroll position tabs exist to
+    /// preserve).
+    pub open_terminals_model: Rc<VecModel<crate::TerminalItem>>,
+    pub open_terminal_model_keys: RefCell<Vec<String>>,
 }
 
 impl Default for ThreadModel {
@@ -228,6 +250,7 @@ impl Default for ThreadModel {
             pending_request: crate::PendingRequestItem::default(),
             terminals: Vec::new(),
             expanded_terminal: None,
+            open_terminals: Vec::new(),
             local_terminal: crate::LocalTerminalItem::default(),
             connection_status: "Connecting...".to_owned(),
             session_modes: None,
