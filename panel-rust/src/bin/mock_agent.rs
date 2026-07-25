@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_request: agent_client_protocol::schema::v1::NewSessionRequest,
+            async move |request: agent_client_protocol::schema::v1::NewSessionRequest,
                         responder,
                         _connection| {
                 let id = format!("mock-session-{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
@@ -209,7 +209,15 @@ async fn main() -> Result<()> {
                         },
                     );
                 });
-                record_gateway_event("session/new", Some(&id), "");
+                // PISO-6: the live isolation matrix needs to assert each
+                // thread's `session/new` actually carried its OWN project's
+                // cwd (not the global override) -- `request.cwd` is the one
+                // place that's visible from outside the panel process, so
+                // it's logged as this event's `detail` instead of the
+                // previously-discarded `""`. Every existing assertion in
+                // this crate keys off `detail` by exact string match on
+                // prompt text, never `session/new`'s, so this is additive.
+                record_gateway_event("session/new", Some(&id), &request.cwd.to_string_lossy());
                 responder.respond(NewSessionResponse::new(SessionId::new(id)))
             },
             agent_client_protocol::on_receive_request!(),
