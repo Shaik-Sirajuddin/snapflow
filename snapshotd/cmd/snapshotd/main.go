@@ -10,11 +10,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,7 +24,7 @@ import (
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
 	"snapshotd/internal/daemonlock"
-	"snapshotd/internal/mcpadapter"
+	"snapshotd/internal/mcpsupervisor"
 	"snapshotd/internal/sdp"
 )
 
@@ -52,6 +50,8 @@ func main() {
 		err = cmdList(cfg, os.Args[2:])
 	case "close":
 		err = cmdClose(cfg, os.Args[2:])
+	case "mcp":
+		err = cmdMCP(cfg, os.Args[2:])
 	case "install":
 		err = cmdInstall(cfg, os.Args[2:])
 	case "-h", "--help", "help":
@@ -78,6 +78,13 @@ Usage:
   snapshotd launch <projectId>           convenience wrapper around daemon.launch
   snapshotd list                         list known process instances (bare daemon.list)
   snapshotd close <instanceId>           stop one running process instance (bare daemon.close)
+  snapshotd mcp status                   show the MCP listener's bind address and auth state
+  snapshotd mcp restart [--bind ADDR]    rebind the MCP listener (default 127.0.0.1:7777; a
+                                          non-loopback ADDR, e.g. 0.0.0.0:7777, is refused unless
+                                          mcp auth set has already been run)
+  snapshotd mcp auth set --user U --password P
+                                          set/replace the MCP listener's Basic Auth credentials
+  snapshotd mcp install-config get       print the MCP endpoint + credentials for a client config
   snapshotd install                      print what installing a system service would do (not implemented for real)`)
 }
 
@@ -106,9 +113,13 @@ func cmdServe(cfg config.Config, args []string) error {
 	}
 	defer d.Close()
 
+	// Written for operator/tooling visibility (e.g. a manual `kill` as a
+	// last resort) -- `snapshotd stop` itself no longer reads this; it goes
+	// through the SDP control socket (daemon.stop) instead, which works
+	// the same on every platform.
 	pidPath := cfg.ControlSocketPath + ".pid"
 	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
-		logger.Warn("could not write pidfile (snapshotd stop will not be able to find this process)", "path", pidPath, "err", err)
+		logger.Warn("could not write pidfile", "path", pidPath, "err", err)
 	}
 	defer os.Remove(pidPath)
 
@@ -126,16 +137,13 @@ func cmdServe(cfg config.Config, args []string) error {
 	}()
 	logger.Info("SDP control socket listening", "path", cfg.ControlSocketPath)
 
-	var mcpServer *mcpadapter.SSEServer
-	mcpErrCh := make(chan error, 1)
+	mcpStarted := false
 	if !*noMCP {
-		mcpServer = mcpadapter.NewSSEServer(d, cfg.MCPSSEAddr)
-		go func() {
-			if err := mcpServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				mcpErrCh <- err
-			}
-		}()
-		logger.Info("MCP SSE endpoint listening", "addr", cfg.MCPSSEAddr)
+		if err := d.Mcp.Start(context.Background()); err != nil {
+			return fmt.Errorf("starting MCP listener: %w", err)
+		}
+		mcpStarted = true
+		logger.Info("MCP SSE endpoint listening", "addr", d.Mcp.Status().Addr)
 	}
 
 	// Optional bundled acpx-server: single gateway owner under snapshotd serve.
@@ -175,12 +183,12 @@ func cmdServe(cfg config.Config, args []string) error {
 	select {
 	case sig := <-sigCh:
 		logger.Info("received signal, shutting down", "signal", sig.String())
+	case <-d.StopRequested():
+		logger.Info("stop requested via daemon.stop (snapshotd stop)")
 	case err := <-sdpErrCh:
 		if err != nil {
 			logger.Error("SDP server exited", "err", err)
 		}
-	case err := <-mcpErrCh:
-		logger.Error("MCP server exited", "err", err)
 	case <-func() <-chan struct{} {
 		if acpxMgr != nil {
 			return acpxMgr.Done()
@@ -198,8 +206,8 @@ func cmdServe(cfg config.Config, args []string) error {
 			logger.Warn("acpx-server stop", "err", err)
 		}
 	}
-	if mcpServer != nil {
-		_ = mcpServer.Shutdown(shutdownCtx)
+	if mcpStarted {
+		_ = d.Mcp.Stop(shutdownCtx)
 	}
 	_ = sdpServer.Shutdown()
 	return nil
@@ -236,30 +244,25 @@ func cmdStatus(cfg config.Config, args []string) error {
 }
 
 func cmdStop(cfg config.Config, args []string) error {
-	// v1 simplification: there is no dedicated daemon.stop SDP method (not
-	// in 06's primitives table) -- the CLI sends the process a graceful
-	// termination signal directly instead of round-tripping through SDP.
-	// This still matches the "thin client against an already-running
-	// daemon" model: if no daemon is running, the status check below fails
-	// to connect and we report that cleanly rather than silently no-op'ing.
+	// Ask the daemon to stop itself over the SDP control socket (daemon.stop
+	// -> Daemon.RequestStop, wired into cmdServe's shutdown select loop)
+	// rather than signaling its PID directly. This is the only mechanism
+	// that works identically on every platform: (*os.Process).Signal only
+	// supports os.Kill and os.Interrupt on Windows, not SIGTERM, so a
+	// PID+signal-based `stop` could never work there. Going through the
+	// control socket also means "no daemon reachable" is reported the same
+	// way status/launch/etc already report it, rather than as a separate
+	// PID-file-missing error path.
 	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
 	if err != nil {
 		return fmt.Errorf("no running daemon found at %s: %w", cfg.ControlSocketPath, err)
 	}
 	defer c.Close()
 
-	pid, err := readServePID(cfg)
-	if err != nil {
-		return fmt.Errorf("daemon is reachable but its PID file is missing/unreadable (%w); send SIGTERM to the `snapshotd serve` process manually", err)
+	if err := c.Call("daemon.stop", map[string]any{}, nil); err != nil {
+		return fmt.Errorf("daemon.stop: %w", err)
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("signaling daemon pid %d: %w", pid, err)
-	}
-	fmt.Printf("sent SIGTERM to snapshotd (pid %d)\n", pid)
+	fmt.Println("snapshotd is shutting down")
 	return nil
 }
 
@@ -334,6 +337,119 @@ func cmdClose(cfg config.Config, args []string) error {
 	return nil
 }
 
+// cmdMCP dispatches `snapshotd mcp <status|restart|auth|install-config>`.
+func cmdMCP(cfg config.Config, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: snapshotd mcp <status|restart|auth|install-config>")
+	}
+	switch args[0] {
+	case "status":
+		return cmdMCPStatus(cfg, args[1:])
+	case "restart":
+		return cmdMCPRestart(cfg, args[1:])
+	case "auth":
+		return cmdMCPAuth(cfg, args[1:])
+	case "install-config":
+		return cmdMCPInstallConfig(cfg, args[1:])
+	default:
+		return fmt.Errorf("unknown mcp subcommand %q (want status|restart|auth|install-config)", args[0])
+	}
+}
+
+func cmdMCPStatus(cfg config.Config, args []string) error {
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var status map[string]any
+	if err := c.Call("daemon.mcpStatus", map[string]any{}, &status); err != nil {
+		return fmt.Errorf("daemon.mcpStatus: %w", err)
+	}
+	enc, _ := json.MarshalIndent(status, "", "  ")
+	fmt.Println(string(enc))
+	return nil
+}
+
+func cmdMCPRestart(cfg config.Config, args []string) error {
+	fs := flag.NewFlagSet("mcp restart", flag.ExitOnError)
+	bind := fs.String("bind", "", "address to rebind the MCP listener to (default: keep current address); a non-loopback address (e.g. 0.0.0.0:7777) requires `mcp auth set` to have been run first")
+	_ = fs.Parse(args)
+
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var status map[string]any
+	if err := c.Call("daemon.mcpRestart", map[string]any{"bind": *bind}, &status); err != nil {
+		return fmt.Errorf("daemon.mcpRestart: %w", err)
+	}
+	if addr, _ := status["addr"].(string); addr != "" && !mcpsupervisor.IsLoopbackAddr(addr) {
+		fmt.Fprintf(os.Stderr, "WARNING: MCP listener is now bound to %s (non-loopback). "+
+			"HTTP Basic Auth credentials still travel base64-encoded, not encrypted -- "+
+			"this endpoint is only as safe as the network it's reachable from. "+
+			"Put it behind TLS (e.g. a reverse proxy) before exposing it beyond a trusted LAN.\n", addr)
+	}
+	enc, _ := json.MarshalIndent(status, "", "  ")
+	fmt.Println(string(enc))
+	return nil
+}
+
+func cmdMCPAuth(cfg config.Config, args []string) error {
+	if len(args) < 1 || args[0] != "set" {
+		return fmt.Errorf("usage: snapshotd mcp auth set --user U --password P")
+	}
+	fs := flag.NewFlagSet("mcp auth set", flag.ExitOnError)
+	user := fs.String("user", "", "Basic Auth username")
+	password := fs.String("password", "", "Basic Auth password (falls back to $SNAPSHOTD_MCP_PASSWORD if omitted -- "+
+		"a shell argument is visible to other local users via `ps`/procfs, an env var generally is not)")
+	_ = fs.Parse(args[1:])
+	if *password == "" {
+		*password = os.Getenv("SNAPSHOTD_MCP_PASSWORD")
+	}
+	if *user == "" || *password == "" {
+		return fmt.Errorf("usage: snapshotd mcp auth set --user U [--password P | $SNAPSHOTD_MCP_PASSWORD] (both required)")
+	}
+
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var status map[string]any
+	if err := c.Call("daemon.mcpAuthSet", map[string]any{"user": *user, "password": *password}, &status); err != nil {
+		return fmt.Errorf("daemon.mcpAuthSet: %w", err)
+	}
+	fmt.Println("MCP auth updated; run `snapshotd mcp restart` to bind beyond 127.0.0.1 if desired")
+	enc, _ := json.MarshalIndent(status, "", "  ")
+	fmt.Println(string(enc))
+	return nil
+}
+
+func cmdMCPInstallConfig(cfg config.Config, args []string) error {
+	if len(args) < 1 || args[0] != "get" {
+		return fmt.Errorf("usage: snapshotd mcp install-config get")
+	}
+
+	c, err := sdp.Dial(cfg.ControlSocketPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	var installConfig map[string]any
+	if err := c.Call("daemon.mcpInstallConfig", map[string]any{}, &installConfig); err != nil {
+		return fmt.Errorf("daemon.mcpInstallConfig: %w", err)
+	}
+	enc, _ := json.MarshalIndent(installConfig, "", "  ")
+	fmt.Println(string(enc))
+	return nil
+}
+
 func cmdInstall(cfg config.Config, args []string) error {
 	// Honest stub: this sandbox/environment must not touch host system
 	// services. Print exactly what a real implementation would do instead of
@@ -351,20 +467,4 @@ None of that is performed here -- this command intentionally only prints
 this description and exits 0, so it is never mistaken for having actually
 modified host service configuration.`)
 	return nil
-}
-
-// readServePID reads a pidfile written by `snapshotd serve` next to the
-// control socket. Kept intentionally simple (no locking beyond what os.Create
-// gives us) -- this is a v1 convenience for `snapshotd stop`, not a general
-// process-supervision primitive.
-func readServePID(cfg config.Config) (int, error) {
-	data, err := os.ReadFile(cfg.ControlSocketPath + ".pid")
-	if err != nil {
-		return 0, err
-	}
-	var pid int
-	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil {
-		return 0, err
-	}
-	return pid, nil
 }

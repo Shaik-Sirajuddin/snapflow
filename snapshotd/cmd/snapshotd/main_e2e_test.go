@@ -65,10 +65,6 @@ func runCLIErr(t *testing.T, snapshotdBin, homeDir string, args ...string) (stri
 }
 
 func TestCLI_ListAndClose_AgainstRealDaemon(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("cmdStop/serve pidfile+SIGTERM handling in main.go is unix-only in this build")
-	}
-
 	fixtureBin := buildBinary(t, "snapshotd/internal/procmgr/testdata/fixture", "fixture-bin")
 	snapshotdBin := buildBinary(t, ".", "snapshotd-bin")
 
