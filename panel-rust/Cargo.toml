@@ -70,6 +70,13 @@ i-slint-backend-testing = "1.17.1"
 # why production code goes through the transport-neutral `Gateway`
 # facade, not raw HTTP).
 reqwest = { version = "0.12", features = ["json"] }
+# PROF-4 (profile-only-backend-selection plan): e2e harnesses provision
+# their mock backend as a real admin-plane custom agent + profile now,
+# instead of the removed ACPX_BACKEND_CMD env-var write (see
+# agent_bridge.rs's own PROF-3 comment) -- `acpx_client::ext::admin::
+# AdminClient::create_custom_agent` takes an `acpx_proto::admin::
+# CustomAgentSpec` by value, so that type needs to be nameable here too.
+acpx-proto = { path = "../acpx/acpx-proto" }
 
 [build-dependencies]
 slint-build = "1.17.1"

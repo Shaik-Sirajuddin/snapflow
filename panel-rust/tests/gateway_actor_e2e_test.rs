@@ -7,8 +7,11 @@
 //! real binary, don't fake the boundary" testing discipline (see
 //! `panel-rust`'s own headless smoke-test methodology).
 
+use acpx_client::ext::admin::AdminClient;
+use acpx_proto::admin::CustomAgentSpec;
 use panel_rust::gateway_actor::spawn_acpx_thread;
 use panel_rust::protocol_types::AgentEvent;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -24,6 +27,63 @@ fn acpx_server_bin() -> PathBuf {
 fn mock_agent_bin() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/debug/rui-mock-agent")
+}
+
+/// PROF-4 (`profile-only-backend-selection` plan): registers `rui-mock-agent`
+/// as a real, durable admin-plane custom agent (`POST /admin/agents/custom`,
+/// see `acpx-server/src/transport/admin.rs`) and a profile naming it, then
+/// returns that profile's name -- the replacement for setting
+/// `ACPX_BACKEND_CMD` directly on the gateway process (removed from
+/// production in PROF-3; this closes the same gap in this file's own
+/// real-process test harness). Every test that used to call
+/// `handle.open_session(cwd)` against an `ACPX_BACKEND_CMD`-configured
+/// gateway now calls `handle.open_session_with_profile(cwd, &profile_name,
+/// ..)` instead -- the mock backend is selected through the exact same
+/// `_acpx.profile` path a real backend uses, not a shortcut.
+///
+/// `extra_env` layers additional env vars onto the custom agent's own spawn
+/// env (e.g. `RUI_MOCK_AGENT_EVENT_LOG`) -- on top of `RUI_MOCK_AGENT_
+/// PERSONA`, which this helper always sets from `persona`.
+async fn provision_mock_profile(
+    base_url: &str,
+    admin_port: u16,
+    admin_token: &str,
+    persona: &str,
+    extra_env: BTreeMap<String, String>,
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_millis(3000);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", admin_port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let admin = AdminClient::new(format!("http://127.0.0.1:{admin_port}"), admin_token);
+    let custom_agent_id = format!("mock-{persona}");
+    let mut env = extra_env;
+    env.insert("RUI_MOCK_AGENT_PERSONA".to_owned(), persona.to_owned());
+    admin
+        .create_custom_agent(&CustomAgentSpec {
+            id: custom_agent_id.clone(),
+            name: format!("mock agent ({persona})"),
+            command: mock_agent_bin().to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env,
+            cwd: None,
+        })
+        .await
+        .expect("admin/agents/custom create");
+
+    let handle = spawn_acpx_thread(base_url.to_owned());
+    handle
+        .create_profile(serde_json::json!({
+            "name": persona,
+            "agent_id": custom_agent_id,
+        }))
+        .await
+        .expect("profiles/create for the mock profile");
+    persona.to_owned()
 }
 
 /// Binds an ephemeral TCP port synchronously (std, not tokio -- this
@@ -93,30 +153,50 @@ fn spawn_acpx_server_with_retry(
 struct GatewayProcess {
     child: Child,
     pub base_url: String,
+    /// PROF-4: the real, admin-provisioned profile name a test should pass
+    /// to `open_session_with_profile` to reach `rui-mock-agent` -- see
+    /// `provision_mock_profile`'s doc comment.
+    pub profile_name: String,
 }
 
 impl GatewayProcess {
-    /// Spawns a real `acpx-server` process with `persona` as both its
-    /// `ACPX_DEFAULT_AGENT_ID` and the `RUI_MOCK_AGENT_PERSONA` its
-    /// backend replies with -- the same shape
+    /// Spawns a real `acpx-server` process, with `persona` naming its
+    /// `ACPX_DEFAULT_AGENT_ID` and doubling as the mock backend's
+    /// `RUI_MOCK_AGENT_PERSONA` reply tag -- the same shape
     /// `panel-rust::agent_bridge::ensure_gateway_running` uses in
-    /// production, just parameterized for a test's own tempdir.
+    /// production, just parameterized for a test's own tempdir. PROF-4:
+    /// no `ACPX_BACKEND_CMD` -- the mock backend is provisioned as a real
+    /// custom agent + profile instead (`provision_mock_profile`), and
+    /// `profile_name` is what callers pass to `open_session_with_profile`.
     async fn spawn(persona: &str, db_path: &std::path::Path) -> Self {
         let persona = persona.to_string();
+        let persona_for_profile = persona.clone();
         let db_path = db_path.to_path_buf();
+        let admin_port = free_port();
+        let admin_token = format!("test-admin-token-{admin_port}");
+        let admin_token_for_env = admin_token.clone();
         let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env(
-                    "ACPX_BACKEND_CMD",
-                    mock_agent_bin().to_string_lossy().to_string(),
-                )
                 .env("ACPX_DEFAULT_AGENT_ID", &persona)
                 .env("ACPX_DB_PATH", &db_path)
-                .env("RUI_MOCK_AGENT_PERSONA", &persona)
+                .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+                .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
                 .env("RUST_LOG", "error");
         });
-        GatewayProcess { child, base_url }
+        let profile_name = provision_mock_profile(
+            &base_url,
+            admin_port,
+            &admin_token,
+            &persona_for_profile,
+            BTreeMap::new(),
+        )
+        .await;
+        GatewayProcess {
+            child,
+            base_url,
+            profile_name,
+        }
     }
 }
 
@@ -171,9 +251,13 @@ async fn open_session_prompt_and_turn_ended_round_trip_through_a_real_gateway() 
     let mut handle = spawn_acpx_thread(gateway.base_url.clone());
     let mut events_rx = handle.take_events();
     let session_id = handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     assert!(!session_id.is_empty());
 
     handle
@@ -197,9 +281,13 @@ async fn resume_session_replays_history_via_session_load() {
     let mut opener = spawn_acpx_thread(gateway.base_url.clone());
     let mut opener_events = opener.take_events();
     let session_id = opener
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     opener
         .send_prompt("history before relaunch")
         .await
@@ -245,9 +333,13 @@ async fn reattach_session_uses_resume_without_replaying_history() {
 
     let opener = spawn_acpx_thread(gateway.base_url.clone());
     let session_id = opener
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     opener
         .send_prompt("history must stay cached locally")
         .await
@@ -394,13 +486,21 @@ async fn two_gateways_stay_isolated_no_cross_provider_bleed() {
     let mut claude_events = claude_handle.take_events();
 
     codex_handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &codex_gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("codex open_session");
+        .expect("codex open_session_with_profile");
     claude_handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &claude_gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("claude open_session");
+        .expect("claude open_session_with_profile");
 
     // Fire both prompts concurrently -- the negative-control shape this
     // plan's Phase 3 explicitly calls for: if the two gateways were ever
@@ -452,9 +552,13 @@ async fn window_close_does_not_close_the_gateway_session() {
 
     let handle = spawn_acpx_thread(gateway.base_url.clone());
     let session_id = handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
     handle.shutdown(); // simulates window/process close -- no session/close sent
     drop(handle);
 
@@ -489,27 +593,43 @@ async fn close_then_delete_session_round_trip_through_a_real_gateway() {
     let event_log = db_dir.path().join("backend-events.jsonl");
     let persona = "codex".to_string();
     let db_path = db_dir.path().join("acpx.sqlite3");
-    let event_log_for_env = event_log.clone();
+    let admin_port = free_port();
+    let admin_token = format!("test-admin-token-{admin_port}");
+    let admin_token_for_env = admin_token.clone();
     let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env(
-                "ACPX_BACKEND_CMD",
-                mock_agent_bin().to_string_lossy().to_string(),
-            )
             .env("ACPX_DEFAULT_AGENT_ID", &persona)
             .env("ACPX_DB_PATH", &db_path)
-            .env("RUI_MOCK_AGENT_PERSONA", &persona)
-            .env("RUI_MOCK_AGENT_EVENT_LOG", &event_log_for_env)
+            .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
             .env("RUST_LOG", "error");
     });
-    let gateway = GatewayProcess { child, base_url };
+    // PROF-4: `RUI_MOCK_AGENT_EVENT_LOG` goes on the custom agent's own
+    // spawn env (not the gateway's) -- see `provision_mock_profile`'s doc
+    // comment.
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert(
+        "RUI_MOCK_AGENT_EVENT_LOG".to_owned(),
+        event_log.to_string_lossy().into_owned(),
+    );
+    let profile_name =
+        provision_mock_profile(&base_url, admin_port, &admin_token, "codex", extra_env).await;
+    let gateway = GatewayProcess {
+        child,
+        base_url,
+        profile_name,
+    };
 
     let handle = spawn_acpx_thread(gateway.base_url.clone());
     let session_id = handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
 
     handle.close_session(false).await.expect("close_session");
 
@@ -569,28 +689,41 @@ async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
     let event_log = db_dir.path().join("backend-events.jsonl");
     let persona = "codex".to_string();
     let db_path = db_dir.path().join("acpx.sqlite3");
-    let event_log_for_env = event_log.clone();
+    let admin_port = free_port();
+    let admin_token = format!("test-admin-token-{admin_port}");
+    let admin_token_for_env = admin_token.clone();
     let (child, base_url) = spawn_acpx_server_with_retry(move |command, port| {
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env(
-                "ACPX_BACKEND_CMD",
-                mock_agent_bin().to_string_lossy().to_string(),
-            )
             .env("ACPX_DEFAULT_AGENT_ID", &persona)
             .env("ACPX_DB_PATH", &db_path)
-            .env("RUI_MOCK_AGENT_PERSONA", &persona)
-            .env("RUI_MOCK_AGENT_EVENT_LOG", &event_log_for_env)
+            .env("ACPX_ADMIN_TOKEN", &admin_token_for_env)
+            .env("ACPX_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
             .env("RUST_LOG", "error");
     });
-    let gateway = GatewayProcess { child, base_url };
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert(
+        "RUI_MOCK_AGENT_EVENT_LOG".to_owned(),
+        event_log.to_string_lossy().into_owned(),
+    );
+    let profile_name =
+        provision_mock_profile(&base_url, admin_port, &admin_token, "codex", extra_env).await;
+    let gateway = GatewayProcess {
+        child,
+        base_url,
+        profile_name,
+    };
 
     let mut handle = spawn_acpx_thread(gateway.base_url.clone());
     let mut events_rx = handle.take_events();
     handle
-        .open_session(std::env::current_dir().unwrap())
+        .open_session_with_profile(
+            std::env::current_dir().unwrap(),
+            &gateway.profile_name,
+            Vec::new(),
+        )
         .await
-        .expect("open_session");
+        .expect("open_session_with_profile");
 
     // Critical, easy to get wrong: `AcpxThreadHandle::send_prompt`'s own
     // doc comment says it "drain[s] the turn to completion" before

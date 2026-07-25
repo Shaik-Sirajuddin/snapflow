@@ -4486,6 +4486,7 @@ name = "panel-rust"
 version = "0.1.0"
 dependencies = [
  "acpx-client",
+ "acpx-proto",
  "agent-client-protocol",
  "i-slint-backend-testing",
  "notify",
