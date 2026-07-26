@@ -255,7 +255,7 @@ impl Drop for ServerGuard {
 
 /// Spawns the real, already-built `acpx-server` binary against an
 /// ephemeral HTTP bind address, then polls until its HTTP listener
-/// actually accepts a connection. The default-agent `ACPX_BACKEND_CMD` is
+/// actually accepts a connection. The default-agent `ACPX_DEFAULT_ACP_COMMAND` is
 /// left at its own default (unused by this test -- every session goes
 /// through a profile, never native mode) rather than pointed at a
 /// stand-in, matching how a real deployment would actually be configured.

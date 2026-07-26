@@ -4326,6 +4326,11 @@ fn take_background_override(request: &mut serde_json::Value) -> Option<bool> {
                     .cloned()
                     .ok_or(RouterError::UnknownAgentId(agent_id))?;
                 let outcome = acpx_registry::install(&agent).await?;
+                // Install may have just written a ready marker / confirmed
+                // runtimes that were missing at process start -- drop the
+                // short which() cache so agents/list|status see Installed
+                // on the next call without restart (agents-install-runtime).
+                crate::detect::invalidate_which_cache();
                 serde_json::json!({ "id": agent.id, "outcome": format!("{outcome:?}") })
             }
             "profiles/create" | "profiles/update" => {
@@ -7112,6 +7117,7 @@ async fn dispatch_agents_install_shared(
             .ok_or(RouterError::UnknownAgentId(agent_id))?
     };
     let outcome = acpx_registry::install(&agent).await?;
+    crate::detect::invalidate_which_cache();
     Ok(serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -8206,7 +8212,16 @@ fn npx_spawn_spec(agent: &acpx_registry::Agent) -> Option<acpx_conductor::SpawnS
     if let Some(npx) = &agent.distribution.npx {
         let mut args = vec!["-y".to_string(), npx.package.clone()];
         args.extend(npx.args.iter().cloned());
-        return Some(acpx_conductor::SpawnSpec::new("npx", args));
+        // Bundled ACP Node (when global-first lost and acpxmgr set
+        // SNAPFLOW_ACP_NODE_HOME): use absolute npx so we never mix
+        // global/bundled bins mid-spawn.
+        let program = std::env::var("SNAPFLOW_ACP_NODE_HOME")
+            .ok()
+            .map(|h| std::path::Path::new(&h).join("bin").join("npx"))
+            .filter(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "npx".to_string());
+        return Some(acpx_conductor::SpawnSpec::new(program, args));
     }
     if let Some(uvx) = &agent.distribution.uvx {
         let mut args = vec![uvx.package.clone()];

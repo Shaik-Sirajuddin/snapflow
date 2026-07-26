@@ -41,7 +41,7 @@ snapshotd serve
    export ACPX_CONFIG_FILE=/tmp/acpx-config.json
    export ACPX_HTTP_BIND=127.0.0.1:8790
    export ACPX_DB_PATH=/tmp/snapshotd-acpx-demo/acpx.sqlite3
-   # ACPX_BACKEND_CMD=…  # real agent or mock
+   # ACPX_DEFAULT_ACP_COMMAND=…  # real agent or mock
    acpx-server
    ```
 

@@ -8,9 +8,18 @@
   already present.
 - Whatever runtime your chosen backend agent needs: `node`+`npm` for an
   `npx`-distributed adapter (e.g. `codex-acp`, `claude-agent-acp`), `uv`
-  for a `uvx`-distributed one. `acpx-core`'s `detect.rs` checks for these
-  on `PATH` and reports `RuntimeMissing`/`NotInstalled` via
-  `agents/list`/`agents/status` if absent.
+  for a `uvx`-distributed one. Resolution is **global-first**: system
+  `node`/`npm`/`npx` on `PATH` win; otherwise Snapflow may use a
+  product-local official Node under
+  `$SNAPFLOW_INSTALL_DIR/runtime/node` (see `scripts/lib/acp-node-runtime.sh`
+  and `snapshotd doctor` / `snapshotd runtime install node`). When the
+  bundled runtime wins, acpxmgr sets `SNAPFLOW_ACP_NODE_HOME` for the
+  acpx-server child.
+- `agents/list` / `agents/status` / `agents/install`: for `npx` agents,
+  **Installed** means runtime present **and** a ready marker under
+  `~/.acpx/adapters/<id>/.ready` (written by `agents/install` after
+  `npm install --prefix …`). Runtime present without a marker is
+  `not_installed`; missing node/npm is `runtime_missing`.
 - If you're using managed profiles against a real provider (Anthropic/
   OpenAI/litellm), the relevant API key. If you're using native mode
   against an already-`claude`/`codex`-CLI-logged-in machine (ambient
@@ -33,7 +42,7 @@ optimized binary.
 No config file is required for a single default backend:
 
 ```sh
-ACPX_BACKEND_CMD="npx -y @agentclientprotocol/codex-acp@1.1.2" \
+ACPX_DEFAULT_ACP_COMMAND="npx -y @agentclientprotocol/codex-acp@1.1.2" \
 ACPX_HTTP_BIND="127.0.0.1:8790" \
   target/debug/acpx-server
 ```
@@ -57,8 +66,9 @@ connection with live `session/update` streaming.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ACPX_BACKEND_CMD` | `npx -y @agentclientprotocol/codex-acp@1.1.2` | Space-separated program + args for the default/native-mode backend. |
+| `ACPX_DEFAULT_ACP_COMMAND` | `npx -y @agentclientprotocol/codex-acp@1.1.2` | Space-separated program + args for the native-mode default ACP agent command (profiles override). Legacy alias: `ACPX_BACKEND_CMD`. |
 | `ACPX_DEFAULT_AGENT_ID` | `default` | Agent id that command is registered under. |
+| `SNAPFLOW_ACP_NODE_HOME` | unset | When set (by acpxmgr when product-bundled Node wins global-first resolve), acpx uses `$SNAPFLOW_ACP_NODE_HOME/bin/{node,npm,npx}` for detect/install/spawn. |
 | `ACPX_NATIVE_AUTH_METHOD_ID` | unset | Explicit backend `authenticate` method for native/unmanaged sessions. Leave unset to preserve ACPX's no-guessing default; set only when the configured backend requires a known method (for example `api-key` for the OpenHands Codex wrapper). |
 | `ACPX_HTTP_BIND` | `127.0.0.1:8790` | HTTP/WS bind address. Loopback only by default -- do not point at a public interface without auth + a TLS-terminating reverse proxy (acpx never terminates TLS itself). |
 | `ACPX_AUTH_TOKEN` | unset (no auth) | If set, requires `Authorization: Bearer <token>` on `POST /rpc` and the `GET /ws` upgrade. Empty string is treated as unset. |

@@ -23,6 +23,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"snapshotd/internal/acpnode"
 )
 
 // AdminBind is the fixed loopback address acpx-server's admin plane binds
@@ -45,8 +47,8 @@ type Config struct {
 	// McpURL is the snapshotd Streamable HTTP MCP endpoint
 	// (e.g. http://127.0.0.1:7777/mcp).
 	McpURL string
-	// BackendCmd is optional ACPX_BACKEND_CMD.
-	BackendCmd string
+	// DefaultAcpCommand is optional ACPX_DEFAULT_ACP_COMMAND.
+	DefaultAcpCommand string
 	// DefaultAgentID is optional ACPX_DEFAULT_AGENT_ID (default "default").
 	DefaultAgentID string
 	// ExtraEnv is merged into the child environment.
@@ -291,7 +293,11 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	cmd.Cancel = func() error {
 		return killProcessGroup(cmd.Process.Pid, syscall.SIGTERM)
 	}
-	cmd.Env = append(os.Environ(),
+	// ACP Node/npm: global-first, then product-bundled official Node.
+	// When bundled wins, inject SNAPFLOW_ACP_NODE_HOME + PATH so
+	// agents/install and npx spawns use the same prefix.
+	cmd.Env = append(os.Environ(), acpnode.EnvForAcpx(acpnode.Resolve())...)
+	cmd.Env = append(cmd.Env,
 		"ACPX_CONFIG_FILE="+cfg.ConfigPath,
 		"ACPX_HTTP_BIND="+cfg.HttpBind,
 		// acpx-core's LifecycleConfig defaults (max_sessions_total: 128,
@@ -316,8 +322,8 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 	if cfg.DbPath != "" {
 		cmd.Env = append(cmd.Env, "ACPX_DB_PATH="+cfg.DbPath)
 	}
-	if cfg.BackendCmd != "" {
-		cmd.Env = append(cmd.Env, "ACPX_BACKEND_CMD="+cfg.BackendCmd)
+	if cfg.DefaultAcpCommand != "" {
+		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_ACP_COMMAND="+cfg.DefaultAcpCommand)
 	}
 	if cfg.DefaultAgentID != "" {
 		cmd.Env = append(cmd.Env, "ACPX_DEFAULT_AGENT_ID="+cfg.DefaultAgentID)

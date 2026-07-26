@@ -108,7 +108,7 @@ impl GatewayProcess {
         let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
                 .env("ACPX_DEFAULT_AGENT_ID", "mcp-agents-test-agent")
                 .env("RUST_LOG", "error");
         });

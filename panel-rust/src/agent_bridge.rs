@@ -1023,7 +1023,7 @@ fn probe_http_endpoint(addr: &str, path: &str) -> bool {
 /// rui-mock-agent` is a compile-time-baked dev-checkout path that doesn't
 /// exist on an end user's machine at all. The old code returned that
 /// nonexistent path anyway, and [`spawn_gateway_process`] set
-/// `ACPX_BACKEND_CMD` to it *unconditionally* -- so a real release install
+/// `ACPX_DEFAULT_ACP_COMMAND` to it *unconditionally* -- so a real release install
 /// with no operator-started acpx-server never reached a real agent on this
 /// autospawn path at all: acpx-server would try to exec a garbage path
 /// instead of falling back to its own real, working default
@@ -1057,7 +1057,7 @@ fn probe_http_endpoint(addr: &str, path: &str) -> bool {
 /// the dev_mock_agent-existence issue above, just one layer up. Automated
 /// tests and explicit local mock-agent workflows must set `RUI_TEST_MODE=1`
 /// themselves; a plain dev/production launch must never need to.
-fn resolve_backend_agent_command() -> Option<String> {
+fn resolve_default_acp_command() -> Option<String> {
     if std::env::var("RUI_TEST_MODE").as_deref() != Ok("1") {
         return None;
     }
@@ -1075,17 +1075,17 @@ fn resolve_backend_agent_command() -> Option<String> {
     None
 }
 
-/// `ServerConfig::from_env`'s own `ACPX_BACKEND_CMD` fallback
+/// `ServerConfig::from_env`'s own `ACPX_DEFAULT_ACP_COMMAND` fallback
 /// (`acpx-server/src/config.rs`) is unconditionally `codex-acp` -- it has
 /// no notion of `provider`/`ACPX_DEFAULT_AGENT_ID` at all, that field is
-/// display-only. So when [`resolve_backend_agent_command`] found no
+/// display-only. So when [`resolve_default_acp_command`] found no
 /// explicit override, a "claude" persona gateway was *still* silently
 /// spawning the real `codex-acp` adapter as its backend: found live
 /// (chat-panel-live-fixes.md phase 4) via a running instance's actual
 /// spawned child-process list, not by re-reading the code. Mirrors the
 /// per-provider default `acpx/scripts/openhands-acpx-claude.sh` already
 /// documents and tests for exactly this integration point.
-fn default_backend_command_for_provider(provider: &str) -> Option<&'static str> {
+fn default_acp_command_for_provider(provider: &str) -> Option<&'static str> {
     match provider {
         "claude" => Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1"),
         // "codex" (and anything else) already matches acpx-server's own
@@ -1413,14 +1413,14 @@ fn reserve_ephemeral_port() -> Option<(u16, File)> {
 ///    `snapshotd`'s `AcpxEnabled` defaults ON whenever an `acpx-server`
 ///    binary is discoverable (`SNAPSHOTD_ACPX_ENABLED` unset -- see
 ///    `snapshotd/internal/config/config.go`), bound to this exact same
-///    default port 8790, and its own `AcpxBackendCmd` defaults to
+///    default port 8790, and its own `AcpxDefaultAcpCommand` defaults to
 ///    *empty*, which means the bundled `acpx-server` picks its own
 ///    real, auth-requiring backend -- **not** a mock. So on a machine
 ///    where snapshotd is running normally, step 2 above already reuses
 ///    a real, production-backed gateway with zero extra configuration;
 ///    there is no separate "production mode" switch to flip. Do not
 ///    hand-launch a second ad hoc `acpx-server` (e.g. with
-///    `ACPX_BACKEND_CMD` forced to `rui-mock-agent`, the dev/test
+///    `ACPX_DEFAULT_ACP_COMMAND` forced to `rui-mock-agent`, the dev/test
 ///    default below) for manual/live verification just because this is
 ///    real-feeling infra -- that only shadows the real one and makes
 ///    every thread look like it's talking to a fake backend. Only set
@@ -1597,22 +1597,22 @@ fn spawn_gateway_process(
             cmd.stderr(std::process::Stdio::null());
         }
     }
-    // Only set ACPX_BACKEND_CMD when we have a real command to point it
+    // Only set ACPX_DEFAULT_ACP_COMMAND when we have a real command to point it
     // at (an explicit override, or a dev-checkout mock binary confirmed
     // to actually exist) -- leaving it unset lets acpx-server fall back
     // to its own real, working default (a genuine LLM-backed ACP adapter)
     // instead of being pointed at a nonexistent path. See
-    // resolve_backend_agent_command's doc comment for the full story.
-    if let Some(backend_cmd) = resolve_backend_agent_command() {
-        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
-    } else if let Some(backend_cmd) = default_backend_command_for_provider(provider) {
+    // resolve_default_acp_command's doc comment for the full story.
+    if let Some(backend_cmd) = resolve_default_acp_command() {
+        cmd.env("ACPX_DEFAULT_ACP_COMMAND", backend_cmd);
+    } else if let Some(backend_cmd) = default_acp_command_for_provider(provider) {
         // No explicit override: acpx-server's own built-in default is
-        // codex-only (see default_backend_command_for_provider's doc
+        // codex-only (see default_acp_command_for_provider's doc
         // comment), so a non-codex provider needs its real adapter
         // spelled out here instead of silently getting codex-acp anyway.
-        cmd.env("ACPX_BACKEND_CMD", backend_cmd);
+        cmd.env("ACPX_DEFAULT_ACP_COMMAND", backend_cmd);
     }
-    // Independent of which ACPX_BACKEND_CMD branch above fired --
+    // Independent of which ACPX_DEFAULT_ACP_COMMAND branch above fired --
     // found live via /verify-impl-style subagent review: this used to be
     // an else-if off the branches above, so an explicit RUI_ACP_AGENT_CMD/
     // RUI_USE_DEV_MOCK_AGENT override (still legitimately codex-acp
@@ -4187,14 +4187,14 @@ mod tests {
 
     /// `RUI_ACP_AGENT_CMD` (a real override) always wins over the
     /// dev-checkout mock-agent fallback -- the production-build regression
-    /// found this session was resolve_backend_agent_command silently
+    /// found this session was resolve_default_acp_command silently
     /// defaulting to a nonexistent path when NEITHER applies (see its own
     /// doc comment); this specific override-wins branch is unaffected by
     /// that fix but is the one part of this function cheaply testable
     /// without touching the real dev_mock_agent build artifact every other
     /// real-process test in this file also depends on existing.
     #[test]
-    fn resolve_backend_agent_command_prefers_explicit_override() {
+    fn resolve_default_acp_command_prefers_explicit_override() {
         // SAFETY (env mutation in a test): guarded by restoring the prior
         // value unconditionally before returning, and this whole suite
         // already runs under --test-threads=1 per this crate's own
@@ -4206,7 +4206,7 @@ mod tests {
             std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
             std::env::set_var("RUI_TEST_MODE", "1");
         }
-        let resolved = resolve_backend_agent_command();
+        let resolved = resolve_default_acp_command();
         match prior {
             Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
             None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
@@ -4224,14 +4224,14 @@ mod tests {
     /// never silently redirect a real interactive launch's chat sessions
     /// to a mock or arbitrary command.
     #[test]
-    fn resolve_backend_agent_command_ignores_override_without_test_mode() {
+    fn resolve_default_acp_command_ignores_override_without_test_mode() {
         let prior = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_test_mode = std::env::var("RUI_TEST_MODE").ok();
         unsafe {
             std::env::set_var("RUI_ACP_AGENT_CMD", "/some/real/agent --flag");
             std::env::remove_var("RUI_TEST_MODE");
         }
-        let resolved = resolve_backend_agent_command();
+        let resolved = resolve_default_acp_command();
         match prior {
             Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
             None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
@@ -4251,14 +4251,14 @@ mod tests {
     /// used to verify real acpx behavior gets the real gateway default
     /// unless someone deliberately asks for the mock.
     #[test]
-    fn resolve_backend_agent_command_ignores_mock_binary_without_explicit_opt_in() {
+    fn resolve_default_acp_command_ignores_mock_binary_without_explicit_opt_in() {
         let prior_override = std::env::var("RUI_ACP_AGENT_CMD").ok();
         let prior_opt_in = std::env::var("RUI_USE_DEV_MOCK_AGENT").ok();
         unsafe {
             std::env::remove_var("RUI_ACP_AGENT_CMD");
             std::env::remove_var("RUI_USE_DEV_MOCK_AGENT");
         }
-        let resolved = resolve_backend_agent_command();
+        let resolved = resolve_default_acp_command();
         match prior_override {
             Some(value) => unsafe { std::env::set_var("RUI_ACP_AGENT_CMD", value) },
             None => unsafe { std::env::remove_var("RUI_ACP_AGENT_CMD") },
@@ -4269,25 +4269,25 @@ mod tests {
         }
         // Even though target/debug/rui-mock-agent genuinely exists in this
         // checkout (every other real-process test in this file depends on
-        // it), resolve_backend_agent_command must still return None here.
+        // it), resolve_default_acp_command must still return None here.
         assert_eq!(resolved, None);
     }
 
-    /// acpx-server's own ACPX_BACKEND_CMD default is codex-only (see this
+    /// acpx-server's own ACPX_DEFAULT_ACP_COMMAND default is codex-only (see this
     /// function's own doc comment) -- "claude" is the one provider that
     /// genuinely needs an explicit override; every other provider string
     /// (including "codex" itself and anything unrecognized) must return
-    /// None so spawn_gateway_process leaves ACPX_BACKEND_CMD unset and
+    /// None so spawn_gateway_process leaves ACPX_DEFAULT_ACP_COMMAND unset and
     /// falls through to that real default instead.
     #[test]
-    fn default_backend_command_for_provider_only_overrides_claude() {
+    fn default_acp_command_for_provider_only_overrides_claude() {
         assert_eq!(
-            default_backend_command_for_provider("claude"),
+            default_acp_command_for_provider("claude"),
             Some("npx -y @agentclientprotocol/claude-agent-acp@0.58.1")
         );
-        assert_eq!(default_backend_command_for_provider("codex"), None);
+        assert_eq!(default_acp_command_for_provider("codex"), None);
         assert_eq!(
-            default_backend_command_for_provider("unknown-provider"),
+            default_acp_command_for_provider("unknown-provider"),
             None
         );
     }
@@ -4562,17 +4562,17 @@ mod tests {
         }
 
         fn spawn_with_persona_and_db(persona: &str, db_path: Option<&std::path::Path>) -> Self {
-            Self::spawn_with_backend_cmd(&mock_agent_bin().to_string_lossy(), persona, db_path)
+            Self::spawn_with_default_acp_command(&mock_agent_bin().to_string_lossy(), persona, db_path)
         }
 
         /// Same as [`Self::spawn_with_persona_and_db`], but with an
-        /// arbitrary `ACPX_BACKEND_CMD` instead of the real
+        /// arbitrary `ACPX_DEFAULT_ACP_COMMAND` instead of the real
         /// `rui-mock-agent` binary -- used by the interactive-relay test
         /// below, which needs a stand-in backend that sends a real
         /// mid-turn `session/request_permission` request (`rui-mock-agent`
         /// only speaks the plain three-notification-then-EndTurn shape
         /// its own module doc describes, no agent-initiated requests).
-        fn spawn_with_backend_cmd(
+        fn spawn_with_default_acp_command(
             backend_cmd: &str,
             persona: &str,
             db_path: Option<&std::path::Path>,
@@ -4580,7 +4580,7 @@ mod tests {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command
                     .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", backend_cmd)
+                    .env("ACPX_DEFAULT_ACP_COMMAND", backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
                     .env("RUST_LOG", "error");
@@ -4606,7 +4606,7 @@ mod tests {
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command
                     .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", &backend_cmd)
+                    .env("ACPX_DEFAULT_ACP_COMMAND", &backend_cmd)
                     .env("ACPX_DEFAULT_AGENT_ID", persona)
                     .env("RUI_MOCK_AGENT_PERSONA", persona)
                     .env("RUI_MOCK_AGENT_EVENT_LOG", event_log_path)
@@ -5025,7 +5025,7 @@ mod tests {
             "codex",
             |command, _port| {
                 // Same real-auth wiring spawn_gateway_process uses for a
-                // real "codex" thread -- no ACPX_BACKEND_CMD override, so
+                // real "codex" thread -- no ACPX_DEFAULT_ACP_COMMAND override, so
                 // acpx-server falls through to its own real default (real
                 // codex-acp via npx), not a mock.
                 command.env("ACPX_NATIVE_AUTH_METHOD_ID", "api-key");
@@ -5249,9 +5249,9 @@ mod tests {
             "claude",
             |command, _port| {
                 // acpx-server's own bare default is codex-only
-                // (config.rs's `ACPX_BACKEND_CMD` fallback is literally
+                // (config.rs's `ACPX_DEFAULT_ACP_COMMAND` fallback is literally
                 // `npx ... codex-acp`) -- exactly the real bug
-                // `default_backend_command_for_provider`/
+                // `default_acp_command_for_provider`/
                 // `spawn_gateway_process` exists to close. Without this
                 // override, a "claude" test/thread silently gets a real
                 // codex-acp reply instead (confirmed live: this test
@@ -5261,8 +5261,8 @@ mod tests {
                 // explicit API-key exchange, claude-acp's ambient auth
                 // (~/.claude/.credentials.json) doesn't need one.
                 command.env(
-                    "ACPX_BACKEND_CMD",
-                    default_backend_command_for_provider("claude")
+                    "ACPX_DEFAULT_ACP_COMMAND",
+                    default_acp_command_for_provider("claude")
                         .expect("claude must have a real backend command override"),
                 );
             },
@@ -5767,7 +5767,7 @@ done
 "#,
         )
         .expect("write delayed backend script");
-        let gateway = TestGateway::spawn_with_backend_cmd(
+        let gateway = TestGateway::spawn_with_default_acp_command(
             &format!("sh {}", script_path.display()),
             "slow-start",
             None,
@@ -6589,7 +6589,7 @@ done
     #[test]
     fn permission_request_relay_round_trips_through_the_bridge() {
         // Written to a real temp file (rather than passed as `sh -c
-        // '...'`) because `ACPX_BACKEND_CMD` is parsed by naive
+        // '...'`) because `ACPX_DEFAULT_ACP_COMMAND` is parsed by naive
         // whitespace-splitting (see `acpx-server/src/config.rs`), which
         // would mangle an inline multi-word script.
         let script_dir = tempfile::tempdir().expect("script tempdir");
@@ -6622,7 +6622,7 @@ done
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command
                     .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "relay-test")
                     .env("RUST_LOG", "error");
             });
@@ -6789,7 +6789,7 @@ done
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command
                     .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "cancel-test")
                     .env("RUST_LOG", "error");
             });
@@ -6849,11 +6849,11 @@ done
     fn add_thread_with_profile_unlocks_terminal_access_end_to_end() {
         // This test needs a stand-in backend that sends a real mid-turn
         // `terminal/create` request, which `rui-mock-agent`/
-        // `spawn_with_backend_cmd`'s default backend cannot do -- reuse
+        // `spawn_with_default_acp_command`'s default backend cannot do -- reuse
         // the same stand-in shell script technique
         // `permission_request_relay_round_trips_through_the_bridge`
         // uses, driving a raw `acpx-server` process directly (built
-        // below) instead of going through `spawn_with_backend_cmd`.
+        // below) instead of going through `spawn_with_default_acp_command`.
         let script_dir = tempfile::tempdir().expect("script tempdir");
         let script_path = script_dir.path().join("stand_in_backend.sh");
         std::fs::write(
@@ -6881,7 +6881,7 @@ done
         let mut command = std::process::Command::new(acpx_server_bin());
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+            .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
             .env("ACPX_DEFAULT_AGENT_ID", "profile-picker-agent")
             .env("RUST_LOG", "error")
             .stdin(std::process::Stdio::null())
@@ -7027,7 +7027,7 @@ done
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command
                     .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "mode-config-test")
                     .env("RUST_LOG", "error");
             });
@@ -7307,7 +7307,7 @@ done
             let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
                 command
                     .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                    .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                    .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
                     .env("ACPX_DEFAULT_AGENT_ID", "stream-merge-test")
                     .env("RUST_LOG", "error");
             });

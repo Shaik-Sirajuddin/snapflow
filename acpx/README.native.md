@@ -43,7 +43,7 @@ No config file needed. This example uses `codex-acp` against an
 already-`codex login`'d machine (ambient auth, no API key required):
 
 ```sh
-ACPX_BACKEND_CMD="npx -y @agentclientprotocol/codex-acp@1.1.2" \
+ACPX_DEFAULT_ACP_COMMAND="npx -y @agentclientprotocol/codex-acp@1.1.2" \
 ACPX_HTTP_BIND="127.0.0.1:8790" \
   target/release/acpx-server
 ```

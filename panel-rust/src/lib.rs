@@ -3110,7 +3110,7 @@ mod lifecycle_tests {
         let mut command = std::process::Command::new(acpx_server_bin_for_lifecycle_test());
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-            .env("ACPX_BACKEND_CMD", mock_agent.to_string_lossy().into_owned())
+            .env("ACPX_DEFAULT_ACP_COMMAND", mock_agent.to_string_lossy().into_owned())
             .env("ACPX_DEFAULT_AGENT_ID", "codex")
             .env("RUI_MOCK_AGENT_PERSONA", "codex")
             .env("RUST_LOG", "error")

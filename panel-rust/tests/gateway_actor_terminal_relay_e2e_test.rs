@@ -81,8 +81,8 @@ struct GatewayProcess {
 
 impl GatewayProcess {
     /// Spawns a real `acpx-server` with `backend_script`'s contents as
-    /// its `ACPX_BACKEND_CMD` (written to a temp file first --
-    /// `ACPX_BACKEND_CMD` is parsed by naive whitespace-splitting, see
+    /// its `ACPX_DEFAULT_ACP_COMMAND` (written to a temp file first --
+    /// `ACPX_DEFAULT_ACP_COMMAND` is parsed by naive whitespace-splitting, see
     /// `acpx-server/src/config.rs`, so an inline multi-word script
     /// cannot be passed directly).
     async fn spawn(backend_script: &str, script_dir: &std::path::Path) -> Self {
@@ -91,7 +91,7 @@ impl GatewayProcess {
         let (child, base_url) = spawn_acpx_server_with_retry(|command, port| {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
-                .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+                .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
                 .env("ACPX_DEFAULT_AGENT_ID", "terminal-relay-agent")
                 .env("RUST_LOG", "error");
         });

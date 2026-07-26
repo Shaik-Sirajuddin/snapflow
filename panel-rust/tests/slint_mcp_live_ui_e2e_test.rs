@@ -155,7 +155,7 @@ impl LiveUiHarness {
         let acpx_server = Command::new(acpx_server_bin())
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{gateway_port}"))
             .env(
-                "ACPX_BACKEND_CMD",
+                "ACPX_DEFAULT_ACP_COMMAND",
                 mock_agent_bin().to_string_lossy().to_string(),
             )
             .env("ACPX_DEFAULT_AGENT_ID", persona)

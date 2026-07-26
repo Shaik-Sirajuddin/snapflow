@@ -1,7 +1,9 @@
-//! Install-step execution (`04-phased-plan.md` step 19): given an agent's
-//! declared distribution, either confirm the required on-demand runtime is
-//! present (`npx`/`uvx`) or download+extract a platform-matched `binary`
-//! archive into `~/.acpx/adapters/<agent_id>/`.
+//! Install-step execution (`04-phased-plan.md` step 19; extended by
+//! `memory/acpx/gen/plans/agents-install-runtime`): given an agent's
+//! declared distribution, either pre-fetch an on-demand `npx`/`uvx`
+//! package (and write a ready marker under `~/.acpx/adapters/<id>/`) or
+//! download+extract a platform-matched `binary` archive into that same
+//! adapters tree.
 //!
 //! Per `05-open-risks.md`'s cross-platform installability notes: the
 //! `binary` archive's format (`.tar.gz`/`.tgz` vs `.zip`) is sniffed from
@@ -15,6 +17,11 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// Filename written under `adapters/<agent_id>/` when an npx/uvx package
+/// pre-fetch (or binary extract) has succeeded. `acpx-core::detect` treats
+/// this as "Installed" for runtime-distributed agents.
+pub const READY_MARKER_NAME: &str = ".ready";
+
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
     #[error("agent {0} declares no supported distribution method")]
@@ -26,6 +33,15 @@ pub enum InstallError {
         runtime: &'static str,
         agent_id: String,
         method: &'static str,
+    },
+    #[error(
+        "failed to pre-fetch {method} package `{package}` for agent `{agent_id}`: {detail}"
+    )]
+    PackageFetchFailed {
+        agent_id: String,
+        method: &'static str,
+        package: String,
+        detail: String,
     },
     #[error(
         "agent `{agent_id}` has no binary distribution entry for host platform `{platform_key}`"
@@ -58,6 +74,8 @@ pub enum InstallError {
     },
     #[error("failed to create adapter directory {0}: {1}")]
     CreateDir(PathBuf, #[source] std::io::Error),
+    #[error("failed to write ready marker {0}: {1}")]
+    ReadyMarkerWrite(PathBuf, #[source] std::io::Error),
 }
 
 /// Outcome of a successful [`install`]/[`install_into`] call, distinct per
@@ -65,9 +83,13 @@ pub enum InstallError {
 /// top of it (out of scope for this crate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallOutcome {
-    /// `npx`/`uvx`: the runtime is on `PATH`. No files were written -- the
-    /// runtime resolves/caches the package itself on first invocation.
-    RuntimeConfirmed { runtime: &'static str },
+    /// `npx`/`uvx`: runtime was confirmed **and** the package was
+    /// pre-fetched; a ready marker was written under `adapters/<id>/`.
+    PackageReady {
+        runtime: &'static str,
+        package: String,
+        marker: PathBuf,
+    },
     /// `binary`: the archive was downloaded and extracted. `cmd` is the
     /// opaque, platform-correct executable path joined with `dir`, ready to
     /// spawn as-is.
@@ -93,20 +115,189 @@ pub async fn install_into(
         .ok_or_else(|| InstallError::NoDistribution(agent.id.clone()))?;
 
     match method {
-        "npx" => {
-            check_runtime("node", agent, "npx").await?;
-            check_runtime("npm", agent, "npx").await?;
-            Ok(InstallOutcome::RuntimeConfirmed {
-                runtime: "node+npm",
-            })
-        }
-        "uvx" => {
-            check_runtime("uv", agent, "uvx").await?;
-            Ok(InstallOutcome::RuntimeConfirmed { runtime: "uv" })
-        }
+        "npx" => install_npx(agent, adapters_root).await,
+        "uvx" => install_uvx(agent, adapters_root).await,
         "binary" => install_binary(agent, adapters_root).await,
         // preferred_method() only ever returns one of the three above.
         _ => unreachable!("Distribution::preferred_method returned an unhandled method"),
+    }
+}
+
+/// Default adapters root: `~/.acpx/adapters/`.
+pub fn default_adapters_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".acpx")
+        .join("adapters")
+}
+
+/// Path of the ready marker for `agent_id` under `adapters_root`.
+pub fn ready_marker_path(adapters_root: &Path, agent_id: &str) -> PathBuf {
+    adapters_root.join(agent_id).join(READY_MARKER_NAME)
+}
+
+/// True when a successful install has left a ready marker for this agent.
+pub fn is_package_ready(adapters_root: &Path, agent_id: &str) -> bool {
+    ready_marker_path(adapters_root, agent_id).is_file()
+}
+
+/// Write (or overwrite) the ready marker after a successful package pre-fetch
+/// or binary extract.
+pub fn write_ready_marker(
+    adapters_root: &Path,
+    agent_id: &str,
+    method: &str,
+    package: &str,
+) -> Result<PathBuf, InstallError> {
+    let dir = adapters_root.join(agent_id);
+    std::fs::create_dir_all(&dir).map_err(|e| InstallError::CreateDir(dir.clone(), e))?;
+    let path = dir.join(READY_MARKER_NAME);
+    let body = format!(
+        "method={method}\npackage={package}\nwritten_unix_secs={}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    std::fs::write(&path, body).map_err(|e| InstallError::ReadyMarkerWrite(path.clone(), e))?;
+    Ok(path)
+}
+
+async fn install_npx(
+    agent: &Agent,
+    adapters_root: &Path,
+) -> Result<InstallOutcome, InstallError> {
+    check_runtime("node", agent, "npx").await?;
+    check_runtime("npm", agent, "npx").await?;
+    let package = agent
+        .distribution
+        .npx
+        .as_ref()
+        .map(|n| n.package.clone())
+        .ok_or_else(|| InstallError::NoDistribution(agent.id.clone()))?;
+    prefetch_npx_package(agent, &package, adapters_root).await?;
+    let marker = write_ready_marker(adapters_root, &agent.id, "npx", &package)?;
+    Ok(InstallOutcome::PackageReady {
+        runtime: "node+npm",
+        package,
+        marker,
+    })
+}
+
+async fn install_uvx(
+    agent: &Agent,
+    adapters_root: &Path,
+) -> Result<InstallOutcome, InstallError> {
+    check_runtime("uv", agent, "uvx").await?;
+    let package = agent
+        .distribution
+        .uvx
+        .as_ref()
+        .map(|u| u.package.clone())
+        .ok_or_else(|| InstallError::NoDistribution(agent.id.clone()))?;
+    prefetch_uvx_package(agent, &package).await?;
+    let marker = write_ready_marker(adapters_root, &agent.id, "uvx", &package)?;
+    Ok(InstallOutcome::PackageReady {
+        runtime: "uv",
+        package,
+        marker,
+    })
+}
+
+/// Hard ceiling on one package pre-fetch (`npx -y …` / `uvx …`). Network +
+/// first-time cache populate can be slow; still fail closed rather than hang
+/// the gateway forever.
+const PACKAGE_PREFETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Pre-fetch an npm package into `adapters_root/<agent_id>/` via
+/// `npm install --prefix …`. We deliberately do **not** run
+/// `npx -y <package> --version`: that executes the adapter binary (many
+/// ACP adapters treat unknown flags as a hard error or hang waiting for
+/// stdio ACP), whereas `npm install --prefix` only populates
+/// `node_modules` / the npm cache so later `npx -y` / spawn is warm.
+async fn prefetch_npx_package(
+    agent: &Agent,
+    package: &str,
+    adapters_root: &Path,
+) -> Result<(), InstallError> {
+    let package_owned = package.to_string();
+    let agent_id = agent.id.clone();
+    let prefix = adapters_root.join(&agent.id);
+    std::fs::create_dir_all(&prefix)
+        .map_err(|e| InstallError::CreateDir(prefix.clone(), e))?;
+    let npm_bin = resolve_npm_bin();
+    // npm is typically a #!/usr/bin/env node script — ensure the same
+    // prefix's bin/ is first on PATH so we never mix global node + bundled npm.
+    let path_for_npm = npm_bin_dir_path_prefix(&npm_bin);
+    let probe = tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new(&npm_bin);
+        cmd.args([
+            "install",
+            "--no-save",
+            "--no-audit",
+            "--no-fund",
+            "--prefix",
+        ])
+        .arg(&prefix)
+        .arg(&package_owned)
+        // MUST null stderr (not pipe-without-read): a full pipe buffer
+        // stalls npm on write while we block on status() — classic hang.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        if let Some(p) = path_for_npm {
+            cmd.env("PATH", p);
+        }
+        cmd.status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    });
+    // Nested Result: timeout Elapsed vs join/panic vs exit status — all
+    // collapse to PackageFetchFailed (operator re-runs install; no retry
+    // policy here). spawn_blocking work is NOT cancelled on timeout.
+    let ok = match tokio::time::timeout(PACKAGE_PREFETCH_TIMEOUT, probe).await {
+        Ok(Ok(success)) => success,
+        Ok(Err(_)) | Err(_) => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(InstallError::PackageFetchFailed {
+            agent_id,
+            method: "npx",
+            package: package.to_string(),
+            detail: "npm install --prefix <adapters/id> <package> failed or timed out"
+                .to_string(),
+        })
+    }
+}
+
+async fn prefetch_uvx_package(agent: &Agent, package: &str) -> Result<(), InstallError> {
+    let package_owned = package.to_string();
+    let agent_id = agent.id.clone();
+    let probe = tokio::task::spawn_blocking(move || {
+        Command::new("uvx")
+            .args([&package_owned, "--help"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    });
+    let ok = tokio::time::timeout(PACKAGE_PREFETCH_TIMEOUT, probe)
+        .await
+        .ok()
+        .and_then(|joined| joined.ok())
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(InstallError::PackageFetchFailed {
+            agent_id,
+            method: "uvx",
+            package: package.to_string(),
+            detail: "uvx <package> --help failed or timed out".to_string(),
+        })
     }
 }
 
@@ -132,25 +323,66 @@ const RUNTIME_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// available, mirroring the check `acpx-core`'s `detect.rs` does for
 /// `agents/status` (not shared code -- that module is owned by the main
 /// agent).
+/// Absolute npm for ACP: SNAPFLOW_ACP_NODE_HOME/bin/npm if set (bundled),
+/// else bare `npm` (global-first via PATH).
+fn resolve_npm_bin() -> String {
+    if let Ok(home) = std::env::var("SNAPFLOW_ACP_NODE_HOME") {
+        let p = std::path::Path::new(&home).join("bin").join("npm");
+        if p.is_file() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    "npm".to_string()
+}
+
+/// Absolute node for runtime checks when bundled home is set.
+fn resolve_runtime_bin(bin: &'static str) -> String {
+    if let Ok(home) = std::env::var("SNAPFLOW_ACP_NODE_HOME") {
+        let p = std::path::Path::new(&home).join("bin").join(bin);
+        if p.is_file() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    bin.to_string()
+}
+
+/// PATH with npm's directory first (so `env node` resolves same-prefix).
+fn npm_bin_dir_path_prefix(npm_bin: &str) -> Option<String> {
+    let path = std::path::Path::new(npm_bin);
+    let dir = path.parent()?;
+    if !dir.is_absolute() {
+        return None;
+    }
+    let rest = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths([dir.as_os_str(), rest.as_os_str()])
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 async fn check_runtime(
     bin: &'static str,
     agent: &Agent,
     method: &'static str,
 ) -> Result<(), InstallError> {
+    let resolved = resolve_runtime_bin(bin);
+    // Absolute npm still needs its bin/ on PATH for `env node` shebang.
+    let path_for_bin = npm_bin_dir_path_prefix(&resolved);
     let probe = tokio::task::spawn_blocking(move || {
-        Command::new(bin)
-            .arg("--version")
+        let mut cmd = Command::new(&resolved);
+        cmd.arg("--version")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        if let Some(p) = path_for_bin {
+            cmd.env("PATH", p);
+        }
+        cmd.status()
             .map(|status| status.success())
             .unwrap_or(false)
     });
-    let ok = tokio::time::timeout(RUNTIME_PROBE_TIMEOUT, probe)
-        .await
-        .ok()
-        .and_then(|joined| joined.ok())
-        .unwrap_or(false);
+    let ok = match tokio::time::timeout(RUNTIME_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(success)) => success,
+        Ok(Err(_)) | Err(_) => false,
+    };
 
     if ok {
         Ok(())
@@ -161,15 +393,6 @@ async fn check_runtime(
             method,
         })
     }
-}
-
-/// The default `binary` install root: `~/.acpx/adapters/`.
-fn default_adapters_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".acpx")
-        .join("adapters")
 }
 
 /// The registry's `<os>-<arch>` platform key for the host this process is
@@ -212,6 +435,10 @@ async fn install_binary(
     // `cmd` is opaque per 05-open-risks.md: join as-is, never normalize
     // separators or append a platform suffix ourselves.
     let cmd = dest_dir.join(&dist.cmd);
+    // Same ready marker as npx/uvx so detect can treat binary installs
+    // uniformly when checking adapters/<id>/.ready (directory existence
+    // alone still counts as Installed for binary in detect).
+    let _ = write_ready_marker(adapters_root, &agent.id, "binary", &dist.cmd);
     Ok(InstallOutcome::Extracted { dir: dest_dir, cmd })
 }
 
@@ -430,6 +657,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, InstallError::RuntimeMissing { .. }));
+    }
+
+    #[test]
+    fn ready_marker_round_trip_under_adapters_root() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!is_package_ready(root.path(), "claude-acp"));
+        let path = write_ready_marker(root.path(), "claude-acp", "npx", "pkg@1").unwrap();
+        assert!(path.ends_with(READY_MARKER_NAME));
+        assert!(is_package_ready(root.path(), "claude-acp"));
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("package=pkg@1"));
+        assert!(body.contains("method=npx"));
     }
 
     #[tokio::test]

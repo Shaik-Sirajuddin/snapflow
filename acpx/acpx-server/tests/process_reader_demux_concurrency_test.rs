@@ -162,7 +162,7 @@ async fn spawn_server(demux_enabled: bool) -> (ServerGuard, SocketAddr, reqwest:
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     cmd.env(
-        "ACPX_BACKEND_CMD",
+        "ACPX_DEFAULT_ACP_COMMAND",
         format!(
             "python3 {} {PROMPT_DELAY_SECS}",
             script_path.display()

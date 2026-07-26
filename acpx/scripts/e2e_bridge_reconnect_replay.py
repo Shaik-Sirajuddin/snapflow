@@ -48,7 +48,7 @@ def start_server():
     env = dict(os.environ)
     env.update(
         {
-            "ACPX_BACKEND_CMD": BACKEND_SCRIPT,
+            "ACPX_DEFAULT_ACP_COMMAND": BACKEND_SCRIPT,
             "ACPX_DEFAULT_AGENT_ID": "stand-in-agent",
             "ACPX_HTTP_BIND": f"127.0.0.1:{SERVER_PORT}",
             "RUST_LOG": "info",

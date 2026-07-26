@@ -108,7 +108,7 @@ impl GatewayProcess {
             command
                 .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
                 .env(
-                    "ACPX_BACKEND_CMD",
+                    "ACPX_DEFAULT_ACP_COMMAND",
                     mock_agent_bin().to_string_lossy().to_string(),
                 )
                 .env("ACPX_DEFAULT_AGENT_ID", &persona)
@@ -494,7 +494,7 @@ async fn close_then_delete_session_round_trip_through_a_real_gateway() {
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
             .env(
-                "ACPX_BACKEND_CMD",
+                "ACPX_DEFAULT_ACP_COMMAND",
                 mock_agent_bin().to_string_lossy().to_string(),
             )
             .env("ACPX_DEFAULT_AGENT_ID", &persona)
@@ -574,7 +574,7 @@ async fn cancel_session_ends_a_real_mock_agent_slow_turn_as_cancelled() {
         command
             .env("ACPX_HTTP_BIND", format!("127.0.0.1:{port}"))
             .env(
-                "ACPX_BACKEND_CMD",
+                "ACPX_DEFAULT_ACP_COMMAND",
                 mock_agent_bin().to_string_lossy().to_string(),
             )
             .env("ACPX_DEFAULT_AGENT_ID", &persona)

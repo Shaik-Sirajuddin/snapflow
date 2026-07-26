@@ -166,7 +166,7 @@ async fn recovery_disabled_spawn_shape_recovers_nothing_from_a_stale_database() 
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")
@@ -232,7 +232,7 @@ async fn recovery_enabled_with_max_age_only_recovers_the_recent_session() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     command
-        .env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+        .env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
         .env("ACPX_DEFAULT_AGENT_ID", "codex-acp")
         .env("ACPX_HTTP_BIND", client_address.to_string())
         .env("ACPX_ADMIN_TOKEN", "admin-secret")

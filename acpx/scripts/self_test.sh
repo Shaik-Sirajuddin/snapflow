@@ -50,7 +50,7 @@ echo "==> Using port ${PORT}"
 # Trivial stand-in backend: reads newline-delimited JSON-RPC requests and
 # replies with a canned success result, echoing the request id back. Mirrors
 # STAND_IN_BACKEND_SCRIPT in acpx-core/tests/router_dispatch_test.rs. Written
-# to a temp file because ACPX_BACKEND_CMD is parsed by naive whitespace
+# to a temp file because ACPX_DEFAULT_ACP_COMMAND is parsed by naive whitespace
 # splitting (see acpx-server/src/config.rs) and can't hold an inline
 # multi-word script.
 BACKEND_SCRIPT="$(mktemp /tmp/acpx-selftest-backend.XXXXXX.sh)"
@@ -74,7 +74,7 @@ STDIN_FIFO="$(mktemp -u /tmp/acpx-selftest-stdin.XXXXXX.fifo)"
 mkfifo "$STDIN_FIFO"
 exec 3<>"$STDIN_FIFO"
 ACPX_HTTP_BIND="127.0.0.1:${PORT}" \
-  ACPX_BACKEND_CMD="sh ${BACKEND_SCRIPT}" \
+  ACPX_DEFAULT_ACP_COMMAND="sh ${BACKEND_SCRIPT}" \
   target/debug/acpx-server <&3 &
 SERVER_PID=$!
 

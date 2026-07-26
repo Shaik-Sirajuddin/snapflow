@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"snapshotd/internal/acpnode"
 	"snapshotd/internal/acpxmgr"
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
@@ -54,6 +55,10 @@ func main() {
 		err = cmdClose(cfg, os.Args[2:])
 	case "install":
 		err = cmdInstall(cfg, os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(cfg, os.Args[2:])
+	case "runtime":
+		err = cmdRuntime(cfg, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -78,7 +83,9 @@ Usage:
   snapshotd launch <projectId>           convenience wrapper around daemon.launch
   snapshotd list                         list known process instances (bare daemon.list)
   snapshotd close <instanceId>           stop one running process instance (bare daemon.close)
-  snapshotd install                      print what installing a system service would do (not implemented for real)`)
+  snapshotd install                      print what installing a system service would do (not implemented for real)
+  snapshotd doctor                       check ACP Node/npm (global-first, then product bundle)
+  snapshotd runtime install node [--force]  install official Node into product runtime/ (if global missing)`)
 }
 
 func cmdServe(cfg config.Config, args []string) error {
@@ -119,6 +126,16 @@ func cmdServe(cfg config.Config, args []string) error {
 		logger.Warn("startup reconciliation failed", "err", err)
 	}
 
+	// ACP Node fallback: if global node missing and bundle missing, try
+	// official local install once (same policy as install.sh ensure).
+	if acpnode.Resolve().Source == acpnode.SourceMissing {
+		if err := acpnode.Ensure(false); err != nil {
+			logger.Warn("ACP Node ensure failed (agents needing node/npm will be limited)", "err", err)
+		} else {
+			logger.Info("ACP Node runtime ready", "source", string(acpnode.Resolve().Source))
+		}
+	}
+
 	sdpServer := &sdp.Server{SocketPath: cfg.ControlSocketPath, Handler: d, Log: logger}
 	sdpErrCh := make(chan error, 1)
 	go func() {
@@ -146,14 +163,14 @@ func cmdServe(cfg config.Config, args []string) error {
 		} else {
 			startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			mgr, err := acpxmgr.Start(startCtx, acpxmgr.Config{
-				BinPath:        cfg.AcpxBinPath,
-				HttpBind:       cfg.AcpxHttpBind,
-				ConfigPath:     cfg.AcpxConfigPath,
-				DbPath:         filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
-				McpURL:         acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
-				DefaultAgentID: "default",
-				BackendCmd:     cfg.AcpxBackendCmd,
-				Log:            logger,
+				BinPath:           cfg.AcpxBinPath,
+				HttpBind:          cfg.AcpxHttpBind,
+				ConfigPath:        cfg.AcpxConfigPath,
+				DbPath:            filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
+				McpURL:            acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
+				DefaultAgentID:    "default",
+				DefaultAcpCommand: cfg.AcpxDefaultAcpCommand,
+				Log:               logger,
 			})
 			startCancel()
 			if err != nil {
@@ -332,6 +349,42 @@ func cmdClose(cfg config.Config, args []string) error {
 	}
 	fmt.Printf("closed instance %s\n", instanceID)
 	return nil
+}
+
+func cmdDoctor(cfg config.Config, args []string) error {
+	_ = cfg
+	_ = args
+	fmt.Print(acpnode.DoctorReport())
+	if acpnode.Resolve().Source == acpnode.SourceMissing {
+		return fmt.Errorf("ACP Node/npm missing (install system Node or: snapshotd runtime install node)")
+	}
+	return nil
+}
+
+func cmdRuntime(cfg config.Config, args []string) error {
+	_ = cfg
+	if len(args) < 1 {
+		return fmt.Errorf("usage: snapshotd runtime install node [--force]")
+	}
+	switch args[0] {
+	case "install":
+		if len(args) < 2 || args[1] != "node" {
+			return fmt.Errorf("usage: snapshotd runtime install node [--force]")
+		}
+		force := false
+		for _, a := range args[2:] {
+			if a == "--force" {
+				force = true
+			}
+		}
+		if err := acpnode.Ensure(force); err != nil {
+			return err
+		}
+		fmt.Print(acpnode.DoctorReport())
+		return nil
+	default:
+		return fmt.Errorf("unknown runtime subcommand %q (want: install)", args[0])
+	}
 }
 
 func cmdInstall(cfg config.Config, args []string) error {

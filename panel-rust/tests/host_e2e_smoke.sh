@@ -60,7 +60,7 @@ xvfb_pid="$!"
 export DISPLAY="$display"
 
 ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
-ACPX_BACKEND_CMD="$agent_bin" \
+ACPX_DEFAULT_ACP_COMMAND="$agent_bin" \
 ACPX_DEFAULT_AGENT_ID="codex" \
 ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
 RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \

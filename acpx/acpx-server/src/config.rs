@@ -3,17 +3,20 @@
 use acpx_conductor::SpawnSpec;
 use acpx_core::LifecycleConfig;
 
-/// Which backend to proxy to by default (native/unmanaged mode, no
+/// Which agent command to proxy to by default (native/unmanaged mode, no
 /// `_acpx.profile` given -- see `02-architecture.md`), and how to spawn
-/// it. Phase 3 adds real profile -> agent/provider resolution on top of
-/// this single default; until then `default_agent_id` is the only agent
-/// `Router` knows how to spawn.
+/// it. Profiles can override this per `session/new`. Phase 3 adds real
+/// profile -> agent/provider resolution on top of this single default;
+/// until then `default_agent_id` is the only agent `Router` registers at
+/// startup (additional agents still register on demand via profiles).
 pub struct ServerConfig {
     pub default_agent_id: String,
     /// Backend auth method for native/unmanaged sessions. This is opt-in so
     /// native ACPX retains its no-guessing authentication default.
     pub native_auth_method_id: Option<String>,
-    pub backend: SpawnSpec,
+    /// Native-mode default ACP agent command (`ACPX_DEFAULT_ACP_COMMAND`).
+    /// Profiles / `_acpx.agentId` override this for managed sessions.
+    pub default_acp_command: SpawnSpec,
     /// Optional strict-ACP `/acp` bridge policy. `None` keeps every bridge
     /// route disabled so legacy ACPX deployments retain their exact public
     /// surface until an operator opts in.
@@ -111,9 +114,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Read the backend command from `ACPX_BACKEND_CMD` (space-separated
-    /// program + args), defaulting to `codex-acp` via npx per the official
-    /// registry (see `01-research.md`) if unset. `ACPX_HTTP_BIND` sets the
+    /// Read the native-mode default ACP command from
+    /// `ACPX_DEFAULT_ACP_COMMAND` (space-separated program + args),
+    /// defaulting to `codex-acp` via npx per the official registry (see
+    /// `01-research.md`) if unset. Legacy alias: `ACPX_BACKEND_CMD` is still
+    /// accepted when the new name is unset. `ACPX_HTTP_BIND` sets the
     /// HTTP/WS bind address (default = `acpx_proto::DEFAULT_ACPX_HTTP_ADDR`,
     /// the single source of truth panel-rust also dials, currently
     /// `127.0.0.1:8790` -- loopback only,
@@ -152,7 +157,8 @@ impl ServerConfig {
     /// tenant-map growth" concern for deployments that know their full
     /// tenant set up front.
     pub fn from_env() -> Self {
-        let raw = std::env::var("ACPX_BACKEND_CMD")
+        let raw = std::env::var("ACPX_DEFAULT_ACP_COMMAND")
+            .or_else(|_| std::env::var("ACPX_BACKEND_CMD")) // legacy alias
             .unwrap_or_else(|_| "npx -y @agentclientprotocol/codex-acp@1.1.2".to_string());
         let mut parts = raw.split_whitespace();
         let program = parts.next().unwrap_or("npx").to_string();
@@ -387,7 +393,7 @@ impl ServerConfig {
         Self {
             default_agent_id,
             native_auth_method_id,
-            backend: SpawnSpec::new(program, args),
+            default_acp_command: SpawnSpec::new(program, args),
             bridge,
             http_bind_addr,
             auth_token,
@@ -426,7 +432,7 @@ impl ServerConfig {
 /// this server directly -- not just panel-rust's own wrapper -- gets a
 /// working ambient login for free. Only fires for the codex-acp npx
 /// package (never silently reinterprets an operator's custom
-/// `ACPX_BACKEND_CMD` for some other adapter), and only when a real key
+/// `ACPX_DEFAULT_ACP_COMMAND` for some other adapter), and only when a real key
 /// is actually found -- an operator with a ChatGPT-account-only login (no
 /// API key in the auth file) keeps today's behavior unchanged.
 fn default_codex_native_auth_method(program: &str, args: &[String]) -> Option<String> {
