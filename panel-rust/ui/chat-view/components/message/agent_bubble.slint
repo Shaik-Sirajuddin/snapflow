@@ -22,16 +22,18 @@ export component AgentBubble inherits Rectangle {
 
     property <bool> is-thinking: item.kind == "thinking";
     property <bool> is-agent: item.kind == "agent";
+    property <bool> is-pending: item.kind == "pending";
 
     vertical-stretch: 0;
+    clip: true;
 
     // Contrasting agent fill (Theme.bg-tertiary)
-    background: is-thinking ? transparent : Theme.bg-tertiary;
+    background: (is-thinking || is-pending) ? transparent : Theme.bg-tertiary;
     border-width: 0px;
-    border-top-left-radius: is-thinking ? 0px : Theme.radius-lg;
-    border-top-right-radius: is-thinking ? 0px : Theme.radius-lg;
-    border-bottom-left-radius: is-thinking ? 0px : Metrics.radius-corner-cut;
-    border-bottom-right-radius: is-thinking ? 0px : Theme.radius-lg;
+    border-top-left-radius: (is-thinking || is-pending) ? 0px : Theme.radius-lg;
+    border-top-right-radius: (is-thinking || is-pending) ? 0px : Theme.radius-lg;
+    border-bottom-left-radius: (is-thinking || is-pending) ? 0px : Metrics.radius-corner-cut;
+    border-bottom-right-radius: (is-thinking || is-pending) ? 0px : Theme.radius-lg;
 
     HorizontalLayout {
         spacing: 0px;
@@ -54,8 +56,21 @@ export component AgentBubble inherits Rectangle {
         // narrow column that a parent stretch layout then re-centers —
         // the classic "md looks centered" regression.
         alignment: stretch;
-        padding: is-thinking ? Metrics.space-2 : Metrics.space-4;
-        spacing: is-thinking ? Metrics.space-2 : 0px;
+        padding: (is-thinking || is-pending) ? Metrics.space-2 : Metrics.space-4;
+        spacing: (is-thinking || is-pending) ? Metrics.space-2 : 0px;
+
+                if is-pending : HorizontalLayout {
+            padding: Metrics.space-2;
+            spacing: Metrics.space-2;
+            Text {
+                text: "Agent is working...";
+                color: Theme.text-muted;
+                font-size: 11px * Theme.font-scale;
+                font-family: Theme.font-sans;
+                font-italic: true;
+                vertical-alignment: center;
+            }
+        }
 
         // Thinking header — always visible; click toggles the body.
         if is-thinking : HoverSurface {
@@ -86,7 +101,7 @@ export component AgentBubble inherits Rectangle {
                     font-weight: 600;
                     font-italic: true;
                     vertical-alignment: center;
-                    horizontal-stretch: 1;
+                    horizontal-stretch: 0;
                 }
                 // One-line preview while collapsed so the block isn't a
                 // mystery empty chevron row.

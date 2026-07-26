@@ -23,6 +23,7 @@ export component MessageCard inherits Rectangle {
     property <string> header-label: is-user ? Strings.user : is-agent ? Strings.agent : is-thinking ? Strings.thinking-label : Strings.tool-label;
 
     vertical-stretch: 0;
+    clip: true;
 
     // Agent: subtle Theme.bg-agent-bubble (not primary-container).
     background: is-thinking ? transparent

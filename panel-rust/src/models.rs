@@ -102,7 +102,7 @@ fn lines_to_slint_model(lines: Vec<markdown::Line>) -> ModelRc<MarkdownLine> {
 /// Agent rows get full markdown parse; other kinds leave lines empty so
 /// MarkdownView falls back to plain `text`.
 fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
-    if kind != "agent" {
+    if kind != "agent" && kind != "thinking" {
         return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
     }
     lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
