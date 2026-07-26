@@ -1931,17 +1931,57 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 // `ThreadModel::agent_content_this_turn`'s doc comment)
                 // streamed reasoning summaries and then ended with no
                 // message or tool call at all.
+                // Reconnect/status spam is not a real reply either -- if
+                // we counted it, a later hard failure would look like a
+                // successful turn and leave Loading/Error handling wrong.
+                let is_status_only = matches!(
+                    message.kind,
+                    crate::protocol_types::MessageKind::Agent
+                ) && crate::models::agent_text_skips_markdown(&message.text);
                 if matches!(
                     message.kind,
                     crate::protocol_types::MessageKind::Agent
                         | crate::protocol_types::MessageKind::ToolCall
-                ) {
+                ) && !is_status_only
+                {
                     thread.agent_content_this_turn = true;
                 }
                 thread.last_activity_time = Some(std::time::Instant::now());
-                dirty.push(Dirty::MessageAppended {
-                    thread_id: thread.thread_id.clone(),
+                // Hard transport failures often arrive as ordinary agent
+                // *message* text (not AgentEvent::Error) after a reconnect
+                // storm -- e.g. "unexpected status 502 Bad Gateway". Without
+                // this, thread.state stays Loading until TurnEnded, the send
+                // button stays in stop/spinner mode, and the UI feels frozen
+                // even though the event loop is still running.
+                if matches!(message.kind, crate::protocol_types::MessageKind::Agent)
+                    && crate::models::agent_text_is_hard_failure(&message.text)
+                    && matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+                {
+                    let failure = message.text.trim().to_owned();
+                    thread.state = ThreadState::Error;
+                    thread.error = Some(failure.clone());
+                    dirty.push(Dirty::Error {
+                        thread_id: thread.thread_id.clone(),
+                        detail: ErrorDetail {
+                            message: failure,
+                        },
+                    });
+                    dirty.push(Dirty::ThreadRow(target_index));
+                }
+                // One MessageAppended per thread per frame is enough: a
+                // reconnect storm can emit many AgentEvent::Message ticks
+                // before poll drains them; re-diffing the full message
+                // model for each one freezes the UI thread.
+                let thread_id = thread.thread_id.clone();
+                let already = dirty.iter().any(|d| {
+                    matches!(
+                        d,
+                        Dirty::MessageAppended { thread_id: id } if id == &thread_id
+                    )
                 });
+                if !already {
+                    dirty.push(Dirty::MessageAppended { thread_id });
+                }
             }
             crate::protocol_types::AgentEvent::TurnEnded(reason) => {
                 // Captured BEFORE the Idle reset below: only a turn this

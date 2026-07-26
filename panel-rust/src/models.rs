@@ -105,7 +105,45 @@ fn markdown_lines_for(kind: &str, text: &str) -> ModelRc<MarkdownLine> {
     if kind != "agent" && kind != "thinking" {
         return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
     }
+    // UI freeze fix: reconnect/status storms (e.g. "Reconnecting... 1/5")
+    // and hard transport failures update agent text many times per second.
+    // Full markdown reparse of the whole transcript on every poll tick
+    // stalls the single UI/paint thread under software GL. These lines
+    // are plain status -- MarkdownView already falls back to `text`
+    // when `markdown_lines` is empty.
+    if agent_text_skips_markdown(text) {
+        return ModelRc::new(VecModel::from(Vec::<MarkdownLine>::new()));
+    }
     lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
+}
+
+/// True for agent text that is only status/reconnect/hard-error noise --
+/// never real markdown content worth a full document parse.
+pub(crate) fn agent_text_skips_markdown(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    trimmed.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty()
+            || line.starts_with("Reconnecting...")
+            || line.starts_with("unexpected status ")
+            || line.contains("502 Bad Gateway")
+            || line.contains("Bad Gateway")
+    })
+}
+
+/// Hard agent/backend failure that should clear `Loading` immediately so
+/// the compose/send controls unlock instead of waiting for a late
+/// `TurnEnded` after a long reconnect loop.
+pub(crate) fn agent_text_is_hard_failure(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("502 bad gateway")
+        || lower.contains("unexpected status 5")
+        || lower.contains("unexpected status 4")
+        || (lower.contains("reconnecting... 5/5")
+            && (lower.contains("unexpected status") || lower.contains("bad gateway")))
 }
 
 /// Plan phase 27: markdown render of the skill editor's active content
