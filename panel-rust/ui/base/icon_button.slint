@@ -17,6 +17,7 @@ export component IconButton inherits Rectangle {
     // over the button, so a caller can show both states with the one
     // primitive instead of re-deriving the hover tint itself.
     in property <bool> active: false;
+    out property <bool> has-hover: touch.has-hover;
     callback clicked();
 
     width: btn-width;

@@ -22,14 +22,15 @@ export component TextPillButton inherits HoverSurface {
     button-accessible-label: root.label;
 
     HorizontalLayout {
-        padding-left: Metrics.space-2;
-        padding-right: Metrics.space-2;
+        padding-left: Metrics.space-4;
+        padding-right: Metrics.space-4;
         padding-top: Metrics.space-1;
         padding-bottom: Metrics.space-1;
+        cross-axis-alignment: center;
         Text {
             text: root.label;
-            color: Theme.text-secondary;
-            font-size: 9px * Theme.font-scale;
+            color: Theme.text-primary;
+            font-size: 10px * Theme.font-scale;
             font-family: Theme.font-sans;
             font-weight: 600;
             vertical-alignment: center;

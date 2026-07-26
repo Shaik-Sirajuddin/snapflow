@@ -46,6 +46,7 @@ export component NavItem inherits HoverSurface {
     // describes). `sidebar.slint`'s Threads/Skills toggle is the
     // opposite: two content-sized labels side by side, no forced fill.
     in property <bool> fill-width: true;
+    in property <bool> show-underline: false;
 
     border-radius: Theme.radius-sm;
     selected: root.active;
@@ -53,10 +54,20 @@ export component NavItem inherits HoverSurface {
     hover-bg: Theme.bg-primary-container.with-alpha(0.5);
     button-accessible-label: root.label;
 
+    if root.show-underline && root.active : Rectangle {
+        y: parent.height - 2px;
+        x: 0px;
+        width: parent.width;
+        height: 2px;
+        background: root.active-color;
+        border-radius: 1px;
+    }
+
     HorizontalLayout {
         width: root.fill-width ? parent.width : self.preferred-width;
         height: parent.height;
         alignment: root.centered ? center : start;
+        cross-axis-alignment: center;
         padding-left: (root.centered || !root.show-icon) ? 0px : root.content-padding-left;
         spacing: (root.show-icon && root.show-label) ? root.content-spacing : 0px;
 

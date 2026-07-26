@@ -101,6 +101,7 @@ export component ToolEventRow inherits Rectangle {
             padding-top: 0px;
             padding-bottom: 0px;
             spacing: Metrics.space-2;
+            cross-axis-alignment: center;
             VerticalLayout {
                 alignment: center;
                 horizontal-stretch: 0;
@@ -108,7 +109,7 @@ export component ToolEventRow inherits Rectangle {
                 Rectangle {
                     width: 6px;
                     height: 6px;
-                    border-radius: 3px;
+                    border-radius: self.width / 2;
                     background: Theme.text-primary;
                 }
             }

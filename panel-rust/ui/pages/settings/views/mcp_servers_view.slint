@@ -7,6 +7,7 @@ import { SettingsRow } from "../../../base/settings_row.slint";
 import { SettingsSection, SettingsSectionHeader, SettingsRowGroup } from "../../../base/settings_section.slint";
 import { McpServerOption, McpToolOption } from "../../../types.slint";
 import { TextUtil } from "../../../base/text_util.slint";
+import { StatusDot } from "../../../base/status_dot.slint";
 
 // MCP Servers left-tab view. Started as a phase-1 shell that only re-hosted
 // the former `components/settings_sheet.slint` list unchanged (name +
@@ -105,13 +106,9 @@ export component McpServersView inherits Rectangle {
                     // disconnected, yellow otherwise (auth required...).
                     // Explicit user direction; supersedes the earlier
                     // no-status-color convention for MCP surfaces.
-                    if server.status != "" : Rectangle {
-                        width: 8px;
-                        height: 8px;
-                        border-radius: 4px;
-                        background: server.status == "connected" ? #22c55e
-                            : (server.status == "error" || server.status == "disconnected") ? #ef4444
-                            : #eab308;
+                    if server.status != "" : StatusDot {
+                        status: server.status;
+                        size: 8px;
                     }
                     // Transport + auth + connection status, combined into one
                     // muted subtitle as before (dot above carries the color).
@@ -195,6 +192,7 @@ export component McpServersView inherits Rectangle {
 
                         for tool in server.tools : HorizontalLayout {
                             spacing: Metrics.gap-md;
+                            cross-axis-alignment: center;
 
                             Text {
                                 text: tool.name;
@@ -241,6 +239,7 @@ export component McpServersView inherits Rectangle {
             // `gap-sm` (6px) -- gap between the two add-server fields and
             // the Add button.
             spacing: Metrics.gap-sm;
+            cross-axis-alignment: center;
             new-mcp-name-field := TextField {
                 horizontal-stretch: 1;
                 text <=> root.new-mcp-name;

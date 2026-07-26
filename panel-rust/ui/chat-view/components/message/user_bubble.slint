@@ -55,28 +55,5 @@ export component UserBubble inherits Rectangle {
                 }
             }
         }
-        VerticalLayout {
-            padding-right: Metrics.space-3;
-            alignment: end;
-            padding-top: Metrics.space-2;
-            vertical-stretch: 0;
-            TouchArea {
-                accessible-role: button;
-                accessible-label: "Copy message text";
-                accessible-action-default => { self.clicked(); }
-                width: 20px;
-                height: 20px;
-                mouse-cursor: pointer;
-                clicked => { root.copy-message(item.text); }
-                Text {
-                    text: "📋";
-                    font-size: 12px;
-                    width: 100%;
-                    height: 100%;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-            }
-        }
     }
 }

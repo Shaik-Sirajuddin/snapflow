@@ -96,6 +96,7 @@ export component SidebarThreadRow inherits HoverSurface {
                     // Expanded: row content L→R. Collapsed:
                     // center status icon in space after the stick.
                     alignment: expanded ? stretch : center;
+                    cross-axis-alignment: center;
                     // Keep titles readable before eliding in the
                     // compact expanded rail; row actions already
                     // provide their own button hit targets.
@@ -251,11 +252,6 @@ export component SidebarThreadRow inherits HoverSurface {
                             rename-input.focus();
                         }
                     }
-                    if expanded && rename-thread-index != index && thread.background : Icon {
-                        source: @image-url("../assets/icons/moon.svg");
-                        size: Metrics.icon-sm;
-                        color: Theme.text-tertiary;
-                    }
                     // `thread_item_project_context` phase: no
                     // dedicated folder/project icon exists in
                     // assets/icons (checked the directory
@@ -264,26 +260,6 @@ export component SidebarThreadRow inherits HoverSurface {
                     // of a "logo" image, matching the
                     // established text-label-for-missing-icon
                     // precedent from active_pane_and_editor_view.
-                    // PISO-8 (project-isolation-mlt-binding plan): a small
-                    // live-instance dot, shown ONLY alongside the badge
-                    // below (never alone) and only when snapshotd
-                    // confirms this thread's recorded project actually
-                    // has a live process instance right now -- not merely
-                    // a stale sqlite-recorded association. Same missing-
-                    // icon precedent as the badge itself: a tiny colored
-                    // dot rather than a dedicated asset, matching the
-                    // busy-status dot above.
-                    if expanded && rename-thread-index != index
-                        && thread.project-path != "" && thread.project-path != active-project-path
-                        && thread.project-instance-live : Rectangle {
-                        width: 6px;
-                        Rectangle {
-                            width: 6px;
-                            height: 6px;
-                            border-radius: 3px;
-                            background: Theme.text-accent-bright;
-                        }
-                    }
                     if expanded && rename-thread-index != index
                         && thread.project-path != "" && thread.project-path != active-project-path : Text {
                         text: thread.project-name;
@@ -332,124 +308,121 @@ export component SidebarThreadRow inherits HoverSurface {
                     // the selected row (and on hover for others)
                     // so keyboard / headless e2e can reach them
                     // without a pointer hover.
-                    if expanded && rename-thread-index != index && (root.has-hover || index == selected-thread) : IconButton {
-                        btn-width: 18px;
-                        btn-height: 18px;
-                        button-accessible-label: "Rename thread " + thread.name;
-                        clicked => { begin-rename(); }
-                        Icon {
-                            source: @image-url("../assets/icons/pencil.svg");
-                            size: 13px;
-                            color: Theme.text-muted;
-                        }
-                    }
-                    if expanded && rename-thread-index == index : IconButton {
-                        btn-width: 18px;
-                        btn-height: 18px;
-                        button-accessible-label: "Save thread name";
-                        clicked => { confirm-rename(); }
-                        Icon {
-                            source: @image-url("../assets/icons/check.svg");
-                            size: 13px;
-                            color: Theme.bg-primary;
-                        }
-                    }
-                    if expanded && rename-thread-index == index : IconButton {
-                        btn-width: 18px;
-                        btn-height: 18px;
-                        button-accessible-label: "Cancel thread rename";
-                        clicked => { cancel-rename(); }
-                        Icon {
-                            source: @image-url("../assets/icons/x.svg");
-                            size: 13px;
-                            color: Theme.text-muted;
-                        }
-                    }
-                    // Coverage Matrix `session/close`/
-                    // `session/delete` row: explicit,
-                    // confirm-gated lifecycle controls per
-                    // thread row -- an open thread shows a
-                    // close (power) icon, a closed one
-                    // shows a delete (trash) icon instead,
-                    // both armed by a first click and only
-                    // acted on by a second, explicit
-                    // confirm -- same two-step pattern as
-                    // `settings_sheet.slint`'s profile
-                    // delete control.
-                    // PUI-007: power (close) button removed from active and
-                    // archived rows -- it was unused; archive is the primary
-                    // hide action. `close-requested`/`pending-close-index`
-                    // retained but no longer surfaced from this row.
-                    if expanded && rename-thread-index != index
-                        && thread.closed && pending-delete-index != index && (root.has-hover || index == selected-thread) : IconButton {
-                        btn-width: 18px;
-                        btn-height: 18px;
-                        button-accessible-label: "Delete thread " + thread.name;
-                        clicked => { pending-delete-index = index; }
-                        Icon {
-                            source: @image-url("../assets/icons/trash-2.svg");
-                            size: 13px;
-                            // Phase 29: destructive action reads as such --
-                            // subtle red, not full alert saturation.
-                            color: #ef4444.with-alpha(0.75);
-                        }
-                    }
-                    if expanded && rename-thread-index != index
-                        && thread.closed && pending-delete-index == index : HorizontalLayout {
-                        spacing: Metrics.space-1;
-                        IconButton {
+                    property <bool> row-hovered: root.has-hover
+                        || rename-btn.has-hover
+                        || delete-btn.has-hover
+                        || resume-btn.has-hover
+                        || archive-btn.has-hover;
+
+                    HorizontalLayout {
+                        horizontal-stretch: 0;
+                        spacing: 2px;
+                        cross-axis-alignment: center;
+
+                        rename-btn := IconButton {
+                            visible: expanded && rename-thread-index != index && (row-hovered || index == selected-thread);
                             btn-width: 18px;
                             btn-height: 18px;
-                            button-accessible-label: "Confirm delete thread " + thread.name;
-                            clicked => {
-                                pending-delete-index = -1;
-                                delete-requested();
-                            }
+                            button-accessible-label: "Rename thread " + thread.name;
+                            clicked => { begin-rename(); }
                             Icon {
-                                source: @image-url("../assets/icons/circle-check.svg");
-                                size: Metrics.icon-sm;
-                                color: Theme.bg-primary;
-                            }
-                        }
-                        IconButton {
-                            btn-width: 18px;
-                            btn-height: 18px;
-                            button-accessible-label: "Cancel delete thread " + thread.name;
-                            clicked => { pending-delete-index = -1; }
-                            Icon {
-                                source: @image-url("../assets/icons/x.svg");
+                                source: @image-url("../assets/icons/pencil.svg");
                                 size: 13px;
-                                color: Theme.text-secondary;
+                                color: Theme.text-muted;
                             }
                         }
-                    }
-                    // Phase 19: resume from archive -- same toggle action,
-                    // shown on archived rows (distinct accessible label).
-                    if expanded && rename-thread-index != index
-                        && thread.archived && (root.has-hover || index == selected-thread) : IconButton {
-                        btn-width: 18px;
-                        btn-height: 18px;
-                        button-accessible-label: "Resume thread " + thread.name;
-                        clicked => { archive-requested(); }
-                        Icon {
-                            source: @image-url("../assets/icons/archive.svg");
-                            size: 13px;
-                            // Phase 29: archive-family action gets its own
-                            // color, distinct from delete's red.
-                            color: #38bdf8;
+                        if expanded && rename-thread-index == index : HorizontalLayout {
+                            spacing: 2px;
+                            IconButton {
+                                btn-width: 18px;
+                                btn-height: 18px;
+                                button-accessible-label: "Save thread name";
+                                clicked => { confirm-rename(); }
+                                Icon {
+                                    source: @image-url("../assets/icons/check.svg");
+                                    size: 13px;
+                                    color: Theme.bg-primary;
+                                }
+                            }
+                            IconButton {
+                                btn-width: 18px;
+                                btn-height: 18px;
+                                button-accessible-label: "Cancel thread rename";
+                                clicked => { cancel-rename(); }
+                                Icon {
+                                    source: @image-url("../assets/icons/x.svg");
+                                    size: 13px;
+                                    color: Theme.text-muted;
+                                }
+                            }
                         }
-                    }
-                    if expanded && rename-thread-index != index
-                        && show-archive-action && !thread.archived && (root.has-hover || index == selected-thread) : IconButton {
-                        btn-width: 18px;
-                        btn-height: 18px;
-                        button-accessible-label: "Archive thread " + thread.name;
-                        clicked => { archive-requested(); }
-                        Icon {
-                            source: @image-url("../assets/icons/archive.svg");
-                            size: 13px;
-                            // PUI-007: archive reads as a destructive/hide action -- red.
-                            color: #ef4444;
+                        delete-btn := IconButton {
+                            visible: expanded && rename-thread-index != index
+                                && thread.closed && pending-delete-index != index && (row-hovered || index == selected-thread);
+                            btn-width: 18px;
+                            btn-height: 18px;
+                            button-accessible-label: "Delete thread " + thread.name;
+                            clicked => { pending-delete-index = index; }
+                            Icon {
+                                source: @image-url("../assets/icons/trash-2.svg");
+                                size: 13px;
+                                color: Theme.status-error.with-alpha(0.75);
+                            }
+                        }
+                        if expanded && rename-thread-index != index
+                            && thread.closed && pending-delete-index == index : HorizontalLayout {
+                            spacing: 2px;
+                            IconButton {
+                                btn-width: 18px;
+                                btn-height: 18px;
+                                button-accessible-label: "Confirm delete thread " + thread.name;
+                                clicked => {
+                                    pending-delete-index = -1;
+                                    delete-requested();
+                                }
+                                Icon {
+                                    source: @image-url("../assets/icons/circle-check.svg");
+                                    size: Metrics.icon-sm;
+                                    color: Theme.bg-primary;
+                                }
+                            }
+                            IconButton {
+                                btn-width: 18px;
+                                btn-height: 18px;
+                                button-accessible-label: "Cancel delete thread " + thread.name;
+                                clicked => { pending-delete-index = -1; }
+                                Icon {
+                                    source: @image-url("../assets/icons/x.svg");
+                                    size: 13px;
+                                    color: Theme.text-secondary;
+                                }
+                            }
+                        }
+                        resume-btn := IconButton {
+                            visible: expanded && rename-thread-index != index
+                                && thread.archived && (row-hovered || index == selected-thread);
+                            btn-width: 18px;
+                            btn-height: 18px;
+                            button-accessible-label: "Resume thread " + thread.name;
+                            clicked => { archive-requested(); }
+                            Icon {
+                                source: @image-url("../assets/icons/archive.svg");
+                                size: 13px;
+                                color: Theme.status-info;
+                            }
+                        }
+                        archive-btn := IconButton {
+                            visible: expanded && rename-thread-index != index
+                                && show-archive-action && !thread.archived && (row-hovered || index == selected-thread);
+                            btn-width: 18px;
+                            btn-height: 18px;
+                            button-accessible-label: "Archive thread " + thread.name;
+                            clicked => { archive-requested(); }
+                            Icon {
+                                source: @image-url("../assets/icons/archive.svg");
+                                size: 13px;
+                                color: Theme.status-error;
+                            }
                         }
                     }
                 }

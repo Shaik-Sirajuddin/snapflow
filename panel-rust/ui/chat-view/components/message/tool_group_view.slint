@@ -58,6 +58,7 @@ export component ToolGroupView inherits Rectangle {
         // Top Header Bar: label + tool count badge + Fullscreen button + Top-Right Expand/Collapse toggle button
         if root.show-header : HorizontalLayout {
             spacing: Metrics.space-2;
+            cross-axis-alignment: center;
 
             VerticalLayout {
                 alignment: center;
