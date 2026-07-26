@@ -1329,6 +1329,10 @@ pub(crate) fn dispatch_theme_changed(panel: &PanelSingleton, theme: String) {
     let _ = update_persistent(panel, Msg::Host(HostMsg::ThemeChanged(theme)));
 }
 
+pub(crate) fn dispatch_language_changed(panel: &PanelSingleton, language: String) {
+    let _ = update_persistent(panel, Msg::Host(HostMsg::LanguageChanged(language)));
+}
+
 pub(crate) fn dispatch_host_invoke_command(panel: &PanelSingleton, command: i32) -> bool {
     let command_name = match command {
         crate::PANEL_COMMAND_PREVIOUS_THREAD => "previous-thread",

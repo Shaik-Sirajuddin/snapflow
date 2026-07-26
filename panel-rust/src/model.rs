@@ -203,6 +203,15 @@ pub struct Model {
     pub traced_attachment_threads: HashSet<String>,
     pub appearance: AppearanceState,
     pub theme_variant: String,
+    // language-switch-sync plan: a QSettings locale code (e.g. "fr",
+    // "zh_CN") pushed from Qt -- both once at ChatRustDock construction
+    // (cold-start seed, mirroring updateProjectPath's own construction-
+    // time call) and live on every later Settings > Language switch
+    // (mirroring producerOpened's live-signal wiring). "" (Default)
+    // means no push has happened yet -- sync() only calls
+    // select_bundled_translation when this is non-empty; absent that
+    // call, @tr() strings simply show their literal English source text.
+    pub language: String,
     pub settings_open: bool,
     pub settings_scope: String,
     pub default_profile: String,

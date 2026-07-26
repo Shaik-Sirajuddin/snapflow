@@ -10,7 +10,7 @@ default = []
 ui-dev-viewer = ["dep:slint-interpreter", "dep:spin_on", "dep:notify"]
 
 [dependencies]
-slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std"] }
+slint = { version = "1.9", default-features = false, features = ["renderer-software", "compat-1-2", "std", "gettext"] }
 # `runtime_gate_full_matrix` (video-generation-e2e-harness plan): Slint's own
 # official MCP UI-introspection/automation server (`mcp_server::init()`,
 # called from `panel_rust_create` right after `set_platform`, see lib.rs).

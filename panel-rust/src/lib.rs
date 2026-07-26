@@ -3011,6 +3011,42 @@ pub extern "C" fn panel_rust_rename_project_path(
     })
 }
 
+/// language-switch-sync plan: sets the active UI language from a QSettings
+/// locale code (e.g. "fr", "zh_CN") -- mirrors `panel_rust_set_theme`'s/
+/// `panel_rust_set_project_path`'s byte-buffer shape exactly.
+/// `ChatRustDock` calls this once at construction (seeded from
+/// `Settings.language()`, the cold-start value) and again live every time
+/// `MainWindow::languageChanged` fires (a real switch in Qt's Settings >
+/// Language menu) -- see that signal's own doc comment for why this is
+/// wired as a genuine live signal rather than construction-time only
+/// (the gap `panel_rust_set_theme`/`applyTheme` still has). An empty
+/// buffer is a real no-op here (unlike theme's "empty means dark"
+/// default) -- there's no sensible language to fall back to other than
+/// "don't switch", so this returns `true` (the panel exists) without
+/// dispatching anything.
+#[no_mangle]
+pub extern "C" fn panel_rust_set_language(
+    _handle: *mut PanelHandle,
+    text_ptr: *const c_uchar,
+    text_len: usize,
+) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
+        if text_ptr.is_null() || text_len == 0 {
+            return true;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return true;
+        };
+        dispatch::dispatch_language_changed(panel, text.to_owned());
+        true
+    })
+}
+
 /// Applies a generation-ordered host appearance snapshot. The host owns only
 /// selector values; the panel retains its component palette and tokens.
 #[no_mangle]

@@ -311,6 +311,12 @@ pub enum Dirty {
     ProjectPath,
     Appearance,
     Theme,
+    /// language-switch-sync plan: `Model::language` changed -- `sync()`
+    /// calls `slint::select_bundled_translation`, which live-updates
+    /// every `@tr()`-bound `Strings.*` property on screen; no explicit
+    /// per-string Slint setter needed (unlike Theme's variant, which
+    /// does push named properties).
+    Language,
     /// Settings changed -- pushed into both the settings panel and chat
     /// view in one place (fixes "settings not propagated to chat view").
     Settings,

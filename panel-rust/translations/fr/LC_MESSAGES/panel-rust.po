@@ -1,0 +1,15 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: panel-rust\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Ask the agent…  / skills  @ mcp  # files"
+msgstr "Demandez à l'agent…  / compétences  @ mcp  # fichiers"
+
+msgid "Send message"
+msgstr "Envoyer le message"
+
+msgid "Stop response"
+msgstr "Arrêter la réponse"
