@@ -1,8 +1,3 @@
-// Layer 1 (tokens) -- translatable UI strings, same "one central global,
-// every component imports and reads from it" convention as Theme/Metrics
-// in this directory. Every property's default value is a real `@tr(...)`
-// call, so `slint-tr-extractor` picks these up exactly like an inline
-// `@tr()` would; the difference is purely organizational -- one file to
 // audit/extend instead of strings scattered across every component.
 export global Strings {
     // Composer placeholder and send/stop buttons
@@ -32,13 +27,10 @@ export global Strings {
     out property <string> attach: @tr("Attach");
     out property <string> cancel: @tr("Cancel");
     out property <string> chat-defaults: @tr("Chat Defaults");
-    out property <string> confirm: @tr("Confirm");
-    out property <string> default-profile: @tr("Default profile");
     out property <string> no-orphaned-sessions: @tr("No orphaned sessions for this provider.");
     out property <string> permission-profile: @tr("Permission profile");
     out property <string> profile: @tr("Profile");
     out property <string> recoverable-sessions: @tr("Recoverable Sessions");
-    out property <string> remove-profile: @tr("Remove profile");
     out property <string> search-agents: @tr("Search agents");
     out property <string> search-agents-ellipsis: @tr("Search agents...");
 
@@ -53,73 +45,15 @@ export global Strings {
     out property <string> focused: @tr("focused");
     out property <string> local-terminal: @tr("local terminal");
 
-    // Chat area
-    out property <string> cancel-thread-rename: @tr("Cancel thread rename");
-    out property <string> connection-status-prefix: @tr("Connection status: ");
-    out property <string> connecting: @tr("Connecting...");
-    out property <string> dismiss-error: @tr("Dismiss error");
-    out property <string> jump-to-latest-message: @tr("Jump to latest message");
-    out property <string> jump-to-pending-request: @tr("Jump to pending request");
-    out property <string> loading-older-messages: @tr("Loading older messages...");
-    out property <string> load-older-messages: @tr("Load older messages");
-    out property <string> mcp-call: @tr("MCP CALL");
-    out property <string> new-thread: @tr("New thread");
-    out property <string> no-active-terminals: @tr("No active terminals");
-    out property <string> no-thread: @tr("No thread");
-    out property <string> rename-thread: @tr("Rename thread");
-    out property <string> save-thread-name: @tr("Save thread name");
-    out property <string> send-to-start-conversation: @tr("Send a message to start the conversation");
-    out property <string> tool-use: @tr("TOOL USE");
-    out property <string> thread-name: @tr("Thread name");
-    out property <string> loading-conversation: @tr("loading conversation...");
-    out property <string> waiting-for-response: @tr("waiting for response");
-
-    // API call view
-    out property <string> input-payload: @tr("INPUT PAYLOAD");
-    out property <string> no-structured-payload: @tr("No structured payload available for this call.");
-    out property <string> output-response: @tr("OUTPUT RESPONSE");
-
     // Skills view
-    out property <string> dev-mode: @tr("Dev mode");
-    out property <string> make-global: @tr("Make Global");
-    out property <string> show-global-skills: @tr("Show global skills");
     out property <string> skills: @tr("Skills");
-    out property <string> toggle-dev-mode: @tr("Toggle dev mode");
-    out property <string> toggle-global-skills: @tr("Toggle global skills visibility");
-
-    // Expandable panel
-    out property <string> collapse-view: @tr("Collapse view");
-    out property <string> open-full-view: @tr("Open full view");
-    out property <string> show-less: @tr("Show less");
 
     // Context ring
     out property <string> session-context: @tr("Session context");
-    out property <string> percent-used: @tr("% used");
-    out property <string> tokens: @tr("tokens");
-
-    // Dynamic modal
-    out property <string> full-view: @tr("FULL VIEW");
 
     // Labeled select (top tabs)
     out property <string> show-global-settings: @tr("Show global settings");
     out property <string> show-project-settings: @tr("Show project settings");
-
-    // Skill view
-    out property <string> back-to-editing: @tr("Back to editing");
-    out property <string> close-skill-editor: @tr("Close skill editor");
-    out property <string> copy-path: @tr("Copy path");
-    out property <string> copy-skill-path: @tr("Copy skill path");
-    out property <string> edit: @tr("Edit");
-    out property <string> open: @tr("Open");
-    out property <string> open-with-os-default: @tr("Open with OS default application");
-    out property <string> preview: @tr("Preview");
-    out property <string> preview-rendered-markdown: @tr("Preview rendered markdown");
-    out property <string> saving-ellipsis: @tr("Saving…");
-
-    // Settings page
-    out property <string> collapse-settings-navigation: @tr("Collapse settings navigation");
-    out property <string> expand-settings-navigation: @tr("Expand settings navigation");
-    out property <string> settings: @tr("Settings");
 
     // Left tabs
     out property <string> agents-section: @tr("Agents section");
@@ -128,62 +62,17 @@ export global Strings {
     out property <string> mcp-servers-section: @tr("MCP Servers section");
     out property <string> skills-section: @tr("Skills section");
 
-    // MCP servers view
-    out property <string> connect: @tr("Connect");
-    out property <string> hide: @tr("Hide");
-    out property <string> hide-tools: @tr("Hide tools");
-    out property <string> show: @tr("Show");
-    out property <string> tools: @tr("Tools");
-
     // Harness view
-    out property <string> background-sessions: @tr("Background sessions");
-    out property <string> disabled: @tr("Disabled");
     out property <string> enabled: @tr("Enabled");
-    out property <string> toggle-background-session-default: @tr("Toggle background session default");
-
-    // Tool group view
-    out property <string> call-singular: @tr(" call");
-    out property <string> calls-plural: @tr(" calls");
 
     // Search bar
     out property <string> search-settings: @tr("Search settings");
     out property <string> search-settings-ellipsis: @tr("Search settings...");
 
-    // Queued message bar
-    out property <string> cancel-queued-message: @tr("Cancel queued message");
-    out property <string> edit-queued-message: @tr("Edit queued message");
-    out property <string> send-now: @tr("Send now");
-    out property <string> stop-sending: @tr("Stop sending");
-
     // Agent card
     out property <string> connected: @tr("Connected");
     out property <string> installed: @tr("Installed");
     out property <string> not-found: @tr("Not found");
-
-    // Terminal card
-    out property <string> expand-terminal: @tr("Expand terminal");
-    out property <string> exit-with-space: @tr("exit ");
-    out property <string> running: @tr("running");
-    out property <string> terminal-with-space: @tr("terminal ");
-    out property <string> truncated-indicator: @tr("... (truncated)");
-
-    // Preview
-    out property <string> chat-panel-preview: @tr("Chat Panel Preview");
-
-    // Permission card
-    out property <string> approval: @tr("Approval");
-    out property <string> approve-request: @tr("Approve request");
-    out property <string> permission-option-prefix: @tr("Permission option: ");
-    out property <string> reject-request: @tr("Reject request");
-
-    // Agent bubble
-    out property <string> collapse-thinking: @tr("Collapse thinking");
-    out property <string> expand-thinking: @tr("Expand thinking");
-    out property <string> thinking: @tr("Thinking");
-
-    // Terminal view
-    out property <string> shell-prompt: @tr("$");
-    out property <string> exit-code-prefix: @tr("exit code ");
 
     // Message card
     out property <string> agent: @tr("AGENT");
@@ -191,6 +80,25 @@ export global Strings {
     out property <string> tool-label: @tr("TOOL");
     out property <string> user: @tr("USER");
 
-    // Settings sheet
-    out property <string> profile-label: @tr("Profile");
+    // Generic base controls (select, toggle, search)
+    out property <string> select-label: @tr("Select");
+    out property <string> select-ellipsis: @tr("Select...");
+    out property <string> select-prefix: @tr("Select ");
+    out property <string> toggle-default-label: @tr("Toggle");
+    out property <string> search-label: @tr("Search");
+    out property <string> save-label: @tr("Save");
+
+    // Expandable panel / call detail views
+    out property <string> full-call-details-payload: @tr("FULL CALL DETAILS & PAYLOAD");
+
+    // Agents view / profile picker
+    out property <string> install-agent-prefix: @tr("Install agent ");
+    out property <string> default-badge: @tr("Default");
+
+    // Agent card default/enable toggles
+    out property <string> unset-default-agent-prefix: @tr("Unset ");
+    out property <string> set-default-agent-prefix: @tr("Set ");
+    out property <string> as-default-agent-suffix: @tr(" as default agent");
+    out property <string> disable-prefix: @tr("Disable ");
+    out property <string> enable-prefix: @tr("Enable ");
 }

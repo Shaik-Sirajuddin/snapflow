@@ -1,4 +1,5 @@
 import { Theme } from "../../../tokens/theme.slint";
+import { Strings } from "../../../tokens/strings.slint";
 import { Metrics } from "../../../tokens/metrics.slint";
 import { Icon } from "../../../base/icon.slint";
 import { AgentLogo } from "../components/agent_logo.slint";
@@ -144,14 +145,14 @@ export component AgentCard inherits Rectangle {
                 vertical-alignment: center;
             }
             Text {
-                text: root.is-connected ? "Connected" : (root.is-present ? "Installed" : "Not found");
+                text: root.is-connected ? Strings.connected : (root.is-present ? Strings.installed : Strings.not-found);
                 color: Theme.text-secondary;
                 font-size: 10px * Theme.font-scale;
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
             Text {
-                text: "Default";
+                text: Strings.default-badge;
                 color: Theme.text-secondary;
                 font-size: 10px * Theme.font-scale;
                 vertical-alignment: center;
@@ -163,8 +164,8 @@ export component AgentCard inherits Rectangle {
             // one-way binding the first time a user clicks it).
             ResetOnFlipToggle {
                 checked: root.is-default;
-                toggle-accessible-label-on: "Unset " + root.agent-name + " as default agent";
-                toggle-accessible-label-off: "Set " + root.agent-name + " as default agent";
+                toggle-accessible-label-on: Strings.unset-default-agent-prefix + root.agent-name + Strings.as-default-agent-suffix;
+                toggle-accessible-label-off: Strings.set-default-agent-prefix + root.agent-name + Strings.as-default-agent-suffix;
                 toggled(new-checked) => { root.set-default(new-checked); }
             }
         }
@@ -174,7 +175,7 @@ export component AgentCard inherits Rectangle {
         if root.is-present : HorizontalLayout {
             spacing: Metrics.space-2;
             Text {
-                text: "Enabled";
+                text: Strings.enabled;
                 color: Theme.text-secondary;
                 font-size: 10px * Theme.font-scale;
                 horizontal-stretch: 1;
@@ -182,8 +183,8 @@ export component AgentCard inherits Rectangle {
             }
             ResetOnFlipToggle {
                 checked: root.enabled;
-                toggle-accessible-label-on: "Disable " + root.agent-name;
-                toggle-accessible-label-off: "Enable " + root.agent-name;
+                toggle-accessible-label-on: Strings.disable-prefix + root.agent-name;
+                toggle-accessible-label-off: Strings.enable-prefix + root.agent-name;
                 toggled(new-checked) => { root.set-enabled(new-checked); }
             }
         }
@@ -198,8 +199,8 @@ export component AgentCard inherits Rectangle {
                 width: parent.width;
                 alignment: start;
                 if !root.is-present : Button {
-                    label: "Install";
-                    button-accessible-label: "Install agent " + root.agent-name;
+                    label: Strings.install;
+                    button-accessible-label: Strings.install-agent-prefix + root.agent-name;
                     btn-width: 72px;
                     btn-height: 24px;
                     font-size: 10px;

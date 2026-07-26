@@ -6,6 +6,7 @@
 // committing to the real component split.
 import { Theme } from "tokens/theme.slint";
 import { Metrics } from "tokens/metrics.slint";
+import { Strings } from "tokens/strings.slint";
 import { Button } from "base/button.slint";
 import { SettingsSearchBar } from "pages/settings/components/search_bar.slint";
 
@@ -28,7 +29,7 @@ export component SettingsPanePreview inherits Window {
         HorizontalLayout {
             spacing: Metrics.space-4;
             height: 32px;
-            for tab[i] in [{ id: "project", label: "Project" }, { id: "global", label: "Global" }] : Rectangle {
+            for tab[i] in [{ id: "project", label: Strings.project }, { id: "global", label: Strings.global }] : Rectangle {
                 width: 100px;
                 border-radius: Theme.radius-sm;
                 background: active-scope == tab.id ? Theme.bg-primary-container : transparent;
@@ -58,7 +59,7 @@ export component SettingsPanePreview inherits Window {
             VerticalLayout {
                 width: 160px;
                 spacing: Metrics.space-2;
-                for section[i] in [{ id: "mcp", label: "MCP Servers" }, { id: "agents", label: "Agents" }] : Rectangle {
+                for section[i] in [{ id: "mcp", label: Strings.mcp-servers }, { id: "agents", label: Strings.agents }] : Rectangle {
                     height: 32px;
                     border-radius: Theme.radius-sm;
                     background: active-section == section.id ? Theme.bg-sidebar : transparent;
@@ -98,8 +99,8 @@ export component SettingsPanePreview inherits Window {
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            Text { text: "Default command timeout"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: "Seconds before an MCP server call is considered stalled"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: Strings.default-command-timeout; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
+                            Text { text: Strings.seconds-before-mcp-stalled; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
                         }
                         Rectangle {
                             width: 60px;
@@ -117,8 +118,8 @@ export component SettingsPanePreview inherits Window {
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            Text { text: "Auto-restart on failure"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: "Relaunch a crashed MCP server process automatically"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: Strings.auto-restart-on-failure; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
+                            Text { text: Strings.relaunch-crashed-mcp; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
                         }
                         property <bool> checked: true;
                         Rectangle {
@@ -151,8 +152,8 @@ export component SettingsPanePreview inherits Window {
                         VerticalLayout {
                             horizontal-stretch: 1;
                             alignment: center;
-                            Text { text: "Default agent"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: "Used when a new thread doesn't specify one"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: Strings.default-agent; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
+                            Text { text: Strings.used-when-no-agent-specified; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
                         }
                         Rectangle {
                             width: 100px;
@@ -171,9 +172,9 @@ export component SettingsPanePreview inherits Window {
                             horizontal-stretch: 1;
                             alignment: center;
                             Text { text: "claude-code (installable)"; color: Theme.text-primary; font-size: 12px * Theme.font-scale; font-weight: 600; }
-                            Text { text: "Not yet installed on this machine"; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
+                            Text { text: Strings.not-yet-installed; color: Theme.text-muted; font-size: 10px * Theme.font-scale; }
                         }
-                        Button { label: "Install"; btn-width: 64px; }
+                        Button { label: Strings.install; btn-width: 64px; }
                     }
                 }
             }

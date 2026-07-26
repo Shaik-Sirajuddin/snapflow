@@ -1,5 +1,6 @@
 import { Theme } from "../tokens/theme.slint";
 import { Metrics } from "../tokens/metrics.slint";
+import { Strings } from "../tokens/strings.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
 
 // Layer 3 (base) -- the "switch"-shaped on/off control. Until now every
@@ -13,7 +14,7 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 // hue, matching this project's no-status-color design language.
 export component Toggle inherits Rectangle {
     in-out property <bool> checked: false;
-    in property <string> toggle-accessible-label: "Toggle";
+    in property <string> toggle-accessible-label: Strings.toggle-default-label;
     callback toggled(bool);
 
     width: 32px;

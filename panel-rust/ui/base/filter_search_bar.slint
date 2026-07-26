@@ -1,4 +1,5 @@
 import { Theme } from "../tokens/theme.slint";
+import { Strings } from "../tokens/strings.slint";
 import { Metrics } from "../tokens/metrics.slint";
 import { Icon } from "icon.slint";
 import { CursorHost } from "../tokens/cursor_host.slint";
@@ -13,8 +14,8 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 // text / icon placement — no second hand-rolled search chrome.
 export component FilterSearchBar inherits Rectangle {
     in-out property <string> query: "";
-    in property <string> placeholder: "Search...";
-    in property <string> bar-accessible-label: "Search";
+    in property <string> placeholder: Strings.search-ellipsis;
+    in property <string> bar-accessible-label: Strings.search-label;
     // Leading search glyph (default on). Mutually exclusive with trailing
     // when only one glyph is wanted — set icon-trailing to put it on the right.
     in property <bool> show-icon: true;

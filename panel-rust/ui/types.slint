@@ -1,3 +1,4 @@
+
 // Shared data-model structs, split out of app.slint so sidebar.slint /
 // chat-area.slint / message-card.slint can each `import` just the types
 // they need without a circular dependency on the root window component.
@@ -46,16 +47,6 @@ export struct ThreadItem {
     // primitive to derive this itself), e.g. "/a/b/foo.mlt" -> "foo.mlt".
     // Empty exactly when project-path is empty.
     project-name: string,
-    // PISO-8 (project-isolation-mlt-binding plan): true only when
-    // project-path is CONFIRMED to have a currently-live snapshotd
-    // process instance right now (possibly headless -- an agent's own
-    // `daemon.launch` MCP call for a project this panel's own host
-    // process never opened), not merely a stale sqlite-recorded
-    // association from a session that has long since closed. Only
-    // meaningful alongside the project-path/project-name badge above
-    // (same non-empty + differs-from-active gate); always false whenever
-    // that badge itself would be hidden.
-    project-instance-live: bool,
     // setup-followups plan, provider_fastmode_profile_persistence: the
     // profile (agent/provider + terminal/fs policy) this thread will use
     // (or already uses). Empty means "no profile chosen, backend
@@ -261,20 +252,6 @@ export struct ModeOption {
     id: string,
     name: string,
     description: string,
-}
-
-// PROF-11: one row of the currently selected thread's live `plan`
-// session/update (`AgentBridge::plan`, see `protocol_types::
-// PlanEntryInfo`). `priority`/`status` are the exact ACP v1 wire tags
-// verbatim (e.g. "high"/"medium"/"low", "pending"/"in_progress"/
-// "completed") -- Rust round-trips them through untouched rather than
-// mapping to a closed enum, same "an unrecognized future value still
-// displays as literal text" posture the rest of this crate's capability
-// rows follow.
-export struct PlanEntryItem {
-    content: string,
-    priority: string,
-    status: string,
 }
 
 // Mode/config selector addition: one *row* of the currently selected
