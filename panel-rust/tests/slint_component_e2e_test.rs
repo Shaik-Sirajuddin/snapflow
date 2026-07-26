@@ -44,6 +44,7 @@ fn sample_open_thread(name: &str) -> ThreadItem {
         project_path: "".into(),
         profile_name: "".into(),
         has_session: false,
+        project_instance_live: false,
     }
 }
 
@@ -1173,6 +1174,7 @@ fn thread_search_box_accepts_real_typed_keystrokes_and_dispatches_search_changed
         project_path: "".into(),
         profile_name: "".into(),
         has_session: false,
+        project_instance_live: false,
     }])));
 
     let search_changes = Rc::new(RefCell::new(Vec::<String>::new()));

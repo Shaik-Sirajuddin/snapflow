@@ -4302,6 +4302,7 @@ mod tests {
                     visible_thread_ids: vec!["thread-0".to_owned()],
                     rows: vec![row],
                     archived_flags: vec![],
+                    active_project_path: None,
                 }),
                 ..FrameInput::default()
             }),
@@ -4337,6 +4338,7 @@ mod tests {
                         visible_thread_ids: vec!["thread-0".to_owned()],
                         rows: vec![row],
                         archived_flags: vec![],
+                        active_project_path: None,
                     }),
                     ..FrameInput::default()
                 }),
