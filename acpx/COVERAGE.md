@@ -2948,7 +2948,7 @@ call-`serve_on` wrapper. New coverage:
 second's stdio transport must still fully round-trip a real request).
 Also added `acpx/scripts/openhands-acpx-{claude,codex}.sh` (wrapper
 scripts OpenHands's `ACPAgentSettings.acp_command` points at, each
-setting `ACPX_HTTP_BIND=off` and a real backend's `ACPX_BACKEND_CMD`)
+setting `ACPX_HTTP_BIND=off` and a real backend's `ACPX_DEFAULT_ACP_COMMAND`)
 and `acpx/tests/openhands_integration/` (a real, dependency-light Python
 pytest suite driving OpenHands's own `openhands-sdk` client against a
 real, already-running agent-server -- see its own `README.md` for

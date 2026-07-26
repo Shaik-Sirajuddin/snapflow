@@ -417,7 +417,7 @@ surface at all; see
 
 - **Native/unmanaged mode** (no `_acpx.profile` in `session/new`):
   requests go to `ServerConfig::default_agent_id`, spawned via
-  `ACPX_BACKEND_CMD`. No profile/provider/keystore machinery is
+  `ACPX_DEFAULT_ACP_COMMAND`. No profile/provider/keystore machinery is
   consulted at all.
 - **Managed mode** (`_acpx.profile` given): `Router` resolves the named
   `Profile` ([`profile.rs`](../acpx-core/src/profile.rs)) to an
@@ -430,11 +430,13 @@ surface at all; see
   (`mcp_servers.rs`) with whatever the client's own `session/new` sent
   (client wins on name collision).
 - **Detection** ([`detect.rs`](../acpx-core/src/detect.rs)) is
-  best-effort runtime-availability checking per registry entry's
-  preferred distribution: `npx`/`uvx` entries check `node`+`npm`/`uv` are
-  on `PATH` (the runtime resolves the actual package on demand); `binary`
-  entries check `~/.acpx/adapters/<id>/` for an already-fetched copy.
-  Surfaced via `agents/list`/`agents/status`.
+  best-effort per registry entry: `npx` entries need `node`+`npm` (PATH
+  and/or `SNAPFLOW_ACP_NODE_HOME`) **and** a ready marker at
+  `~/.acpx/adapters/<id>/.ready` for `Installed` (marker written by
+  `agents/install` after `npm install --prefix`); runtime without marker
+  is `NotInstalled`; missing toolchain is `RuntimeMissing`. `uvx` is
+  analogous with `uv`. `binary` entries check
+  `~/.acpx/adapters/<id>/`. Surfaced via `agents/list`/`agents/status`.
 
 ## Further reading
 

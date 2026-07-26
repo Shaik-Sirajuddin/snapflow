@@ -207,7 +207,7 @@ async fn cancelling_one_session_does_not_disturb_a_concurrent_sessions_live_upda
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     cmd.env(
-        "ACPX_BACKEND_CMD",
+        "ACPX_DEFAULT_ACP_COMMAND",
         format!("python3 {} {TURN_DELAY_SECS}", script_path.display()),
     )
     .env("ACPX_HTTP_BIND", addr.to_string())
@@ -371,7 +371,7 @@ async fn spawn_server_with_demux(demux: Option<&str>) -> (ServerGuard, SocketAdd
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
     cmd.env(
-        "ACPX_BACKEND_CMD",
+        "ACPX_DEFAULT_ACP_COMMAND",
         format!("python3 {} {TURN_DELAY_SECS}", script_path.display()),
     )
     .env("ACPX_HTTP_BIND", addr.to_string())

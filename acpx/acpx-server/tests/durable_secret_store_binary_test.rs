@@ -86,7 +86,7 @@ async fn spawn_server(
     extra_env: &[(&str, &str)],
 ) -> ServerGuard {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+    cmd.env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
         .env("ACPX_HTTP_BIND", addr.to_string())
         .env("ACPX_DB_PATH", db_path.display().to_string())
         .stdin(Stdio::piped())

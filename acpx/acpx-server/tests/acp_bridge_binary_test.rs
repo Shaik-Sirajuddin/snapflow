@@ -137,7 +137,7 @@ async fn real_binary_bridge_binding_unsticks_itself_after_the_backend_handshake_
     std::fs::remove_file(&db_path).expect("clear placeholder db file");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("sh {}", script_path.display()))
+    cmd.env("ACPX_DEFAULT_ACP_COMMAND", format!("sh {}", script_path.display()))
         .env("ACPX_HTTP_BIND", addr.to_string())
         .env("ACPX_ACP_BRIDGE_ENABLED", "1")
         .env(

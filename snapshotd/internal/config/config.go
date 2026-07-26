@@ -89,14 +89,15 @@ type Config struct {
 	// AcpxConfigPath is the generated ACPX_CONFIG_FILE path.
 	AcpxConfigPath string
 
-	// AcpxBackendCmd is optional ACPX_BACKEND_CMD for the bundled
-	// acpx-server's "default" profile (SNAPSHOTD_ACPX_BACKEND_CMD).
-	// Empty means acpx-server picks its own built-in default backend
-	// (a real, auth-requiring adapter) -- set this to point the bundled
-	// gateway at a no-auth stdio ACP agent (e.g. panel-rust's
-	// `rui-mock-agent` dev/test binary) for local verification flows
-	// that shouldn't need real provider credentials.
-	AcpxBackendCmd string
+	// AcpxDefaultAcpCommand is optional ACPX_DEFAULT_ACP_COMMAND for the
+	// bundled acpx-server native-mode default agent
+	// (SNAPSHOTD_ACPX_DEFAULT_ACP_COMMAND; legacy alias
+	// SNAPSHOTD_ACPX_BACKEND_CMD). Empty means acpx-server picks its own
+	// built-in default (a real, auth-requiring adapter) -- set this to
+	// point the bundled gateway at a no-auth stdio ACP agent (e.g.
+	// panel-rust's `rui-mock-agent` dev/test binary) for local
+	// verification flows that shouldn't need real provider credentials.
+	AcpxDefaultAcpCommand string
 }
 
 // Default returns the v1 default configuration, honoring the handful of
@@ -153,24 +154,28 @@ func Default() Config {
 		// Default on only when a binary is discoverable so plain serve stays quiet.
 		acpxEnabled = acpxBin != ""
 	}
-	acpxBackendCmd := os.Getenv("SNAPSHOTD_ACPX_BACKEND_CMD")
+	acpxDefaultAcpCommand := os.Getenv("SNAPSHOTD_ACPX_DEFAULT_ACP_COMMAND")
+	if acpxDefaultAcpCommand == "" {
+		// Legacy alias kept so existing operator env still works.
+		acpxDefaultAcpCommand = os.Getenv("SNAPSHOTD_ACPX_BACKEND_CMD")
+	}
 
 	return Config{
-		HomeDir:              home,
-		DBPath:               filepath.Join(home, "registry.db"),
-		ControlSocketPath:    filepath.Join(home, "control.sock"),
-		RunDir:               filepath.Join(home, "run"),
-		LogDir:               filepath.Join(home, "logs"),
-		ProjectsRoot:         filepath.Join(home, "projects"),
-		SnapshotBinPath:      binPath,
-		LaunchConnectTimeout: launchTimeout,
-		MCPSSEAddr:           mcpAddr,
-		AudioEnabled:         audioEnabled,
-		AcpxEnabled:          acpxEnabled,
-		AcpxBinPath:          acpxBin,
-		AcpxHttpBind:         acpxBind,
-		AcpxConfigPath:       acpxConfig,
-		AcpxBackendCmd:       acpxBackendCmd,
+		HomeDir:               home,
+		DBPath:                filepath.Join(home, "registry.db"),
+		ControlSocketPath:     filepath.Join(home, "control.sock"),
+		RunDir:                filepath.Join(home, "run"),
+		LogDir:                filepath.Join(home, "logs"),
+		ProjectsRoot:          filepath.Join(home, "projects"),
+		SnapshotBinPath:       binPath,
+		LaunchConnectTimeout:  launchTimeout,
+		MCPSSEAddr:            mcpAddr,
+		AudioEnabled:          audioEnabled,
+		AcpxEnabled:           acpxEnabled,
+		AcpxBinPath:           acpxBin,
+		AcpxHttpBind:          acpxBind,
+		AcpxConfigPath:        acpxConfig,
+		AcpxDefaultAcpCommand: acpxDefaultAcpCommand,
 	}
 }
 

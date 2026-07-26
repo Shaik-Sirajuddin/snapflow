@@ -6,7 +6,7 @@
 //!
 //! Same "spawn the real compiled acpx-server binary, don't fake the
 //! boundary" discipline as gateway_actor_mcp_agents_e2e_test.rs, but here
-//! the backend is *also* real: no `ACPX_BACKEND_CMD` override, so
+//! the backend is *also* real: no `ACPX_DEFAULT_ACP_COMMAND` override, so
 //! acpx-server's own default (`npx -y @agentclientprotocol/codex-acp@1.1.2`,
 //! wrapping the real, locally-authenticated Codex CLI) is what actually
 //! answers `session/new`/`session/prompt`. Per
@@ -36,7 +36,7 @@ struct GatewayProcess {
 }
 
 impl GatewayProcess {
-    /// No `ACPX_BACKEND_CMD` override -- acpx-server's own built-in
+    /// No `ACPX_DEFAULT_ACP_COMMAND` override -- acpx-server's own built-in
     /// default is the real `codex-acp` adapter (see
     /// acpx/acpx-server/src/config.rs:155-156), which is exactly the
     /// point of this test.

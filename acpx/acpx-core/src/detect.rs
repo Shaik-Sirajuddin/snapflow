@@ -33,25 +33,32 @@ use std::time::{Duration, Instant};
 const WHICH_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Best-effort detection for a single registry entry's preferred
-/// distribution method. `npx`/`uvx` entries: checks the runtime
-/// (`node`+`npm`, or `uv`) is on `PATH` -- the runtime itself resolves the
-/// package on demand, so there's no separate "package installed" check.
-/// `binary` entries: checks `~/.acpx/adapters/<id>/` for an already-fetched
-/// copy (Phase 4 fills in the actual fetch step).
+/// distribution method.
+///
+/// - `npx`/`uvx`: runtime on `PATH` **and** a ready marker under
+///   `~/.acpx/adapters/<id>/.ready` (written by `agents/install` after a
+///   real package pre-fetch -- see `agents-install-runtime` plan). Runtime
+///   present but no marker → `NotInstalled` (not "Installed" solely because
+///   Node is available).
+/// - `binary`: checks `~/.acpx/adapters/<id>/` for an already-fetched copy.
 pub fn detect(agent_id: &str, dist: &Distribution) -> AgentStatus {
     match dist.preferred_method() {
         Some("npx") => {
-            if which("node") && which("npm") {
+            if !(which_node_tool("node") && which_node_tool("npm")) {
+                AgentStatus::RuntimeMissing
+            } else if package_ready(agent_id) {
                 AgentStatus::Installed
             } else {
-                AgentStatus::RuntimeMissing
+                AgentStatus::NotInstalled
             }
         }
         Some("uvx") => {
-            if which("uv") {
+            if !which("uv") {
+                AgentStatus::RuntimeMissing
+            } else if package_ready(agent_id) {
                 AgentStatus::Installed
             } else {
-                AgentStatus::RuntimeMissing
+                AgentStatus::NotInstalled
             }
         }
         Some("binary") => {
@@ -67,13 +74,38 @@ pub fn detect(agent_id: &str, dist: &Distribution) -> AgentStatus {
 }
 
 fn adapters_dir() -> std::path::PathBuf {
-    dirs_home().join(".acpx").join("adapters")
+    acpx_registry::default_adapters_dir()
 }
 
-fn dirs_home() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+fn package_ready(agent_id: &str) -> bool {
+    acpx_registry::is_package_ready(&adapters_dir(), agent_id)
+}
+
+/// Prefer bundled bin when SNAPFLOW_ACP_NODE_HOME is set (acpxmgr injects
+/// this only when bundled wins — global-first is decided at spawn time).
+/// Otherwise PATH via which(). Matches which()'s executable check so a
+/// non-executable stub is not treated as Installed.
+fn which_node_tool(bin: &str) -> bool {
+    if let Ok(home) = std::env::var("SNAPFLOW_ACP_NODE_HOME") {
+        let p = std::path::Path::new(&home).join("bin").join(bin);
+        if is_executable_file(&p) {
+            return true;
+        }
+        // Home set but incomplete → do not fall through to a different
+        // global bin (would mix prefixes). Treat as missing this tool.
+        return false;
+    }
+    which(bin)
+}
+
+/// Drop cached `which()` results so a runtime installed after acpx started
+/// (or an install that just completed) is visible on the next `agents/list`
+/// without waiting for [`WHICH_CACHE_TTL`] or restarting the process.
+pub fn invalidate_which_cache() {
+    which_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 fn which(bin: &str) -> bool {

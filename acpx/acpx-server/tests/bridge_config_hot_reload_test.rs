@@ -181,7 +181,7 @@ async fn editing_the_bridge_config_file_hot_reloads_without_a_restart() {
     std::fs::remove_file(&db_path).expect("clear placeholder db file");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("python3 {}", script_path.display()))
+    cmd.env("ACPX_DEFAULT_ACP_COMMAND", format!("python3 {}", script_path.display()))
         .env("ACPX_HTTP_BIND", addr.to_string())
         .env("ACPX_ACP_BRIDGE_ENABLED", "1")
         .env(
@@ -291,7 +291,7 @@ async fn an_invalid_config_edit_is_rejected_and_the_previous_config_stays_live()
     std::fs::remove_file(&db_path).expect("clear placeholder db file");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_acpx-server"));
-    cmd.env("ACPX_BACKEND_CMD", format!("python3 {}", script_path.display()))
+    cmd.env("ACPX_DEFAULT_ACP_COMMAND", format!("python3 {}", script_path.display()))
         .env("ACPX_HTTP_BIND", addr.to_string())
         .env("ACPX_ACP_BRIDGE_ENABLED", "1")
         .env(

@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"snapshotd/internal/acpnode"
 	"snapshotd/internal/acpxmgr"
 	"snapshotd/internal/config"
 	"snapshotd/internal/daemon"
@@ -56,6 +57,10 @@ func main() {
 		err = cmdMCP(cfg, os.Args[2:])
 	case "install":
 		err = cmdInstall(cfg, os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(cfg, os.Args[2:])
+	case "runtime":
+		err = cmdRuntime(cfg, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -88,7 +93,9 @@ Usage:
   snapshotd mcp auth set --user U --password P
                                           set/replace the MCP listener's Basic Auth credentials
   snapshotd mcp install-config get       print the MCP endpoint + credentials for a client config
-  snapshotd install                      print what installing a system service would do (not implemented for real)`)
+  snapshotd install                      print what installing a system service would do (not implemented for real)  snapshotd doctor                       check ACP Node/npm (global-first, then product bundle)
+  snapshotd runtime install node [--force]  install official Node into product runtime/ (if global missing)`)
+`)
 }
 
 func cmdServe(cfg config.Config, args []string) error {
@@ -133,6 +140,16 @@ func cmdServe(cfg config.Config, args []string) error {
 		logger.Warn("startup reconciliation failed", "err", err)
 	}
 
+	// ACP Node fallback: if global node missing and bundle missing, try
+	// official local install once (same policy as install.sh ensure).
+	if acpnode.Resolve().Source == acpnode.SourceMissing {
+		if err := acpnode.Ensure(false); err != nil {
+			logger.Warn("ACP Node ensure failed (agents needing node/npm will be limited)", "err", err)
+		} else {
+			logger.Info("ACP Node runtime ready", "source", string(acpnode.Resolve().Source))
+		}
+	}
+
 	sdpServer := &sdp.Server{SocketPath: cfg.ControlSocketPath, Handler: d, Log: logger}
 	sdpErrCh := make(chan error, 1)
 	go func() {
@@ -157,14 +174,14 @@ func cmdServe(cfg config.Config, args []string) error {
 		} else {
 			startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			mgr, err := acpxmgr.Start(startCtx, acpxmgr.Config{
-				BinPath:        cfg.AcpxBinPath,
-				HttpBind:       cfg.AcpxHttpBind,
-				ConfigPath:     cfg.AcpxConfigPath,
-				DbPath:         filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
-				McpURL:         acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
-				DefaultAgentID: "default",
-				BackendCmd:     cfg.AcpxBackendCmd,
-				Log:            logger,
+				BinPath:           cfg.AcpxBinPath,
+				HttpBind:          cfg.AcpxHttpBind,
+				ConfigPath:        cfg.AcpxConfigPath,
+				DbPath:            filepath.Join(cfg.HomeDir, "acpx.sqlite3"),
+				McpURL:            acpxmgr.McpHTTPURL(cfg.MCPSSEAddr),
+				DefaultAgentID:    "default",
+				DefaultAcpCommand: cfg.AcpxDefaultAcpCommand,
+				Log:               logger,
 			})
 			startCancel()
 			if err != nil {

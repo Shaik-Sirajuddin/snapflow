@@ -207,6 +207,33 @@ case "$platform" in
     ;;
 esac
 
+# ── ACP Node/npm (global-first; official bundle only if system missing).
+# scripts/lib/acp-node-runtime.sh: never forces Node onto the user shell
+# PATH; only materializes $INSTALL_DIR/runtime/node for ACP/acpx children.
+# Failures are non-fatal so a Node CDN outage does not block snapflow
+# install (doctor / `runtime install node` can retry later).
+ACP_NODE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/acp-node-runtime.sh"
+if [ ! -f "$ACP_NODE_LIB" ]; then
+  # install.sh may be curl'd alone; try next to INSTALL_DIR copy if present.
+  ACP_NODE_LIB="$INSTALL_DIR/scripts/lib/acp-node-runtime.sh"
+fi
+if [ -f "$ACP_NODE_LIB" ]; then
+  # shellcheck source=lib/acp-node-runtime.sh
+  SNAPFLOW_INSTALL_DIR="$INSTALL_DIR"
+  export SNAPFLOW_INSTALL_DIR
+  # shellcheck disable=SC1090
+  . "$ACP_NODE_LIB"
+  info "Ensuring ACP Node/npm (global-first; bundle only if needed)..."
+  if acp_node_ensure 0; then
+    info "ACP Node ready (source=$(acp_node_resolve_source))"
+  else
+    echo "note: ACP Node ensure failed -- agents needing node/npm will not work until" >&2
+    echo "  system Node is installed or: bash $ACP_NODE_LIB ensure" >&2
+  fi
+else
+  echo "note: acp-node-runtime.sh not found; skipping ACP Node bootstrap." >&2
+fi
+
 # ── Make snapflowd/snapflow usable immediately, not just after a new shell.
 # A curl|bash subprocess can't mutate the calling interactive shell's PATH
 # directly, so this (a) exports it for the rest of *this* script/subshells,
