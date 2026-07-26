@@ -79,6 +79,10 @@ export component ChatInputLayout inherits Rectangle {
     in property <int> terminal-count: 0;
 
     callback send-requested();
+    // SCNA-03: Return on an *empty* compose box fast-tracks the front
+    // send-queue entry instead of sending an empty prompt -- see the
+    // Return-key handler below, and send_queue.rs's try_fast_track.
+    callback queue-fast-track-requested();
     callback stop-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
@@ -609,7 +613,18 @@ export component ChatInputLayout inherits Rectangle {
                                 }
                             }
                             if (event.text == Key.Return && !event.modifiers.shift && !event.modifiers.control) {
-                                root.send-requested();
+                                // SCNA-03: an empty compose box has nothing
+                                // to send -- if a message is already
+                                // queued, Return here means "send it now"
+                                // (try_fast_track), not "send an empty
+                                // prompt". Safe to fire unconditionally:
+                                // the reducer no-ops if nothing is
+                                // fast-track-eligible.
+                                if (root.compose-text == "") {
+                                    root.queue-fast-track-requested();
+                                } else {
+                                    root.send-requested();
+                                }
                                 return EventResult.accept;
                             }
                             if (event.text == Key.Backspace && event.modifiers.control) {

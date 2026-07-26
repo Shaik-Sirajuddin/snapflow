@@ -27,13 +27,23 @@ gateway_port="${PANEL_HOST_E2E_MCP_GATEWAY_PORT:-18796}"
 admin_port="${PANEL_HOST_E2E_MCP_ADMIN_PORT:-18797}"
 admin_token="panel-host-e2e-mcp-admin-token-$$"
 mcp_port="${PANEL_HOST_E2E_MCP_PORT:-19099}"
-scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|rename>}"
+scenario="${1:?usage: host_e2e_mcp_smoke.sh <send-now|fast-track|rename|startup-warning|mid-session-write-failure|real-agent-smoke>}"
 
 server_bin="${ACPX_SERVER_BIN:-$repo_root/acpx/target/debug/acpx-server}"
 agent_bin="${RUI_MOCK_AGENT_BIN:-$repo_root/panel-rust/target/debug/rui-mock-agent}"
 shotcut_bin="${SHOTCUT_BIN:-$repo_root/shotcut/build/src/shotcut}"
+# SCNA-09: real-agent-smoke skips the mock backend entirely -- ACPX_BACKEND_CMD
+# stays unset so acpx-registry's own real fallback registry (ambient CLI auth,
+# npx-spawned) resolves ACPX_DEFAULT_AGENT_ID for real, same as host_vnc_dev.sh.
+# HOME must stay this machine's real $HOME (not a sandboxed one) so the
+# ambient ~/.claude/.credentials.json OAuth this needs is actually found.
+real_agent_id="${PANEL_HOST_E2E_MCP_REAL_AGENT_ID:-claude-acp}"
 
-for binary in "$server_bin" "$agent_bin" "$shotcut_bin" Xvfb curl python3; do
+required_binaries=("$server_bin" "$shotcut_bin" Xvfb curl python3)
+if [[ "$scenario" != "real-agent-smoke" ]]; then
+    required_binaries+=("$agent_bin")
+fi
+for binary in "${required_binaries[@]}"; do
     if ! command -v "$binary" >/dev/null 2>&1 && [[ ! -x "$binary" ]]; then
         printf 'required executable is unavailable: %s\n' "$binary" >&2
         exit 1
@@ -57,6 +67,7 @@ cleanup() {
             wait "$pid" 2>/dev/null || true
         fi
     done
+    chmod -f 755 "$state_dir/panel" 2>/dev/null || true
     if [[ "$keep_state" != "1" ]]; then
         rm -rf "$state_dir"
     else
@@ -76,13 +87,22 @@ for _ in $(seq 1 80); do
 done
 xdpyinfo -display "$display" >/dev/null
 
-ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
-ACPX_DEFAULT_AGENT_ID="codex" \
-ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
-ACPX_ADMIN_TOKEN="$admin_token" \
-ACPX_ADMIN_BIND="127.0.0.1:$admin_port" \
-RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
-"$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
+if [[ "$scenario" == "real-agent-smoke" ]]; then
+    # SCNA-09: ambient registry agent, no mock / no admin mock profile.
+    ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
+    ACPX_DEFAULT_AGENT_ID="$real_agent_id" \
+    ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+    "$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
+else
+    # Main/PROF-4: profile-only mock via admin plane (no ACPX_BACKEND_CMD).
+    ACPX_HTTP_BIND="127.0.0.1:$gateway_port" \
+    ACPX_DEFAULT_AGENT_ID="codex" \
+    ACPX_DB_PATH="$state_dir/acpx/gateway.sqlite3" \
+    ACPX_ADMIN_TOKEN="$admin_token" \
+    ACPX_ADMIN_BIND="127.0.0.1:$admin_port" \
+    RUI_MOCK_AGENT_EVENT_LOG="$state_dir/acpx/backend-events.jsonl" \
+    "$server_bin" <"$fifo" >"$state_dir/acpx/server.stdout.log" 2>"$state_dir/acpx/server.stderr.log" &
+fi
 server_pid="$!"
 
 for _ in $(seq 1 80); do
@@ -93,9 +113,15 @@ for _ in $(seq 1 80); do
 done
 curl --fail --silent "http://127.0.0.1:$gateway_port/health" >/dev/null
 
-# PROF-4 (profile-only-backend-selection plan): see
-# host_e2e_admin_provision.sh's own doc comment for the full mechanism.
-provision_mock_profile_via_admin "$gateway_port" "$admin_port" "$admin_token" "$agent_bin" "$state_dir"
+# PROF-4: mock profile via admin plane for non-real scenarios.
+if [[ "$scenario" != "real-agent-smoke" ]]; then
+    provision_mock_profile_via_admin "$gateway_port" "$admin_port" "$admin_token" "$agent_bin" "$state_dir"
+fi
+
+# SCNA-01: read-only panel cache dir before create for startup-warning.
+if [[ "$scenario" == "startup-warning" ]]; then
+    chmod 555 "$state_dir/panel"
+fi
 
 env \
 SLINT_MCP_PORT="$mcp_port" \
@@ -116,10 +142,18 @@ if ! kill -0 "$shotcut_pid" 2>/dev/null; then
     exit 1
 fi
 
-python3 "$repo_root/panel-rust/tests/host_e2e_mcp_driver.py" \
-    --mcp-url "http://127.0.0.1:$mcp_port/mcp" \
-    --event-log "$state_dir/acpx/backend-events.jsonl" \
-    --host-log "$state_dir/shotcut.stdout.log" \
-    "$scenario"
+driver_args=(
+    --mcp-url "http://127.0.0.1:$mcp_port/mcp"
+    --event-log "$state_dir/acpx/backend-events.jsonl"
+    --host-log "$state_dir/shotcut.stdout.log"
+    --state-dir "$state_dir"
+)
+if [[ "$scenario" == "real-agent-smoke" ]]; then
+    # A real ambient-auth npx spawn (first-run package fetch/cache) plus a
+    # real model round trip is slower and less bounded than the mock
+    # agent's near-instant scripted replies.
+    driver_args+=(--timeout "${PANEL_HOST_E2E_MCP_REAL_AGENT_TIMEOUT:-90}")
+fi
+python3 "$repo_root/panel-rust/tests/host_e2e_mcp_driver.py" "${driver_args[@]}" "$scenario"
 
 printf 'backend events: %s/acpx/backend-events.jsonl\n' "$state_dir"

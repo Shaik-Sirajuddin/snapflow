@@ -113,6 +113,20 @@ def wait_for_accessible_label(client, root_handle, label, timeout=10, max_elemen
     raise RuntimeError(f"no element with accessibleLabel={label!r} appeared in time")
 
 
+def wait_for_accessible_label_prefix(client, root_handle, prefix, timeout=10, max_elements=600):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        tree = client.call_tool(
+            "get_element_tree", {"elementHandle": root_handle, "maxElements": max_elements}
+        )
+        for element in tree.get("elements", []):
+            label = element.get("accessibleLabel")
+            if label and label.startswith(prefix):
+                return element["handle"], label
+        time.sleep(0.2)
+    raise RuntimeError(f"no element with accessibleLabel starting {prefix!r} appeared in time")
+
+
 def set_text(client, element_handle, text):
     client.call_tool(
         "set_element_value", {"elementHandle": element_handle, "value": text}
@@ -239,6 +253,58 @@ def scenario_send_now(args):
     )
 
 
+def scenario_fast_track(args):
+    """SCNA-03: pressing Return on an *empty* compose box right after
+    queuing a message (while a turn is still in flight) fast-tracks that
+    queued entry instead of sending an empty prompt -- verifies the
+    compose-text-empty branch in chat_input_layout.slint's Return-key
+    handler actually reaches update()'s new QueueFastTrack arm on a real
+    host, cancelling the in-flight turn and sending the queued text.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    compose_handle = find_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose"
+    )
+    click(client, compose_handle)
+
+    # Turn 1: blocks (mock_agent.rs's "slow " marker) so the queued entry
+    # below actually enqueues instead of sending immediately.
+    set_text(client, compose_handle, "slow scenario fast track base")
+    press_return(client, window_handle)
+    wait_for_prompt_texts(args.event_log, ["slow scenario fast track base"])
+
+    # Enqueue one entry (arms can_fast_track), then clear the compose box
+    # and press Return again with it empty -- must fast-track, not send
+    # an empty prompt.
+    set_text(client, compose_handle, "fast tracked message")
+    press_return(client, window_handle)
+    set_text(client, compose_handle, "")
+    press_return(client, window_handle)
+
+    wait_for_prompt_texts(
+        args.event_log,
+        ["slow scenario fast track base", "fast tracked message"],
+        timeout=args.timeout,
+    )
+    sent_texts = [
+        event["detail"]
+        for event in prompt_events(args.event_log)
+        if event["method"] == "session/prompt"
+    ]
+    if "" in sent_texts:
+        raise RuntimeError(
+            f"an empty prompt was sent to the backend -- fast-track did not intercept "
+            f"the empty-compose Return, saw prompts: {sent_texts!r}"
+        )
+    print(
+        "PASS fast_track scenario: empty-compose Return fast-tracked the queued "
+        "message instead of sending an empty prompt"
+    )
+
+
 def scenario_rename(args):
     """Round-trips a real thread rename through the actual host process:
     click Rename thread, type a new name, confirm, verify the header
@@ -274,9 +340,166 @@ def scenario_rename(args):
     print(f"PASS rename scenario: header title updated to {new_name!r} via the real host")
 
 
+def scenario_startup_warning(args):
+    """SCNA-01: forces PanelStateStore::open to fail at cold start (the
+    launcher chmods the panel cache dir read-only before this process
+    ever starts -- see host_e2e_mcp_smoke.sh) and verifies the failure
+    reaches the live UI as a real error banner, not just stderr or a
+    unit-tested Dirty::Error value.
+
+    This exercises cold_start_error_surfacing's actual production path:
+    lib.rs's panel_rust_create -> InitialState::startup_warnings ->
+    update()'s InitialStateLoaded(Ok(..)) handler -> Dirty::Error{thread_id:
+    "", ..} -> sync.rs (thread_id.is_empty() short-circuits the "only the
+    displayed thread" filter, so this is a global banner) ->
+    ChatArea.last-error -> the real "⚠ ..." Text element in chat_area.slint.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    _window_handle, root_handle = get_root_element(client)
+
+    _handle, label = wait_for_accessible_label_prefix(
+        client, root_handle, "⚠ ", timeout=args.timeout
+    )
+    if "panel settings persistence unavailable" not in label:
+        raise RuntimeError(
+            f"error banner appeared but with an unexpected message: {label!r}"
+        )
+    print(f"PASS startup_warning scenario: real error banner appeared: {label!r}")
+
+
+def scenario_mid_session_write_failure(args):
+    """SCNA-10: a real, deterministic mid-session PanelStateStore write
+    failure trigger, exercised end to end. Unlike scenario_startup_warning
+    (which fails PanelStateStore::open itself, before this process even
+    starts), the panel-state.sqlite3 connection here is already open and
+    has already served at least one successful write -- this instead makes
+    the *containing directory* read-only mid-session. SQLite's default
+    rollback-journal mode needs to create/delete a `-journal` sibling file
+    on every write even though the main .sqlite3 file itself stays
+    writable, so this reliably fails the very next write with a real
+    "attempt to write a readonly database" error on an already-open
+    connection -- no test-only production hook needed (see the matching
+    Rust-level regression,
+    state_store::tests::a_mid_session_write_fails_when_the_state_dir_becomes_read_only_after_open).
+
+    Exercises effect_executor.rs's Effect::RenameThread failure branch for
+    real: the spawned-thread write fails -> StateEffectFailed -> Dirty::Error
+    -> a live "⚠ failed to persist renamed chat thread: ..." banner, then
+    proves the store self-heals (no code involved, just restored directory
+    permissions) once the directory is writable again.
+    """
+    import os
+    import stat
+
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    panel_dir = args.state_dir / "panel"
+    original_mode = stat.S_IMODE(panel_dir.stat().st_mode)
+    os.chmod(panel_dir, 0o555)
+    try:
+        rename_handle = wait_for_accessible_label(client, root_handle, "Rename thread")
+        click(client, rename_handle)
+        name_input_handle = wait_for_accessible_label(client, root_handle, "Thread name")
+        set_text(client, name_input_handle, "mcp write-failure attempt")
+        press_return(client, window_handle)
+
+        _handle, label = wait_for_accessible_label_prefix(
+            client, root_handle, "⚠ ", timeout=args.timeout
+        )
+        # Whichever StateEffectFailed-producing write loses the race against
+        # the read-only directory first (RenameThread's own write, or a
+        # SetSelectedThread persist fired incidentally by opening the rename
+        # dialog) is equally valid proof of the mechanism: some real,
+        # already-in-flight PanelStateStore write failed mid-session and
+        # reached the live UI as an error banner, not just stderr.
+        if "failed to persist" not in label or "readonly database" not in label:
+            raise RuntimeError(
+                f"error banner appeared but with an unexpected message: {label!r}"
+            )
+    finally:
+        os.chmod(panel_dir, original_mode)
+
+    new_name = "mcp write-failure recovered"
+    rename_handle = wait_for_accessible_label(client, root_handle, "Rename thread")
+    click(client, rename_handle)
+    name_input_handle = wait_for_accessible_label(client, root_handle, "Thread name")
+    set_text(client, name_input_handle, new_name)
+    press_return(client, window_handle)
+    wait_for_accessible_label(client, root_handle, new_name, timeout=args.timeout)
+    print(
+        "PASS mid_session_write_failure scenario: a real mid-session "
+        "PanelStateStore write failure surfaced as a live error banner, "
+        "and a later write succeeded again once the directory was writable"
+    )
+
+
+def scenario_real_agent_smoke(args):
+    """SCNA-09: the one real-agent-backend gap never actually run in this
+    repo's automated (non-interactive) harnesses -- every other MCP/XTEST
+    scenario in this file talks to rui-mock-agent; host_vnc_dev.sh talks to
+    a real ambient-auth backend but is a manual/VNC-only harness with no
+    automated pass/fail. This sends exactly one short prompt (cheapest
+    model, minimal token spend -- same "one real, billed call" posture as
+    this repo's own #[ignore]'d ACPX_LIVE_TEST_AMBIENT=1 acpx-server tests)
+    through the real, live embedded panel UI and confirms a real assistant
+    reply actually renders -- proving the whole host chain (Shotcut's
+    ChatRustDock -> panel-rust's dispatch/update/sync -> a real gateway ->
+    a real ambient-auth-spawned claude-acp process -> a real model
+    response -> back through TEA -> a real rendered message bubble) works
+    end to end, not just the gateway-level path acpx-server's own real-*
+    tests already cover.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    compose_handle = find_element_by_qualified_id(
+        client, window_handle, "ChatInputLayout::compose"
+    )
+    click(client, compose_handle)
+    prompt_text = "Reply with exactly the single word: OK"
+    set_text(client, compose_handle, prompt_text)
+    press_return(client, window_handle)
+
+    # No backend event log for a real agent (that's rui-mock-agent-only
+    # instrumentation) -- wait for a real assistant message element to
+    # appear in the transcript instead, via the live element tree.
+    deadline = time.monotonic() + args.timeout
+    reply_text = None
+    while time.monotonic() < deadline:
+        tree = client.call_tool(
+            "get_element_tree", {"elementHandle": root_handle, "maxElements": 800}
+        )
+        texts = [
+            element.get("accessibleLabel", "")
+            for element in tree.get("elements", [])
+        ]
+        candidates = [
+            text for text in texts
+            if text and text != prompt_text and "OK" in text.upper()
+        ]
+        if candidates:
+            reply_text = candidates[-1]
+            break
+        time.sleep(0.5)
+    if reply_text is None:
+        raise RuntimeError(
+            f"no real assistant reply appeared within {args.timeout}s -- "
+            f"real-agent round trip did not complete"
+        )
+    print(f"PASS real_agent_smoke scenario: real assistant reply observed: {reply_text!r}")
+
+
 SCENARIOS = {
     "send-now": scenario_send_now,
+    "fast-track": scenario_fast_track,
     "rename": scenario_rename,
+    "startup-warning": scenario_startup_warning,
+    "mid-session-write-failure": scenario_mid_session_write_failure,
+    "real-agent-smoke": scenario_real_agent_smoke,
 }
 
 
@@ -285,6 +508,11 @@ def main():
     parser.add_argument("--mcp-url", default="http://127.0.0.1:18999/mcp")
     parser.add_argument("--event-log", type=pathlib.Path, required=True)
     parser.add_argument("--host-log", type=pathlib.Path)
+    parser.add_argument(
+        "--state-dir",
+        type=pathlib.Path,
+        help="host_e2e_mcp_smoke.sh's state_dir; only mid-session-write-failure needs this",
+    )
     parser.add_argument("--timeout", type=float, default=15)
     parser.add_argument("scenario", choices=sorted(SCENARIOS))
     args = parser.parse_args()

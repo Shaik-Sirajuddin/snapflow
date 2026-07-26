@@ -913,6 +913,63 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 }
             }
         }
+        ComposeMsg::QueueFastTrack => {
+            let is_generating = {
+                let Some(thread) = model.threads.get(idx) else {
+                    return (vec![], vec![]);
+                };
+                matches!(thread.state, ThreadState::Loading | ThreadState::Cancelling)
+            };
+            let fast_track_result = {
+                let Some(thread) = model.threads.get_mut(idx) else {
+                    return (vec![], vec![]);
+                };
+                thread.send_queue.try_fast_track(is_generating)
+            };
+            match fast_track_result {
+                Ok(Some(entry)) => {
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = None;
+                    thread.state = ThreadState::Loading;
+                    let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
+                    dirty.push(Dirty::Connection { thread_id });
+                    let mut effects = Vec::with_capacity(2);
+                    if is_generating {
+                        // Same AbsorbingCancel handoff as QueueSendNow --
+                        // try_fast_track already armed it above.
+                        effects.push(Effect::CancelGeneration { real_index: idx });
+                    }
+                    effects.push(Effect::SendPrompt {
+                        real_index: idx,
+                        text: entry.text,
+                    });
+                    (effects, dirty)
+                }
+                // Safe no-op: no can_fast_track-eligible entry (queue
+                // empty, or the last mutation wasn't a fresh enqueue) --
+                // the Slint side fires this unconditionally on empty-
+                // compose Return, so this is the expected common case.
+                Ok(None) => (vec![], vec![]),
+                Err(error) => {
+                    let message = error.to_string();
+                    let Some(thread) = model.threads.get_mut(idx) else {
+                        return (vec![], vec![]);
+                    };
+                    let thread_id = thread.thread_id.clone();
+                    thread.error = Some(message.clone());
+                    (
+                        vec![],
+                        vec![Dirty::Error {
+                            thread_id,
+                            detail: ErrorDetail { message },
+                        }],
+                    )
+                }
+            }
+        }
         // Pure text-parsing helpers -- no Model mutation, no Dirty. These
         // exist as Msg variants for coverage completeness (see
         // 00-plan.md's callback mapping table) but their real logic stays
@@ -2213,6 +2270,25 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let Some(target_index) = target_index else {
             return (effects, dirty);
         };
+        // SCNA-01: distinct from `switched_thread` below -- specifically
+        // whether there was a *real* previously-displayed thread to leave.
+        // `model.displayed_thread` starts `None` before cold-start
+        // hydration's first frame, so that first frame's `switched_thread`
+        // is also true; every restored thread starts idle/error-free (see
+        // `Model::from_initial_state`'s own doc comment), so the
+        // `Dirty::Error` this function pushes below on `switched_thread`
+        // always carries an empty message on that first frame -- but
+        // still unconditionally overwrites `last-error`, silently wiping
+        // any global cold-start warning (InitialState::startup_warnings,
+        // routed through `Dirty::Error{thread_id: "", ..}` a moment
+        // earlier in the same synchronous panel_rust_create call) before
+        // the window is ever shown. Captured before the
+        // `selection_matches`-gated switched_thread below, since that
+        // gate answers a different question (is this snapshot even for
+        // the currently-selected thread) and must not affect this one
+        // (was there a real previous thread to leave, regardless of
+        // whether *this particular* snapshot ends up promoting a switch).
+        let had_prior_displayed_thread = model.displayed_thread.is_some();
         // One-frame stale-collection guard (plan phase 23): the snapshot
         // was collected via `visible_indices[selected_thread]` *before*
         // this same frame's thread-list fold re-anchored the selection, so
@@ -2383,7 +2459,12 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             if capabilities_changed {
                 dirty.push(Dirty::Capabilities { thread_id });
             }
-            if switched_thread {
+            // See had_prior_displayed_thread's doc comment above: skip on
+            // cold start's implicit first display (nothing stale to
+            // clear, and thread.error is always None there anyway per
+            // Model::from_initial_state), so a global cold-start warning
+            // banner set moments earlier survives instead of being wiped.
+            if switched_thread && had_prior_displayed_thread {
                 dirty.push(Dirty::Error {
                     thread_id: thread.thread_id.clone(),
                     detail: ErrorDetail {
@@ -3276,6 +3357,96 @@ mod tests {
     }
 
     #[test]
+    fn queue_fast_track_while_idle_sends_immediately() {
+        // SCNA-03: Return on an empty compose box right after enqueuing
+        // (can_fast_track armed by enqueue itself) sends immediately.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0]
+            .send_queue
+            .enqueue("go now".to_owned(), false)
+            .expect("queue");
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::SendPrompt {
+                real_index: 0,
+                text: "go now".to_owned(),
+            }]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::Connection { .. })));
+    }
+
+    #[test]
+    fn queue_fast_track_while_generating_cancels_then_sends_and_arms_absorbing_cancel() {
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0].state = ThreadState::Loading;
+        model.threads[0]
+            .send_queue
+            .enqueue("front".to_owned(), false)
+            .expect("queue");
+        let (effects, _dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert_eq!(
+            effects,
+            vec![
+                Effect::CancelGeneration { real_index: 0 },
+                Effect::SendPrompt {
+                    real_index: 0,
+                    text: "front".to_owned(),
+                },
+            ]
+        );
+        assert!(model.threads[0].send_queue.is_empty());
+        assert_eq!(model.threads[0].state, ThreadState::Loading);
+        // The eventual TurnEnded from the cancel above must not also
+        // auto-drain -- AbsorbingCancel swallows it once, same
+        // contract as QueueSendNow.
+        let popped = model.threads[0]
+            .send_queue
+            .on_generation_stopped(false)
+            .unwrap();
+        assert!(popped.is_none(), "AbsorbingCancel must swallow this Stopped event");
+    }
+
+    #[test]
+    fn queue_fast_track_is_a_safe_no_op_when_nothing_is_eligible() {
+        // No enqueue just happened (can_fast_track never armed) -- the
+        // Slint side fires this unconditionally on empty-compose Return,
+        // so this is the expected common case, not an error.
+        let mut model = model_with_threads(&["a"]);
+        model.threads[0]
+            .send_queue
+            .enqueue("already queued earlier".to_owned(), false)
+            .expect("queue");
+        // Consume the fast-track eligibility some other way (matches how
+        // any queue mutation other than a fresh enqueue leaves nothing
+        // eligible) -- send_now clears it same as try_fast_track would.
+        let entry_id = model.threads[0]
+            .send_queue
+            .first_id()
+            .expect("one entry queued");
+        model.threads[0]
+            .send_queue
+            .send_now(entry_id, false)
+            .expect("send_now");
+        assert!(model.threads[0].send_queue.is_empty());
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
     fn queue_stop_pauses_queue_and_cancels_generation() {
         let mut model = model_with_threads(&["a"]);
         model.threads[0].state = ThreadState::Loading;
@@ -3950,6 +4121,90 @@ mod tests {
             item,
             Dirty::Connection { thread_id } if thread_id == "thread-0"
         )));
+    }
+
+    #[test]
+    fn cold_starts_first_displayed_thread_snapshot_never_clears_a_global_error_banner() {
+        // SCNA-01 regression: model.displayed_thread starts None before
+        // cold-start hydration's first Frame. That first frame's own
+        // "switched_thread" (None -> Some(0)) used to unconditionally
+        // push Dirty::Error{thread_id: "thread-0", message: ""}
+        // (thread.error is always None on a freshly-restored thread),
+        // silently wiping out any InitialState::startup_warnings banner
+        // set moments earlier in the same synchronous cold-start call,
+        // before the window was ever shown. The fix: skip that push when
+        // there was no real previously-displayed thread to leave.
+        let mut model = model_with_threads(&["thread"]);
+        assert_eq!(model.displayed_thread, None);
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-0".to_owned(),
+                    real_index: 0,
+                    transcript: vec![],
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                    usage: (0, 0),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.displayed_thread, Some(0));
+        assert!(
+            !dirty.iter().any(|item| matches!(item, Dirty::Error { .. })),
+            "the first-ever displayed-thread snapshot must not emit a Dirty::Error, got {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_thread_switch_still_clears_the_outgoing_threads_error_banner() {
+        // Companion to the cold-start regression above: once a thread has
+        // genuinely been displayed before, switching away from it must
+        // still clear/refresh the error banner for the incoming thread --
+        // this is the original leak_audit_report behavior the
+        // had_prior_displayed_thread guard must not disable.
+        let mut model = model_with_threads(&["first", "second"]);
+        model.threads[0].session_id = Some("thread-0-session".to_owned());
+        model.displayed_thread = Some(0);
+        // phase-23's selection_matches gate requires the snapshot's target
+        // to actually be the currently-selected thread, not just any
+        // thread -- otherwise switched_thread is false regardless of this
+        // test's own guard, for an unrelated reason.
+        model.selected_thread = 1;
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                selected_thread_snapshot: Some(crate::msg::ThreadFrameSnapshot {
+                    thread_id: "thread-1".to_owned(),
+                    real_index: 1,
+                    transcript: vec![],
+                    has_older_messages: false,
+                    pending_request: crate::PendingRequestItem::default(),
+                    terminals: vec![],
+                    expanded_terminal: None,
+                    local_terminal: crate::LocalTerminalItem::default(),
+                    connection_status: String::new(),
+                    session_modes: None,
+                    config_options: vec![],
+                    usage: (0, 0),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert!(
+            dirty.iter().any(|item| matches!(
+                item,
+                Dirty::Error { thread_id, .. } if thread_id == "thread-1"
+            )),
+            "a genuine thread switch must still refresh the error banner, got {dirty:?}"
+        );
     }
 
     #[test]

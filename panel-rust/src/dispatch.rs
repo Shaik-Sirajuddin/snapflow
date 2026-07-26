@@ -590,6 +590,24 @@ pub(crate) fn dispatch_queue_send_now(panel: &PanelSingleton, message_index: usi
     execute_effects(panel, effects);
 }
 
+/// SCNA-03: Return pressed on an empty compose box -- fast-tracks the
+/// front queue entry if one is eligible (safe no-op otherwise, see
+/// ComposeMsg::QueueFastTrack's own doc comment).
+pub(crate) fn dispatch_queue_fast_track(panel: &PanelSingleton) {
+    let (effects, _dirty) =
+        update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueFastTrack)));
+    debug_assert!(
+        effects.len() <= 2
+            && effects.iter().all(|effect| matches!(
+                effect,
+                crate::effect::Effect::CancelGeneration { .. }
+                    | crate::effect::Effect::SendPrompt { .. }
+            )),
+        "Compose::QueueFastTrack must only produce CancelGeneration/SendPrompt effects"
+    );
+    execute_effects(panel, effects);
+}
+
 /// QueuedMessageBar stop -- pause queue auto-drain and cancel generation.
 pub(crate) fn dispatch_queue_stop(panel: &PanelSingleton) {
     let (effects, _dirty) =

@@ -22,7 +22,6 @@
 
 use crate::protocol_types::AgentRequestEvent;
 use serde_json::Value;
-use slint::{ModelRc, VecModel};
 
 /// One selectable approval choice for the Slint card (mirrors
 /// [`crate::PermissionOptionItem`]).
@@ -197,13 +196,6 @@ pub fn to_pending_request_view(event: &AgentRequestEvent) -> PendingRequestView 
         summary,
         options: extract_options(event),
     }
-}
-
-/// Convert option views into the Slint model.
-pub fn to_permission_option_model(
-    options: Vec<PermissionOptionView>,
-) -> ModelRc<crate::PermissionOptionItem> {
-    ModelRc::new(VecModel::from(to_permission_option_rows(options)))
 }
 
 /// Builds concrete rows for a reducer-owned pending-request snapshot.

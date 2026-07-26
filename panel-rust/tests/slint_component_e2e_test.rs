@@ -274,6 +274,7 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         raw_output: "".into(),
         queued: false,
         can_edit: false,
+        can_send_now: false,
         sending: false,
         first_use: false,
     }])));
@@ -350,7 +351,13 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
     let expand_terminal = ElementHandle::find_by_accessible_label(&panel, "Expand terminal build-42")
         .next()
         .expect("terminal expand control must be accessible");
-    assert_eq!(expand_terminal.id().as_deref(), Some("TerminalCard::terminal-expand"));
+    // SCNA-11: TerminalCard's header is TerminalHeader, which inherits
+    // HoverSurface directly (terminal_header.slint) rather than exposing
+    // its own separately-named clickable element -- there is no
+    // "TerminalCard::terminal-expand" id in the current component tree
+    // (this assertion predates that refactor). HoverSurface::touch is
+    // the real, current id of the single accessible-label match.
+    assert_eq!(expand_terminal.id().as_deref(), Some("HoverSurface::touch"));
     expand_terminal.invoke_accessible_default_action();
     assert_eq!(expanded_terminal.take(), "build-42");
 
@@ -1767,6 +1774,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
+                link: "".into(),
             },
             panel_rust::MarkdownRun {
                 link: "".into(),
@@ -1775,6 +1783,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
+                link: "".into(),
             },
             panel_rust::MarkdownRun {
                 link: "".into(),
@@ -1783,6 +1792,7 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
+                link: "".into(),
             },
         ])),
         indent: 0,

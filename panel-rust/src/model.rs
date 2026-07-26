@@ -172,7 +172,6 @@ pub struct Model {
     /// `None`/empty together (see `update_terminal`'s `Expand`/
     /// `CloseTab`/`CloseOverlay` arms, which keep the two in lockstep).
     pub open_terminal_ids: Vec<String>,
-    pub local_terminal_last_text: String,
     pub active_project_path: Option<String>,
     /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
     /// path` value the currently-applied thread list (`visible_indices`/
