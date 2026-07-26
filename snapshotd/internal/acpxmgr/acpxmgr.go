@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,6 +33,8 @@ import (
 // (unlike panel-rust's own per-provider dev-fallback spawn path, which
 // does need a fresh port per instance).
 const AdminBind = "127.0.0.1:8791"
+
+const maxPortBumpAttempts = 100
 
 // Config drives spawn + generated provisioning file.
 type Config struct {
@@ -248,6 +252,22 @@ func Start(ctx context.Context, cfg Config) (*Manager, error) {
 		// ever changes.
 		cfg.HttpBind = "127.0.0.1:8790"
 	}
+	// snapshotd-launch-fix: walk ports if preferred bind is occupied.
+	resolvedBind, err := nextAvailableTCPBind(cfg.HttpBind, maxPortBumpAttempts)
+	if err != nil {
+		return nil, fmt.Errorf("acpxmgr: select HTTP bind: %w", err)
+	}
+	if resolvedBind != cfg.HttpBind {
+		log := cfg.Log
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("acpx HTTP bind is occupied; using next available port",
+			"requested", cfg.HttpBind,
+			"selected", resolvedBind,
+		)
+		cfg.HttpBind = resolvedBind
+	}
 	if cfg.McpURL == "" {
 		return nil, fmt.Errorf("acpxmgr: empty McpURL")
 	}
@@ -456,4 +476,40 @@ func isExpectedExit(err error) bool {
 	return strings.Contains(s, "signal: killed") ||
 		strings.Contains(s, "signal: terminated") ||
 		strings.Contains(s, "context canceled")
+}
+
+// HTTPBind returns the address assigned to the managed acpx-server process
+// (may differ from the requested Config.HttpBind after port-bump).
+func (m *Manager) HTTPBind() string {
+	if m == nil {
+		return ""
+	}
+	return m.cfg.HttpBind
+}
+
+// nextAvailableTCPBind returns bind when free, otherwise tries higher ports.
+func nextAvailableTCPBind(bind string, attempts int) (string, error) {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(bind))
+	if err != nil {
+		return "", fmt.Errorf("invalid TCP bind %q: %w", bind, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid TCP port in %q", bind)
+	}
+	if attempts < 1 {
+		return "", fmt.Errorf("attempts must be positive")
+	}
+	for offset := 0; offset < attempts && port+offset <= 65535; offset++ {
+		candidate := net.JoinHostPort(host, strconv.Itoa(port+offset))
+		listener, err := net.Listen("tcp", candidate)
+		if err == nil {
+			_ = listener.Close()
+			return candidate, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("no available TCP port in %s through %d", bind, port+attempts-1)
 }
