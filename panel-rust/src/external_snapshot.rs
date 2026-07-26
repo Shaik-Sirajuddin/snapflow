@@ -30,6 +30,54 @@ fn skills_rescan_due() -> bool {
     })
 }
 
+/// Throttle for settings prefs disk/SQLite reads on the UI frame path
+/// (lock_audit F-04). Returns true when a full rescan should run.
+fn prefs_rescan_due() -> bool {
+    thread_local! {
+        static LAST_PREFS_SCAN: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+    LAST_PREFS_SCAN.with(|last| {
+        let now = std::time::Instant::now();
+        let due = last
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(1));
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
+thread_local! {
+    static LAST_PREFS_SNAPSHOT: std::cell::RefCell<Option<(String, msg::SettingsPreferencesSnapshot)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn last_prefs_snapshot_if_scope(scope: &str) -> Option<msg::SettingsPreferencesSnapshot> {
+    LAST_PREFS_SNAPSHOT.with(|cell| {
+        cell.borrow().as_ref().and_then(|(cached_scope, snap)| {
+            (cached_scope == scope).then(|| snap.clone())
+        })
+    })
+}
+
+fn store_prefs_snapshot(snap: msg::SettingsPreferencesSnapshot) {
+    LAST_PREFS_SNAPSHOT.with(|cell| {
+        *cell.borrow_mut() = Some((snap.scope.clone(), snap));
+    });
+}
+
+fn model_gateway_catalog_snapshot(model: &crate::model::Model) -> msg::SettingsGatewaySnapshot {
+    msg::SettingsGatewaySnapshot {
+        profiles: model.available_profiles.clone(),
+        mcp_servers: model.available_mcp_servers.clone(),
+        agents: model.agent_catalog.clone(),
+        recoverable_sessions: model.recoverable_sessions.clone(),
+        recovery_provider: model.recovery_provider.clone(),
+    }
+}
+
 /// PISO-8 (project-isolation-mlt-binding plan): throttle for
 /// `Effect::RefreshDaemonProjectInstances` -- same thread-local-timer
 /// mechanism as `skills_rescan_due`, a longer 3s period since this poll
@@ -126,8 +174,17 @@ impl<'a> ExternalSnapshotSource<'a> {
             selected_thread_snapshot: self.collect_selected_thread_snapshot(),
             settings_preferences_snapshot: (settings_open || settings_reload_pending)
                 .then(|| self.collect_settings_preferences_snapshot(None)),
+            // The bridge returns a cached catalog and starts any refresh on
+            // its runtime. This path never waits for installation, RPC, or a
+            // contended cache lock.
             settings_gateway_snapshot: need_gateway_catalog
                 .then(|| self.collect_settings_gateway_snapshot()),
+            agent_operations_in_flight: self
+                .panel
+                .bridge
+                .as_ref()
+                .map(AgentBridge::agent_operations_in_flight)
+                .unwrap_or_default(),
             // Plan phase 27 (skills view reactivity): while Settings is on
             // screen, re-scan the skills dirs about once a second and fold
             // the result, so the live skills view tracks filesystem/state
@@ -142,19 +199,21 @@ impl<'a> ExternalSnapshotSource<'a> {
         }
     }
 
+    /// Gateway catalog for Settings / compose provider dropdown.
+    ///
+    /// **UI-thread contract (lock_audit Layer 1):** never `block_on` RPC here.
+    /// Kick a background refresh, then return the last cache fill only
+    /// (same shape as `AgentBridge::poll` — background pushes, UI drains).
     pub(crate) fn collect_settings_gateway_snapshot(&self) -> msg::SettingsGatewaySnapshot {
         self.panel
             .bridge
             .as_ref()
             .map(|bridge| {
                 let gw = self.panel.settings_gateway_index();
-                msg::SettingsGatewaySnapshot {
-                    profiles: bridge.list_profiles(gw),
-                    mcp_servers: bridge.list_mcp_servers(gw),
-                    agents: bridge.list_agents(gw),
-                    recoverable_sessions: bridge.recoverable_sessions(gw),
-                    recovery_provider: bridge.thread_provider(gw).unwrap_or_default(),
-                }
+                // Push work off the frame-poll path (tokio), then drain cache.
+                bridge.request_gateway_catalog_refresh(gw);
+                let stale_fallback = model_gateway_catalog_snapshot(&self.panel.model.borrow());
+                bridge.gateway_catalog_snapshot(stale_fallback)
             })
             .unwrap_or(msg::SettingsGatewaySnapshot {
                 profiles: Vec::new(),
@@ -192,10 +251,17 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .and_then(|bridge| bridge.thread_binding(idx))
                     .map(|binding| binding.thread_id)
             });
-        // Frame-poll path (this snapshot is collected up to 60-90x/sec):
-        // discard warnings here rather than route through Dirty::Error on
-        // every tick -- the once-per-launch cold-start call sites in
-        // lib.rs::panel_rust_create surface the same failures already.
+        // Frame-poll path (up to 60-90x/sec): throttle disk/settings reads
+        // (lock_audit F-04). Same pattern as skills_rescan_due — full JSON
+        // load at most once per second while settings stay open.
+        // Discard warnings here rather than Dirty::Error every tick —
+        // cold-start call sites in lib.rs surface the same failures.
+        if !prefs_rescan_due() {
+            if let Some(cached) = last_prefs_snapshot_if_scope(scope) {
+                return cached;
+            }
+            // Scope changed mid-window: fall through to one disk read.
+        }
         let mut discarded_warnings = Vec::new();
         let prefs =
             crate::load_scoped_panel_prefs(scope, selected_thread_id.clone(), &mut discarded_warnings);
@@ -214,14 +280,14 @@ impl<'a> ExternalSnapshotSource<'a> {
             .as_deref()
             .and_then(|thread_id| {
                 self.panel
-                    .panel_state
+                    .active_panel_state()
                     .as_ref()
                     .and_then(|store| store.thread_settings(thread_id).ok().flatten())
                     .and_then(|settings| settings.background_session)
                     .map(|value| (true, value))
             })
             .unwrap_or((false, false));
-        msg::SettingsPreferencesSnapshot {
+        let snap = msg::SettingsPreferencesSnapshot {
             scope: scope.to_owned(),
             default_profile: defaults.profile_name.unwrap_or_default(),
             permission_profile: defaults.permission_profile.unwrap_or_default(),
@@ -230,7 +296,9 @@ impl<'a> ExternalSnapshotSource<'a> {
             dev_mode: crate::settings_file::SettingsPaths::from_env().dev_mode(),
             background_override_set,
             background_override,
-        }
+        };
+        store_prefs_snapshot(snap.clone());
+        snap
     }
 
     pub(crate) fn collect_thread_list_snapshot(&self) -> msg::ThreadListSnapshot {
@@ -295,7 +363,8 @@ impl<'a> ExternalSnapshotSource<'a> {
             .iter()
             .enumerate()
             .map(|(idx, _)| {
-                let Some(store) = self.panel.panel_state.as_ref() else {
+                let active_store = self.panel.active_panel_state();
+                let Some(store) = active_store.as_ref() else {
                     return false;
                 };
                 let Some(thread_id) = self
@@ -484,11 +553,18 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .threads
                     .get(item.real_index)
                     .is_some_and(|thread| thread.session_id.is_some());
+                // Use catalog cache only — never block_on agents/list on the
+                // frame path (lock_audit F-01). Kick a background refresh if
+                // cold; agent_detected may be None for one tick then settle.
                 let agent_detected = if !already_attached && new_session_id.is_some() {
                     self.panel.bridge.as_ref().and_then(|bridge| {
+                        bridge.request_gateway_catalog_refresh(item.real_index);
+                        let catalog = bridge.gateway_catalog_snapshot(
+                            model_gateway_catalog_snapshot(&model_snapshot),
+                        );
                         models::agent_detected_for_profile(
-                            &bridge.list_profiles(item.real_index),
-                            &bridge.list_agents(item.real_index),
+                            &catalog.profiles,
+                            &catalog.agents,
                             &row.profile_name,
                         )
                     })
@@ -551,6 +627,25 @@ impl<'a> ExternalSnapshotSource<'a> {
         real_idx: usize,
     ) -> Option<msg::ThreadFrameSnapshot> {
         let bridge = self.panel.bridge.as_ref()?;
+        let selected_provider = self
+            .panel
+            .model
+            .borrow()
+            .threads
+            .get(real_idx)
+            .and_then(|thread| thread.profile_name.as_deref())
+            .and_then(|profile_name| {
+                self.panel
+                    .model
+                    .borrow()
+                    .available_profiles
+                    .iter()
+                    .find(|profile| profile.name == profile_name)
+                    .map(|profile| profile.agent_id.clone())
+            })
+            .or_else(|| bridge.thread_provider(real_idx))
+            .unwrap_or_default();
+        bridge.ensure_models_for_provider(real_idx, &selected_provider);
         let pending_request = match bridge.pending_requests(real_idx).first() {
             Some(event) => {
                 let view = crate::permission::to_pending_request_view(event);
@@ -627,7 +722,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             connection_status: bridge.transport_status(real_idx),
             session_modes: bridge.session_modes(real_idx),
             usage: bridge.thread_usage(real_idx),
-            config_options: bridge.config_options(real_idx),
+            config_options: bridge.config_options_for_provider(real_idx, &selected_provider),
             available_commands: bridge.available_commands(real_idx),
             plan: bridge.plan(real_idx),
             session_title: bridge.session_title(real_idx),

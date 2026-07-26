@@ -138,7 +138,11 @@ pub(crate) fn update_persistent(
         update(&mut model, msg)
     };
     if !result.1.is_empty() {
-        let model = panel.model.borrow().clone();
+        // Borrow the persistent model directly. Cloning `Model` duplicates
+        // RefCell key caches while keeping Slint VecModels shared, so sync
+        // would update a throwaway cache against the real UI model and
+        // trigger perpetual list reconciliation desyncs.
+        let model = panel.model.borrow();
         sync(&model, &panel.component, &result.1);
     }
     result
@@ -1090,10 +1094,17 @@ pub(crate) fn dispatch_mode_selected(
     execute_effects(panel, effects);
 }
 
-pub(crate) fn dispatch_profile_selected(panel: &PanelSingleton, profile_name: String) {
+pub(crate) fn dispatch_profile_selected(
+    panel: &PanelSingleton,
+    profile_name: String,
+    agent_id: String,
+) {
     let (effects, _) = update_persistent(
         panel,
-        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected(profile_name))),
+        Msg::Ui(UiMsg::Settings(SettingsMsg::ProfileSelected {
+            profile_name,
+            agent_id,
+        })),
     );
     execute_effects(panel, effects);
 }
@@ -1315,12 +1326,34 @@ pub(crate) fn dispatch_project_path_changed(panel: &PanelSingleton, path: Option
     execute_effects(panel, effects);
 }
 
+pub(crate) fn dispatch_project_created_untitled(panel: &PanelSingleton) {
+    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::ProjectCreatedUntitled));
+    execute_effects(panel, effects);
+}
+
+pub(crate) fn dispatch_project_closed(panel: &PanelSingleton) {
+    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::ProjectClosed));
+    execute_effects(panel, effects);
+}
+
 /// PISO-7: the explicit Save-As rename signal, kept as its own dispatch
 /// function rather than folded into `dispatch_project_path_changed` --
 /// see `HostMsg::ProjectPathRenamed`'s doc comment for why only the host
 /// (never an inferred pair of `ProjectPathChanged` calls) may say "this
 /// was a rename".
 pub(crate) fn dispatch_project_path_renamed(panel: &PanelSingleton, old: String, new: String) {
+    // Shotcut has no knowledge of the Rust-assigned untitled UUID. On the
+    // first save it therefore sends an empty old path; resolve that signal
+    // while the prior lifecycle identity is still available so the physical
+    // staging store can be moved into the saved project store.
+    let old = if old.is_empty() {
+        match panel.model.borrow().active_project.clone() {
+            crate::model::ProjectIdentity::Untitled(id) => id,
+            _ => old,
+        }
+    } else {
+        old
+    };
     let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::ProjectPathRenamed { old, new }));
     execute_effects(panel, effects);
 }

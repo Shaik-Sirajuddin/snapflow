@@ -115,7 +115,6 @@ fn main() {
     install_text_util(&instance);
 
     println!("ui-dev-viewer: {}", path.display());
-    println!("TextUtil installed — filter works for / skills and mode/model SearchableDropdown");
     println!("Demo approval: type /demo-permission (or /demo-approve) in compose and press Enter");
     println!("  → one-of card appears above the input; click an option or Esc / Ctrl+Enter");
     instance.run().ok();

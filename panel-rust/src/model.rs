@@ -18,8 +18,38 @@ use crate::protocol_types::{AvailableCommandInfo, ConfigOptionInfo, SessionModes
 use crate::send_queue::SendQueue;
 use slint::VecModel;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+
+/// Stable lifecycle identity for the project currently owned by the panel.
+/// An untitled project is real state, not an empty path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum ProjectIdentity {
+    #[default]
+    None,
+    Untitled(String),
+    Saved(String),
+}
+
+impl ProjectIdentity {
+    pub fn saved_path(&self) -> Option<&str> {
+        match self {
+            Self::Saved(path) => Some(path),
+            Self::None | Self::Untitled(_) => None,
+        }
+    }
+}
+
+/// Leave/return snapshot for one thread's chat list presentation.
+/// Rows include `MessageItem.expanded` so expand state survives A→B→A.
+/// Not a Slint tree cache — host-owned values installed into the shared
+/// `messages_model` on switch (see chat_view_audit_report §5).
+#[derive(Debug, Clone, Default)]
+pub struct ThreadListUiCache {
+    pub keys: Vec<String>,
+    pub rows: Vec<crate::MessageItem>,
+    pub gen: u64,
+}
 
 /// Result of `Effect::LoadInitialState` -- the same data
 /// `panel_rust_create` reads from `PanelStateStore` today (thread
@@ -161,8 +191,19 @@ pub struct Model {
     pub compose_text: String,
     pub search_query: String,
     pub visible_indices: Vec<usize>,
+    /// Index-parallel expand flags for the *currently displayed* list only.
+    /// Durable expand lives on each `MessageItem.expanded` and in
+    /// `list_ui_cache` / `ThreadModel.message_rows` across switches.
     pub expanded: Vec<bool>,
     pub displayed_thread: Option<usize>,
+    /// Who currently owns `messages_model` (durable thread id). Must match
+    /// the displayed thread after every install; used to refuse cross-thread
+    /// writes and detect owner mismatch after selection.
+    pub list_owner_thread_id: Option<String>,
+    /// Bumps on every full list install (switch / cold hydrate).
+    pub list_gen: u64,
+    /// Per-thread list presentation cache for leave/return (content + expand).
+    pub list_ui_cache: HashMap<String, ThreadListUiCache>,
     pub expanded_terminal_id: Option<String>,
     /// Terminal-tabs phase: every terminal id currently pinned open as a
     /// full-view tab, in the order tabs were first opened (not
@@ -173,6 +214,9 @@ pub struct Model {
     /// `CloseTab`/`CloseOverlay` arms, which keep the two in lockstep).
     pub open_terminal_ids: Vec<String>,
     pub active_project_path: Option<String>,
+    /// Lifecycle identity; `active_project_path` remains as a UI/compatibility
+    /// projection until the per-project store migration is complete.
+    pub active_project: ProjectIdentity,
     /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
     /// path` value the currently-applied thread list (`visible_indices`/
     /// `thread_rows`) was actually synced against -- distinct from
@@ -224,6 +268,7 @@ pub struct Model {
     pub available_profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub available_mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
     pub agent_catalog: Vec<crate::protocol_types::AgentCatalogEntry>,
+    pub agent_operations_in_flight: Vec<String>,
     pub recoverable_sessions: Vec<crate::gateway_actor::RemoteThreadInfo>,
     pub recovery_provider: String,
     /// Review-gate fix (phase 32): true once a real thread-list snapshot
@@ -284,6 +329,80 @@ pub struct Model {
     /// preserve).
     pub open_terminals_model: Rc<VecModel<crate::TerminalItem>>,
     pub open_terminal_model_keys: RefCell<Vec<String>>,
+}
+
+/// The Slint-facing models and their identity caches survive reducer
+/// hydration. Keep this inventory in one place: `InitialStateLoaded` can
+/// replace all ordinary TEA fields without accidentally replacing a live
+/// VecModel or dropping its paired key cache.
+pub(crate) struct PersistentModels {
+    pub(crate) thread_model: Rc<VecModel<crate::ThreadItem>>,
+    pub(crate) thread_model_keys: Vec<String>,
+    pub(crate) messages_model: Rc<VecModel<crate::MessageItem>>,
+    pub(crate) message_model_keys: Vec<String>,
+    pub(crate) skills_model: Rc<VecModel<crate::SkillOption>>,
+    pub(crate) skill_model_keys: Vec<std::path::PathBuf>,
+    pub(crate) commands_model: Rc<VecModel<crate::SkillOption>>,
+    pub(crate) profiles_model: Rc<VecModel<crate::ProfileOption>>,
+    pub(crate) profile_model_keys: Vec<String>,
+    pub(crate) mcp_servers_model: Rc<VecModel<crate::McpServerOption>>,
+    pub(crate) mcp_server_model_keys: Vec<String>,
+    pub(crate) agent_catalog_model: Rc<VecModel<crate::AgentCatalogEntry>>,
+    pub(crate) agent_catalog_model_keys: Vec<String>,
+    pub(crate) recoverable_sessions_model: Rc<VecModel<crate::RemoteSessionOption>>,
+    pub(crate) recoverable_session_model_keys: Vec<String>,
+    pub(crate) terminals_model: Rc<VecModel<crate::TerminalItem>>,
+    pub(crate) terminal_model_keys: Vec<String>,
+    pub(crate) open_terminals_model: Rc<VecModel<crate::TerminalItem>>,
+    pub(crate) open_terminal_model_keys: Vec<String>,
+}
+
+impl Model {
+    pub(crate) fn persistent_models(&self) -> PersistentModels {
+        PersistentModels {
+            thread_model: self.thread_model.clone(),
+            thread_model_keys: self.thread_model_keys.borrow().clone(),
+            messages_model: self.messages_model.clone(),
+            message_model_keys: self.message_model_keys.borrow().clone(),
+            skills_model: self.skills_model.clone(),
+            skill_model_keys: self.skill_model_keys.borrow().clone(),
+            commands_model: self.commands_model.clone(),
+            profiles_model: self.profiles_model.clone(),
+            profile_model_keys: self.profile_model_keys.borrow().clone(),
+            mcp_servers_model: self.mcp_servers_model.clone(),
+            mcp_server_model_keys: self.mcp_server_model_keys.borrow().clone(),
+            agent_catalog_model: self.agent_catalog_model.clone(),
+            agent_catalog_model_keys: self.agent_catalog_model_keys.borrow().clone(),
+            recoverable_sessions_model: self.recoverable_sessions_model.clone(),
+            recoverable_session_model_keys: self.recoverable_session_model_keys.borrow().clone(),
+            terminals_model: self.terminals_model.clone(),
+            terminal_model_keys: self.terminal_model_keys.borrow().clone(),
+            open_terminals_model: self.open_terminals_model.clone(),
+            open_terminal_model_keys: self.open_terminal_model_keys.borrow().clone(),
+        }
+    }
+
+    pub(crate) fn restore_persistent_models(&mut self, persistent: PersistentModels) {
+        self.thread_model = persistent.thread_model;
+        *self.thread_model_keys.borrow_mut() = persistent.thread_model_keys;
+        self.messages_model = persistent.messages_model;
+        *self.message_model_keys.borrow_mut() = persistent.message_model_keys;
+        self.skills_model = persistent.skills_model;
+        *self.skill_model_keys.borrow_mut() = persistent.skill_model_keys;
+        self.commands_model = persistent.commands_model;
+        self.profiles_model = persistent.profiles_model;
+        *self.profile_model_keys.borrow_mut() = persistent.profile_model_keys;
+        self.mcp_servers_model = persistent.mcp_servers_model;
+        *self.mcp_server_model_keys.borrow_mut() = persistent.mcp_server_model_keys;
+        self.agent_catalog_model = persistent.agent_catalog_model;
+        *self.agent_catalog_model_keys.borrow_mut() = persistent.agent_catalog_model_keys;
+        self.recoverable_sessions_model = persistent.recoverable_sessions_model;
+        *self.recoverable_session_model_keys.borrow_mut() = persistent.recoverable_session_model_keys;
+        self.terminals_model = persistent.terminals_model;
+        *self.terminal_model_keys.borrow_mut() = persistent.terminal_model_keys;
+        self.open_terminals_model = persistent.open_terminals_model;
+        *self.open_terminal_model_keys.borrow_mut() = persistent.open_terminal_model_keys;
+    }
 }
 
 impl Default for ThreadModel {

@@ -681,6 +681,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::RenameProjectAssociation { old, new } => {
+                panel.move_project_store_for_rename(&old, &new);
                 // Synchronous, in-memory only (no I/O) -- must run before
                 // this call returns, not spawned, so the very next poll
                 // tick already sees the rebind and the running session's
@@ -696,7 +697,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 // the time this completes, so a failure here only risks
                 // the association not surviving a restart, logged rather
                 // than surfaced as a user-facing error.
-                if let Some(store) = panel.panel_state.clone() {
+                if let Some(store) = panel.active_panel_state() {
                     std::thread::spawn(move || {
                         if let Err(error) = store.rename_project_path(&old, &new) {
                             eprintln!(
@@ -715,16 +716,13 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     let thread_id = bridge
                         .thread_binding(real_index)
                         .map(|binding| binding.thread_id);
+                    let store = panel.active_panel_state();
                     let background = thread_id
                         .as_ref()
                         .and_then(|thread_id| {
-                            panel
-                                .panel_state
+                            store
                                 .as_ref()
-                                .map(|store| (store, thread_id))
-                        })
-                        .and_then(|(store, thread_id)| {
-                            store.effective_background_session(thread_id).ok()
+                                .and_then(|store| store.effective_background_session(thread_id).ok())
                         })
                         .unwrap_or(false);
                     if !bridge.close_thread(real_index, background) {
@@ -761,7 +759,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 }
             }
             Effect::PersistSelectedThread { thread_id } => {
-                let Some(store) = panel.panel_state.clone() else {
+                let Some(store) = panel.active_panel_state() else {
                     continue;
                 };
                 std::thread::spawn(move || {
@@ -787,7 +785,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::ToggleBackground { real_index } => {
-                let Some(store) = panel.panel_state.clone() else {
+                let Some(store) = panel.active_panel_state() else {
                     continue;
                 };
                 let Some(thread_id) = panel
@@ -825,7 +823,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::PersistThreadRecord { record } => {
-                let store = panel.panel_state.clone();
+                let store = panel.active_panel_state();
                 std::thread::spawn(move || {
                     let result = store
                         .map(|store| {
@@ -854,7 +852,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 // write itself is offloaded.
                 let record = crate::external_snapshot::ExternalSnapshotSource::new(panel)
                     .collect_thread_record(real_index);
-                let store = panel.panel_state.clone();
+                let store = panel.active_panel_state();
                 std::thread::spawn(move || {
                     let result = record.map(|record| {
                         store
@@ -890,7 +888,7 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     .threads
                     .get(real_index)
                     .map(|thread| thread.thread_id.clone());
-                let store = panel.panel_state.clone();
+                let store = panel.active_panel_state();
                 if let (Some(store), Some(thread_id)) = (store, thread_id) {
                     std::thread::spawn(move || {
                         if let Err(error) = store.update_thread_display_name(&thread_id, &name) {
@@ -1069,6 +1067,33 @@ pub(crate) fn write_clipboard_text(text: &str) -> Result<(), String> {
         }
     }
     Err("no clipboard helper (wl-copy/xclip/xsel) available".into())
+}
+
+/// Read the system clipboard for Slint's native TextInput paste path.
+/// Keep the helper order aligned with `write_clipboard_text` so Wayland and
+/// X11 sessions use the same small external-tool fallback strategy.
+pub(crate) fn read_clipboard_text() -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    let helpers: [(&str, &[&str]); 3] = [
+        ("wl-paste", &["--no-newline"]),
+        ("xclip", &["-selection", "clipboard", "-o"]),
+        ("xsel", &["--clipboard", "--output"]),
+    ];
+    for (bin, args) in helpers {
+        let Ok(output) = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            return String::from_utf8(output.stdout).ok();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

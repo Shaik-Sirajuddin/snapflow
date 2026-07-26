@@ -184,6 +184,7 @@ export component ChatPanel inherits Window {
     // Empty string means no project is open. Sidebar rows use this to
     // decide whether a thread's own project-path differs from "here".
     in property <string> active-project-path: "";
+    in property <bool> project-open: false;
     callback skill-content-edited(string, string /* path, new content */);
     callback skill-copy-path-requested(string);
     callback skill-open-in-editor-requested(string, string /* editor name, path */);
@@ -293,7 +294,8 @@ export component ChatPanel inherits Window {
     callback local-terminal-close-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
-    callback profile-selected(string);
+    callback profile-selected(string, string);
+    callback configure-provider-requested();
     callback thread-toggle-background(int);
     property <int> rename-thread-index: -1;
     property <string> rename-thread-draft: "";
@@ -513,6 +515,7 @@ export component ChatPanel inherits Window {
                 }
             }
             chat-area := ChatArea {
+                no-project: !root.project-open;
                 visible: root.active-pane == "chat";
                 x: sidebar.width;
                 y: 0px;
@@ -621,7 +624,12 @@ export component ChatPanel inherits Window {
                 file-options: file-options;
                 mode-selected(id) => { mode-selected(id); }
                 config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
-                profile-selected(id) => { profile-selected(id); }
+                profile-selected(id, agent) => { profile-selected(id, agent); }
+                configure-provider-requested => {
+                    root.settings-active-section = "agents";
+                    root.open-settings();
+                    root.configure-provider-requested();
+                }
                 context-view-requested => { context-view-requested(); }
                 // Compose owns focus for typing -- re-dispatch panel chords
                 // so Ctrl+B/N/K/, and Escape still work while composing.

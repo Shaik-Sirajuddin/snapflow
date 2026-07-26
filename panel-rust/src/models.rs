@@ -862,120 +862,21 @@ pub fn fast_mode_from_config(options: &[ConfigOptionInfo]) -> FastModeUi {
 }
 
 /// Model selector rows: **only** the ACP `"model"` option (not reasoning,
-/// not fast-mode). When `provider_agent_id` is set and at least one value
-/// is namespaced to that agent (`agent/model`, etc.), only those values
-/// are kept; if none are namespaced, the full session model list is
-/// shown (session ads are already per-agent).
+/// not fast-mode). The catalog is already agent-scoped by ACPX's
+/// `models/list` or the session that advertised it; the panel must not guess
+/// ownership from model-name strings.
 pub fn to_config_dropdown_entries(options: Vec<ConfigOptionInfo>) -> ModelRc<DropdownEntry> {
-    to_config_dropdown_entries_for_provider(options, "")
-}
-
-pub fn to_config_dropdown_entries_for_provider(
-    options: Vec<ConfigOptionInfo>,
-    provider_agent_id: &str,
-) -> ModelRc<DropdownEntry> {
     let mut items: Vec<DropdownEntry> = Vec::new();
     for option in options {
         if option_id_norm(&option.id) != "model" {
             continue;
         }
-        let option = filter_model_option_for_provider(option, provider_agent_id);
         if option.options.is_empty() {
             continue;
         }
         append_option_entries(&mut items, option);
     }
     ModelRc::new(VecModel::from(items))
-}
-
-fn filter_model_option_for_provider(
-    mut option: ConfigOptionInfo,
-    provider_agent_id: &str,
-) -> ConfigOptionInfo {
-    if provider_agent_id.is_empty() || option.options.is_empty() {
-        return option;
-    }
-    let agent = provider_agent_id.to_ascii_lowercase();
-    let any_namespaced = option
-        .options
-        .iter()
-        .any(|v| model_value_looks_namespaced(&v.value));
-    if !any_namespaced {
-        // Bare model ids (gpt-5, sonnet) — already session-scoped.
-        return option;
-    }
-    let filtered: Vec<_> = option
-        .options
-        .iter()
-        .filter(|v| model_value_matches_provider(&v.value, &v.name, &agent))
-        .cloned()
-        .collect();
-    if filtered.is_empty() {
-        // Fail CLOSED for providers whose vendor vocabulary we know: a
-        // namespaced catalog where *nothing* matches claude/grok/codex is a
-        // foreign provider's catalog, and returning it whole is exactly the
-        // live "claude-acp thread offering GPT models" bug (plan phase 24).
-        // Unknown/custom agent ids keep the permissive fallback so a
-        // custom-catalog gateway (bifrost-style) still shows its list.
-        if provider_vendor_stems(&agent).is_some() {
-            option.options.clear();
-            return option;
-        }
-        return option;
-    }
-    if let Some(cur) = option.current_value.as_ref() {
-        if !filtered.iter().any(|v| &v.value == cur) {
-            option.current_value = filtered.first().map(|v| v.value.clone());
-        }
-    }
-    option.options = filtered;
-    option
-}
-
-fn model_value_looks_namespaced(value: &str) -> bool {
-    value.contains('/') || value.contains(':')
-}
-
-/// Vendor vocabulary per known provider stem. Interim panel-side
-/// heuristic only -- the plan's phase 8 moves provider->model filtering
-/// into acpx-server proper and DELETES this table along with the string
-/// matching around it. Until then it is what makes "codex-acp carries an
-/// additional openai/gpt custom catalog" work while "claude-acp shows a
-/// gpt catalog" fails closed (plan phase 24 matrix).
-fn provider_vendor_stems(agent_lower: &str) -> Option<&'static [&'static str]> {
-    let stem = agent_lower.split('-').next().unwrap_or(agent_lower);
-    match stem {
-        "claude" | "anthropic" => Some(&["claude", "anthropic", "sonnet", "haiku", "opus"]),
-        "codex" | "openai" => Some(&["codex", "openai", "gpt", "o3", "o4"]),
-        "grok" | "xai" => Some(&["grok", "xai"]),
-        "gemini" | "google" => Some(&["gemini", "google"]),
-        _ => None,
-    }
-}
-
-fn model_value_matches_provider(value: &str, name: &str, agent_lower: &str) -> bool {
-    let v = value.to_ascii_lowercase();
-    let n = name.to_ascii_lowercase();
-    if v.starts_with(agent_lower) {
-        return true;
-    }
-    if let Some((prefix, _)) = v.split_once('/') {
-        if prefix == agent_lower || agent_lower.contains(prefix) || prefix.contains(agent_lower) {
-            return true;
-        }
-    }
-    if let Some((prefix, _)) = v.split_once(':') {
-        if prefix == agent_lower {
-            return true;
-        }
-    }
-    if let Some(stems) = provider_vendor_stems(agent_lower) {
-        return stems
-            .iter()
-            .any(|stem| v.contains(stem) || n.contains(stem));
-    }
-    let stem = agent_lower.split('-').next().unwrap_or(agent_lower);
-    stem.len() >= 3 && (v.contains(stem) || n.contains(stem))
 }
 
 /// Reasoning-effort selector rows (dedicated compose dropdown).
@@ -1192,13 +1093,11 @@ pub fn build_thread_items<N: AsRef<str>>(
         .collect()
 }
 
-/// Plan phase 26 (`chat_project_binding`): scope the visible thread list
-/// to the active project. A thread belongs to the active project when its
-/// recorded session project path (captured at session-open time from the
-/// active MLT project) matches it, or when it has NO recorded path yet
-/// (pre-project/global threads stay visible everywhere rather than
-/// vanishing). With no active project everything is visible. Pure so the
-/// reducer-side snapshot collection stays thin and this stays unit-tested.
+/// Scope the visible thread list to the active project. Empty associations
+/// are legacy-only and must not make a thread global: a newly-created project
+/// has a real identity before a first save. With no active project, nothing is
+/// displayed by the legacy shared-store compatibility path; the chat surface
+/// still renders its explicit neutral state after a close signal.
 pub fn retain_items_for_project(
     items: &mut Vec<VisibleThreadItem>,
     thread_project_paths: &[String],
@@ -1455,6 +1354,13 @@ pub fn to_profile_dropdown_entries(
             is_header: false,
         });
     }
+    items.push(DropdownEntry {
+        is_current: false,
+        id: "__new_provider__".into(),
+        label: "+ New provider".into(),
+        value: "".into(),
+        is_header: false,
+    });
     ModelRc::new(VecModel::from(items))
 }
 
@@ -1604,20 +1510,15 @@ pub fn to_mcp_server_option_rows(
 }
 
 /// PUI-015: the built-in `snapshotd` daemon MCP row for the Settings list,
-/// or `None` when the daemon is not currently reachable. This is the same
-/// endpoint the panel actually injects into every session's `mcpServers`
-/// array (`agent_bridge::snapshotd_mcp_server_entry`, gated on the same live
-/// probe cached in `agent_bridge::snapshotd_reachable`) -- surfaced here as a
+/// or `None` when the watcher has no current authoritative MCP status. This
+/// is the same endpoint the panel injects into sessions, surfaced here as a
 /// first-class, non-removable row so the always-on daemon server the model
 /// really talks to is visible in Settings, instead of the list showing only
 /// user-added registry servers and hiding the built-in one entirely. Not a
 /// synthetic UI guess: it names the exact `http://<addr>/mcp` endpoint the
 /// injection uses (`agent_bridge::snapshotd_mcp_addr`).
-pub fn builtin_snapshotd_option(reachable: bool) -> Option<McpServerOption> {
-    if !reachable {
-        return None;
-    }
-    let addr = crate::agent_bridge::snapshotd_mcp_addr();
+pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption> {
+    let addr = addr?;
     Some(McpServerOption {
         name: "snapshotd".into(),
         command: String::new().into(),
@@ -1720,7 +1621,7 @@ pub fn to_remote_session_option_rows(
 pub fn to_agent_catalog_entries(
     agents: Vec<crate::protocol_types::AgentCatalogEntry>,
 ) -> ModelRc<AgentCatalogEntry> {
-    ModelRc::new(VecModel::from(to_agent_catalog_entry_rows(agents)))
+    ModelRc::new(VecModel::from(to_agent_catalog_entry_rows(agents, &[])))
 }
 
 /// setup-followups plan, agent_settings_ordering_and_install_enable_flow:
@@ -1744,16 +1645,21 @@ fn agent_status_sort_priority(status: &crate::protocol_types::AgentStatus) -> u8
 
 pub fn to_agent_catalog_entry_rows(
     mut agents: Vec<crate::protocol_types::AgentCatalogEntry>,
+    loading_ids: &[String],
 ) -> Vec<AgentCatalogEntry> {
     agents.sort_by_key(|entry| agent_status_sort_priority(&entry.status));
     agents
         .into_iter()
-        .map(|entry| AgentCatalogEntry {
-            id: entry.id.into(),
-            name: entry.name.into(),
-            version: entry.version.into(),
-            status: entry.status.as_wire_str().into(),
-            enabled: entry.enabled,
+        .map(|entry| {
+            let id = entry.id.clone();
+            AgentCatalogEntry {
+                id: id.clone().into(),
+                name: entry.name.into(),
+                version: entry.version.into(),
+                status: entry.status.as_wire_str().into(),
+                enabled: entry.enabled,
+                loading: loading_ids.iter().any(|loading_id| loading_id == &id),
+            }
         })
         .collect()
 }
@@ -1945,10 +1851,12 @@ mod tests {
     #[test]
     fn builtin_snapshotd_option_is_present_and_non_removable_only_when_reachable() {
         assert!(
-            builtin_snapshotd_option(false).is_none(),
+            builtin_snapshotd_option(None).is_none(),
             "no built-in row when the daemon is unreachable"
         );
-        let row = builtin_snapshotd_option(true).expect("row present when reachable");
+        let addr = "127.0.0.1:43210";
+        let row = builtin_snapshotd_option(Some(addr.to_owned()))
+            .expect("row present when reachable");
         assert_eq!(row.name.as_str(), "snapshotd");
         assert!(!row.removable, "built-in daemon row must not be removable");
         assert_eq!(row.transport.as_str(), "http");
@@ -1958,7 +1866,7 @@ mod tests {
             row.url
         );
         assert!(
-            row.url.contains(&crate::agent_bridge::snapshotd_mcp_addr()),
+            row.url.contains(addr),
             "must name the same address the session injection uses"
         );
     }
@@ -2602,11 +2510,13 @@ mod transcript_model_tests {
         // yet is not evidence an agent is missing), so nothing is filtered
         // here -- exercised on its own below.
         let entries = to_profile_dropdown_entries(&profiles, &[], "work");
-        assert_eq!(entries.row_count(), 2); // one per agent
+        assert_eq!(entries.row_count(), 3); // one per agent + new-provider action
         assert_eq!(entries.row_data(0).unwrap().label.as_str(), "codex-acp");
         assert_eq!(entries.row_data(0).unwrap().value.as_str(), "codex-acp");
         assert!(entries.row_data(0).unwrap().is_current);
         assert_eq!(entries.row_data(1).unwrap().label.as_str(), "claude-acp");
+        assert_eq!(entries.row_data(2).unwrap().id.as_str(), "__new_provider__");
+        assert_eq!(entries.row_data(2).unwrap().label.as_str(), "+ New provider");
         assert_eq!(
             current_provider_trigger_label(&profiles, "work"),
             "codex-acp"
@@ -2632,10 +2542,13 @@ mod transcript_model_tests {
                 },
             ],
         }];
-        let filtered = to_config_dropdown_entries_for_provider(options, "codex-acp");
-        // header + one value
-        assert_eq!(filtered.row_count(), 2);
+        let filtered = to_config_dropdown_entries(options);
+        // header + both provider-scoped values. Provider ownership is
+        // authoritative from models/list/session state; the panel no longer
+        // drops namespaced values using string heuristics.
+        assert_eq!(filtered.row_count(), 3);
         assert_eq!(filtered.row_data(1).unwrap().value.as_str(), "codex-acp/gpt-5");
+        assert_eq!(filtered.row_data(2).unwrap().value.as_str(), "claude-acp/sonnet");
     }
 
     /// PROF-10: a provider whose agent the catalog genuinely reports as
@@ -2698,7 +2611,12 @@ mod transcript_model_tests {
             .collect();
         assert_eq!(
             labels,
-            vec!["codex-acp".to_owned(), "unknown-to-catalog-yet".to_owned(), "native".to_owned()],
+            vec![
+                "codex-acp".to_owned(),
+                "unknown-to-catalog-yet".to_owned(),
+                "native".to_owned(),
+                "+ New provider".to_owned(),
+            ],
             "vanished-acp must be hidden; still-loading and native must fail open and stay visible"
         );
     }
@@ -2730,8 +2648,8 @@ mod transcript_model_tests {
             .collect()
     }
 
-    // Plan phase 24: provider->models matrix. One shared mixed namespaced
-    // catalog; each provider must keep EXACTLY its own vendor's models.
+    // Model catalogs are already scoped by the backend; preserve every value
+    // returned by the agent instead of applying panel-side vendor guesses.
     fn mixed_catalog() -> Vec<ConfigOptionInfo> {
         model_option(&[
             ("anthropic/claude-sonnet-4", "Claude Sonnet 4"),
@@ -2743,45 +2661,18 @@ mod transcript_model_tests {
     }
 
     #[test]
-    fn provider_matrix_claude_acp_keeps_only_anthropic_models() {
-        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "claude-acp");
+    fn agent_scoped_catalog_preserves_backend_values() {
+        let entries = to_config_dropdown_entries(mixed_catalog());
         assert_eq!(
             dropdown_values(&entries),
-            vec!["anthropic/claude-sonnet-4", "anthropic/claude-opus-4"]
+            vec![
+                "anthropic/claude-sonnet-4",
+                "anthropic/claude-opus-4",
+                "openai/gpt-5",
+                "openai/o4-mini",
+                "xai/grok-4"
+            ]
         );
-    }
-
-    #[test]
-    fn provider_matrix_grok_acp_keeps_only_xai_models() {
-        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "grok-acp");
-        assert_eq!(dropdown_values(&entries), vec!["xai/grok-4"]);
-    }
-
-    #[test]
-    fn provider_matrix_codex_acp_keeps_its_openai_custom_catalog() {
-        // codex-acp may carry an ADDITIONAL custom (bifrost-style) openai
-        // catalog whose values never contain "codex" -- the vendor alias
-        // table is what keeps these visible under codex.
-        let entries = to_config_dropdown_entries_for_provider(mixed_catalog(), "codex-acp");
-        assert_eq!(
-            dropdown_values(&entries),
-            vec!["openai/gpt-5", "openai/o4-mini"]
-        );
-    }
-
-    #[test]
-    fn claude_acp_never_falls_back_to_a_pure_foreign_gpt_catalog() {
-        // The live phase-24 repro: a catalog holding ONLY another vendor's
-        // namespaced models used to hit the permissive empty-filter
-        // fallback and be shown WHOLE under claude-acp ("selected
-        // claude-acp, models of gpt are shown"). Known providers now fail
-        // closed: no foreign models, empty dropdown.
-        let gpt_only = model_option(&[
-            ("openai/gpt-5", "GPT-5"),
-            ("openai/gpt-5-mini", "GPT-5 mini"),
-        ]);
-        let entries = to_config_dropdown_entries_for_provider(gpt_only, "claude-acp");
-        assert_eq!(entries.row_count(), 0);
     }
 
     // Plan phase 26: project-scoped thread list.
@@ -2809,12 +2700,12 @@ mod transcript_model_tests {
         assert_eq!(
             items.iter().map(|i| i.real_index).collect::<Vec<_>>(),
             vec![1, 2],
-            "other-project threads drop; active + path-less threads stay"
+            "other-project threads drop; legacy-unscoped rows remain visible for compatibility"
         );
     }
 
     #[test]
-    fn no_active_project_keeps_every_thread_visible() {
+    fn no_active_project_keeps_legacy_threads_visible_for_compatibility() {
         let mut items = project_items(2);
         let paths = vec!["/work/a/project.mlt".to_owned(), String::new()];
         retain_items_for_project(&mut items, &paths, None);
@@ -2900,11 +2791,9 @@ mod transcript_model_tests {
     }
 
     #[test]
-    fn unknown_custom_agent_keeps_the_permissive_catalog_fallback() {
-        // A gateway with an agent id outside the vendor table (fully
-        // custom catalog) still shows its list rather than nothing.
+    fn custom_agent_catalog_is_preserved() {
         let custom = model_option(&[("somevendor/model-x", "Model X")]);
-        let entries = to_config_dropdown_entries_for_provider(custom, "my-router");
+        let entries = to_config_dropdown_entries(custom);
         assert_eq!(dropdown_values(&entries), vec!["somevendor/model-x"]);
     }
 

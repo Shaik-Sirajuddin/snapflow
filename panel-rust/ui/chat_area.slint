@@ -56,6 +56,7 @@ export component ChatArea inherits Rectangle {
     in property <string> project-name: "";
     in property <string> project-path: "";
     in property <bool> project-mcp-live: false;
+    in property <bool> no-project: false;
     in property <string> connection-status: "Connecting...";
     in property <string> last-error: "";
     callback error-banner-dismissed();
@@ -161,7 +162,8 @@ export component ChatArea inherits Rectangle {
     in property <[string]> file-options: [];
     callback mode-selected(string);
     callback config-option-selected(string, string);
-    callback profile-selected(string);
+    callback profile-selected(string, string);
+    callback configure-provider-requested();
     callback context-view-requested();
     callback send-requested();
     callback queue-fast-track-requested();
@@ -919,7 +921,20 @@ export component ChatArea inherits Rectangle {
                 // Phase 18 empty/loading states: never leave the chat
                 // view blank. While (re)connecting, a blinking loading
                 // line; once live with no messages, a centered starter.
-                if root.messages.length == 0 : VerticalLayout {
+                if root.no-project : VerticalLayout {
+                    height: 160px;
+                    alignment: center;
+                    Text {
+                        text: "No project open";
+                        color: Theme.text-muted;
+                        opacity: 0.8;
+                        font-size: 11px * Theme.font-scale;
+                        font-italic: true;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                if root.messages.length == 0 && !root.no-project : VerticalLayout {
                     height: 160px;
                     alignment: center;
                     property <bool> reloading: connection-status == "Connecting...";
@@ -1442,7 +1457,8 @@ export component ChatArea inherits Rectangle {
             stop-requested => { stop-requested(); }
             mode-selected(id) => { mode-selected(id); }
             config-option-selected(option-id, value) => { config-option-selected(option-id, value); }
-            profile-selected(id) => { profile-selected(id); }
+            profile-selected(id, agent) => { profile-selected(id, agent); }
+            configure-provider-requested => { configure-provider-requested(); }
             context-view-requested => { context-view-requested(); }
             terminals-clicked => {
                 root.terminals-clicked();

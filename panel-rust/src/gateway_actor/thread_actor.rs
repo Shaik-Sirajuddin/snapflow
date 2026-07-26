@@ -200,6 +200,11 @@ enum Command {
         resp:
             oneshot::Sender<Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError>>,
     },
+    /// `models/list` for one agent, safe before a session exists.
+    ListModels {
+        agent_id: String,
+        resp: oneshot::Sender<Result<Vec<ConfigOptionInfo>, AcpxThreadError>>,
+    },
     /// `agents/status` for one agent id.
     AgentStatus {
         agent_id: String,
@@ -532,6 +537,14 @@ impl AcpxThreadHandle {
         &self,
     ) -> Result<Vec<crate::protocol_types::AgentCatalogEntry>, AcpxThreadError> {
         self.call(|resp| Command::ListAgents { resp }).await
+    }
+
+    /// `models/list` for an agent-scoped pre-session model catalog.
+    pub async fn list_models(
+        &self,
+        agent_id: String,
+    ) -> Result<Vec<ConfigOptionInfo>, AcpxThreadError> {
+        self.call(|resp| Command::ListModels { agent_id, resp }).await
     }
 
     /// `agents/status` for one agent id. Typed `AgentCatalogEntry`, same
@@ -1009,6 +1022,47 @@ fn parse_config_options(list: &serde_json::Value) -> Option<Vec<ConfigOptionInfo
             })
             .collect(),
     )
+}
+
+fn parse_model_catalog(value: &serde_json::Value) -> Vec<ConfigOptionInfo> {
+    let Some(models) = value
+        .get("catalogs")
+        .and_then(|catalogs| catalogs.as_array())
+        .and_then(|catalogs| catalogs.first())
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(|models| models.as_array())
+    else {
+        return Vec::new();
+    };
+    let options = models
+        .iter()
+        .filter_map(|model| {
+            Some(ConfigOptionValue {
+                value: model.get("value")?.as_str()?.to_owned(),
+                name: model
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                description: model
+                    .get("description")
+                    .and_then(|description| description.as_str())
+                    .map(str::to_owned),
+            })
+        })
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        return Vec::new();
+    }
+    vec![ConfigOptionInfo {
+        id: "model".to_owned(),
+        name: "Model".to_owned(),
+        description: None,
+        category: Some("model".to_owned()),
+        kind: "select".to_owned(),
+        current_value: None,
+        options,
+    }]
 }
 
 /// Emits [`AgentEvent::SessionModes`]/[`AgentEvent::ConfigOptions`] for
@@ -1655,6 +1709,17 @@ async fn run_thread_actor(
                             })
                             .unwrap_or_default()
                     });
+                let _ = resp.send(result.map_err(Into::into));
+            }
+            Command::ListModels { agent_id, resp } => {
+                let result = client
+                    .call(
+                        "models/list",
+                        serde_json::json!({ "agentId": agent_id }),
+                        None,
+                    )
+                    .await
+                    .map(|value| parse_model_catalog(&value));
                 let _ = resp.send(result.map_err(Into::into));
             }
             Command::AgentStatus { agent_id, resp } => {

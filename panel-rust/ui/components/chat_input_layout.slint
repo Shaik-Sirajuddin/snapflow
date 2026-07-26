@@ -62,6 +62,7 @@ export component ChatInputLayout inherits Rectangle {
     in property <float> context-ratio: 0.0;
     in property <int> context-used-tokens: 0;
     in property <int> context-limit-tokens: 0;
+    property <bool> context-ring-hovered: false;
     // Slash/mention catalogs for the compose popup.
     in property <[SkillOption]> skill-options: [];
     // PUI-003: the agent's own ACP slash-commands. The `/` menu shows these
@@ -87,7 +88,9 @@ export component ChatInputLayout inherits Rectangle {
     callback stop-requested();
     callback mode-selected(string);
     callback config-option-selected(string, string);
-    callback profile-selected(string);
+    // profile name (session/_acpx.profile), agent/provider id (thread.provider).
+    callback profile-selected(string, string);
+    callback configure-provider-requested();
     callback context-view-requested();
     callback terminals-clicked();
     // Phase 15: inline OAuth/connect from the @ MCP popup row.
@@ -640,6 +643,19 @@ export component ChatInputLayout inherits Rectangle {
                         }
                     }
                 }
+                // The composer is nested inside padding and a Flickable, so
+                // the blank parts of the input box would otherwise not focus
+                // it. This capture sits above the content only while the
+                // composer is unfocused; once focused it disables itself so
+                // normal cursor placement and text selection remain intact.
+                input-focus-capture := TouchArea {
+                    enabled: !compose.has-focus;
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => { compose.focus(); }
+                }
             }
             VerticalLayout {
                 alignment: end;
@@ -744,10 +760,15 @@ export component ChatInputLayout inherits Rectangle {
         row2-host := Rectangle {
             width: 100%;
             height: root.row2-h;
+            // Clip only while nothing paints outside the 24px band. Open
+            // dropdowns *and* the context-ring hover card both paint upward;
+            // without context-ring.has-hover here the session-context hover
+            // card was fully clipped (never visible in the compose bar).
             clip: !(profile-dropdown.is-open
                 || mode-dropdown.is-open
                 || config-dropdown.is-open
-                || reasoning-dropdown.is-open);
+                || reasoning-dropdown.is-open
+                || root.context-ring-hovered);
             property <length> pan: 0px;
             property <length> overflow: max(0px, row2-strip.preferred-width - self.width);
             // Declared BEFORE the strip so every trigger keeps click
@@ -795,10 +816,15 @@ export component ChatInputLayout inherits Rectangle {
                 placeholder: "Search providers...";
                 popup-width: 200px;
                 entry-selected(id, value, label) => {
+                    if (id == "__new_provider__") {
+                        root.configure-provider-requested();
+                        return;
+                    }
                     root.local-profile-id = id;
                     // Show provider id (value/agent) or label without " ›".
                     root.local-profile-label = value != "" ? value : label;
-                    root.profile-selected(id);
+                    // id = profile name, value = agent_id (see to_profile_dropdown_entries).
+                    root.profile-selected(id, value);
                 }
                 opened => {
                     mode-dropdown.close();
@@ -922,13 +948,21 @@ export component ChatInputLayout inherits Rectangle {
             // doc comment. Least essential of row 2's three controls
             // (decorative usage indicator, not a picker), so it's the one
             // dropped to keep the mode/model selects reachable.
-            if !root.row2-compact : ContextRing {
+            // Always mounted (`visible:`, not `if:`) so row2-host.clip can
+            // read context-ring.has-hover — Slint forbids accessing ids of
+            // `if`-only elements. Hidden under row2-compact (width budget).
+            context-ring := ContextRing {
+                visible: !root.row2-compact;
                 size: root.row2-h;
                 horizontal-stretch: 0;
                 vertical-stretch: 0;
+                // Collapse layout footprint when hidden so mode/model keep room.
+                width: root.row2-compact ? 0px : root.row2-h;
+                height: root.row2-h;
                 ratio: root.context-ratio;
                 used-tokens: root.context-used-tokens;
                 limit-tokens: root.context-limit-tokens;
+                changed has-hover => { root.context-ring-hovered = self.has-hover; }
                 context-view-requested => { root.context-view-requested(); }
             }
         }

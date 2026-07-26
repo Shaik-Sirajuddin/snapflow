@@ -158,12 +158,20 @@ pub enum SettingsMsg {
         value: String,
     },
     ModeSelected(String),
-    // setup-followups plan, provider_fastmode_profile_persistence: only
-    // meaningful while the currently selected thread has no attached
-    // session yet (see ThreadItem.has-session's doc comment) -- update()
-    // is a no-op if it already has one, since ACP has no primitive for
-    // moving a live session to a different backend.
-    ProfileSelected(String),
+    // Compose-bar **Provider** picker (ui label "Provider"; still named
+    // ProfileSelected for history). Only meaningful while the selected
+    // thread has no attached session (see ThreadItem.has-session) --
+    // update() is a no-op if it already has one (ACP cannot retarget a
+    // live session). Writes BOTH:
+    //   - profile_name: ACPX profile name (session/_acpx.profile)
+    //   - agent_id → thread.provider: which agent/gateway to attach
+    // (dispatch_compose_send_maybe_attach reads thread.provider for
+    // attach_deferred_thread — writing only profile_name left provider
+    // stuck at create-time default and ignored the picker).
+    ProfileSelected {
+        profile_name: String,
+        agent_id: String,
+    },
     DevModeToggled(bool),
     McpServerCreate {
         name: String,
@@ -271,6 +279,8 @@ pub enum HostMsg {
     AppearanceChanged(crate::appearance::AppearanceState),
     ThemeChanged(String),
     ProjectPathChanged(Option<String>),
+    ProjectCreatedUntitled,
+    ProjectClosed,
     /// PISO-7 (project-isolation-mlt-binding plan): an explicit host
     /// signal for an MLT Save-As, carrying BOTH the old and new project
     /// file paths -- deliberately a separate variant from
@@ -319,6 +329,8 @@ pub struct FrameInput {
     pub clear_selected_thread: bool,
     pub settings_preferences_snapshot: Option<SettingsPreferencesSnapshot>,
     pub settings_gateway_snapshot: Option<SettingsGatewaySnapshot>,
+    /// Agent ids whose install/enablement RPC is still in flight.
+    pub agent_operations_in_flight: Vec<String>,
     pub skills_snapshot: Option<Vec<crate::skills_state::SkillEntry>>,
     /// PISO-8 (project-isolation-mlt-binding plan): true at most once
     /// every few seconds (see `ExternalSnapshotSource`'s throttle, mirrors
@@ -360,7 +372,7 @@ pub struct ThreadListSnapshot {
 /// Read-only settings data collected from the selected gateway for one
 /// reducer turn. The gateway remains the source of truth; `update_frame`
 /// owns the projected values after folding this snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SettingsGatewaySnapshot {
     pub profiles: Vec<crate::gateway_actor::ProfileSummary>,
     pub mcp_servers: Vec<crate::protocol_types::McpServerEntry>,
@@ -370,7 +382,7 @@ pub struct SettingsGatewaySnapshot {
 }
 
 /// Read-only JSON/SQLite preferences collected for one reducer turn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct SettingsPreferencesSnapshot {
     pub scope: String,
     pub default_profile: String,
@@ -385,7 +397,7 @@ pub struct SettingsPreferencesSnapshot {
 /// Read-only bridge data collected for the currently displayed thread during
 /// one frame. The bridge owns the live connections; the reducer owns the
 /// resulting presentation state after this value is folded into `Model`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ThreadFrameSnapshot {
     /// Durable reducer identity. `real_index` is only the bridge lookup
     /// location at collection time and may change before this snapshot is

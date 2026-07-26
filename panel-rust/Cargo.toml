@@ -50,6 +50,7 @@ vt100 = "0.15"
 # default-app-opener dependency first (none present), so this is the
 # one new dependency rather than hand-rolling per-OS Command branching.
 opener = "0.7"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 # Windows CI runners have no system sqlite3.lib (link.exe: LNK1181 cannot

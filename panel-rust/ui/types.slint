@@ -448,6 +448,7 @@ export struct AgentCatalogEntry {
     // AgentBridge::agent_enablement_map's doc comment) since agents/list
     // itself carries no enablement concept. Defaults true.
     enabled: bool,
+    loading: bool,
 }
 
 // Client-local PTY terminal addition: a snapshot of the currently

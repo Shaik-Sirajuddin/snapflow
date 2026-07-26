@@ -14,6 +14,7 @@ import { CursorHost } from "../tokens/cursor_host.slint";
 // hue, matching this project's no-status-color design language.
 export component Toggle inherits Rectangle {
     in-out property <bool> checked: false;
+    in property <bool> enabled: true;
     in property <string> toggle-accessible-label: Strings.toggle-default-label;
     callback toggled(bool);
 
@@ -26,6 +27,7 @@ export component Toggle inherits Rectangle {
     border-color: root.checked ? Theme.bg-primary : Theme.border-default;
 
     touch := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: pointer;
         accessible-role: button;
         accessible-label: root.toggle-accessible-label;

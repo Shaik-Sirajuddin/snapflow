@@ -389,6 +389,7 @@ export component AgentsView inherits Rectangle {
                         card-width: cards-per-row == 1 ? root.width : 260px;
                         is-default: root.agent-catalog[first-agent-index].id == root.default-agent-id;
                         enabled: root.agent-catalog[first-agent-index].enabled;
+                        loading: root.agent-catalog[first-agent-index].loading;
                         set-default(new-default) => {
                             root.default-agent-id = new-default ? root.agent-catalog[first-agent-index].id : "";
                         }
@@ -406,6 +407,7 @@ export component AgentsView inherits Rectangle {
                         card-width: 260px;
                         is-default: root.agent-catalog[first-agent-index + 1].id == root.default-agent-id;
                         enabled: root.agent-catalog[first-agent-index + 1].enabled;
+                        loading: root.agent-catalog[first-agent-index + 1].loading;
                         set-default(new-default) => {
                             root.default-agent-id = new-default ? root.agent-catalog[first-agent-index + 1].id : "";
                         }

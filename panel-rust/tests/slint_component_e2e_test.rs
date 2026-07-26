@@ -1328,7 +1328,11 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
     let profile_selection = Rc::new(RefCell::new(Vec::<String>::new()));
     {
         let profile_selection = profile_selection.clone();
-        panel.on_profile_selected(move |id| profile_selection.borrow_mut().push(id.to_string()));
+        panel.on_profile_selected(move |id, agent| {
+            profile_selection
+                .borrow_mut()
+                .push(format!("{id}|{agent}"));
+        });
     }
 
     // Provider picker: label = agent_id, id = profile name for session open.
@@ -1358,7 +1362,7 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
         .next()
         .expect("provider option must be accessible once the dropdown is open");
     select_profile.invoke_accessible_default_action();
-    assert_eq!(&*profile_selection.borrow(), &["codex-tools"]);
+    assert_eq!(&*profile_selection.borrow(), &["codex-tools|codex-acp"]);
 
     // Once a session attaches, the picker must be genuinely locked, not
     // merely re-labelled -- SearchableDropdown.enabled: false disables
@@ -1378,7 +1382,7 @@ fn profile_picker_is_selectable_before_a_session_attaches_and_locked_after() {
     );
     assert_eq!(
         &*profile_selection.borrow(),
-        &["codex-tools"],
+        &["codex-tools|codex-acp"],
         "no further profile-selected calls once locked"
     );
 }

@@ -29,6 +29,7 @@ mod list_model;
 mod local_terminal;
 mod markdown;
 mod model;
+pub mod project_store;
 pub mod models;
 mod msg;
 mod permission;
@@ -78,6 +79,7 @@ use slint::platform::{EventLoopProxy, Key, Platform, PointerEventButton, WindowA
 use slint::{SharedString, VecModel};
 use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::os::raw::{c_int, c_uchar, c_uint};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -627,6 +629,10 @@ impl Platform for SpikePlatform {
             let _ = effect_executor::write_clipboard_text(&text);
         });
     }
+
+    fn clipboard_text(&self, _clipboard: slint::platform::Clipboard) -> Option<String> {
+        effect_executor::read_clipboard_text()
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +679,9 @@ struct PanelSingleton {
     // closure so the blocking SQLite write happens off the Slint UI
     // thread (offload_state_effects_off_ui_thread).
     panel_state: Option<Arc<PanelStateStore>>,
+    /// Identity-scoped durable stores. The legacy `panel_state` above is the
+    /// global/None store and remains the migration fallback only.
+    project_state_stores: RefCell<HashMap<model::ProjectIdentity, Arc<PanelStateStore>>>,
     /// Set by [`settings_file::SettingsWatcher`]; drained on poll to
     /// refresh open settings fields without clobbering dirty edits.
     settings_reload_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -682,6 +691,32 @@ struct PanelSingleton {
 }
 
 impl PanelSingleton {
+    /// Return the physically isolated durable store for the lifecycle
+    /// identity currently folded into the model.
+    pub(crate) fn active_panel_state(&self) -> Option<Arc<PanelStateStore>> {
+        let identity = self.model.borrow().active_project.clone();
+        if matches!(identity, model::ProjectIdentity::None) {
+            return self.panel_state.clone();
+        }
+        if let Some(store) = self.project_state_stores.borrow().get(&identity).cloned() {
+            return Some(store);
+        }
+        let path = crate::project_store::panel_state_path(&identity, &resolve_cache_dir());
+        match PanelStateStore::open(path) {
+            Ok(store) => {
+                let store = Arc::new(store);
+                self.project_state_stores
+                    .borrow_mut()
+                    .insert(identity, store.clone());
+                Some(store)
+            }
+            Err(error) => {
+                eprintln!("panel-rust: project state persistence unavailable: {error}");
+                None
+            }
+        }
+    }
+
     /// Gateway index for settings RPCs: selected real thread, else first
     /// bound thread, else `0` only as last resort when the bridge exists.
     fn settings_gateway_index(&self) -> usize {
@@ -712,7 +747,7 @@ impl PanelSingleton {
     }
 
     fn sync_runtime_defaults(&self, effective: &PanelDefaults) {
-        let Some(store) = self.panel_state.as_ref() else {
+        let Some(store) = self.active_panel_state() else {
             return;
         };
         let selected_thread_id = store
@@ -924,7 +959,7 @@ impl PanelSingleton {
         self.settings_ignore_watch_until.set(Some(
             std::time::Instant::now() + std::time::Duration::from_millis(500),
         ));
-        if let Some(store) = self.panel_state.as_ref() {
+        if let Some(store) = self.active_panel_state().as_ref() {
             if let Some(thread_id) = defaults.selected_thread_id.as_ref() {
                 if let Err(error) = store.set_selected_thread_id(Some(thread_id)) {
                     return Err(effect::EffectError::new(format!(
@@ -1223,6 +1258,56 @@ impl PanelSingleton {
         }
     }
 
+    /// Move the durable project store during Save-As/first-save. The rename
+    /// effect already owns this transition for live bridge associations; the
+    /// filesystem half keeps the physical SQLite store aligned with it.
+    pub(crate) fn move_project_store_for_rename(&self, old: &str, new: &str) {
+        let cache_root = resolve_cache_dir();
+        let old_identity = if old.ends_with(".mlt") {
+            model::ProjectIdentity::Saved(old.to_owned())
+        } else {
+            model::ProjectIdentity::Untitled(old.to_owned())
+        };
+        let new_identity = model::ProjectIdentity::Saved(new.to_owned());
+        let old_dir = crate::project_store::project_store_dir(&old_identity, &cache_root);
+        let new_dir = crate::project_store::project_store_dir(&new_identity, &cache_root);
+        let (Some(old_dir), Some(new_dir)) = (old_dir, new_dir) else {
+            return;
+        };
+        if old_dir == new_dir || !old_dir.exists() {
+            return;
+        }
+        if new_dir.exists() {
+            eprintln!(
+                "panel-rust: retaining existing project store at {} during rename from {}",
+                new_dir.display(),
+                old_dir.display()
+            );
+            return;
+        }
+        if let Some(parent) = new_dir.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                eprintln!("panel-rust: failed to create project store parent: {error}");
+                return;
+            }
+        }
+        if let Err(error) = std::fs::rename(&old_dir, &new_dir) {
+            eprintln!(
+                "panel-rust: failed to move project store {} -> {}: {error}",
+                old_dir.display(),
+                new_dir.display()
+            );
+        } else if let Some(store) = self.project_state_stores.borrow_mut().remove(&old_identity) {
+            // The SQLite connection remains valid after the directory move,
+            // but its registry key must move with the project identity or a
+            // later switch can reopen the old path and leave two live cache
+            // entries for the same physical store.
+            self.project_state_stores
+                .borrow_mut()
+                .insert(new_identity, store);
+        }
+    }
+
     // `dispatch.rs`'s Request-domain wrappers (tea-slint-model Phase 4)
     // call this directly.
     pub(crate) fn answer_pending_request_option(&self, option_id: &str) {
@@ -1288,6 +1373,14 @@ static SENTINEL: PanelHandle = PanelHandle { _private: () };
 /// this process must run with `QSG_RENDER_LOOP=basic`.
 #[no_mangle]
 pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut PanelHandle {
+    panel_rust_create_with_initial_identity(width, height, None)
+}
+
+fn panel_rust_create_with_initial_identity(
+    width: c_uint,
+    height: c_uint,
+    initial_identity: Option<model::ProjectIdentity>,
+) -> *mut PanelHandle {
     PANEL.with(|cell| {
         let mut slot = cell.borrow_mut();
         if let Some(existing) = slot.as_mut() {
@@ -1452,7 +1545,11 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         // Dirty::Error instead of silently degrading with no UI signal.
         let mut startup_warnings: Vec<String> = Vec::new();
         let panel_state = {
-            let path = resolve_cache_dir().join("panel-state.sqlite3");
+            let cache_dir = resolve_cache_dir();
+            let identity = initial_identity
+                .as_ref()
+                .unwrap_or(&model::ProjectIdentity::None);
+            let path = crate::project_store::panel_state_path(identity, &cache_dir);
             match PanelStateStore::open(path) {
                 Ok(store) => Some(Arc::new(store)),
                 Err(error) => {
@@ -1646,10 +1743,24 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             height,
             bridge,
             panel_state,
+            project_state_stores: RefCell::new(HashMap::new()),
             settings_reload_pending,
             settings_ignore_watch_until: Cell::new(None),
             _settings_watcher: settings_watcher,
         };
+        if let Some(identity) = initial_identity {
+            let saved_path = identity.saved_path().map(str::to_owned);
+            let mut model = panel.model.borrow_mut();
+            model.active_project = identity;
+            model.active_project_path = saved_path;
+            drop(model);
+            if let Some(store) = panel.panel_state.clone() {
+                panel
+                    .project_state_stores
+                    .borrow_mut()
+                    .insert(panel.model.borrow().active_project.clone(), store);
+            }
+        }
         // Bind persistent VecModels before any callback can fire; content
         // arrives from the Init hydration + first Frame snapshot below.
         crate::sync::sync_initial_models(&panel.model.borrow(), &panel.component);
@@ -2495,10 +2606,14 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
             });
         });
 
-        panel.component.on_profile_selected(move |profile_name| {
+        panel.component.on_profile_selected(move |profile_name, agent_id| {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_profile_selected(panel, profile_name.to_string());
+                    dispatch::dispatch_profile_selected(
+                        panel,
+                        profile_name.to_string(),
+                        agent_id.to_string(),
+                    );
                 }
             });
         });
@@ -2596,6 +2711,30 @@ pub extern "C" fn panel_rust_create(width: c_uint, height: c_uint) -> *mut Panel
         *slot = Some(panel);
         &SENTINEL as *const PanelHandle as *mut PanelHandle
     })
+}
+
+/// Cold-start variant used by the Qt adapter when it already has the host's
+/// pending project lifecycle signal. Supplying the identity before creating
+/// the bridge makes initial thread hydration read the project-local store.
+#[no_mangle]
+pub extern "C" fn panel_rust_create_with_identity(
+    width: c_uint,
+    height: c_uint,
+    path_ptr: *const c_uchar,
+    path_len: usize,
+    untitled: bool,
+) -> *mut PanelHandle {
+    let identity = if untitled {
+        Some(model::ProjectIdentity::Untitled(uuid::Uuid::new_v4().to_string()))
+    } else if path_ptr.is_null() || path_len == 0 {
+        None
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(|path| model::ProjectIdentity::Saved(path.to_owned()))
+    };
+    panel_rust_create_with_initial_identity(width, height, identity)
 }
 
 #[no_mangle]
@@ -2965,6 +3104,26 @@ pub extern "C" fn panel_rust_set_project_path(
             return false;
         };
         dispatch::dispatch_project_path_changed(panel, path);
+        true
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn panel_rust_project_created_untitled(_handle: *mut PanelHandle) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else { return false };
+        dispatch::dispatch_project_created_untitled(panel);
+        true
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn panel_rust_project_closed(_handle: *mut PanelHandle) -> bool {
+    PANEL.with(|cell| {
+        let slot = cell.borrow();
+        let Some(panel) = slot.as_ref() else { return false };
+        dispatch::dispatch_project_closed(panel);
         true
     })
 }
