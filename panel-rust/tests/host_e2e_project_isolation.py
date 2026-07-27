@@ -46,6 +46,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -462,8 +463,6 @@ def rename_active_thread(client, root_handle, window_handle, new_name, timeout=1
 
 
 def wait_for_http(url, timeout=20):
-    import urllib.request
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -472,6 +471,98 @@ def wait_for_http(url, timeout=20):
         except Exception:
             time.sleep(0.2)
     raise Failure(f"{url} never came up")
+
+
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def provision_mock_profile(gateway_port, admin_port, admin_token, agent_bin, event_log, state_dir):
+    """Provision the mock through ACPX's admin/profile path.
+
+    The legacy ACPX_BACKEND_CMD shortcut does not carry the event-log env into
+    profile-owned backend processes on current acpx-server builds. PISO6
+    needs backend-owned cwd evidence, so use the same profile-only contract as
+    the maintained MCP host harness.
+    """
+    admin_url = f"http://127.0.0.1:{admin_port}/admin/agents"
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            request = urllib.request.Request(
+                admin_url, headers={"Authorization": f"Bearer {admin_token}"}
+            )
+            with urllib.request.urlopen(request, timeout=1):
+                break
+        except Exception:
+            time.sleep(0.2)
+    else:
+        raise Failure("ACPX admin plane never became reachable")
+
+    def post(url, payload, headers):
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url, data=data, headers={**headers, "Content-Type": "application/json"}, method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read()
+        parsed = json.loads(body)
+        if parsed.get("error"):
+            raise Failure(f"JSON-RPC {payload.get('method', url)} failed: {parsed['error']}")
+        return parsed
+
+    post(
+        admin_url + "/custom",
+        {
+            "id": "mock-codex",
+            "name": "mock-codex",
+            "command": str(agent_bin),
+            "args": [],
+            "env": {
+                "RUI_MOCK_AGENT_PERSONA": "codex",
+                "RUI_MOCK_AGENT_EVENT_LOG": str(event_log),
+            },
+            "cwd": None,
+        },
+        {"Authorization": f"Bearer {admin_token}"},
+    )
+    # Registration updates the supervisor asynchronously on current
+    # acpx-server builds. Do not race profiles/create against that update.
+    registered_deadline = time.monotonic() + 10
+    while time.monotonic() < registered_deadline:
+        try:
+            request = urllib.request.Request(
+                admin_url, headers={"Authorization": f"Bearer {admin_token}"}
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                agents = json.loads(response.read())
+            if any(
+                item.get("id") == "mock-codex"
+                for item in (agents.get("agents") if isinstance(agents, dict) else agents)
+            ):
+                break
+        except Exception:
+            pass
+        time.sleep(0.2)
+    else:
+        raise Failure("admin custom mock agent never appeared in the agent catalog")
+    post(
+        f"http://127.0.0.1:{gateway_port}/rpc",
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "profiles/create",
+            "params": {"name": "codex", "agent_id": "mock-codex"},
+        },
+        {},
+    )
+    settings_dir = state_dir / "panel-settings"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    (settings_dir / "settings.global.json").write_text(
+        json.dumps({"schema_version": 1, "default_agent_id": "codex"})
+    )
 
 
 def spawn_snapflow(env, state_dir, log_name, extra_args=None):
@@ -517,8 +608,10 @@ def main():
     log(f"state dir = {state_dir}")
 
     display_name = ":97"
-    gateway_port = 18999
-    mcp_port = 19199
+    gateway_port = free_port()
+    admin_port = free_port()
+    admin_token = f"panel-piso6-admin-{os.getpid()}"
+    mcp_port = free_port()
     event_log = state_dir / "acpx" / "backend-events.jsonl"
 
     server_bin = str(MAIN_CHECKOUT_ROOT / "acpx" / "target" / "debug" / "acpx-server")
@@ -552,10 +645,10 @@ def main():
     server_env.update(
         {
             "ACPX_HTTP_BIND": f"127.0.0.1:{gateway_port}",
-            "ACPX_BACKEND_CMD": agent_bin,
             "ACPX_DEFAULT_AGENT_ID": "codex",
             "ACPX_DB_PATH": str(state_dir / "acpx" / "gateway.sqlite3"),
-            "RUI_MOCK_AGENT_EVENT_LOG": str(event_log),
+            "ACPX_ADMIN_TOKEN": admin_token,
+            "ACPX_ADMIN_BIND": f"127.0.0.1:{admin_port}",
         }
     )
     server = subprocess.Popen(
@@ -570,6 +663,9 @@ def main():
     panel_proc = None
     try:
         wait_for_http(f"http://127.0.0.1:{gateway_port}/health")
+        provision_mock_profile(
+            gateway_port, admin_port, admin_token, agent_bin, event_log, state_dir
+        )
 
         env = dict(os.environ)
         env.update(

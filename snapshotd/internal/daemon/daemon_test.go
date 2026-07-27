@@ -231,6 +231,62 @@ func TestDaemon_ExternalRegistrationAndMcpContextIsolation(t *testing.T) {
 	}
 }
 
+func TestDaemon_ResolveProjectInstanceUsesReadyExternalSAPSocket(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "manual-project"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	external, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "manual-instance",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+		SAPSocketPath: filepath.Join(t.TempDir(), "manual.sap.sock"),
+	})
+	if err != nil {
+		t.Fatalf("register external instance: %v", err)
+	}
+	socket, token, err := d.resolveProjectInstance(project.ID)
+	if err != nil {
+		t.Fatalf("resolve external project instance: %v", err)
+	}
+	if socket != external.Instance.SAPSocketPath || token != "" {
+		t.Fatalf("unexpected external resolution: socket=%q token=%q instance=%+v", socket, token, external.Instance)
+	}
+}
+
+func TestDaemon_ResolveProjectInstanceIgnoresExpiredExternalSAPSocket(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "expired-project"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	external, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "expired-instance",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+		SAPSocketPath: filepath.Join(t.TempDir(), "expired.sap.sock"),
+	})
+	if err != nil {
+		t.Fatalf("register external instance: %v", err)
+	}
+	row, err := d.Reg.GetExternalInstance(external.Instance.ID)
+	if err != nil {
+		t.Fatalf("get external instance: %v", err)
+	}
+	row.LeaseExpiresAt = time.Now().UTC().Add(-time.Second)
+	if err := d.Reg.SaveExternalInstance(row); err != nil {
+		t.Fatalf("expire external instance: %v", err)
+	}
+	if _, _, err := d.resolveProjectInstance(project.ID); err == nil {
+		t.Fatal("expired external instance must not resolve")
+	}
+}
+
 func TestDaemon_ReconcileExternalLeaseAndProjectAggregate(t *testing.T) {
 	d := newTestDaemon(t, buildFixture(t))
 	ctx := context.Background()

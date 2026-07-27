@@ -397,11 +397,11 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 	return d, nil
 }
 
-// resolveProjectInstance implements sapproxy.Resolver: it finds the most
-// recently launched "ready" ProcessInstance for a project and returns the
-// socket path + per-launch token a new SAP connection should present to
-// sap.hello -- exactly what a direct SAP client would need to look up
-// itself to connect to that project's running instance.
+// resolveProjectInstance implements sapproxy.Resolver. It first checks
+// daemon-owned ProcessInstance rows, then registered external GUI instances.
+// The latter is required for a manually launched Shotcut/Snapflow process:
+// its SAP socket is authoritative in ExternalInstance, but it is not a child
+// represented by ProcessInstance and therefore must not require daemon.launch.
 func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error) {
 	instances, err := d.Reg.ListProcessInstancesByProject(projectID)
 	if err != nil {
@@ -412,7 +412,42 @@ func (d *Daemon) resolveProjectInstance(projectID string) (string, string, error
 			return in.SocketPath, in.Token, nil
 		}
 	}
+
+	project, err := d.Reg.GetProject(projectID)
+	if err != nil {
+		return "", "", err
+	}
+	externalInstances, err := d.Reg.ListExternalInstances()
+	if err != nil {
+		return "", "", err
+	}
+	now := time.Now().UTC()
+	for _, in := range externalInstances { // newest first, per ListExternalInstances
+		if in.Status != registry.ExternalStatusOpen ||
+			in.SAPSocketPath == "" ||
+			(!in.LeaseExpiresAt.IsZero() && !in.LeaseExpiresAt.After(now)) ||
+			externalProjectRoot(in.ProjectPath) != filepath.Clean(project.RootDir) {
+			continue
+		}
+		// External registrations use their own local SAP endpoint and do not
+		// have a daemon-generated per-launch hello token.
+		return in.SAPSocketPath, "", nil
+	}
 	return "", "", fmt.Errorf("daemon: no running (ready) process instance for project %s; call daemon.launch first", projectID)
+}
+
+func externalProjectRoot(projectPath string) string {
+	if projectPath == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(projectPath); err == nil {
+		projectPath = resolved
+	}
+	projectPath = filepath.Clean(projectPath)
+	if filepath.Ext(projectPath) == "" {
+		return projectPath
+	}
+	return filepath.Dir(projectPath)
 }
 
 // Reconcile runs the startup reconciliation sweep described in
