@@ -661,10 +661,17 @@ def main():
             # shutdown.
             panel_proc.kill()
             panel_proc.wait(timeout=10)
-        panel_proc = spawn_snapflow(env, state_dir, "shotcut-2", extra_args=[str(project_a)])
+        # Start a fresh untitled host, then use the same real file-open IPC
+        # lifecycle as rows 1/2. The CLI argument path is handled by a
+        # different startup ordering in the available Qt host binary and
+        # does not exercise the dock's project-open signal deterministically.
+        panel_proc = spawn_snapflow(env, state_dir, "shotcut-2")
         time.sleep(5)
         if panel_proc.poll() is not None:
             raise Failure("snapflow (restart) exited before MCP came up; see shotcut-2.stderr.log")
+        client, window_handle, root_handle = connect_mcp()
+        send_file_open(project_a)
+        time.sleep(1.0)
         client, window_handle, root_handle = connect_mcp()
         wait_for_visible_thread(client, root_handle, "thread-on-A")
         path_a_after_restart = thread_project_path(db_path_a, "thread-on-A")

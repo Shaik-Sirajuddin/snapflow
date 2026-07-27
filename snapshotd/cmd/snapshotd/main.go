@@ -94,8 +94,7 @@ Usage:
                                           set/replace the MCP listener's Basic Auth credentials
   snapshotd mcp install-config get       print the MCP endpoint + credentials for a client config
   snapshotd install                      print what installing a system service would do (not implemented for real)  snapshotd doctor                       check ACP Node/npm (global-first, then product bundle)
-  snapshotd runtime install node [--force]  install official Node into product runtime/ (if global missing)`)
-`)
+	  snapshotd runtime install node [--force]  install official Node into product runtime/ (if global missing)`)
 }
 
 func cmdServe(cfg config.Config, args []string) error {
@@ -509,5 +508,32 @@ A real implementation would, per 08-lifecycle-and-cli.md:
 None of that is performed here -- this command intentionally only prints
 this description and exits 0, so it is never mistaken for having actually
 modified host service configuration.`)
+	return nil
+}
+
+func cmdDoctor(cfg config.Config, args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("usage: snapshotd doctor")
+	}
+	fmt.Print(acpnode.DoctorReport())
+	return nil
+}
+
+func cmdRuntime(cfg config.Config, args []string) error {
+	if len(args) < 2 || args[0] != "install" || args[1] != "node" {
+		return fmt.Errorf("usage: snapshotd runtime install node [--force]")
+	}
+	force := false
+	for _, arg := range args[2:] {
+		if arg == "--force" {
+			force = true
+			continue
+		}
+		return fmt.Errorf("usage: snapshotd runtime install node [--force]")
+	}
+	if err := acpnode.Ensure(force); err != nil {
+		return err
+	}
+	fmt.Print(acpnode.DoctorReport())
 	return nil
 }
