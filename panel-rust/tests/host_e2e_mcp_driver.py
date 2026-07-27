@@ -109,9 +109,20 @@ def find_elements_by_accessible_label(client, root_handle, label, max_elements=6
 def wait_for_accessible_label(client, root_handle, label, timeout=10, max_elements=600):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        matches = find_elements_by_accessible_label(
-            client, root_handle, label, max_elements
-        )
+        try:
+            matches = find_elements_by_accessible_label(
+                client, root_handle, label, max_elements
+            )
+        except McpError as error:
+            # Slint invalidates all element handles when a component tree is
+            # recreated during project/thread lifecycle work. Reacquire the
+            # root and continue polling; this is a transport-level retry,
+            # not permission to hide arbitrary MCP failures.
+            if "Invalid element handle" not in str(error):
+                raise
+            root_handle = get_root_element(client)[1]
+            time.sleep(0.1)
+            continue
         if matches:
             return matches[0]["handle"]
         time.sleep(0.2)
@@ -121,9 +132,16 @@ def wait_for_accessible_label(client, root_handle, label, timeout=10, max_elemen
 def wait_for_accessible_label_prefix(client, root_handle, prefix, timeout=10, max_elements=600):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        tree = client.call_tool(
-            "get_element_tree", {"elementHandle": root_handle, "maxElements": max_elements}
-        )
+        try:
+            tree = client.call_tool(
+                "get_element_tree", {"elementHandle": root_handle, "maxElements": max_elements}
+            )
+        except McpError as error:
+            if "Invalid element handle" not in str(error):
+                raise
+            root_handle = get_root_element(client)[1]
+            time.sleep(0.1)
+            continue
         for element in tree.get("elements", []):
             label = element.get("accessibleLabel")
             if label and label.startswith(prefix):

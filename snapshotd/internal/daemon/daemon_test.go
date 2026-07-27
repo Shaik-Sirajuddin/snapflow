@@ -141,8 +141,8 @@ func TestDaemon_Dispatch_RoutesAllDaemonMethods(t *testing.T) {
 
 	call("daemon.listProjects", nil)
 	subscription := call("daemon.subscribeProjects", nil)
-	if !bytes.Contains(subscription, []byte(`"mode":"poll"`)) {
-		t.Fatalf("expected polling project subscription payload: %s", subscription)
+	if !bytes.Contains(subscription, []byte(`"mode":"push"`)) {
+		t.Fatalf("expected push project subscription payload: %s", subscription)
 	}
 
 	launchOut := call("daemon.launch", LaunchParams{ProjectID: proj.ID})

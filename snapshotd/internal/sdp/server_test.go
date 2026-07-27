@@ -21,10 +21,20 @@ type fakeHandler struct {
 	mu           sync.Mutex
 	boundProject map[string]string // sessionID -> projectID, mirroring internal/daemon.ForwardSAP's project.select bookkeeping
 	unbound      []string
+	projects     []map[string]any
 }
 
 func (f *fakeHandler) Dispatch(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	switch method {
+	case "daemon.subscribeProjects":
+		f.mu.Lock()
+		projects := append([]map[string]any(nil), f.projects...)
+		f.mu.Unlock()
+		return map[string]any{"mode": "push", "pollAfter": "500ms", "projects": projects}, nil
+	case "daemon.listProjects":
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return append([]map[string]any(nil), f.projects...), nil
 	case "daemon.echo":
 		var p map[string]any
 		_ = json.Unmarshal(params, &p)
@@ -34,6 +44,46 @@ func (f *fakeHandler) Dispatch(ctx context.Context, method string, params json.R
 	default:
 		return nil, errors.New("unknown method")
 	}
+}
+
+func TestServer_PushesProjectInventoryChanges(t *testing.T) {
+	sockPath := filepath.Join(t.TempDir(), "control.sock")
+	h := &fakeHandler{}
+	srv := &sdp.Server{SocketPath: sockPath, Handler: h}
+	go func() { _ = srv.ListenAndServe() }()
+	defer srv.Shutdown()
+
+	c := dialRaw(t, sockPath)
+	defer c.nc.Close()
+	c.send("daemon.subscribeProjects", map[string]any{}, 1)
+	if isNotif, _, response := c.nextFrame(t); isNotif || response.Error != nil {
+		t.Fatalf("expected subscription response, notif=%v response=%+v", isNotif, response)
+	}
+	// Allow the watcher to capture the response snapshot before changing the
+	// fake authoritative inventory.
+	time.Sleep(650 * time.Millisecond)
+	h.mu.Lock()
+	h.projects = []map[string]any{{"id": "project-a", "open": true}}
+	h.mu.Unlock()
+
+	_ = c.nc.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		isNotif, notification, _ := c.nextFrame(t)
+		if !isNotif {
+			continue
+		}
+		if notification.Method != "daemon.projectsChanged" {
+			continue
+		}
+		var projects []map[string]any
+		if err := json.Unmarshal(notification.Params, &projects); err != nil {
+			t.Fatalf("decode project update: %v", err)
+		}
+		if len(projects) == 1 && projects[0]["id"] == "project-a" {
+			return
+		}
+	}
+	t.Fatal("timed out waiting for daemon.projectsChanged")
 }
 
 // ForwardSAP is a minimal stand-in for internal/daemon.Daemon.ForwardSAP:

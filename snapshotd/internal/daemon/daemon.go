@@ -501,10 +501,11 @@ func (d *Daemon) ListProjects(ctx context.Context) ([]registry.Project, error) {
 	return d.Reg.ListProjects()
 }
 
-// ProjectSubscription is the v1 control-plane fallback for clients that
-// cannot keep a notification stream. It returns an authoritative snapshot
-// and a bounded poll interval; a future multiplexed SDP connection can
-// upgrade the same method to push deltas without changing the payload.
+// ProjectSubscription is the control-plane inventory subscription response.
+// The SDP connection remains open after this response and emits
+// daemon.projectsChanged notifications when the authoritative inventory
+// changes. PollAfter is retained as a client-side fallback hint for older
+// clients which do not consume notifications.
 type ProjectSubscription struct {
 	Projects  []registry.Project `json:"projects"`
 	Mode      string             `json:"mode"`
@@ -516,7 +517,7 @@ func (d *Daemon) SubscribeProjects(ctx context.Context) (ProjectSubscription, er
 	if err != nil {
 		return ProjectSubscription{}, err
 	}
-	return ProjectSubscription{Projects: projects, Mode: "poll", PollAfter: 5 * time.Second}, nil
+	return ProjectSubscription{Projects: projects, Mode: "push", PollAfter: 5 * time.Second}, nil
 }
 
 // LaunchParams / Launch implement daemon.launch.

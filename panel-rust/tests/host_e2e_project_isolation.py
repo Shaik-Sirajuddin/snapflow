@@ -310,7 +310,11 @@ def expand_thread_sidebar(client, root_handle, timeout=2):
     # empty set instead of failing loudly -- a negative assertion against
     # an empty set is trivially true and proves nothing, so this must run
     # before every visibility check, not just before creating a thread.
+    # Project lifecycle callbacks recreate the Slint component tree. Element
+    # handles are intentionally invalidated by the testing backend in that
+    # case, so refresh the root immediately before every tree traversal.
     try:
+        root_handle = mcp.get_root_element(client)[1]
         expand_handle = mcp.wait_for_accessible_label(
             client, root_handle, "Expand thread sidebar", timeout=timeout
         )
@@ -332,7 +336,9 @@ def visible_thread_names(client, root_handle, max_elements=800):
     # `button-accessible-label: thread.name` (unconditional, on
     # HoverSurface itself, no hover/selection gate) is the real
     # unconditional-per-row signal.
+    root_handle = mcp.get_root_element(client)[1]
     expand_thread_sidebar(client, root_handle)
+    root_handle = mcp.get_root_element(client)[1]
     tree = client.call_tool(
         "get_element_tree", {"elementHandle": root_handle, "maxElements": max_elements}
     )
@@ -391,13 +397,28 @@ def click_new_thread(client, root_handle, timeout=15):
     # "New thread" only renders when the sidebar rail is expanded
     # (sidebar.slint: `if expanded && !skill-mode`) -- see
     # expand_thread_sidebar's own doc comment.
+    root_handle = mcp.get_root_element(client)[1]
     expand_thread_sidebar(client, root_handle)
+    root_handle = mcp.get_root_element(client)[1]
+    # A restored panel can come up in the Skills tab. New-thread is
+    # intentionally absent there; explicitly select Chats before asserting
+    # the control exists.
+    try:
+        show_threads = mcp.wait_for_accessible_label(
+            client, root_handle, "Show threads", timeout=2
+        )
+        mcp.click(client, show_threads)
+        time.sleep(0.2)
+        root_handle = mcp.get_root_element(client)[1]
+    except RuntimeError:
+        pass
     new_thread_handle = mcp.wait_for_accessible_label(client, root_handle, "New thread", timeout=timeout)
     mcp.click(client, new_thread_handle)
     # The new thread's compose box isn't necessarily in the element tree
     # the instant the click callback returns (new-thread-requested's Msg
     # round-trip + a render frame) -- ground-truthed live.
     time.sleep(0.5)
+    root_handle = mcp.get_root_element(client)[1]
     # Collapse back: the dock has a FIXED total width, and the expanded
     # Threads rail eats into it -- wide enough to squeeze ChatInputLayout
     # (and its "compose" element) down to where Slint doesn't render it
@@ -426,6 +447,7 @@ def send_and_wait(client, window_handle, event_log, text, timeout=15):
 
 
 def rename_active_thread(client, root_handle, window_handle, new_name, timeout=15):
+    root_handle = mcp.get_root_element(client)[1]
     rename_handle = mcp.wait_for_accessible_label(client, root_handle, "Rename thread")
     mcp.click(client, rename_handle)
     name_input_handle = mcp.wait_for_accessible_label(client, root_handle, "Thread name")

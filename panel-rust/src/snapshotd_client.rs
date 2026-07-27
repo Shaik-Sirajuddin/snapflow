@@ -70,6 +70,26 @@ pub struct SnapshotdControlClient {
     next_id: std::sync::Arc<AtomicU64>,
 }
 
+/// A live daemon inventory subscription. The initial snapshot is returned by
+/// `subscribe_projects_stream`; subsequent values are authoritative project
+/// arrays delivered from `daemon.projectsChanged` notifications. Dropping
+/// this value closes the socket-reading task and therefore unregisters the
+/// subscription at the transport boundary.
+#[cfg(unix)]
+pub struct ProjectUpdateSubscription {
+    pub initial: Value,
+    pub updates: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    _writer: tokio::net::unix::OwnedWriteHalf,
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl Drop for ProjectUpdateSubscription {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+    }
+}
+
 enum RegistrationCommand {
     Update {
         project_path: Option<String>,
@@ -124,11 +144,13 @@ impl DiscoveryEndpoint {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let mut line = String::new();
-                            if std::io::BufReader::new(&stream).read_line(&mut line).is_ok() {
+                            if std::io::BufReader::new(&stream)
+                                .read_line(&mut line)
+                                .is_ok()
+                            {
                                 if let Ok(request) = serde_json::from_str::<Value>(&line) {
-                                    let challenge = request["params"]["challenge"]
-                                        .as_str()
-                                        .unwrap_or_default();
+                                    let challenge =
+                                        request["params"]["challenge"].as_str().unwrap_or_default();
                                     let project = project_for_thread
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -156,7 +178,12 @@ impl DiscoveryEndpoint {
                 let _ = std::fs::remove_file(socket_for_thread);
             })
             .ok()?;
-        Some(Self { stop, descriptor, socket, project_path })
+        Some(Self {
+            stop,
+            descriptor,
+            socket,
+            project_path,
+        })
     }
 
     fn update(&self, project_path: Option<String>) {
@@ -197,7 +224,9 @@ impl SnapshotdRegistration {
         {
             let home = std::env::var_os("SNAPSHOTD_HOME")
                 .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd")))?;
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd"))
+                })?;
             let client = SnapshotdControlClient::new(home.join("control.sock"));
             let nonce = uuid::Uuid::new_v4().to_string();
             let discovery = DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone())?;
@@ -207,7 +236,10 @@ impl SnapshotdRegistration {
             std::thread::Builder::new()
                 .name("snapshotd-registration".into())
                 .spawn(move || {
-                    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
                         Ok(runtime) => runtime,
                         Err(error) => {
                             eprintln!("panel-rust: snapshotd registration runtime failed: {error}");
@@ -225,15 +257,20 @@ impl SnapshotdRegistration {
                     let mut current_project_path = initial_project_path.clone();
                     let mut current_reason = "opened".to_owned();
                     let mut current_generation = 0u64;
-                    let mut current_id = runtime.block_on(async {
-                        register_and_extract_id(&client, &registration).await
-                    });
+                    let mut current_id = runtime
+                        .block_on(async { register_and_extract_id(&client, &registration).await });
                     if let Some(id) = current_id.as_ref() {
-                        *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                        *published_id
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
                     }
                     loop {
                         match receiver.recv_timeout(Duration::from_secs(10)) {
-                            Ok(RegistrationCommand::Update { project_path, reason, generation }) => {
+                            Ok(RegistrationCommand::Update {
+                                project_path,
+                                reason,
+                                generation,
+                            }) => {
                                 current_project_path = project_path;
                                 current_reason = reason;
                                 current_generation = generation;
@@ -246,9 +283,11 @@ impl SnapshotdRegistration {
                                     ));
                                 }
                             }
-                            Ok(RegistrationCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            Ok(RegistrationCommand::Stop)
+                            | Err(mpsc::RecvTimeoutError::Disconnected) => {
                                 if let Some(id) = current_id.take() {
-                                    let _ = runtime.block_on(client.unregister_external_instance(&id));
+                                    let _ =
+                                        runtime.block_on(client.unregister_external_instance(&id));
                                 }
                                 return;
                             }
@@ -256,9 +295,14 @@ impl SnapshotdRegistration {
                                 if let Some(id) = current_id.as_deref() {
                                     if runtime.block_on(client.heartbeat(id)).is_err() {
                                         registration.project_path = current_project_path.clone();
-                                        current_id = runtime.block_on(async { register_and_extract_id(&client, &registration).await });
+                                        current_id = runtime.block_on(async {
+                                            register_and_extract_id(&client, &registration).await
+                                        });
                                         if let Some(id) = current_id.as_ref() {
-                                            *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                                            *published_id
+                                                .lock()
+                                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                                Some(id.clone());
                                             let _ = runtime.block_on(client.update_open_project(
                                                 id,
                                                 current_project_path.as_deref(),
@@ -269,9 +313,14 @@ impl SnapshotdRegistration {
                                     }
                                 } else {
                                     registration.project_path = current_project_path.clone();
-                                    current_id = runtime.block_on(async { register_and_extract_id(&client, &registration).await });
+                                    current_id = runtime.block_on(async {
+                                        register_and_extract_id(&client, &registration).await
+                                    });
                                     if let Some(id) = current_id.as_ref() {
-                                        *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                                        *published_id
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            Some(id.clone());
                                         let _ = runtime.block_on(client.update_open_project(
                                             id,
                                             current_project_path.as_deref(),
@@ -285,18 +334,29 @@ impl SnapshotdRegistration {
                     }
                 })
                 .ok()?;
-            Some(Self { commands, instance_id, discovery })
+            Some(Self {
+                commands,
+                instance_id,
+                discovery,
+            })
         }
     }
 
     pub fn update(&self, project_path: Option<String>, reason: impl Into<String>, generation: u64) {
         #[cfg(unix)]
         self.discovery.update(project_path.clone());
-        let _ = self.commands.send(RegistrationCommand::Update { project_path, reason: reason.into(), generation });
+        let _ = self.commands.send(RegistrationCommand::Update {
+            project_path,
+            reason: reason.into(),
+            generation,
+        });
     }
 
     pub fn instance_id(&self) -> Option<String> {
-        self.instance_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+        self.instance_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -311,7 +371,11 @@ async fn register_and_extract_id(
     registration: &ExternalInstanceRegistration,
 ) -> Option<String> {
     let value = client.register_external_instance(registration).await.ok()?;
-    value.get("instance")?.get("instanceId")?.as_str().map(str::to_owned)
+    value
+        .get("instance")?
+        .get("instanceId")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn process_start_identity() -> String {
@@ -339,7 +403,9 @@ impl SnapshotdControlClient {
     pub fn from_default_runtime() -> Option<Self> {
         let home = std::env::var_os("SNAPSHOTD_HOME")
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd")))?;
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd"))
+            })?;
         Some(Self::new(home.join("control.sock")))
     }
 
@@ -370,7 +436,12 @@ impl SnapshotdControlClient {
         &self,
         registration: &ExternalInstanceRegistration,
     ) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.registerExternalInstance", serde_json::to_value(registration).map_err(|e| SnapshotdClientError::Malformed(e.to_string()))?).await
+        self.call(
+            "daemon.registerExternalInstance",
+            serde_json::to_value(registration)
+                .map_err(|e| SnapshotdClientError::Malformed(e.to_string()))?,
+        )
+        .await
     }
 
     pub async fn update_open_project(
@@ -380,32 +451,67 @@ impl SnapshotdControlClient {
         reason: &str,
         generation: u64,
     ) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.updateOpenProject", json!({
-            "instanceId": instance_id,
-            "projectPath": project_path,
-            "reason": reason,
-            "generation": generation,
-        })).await
+        self.call(
+            "daemon.updateOpenProject",
+            json!({
+                "instanceId": instance_id,
+                "projectPath": project_path,
+                "reason": reason,
+                "generation": generation,
+            }),
+        )
+        .await
     }
 
     pub async fn heartbeat(&self, instance_id: &str) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.heartbeat", json!({"instanceId": instance_id})).await
+        self.call("daemon.heartbeat", json!({"instanceId": instance_id}))
+            .await
     }
 
-    pub async fn unregister_external_instance(&self, instance_id: &str) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.unregisterExternalInstance", json!({"instanceId": instance_id})).await
+    pub async fn unregister_external_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<Value, SnapshotdClientError> {
+        self.call(
+            "daemon.unregisterExternalInstance",
+            json!({"instanceId": instance_id}),
+        )
+        .await
     }
 
-    pub async fn register_mcp_context(&self, registration: &McpContextRegistration) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.registerMcpContext", serde_json::to_value(registration).map_err(|e| SnapshotdClientError::Malformed(e.to_string()))?).await
+    pub async fn register_mcp_context(
+        &self,
+        registration: &McpContextRegistration,
+    ) -> Result<Value, SnapshotdClientError> {
+        self.call(
+            "daemon.registerMcpContext",
+            serde_json::to_value(registration)
+                .map_err(|e| SnapshotdClientError::Malformed(e.to_string()))?,
+        )
+        .await
     }
 
-    pub async fn set_mcp_project_target(&self, context_token: &str, project_id: &str) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.setMcpProjectTarget", json!({"contextToken": context_token, "projectId": project_id})).await
+    pub async fn set_mcp_project_target(
+        &self,
+        context_token: &str,
+        project_id: &str,
+    ) -> Result<Value, SnapshotdClientError> {
+        self.call(
+            "daemon.setMcpProjectTarget",
+            json!({"contextToken": context_token, "projectId": project_id}),
+        )
+        .await
     }
 
-    pub async fn unregister_mcp_context(&self, context_token: &str) -> Result<Value, SnapshotdClientError> {
-        self.call("daemon.unregisterMcpContext", json!({"contextToken": context_token})).await
+    pub async fn unregister_mcp_context(
+        &self,
+        context_token: &str,
+    ) -> Result<Value, SnapshotdClientError> {
+        self.call(
+            "daemon.unregisterMcpContext",
+            json!({"contextToken": context_token}),
+        )
+        .await
     }
 
     pub async fn list_projects(&self) -> Result<Value, SnapshotdClientError> {
@@ -416,10 +522,88 @@ impl SnapshotdControlClient {
         self.call("daemon.subscribeProjects", json!({})).await
     }
 
+    /// Open a persistent JSONL control connection for project inventory
+    /// updates. Ordinary `call` requests intentionally remain one-shot; this
+    /// method is the opt-in long-lived transport used by panel inventory
+    /// consumers.
+    #[cfg(unix)]
+    pub async fn subscribe_projects_stream(
+        &self,
+    ) -> Result<ProjectUpdateSubscription, SnapshotdClientError> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request =
+            json!({"jsonrpc": "2.0", "id": id, "method": "daemon.subscribeProjects", "params": {}});
+        let stream = tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(&self.socket_path))
+            .await
+            .map_err(|_| SnapshotdClientError::Timeout)?
+            .map_err(|error| SnapshotdClientError::Unavailable(error.to_string()))?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut line = serde_json::to_vec(&request)
+            .map_err(|error| SnapshotdClientError::Malformed(error.to_string()))?;
+        line.push(b'\n');
+        tokio::time::timeout(REQUEST_TIMEOUT, write_half.write_all(&line))
+            .await
+            .map_err(|_| SnapshotdClientError::Timeout)?
+            .map_err(|error| SnapshotdClientError::Unavailable(error.to_string()))?;
+
+        let mut reader = BufReader::new(read_half);
+        let mut response = String::new();
+        tokio::time::timeout(REQUEST_TIMEOUT, reader.read_line(&mut response))
+            .await
+            .map_err(|_| SnapshotdClientError::Timeout)?
+            .map_err(|error| SnapshotdClientError::Unavailable(error.to_string()))?;
+        let value: Value = serde_json::from_str(&response)
+            .map_err(|error| SnapshotdClientError::Malformed(error.to_string()))?;
+        if let Some(error) = value.get("error") {
+            return Err(SnapshotdClientError::Rpc(error.to_string()));
+        }
+        let initial = value
+            .get("result")
+            .cloned()
+            .ok_or_else(|| SnapshotdClientError::Malformed("response has no result".into()))?;
+        let (updates, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let reader_task = tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let read = match reader.read_line(&mut line).await {
+                    Ok(read) => read,
+                    Err(_) => break,
+                };
+                if read == 0 {
+                    break;
+                }
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if frame.get("method").and_then(Value::as_str) == Some("daemon.projectsChanged") {
+                    if updates
+                        .send(frame.get("params").cloned().unwrap_or(Value::Null))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(ProjectUpdateSubscription {
+            initial,
+            updates: receiver,
+            _writer: write_half,
+            reader_task,
+        })
+    }
+
     /// Resolve the daemon project id from the canonical MLT path. This keeps
     /// the panel's durable identity path-based while still supplying the
     /// daemon's opaque project id for MCP context registration.
-    pub async fn project_id_for_path(&self, project_path: &Path) -> Result<Option<String>, SnapshotdClientError> {
+    pub async fn project_id_for_path(
+        &self,
+        project_path: &Path,
+    ) -> Result<Option<String>, SnapshotdClientError> {
         let projects = self.list_projects().await?;
         let project_path = project_path.to_path_buf();
         let wanted = tokio::task::spawn_blocking(move || {
@@ -430,13 +614,24 @@ impl SnapshotdControlClient {
         })
         .await
         .map_err(|error| SnapshotdClientError::Malformed(format!("project path task: {error}")))?;
-        let Some(rows) = projects.as_array() else { return Ok(None) };
+        let Some(rows) = projects.as_array() else {
+            return Ok(None);
+        };
         let candidates: Vec<(String, PathBuf)> = rows
             .iter()
             .filter_map(|row| {
-                let id = row.get("id").or_else(|| row.get("ID")).and_then(Value::as_str)?;
-                let root = row.get("rootDir").or_else(|| row.get("RootDir")).and_then(Value::as_str)?;
-                let file = row.get("mltFileName").or_else(|| row.get("MltFileName")).and_then(Value::as_str)?;
+                let id = row
+                    .get("id")
+                    .or_else(|| row.get("ID"))
+                    .and_then(Value::as_str)?;
+                let root = row
+                    .get("rootDir")
+                    .or_else(|| row.get("RootDir"))
+                    .and_then(Value::as_str)?;
+                let file = row
+                    .get("mltFileName")
+                    .or_else(|| row.get("MltFileName"))
+                    .and_then(Value::as_str)?;
                 Some((id.to_owned(), Path::new(root).join(file)))
             })
             .collect();
@@ -511,28 +706,99 @@ mod tests {
                 reader.read_line(&mut line).await.unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
                 let result = match request["method"].as_str() {
-                    Some("daemon.registerExternalInstance") => json!({"instance": {"instanceId": "instance-1"}, "heartbeatEvery": "10s", "leaseDuration": "30s"}),
-                    Some("daemon.setMcpProjectTarget") => json!({"contextToken": "ctx", "targetProjectId": "project-b"}),
+                    Some("daemon.registerExternalInstance") => {
+                        json!({"instance": {"instanceId": "instance-1"}, "heartbeatEvery": "10s", "leaseDuration": "30s"})
+                    }
+                    Some("daemon.setMcpProjectTarget") => {
+                        json!({"contextToken": "ctx", "targetProjectId": "project-b"})
+                    }
                     Some("daemon.unregisterMcpContext") => json!({}),
-                    Some("daemon.subscribeProjects") => json!({"mode": "poll", "pollAfter": "5s", "projects": []}),
+                    Some("daemon.subscribeProjects") => {
+                        json!({"mode": "push", "pollAfter": "5s", "projects": []})
+                    }
                     other => panic!("unexpected method: {other:?}"),
                 };
-                write.write_all(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}).to_string().as_bytes()).await.unwrap();
+                write
+                    .write_all(
+                        json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                            .to_string()
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
                 write.write_all(b"\n").await.unwrap();
             }
         });
         let client = SnapshotdControlClient::new(&socket);
         let registration = ExternalInstanceRegistration {
-            instance_nonce: "nonce".into(), pid: 1, process_start: "start".into(),
-            project_path: None, sap_socket_path: None, capabilities: None,
+            instance_nonce: "nonce".into(),
+            pid: 1,
+            process_start: "start".into(),
+            project_path: None,
+            sap_socket_path: None,
+            capabilities: None,
         };
-        let registered = client.register_external_instance(&registration).await.unwrap();
+        let registered = client
+            .register_external_instance(&registration)
+            .await
+            .unwrap();
         assert_eq!(registered["instance"]["instanceId"], "instance-1");
-        let context = client.set_mcp_project_target("ctx", "project-b").await.unwrap();
+        let context = client
+            .set_mcp_project_target("ctx", "project-b")
+            .await
+            .unwrap();
         assert_eq!(context["targetProjectId"], "project-b");
         client.unregister_mcp_context("ctx").await.unwrap();
         let subscription = client.subscribe_projects().await.unwrap();
-        assert_eq!(subscription["mode"], "poll");
+        assert_eq!(subscription["mode"], "push");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persistent_project_subscription_receives_inventory_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "daemon.subscribeProjects");
+            write
+                .write_all(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"mode": "push", "projects": []}
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            write.write_all(b"\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            write
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"method\":\"daemon.projectsChanged\",\"params\":[{\"id\":\"project-a\"}]}\n",
+                )
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        let client = SnapshotdControlClient::new(&socket);
+        let mut subscription = client.subscribe_projects_stream().await.unwrap();
+        assert_eq!(subscription.initial["mode"], "push");
+        let update = tokio::time::timeout(Duration::from_secs(1), subscription.updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update[0]["id"], "project-a");
+        drop(subscription);
         server.await.unwrap();
     }
 }
