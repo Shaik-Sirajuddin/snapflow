@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -279,6 +281,74 @@ func TestDaemon_ReconcileExternalLeaseAndProjectAggregate(t *testing.T) {
 	}
 	if _, err := d.Reg.GetMcpContext("expired-context"); !errors.Is(err, registry.ErrNotFound) {
 		t.Fatalf("expected expired MCP context to be removed, err=%v", err)
+	}
+}
+
+func TestDaemon_DiscoveryPromotesVerifiedCandidate(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	apps := filepath.Join(d.Cfg.HomeDir, "apps")
+	if err := os.MkdirAll(apps, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := filepath.Join(apps, "discovery.sock")
+	listener, err := net.Listen("unix", endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	processStart := mustProcessStart(t)
+	nonce := "discovery-promote"
+	projectDir := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(projectDir, registry.DefaultMltFileName)
+	if err := os.WriteFile(projectPath, []byte("<mlt/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var request struct {
+			Params struct {
+				Challenge string `json:"challenge"`
+			} `json:"params"`
+		}
+		if json.NewDecoder(bufio.NewReader(conn)).Decode(&request) != nil {
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(map[string]any{"result": map[string]any{
+			"instanceNonce": nonce,
+			"pid":           os.Getpid(),
+			"processStart":  processStart,
+			"projectPath":   projectPath,
+			"challenge":     request.Params.Challenge,
+		}})
+	}()
+	descriptor, err := json.Marshal(map[string]any{
+		"endpoint":        endpoint,
+		"pid":             os.Getpid(),
+		"processStart":    processStart,
+		"instanceNonce":   nonce,
+		"protocolVersion": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apps, "discovery.json"), descriptor, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := d.DiscoverExternalInstances(ctx)
+	if err != nil || len(candidates) != 1 || !candidates[0].Verified {
+		t.Fatalf("expected verified discovery candidate: candidates=%+v err=%v", candidates, err)
+	}
+	registered, err := d.Reg.GetExternalInstanceByNonce(nonce)
+	if err != nil || registered.Status != registry.ExternalStatusOpen {
+		t.Fatalf("expected verified candidate to be registered open: %+v err=%v", registered, err)
 	}
 }
 

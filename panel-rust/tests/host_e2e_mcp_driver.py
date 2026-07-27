@@ -55,7 +55,12 @@ class McpClient:
             "tools/call", {"name": name, "arguments": arguments or {}}
         )
         text = result["content"][0]["text"]
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as error:
+            raise McpError(
+                f"{name} returned non-JSON tool text {text!r}; content={result.get('content')!r}"
+            ) from error
 
     def wait_until_up(self, timeout=15):
         deadline = time.monotonic() + timeout
