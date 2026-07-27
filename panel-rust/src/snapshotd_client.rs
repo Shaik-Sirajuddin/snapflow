@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -66,6 +68,133 @@ pub struct McpContextRegistration {
 pub struct SnapshotdControlClient {
     socket_path: PathBuf,
     next_id: std::sync::Arc<AtomicU64>,
+}
+
+enum RegistrationCommand {
+    Update {
+        project_path: Option<String>,
+        reason: String,
+        generation: u64,
+    },
+    Stop,
+}
+
+/// Owns the non-UI lifecycle loop for one external Snapflow process. The
+/// registration and heartbeat never run on the Slint/Qt thread; the returned
+/// handle only sends small commands to the worker.
+pub struct SnapshotdRegistration {
+    commands: Sender<RegistrationCommand>,
+    instance_id: Arc<Mutex<Option<String>>>,
+}
+
+impl SnapshotdRegistration {
+    pub fn start(initial_project_path: Option<String>) -> Option<Self> {
+        #[cfg(not(unix))]
+        {
+            let _ = initial_project_path;
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            let home = std::env::var_os("SNAPSHOTD_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd")))?;
+            let client = SnapshotdControlClient::new(home.join("control.sock"));
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let (commands, receiver) = mpsc::channel();
+            let instance_id = Arc::new(Mutex::new(None));
+            let published_id = Arc::clone(&instance_id);
+            std::thread::Builder::new()
+                .name("snapshotd-registration".into())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            eprintln!("panel-rust: snapshotd registration runtime failed: {error}");
+                            return;
+                        }
+                    };
+                    let registration = ExternalInstanceRegistration {
+                        instance_nonce: nonce,
+                        pid: std::process::id(),
+                        process_start: process_start_identity(),
+                        project_path: initial_project_path,
+                        sap_socket_path: None,
+                        capabilities: Some(json!({"lifecycle": true, "mcpContexts": true})),
+                    };
+                    let mut current_id = runtime.block_on(async {
+                        register_and_extract_id(&client, &registration).await
+                    });
+                    if let Some(id) = current_id.as_ref() {
+                        *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                    }
+                    loop {
+                        match receiver.recv_timeout(Duration::from_secs(10)) {
+                            Ok(RegistrationCommand::Update { project_path, reason, generation }) => {
+                                if let Some(id) = current_id.as_deref() {
+                                    let _ = runtime.block_on(client.update_open_project(id, project_path.as_deref(), &reason, generation));
+                                }
+                            }
+                            Ok(RegistrationCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                if let Some(id) = current_id.take() {
+                                    let _ = runtime.block_on(client.unregister_external_instance(&id));
+                                }
+                                return;
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if let Some(id) = current_id.as_deref() {
+                                    if runtime.block_on(client.heartbeat(id)).is_err() {
+                                        current_id = runtime.block_on(async { register_and_extract_id(&client, &registration).await });
+                                        if let Some(id) = current_id.as_ref() {
+                                            *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                                        }
+                                    }
+                                } else {
+                                    current_id = runtime.block_on(async { register_and_extract_id(&client, &registration).await });
+                                    if let Some(id) = current_id.as_ref() {
+                                        *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+                .ok()?;
+            Some(Self { commands, instance_id })
+        }
+    }
+
+    pub fn update(&self, project_path: Option<String>, reason: impl Into<String>, generation: u64) {
+        let _ = self.commands.send(RegistrationCommand::Update { project_path, reason: reason.into(), generation });
+    }
+
+    pub fn instance_id(&self) -> Option<String> {
+        self.instance_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+}
+
+impl Drop for SnapshotdRegistration {
+    fn drop(&mut self) {
+        let _ = self.commands.send(RegistrationCommand::Stop);
+    }
+}
+
+async fn register_and_extract_id(
+    client: &SnapshotdControlClient,
+    registration: &ExternalInstanceRegistration,
+) -> Option<String> {
+    let value = client.register_external_instance(registration).await.ok()?;
+    value.get("instance")?.get("instanceId")?.as_str().map(str::to_owned)
+}
+
+fn process_start_identity() -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+        if let Some(start) = stat.split_whitespace().nth(21) {
+            return start.to_owned();
+        }
+    }
+    format!("{}", std::process::id())
 }
 
 impl SnapshotdControlClient {

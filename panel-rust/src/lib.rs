@@ -689,6 +689,7 @@ struct PanelSingleton {
     /// Suppress self-write feedback from settings save for a short window.
     settings_ignore_watch_until: Cell<Option<std::time::Instant>>,
     _settings_watcher: Option<settings_file::SettingsWatcher>,
+    snapshotd_registration: Option<snapshotd_client::SnapshotdRegistration>,
 }
 
 impl PanelSingleton {
@@ -1281,6 +1282,9 @@ impl PanelSingleton {
         if let Some(bridge) = self.bridge.as_ref() {
             bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
         }
+        if let Some(registration) = self.snapshotd_registration.as_ref() {
+            registration.update(path, "lifecycle", 0);
+        }
     }
 
     /// Move the durable project store during Save-As/first-save. The rename
@@ -1772,6 +1776,11 @@ fn panel_rust_create_with_initial_identity(
             settings_reload_pending,
             settings_ignore_watch_until: Cell::new(None),
             _settings_watcher: settings_watcher,
+            snapshotd_registration: initial_identity.as_ref().and_then(|identity| {
+                snapshotd_client::SnapshotdRegistration::start(
+                    identity.saved_path().map(str::to_owned),
+                )
+            }),
         };
         if let Some(identity) = initial_identity {
             let saved_path = identity.saved_path().map(str::to_owned);
