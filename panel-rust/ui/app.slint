@@ -470,6 +470,7 @@ export component ChatPanel inherits Window {
                 // again to reveal the chat or skill editor.
                 threads: threads;
                 selected-thread: selected-thread;
+                project-open: root.project-open;
                 compact: compact;
                 narrow: root.narrow;
                 expanded: sidebar-expanded;
@@ -548,7 +549,8 @@ export component ChatPanel inherits Window {
                     ? threads[selected-thread].provider
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
-                inputs-enabled: !(threads.length > 0 && threads[selected-thread].archived);
+                inputs-enabled: root.project-open
+                    && !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }
                 // Phase 16: project indicator from the selected thread's

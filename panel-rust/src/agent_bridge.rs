@@ -308,6 +308,10 @@ struct ThreadSlot {
     /// freshly-built, eagerly-attached slot bound to the then-current
     /// provider. `false` for every eagerly-attached or recovered slot.
     deferred: bool,
+    /// Whether teardown should retain this session server-side as a
+    /// background session. This belongs to the owning chat, not the active
+    /// project, so it is kept per slot.
+    background: Mutex<bool>,
 }
 
 impl ThreadSlot {
@@ -446,6 +450,11 @@ pub struct AgentBridge {
     // tokio worker thread, well past this struct's own lifetime scope at
     // spawn time) can observe updates made after construction.
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
+    /// Raw active MLT identity used for newly-created thread ownership.
+    /// `session_cwd_override` is deliberately the derived project store,
+    /// which is suitable for ACP cwd but must never be persisted as a raw
+    /// project path or fed back through project_store_dir.
+    session_project_path_override: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// Provider gateways are process-scoped, not project-view-scoped. Keeping a
@@ -2814,7 +2823,23 @@ impl AgentBridge {
         thread_specs: &[ThreadSpec],
         initial_cwd: Option<PathBuf>,
     ) -> Result<Self, BridgeError> {
-        let cache_dir = resolve_cache_dir();
+        Self::new_with_thread_specs_and_initial_identity(thread_specs, initial_cwd, None)
+    }
+
+    /// Cold-start variant carrying both representations of the active
+    /// project: the derived store used as ACP cwd and the raw saved path used
+    /// as durable thread ownership. Keeping these separate prevents a store
+    /// path from being fed back through `project_store_dir`.
+    pub fn new_with_thread_specs_and_initial_identity(
+        thread_specs: &[ThreadSpec],
+        initial_cwd: Option<PathBuf>,
+        initial_project_path: Option<PathBuf>,
+    ) -> Result<Self, BridgeError> {
+        // A real project identity owns its transcript/cache physically. The
+        // host supplies `initial_cwd` as the already-derived project store;
+        // prefer it here so recreating the panel for Project B cannot restore
+        // Project A's JSONL/session binding from one global cache directory.
+        let cache_dir = initial_cwd.clone().unwrap_or_else(resolve_cache_dir);
         let cache_dir_for_resolver = cache_dir.clone();
         Self::new_with_thread_specs_and_gateway_resolver_and_cache_dir_and_initial_cwd(
             thread_specs,
@@ -2824,6 +2849,7 @@ impl AgentBridge {
             },
             Some(cache_dir),
             initial_cwd,
+            initial_project_path,
         )
     }
 
@@ -2860,6 +2886,7 @@ impl AgentBridge {
             resolve_gateway,
             cache_dir,
             None,
+            None,
         )
     }
 
@@ -2868,6 +2895,7 @@ impl AgentBridge {
         resolve_gateway: impl Fn(&str) -> Result<String, BridgeError> + 'static,
         cache_dir: Option<PathBuf>,
         initial_cwd: Option<PathBuf>,
+        initial_project_path: Option<PathBuf>,
     ) -> Result<Self, BridgeError> {
         // Boxed immediately so the same resolver this constructor uses to
         // seed `gateway_urls` up front can also be kept on the struct for
@@ -2947,6 +2975,7 @@ impl AgentBridge {
         }
         let mut attachment_gates: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
         let session_cwd_override: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(initial_cwd));
+        let session_project_path_override = Arc::new(Mutex::new(initial_project_path));
 
         // `spawn_acpx_thread_with_gateway` calls the free-function `tokio::spawn` internally,
         // which needs an active runtime context on this (calling) thread --
@@ -3056,6 +3085,7 @@ impl AgentBridge {
                 // or a legacy pre-migration record, same as before.
                 project_path: Mutex::new(spec.project_path.as_deref().map(PathBuf::from)),
                 deferred: false,
+                background: Mutex::new(false),
             });
             slots.push(slot.clone());
 
@@ -3123,6 +3153,7 @@ impl AgentBridge {
             store,
             local_terminals: std::cell::RefCell::new(std::collections::HashMap::new()),
             session_cwd_override,
+            session_project_path_override,
         })
     }
 
@@ -3192,8 +3223,18 @@ impl AgentBridge {
     /// NOT retroactively move already-open sessions -- ACP has no
     /// "change an existing session's cwd" operation.
     pub fn set_active_project_path(&self, path: Option<PathBuf>) {
+        let store_path = path.as_deref().and_then(|raw| {
+            crate::project_store::project_store_dir(
+                &crate::model::ProjectIdentity::Saved(raw.to_string_lossy().into_owned()),
+                &resolve_cache_dir(),
+            )
+        });
         *self
             .session_cwd_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = store_path;
+        *self
+            .session_project_path_override
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = path;
     }
@@ -3346,7 +3387,7 @@ impl AgentBridge {
         let events_rx = handle.take_events();
         let handle = Arc::new(handle);
         let project_path_for_slot = self
-            .session_cwd_override
+            .session_project_path_override
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -3402,6 +3443,7 @@ impl AgentBridge {
             archived: Mutex::new(runtime_snapshot.archived),
             project_path: Mutex::new(project_path_for_slot),
             deferred,
+            background: Mutex::new(false),
         });
         Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
     }
@@ -3673,7 +3715,7 @@ impl AgentBridge {
         let mut events_rx = handle.take_events();
         let handle = Arc::new(handle);
         let project_path_for_slot = self
-            .session_cwd_override
+            .session_project_path_override
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -3709,6 +3751,7 @@ impl AgentBridge {
             archived: Mutex::new(false),
             project_path: Mutex::new(project_path_for_slot),
             deferred: false,
+            background: Mutex::new(false),
         });
 
         // `slot.project_path` (not `self.session_cwd_override` directly) so
@@ -3882,6 +3925,14 @@ impl AgentBridge {
                 .map(|path| path.to_string_lossy().into_owned())
                 .filter(|path| !path.is_empty())
         })
+    }
+
+    /// Update the local teardown policy after the durable background-session
+    /// override has been written. This does not issue an ACP request.
+    pub fn set_thread_background(&self, idx: usize, background: bool) {
+        if let Some(slot) = self.slots.get(idx) {
+            *slot.background.lock().unwrap_or_else(|e| e.into_inner()) = background;
+        }
     }
 
     /// Snapshot of a thread's currently-pending interactive requests
@@ -5056,6 +5107,21 @@ impl Drop for AgentBridge {
         // the runtime's own shutdown-cancels-outstanding-tasks behavior.
         for slot in &self.slots {
             spawn_snapshotd_mcp_context_cleanup(self.runtime.handle(), slot);
+            // Project recreation detaches foreground thread actors. Stopping
+            // only the local actor leaves the ACPX session live until server
+            // expiry, so repeated A -> B -> restart cycles exhaust the
+            // tenant session capacity. Explicitly close this panel-owned
+            // session before shutting down its actor; an explicitly
+            // backgrounded session is reattached through its durable record
+            // when the project becomes active again.
+            let background = *slot.background.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    slot.handle.close_session(background),
+                )
+                .await
+            });
             slot.handle.shutdown();
         }
     }

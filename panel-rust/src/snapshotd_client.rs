@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -211,6 +211,12 @@ pub struct SnapshotdRegistration {
     instance_id: Arc<Mutex<Option<String>>>,
     #[cfg(unix)]
     discovery: DiscoveryEndpoint,
+    #[cfg(unix)]
+    project_inventory: Arc<Mutex<Option<Value>>>,
+    #[cfg(unix)]
+    project_inventory_dirty: Arc<AtomicBool>,
+    #[cfg(unix)]
+    inventory_stop: Arc<AtomicBool>,
 }
 
 impl SnapshotdRegistration {
@@ -232,6 +238,60 @@ impl SnapshotdRegistration {
             let discovery = DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone())?;
             let (commands, receiver) = mpsc::channel();
             let instance_id = Arc::new(Mutex::new(None));
+            let project_inventory = Arc::new(Mutex::new(None));
+            let project_inventory_dirty = Arc::new(AtomicBool::new(false));
+            let inventory_stop = Arc::new(AtomicBool::new(false));
+            {
+                let inventory_client = client.clone();
+                let inventory_snapshot = project_inventory.clone();
+                let inventory_dirty = project_inventory_dirty.clone();
+                let stop = inventory_stop.clone();
+                std::thread::Builder::new()
+                    .name("snapshotd-project-inventory".into())
+                    .spawn(move || {
+                        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        else {
+                            return;
+                        };
+                        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            let subscription = runtime.block_on(
+                                inventory_client.subscribe_projects_stream(),
+                            );
+                            let Ok(mut subscription) = subscription else {
+                                std::thread::sleep(Duration::from_secs(1));
+                                continue;
+                            };
+                            let initial = subscription
+                                .initial
+                                .get("projects")
+                                .cloned()
+                                .unwrap_or(subscription.initial.clone());
+                            *inventory_snapshot
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(initial);
+                            inventory_dirty.store(true, Ordering::SeqCst);
+                            while !stop.load(Ordering::SeqCst) {
+                                let next = runtime.block_on(tokio::time::timeout(
+                                    Duration::from_secs(1),
+                                    subscription.updates.recv(),
+                                ));
+                                match next {
+                                    Ok(Some(value)) => {
+                                        *inventory_snapshot
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            Some(value);
+                                        inventory_dirty.store(true, Ordering::SeqCst);
+                                    }
+                                    Ok(None) | Err(_) => break,
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+            }
             let published_id = Arc::clone(&instance_id);
             std::thread::Builder::new()
                 .name("snapshotd-registration".into())
@@ -338,6 +398,9 @@ impl SnapshotdRegistration {
                 commands,
                 instance_id,
                 discovery,
+                project_inventory,
+                project_inventory_dirty,
+                inventory_stop,
             })
         }
     }
@@ -358,10 +421,32 @@ impl SnapshotdRegistration {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    /// Return the newest push inventory exactly once. The reader thread owns
+    /// all socket I/O; this accessor is a lock-only UI snapshot operation.
+    #[cfg(unix)]
+    pub fn take_project_inventory(&self) -> Option<Value> {
+        if !self.project_inventory_dirty.swap(false, Ordering::SeqCst) {
+            return None;
+        }
+        self.project_inventory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Consume only the notification edge when the caller uses the existing
+    /// bounded list-projects fallback to materialize the typed model.
+    #[cfg(unix)]
+    pub fn take_project_inventory_notification(&self) -> bool {
+        self.take_project_inventory().is_some()
+    }
 }
 
 impl Drop for SnapshotdRegistration {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        self.inventory_stop.store(true, Ordering::SeqCst);
         let _ = self.commands.send(RegistrationCommand::Stop);
     }
 }

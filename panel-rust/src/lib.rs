@@ -693,6 +693,24 @@ struct PanelSingleton {
 }
 
 impl PanelSingleton {
+    fn project_identity_for_path(path: &str) -> model::ProjectIdentity {
+        if path.ends_with(".mlt") {
+            model::ProjectIdentity::Saved(path.to_owned())
+        } else {
+            model::ProjectIdentity::Untitled(path.to_owned())
+        }
+    }
+
+    /// Return an already-open project store without consulting the model's
+    /// active identity. Lifecycle effects use this while the model already
+    /// points at the destination identity (for example during Save-As), so
+    /// calling `active_panel_state()` there would open the destination store
+    /// before the source store has been flushed and moved.
+    pub(crate) fn project_state_for_path(&self, path: &str) -> Option<Arc<PanelStateStore>> {
+        let identity = Self::project_identity_for_path(path);
+        self.project_state_stores.borrow().get(&identity).cloned()
+    }
+
     /// Return the physically isolated durable store for the lifecycle
     /// identity currently folded into the model.
     pub(crate) fn active_panel_state(&self) -> Option<Arc<PanelStateStore>> {
@@ -1296,12 +1314,8 @@ impl PanelSingleton {
     /// filesystem half keeps the physical SQLite store aligned with it.
     pub(crate) fn move_project_store_for_rename(&self, old: &str, new: &str) {
         let cache_root = resolve_cache_dir();
-        let old_identity = if old.ends_with(".mlt") {
-            model::ProjectIdentity::Saved(old.to_owned())
-        } else {
-            model::ProjectIdentity::Untitled(old.to_owned())
-        };
-        let new_identity = model::ProjectIdentity::Saved(new.to_owned());
+        let old_identity = Self::project_identity_for_path(old);
+        let new_identity = Self::project_identity_for_path(new);
         let old_dir = crate::project_store::project_store_dir(&old_identity, &cache_root);
         let new_dir = crate::project_store::project_store_dir(&new_identity, &cache_root);
         let (Some(old_dir), Some(new_dir)) = (old_dir, new_dir) else {
@@ -1330,14 +1344,17 @@ impl PanelSingleton {
                 old_dir.display(),
                 new_dir.display()
             );
-        } else if let Some(store) = self.project_state_stores.borrow_mut().remove(&old_identity) {
+        } else {
+            let moved_store = self.project_state_stores.borrow_mut().remove(&old_identity);
+            if let Some(store) = moved_store {
             // The SQLite connection remains valid after the directory move,
             // but its registry key must move with the project identity or a
             // later switch can reopen the old path and leave two live cache
             // entries for the same physical store.
-            self.project_state_stores
-                .borrow_mut()
-                .insert(new_identity, store);
+                self.project_state_stores
+                    .borrow_mut()
+                    .insert(new_identity, store);
+            }
         }
     }
 
@@ -1709,7 +1726,13 @@ fn panel_rust_create_with_initial_identity(
             let initial_cwd = initial_identity.as_ref().and_then(|identity| {
                 crate::project_store::project_store_dir(identity, &resolve_cache_dir())
             });
-            match AgentBridge::new_with_thread_specs_and_initial_cwd(&initial_specs, initial_cwd) {
+            match AgentBridge::new_with_thread_specs_and_initial_identity(
+                &initial_specs,
+                initial_cwd,
+                initial_identity
+                    .as_ref()
+                    .and_then(|identity| identity.saved_path().map(std::path::PathBuf::from)),
+            ) {
                 Ok(b) => (Some(b), true),
                 Err(e) => {
                     let message = format!("agent bridge unavailable, chat panel is display-only: {e}");
@@ -1719,6 +1742,15 @@ fn panel_rust_create_with_initial_identity(
                 }
             }
         };
+        if let Some(bridge) = bridge.as_ref() {
+            if let Some(store) = panel_state.as_ref() {
+                for (index, record) in restored_records.iter().enumerate() {
+                    if let Ok(background) = store.effective_background_session(&record.thread_id) {
+                        bridge.set_thread_background(index, background);
+                    }
+                }
+            }
+        }
         let initial_selected_thread_id = panel_state
             .as_ref()
             .and_then(|store| store.defaults().ok())

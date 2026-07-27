@@ -23,6 +23,10 @@ export component Sidebar inherits Rectangle {
     in property <bool> compact: true;
     in property <bool> narrow: false;
     in property <bool> expanded: false;
+    // None disables creation of new chats; Saved and Untitled identities
+    // both count as an available project even when active-project-path is
+    // empty for an untitled document.
+    in property <bool> project-open: false;
     // Phase 19: section counters (computed in Rust; slint lacks reduce).
     in property <int> active-count: 0;
     in property <int> archived-count: 0;
@@ -239,6 +243,7 @@ export component Sidebar inherits Rectangle {
                     alignment: center;
                     IconButton {
                         button-accessible-label: "New thread";
+                        enabled: root.project-open;
                         clicked => { new-thread-requested(); }
                         Icon {
                             source: @image-url("../assets/icons/plus.svg");

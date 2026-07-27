@@ -17,6 +17,7 @@ export component IconButton inherits Rectangle {
     // over the button, so a caller can show both states with the one
     // primitive instead of re-deriving the hover tint itself.
     in property <bool> active: false;
+    in property <bool> enabled: true;
     out property <bool> has-hover: touch.has-hover;
     callback clicked();
 
@@ -29,10 +30,12 @@ export component IconButton inherits Rectangle {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     border-radius: Theme.radius-sm;
-    background: (active || touch.has-hover) ? Theme.bg-primary-container : transparent;
+    opacity: enabled ? 1.0 : 0.45;
+    background: (enabled && (active || touch.has-hover)) ? Theme.bg-primary-container : transparent;
     animate background { duration: 100ms; }
 
     touch := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: pointer;
         accessible-role: button;
         accessible-label: root.button-accessible-label;

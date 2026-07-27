@@ -443,6 +443,13 @@ fn merge_expanded_by_key(
 fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>) {
     match msg {
         ThreadMsg::New => {
+            // D6/D7: `None` is a real no-project state, not a permission
+            // to fall back to the host process cwd. The UI also disables
+            // New thread, but keep the reducer gate so keyboard/FFI callers
+            // cannot bypass the attachment invariant.
+            if matches!(model.active_project, crate::model::ProjectIdentity::None) {
+                return (vec![], vec![]);
+            }
             let old_keys = current_visible_keys(model);
             model.compose_text.clear();
             model.search_query.clear();
@@ -539,6 +546,12 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             session_id,
             thread_id,
         } => {
+            // A deferred New request can complete after the host closes the
+            // project. Never materialize that late result into an unscoped
+            // thread or let it start an ACP session against process cwd.
+            if matches!(model.active_project, crate::model::ProjectIdentity::None) {
+                return (vec![], vec![]);
+            }
             let old_keys = current_visible_keys(model);
             model.compose_text.clear();
             model.search_query.clear();
@@ -793,6 +806,9 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
     let idx = selected_real_index(model);
     match msg {
         ComposeMsg::SendRequested(text) => {
+            if matches!(model.active_project, crate::model::ProjectIdentity::None) {
+                return (vec![], vec![]);
+            }
             model.compose_text.clear();
             let Some(thread) = model.threads.get_mut(idx) else {
                 return (vec![], vec![]);

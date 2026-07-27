@@ -684,6 +684,24 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 });
             }
             Effect::RenameProjectAssociation { old, new } => {
+                // Rewrite the live SQLite rows before moving its directory.
+                // An open SQLite connection can become read-only when its
+                // containing directory is renamed first (especially with a
+                // WAL/journal present), which would leave Save-As looking
+                // correct in memory but stale after restart.
+                // `update_host(ProjectPathRenamed)` has already folded the
+                // destination identity into the model. Resolve the source
+                // store by its durable old path; using active_panel_state()
+                // here would create the destination store prematurely and
+                // make the filesystem move a no-op.
+                let store = panel.project_state_for_path(&old);
+                if let Some(store) = store.as_ref() {
+                    if let Err(error) = store.rename_project_path(&old, &new) {
+                        eprintln!(
+                            "panel-rust: failed to persist project rename {old:?} -> {new:?}: {error}"
+                        );
+                    }
+                }
                 panel.move_project_store_for_rename(&old, &new);
                 // Synchronous, in-memory only (no I/O) -- must run before
                 // this call returns, not spawned, so the very next poll
@@ -694,21 +712,10 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     bridge.rebind_project_path(&old, &new);
                 }
-                // Durable half: survives a restart. Best-effort/fire-and-
-                // forget like RenameThread's own display-name persist
-                // just above -- the live session is already correct by
-                // the time this completes, so a failure here only risks
-                // the association not surviving a restart, logged rather
-                // than surfaced as a user-facing error.
-                if let Some(store) = panel.active_panel_state() {
-                    std::thread::spawn(move || {
-                        if let Err(error) = store.rename_project_path(&old, &new) {
-                            eprintln!(
-                                "panel-rust: failed to persist project rename {old:?} -> {new:?}: {error}"
-                            );
-                        }
-                    });
-                }
+                // Durable half: survives a restart. This write is kept
+                // synchronous at the lifecycle boundary so Save-As cannot
+                // return with the in-memory association moved while SQLite
+                // still contains the old project path.
             }
             Effect::CloseThread { real_index } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
@@ -820,6 +827,18 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                                         message,
                                     }),
                                 );
+                            });
+                        });
+                    } else {
+                        let _ = slint::invoke_from_event_loop(move || {
+                            crate::PANEL.with(|cell| {
+                                let slot = cell.borrow();
+                                let Some(panel) = slot.as_ref() else {
+                                    return;
+                                };
+                                if let Some(bridge) = panel.bridge.as_ref() {
+                                    bridge.set_thread_background(real_index, next);
+                                }
                             });
                         });
                     }

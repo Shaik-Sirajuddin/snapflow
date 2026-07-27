@@ -193,6 +193,22 @@ impl<'a> ExternalSnapshotSource<'a> {
                     || model.agent_catalog.is_empty(),
             )
         };
+        let push_inventory_due = self
+            .panel
+            .snapshotd_registration
+            .as_ref()
+            .map(|registration| {
+                #[cfg(unix)]
+                {
+                    registration.take_project_inventory_notification()
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = registration;
+                    false
+                }
+            })
+            .unwrap_or(false);
         msg::FrameInput {
             bridge_events_pending: !bridge_events.is_empty(),
             bridge_events,
@@ -226,7 +242,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             // an unchanged scan dirties nothing.
             skills_snapshot: (settings_open && skills_rescan_due())
                 .then(|| self.collect_skills_snapshot()),
-            daemon_projects_refresh_due: daemon_projects_refresh_due(),
+            daemon_projects_refresh_due: daemon_projects_refresh_due() || push_inventory_due,
         }
     }
 
