@@ -1736,6 +1736,7 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
         HostMsg::ProjectPathRenamed { old, new } => {
             model.project_generation = model.project_generation.saturating_add(1);
             model.project_lifecycle_reason = "saved_as".to_owned();
+            let old_identity = model.active_project.clone();
             // PISO-7: this is a SEPARATE branch from ProjectPathChanged
             // above, by design -- rebinding on a bare active-path change
             // would be unable to tell "Save-As A -> B" apart from "close
@@ -1750,14 +1751,22 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
                 .unwrap_or_default();
             model.active_project_path = new_path.clone();
             let mut effects = vec![Effect::SetActiveProjectPath { path: new_path }];
-            // "old empty" means this project was untitled and is being
-            // saved for the first time -- those threads were created
-            // unscoped on purpose (see `ThreadRecord::project_path`'s doc
-            // comment) and must stay unscoped, not get retro-bound to the
-            // new path just because it's the first path they've ever
-            // had. That is NOT a rename of anything, so no rebind fires.
             if !old.is_empty() && !new.is_empty() {
-                effects.push(Effect::RenameProjectAssociation { old, new });
+                effects.push(Effect::RenameProjectAssociation {
+                    old,
+                    new,
+                    old_identity,
+                });
+            } else if old.is_empty() && !new.is_empty() {
+                // First Save is a real staging-store migration. The
+                // untitled identity is captured before the model changes to
+                // Saved(new), so the effect can move the correct UUID store
+                // and rebind its previously unscoped thread rows.
+                effects.push(Effect::RenameProjectAssociation {
+                    old,
+                    new,
+                    old_identity,
+                });
             }
             (
                 effects,

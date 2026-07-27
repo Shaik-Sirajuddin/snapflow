@@ -701,14 +701,11 @@ impl PanelSingleton {
         }
     }
 
-    /// Return an already-open project store without consulting the model's
-    /// active identity. Lifecycle effects use this while the model already
-    /// points at the destination identity (for example during Save-As), so
-    /// calling `active_panel_state()` there would open the destination store
-    /// before the source store has been flushed and moved.
-    pub(crate) fn project_state_for_path(&self, path: &str) -> Option<Arc<PanelStateStore>> {
-        let identity = Self::project_identity_for_path(path);
-        self.project_state_stores.borrow().get(&identity).cloned()
+    pub(crate) fn project_state_for_identity(
+        &self,
+        identity: &model::ProjectIdentity,
+    ) -> Option<Arc<PanelStateStore>> {
+        self.project_state_stores.borrow().get(identity).cloned()
     }
 
     /// Return the physically isolated durable store for the lifecycle
@@ -1297,12 +1294,16 @@ impl PanelSingleton {
     /// This must stay separate from `dispatch_project_path_changed`, which
     /// creates that effect; calling the dispatcher here would recurse forever.
     pub(crate) fn apply_active_project_path(&self, path: Option<String>) {
-        let (reason, generation) = {
+        let (reason, generation, identity) = {
             let model = self.model.borrow();
-            (model.project_lifecycle_reason.clone(), model.project_generation)
+            (
+                model.project_lifecycle_reason.clone(),
+                model.project_generation,
+                model.active_project.clone(),
+            )
         };
         if let Some(bridge) = self.bridge.as_ref() {
-            bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
+            bridge.set_active_project_identity(&identity);
         }
         if let Some(registration) = self.snapshotd_registration.as_ref() {
             registration.update(path, reason, generation);
@@ -1312,11 +1313,14 @@ impl PanelSingleton {
     /// Move the durable project store during Save-As/first-save. The rename
     /// effect already owns this transition for live bridge associations; the
     /// filesystem half keeps the physical SQLite store aligned with it.
-    pub(crate) fn move_project_store_for_rename(&self, old: &str, new: &str) {
+    pub(crate) fn move_project_store_for_rename(
+        &self,
+        old_identity: &model::ProjectIdentity,
+        new: &str,
+    ) {
         let cache_root = resolve_cache_dir();
-        let old_identity = Self::project_identity_for_path(old);
         let new_identity = Self::project_identity_for_path(new);
-        let old_dir = crate::project_store::project_store_dir(&old_identity, &cache_root);
+        let old_dir = crate::project_store::project_store_dir(old_identity, &cache_root);
         let new_dir = crate::project_store::project_store_dir(&new_identity, &cache_root);
         let (Some(old_dir), Some(new_dir)) = (old_dir, new_dir) else {
             return;
@@ -1345,7 +1349,7 @@ impl PanelSingleton {
                 new_dir.display()
             );
         } else {
-            let moved_store = self.project_state_stores.borrow_mut().remove(&old_identity);
+            let moved_store = self.project_state_stores.borrow_mut().remove(old_identity);
             if let Some(store) = moved_store {
             // The SQLite connection remains valid after the directory move,
             // but its registry key must move with the project identity or a

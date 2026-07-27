@@ -215,6 +215,7 @@ pub enum Effect {
     RenameProjectAssociation {
         old: String,
         new: String,
+        old_identity: crate::model::ProjectIdentity,
     },
     /// PISO-8 (project-isolation-mlt-binding plan): a throttled background
     /// poll of snapshotd's `daemon.list`/`daemon.listProjects` CLI

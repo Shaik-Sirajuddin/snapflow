@@ -683,7 +683,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     });
                 });
             }
-            Effect::RenameProjectAssociation { old, new } => {
+            Effect::RenameProjectAssociation {
+                old,
+                new,
+                old_identity,
+            } => {
                 // Rewrite the live SQLite rows before moving its directory.
                 // An open SQLite connection can become read-only when its
                 // containing directory is renamed first (especially with a
@@ -694,15 +698,20 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 // store by its durable old path; using active_panel_state()
                 // here would create the destination store prematurely and
                 // make the filesystem move a no-op.
-                let store = panel.project_state_for_path(&old);
+                let store = panel.project_state_for_identity(&old_identity);
                 if let Some(store) = store.as_ref() {
-                    if let Err(error) = store.rename_project_path(&old, &new) {
+                    let result = if old.is_empty() {
+                        store.assign_unscoped_project_path(&new)
+                    } else {
+                        store.rename_project_path(&old, &new)
+                    };
+                    if let Err(error) = result {
                         eprintln!(
                             "panel-rust: failed to persist project rename {old:?} -> {new:?}: {error}"
                         );
                     }
                 }
-                panel.move_project_store_for_rename(&old, &new);
+                panel.move_project_store_for_rename(&old_identity, &new);
                 // Synchronous, in-memory only (no I/O) -- must run before
                 // this call returns, not spawned, so the very next poll
                 // tick already sees the rebind and the running session's
@@ -710,7 +719,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 // below. See `AgentBridge::rebind_project_path`'s doc
                 // comment for why sqlite alone isn't enough on its own.
                 if let Some(bridge) = panel.bridge.as_ref() {
-                    bridge.rebind_project_path(&old, &new);
+                    if old.is_empty() {
+                        bridge.rebind_unscoped_project_path(&new);
+                    } else {
+                        bridge.rebind_project_path(&old, &new);
+                    }
                 }
                 // Durable half: survives a restart. This write is kept
                 // synchronous at the lifecycle boundary so Save-As cannot

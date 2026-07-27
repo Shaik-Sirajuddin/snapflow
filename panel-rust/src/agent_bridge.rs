@@ -3223,12 +3223,18 @@ impl AgentBridge {
     /// NOT retroactively move already-open sessions -- ACP has no
     /// "change an existing session's cwd" operation.
     pub fn set_active_project_path(&self, path: Option<PathBuf>) {
-        let store_path = path.as_deref().and_then(|raw| {
-            crate::project_store::project_store_dir(
-                &crate::model::ProjectIdentity::Saved(raw.to_string_lossy().into_owned()),
-                &resolve_cache_dir(),
-            )
+        let identity = path.as_ref().map_or(crate::model::ProjectIdentity::None, |raw| {
+            crate::model::ProjectIdentity::Saved(raw.to_string_lossy().into_owned())
         });
+        self.set_active_project_identity(&identity);
+    }
+
+    /// Apply the complete lifecycle identity, including an untitled UUID.
+    /// An untitled project has no raw MLT path to publish to snapshotd, but it
+    /// still owns a staging store and therefore must provide a real ACP cwd.
+    pub fn set_active_project_identity(&self, identity: &crate::model::ProjectIdentity) {
+        let store_path = crate::project_store::project_store_dir(identity, &resolve_cache_dir());
+        let raw_path = identity.saved_path().map(PathBuf::from);
         *self
             .session_cwd_override
             .lock()
@@ -3236,7 +3242,7 @@ impl AgentBridge {
         *self
             .session_project_path_override
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = path;
+            .unwrap_or_else(|e| e.into_inner()) = raw_path;
     }
 
     /// PISO-7 (project-isolation-mlt-binding plan): the live half of a
@@ -3280,6 +3286,20 @@ impl AgentBridge {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if guard.as_deref() == Some(old_path) {
+                *guard = Some(new_path.clone());
+            }
+        }
+    }
+
+    /// First-save half of the project migration: slots created while the
+    /// project was Untitled have no raw project path, so a path-based rename
+    /// cannot find them. Rebind only those unscoped slots to the new saved
+    /// identity; already-scoped slots are left untouched.
+    pub fn rebind_unscoped_project_path(&self, new: &str) {
+        let new_path = PathBuf::from(new);
+        for slot in &self.slots {
+            let mut guard = slot.project_path.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
                 *guard = Some(new_path.clone());
             }
         }

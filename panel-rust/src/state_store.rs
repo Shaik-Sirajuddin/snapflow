@@ -468,6 +468,19 @@ impl PanelStateStore {
         )?;
         Ok(())
     }
+
+    /// First-save migration for rows created while the project was Untitled.
+    /// Those rows intentionally carry NULL project_path until the staging
+    /// identity becomes a saved MLT identity; update only those rows so a
+    /// different project's durable chats can never be rehomed accidentally.
+    pub fn assign_unscoped_project_path(&self, new: &str) -> Result<(), StateStoreError> {
+        let connection = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        connection.execute(
+            "UPDATE thread_settings SET project_path = ?1 WHERE project_path IS NULL",
+            params![new],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
