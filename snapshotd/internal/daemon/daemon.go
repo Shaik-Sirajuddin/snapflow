@@ -221,7 +221,32 @@ func (d *Daemon) UnregisterExternalInstance(ctx context.Context, instanceID stri
 }
 
 func (d *Daemon) DiscoverExternalInstances(ctx context.Context) ([]discovery.Candidate, error) {
-	return discovery.ScanAndPing(filepath.Join(d.Cfg.HomeDir, "apps"))
+	candidates, err := discovery.ScanAndPing(filepath.Join(d.Cfg.HomeDir, "apps"))
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range candidates {
+		// A verified endpoint with no active project is still a healthy
+		// process, but it must not create an open project row. The next
+		// lifecycle update will register it once a project is opened.
+		if !candidate.Verified || strings.TrimSpace(candidate.ProjectPath) == "" {
+			continue
+		}
+		_, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+			InstanceNonce: candidate.InstanceNonce,
+			PID:           candidate.PID,
+			ProcessStart:  candidate.ProcessStart,
+			ProjectPath:   candidate.ProjectPath,
+			Capabilities:  map[string]any{"discovery": true, "protocolVersion": candidate.ProtocolVersion},
+		})
+		if err != nil {
+			// Keep the advisory candidate visible even when its project path
+			// has become invalid between ping and registration. It is not
+			// authoritative until registration succeeds.
+			d.Log.Warn("discovered external instance could not be registered", "nonce", candidate.InstanceNonce, "err", err)
+		}
+	}
+	return candidates, nil
 }
 
 // ReconcileExternalInstances expires external leases without ever launching
