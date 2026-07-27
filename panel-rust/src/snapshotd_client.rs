@@ -311,6 +311,13 @@ impl SnapshotdControlClient {
         &self.socket_path
     }
 
+    pub fn from_default_runtime() -> Option<Self> {
+        let home = std::env::var_os("SNAPSHOTD_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd")))?;
+        Some(Self::new(home.join("control.sock")))
+    }
+
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, SnapshotdClientError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
@@ -370,6 +377,45 @@ impl SnapshotdControlClient {
 
     pub async fn set_mcp_project_target(&self, context_token: &str, project_id: &str) -> Result<Value, SnapshotdClientError> {
         self.call("daemon.setMcpProjectTarget", json!({"contextToken": context_token, "projectId": project_id})).await
+    }
+
+    pub async fn list_projects(&self) -> Result<Value, SnapshotdClientError> {
+        self.call("daemon.listProjects", json!({})).await
+    }
+
+    /// Resolve the daemon project id from the canonical MLT path. This keeps
+    /// the panel's durable identity path-based while still supplying the
+    /// daemon's opaque project id for MCP context registration.
+    pub async fn project_id_for_path(&self, project_path: &Path) -> Result<Option<String>, SnapshotdClientError> {
+        let projects = self.list_projects().await?;
+        let project_path = project_path.to_path_buf();
+        let wanted = tokio::task::spawn_blocking(move || {
+            std::fs::canonicalize(&project_path)
+                .unwrap_or(project_path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .await
+        .map_err(|error| SnapshotdClientError::Malformed(format!("project path task: {error}")))?;
+        let Some(rows) = projects.as_array() else { return Ok(None) };
+        let candidates: Vec<(String, PathBuf)> = rows
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("id").or_else(|| row.get("ID")).and_then(Value::as_str)?;
+                let root = row.get("rootDir").or_else(|| row.get("RootDir")).and_then(Value::as_str)?;
+                let file = row.get("mltFileName").or_else(|| row.get("MltFileName")).and_then(Value::as_str)?;
+                Some((id.to_owned(), Path::new(root).join(file)))
+            })
+            .collect();
+        let matched = tokio::task::spawn_blocking(move || {
+            candidates.into_iter().find_map(|(id, candidate)| {
+                let candidate = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+                (candidate.to_string_lossy() == wanted).then_some(id)
+            })
+        })
+        .await
+        .map_err(|error| SnapshotdClientError::Malformed(format!("project match task: {error}")))?;
+        Ok(matched)
     }
 
     #[cfg(unix)]

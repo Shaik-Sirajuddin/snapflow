@@ -75,7 +75,7 @@ func ScanAndPing(runtimeDir string) ([]Candidate, error) {
 		if json.Unmarshal(data, &descriptor) != nil || !validDescriptor(descriptor) {
 			continue
 		}
-		if !health.PIDAlive(descriptor.PID) {
+		if !health.ProcessIdentityMatches(descriptor.PID, descriptor.ProcessStart) {
 			continue
 		}
 		challenge, err := randomChallenge()

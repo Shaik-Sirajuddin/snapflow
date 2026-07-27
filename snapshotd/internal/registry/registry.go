@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -139,6 +140,39 @@ func (r *Registry) GetProject(id string) (*Project, error) {
 		return nil, err
 	}
 	return &p, nil
+}
+
+// EnsureProjectForPath makes an externally opened MLT visible in the same
+// project inventory used by daemon-launched instances. It never creates or
+// deletes files; it only derives the registry folder/file identity.
+func (r *Registry) EnsureProjectForPath(projectPath string) (*Project, error) {
+	abs, err := filepath.Abs(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = filepath.Clean(resolved)
+	}
+	root := filepath.Dir(abs)
+	fileName := filepath.Base(abs)
+	if filepath.Ext(abs) == "" {
+		root = abs
+		fileName = DefaultMltFileName
+	}
+	var existing Project
+	if err := r.db.Where("root_dir = ?", root).First(&existing).Error; err == nil {
+		return &existing, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	project := &Project{
+		ID: uuid.NewString(), RootDir: root, MltFileName: fileName, Status: "active",
+	}
+	if err := r.CreateProject(project); err != nil {
+		return nil, err
+	}
+	return project, nil
 }
 
 func (r *Registry) ListProjects() ([]Project, error) {

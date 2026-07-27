@@ -87,6 +87,13 @@ type Handler interface {
 	UnbindSession(sessionID string)
 }
 
+// ContextAwareHandler is implemented by the daemon when a native panel
+// supplies an opaque context token. The legacy Handler shape remains valid
+// for embedded/test adapters that do not need project-target defaults.
+type ContextAwareHandler interface {
+	ForwardSAPWithContext(ctx context.Context, sessionID, contextToken string, sink sapproxy.Sink, method string, params json.RawMessage) (json.RawMessage, error)
+}
+
 // New constructs an MCP server exposing the daemon.* SDP methods as tools,
 // per 06's primitives table.
 func New(h Handler) *server.MCPServer {
@@ -347,7 +354,7 @@ func sapCallTool(s *server.MCPServer, h Handler) server.ServerTool {
 			}
 			sink := &mcpSink{server: s, sessionID: cs.SessionID()}
 
-			result, err := h.ForwardSAP(ctx, cs.SessionID(), sink, method, paramsRaw)
+			result, err := forwardSAP(h, ctx, cs.SessionID(), sink, method, paramsRaw)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
@@ -388,7 +395,7 @@ func sapTool(s *server.MCPServer, h Handler, mcpName, sapMethod, description str
 			}
 			sink := &mcpSink{server: s, sessionID: cs.SessionID()}
 
-			result, err := h.ForwardSAP(ctx, cs.SessionID(), sink, sapMethod, paramsRaw)
+			result, err := forwardSAP(h, ctx, cs.SessionID(), sink, sapMethod, paramsRaw)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
@@ -398,6 +405,15 @@ func sapTool(s *server.MCPServer, h Handler, mcpName, sapMethod, description str
 			return mcp.NewToolResultJSON(wrapArrayResult(result))
 		},
 	}
+}
+
+func forwardSAP(h Handler, ctx context.Context, sessionID string, sink sapproxy.Sink, method string, params json.RawMessage) (json.RawMessage, error) {
+	if contextToken := ContextTokenFromContext(ctx); contextToken != "" {
+		if aware, ok := h.(ContextAwareHandler); ok {
+			return aware.ForwardSAPWithContext(ctx, sessionID, contextToken, sink, method, params)
+		}
+	}
+	return h.ForwardSAP(ctx, sessionID, sink, method, params)
 }
 
 // mcpSink relays a project's fanned-out SAP notifications (edit.changed,

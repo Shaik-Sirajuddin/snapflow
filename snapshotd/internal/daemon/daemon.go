@@ -95,6 +95,9 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: projectPath: %w", err)
 		}
 		projectPath = abs
+		if _, err := d.Reg.EnsureProjectForPath(projectPath); err != nil {
+			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: project: %w", err)
+		}
 	}
 	now := time.Now().UTC()
 	instance, err := d.Reg.GetExternalInstanceByNonce(p.InstanceNonce)
@@ -168,6 +171,9 @@ func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectP
 			return registry.ExternalInstance{}, err
 		}
 		instance.ProjectPath = path
+		if _, err := d.Reg.EnsureProjectForPath(path); err != nil {
+			return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: project: %w", err)
+		}
 	} else {
 		instance.ProjectPath = ""
 	}
@@ -686,6 +692,53 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 	result, err := d.SAP.Call(ctx, sessionID, method, params)
 	logMethod(err)
 	return result, err
+}
+
+// ForwardSAPWithContext applies the registered per-ACP-session MCP target
+// before using the ordinary MCP connection binding. The MCP transport's own
+// session id remains the routing key for notifications; the opaque context
+// token only supplies the durable chat-owner/target policy. This prevents a
+// daemon-global active project while allowing a target update to take effect
+// on the next tool call.
+func (d *Daemon) ForwardSAPWithContext(ctx context.Context, sessionID, contextToken string, sink sapproxy.Sink, method string, params json.RawMessage) (json.RawMessage, error) {
+	record, err := d.Reg.GetMcpContext(contextToken)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: MCP context: %w", err)
+	}
+	if record.LeaseExpiresAt.Before(time.Now().UTC()) {
+		return nil, fmt.Errorf("daemon: MCP context lease expired")
+	}
+	target := record.TargetProjectID
+	if method == "project.select" {
+		var requested struct {
+			ProjectID string `json:"projectId"`
+		}
+		if err := unmarshalParams(params, &requested); err != nil {
+			return nil, err
+		}
+		if requested.ProjectID == "" {
+			return nil, fmt.Errorf("daemon: project.select: projectId is required")
+		}
+		if _, err := d.SetMcpProjectTarget(ctx, contextToken, requested.ProjectID); err != nil {
+			return nil, err
+		}
+		target = requested.ProjectID
+	}
+	if target == "" {
+		return nil, fmt.Errorf("daemon: MCP context has no target project")
+	}
+	if bound, ok := d.SAP.BoundProject(sessionID); ok && bound != target {
+		if _, err := d.ForwardSAP(ctx, sessionID, sink, "project.exit", nil); err != nil {
+			return nil, err
+		}
+	}
+	if _, ok := d.SAP.BoundProject(sessionID); !ok {
+		selectParams, _ := json.Marshal(map[string]string{"projectId": target})
+		if _, err := d.ForwardSAP(ctx, sessionID, sink, "project.select", selectParams); err != nil {
+			return nil, err
+		}
+	}
+	return d.ForwardSAP(ctx, sessionID, sink, method, params)
 }
 
 // UnbindSession releases sessionID's SAP project binding/notification sink

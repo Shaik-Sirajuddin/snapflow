@@ -171,3 +171,13 @@ func (r *Router) Unbind(sessionID string) {
 		pc.mu.Unlock()
 	}
 }
+
+// BoundProject reports the current binding without exposing Router's mutable
+// maps to callers. It is used by the daemon's context-aware MCP path to
+// reconcile a per-agent target update before forwarding the next call.
+func (r *Router) BoundProject(sessionID string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	projectID, ok := r.sessionProject[sessionID]
+	return projectID, ok
+}

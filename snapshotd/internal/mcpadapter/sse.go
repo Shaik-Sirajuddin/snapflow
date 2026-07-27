@@ -10,6 +10,19 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+type contextTokenKey struct{}
+
+// ContextTokenFromContext returns the opaque per-ACP-session token supplied
+// by panel-rust as an HTTP MCP header.
+func ContextTokenFromContext(ctx context.Context) string {
+	token, _ := ctx.Value(contextTokenKey{}).(string)
+	return token
+}
+
+func contextWithToken(ctx context.Context, r *http.Request) context.Context {
+	return context.WithValue(ctx, contextTokenKey{}, r.Header.Get("X-Snapshotd-Context-Token"))
+}
+
 // Credentials is the current HTTP Basic Auth check for an SSEServer. A
 // zero-value Credentials (Enabled == false) disables auth entirely -- the
 // pre-existing, unauthenticated default.
@@ -46,9 +59,12 @@ type SSEServer struct {
 func NewSSEServer(h Handler, addr string) *SSEServer {
 	mcpServer := New(h)
 	return &SSEServer{
-		addr:       addr,
-		sse:        server.NewSSEServer(mcpServer),
-		streamable: server.NewStreamableHTTPServer(mcpServer, server.WithEndpointPath("/mcp")),
+		addr: addr,
+		sse:  server.NewSSEServer(mcpServer, server.WithSSEContextFunc(contextWithToken)),
+		streamable: server.NewStreamableHTTPServer(mcpServer,
+			server.WithEndpointPath("/mcp"),
+			server.WithHTTPContextFunc(contextWithToken),
+		),
 	}
 }
 

@@ -1635,7 +1635,7 @@ fn panel_rust_create_with_initial_identity(
         // "Chat" thread or construct AgentBridge here: doing either would
         // let ACP capture the host process cwd before the lifecycle binding
         // arrives, and a later path setter cannot repair that session's cwd.
-        let initial_specs: Vec<ThreadSpec> = if initial_identity.is_none() {
+        let mut initial_specs: Vec<ThreadSpec> = if initial_identity.is_none() {
             Vec::new()
         } else if restored_records.is_empty() {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
@@ -1684,6 +1684,19 @@ fn panel_rust_create_with_initial_identity(
                 })
                 .collect()
         };
+        if let Some(identity) = initial_identity.as_ref() {
+            // Fresh and legacy rows in this project-local store inherit the
+            // current saved MLT association. Untitled remains pathless in
+            // durable thread metadata, but its initial store cwd is passed
+            // separately below.
+            if let Some(saved_path) = identity.saved_path() {
+                for spec in &mut initial_specs {
+                    if spec.project_path.is_none() {
+                        spec.project_path = Some(saved_path.to_owned());
+                    }
+                }
+            }
+        }
         let initial_permission_profiles: Vec<Option<String>> = restored_records
             .iter()
             .map(|record| settings_file::non_default_sentinel(record.permission_profile.clone()))
@@ -1693,7 +1706,10 @@ fn panel_rust_create_with_initial_identity(
         let (bridge, bridge_available) = if initial_identity.is_none() {
             (None, false)
         } else {
-            match AgentBridge::new_with_thread_specs(&initial_specs) {
+            let initial_cwd = initial_identity.as_ref().and_then(|identity| {
+                crate::project_store::project_store_dir(identity, &resolve_cache_dir())
+            });
+            match AgentBridge::new_with_thread_specs_and_initial_cwd(&initial_specs, initial_cwd) {
                 Ok(b) => (Some(b), true),
                 Err(e) => {
                     let message = format!("agent bridge unavailable, chat panel is display-only: {e}");
@@ -3650,7 +3666,15 @@ mod lifecycle_tests {
         std::env::set_var("RUI_ACPX_CODEX_URL", format!("http://127.0.0.1:{port}"));
         std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
 
-        let handle = panel_rust_create(96, 64);
+        let project_path = cache_dir.path().join("lifecycle-test.mlt");
+        let project_path = project_path.to_string_lossy().into_owned();
+        let handle = panel_rust_create_with_identity(
+            96,
+            64,
+            project_path.as_ptr(),
+            project_path.len(),
+            false,
+        );
         assert!(!handle.is_null());
 
         // `dispatch_thread_new`'s `_component` parameter is unused in its
@@ -3791,7 +3815,15 @@ mod keyboard_shortcut_tests {
             std::env::set_var("RUI_ACPX_CLAUDE_URL", "http://127.0.0.1:1");
             std::env::set_var("RUI_ACP_CACHE_DIR", cache_dir.path());
 
-            let handle = panel_rust_create(240, 260);
+            let project_path = cache_dir.path().join("test-panel.mlt");
+            let project_path = project_path.to_string_lossy().into_owned();
+            let handle = panel_rust_create_with_identity(
+                240,
+                260,
+                project_path.as_ptr(),
+                project_path.len(),
+                false,
+            );
             assert!(!handle.is_null());
             Self {
                 handle,
