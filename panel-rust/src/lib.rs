@@ -813,6 +813,18 @@ impl PanelSingleton {
     /// than being reimplemented against `Model`.
     pub(crate) fn execute_send_prompt_real(&self, real_idx: usize, text: &str) {
         let Some(bridge) = &self.bridge else { return };
+        if let Some(error) = bridge.attachment_error(real_idx) {
+            let _ = crate::dispatch::update_persistent(
+                self,
+                msg::Msg::Effect(effect::EffectResultMsg::PromptSent {
+                    real_index: real_idx,
+                    result: Err(effect::EffectError::new(format!(
+                        "session attachment failed: {error}"
+                    ))),
+                }),
+            );
+            return;
+        }
         self.start_send_prompt(real_idx, text, bridge);
     }
 
@@ -821,6 +833,18 @@ impl PanelSingleton {
             trace_host_input(format_args!(
                 "send ignored real_thread={idx} because the thread is closed"
             ));
+            return;
+        }
+        if let Some(error) = bridge.attachment_error(idx) {
+            let _ = crate::dispatch::update_persistent(
+                self,
+                msg::Msg::Effect(effect::EffectResultMsg::PromptSent {
+                    real_index: idx,
+                    result: Err(effect::EffectError::new(format!(
+                        "session attachment failed: {error}"
+                    ))),
+                }),
+            );
             return;
         }
         bridge.push_local(

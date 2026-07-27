@@ -2577,11 +2577,21 @@ fn spawn_background_attachment(
             match resume_result {
                 Ok(()) => Ok(session_id),
                 Err(resume_error) => {
-                    eprintln!(
-                        "panel-rust: cached acpx session resume failed for thread {:?} ({resume_error}); opening a fresh session",
-                        slot.thread_id
-                    );
-                    open_session_maybe_profiled(&handle, cwd, profile_name.as_deref(), mcp_servers.clone()).await
+                    if resume_error.is_authentication_or_capacity() {
+                        Err(resume_error)
+                    } else {
+                        eprintln!(
+                            "panel-rust: cached acpx session resume failed for thread {:?} ({resume_error}); opening a fresh session",
+                            slot.thread_id
+                        );
+                        open_session_maybe_profiled(
+                            &handle,
+                            cwd,
+                            profile_name.as_deref(),
+                            mcp_servers.clone(),
+                        )
+                        .await
+                    }
                 }
             }
         } else {
@@ -3649,6 +3659,10 @@ impl AgentBridge {
 
     /// The durable identity of an already-open thread, used by the panel's
     /// local SQLite state store after creation and after a resumed startup.
+    pub fn thread_count(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn thread_binding(&self, idx: usize) -> Option<ThreadBinding> {
         self.slots.get(idx).and_then(|slot| {
             slot.acp_session_id
@@ -4526,6 +4540,19 @@ impl AgentBridge {
                     });
             }
         });
+    }
+
+    /// Returns a completed attachment failure without waiting. The UI uses
+    /// this to reject a send before it appends a user message or marks the
+    /// thread as generating; the background wait remains the final race-safe
+    /// guard for an attachment that fails between the UI check and dispatch.
+    pub fn attachment_error(&self, idx: usize) -> Option<String> {
+        let slot = self.slots.get(idx)?;
+        let state = slot
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.error.clone()
     }
 
     /// Dispatches the control operation on the handle's independent cancel

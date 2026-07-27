@@ -235,6 +235,16 @@ pub(crate) fn visible_thread_row(
     })
 }
 
+fn thread_row_dirty(model: &Model, real_index: usize) -> Dirty {
+    Dirty::ThreadRow {
+        thread_id: model
+            .threads
+            .get(real_index)
+            .map(|thread| thread.thread_id.clone())
+            .unwrap_or_default(),
+    }
+}
+
 fn thread_list_dirty_with_keys(model: &mut Model, old_keys: Vec<String>) -> Dirty {
     let new_indices = visible_thread_indices(model);
     let rows: Vec<crate::models::VisibleThreadItem> = new_indices
@@ -501,6 +511,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
+            model.rebuild_thread_indices();
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
             // PUI-014: create the thread DEFERRED -- no ACP session opens until
             // the first message is sent, so the provider/profile picker stays
@@ -545,6 +556,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
+            model.rebuild_thread_indices();
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
             (
                 vec![],
@@ -592,7 +604,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             }
             (
                 vec![Effect::CloseThread { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
+                vec![thread_row_dirty(model, idx)],
             )
         }
         ThreadMsg::DeleteRequested(idx) => {
@@ -620,7 +632,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             let now_archived = !thread.archived;
             thread.archived = now_archived;
             let mut effects = vec![Effect::ArchiveThread { real_index: idx, archived: now_archived }];
-            let mut dirty = vec![Dirty::ThreadRow(idx)];
+            let mut dirty = vec![thread_row_dirty(model, idx)];
             // Phase 19 pool cap: at most ARCHIVE_POOL_CAP archived
             // threads; beyond it the OLDEST archived thread is quietly
             // dropped -- permanent delete via the existing delete flow
@@ -650,7 +662,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                             oldest.closed = true;
                         }
                         effects.push(Effect::DeleteThread { real_index: drop_idx });
-                        dirty.push(Dirty::ThreadRow(drop_idx));
+                        dirty.push(thread_row_dirty(model, drop_idx));
                     }
                 }
             }
@@ -677,7 +689,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
             }
             (
                 vec![Effect::ToggleBackground { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
+                vec![thread_row_dirty(model, idx)],
             )
         }
         ThreadMsg::RecoverSessionAttach {
@@ -698,6 +710,7 @@ fn update_thread(model: &mut Model, msg: ThreadMsg) -> (Vec<Effect>, Vec<Dirty>)
                 send_queue: new_thread_send_queue(&thread_id),
                 ..ThreadModel::default()
             });
+            model.rebuild_thread_indices();
             let at = model.threads.len() - 1;
             let list_dirty = thread_list_dirty_with_keys(model, old_keys);
             (
@@ -741,7 +754,7 @@ fn rebuild_send_queue_projection(
     (
         thread_id.clone(),
         vec![
-            Dirty::ThreadRow(idx),
+            thread_row_dirty(model, idx),
             Dirty::MessagesDiff {
                 thread_id,
                 ops,
@@ -808,7 +821,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         (
                             vec![],
                             vec![
-                                Dirty::ThreadRow(idx),
+                                thread_row_dirty(model, idx),
                                 Dirty::Scalar(ScalarField::ComposeText),
                                 Dirty::MessagesDiff {
                                     thread_id: thread_id.clone(),
@@ -842,7 +855,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             thread.send_queue.resume();
             (
                 vec![Effect::SendPrompt {
-                    real_index: idx,
+                    thread_id: thread_id.clone(),
                     text,
                 }],
                 vec![
@@ -853,7 +866,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     // rebuild -- "loading should start immediately on
                     // send" was true in `model.threads[idx].state` above,
                     // just not yet visible.
-                    Dirty::ThreadRow(idx),
+                    thread_row_dirty(model, idx),
                     Dirty::Connection { thread_id },
                     Dirty::Scalar(ScalarField::ComposeText),
                 ],
@@ -869,7 +882,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
             thread.state = ThreadState::Cancelling;
             (
                 vec![Effect::CancelGeneration { real_index: idx }],
-                vec![Dirty::ThreadRow(idx)],
+                vec![thread_row_dirty(model, idx)],
             )
         }
         ComposeMsg::GenerationStopped => {
@@ -877,7 +890,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                 return (vec![], vec![]);
             };
             thread.state = ThreadState::Idle;
-            (vec![], vec![Dirty::ThreadRow(idx)])
+            (vec![], vec![thread_row_dirty(model, idx)])
         }
         ComposeMsg::QueueCancel { message_index } => {
             let entry_id = {
@@ -988,7 +1001,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     thread.error = None;
                     thread.state = ThreadState::Loading;
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
-                    dirty.push(Dirty::Connection { thread_id });
+                    dirty.push(Dirty::Connection { thread_id: thread_id.clone() });
                     let mut effects = Vec::with_capacity(2);
                     if is_generating {
                         // A turn is already in flight -- cancel it. The
@@ -1000,7 +1013,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         effects.push(Effect::CancelGeneration { real_index: idx });
                     }
                     effects.push(Effect::SendPrompt {
-                        real_index: idx,
+                        thread_id: thread_id.clone(),
                         text: entry.text,
                     });
                     (effects, dirty)
@@ -1045,7 +1058,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                     thread.error = None;
                     thread.state = ThreadState::Loading;
                     let (_thread_id, mut dirty) = rebuild_send_queue_projection(model, idx);
-                    dirty.push(Dirty::Connection { thread_id });
+                    dirty.push(Dirty::Connection { thread_id: thread_id.clone() });
                     let mut effects = Vec::with_capacity(2);
                     if is_generating {
                         // Same AbsorbingCancel handoff as QueueSendNow --
@@ -1053,7 +1066,7 @@ fn update_compose(model: &mut Model, msg: ComposeMsg) -> (Vec<Effect>, Vec<Dirty
                         effects.push(Effect::CancelGeneration { real_index: idx });
                     }
                     effects.push(Effect::SendPrompt {
-                        real_index: idx,
+                        thread_id: thread_id.clone(),
                         text: entry.text,
                     });
                     (effects, dirty)
@@ -1320,12 +1333,13 @@ fn update_settings(model: &mut Model, msg: SettingsMsg) -> (Vec<Effect>, Vec<Dir
             if !resolved_agent.is_empty() {
                 thread.provider = resolved_agent;
             }
+            let thread_id = thread.thread_id.clone();
             (
                 vec![],
                 vec![
-                    Dirty::ThreadRow(idx),
+                    Dirty::ThreadRow { thread_id: thread_id.clone() },
                     Dirty::Capabilities {
-                        thread_id: thread.thread_id.clone(),
+                        thread_id,
                     },
                 ],
             )
@@ -1598,7 +1612,7 @@ fn update_chrome(model: &mut Model, msg: ChromeMsg) -> (Vec<Effect>, Vec<Dirty>)
             (
                 vec![],
                 vec![
-                    Dirty::ThreadRow(real_idx),
+                    thread_row_dirty(model, real_idx),
                     Dirty::Error {
                         thread_id,
                         detail: ErrorDetail {
@@ -1764,7 +1778,7 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             }],
         ),
         EffectResultMsg::ThreadPersisted { real_index, result } => match result {
-            Ok(()) => (vec![], vec![Dirty::ThreadRow(real_index)]),
+            Ok(()) => (vec![], vec![thread_row_dirty(model, real_index)]),
             Err(err) => (
                 vec![],
                 vec![Dirty::Error {
@@ -1819,9 +1833,10 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     if let Some(provider) = provider {
                         thread.provider = provider;
                     }
+                    model.rebuild_thread_indices();
                     (
                         vec![Effect::PersistThread { real_index }],
-                        vec![Dirty::ThreadRow(real_index)],
+                        vec![thread_row_dirty(model, real_index)],
                     )
                 }
                 Err(err) => (
@@ -1935,18 +1950,10 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             // Stale-target no-op: either the thread was closed/deleted or
             // the message row was removed while the stream was in flight.
             // Resolve both identities before producing a Dirty marker.
-            let thread_exists = model
-                .threads
-                .iter()
-                .any(|thread| Model::thread_matches_id(thread, &thread_id));
-            if !thread_exists {
+            let Some(target_index) = model.thread_index_for_id(&thread_id) else {
                 return (vec![], vec![]);
-            }
-            let Some(thread) = model
-                .threads
-                .iter_mut()
-                .find(|thread| Model::thread_matches_id(thread, &thread_id))
-            else {
+            };
+            let Some(thread) = model.threads.get_mut(target_index) else {
                 return (vec![], vec![]);
             };
             if !thread.message_ids.iter().any(|id| id == &message_id) {
@@ -2077,17 +2084,19 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
     let mut effects = Vec::new();
     let mut dirty = Vec::new();
     for (event_index, bridge_event) in frame.bridge_events.iter().enumerate() {
-        let target_index = frame
+        let Some(target_index) = frame
             .bridge_event_thread_ids
             .get(event_index)
             .filter(|thread_id| !thread_id.is_empty())
-            .and_then(|thread_id| {
-                model
-                    .threads
-                    .iter()
-                    .position(|thread| Model::thread_matches_id(thread, thread_id))
-            })
-            .unwrap_or(bridge_event.thread_index);
+            .and_then(|thread_id| model.thread_index_for_id(thread_id))
+        else {
+            // A bridge event without a current durable/session identity is
+            // stale or mid-attach. Never guess from its positional slot:
+            // applying it to `thread_index` can mutate another conversation
+            // after a reorder/close. The next frame will retry once binding
+            // hydration makes the identity available.
+            continue;
+        };
         let Some(thread) = model.threads.get_mut(target_index) else {
             continue;
         };
@@ -2138,7 +2147,9 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                             message: failure,
                         },
                     });
-                    dirty.push(Dirty::ThreadRow(target_index));
+                    dirty.push(Dirty::ThreadRow {
+                        thread_id: thread.thread_id.clone(),
+                    });
                 }
                 // One MessageAppended per thread per frame is enough: a
                 // reconnect storm can emit many AgentEvent::Message ticks
@@ -2202,11 +2213,13 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 {
                     thread.state = ThreadState::Loading;
                     effects.push(Effect::SendPrompt {
-                        real_index: target_index,
+                        thread_id: thread.thread_id.clone(),
                         text: entry.text,
                     });
                 }
-                dirty.push(Dirty::ThreadRow(target_index));
+                dirty.push(Dirty::ThreadRow {
+                    thread_id: thread.thread_id.clone(),
+                });
             }
             crate::protocol_types::AgentEvent::Error(error) => {
                 thread.state = ThreadState::Error;
@@ -2243,7 +2256,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
             // (thread.plan / thread.session_title).
             | crate::protocol_types::AgentEvent::PlanUpdate(_)
             | crate::protocol_types::AgentEvent::SessionInfoUpdate { .. } => {
-                dirty.push(Dirty::ThreadRow(target_index));
+                dirty.push(thread_row_dirty(model, target_index));
             }
         }
     }
@@ -2315,7 +2328,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                         effects.push(Effect::PersistThread {
                             real_index: row.real_index,
                         });
-                        dirty.push(Dirty::ThreadRow(row.real_index));
+                dirty.push(thread_row_dirty(model, row.real_index));
                         dirty.push(Dirty::Capabilities {
                             thread_id: row.thread_id.clone(),
                         });
@@ -2323,6 +2336,10 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                 }
             }
         }
+        // Thread ids/session ids may have been hydrated by the bridge row;
+        // publish those identity changes to the reverse lookup maps before
+        // the next notification or snapshot is routed.
+        model.rebuild_thread_indices();
         // Review-gate fix (phase 32): hydrate bridge-persisted archived
         // flags (restarts previously left every ThreadModel::archived
         // false -- wrong sidebar counters, unenforced pool cap).
@@ -2482,10 +2499,7 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
         let target_index = if snapshot.thread_id.is_empty() {
             Some(snapshot.real_index)
         } else {
-            model
-                .threads
-                .iter()
-                .position(|thread| Model::thread_matches_id(thread, &snapshot.thread_id))
+            model.thread_index_for_id(&snapshot.thread_id)
         };
         let Some(target_index) = target_index else {
             // An unknown-identity snapshot can arrive after a deferred or
@@ -2777,10 +2791,12 @@ mod tests {
                 ..ThreadModel::default()
             })
             .collect();
-        Model {
+        let mut model = Model {
             threads,
             ..Model::default()
-        }
+        };
+        model.rebuild_thread_indices();
+        model
     }
 
     /// Dirty set emitted when selection actually changes thread: atomic
@@ -2947,7 +2963,7 @@ mod tests {
         );
         assert!(model.threads[0].closed);
         assert_eq!(effects, vec![Effect::CloseThread { real_index: 0 }]);
-        assert_eq!(dirty, vec![Dirty::ThreadRow(0)]);
+        assert_eq!(dirty, vec![Dirty::ThreadRow { thread_id: "thread-0".to_owned() }]);
     }
 
     /// send_queue.rs's disk persistence (SendQueue::load/send_queue_path)
@@ -3109,7 +3125,7 @@ mod tests {
         assert_eq!(
             dirty,
             vec![
-                Dirty::ThreadRow(0),
+                Dirty::ThreadRow { thread_id: "thread-0".to_owned() },
                 Dirty::Capabilities {
                     thread_id: "thread-0".to_owned()
                 }
@@ -3275,7 +3291,7 @@ mod tests {
         assert_eq!(follow_up, vec![Effect::PersistThread { real_index: 1 }]);
         assert_eq!(model.threads[1].thread_id, "durable-new");
         assert_eq!(model.threads[1].session_id.as_deref(), Some("session-new"));
-        assert_eq!(dirty, vec![Dirty::ThreadRow(1)]);
+        assert_eq!(dirty, vec![Dirty::ThreadRow { thread_id: "durable-new".to_owned() }]);
     }
 
     #[test]
@@ -3379,7 +3395,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                thread_id: "thread-0".to_owned(),
                 text: "hi".to_owned()
             }]
         );
@@ -3391,7 +3407,7 @@ mod tests {
         // re-render that row -- it only caught up whenever some
         // unrelated event later forced a full thread-list rebuild.
         assert!(
-            dirty.contains(&Dirty::ThreadRow(0)),
+            dirty.contains(&Dirty::ThreadRow { thread_id: "thread-0".to_owned() }),
             "sending a message must immediately dirty this thread's row so the loading \
              spinner/pulse starts right away, got: {dirty:?}"
         );
@@ -3409,7 +3425,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 2,
+                thread_id: "thread-2".to_owned(),
                 text: "hi".to_owned(),
             }]
         );
@@ -3432,18 +3448,19 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-1".to_owned()],
                 ..FrameInput::default()
             }),
         );
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                thread_id: "thread-0".to_owned(),
                 text: "queued".to_owned(),
             }]
         );
         assert_eq!(model.threads[0].state, ThreadState::Loading);
-        assert!(dirty.contains(&Dirty::ThreadRow(0)));
+        assert!(dirty.contains(&Dirty::ThreadRow { thread_id: "thread-0".to_owned() }));
     }
 
     #[test]
@@ -3462,6 +3479,7 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
@@ -3530,6 +3548,7 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("end_turn".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
@@ -3614,7 +3633,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                thread_id: "thread-0".to_owned(),
                 text: "go now".to_owned(),
             }]
         );
@@ -3657,7 +3676,7 @@ mod tests {
             vec![
                 Effect::CancelGeneration { real_index: 0 },
                 Effect::SendPrompt {
-                    real_index: 0,
+                    thread_id: "thread-0".to_owned(),
                     text: "steer me".to_owned(),
                 },
             ]
@@ -3698,7 +3717,7 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 0,
+                thread_id: "thread-0".to_owned(),
                 text: "go now".to_owned(),
             }]
         );
@@ -3724,7 +3743,7 @@ mod tests {
             vec![
                 Effect::CancelGeneration { real_index: 0 },
                 Effect::SendPrompt {
-                    real_index: 0,
+                    thread_id: "thread-0".to_owned(),
                     text: "front".to_owned(),
                 },
             ]
@@ -3789,7 +3808,7 @@ mod tests {
             vec![Effect::CancelGeneration { real_index: 0 }]
         );
         assert_eq!(model.threads[0].state, ThreadState::Cancelling);
-        assert!(dirty.contains(&Dirty::ThreadRow(0)));
+        assert!(dirty.contains(&Dirty::ThreadRow { thread_id: "thread-0".to_owned() }));
         // Paused: TurnEnded must not auto-drain.
         let (effects2, _) = update(
             &mut model,
@@ -3798,6 +3817,7 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("cancelled".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
@@ -3827,6 +3847,7 @@ mod tests {
                     thread_index: 0,
                     event: crate::protocol_types::AgentEvent::TurnEnded("cancelled".to_owned()),
                 }],
+                bridge_event_thread_ids: vec!["thread-0".to_owned()],
                 ..FrameInput::default()
             }),
         );
@@ -3864,14 +3885,14 @@ mod tests {
         assert_eq!(
             effects,
             vec![Effect::SendPrompt {
-                real_index: 1,
+                thread_id: "target-id".to_owned(),
                 text: "queued".to_owned(),
             }]
         );
         assert_eq!(model.threads[0].thread_id, "other-id");
         assert_eq!(model.threads[1].thread_id, "target-id");
         assert_eq!(model.threads[1].state, ThreadState::Loading);
-        assert!(dirty.contains(&Dirty::ThreadRow(1)));
+        assert!(dirty.contains(&Dirty::ThreadRow { thread_id: "target-id".to_owned() }));
     }
 
     #[test]
@@ -3907,6 +3928,27 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn frame_event_with_unknown_identity_does_not_use_positional_fallback() {
+        let mut model = model_with_threads(&["first", "second"]);
+        model.threads[1].state = ThreadState::Loading;
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                bridge_events: vec![crate::agent_bridge::BridgeEvent {
+                    thread_index: 1,
+                    event: crate::protocol_types::AgentEvent::TurnEnded("stale".to_owned()),
+                }],
+                bridge_event_thread_ids: vec!["unknown-thread".to_owned()],
+                ..FrameInput::default()
+            }),
+        );
+
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert_eq!(model.threads[1].state, ThreadState::Loading);
     }
 
     #[test]

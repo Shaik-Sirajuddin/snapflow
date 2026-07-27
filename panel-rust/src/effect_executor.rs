@@ -489,8 +489,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
         );
         match effect {
             Effect::LoadInitialState => {}
-            Effect::SendPrompt { real_index, text } => {
-                panel.execute_send_prompt_real(real_index, &text);
+            Effect::SendPrompt { thread_id, text } => {
+                let real_index = panel.model.borrow().thread_index_for_id(&thread_id);
+                if let Some(real_index) = real_index {
+                    panel.execute_send_prompt_real(real_index, &text);
+                }
             }
             Effect::CancelGeneration { real_index } => {
                 panel.execute_cancel_generation_real(real_index);

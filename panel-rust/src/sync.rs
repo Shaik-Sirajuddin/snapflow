@@ -54,8 +54,10 @@ fn trace_transcript_tail(model: &Model, thread_id: &str) {
 fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
     match dirty {
         Dirty::Scalar(field) => sync_scalar(model, component, *field),
-        Dirty::ThreadRow(idx) => {
-            apply_thread_row(model, *idx);
+        Dirty::ThreadRow { thread_id } => {
+            if let Some(idx) = model.thread_index_for_id(thread_id) {
+                apply_thread_row(model, idx);
+            }
         }
         Dirty::ThreadListDiff(ops) => {
             apply_thread_ops(model, ops);
@@ -134,12 +136,7 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             // MessageStreamingDelta / frame snapshots). Comparing only
             // session_id dropped banners for pre-attach threads.
             let for_displayed = thread_id.is_empty()
-                || model.displayed_thread.is_some_and(|idx| {
-                    model
-                        .threads
-                        .get(idx)
-                        .is_some_and(|thread| Model::thread_matches_id(thread, thread_id))
-                });
+                || displayed_thread_for_id(model, thread_id).is_some();
             if for_displayed {
                 component.set_last_error(detail.message.clone().into());
                 // PROF-8: same displayed-thread gate as last_error above --
@@ -387,18 +384,13 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
 
 fn thread_for_id<'a>(model: &'a Model, thread_id: &str) -> Option<&'a crate::model::ThreadModel> {
     model
-        .threads
-        .iter()
-        .find(|thread| Model::thread_matches_id(thread, thread_id))
+        .thread_index_for_id(thread_id)
+        .and_then(|index| model.threads.get(index))
 }
 
 fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
-    model.displayed_thread.filter(|idx| {
-        model
-            .threads
-            .get(*idx)
-            .is_some_and(|thread| Model::thread_matches_id(thread, thread_id))
-    })
+    let index = model.thread_index_for_id(thread_id)?;
+    model.displayed_thread.filter(|displayed| *displayed == index)
 }
 
 fn sync_message_snapshot(model: &Model, thread_id: &str) {
@@ -492,11 +484,10 @@ fn apply_message_streaming_owned(model: &Model, message_id: &str, delta: &str) {
 }
 
 fn thread_matches_owner(model: &Model, thread_id: &str) -> bool {
-    model.list_owner_thread_id.as_ref().is_some_and(|owner| {
-        model.threads.iter().any(|thread| {
-            Model::thread_matches_id(thread, thread_id) && Model::thread_matches_id(thread, owner)
-        })
-    })
+    let Some(owner) = model.list_owner_thread_id.as_deref() else {
+        return false;
+    };
+    model.thread_index_for_id(thread_id) == model.thread_index_for_id(owner)
 }
 
 /// Atomic full install of the shared message list for `thread_id`.
@@ -505,9 +496,7 @@ pub(crate) fn install_message_list_snapshot(model: &Model, thread_id: &str) {
     let (desired_keys, desired_rows) = if thread_id.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        let Some(idx) = model.threads.iter().position(|thread| {
-            Model::thread_matches_id(thread, thread_id)
-        }) else {
+        let Some(idx) = model.thread_index_for_id(thread_id) else {
             return;
         };
         // Only install when this thread is (or is becoming) displayed —

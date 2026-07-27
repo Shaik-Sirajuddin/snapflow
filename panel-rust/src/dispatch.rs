@@ -509,7 +509,14 @@ pub(crate) fn dispatch_compose_send_maybe_attach(
 }
 
 pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize, text: String) {
-    let real_idx = panel.real_index(filtered_idx);
+    let expected_thread_id = panel.real_index(filtered_idx).and_then(|real_idx| {
+        panel
+            .model
+            .borrow()
+            .threads
+            .get(real_idx)
+            .map(|thread| thread.thread_id.clone())
+    });
     let (effects, _dirty) = update_persistent(
         panel,
         Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(text.clone()))),
@@ -526,8 +533,8 @@ pub(crate) fn dispatch_compose_send(panel: &PanelSingleton, filtered_idx: usize,
         effects.iter().all(|effect| {
             matches!(
                 effect,
-                crate::effect::Effect::SendPrompt { real_index, .. }
-                    if Some(*real_index) == real_idx
+                crate::effect::Effect::SendPrompt { thread_id, .. }
+                    if Some(thread_id) == expected_thread_id.as_ref()
             )
         }),
         "send effect must target the selected filtered index"

@@ -267,7 +267,7 @@ pub enum Dirty {
     /// One existing thread row changed shape-preservingly (rename,
     /// toggle-background, status) -- `set_row_data(idx, ..)`, no
     /// insert/remove.
-    ThreadRow(usize),
+    ThreadRow { thread_id: String },
     /// The thread list's *shape* changed (add/remove/reorder) -- id-keyed
     /// diff ops, never a full replace (see 00-plan.md's known gap).
     ThreadListDiff(Vec<RowOp<crate::models::VisibleThreadItem>>),

@@ -30,6 +30,24 @@ pub enum AcpxThreadError {
     MissingSessionId,
 }
 
+impl AcpxThreadError {
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::Gateway(error) if error.is_transient())
+    }
+
+    pub(crate) fn is_authentication_or_capacity(&self) -> bool {
+        matches!(self, Self::Gateway(error) if error.is_authentication_or_capacity())
+    }
+}
+
+fn should_retry<T>(result: &Result<T, AcpxThreadError>, attempt: u32) -> bool {
+    attempt < 4
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(AcpxThreadError::is_transient)
+}
+
 /// A summary of a session the bound gateway already knows about, from
 /// `session/list` -- translated out of `acpx_client::ext::sessions`'s
 /// wire-adjacent type so it doesn't leak past this crate's boundary,
@@ -780,8 +798,23 @@ async fn run_respond_worker(
 /// [`spawn_out_of_band_notification_forwarder`]'s job now (see that
 /// function's doc comment for why they were split out of this
 /// function).
-fn forward_updates(updates: &[serde_json::Value], event_tx: &mpsc::UnboundedSender<AgentEvent>) {
+fn forward_updates(
+    updates: &[serde_json::Value],
+    active_session_id: Option<&str>,
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+) {
     for update in updates {
+        let Some(active_session_id) = active_session_id else {
+            continue;
+        };
+        if update
+            .get("params")
+            .and_then(|params| params.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            != Some(active_session_id)
+        {
+            continue;
+        }
         if let Some(msg) = classify_raw_update(update) {
             let _ = event_tx.send(AgentEvent::Message(msg));
         } else if let Some(event) = parse_capability_update(update) {
@@ -1106,7 +1139,7 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
 /// `session/prompt` has already completed, and no further command was
 /// ever queued, so the push was silently lost.
 ///
-/// **Why this doesn't double-deliver.** `client.subscribe()` (an
+/// **Why this doesn't double-deliver.** `client.subscribe_session()` (an
 /// `acpx_client::ws::GatewayWsClient` broadcast channel) hands back a
 /// fresh, independent `broadcast::Receiver` on every call -- this task's
 /// subscription and `run_thread_actor`'s own are two separate receivers
@@ -1116,11 +1149,15 @@ fn emit_capability_events(value: &serde_json::Value, event_tx: &mpsc::UnboundedS
 /// (fed by `run_thread_actor`'s own subscription) only recognizes
 /// `session/update`-shaped frames now; this task only recognizes
 /// `acpx/agent_request`/`acpx/terminal_output`-shaped frames. A `None`
-/// from `client.subscribe()` (HTTP degraded mode -- no live push channel
+/// from `client.subscribe_session()` (HTTP degraded mode -- no live push channel
 /// at all) makes this a no-op, matching every other live-only code path
 /// in this crate.
-fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc::UnboundedSender<AgentEvent>) {
-    if client.subscribe().is_none() {
+fn spawn_out_of_band_notification_forwarder(
+    client: Arc<Gateway>,
+    mut session_rx: watch::Receiver<Option<String>>,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
+    if client.mode() == acpx_client::TransportMode::HttpDegraded {
         // HTTP-degraded mode with no live push channel at all -- matches
         // every other live-only code path in this crate; there is no
         // connection to reconnect either, so this stays a no-op rather
@@ -1136,17 +1173,29 @@ fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc
         // killed/restarted gateway process used to permanently strand a
         // live thread with no recovery short of restarting the whole app).
         loop {
-            let Some(mut notifications) = client.subscribe() else {
+            let session_id = loop {
+                if let Some(session_id) = session_rx.borrow().clone() {
+                    break session_id;
+                }
+                if session_rx.changed().await.is_err() {
+                    return;
+                }
+            };
+            let Some(mut notifications) = client.subscribe_session(&session_id) else {
                 if !client.reconnect().await {
                     return;
                 }
                 continue;
             };
+            let mut session_changed = false;
             loop {
                 tokio::select! {
                     update = notifications.recv() => {
                         match update {
                             Ok(update) => {
+                                if update.get("params").and_then(|p| p.get("sessionId")).and_then(serde_json::Value::as_str) != Some(session_id.as_str()) {
+                                    continue;
+                                }
                                 if let Some(request) = AgentRequest::from_notification(&update) {
                                     let method = request.method().unwrap_or_default().to_string();
                                     let _ = event_tx.send(AgentEvent::PermissionRequest(AgentRequestEvent {
@@ -1167,8 +1216,16 @@ fn spawn_out_of_band_notification_forwarder(client: Arc<Gateway>, event_tx: mpsc
                     // Notices the connection dying even during a quiet
                     // period with no notifications in flight to
                     // otherwise trigger this via `recv()`'s own Closed.
+                    result = session_rx.changed() => {
+                        if result.is_err() { return; }
+                        session_changed = true;
+                        break;
+                    }
                     _ = client.wait_for_disconnect() => break,
                 }
+            }
+            if session_changed {
+                continue;
             }
             if !client.reconnect().await {
                 return;
@@ -1256,6 +1313,67 @@ fn parse_terminal_created(value: &serde_json::Value) -> Option<TerminalCreatedEv
     })
 }
 
+fn spawn_session_live_forwarder(
+    client: Arc<Gateway>,
+    mut session_rx: watch::Receiver<Option<String>>,
+    live_tx: mpsc::UnboundedSender<serde_json::Value>,
+) {
+    tokio::spawn(async move {
+        let mut rehydrate_after_connect = false;
+        loop {
+            let session_id = loop {
+                if let Some(session_id) = session_rx.borrow().clone() {
+                    break session_id;
+                }
+                if session_rx.changed().await.is_err() {
+                    return;
+                }
+            };
+            let Some(mut notifications) = client.subscribe_session(&session_id) else {
+                if !client.reconnect().await {
+                    return;
+                }
+                continue;
+            };
+            if rehydrate_after_connect {
+                if let Err(error) = client.rehydrate_session(&session_id).await {
+                    eprintln!(
+                        "panel-rust: session rehydration failed for {session_id}: {error}"
+                    );
+                }
+                rehydrate_after_connect = false;
+            }
+            let mut session_changed = false;
+            loop {
+                tokio::select! {
+                    update = notifications.recv() => match update {
+                        Ok(update) => {
+                            if update.get("params").and_then(|p| p.get("sessionId")).and_then(serde_json::Value::as_str) == Some(session_id.as_str()) {
+                                let _ = live_tx.send(update);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    result = session_rx.changed() => {
+                        if result.is_err() { return; }
+                        session_changed = true;
+                        break;
+                    }
+                    _ = client.wait_for_disconnect() => break,
+                }
+            }
+            if session_changed {
+                continue;
+            }
+            if !client.reconnect().await {
+                return;
+            }
+            rehydrate_after_connect = true;
+        }
+    });
+}
+
 async fn run_thread_actor(
     mut gateway_rx: watch::Receiver<Option<Arc<Gateway>>>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
@@ -1263,40 +1381,13 @@ async fn run_thread_actor(
     session_tx: watch::Sender<Option<String>>,
 ) {
     let client = await_gateway(&mut gateway_rx).await;
-    spawn_out_of_band_notification_forwarder(Arc::clone(&client), event_tx.clone());
+    spawn_out_of_band_notification_forwarder(
+        Arc::clone(&client),
+        session_tx.subscribe(),
+        event_tx.clone(),
+    );
     let (live_tx, mut live_rx) = mpsc::unbounded_channel();
-    if client.subscribe().is_some() {
-        // See spawn_out_of_band_notification_forwarder's doc comment --
-        // same "reconnect and resubscribe rather than die forever on the
-        // first disconnect" shape, for this actor's own live_rx feed
-        // (session/update frames `forward_updates` below drains).
-        let live_client = Arc::clone(&client);
-        tokio::spawn(async move {
-            loop {
-                let Some(mut live_notifications) = live_client.subscribe() else {
-                    if !live_client.reconnect().await {
-                        return;
-                    }
-                    continue;
-                };
-                loop {
-                    tokio::select! {
-                        update = live_notifications.recv() => {
-                            match update {
-                                Ok(update) => { let _ = live_tx.send(update); }
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                        _ = live_client.wait_for_disconnect() => break,
-                    }
-                }
-                if !live_client.reconnect().await {
-                    return;
-                }
-            }
-        });
-    }
+    spawn_session_live_forwarder(Arc::clone(&client), session_tx.subscribe(), live_tx);
     let mut session_id: Option<String> = None;
 
     // Keep forwarding live session updates even while the user is idle.
@@ -1306,7 +1397,7 @@ async fn run_thread_actor(
     loop {
         let cmd = tokio::select! {
             Some(update) = live_rx.recv() => {
-                forward_updates(&[update], &event_tx);
+                forward_updates(&[update], session_id.as_deref(), &event_tx);
                 continue;
             }
             command = cmd_rx.recv() => match command {
@@ -1333,6 +1424,16 @@ async fn run_thread_actor(
                     {
                         Ok(value) => match value.get("sessionId").and_then(|s| s.as_str()) {
                             Some(sid) => {
+                                client.register_session_replay(
+                                    sid,
+                                    "session/load",
+                                    serde_json::json!({
+                                        "sessionId": sid,
+                                        "cwd": cwd.to_string_lossy(),
+                                        "mcpServers": mcp_servers.clone(),
+                                    }),
+                                    profile.clone(),
+                                );
                                 session_id = Some(sid.to_string());
                                 let _ = session_tx.send(Some(sid.to_string()));
                                 emit_capability_events(&value, &event_tx);
@@ -1342,10 +1443,13 @@ async fn run_thread_actor(
                         },
                         Err(e) => Err(e.into()),
                     };
-                    if result.is_ok() || attempt == 4 {
+                    if !should_retry(&result, attempt) {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * u64::from(attempt + 1),
+                    ))
+                    .await;
                 }
                 let _ = resp.send(result);
             }
@@ -1367,6 +1471,11 @@ async fn run_thread_actor(
                     "cwd": cwd.to_string_lossy(),
                     "mcpServers": mcp_servers,
                 });
+                // Register both the local receiver and the replay contract
+                // before `session/load`: ACPX may begin replaying updates
+                // before the RPC response is written.
+                client.register_session_replay(&sid, "session/load", params.clone(), None);
+                let mut early_notifications = client.subscribe_session(&sid);
                 // Match session/new's bounded retry. A relaunched panel can
                 // race an acpx-server that is still accepting its socket but
                 // has not finished restoring its sqlite-backed registry.
@@ -1381,7 +1490,7 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx);
                             // A session/load replay is allowed to start
                             // before its RPC response, but a busy real
                             // host can schedule the WS reader just after
@@ -1394,10 +1503,23 @@ async fn run_thread_actor(
                             )
                             .await
                             {
-                                forward_updates(&[update], &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx);
                             }
                             while let Ok(update) = live_rx.try_recv() {
-                                forward_updates(&[update], &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx);
+                            }
+                            if let Some(notifications) = early_notifications.as_mut() {
+                                if let Ok(Ok(update)) = tokio::time::timeout(
+                                    std::time::Duration::from_millis(500),
+                                    notifications.recv(),
+                                )
+                                .await
+                                {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
+                                while let Ok(update) = notifications.try_recv() {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
                             }
                             session_id = Some(sid.clone());
                             let _ = session_tx.send(Some(sid.clone()));
@@ -1405,10 +1527,19 @@ async fn run_thread_actor(
                         }
                         Err(e) => Err(e.into()),
                     };
-                    if result.is_ok() || attempt == 4 {
+                    if !should_retry(&result, attempt) {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                if result.is_err() {
+                    // A failed resume must not become a durable replay
+                    // contract. Otherwise a later reconnect can reattach a
+                    // session that this actor never successfully activated.
+                    client.unregister_session_replay(&sid);
                 }
                 let _ = resp.send(result);
             }
@@ -1421,6 +1552,8 @@ async fn run_thread_actor(
                     "sessionId": sid,
                     "cwd": cwd.to_string_lossy(),
                 });
+                client.register_session_replay(&sid, "session/resume", params.clone(), None);
+                let mut early_notifications = client.subscribe_session(&sid);
                 let mut result = Err(AcpxThreadError::ActorGone);
                 for attempt in 0..5 {
                     result = match client
@@ -1429,17 +1562,38 @@ async fn run_thread_actor(
                     {
                         Ok((value, updates)) => {
                             emit_capability_events(&value, &event_tx);
-                            forward_updates(&updates, &event_tx);
+                            forward_updates(&updates, Some(&sid), &event_tx);
+                            if let Some(notifications) = early_notifications.as_mut() {
+                                if let Ok(Ok(update)) = tokio::time::timeout(
+                                    std::time::Duration::from_millis(250),
+                                    notifications.recv(),
+                                )
+                                .await
+                                {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
+                                while let Ok(update) = notifications.try_recv() {
+                                    forward_updates(&[update], Some(&sid), &event_tx);
+                                }
+                            }
                             session_id = Some(sid.clone());
                             let _ = session_tx.send(Some(sid.clone()));
                             Ok(())
                         }
                         Err(error) => Err(error.into()),
                     };
-                    if result.is_ok() || attempt == 4 {
+                    if !should_retry(&result, attempt) {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * u64::from(attempt + 1),
+                    ))
+                    .await;
+                }
+                if result.is_err() {
+                    // A failed resume must not remain as a durable replay
+                    // contract in the shared Gateway.
+                    client.unregister_session_replay(&sid);
                 }
                 let _ = resp.send(result);
             }
@@ -1458,7 +1612,7 @@ async fn run_thread_actor(
                     tokio::select! {
                         update = live_rx.recv() => {
                             if let Some(update) = update {
-                                forward_updates(&[update], &event_tx);
+                                forward_updates(&[update], Some(&sid), &event_tx);
                             }
                         }
                         result = &mut prompt => break result,
@@ -1466,7 +1620,7 @@ async fn run_thread_actor(
                 };
                 match outcome {
                     Ok((result, updates)) => {
-                        forward_updates(&updates, &event_tx);
+                        forward_updates(&updates, Some(&sid), &event_tx);
                         // A resumed WS subscription can receive a burst of
                         // final notifications just after the prompt response.
                         // Keep draining until the stream is briefly quiet,
@@ -1480,7 +1634,7 @@ async fn run_thread_actor(
                                 deadline.saturating_duration_since(tokio::time::Instant::now());
                             match tokio::time::timeout(wait.min(remaining), live_rx.recv()).await {
                                 Ok(Some(update)) => {
-                                    forward_updates(&[update], &event_tx);
+                                    forward_updates(&[update], Some(&sid), &event_tx);
                                     wait = std::time::Duration::from_millis(75);
                                 }
                                 Ok(None) | Err(_) => break,
@@ -1565,6 +1719,7 @@ async fn run_thread_actor(
                     params["_acpx"] = serde_json::json!({ "bg": true });
                 }
                 let result = client.call("session/close", params, None).await;
+                client.unregister_session_replay(&sid);
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::DeleteSession { resp } => {
@@ -1575,6 +1730,7 @@ async fn run_thread_actor(
                 };
                 let params = serde_json::json!({ "sessionId": sid });
                 let result = client.call("session/delete", params, None).await;
+                client.unregister_session_replay(&sid);
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }
             Command::SetMode { mode_id, resp } => {

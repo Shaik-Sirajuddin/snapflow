@@ -80,7 +80,7 @@ pub enum Effect {
         title: String,
     },
     SendPrompt {
-        real_index: usize,
+        thread_id: String,
         text: String,
     },
     CancelGeneration {

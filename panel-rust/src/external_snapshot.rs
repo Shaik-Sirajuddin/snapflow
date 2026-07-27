@@ -109,6 +109,44 @@ impl<'a> ExternalSnapshotSource<'a> {
         Self { panel }
     }
 
+    /// Copy completed ACP bindings into the TEA model before routing the
+    /// events drained in this frame. This closes the attach window where
+    /// `session/new`/`session/load` had completed in `AgentBridge`, but the
+    /// model still had no remote session identity for map-based routing.
+    fn hydrate_model_thread_bindings(&self) {
+        let bindings = self
+            .panel
+            .bridge
+            .as_ref()
+            .map(|bridge| {
+                (0..bridge.thread_count())
+                    .filter_map(|index| bridge.thread_binding(index).map(|binding| (index, binding)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if bindings.is_empty() {
+            return;
+        }
+        let mut model = self.panel.model.borrow_mut();
+        let mut changed = false;
+        for (index, binding) in bindings {
+            let Some(thread) = model.threads.get_mut(index) else {
+                continue;
+            };
+            if thread.thread_id != binding.thread_id {
+                thread.thread_id = binding.thread_id;
+                changed = true;
+            }
+            if thread.session_id.as_deref() != Some(binding.session_id.as_str()) {
+                thread.session_id = Some(binding.session_id);
+                changed = true;
+            }
+        }
+        if changed {
+            model.rebuild_thread_indices();
+        }
+    }
+
     pub(crate) fn collect_frame_input(&self) -> msg::FrameInput {
         let bridge_events = self
             .panel
@@ -116,6 +154,7 @@ impl<'a> ExternalSnapshotSource<'a> {
             .as_ref()
             .map(AgentBridge::poll)
             .unwrap_or_default();
+        self.hydrate_model_thread_bindings();
         let bridge_event_thread_ids = bridge_events
             .iter()
             .map(|event| {
@@ -124,14 +163,6 @@ impl<'a> ExternalSnapshotSource<'a> {
                     .as_ref()
                     .and_then(|bridge| bridge.thread_binding(event.thread_index))
                     .map(|binding| binding.thread_id)
-                    .or_else(|| {
-                        self.panel
-                            .model
-                            .borrow()
-                            .threads
-                            .get(event.thread_index)
-                            .map(|thread| thread.thread_id.clone())
-                    })
                     .unwrap_or_default()
             })
             .collect();

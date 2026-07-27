@@ -41,6 +41,71 @@ pub enum ClientError {
     WebSocket(String),
 }
 
+impl ClientError {
+    /// Only transport loss and gateway-startup/recovery responses are safe
+    /// to retry. Authentication and capacity errors are stable server-side
+    /// conditions; retrying them just repeats the same failure or creates
+    /// pressure while the user still has no valid credentials/capacity.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::WebSocket(_) => true,
+            Self::Http(error) => error.is_connect() || error.is_timeout(),
+            Self::Rpc { message, .. } => {
+                let message = message.to_ascii_lowercase();
+                (message.contains("restor") || message.contains("starting"))
+                    && !message.contains("authentication")
+                    && !message.contains("capacity")
+            }
+            Self::MalformedResponse => false,
+        }
+    }
+
+    pub fn is_authentication_or_capacity(&self) -> bool {
+        match self {
+            Self::Rpc { message, .. } => {
+                let message = message.to_ascii_lowercase();
+                message.contains("authentication") || message.contains("capacity")
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientError;
+
+    #[test]
+    fn retries_only_transport_and_startup_recovery_errors() {
+        assert!(ClientError::WebSocket("connection reset".into()).is_transient());
+        assert!(ClientError::Rpc {
+            code: -32603,
+            message: "gateway starting".into(),
+        }
+        .is_transient());
+        assert!(ClientError::Rpc {
+            code: -32000,
+            message: "session is restoring".into(),
+        }
+        .is_transient());
+        assert!(!ClientError::Rpc {
+            code: -32000,
+            message: "backend requires authentication before session/new".into(),
+        }
+        .is_transient());
+        assert!(ClientError::Rpc {
+            code: -32000,
+            message: "backend requires authentication before session/new".into(),
+        }
+        .is_authentication_or_capacity());
+        assert!(ClientError::Rpc {
+            code: -32000,
+            message: "session capacity reached for tenant default: 512/512 live gateway sessions".into(),
+        }
+        .is_authentication_or_capacity());
+    }
+}
+
 /// Raw JSON-RPC-over-HTTP transport to one acpx gateway instance. Every
 /// call is a fresh `POST {base_url}/rpc` (matching `http.rs`'s
 /// stateless-per-request handling); nothing here is a persistent

@@ -187,6 +187,12 @@ pub struct SkillEditorState {
 #[derive(Clone, Default)]
 pub struct Model {
     pub threads: Vec<ThreadModel>,
+    /// O(1) durable identity -> `threads` index lookup for bridge/effect
+    /// routing. The vector remains the source of insertion/display order.
+    pub(crate) thread_id_index: HashMap<String, usize>,
+    /// O(1) remote ACP session -> `threads` index lookup. A session can be
+    /// absent while a newly-created thread is still pre-attach.
+    pub(crate) session_id_index: HashMap<String, usize>,
     pub selected_thread: usize,
     pub compose_text: String,
     pub search_query: String,
@@ -445,8 +451,61 @@ impl Default for ThreadModel {
 }
 
 impl Model {
-    pub(crate) fn thread_matches_id(thread: &ThreadModel, id: &str) -> bool {
-        id.is_empty() || thread.thread_id == id || thread.session_id.as_deref() == Some(id)
+    /// Rebuild the identity indices after a structural or identity change.
+    /// Durable ids and session ids are intentionally indexed separately so a
+    /// durable id always wins when an incoming identifier could match both.
+    pub(crate) fn rebuild_thread_indices(&mut self) {
+        self.thread_id_index.clear();
+        self.session_id_index.clear();
+        for (index, thread) in self.threads.iter().enumerate() {
+            if !thread.thread_id.is_empty() {
+                self.thread_id_index
+                    .entry(thread.thread_id.clone())
+                    .or_insert(index);
+            }
+            if let Some(session_id) = thread.session_id.as_deref().filter(|id| !id.is_empty()) {
+                self.session_id_index
+                    .entry(session_id.to_owned())
+                    .or_insert(index);
+            }
+        }
+    }
+
+    /// Resolve an incoming durable thread or remote session identity. The
+    /// map entry is validated against the vector because `threads` is still a
+    /// public ordered vector and a few legacy/test callers mutate it
+    /// directly; those callers get a correct linear fallback until the next
+    /// normal reducer rebuilds the indices.
+    pub(crate) fn thread_index_for_id(&self, id: &str) -> Option<usize> {
+        if id.is_empty() {
+            return None;
+        }
+        if let Some(index) = self.thread_id_index.get(id).copied() {
+            if self
+                .threads
+                .get(index)
+                .is_some_and(|thread| thread.thread_id == id)
+            {
+                return Some(index);
+            }
+        }
+        if let Some(index) = self.session_id_index.get(id).copied() {
+            if self
+                .threads
+                .get(index)
+                .is_some_and(|thread| thread.session_id.as_deref() == Some(id))
+            {
+                return Some(index);
+            }
+        }
+        self.threads
+            .iter()
+            .position(|thread| thread.thread_id == id)
+            .or_else(|| {
+                self.threads
+                    .iter()
+                    .position(|thread| thread.session_id.as_deref() == Some(id))
+            })
     }
 
     /// Folds `Effect::LoadInitialState`'s result into a fresh `Model` --
@@ -490,12 +549,14 @@ impl Model {
             })
             .unwrap_or(0);
         let thread_count = threads.len();
-        Self {
+        let mut model = Self {
             threads,
             selected_thread,
             visible_indices: (0..thread_count).collect(),
             ..Self::default()
-        }
+        };
+        model.rebuild_thread_indices();
+        model
     }
 }
 
@@ -581,5 +642,37 @@ mod tests {
             Some("workspace")
         );
         assert_eq!(model.threads[0].state, ThreadState::Error);
+    }
+
+    #[test]
+    fn thread_identity_indices_resolve_durable_and_session_ids() {
+        let model = Model::from_initial_state(InitialState {
+            threads: vec![
+                ThreadSpec {
+                    display_name: "First".to_owned(),
+                    provider: "codex".to_owned(),
+                    session_id: Some("session-first".to_owned()),
+                    profile_name: None,
+                    project_path: None,
+                },
+                ThreadSpec {
+                    display_name: "Second".to_owned(),
+                    provider: "claude".to_owned(),
+                    session_id: Some("session-second".to_owned()),
+                    profile_name: None,
+                    project_path: None,
+                },
+            ],
+            thread_ids: vec!["thread-first".to_owned(), "thread-second".to_owned()],
+            selected_thread_id: None,
+            permission_profiles: vec![None, None],
+            thread_states: vec![ThreadState::Idle, ThreadState::Idle],
+            startup_warnings: vec![],
+            send_queues: vec![],
+        });
+
+        assert_eq!(model.thread_index_for_id("thread-second"), Some(1));
+        assert_eq!(model.thread_index_for_id("session-first"), Some(0));
+        assert_eq!(model.thread_index_for_id("missing"), None);
     }
 }

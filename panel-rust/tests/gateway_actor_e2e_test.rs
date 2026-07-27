@@ -7,10 +7,13 @@
 //! real binary, don't fake the boundary" testing discipline (see
 //! `panel-rust`'s own headless smoke-test methodology).
 
-use panel_rust::gateway_actor::spawn_acpx_thread;
-use panel_rust::protocol_types::AgentEvent;
+use panel_rust::gateway_actor::{spawn_acpx_thread, spawn_acpx_thread_with_gateway};
+use panel_rust::jsonl_store::JsonlStore;
+use panel_rust::protocol_types::{AgentEvent, ChatMessage, MessageKind};
+use acpx_client::Gateway;
 use std::collections::BTreeMap;
 use std::process::Child;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -142,6 +145,103 @@ async fn open_session_prompt_and_turn_ended_round_trip_through_a_real_gateway() 
 }
 
 #[tokio::test]
+async fn two_shared_gateway_actors_keep_interleaved_events_and_jsonl_isolated() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let cache_dir = tempfile::tempdir().expect("jsonl cache");
+    let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
+    let shared_gateway = Arc::new(Gateway::connect(gateway.base_url.clone()).await);
+    let mut thread_one = spawn_acpx_thread_with_gateway(Arc::clone(&shared_gateway));
+    let mut thread_two = spawn_acpx_thread_with_gateway(shared_gateway);
+    let mut events_one = thread_one.take_events();
+    let mut events_two = thread_two.take_events();
+
+    let cwd = std::env::current_dir().expect("cwd");
+    let (open_one, open_two) = tokio::join!(
+        thread_one.open_session_with_profile(cwd.clone(), &gateway.profile_name, Vec::new()),
+        thread_two.open_session_with_profile(cwd, &gateway.profile_name, Vec::new()),
+    );
+    open_one.expect("thread one open_session_with_profile");
+    open_two.expect("thread two open_session_with_profile");
+    let store = JsonlStore::open(cache_dir.path()).expect("open jsonl store");
+    let user_one = ChatMessage {
+        kind: MessageKind::User,
+        text: "thread one only".into(),
+        status: None,
+        id: None,
+        raw_input: None,
+        raw_output: None,
+    };
+    let user_two = ChatMessage {
+        kind: MessageKind::User,
+        text: "thread two only".into(),
+        status: None,
+        id: None,
+        raw_input: None,
+        raw_output: None,
+    };
+    store.append("thread-one", &user_one).expect("write thread one user");
+    store.append("thread-two", &user_two).expect("write thread two user");
+    let (send_one, send_two) = tokio::join!(
+        thread_one.send_prompt("thread one only"),
+        thread_two.send_prompt("thread two only"),
+    );
+    send_one.expect("thread one prompt");
+    send_two.expect("thread two prompt");
+
+    let mut one_reply = None;
+    let mut two_reply = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline && (one_reply.is_none() || two_reply.is_none()) {
+        tokio::select! {
+            Some(event) = events_one.recv() => {
+                if let AgentEvent::Message(message) = event {
+                    store.append("thread-one", &message).expect("write thread one agent message");
+                    if message.text.contains("THREAD ONE ONLY") {
+                        one_reply = Some(message.text);
+                    }
+                }
+            }
+            Some(event) = events_two.recv() => {
+                if let AgentEvent::Message(message) = event {
+                    store.append("thread-two", &message).expect("write thread two agent message");
+                    if message.text.contains("THREAD TWO ONLY") {
+                        two_reply = Some(message.text);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+    assert!(one_reply.is_some(), "thread one did not receive its own reply");
+    assert!(two_reply.is_some(), "thread two did not receive its own reply");
+
+    let one = store.load("thread-one").expect("load thread one jsonl");
+    let two = store.load("thread-two").expect("load thread two jsonl");
+    let one_text: String = one.messages.iter().map(|message| message.text.as_str()).collect();
+    let two_text: String = two.messages.iter().map(|message| message.text.as_str()).collect();
+    assert!(one_text.contains("THREAD ONE ONLY"));
+    assert!(!one_text.contains("THREAD TWO ONLY"));
+    assert!(two_text.contains("THREAD TWO ONLY"));
+    assert!(!two_text.contains("THREAD ONE ONLY"));
+    assert_eq!(
+        one.messages
+            .iter()
+            .filter(|message| message.text.contains("THREAD ONE ONLY"))
+            .count(),
+        1,
+        "thread one transcript must contain one reply, not a replay duplicate"
+    );
+    assert_eq!(
+        two.messages
+            .iter()
+            .filter(|message| message.text.contains("THREAD TWO ONLY"))
+            .count(),
+        1,
+        "thread two transcript must contain one reply, not a replay duplicate"
+    );
+}
+
+#[tokio::test]
 async fn resume_session_replays_history_via_session_load() {
     let db_dir = tempfile::tempdir().expect("tempdir");
     let gateway = GatewayProcess::spawn("codex", &db_dir.path().join("acpx.sqlite3")).await;
@@ -191,6 +291,22 @@ async fn resume_session_replays_history_via_session_load() {
     assert!(
         reply.is_some(),
         "expected session/load's replayed-history reply via the gateway"
+    );
+    let mut duplicate_replies = 0;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < drain_deadline {
+        let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(Some(AgentEvent::Message(message))) =
+            tokio::time::timeout(remaining.min(Duration::from_millis(50)), events_rx.recv()).await
+        {
+            if message.text.contains("HISTORY BEFORE RELAUNCH") {
+                duplicate_replies += 1;
+            }
+        }
+    }
+    assert_eq!(
+        duplicate_replies, 0,
+        "session history must be delivered once after reattachment, not duplicated"
     );
 }
 
