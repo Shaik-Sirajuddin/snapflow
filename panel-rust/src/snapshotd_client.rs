@@ -214,7 +214,7 @@ impl SnapshotdRegistration {
                             return;
                         }
                     };
-                    let registration = ExternalInstanceRegistration {
+                    let mut registration = ExternalInstanceRegistration {
                         instance_nonce: nonce.clone(),
                         pid: std::process::id(),
                         process_start: process_start_identity(),
@@ -222,6 +222,9 @@ impl SnapshotdRegistration {
                         sap_socket_path: None,
                         capabilities: Some(json!({"lifecycle": true, "mcpContexts": true})),
                     };
+                    let mut current_project_path = initial_project_path.clone();
+                    let mut current_reason = "opened".to_owned();
+                    let mut current_generation = 0u64;
                     let mut current_id = runtime.block_on(async {
                         register_and_extract_id(&client, &registration).await
                     });
@@ -231,8 +234,16 @@ impl SnapshotdRegistration {
                     loop {
                         match receiver.recv_timeout(Duration::from_secs(10)) {
                             Ok(RegistrationCommand::Update { project_path, reason, generation }) => {
+                                current_project_path = project_path;
+                                current_reason = reason;
+                                current_generation = generation;
                                 if let Some(id) = current_id.as_deref() {
-                                    let _ = runtime.block_on(client.update_open_project(id, project_path.as_deref(), &reason, generation));
+                                    let _ = runtime.block_on(client.update_open_project(
+                                        id,
+                                        current_project_path.as_deref(),
+                                        &current_reason,
+                                        current_generation,
+                                    ));
                                 }
                             }
                             Ok(RegistrationCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -244,15 +255,29 @@ impl SnapshotdRegistration {
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 if let Some(id) = current_id.as_deref() {
                                     if runtime.block_on(client.heartbeat(id)).is_err() {
+                                        registration.project_path = current_project_path.clone();
                                         current_id = runtime.block_on(async { register_and_extract_id(&client, &registration).await });
                                         if let Some(id) = current_id.as_ref() {
                                             *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                                            let _ = runtime.block_on(client.update_open_project(
+                                                id,
+                                                current_project_path.as_deref(),
+                                                &current_reason,
+                                                current_generation,
+                                            ));
                                         }
                                     }
                                 } else {
+                                    registration.project_path = current_project_path.clone();
                                     current_id = runtime.block_on(async { register_and_extract_id(&client, &registration).await });
                                     if let Some(id) = current_id.as_ref() {
                                         *published_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id.clone());
+                                        let _ = runtime.block_on(client.update_open_project(
+                                            id,
+                                            current_project_path.as_deref(),
+                                            &current_reason,
+                                            current_generation,
+                                        ));
                                     }
                                 }
                             }
