@@ -2058,16 +2058,30 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
                     )
                 }
                 Err(err) => {
+                    // Attachment/send failure must leave Loading and refresh
+                    // the send/stop control. Dirty::Error alone only updates
+                    // the banner; without ThreadRow/Connection the chat input
+                    // stays stuck on "Stop response" forever (found live in
+                    // full GUI matrix: open_session WebSocket failure → send
+                    // requested → no prompt → Stop never clears).
                     thread.state = ThreadState::Error;
                     thread.error = Some(err.message.clone());
                     (
                         vec![],
-                        vec![Dirty::Error {
-                            thread_id: thread.thread_id.clone(),
-                            detail: ErrorDetail {
-                                message: err.message,
+                        vec![
+                            Dirty::Error {
+                                thread_id: thread.thread_id.clone(),
+                                detail: ErrorDetail {
+                                    message: err.message,
+                                },
                             },
-                        }],
+                            Dirty::ThreadRow {
+                                thread_id: thread.thread_id.clone(),
+                            },
+                            Dirty::Connection {
+                                thread_id: thread.thread_id.clone(),
+                            },
+                        ],
                     )
                 }
             }
@@ -2289,6 +2303,14 @@ fn update_frame(model: &mut Model, frame: crate::msg::FrameInput) -> (Vec<Effect
                     detail: ErrorDetail {
                         message: error.clone(),
                     },
+                });
+                // Mirror PromptSent Err: leave Loading/Cancelling in the
+                // visible send/stop control, not only the error banner.
+                dirty.push(Dirty::ThreadRow {
+                    thread_id: thread.thread_id.clone(),
+                });
+                dirty.push(Dirty::Connection {
+                    thread_id: thread.thread_id.clone(),
                 });
             }
             crate::protocol_types::AgentEvent::UsageUpdate { .. } => {
