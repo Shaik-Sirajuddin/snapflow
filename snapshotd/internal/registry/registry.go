@@ -342,6 +342,14 @@ func (r *Registry) SaveMcpContext(context *McpContext) error {
 	return r.db.Save(context).Error
 }
 
+func (r *Registry) ListMcpContexts() ([]McpContext, error) {
+	var out []McpContext
+	if err := r.db.Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (r *Registry) DeleteMcpContext(token string) error {
 	result := r.db.Delete(&McpContext{}, "context_token = ?", token)
 	if result.Error != nil {

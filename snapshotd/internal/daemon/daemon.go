@@ -244,6 +244,17 @@ func (d *Daemon) ReconcileExternalInstances(ctx context.Context) ([]registry.Ext
 			}
 		}
 	}
+	contexts, err := d.Reg.ListMcpContexts()
+	if err != nil {
+		return nil, err
+	}
+	for _, contextRecord := range contexts {
+		if !contextRecord.LeaseExpiresAt.After(now) {
+			if err := d.Reg.DeleteMcpContext(contextRecord.ContextToken); err != nil && !errors.Is(err, registry.ErrNotFound) {
+				return nil, err
+			}
+		}
+	}
 	return d.Reg.ListExternalInstances()
 }
 
@@ -302,6 +313,20 @@ func (d *Daemon) SetMcpProjectTarget(ctx context.Context, token, projectID strin
 		return registry.McpContext{}, err
 	}
 	return *contextRecord, nil
+}
+
+// UnregisterMcpContext removes the per-ACP-session MCP binding. It is
+// idempotent so panel teardown can race with lease reconciliation or a
+// duplicate close without turning normal shutdown into an error.
+func (d *Daemon) UnregisterMcpContext(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+	err := d.Reg.DeleteMcpContext(token)
+	if errors.Is(err, registry.ErrNotFound) {
+		return nil
+	}
+	return err
 }
 
 // RequestStop signals StopRequested's channel exactly once (idempotent --
@@ -449,6 +474,24 @@ func (d *Daemon) DeleteProject(ctx context.Context, projectID string) error {
 // ListProjects implements daemon.listProjects.
 func (d *Daemon) ListProjects(ctx context.Context) ([]registry.Project, error) {
 	return d.Reg.ListProjects()
+}
+
+// ProjectSubscription is the v1 control-plane fallback for clients that
+// cannot keep a notification stream. It returns an authoritative snapshot
+// and a bounded poll interval; a future multiplexed SDP connection can
+// upgrade the same method to push deltas without changing the payload.
+type ProjectSubscription struct {
+	Projects  []registry.Project `json:"projects"`
+	Mode      string             `json:"mode"`
+	PollAfter time.Duration      `json:"pollAfter"`
+}
+
+func (d *Daemon) SubscribeProjects(ctx context.Context) (ProjectSubscription, error) {
+	projects, err := d.ListProjects(ctx)
+	if err != nil {
+		return ProjectSubscription{}, err
+	}
+	return ProjectSubscription{Projects: projects, Mode: "poll", PollAfter: 5 * time.Second}, nil
 }
 
 // LaunchParams / Launch implement daemon.launch.
@@ -776,6 +819,9 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 	case "daemon.listProjects":
 		return d.ListProjects(ctx)
 
+	case "daemon.subscribeProjects":
+		return d.SubscribeProjects(ctx)
+
 	case "daemon.registerExternalInstance":
 		var p RegisterExternalInstanceParams
 		if err := unmarshalParams(params, &p); err != nil {
@@ -824,6 +870,15 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return d.SetMcpProjectTarget(ctx, p.ContextToken, p.ProjectID)
+
+	case "daemon.unregisterMcpContext":
+		var p struct {
+			ContextToken string `json:"contextToken"`
+		}
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, d.UnregisterMcpContext(ctx, p.ContextToken)
 
 	case "daemon.discoverExternalInstances":
 		return d.DiscoverExternalInstances(ctx)

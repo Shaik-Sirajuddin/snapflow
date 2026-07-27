@@ -39,6 +39,7 @@ answers directly:
 
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import socket
@@ -290,6 +291,15 @@ def session_cwd_for_prompt(event_log: pathlib.Path, prompt_text: str, timeout=10
     raise Failure(f"no session/new cwd found for prompt {prompt_text!r} in {event_log}")
 
 
+def project_store_dir_for_mlt(mlt_path: pathlib.Path) -> pathlib.Path:
+    """Mirror project_store::project_store_dir for saved projects.
+
+    ACP sessions use the project-local Snapflow store as cwd, never the raw
+    MLT file. The host test must assert that same invariant.
+    """
+    return mlt_path.parent / ".snapflow" / mlt_path.stem
+
+
 def expand_thread_sidebar(client, root_handle, timeout=2):
     # "Rename thread <name>" labels (sidebar_thread_row.slint) and "New
     # thread" (sidebar.slint: `if expanded && !skill-mode`) only render
@@ -487,13 +497,13 @@ def main():
     display_name = ":97"
     gateway_port = 18999
     mcp_port = 19199
-    db_path = state_dir / "panel" / "panel-state.sqlite3"
     event_log = state_dir / "acpx" / "backend-events.jsonl"
 
     server_bin = str(MAIN_CHECKOUT_ROOT / "acpx" / "target" / "debug" / "acpx-server")
     agent_bin = str(WORKTREE_ROOT / "panel-rust" / "target" / "debug" / "rui-mock-agent")
-    shotcut_bin = str(
-        MAIN_CHECKOUT_ROOT / "shotcut-rebrand" / "build-local" / "src" / "snapflow"
+    shotcut_bin = os.environ.get(
+        "SHOTCUT_BIN",
+        str(MAIN_CHECKOUT_ROOT / "shotcut-rebrand" / "build-local" / "src" / "snapflow"),
     )
     for binary in (server_bin, agent_bin, shotcut_bin):
         if not pathlib.Path(binary).is_file():
@@ -513,8 +523,6 @@ def main():
     )
 
     fifo = state_dir / "acpx" / "stdin.fifo"
-    import os
-
     os.mkfifo(fifo)
     fifo_fd = os.open(str(fifo), os.O_RDWR)
 
@@ -600,7 +608,7 @@ def main():
         log("saved untitled -> B.mlt (independent project, for the switch row)")
         close_project(xdisplay)
 
-        # === Row 1: open A -> thread scoped to A, real acpx cwd is A. ===
+        # === Row 1: open A -> thread scoped to A and its store. =========
         send_file_open(project_a)
         # openMultiple() runs async on the Qt event loop; the IPC write
         # returning has no bearing on when the panel's active_project_path
@@ -613,13 +621,15 @@ def main():
         send_and_wait(client, window_handle, event_log, "piso6 marker on A")
         rename_active_thread(client, root_handle, window_handle, "thread-on-A")
         cwd_a = session_cwd_for_prompt(event_log, "piso6 marker on A")
-        if cwd_a != str(project_a):
-            raise Failure(f"row1: acpx cwd {cwd_a!r} != project A {str(project_a)!r}")
-        path_a = thread_project_path(db_path, "thread-on-A")
+        expected_store_a = project_store_dir_for_mlt(project_a)
+        if cwd_a != str(expected_store_a):
+            raise Failure(f"row1: acpx cwd {cwd_a!r} != project A store {str(expected_store_a)!r}")
+        db_path_a = expected_store_a / "panel-state.sqlite3"
+        path_a = thread_project_path(db_path_a, "thread-on-A")
         if path_a != str(project_a):
             raise Failure(f"row1: thread_settings.project_path {path_a!r} != {str(project_a)!r}")
         results["row1_open_a_scoped_and_cwd"] = "PASS"
-        log("PASS row1: thread-on-A scoped to A, real session/new cwd == A.mlt")
+        log("PASS row1: thread-on-A scoped to A, real session/new cwd == A's store")
 
         # === Row 2: switch to B -> distinct threads, B's cwd. ===========
         send_file_open(project_b)
@@ -633,10 +643,11 @@ def main():
         send_and_wait(client, window_handle, event_log, "piso6 marker on B")
         rename_active_thread(client, root_handle, window_handle, "thread-on-B")
         cwd_b = session_cwd_for_prompt(event_log, "piso6 marker on B")
-        if cwd_b != str(project_b):
-            raise Failure(f"row2: acpx cwd {cwd_b!r} != project B {str(project_b)!r}")
+        expected_store_b = project_store_dir_for_mlt(project_b)
+        if cwd_b != str(expected_store_b):
+            raise Failure(f"row2: acpx cwd {cwd_b!r} != project B store {str(expected_store_b)!r}")
         results["row2_switch_b_distinct_and_cwd"] = "PASS"
-        log("PASS row2: switching to B hides thread-on-A, thread-on-B gets B's real cwd")
+        log("PASS row2: switching to B hides thread-on-A, thread-on-B gets B's store cwd")
 
         # === Row 3: restart -> durable association survives. ============
         panel_proc.terminate()
@@ -656,7 +667,7 @@ def main():
             raise Failure("snapflow (restart) exited before MCP came up; see shotcut-2.stderr.log")
         client, window_handle, root_handle = connect_mcp()
         wait_for_visible_thread(client, root_handle, "thread-on-A")
-        path_a_after_restart = thread_project_path(db_path, "thread-on-A")
+        path_a_after_restart = thread_project_path(db_path_a, "thread-on-A")
         if path_a_after_restart != str(project_a):
             raise Failure(
                 f"row3: project_path after restart {path_a_after_restart!r} != {str(project_a)!r}"
@@ -670,7 +681,8 @@ def main():
         if not project_a_renamed.exists():
             raise Failure(f"Save-As did not produce {project_a_renamed}")
         wait_for_visible_thread(client, root_handle, "thread-on-A")
-        path_a_after_rename = thread_project_path(db_path, "thread-on-A")
+        db_path_a_renamed = project_store_dir_for_mlt(project_a_renamed) / "panel-state.sqlite3"
+        path_a_after_rename = thread_project_path(db_path_a_renamed, "thread-on-A")
         if path_a_after_rename != str(project_a_renamed):
             raise Failure(
                 f"row4: project_path after Save-As {path_a_after_rename!r} != "

@@ -2749,6 +2749,17 @@ fn spawn_snapshotd_mcp_context_registration(
     });
 }
 
+fn spawn_snapshotd_mcp_context_cleanup(runtime: &tokio::runtime::Handle, slot: &Arc<ThreadSlot>) {
+    let Some(client) = crate::snapshotd_client::SnapshotdControlClient::from_default_runtime()
+    else {
+        return;
+    };
+    let token = slot.mcp_context_token.clone();
+    runtime.spawn(async move {
+        let _ = client.unregister_mcp_context(&token).await;
+    });
+}
+
 impl AgentBridge {
     /// Production constructor: every thread's acpx gateway URL resolved
     /// (env-override-or-local-autospawn, see [`provision_gateway`]) +
@@ -4001,6 +4012,9 @@ impl AgentBridge {
             .is_ok();
         if ok {
             *slot.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            if !background {
+                spawn_snapshotd_mcp_context_cleanup(self.runtime.handle(), slot);
+            }
         }
         ok
     }
@@ -4023,6 +4037,7 @@ impl AgentBridge {
         let ok = self.runtime.block_on(handle.delete_session()).is_ok();
         if ok {
             *slot.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            spawn_snapshotd_mcp_context_cleanup(self.runtime.handle(), slot);
         }
         ok
     }
@@ -5040,6 +5055,7 @@ impl Drop for AgentBridge {
         // returns `None` and unwinds cleanly, instead of relying purely on
         // the runtime's own shutdown-cancels-outstanding-tasks behavior.
         for slot in &self.slots {
+            spawn_snapshotd_mcp_context_cleanup(self.runtime.handle(), slot);
             slot.handle.shutdown();
         }
     }

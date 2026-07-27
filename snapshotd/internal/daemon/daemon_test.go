@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -136,6 +138,10 @@ func TestDaemon_Dispatch_RoutesAllDaemonMethods(t *testing.T) {
 	}
 
 	call("daemon.listProjects", nil)
+	subscription := call("daemon.subscribeProjects", nil)
+	if !bytes.Contains(subscription, []byte(`"mode":"poll"`)) {
+		t.Fatalf("expected polling project subscription payload: %s", subscription)
+	}
 
 	launchOut := call("daemon.launch", LaunchParams{ProjectID: proj.ID})
 	var pi registry.ProcessInstance
@@ -205,6 +211,15 @@ func TestDaemon_ExternalRegistrationAndMcpContextIsolation(t *testing.T) {
 	if err != nil || target.ChatProjectID != projectA.ID || target.TargetProjectID != projectB.ID {
 		t.Fatalf("MCP target must be mutable without moving chat ownership: %+v err=%v", target, err)
 	}
+	if err := d.UnregisterMcpContext(ctx, owner.ContextToken); err != nil {
+		t.Fatalf("unregister MCP context: %v", err)
+	}
+	if _, err := d.Reg.GetMcpContext(owner.ContextToken); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("expected MCP context to be deleted, err=%v", err)
+	}
+	if err := d.UnregisterMcpContext(ctx, owner.ContextToken); err != nil {
+		t.Fatalf("unregister MCP context must be idempotent: %v", err)
+	}
 	if err := d.UnregisterExternalInstance(ctx, first.Instance.ID); err != nil {
 		t.Fatalf("unregister external instance: %v", err)
 	}
@@ -230,6 +245,19 @@ func TestDaemon_ReconcileExternalLeaseAndProjectAggregate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	contextRecord, err := d.RegisterMcpContext(ctx, RegisterMcpContextParams{
+		ContextToken:           "expired-context",
+		ACPSessionID:           "acp-expired",
+		ChatProjectID:          project.ID,
+		DefaultTargetProjectID: project.ID,
+	})
+	if err != nil {
+		t.Fatalf("register MCP context: %v", err)
+	}
+	contextRecord.LeaseExpiresAt = time.Now().UTC().Add(-time.Second)
+	if err := d.Reg.SaveMcpContext(&contextRecord); err != nil {
+		t.Fatalf("expire MCP context: %v", err)
+	}
 	projects, err := d.ListProjects(ctx)
 	if err != nil || len(projects) != 1 || !projects[0].Open || projects[0].InstanceCount != 1 {
 		t.Fatalf("expected registered project aggregate, projects=%+v err=%v", projects, err)
@@ -248,6 +276,9 @@ func TestDaemon_ReconcileExternalLeaseAndProjectAggregate(t *testing.T) {
 	row, err = d.Reg.GetExternalInstance(registered.Instance.ID)
 	if err != nil || row.Status != registry.ExternalStatusStale {
 		t.Fatalf("expected stale lease: %+v err=%v", row, err)
+	}
+	if _, err := d.Reg.GetMcpContext("expired-context"); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("expected expired MCP context to be removed, err=%v", err)
 	}
 }
 

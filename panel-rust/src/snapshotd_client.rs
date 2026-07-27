@@ -379,8 +379,16 @@ impl SnapshotdControlClient {
         self.call("daemon.setMcpProjectTarget", json!({"contextToken": context_token, "projectId": project_id})).await
     }
 
+    pub async fn unregister_mcp_context(&self, context_token: &str) -> Result<Value, SnapshotdClientError> {
+        self.call("daemon.unregisterMcpContext", json!({"contextToken": context_token})).await
+    }
+
     pub async fn list_projects(&self) -> Result<Value, SnapshotdClientError> {
         self.call("daemon.listProjects", json!({})).await
+    }
+
+    pub async fn subscribe_projects(&self) -> Result<Value, SnapshotdClientError> {
+        self.call("daemon.subscribeProjects", json!({})).await
     }
 
     /// Resolve the daemon project id from the canonical MLT path. This keeps
@@ -470,17 +478,19 @@ mod tests {
         let socket = dir.path().join("control.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read, mut write) = stream.into_split();
                 let mut reader = BufReader::new(read);
                 let mut line = String::new();
                 reader.read_line(&mut line).await.unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
-                let result = if request["method"] == "daemon.registerExternalInstance" {
-                    json!({"instance": {"instanceId": "instance-1"}, "heartbeatEvery": "10s", "leaseDuration": "30s"})
-                } else {
-                    json!({"contextToken": "ctx", "targetProjectId": "project-b"})
+                let result = match request["method"].as_str() {
+                    Some("daemon.registerExternalInstance") => json!({"instance": {"instanceId": "instance-1"}, "heartbeatEvery": "10s", "leaseDuration": "30s"}),
+                    Some("daemon.setMcpProjectTarget") => json!({"contextToken": "ctx", "targetProjectId": "project-b"}),
+                    Some("daemon.unregisterMcpContext") => json!({}),
+                    Some("daemon.subscribeProjects") => json!({"mode": "poll", "pollAfter": "5s", "projects": []}),
+                    other => panic!("unexpected method: {other:?}"),
                 };
                 write.write_all(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}).to_string().as_bytes()).await.unwrap();
                 write.write_all(b"\n").await.unwrap();
@@ -495,6 +505,9 @@ mod tests {
         assert_eq!(registered["instance"]["instanceId"], "instance-1");
         let context = client.set_mcp_project_target("ctx", "project-b").await.unwrap();
         assert_eq!(context["targetProjectId"], "project-b");
+        client.unregister_mcp_context("ctx").await.unwrap();
+        let subscription = client.subscribe_projects().await.unwrap();
+        assert_eq!(subscription["mode"], "poll");
         server.await.unwrap();
     }
 }
