@@ -582,15 +582,12 @@ def main():
                 "RUI_ACPX_CODEX_URL": f"http://127.0.0.1:{gateway_port}",
                 "RUI_ACPX_CLAUDE_URL": f"http://127.0.0.1:{gateway_port}",
                 "SHOTCUT_BIN": shotcut_bin,
-                # PISO-13: cold-start seeding now defaults to a single
-                # empty "Chat" thread (unset/"0"), not the 4 named fixture
-                # threads -- that default is intentionally no longer
-                # fixture content. This harness doesn't assert on the
-                # fixture names, but pins the old opt-in explicitly so a
-                # thread already exists (and the default-thread/index
-                # assumptions the rest of this script makes stay valid)
-                # regardless of which way that default moves again later.
-                "RUI_SEED_THREADS": "4",
+                # Keep the lifecycle matrix independent of restored fixture
+                # sessions. Each row creates the one thread it asserts; a
+                # four-thread cold start would consume the mock gateway's
+                # bounded tenant capacity across rapid A/B/restart teardown
+                # even though the product correctly emits session/close.
+                "RUI_SEED_THREADS": "0",
                 # Release builds fork a watchdog-parent/real-child pair
                 # (main.cpp's kWatchdogEnvVar == "SNAPFLOW_WATCHDOG";
                 # QT_DEBUG builds set this for themselves). This harness
@@ -721,30 +718,36 @@ def main():
         log("PASS row4 (PISO-7): thread-on-A followed Save-As live, no restart needed")
 
         # === Row 5: close -> panel clears. ===============================
-        # "Panel clears" means the ACTIVE PROJECT association clears, not
-        # that previously-visible threads vanish from the sidebar --
-        # ground-truthed against retain_items_for_project itself
-        # (models.rs): `let Some(active) = active_project_path.filter(...)
-        # else { return; };` returns WITHOUT filtering at all when there
-        # is no active project, by design -- nothing to scope AGAINST, so
-        # every thread stays visible. This is deliberate, not a bug: an
-        # earlier version of this row asserted thread-on-A disappears
-        # after Close, which contradicts this code on purpose and was
-        # simply the wrong invariant to test. The real, provable claim is
-        # that a thread created AFTER Close is unscoped (gets the process
-        # cwd fallback, not any project's path) -- the same signal row1/
-        # row2 already use to prove the opposite (a thread IS scoped).
+        # Close leaves the panel in ProjectIdentity::None. The production
+        # contract is now an attach gate: New/send are disabled and no
+        # session/new may be emitted against the host cwd. Do not attempt a
+        # prompt here; that would test the old unsafe fallback behavior.
         close_project(xdisplay)
         time.sleep(1.0)
-        click_new_thread(client, root_handle)
-        send_and_wait(client, window_handle, event_log, "piso6 marker after close")
-        cwd_after_close = session_cwd_for_prompt(event_log, "piso6 marker after close")
-        if cwd_after_close in (str(project_a), str(project_b), str(project_a_renamed)):
+        before_new = len([e for e in mcp.prompt_events(event_log) if e["method"] == "session/new"])
+        try:
+            root_handle = mcp.get_root_element(client)[1]
+            expand_thread_sidebar(client, root_handle)
+            root_handle = mcp.get_root_element(client)[1]
+            new_thread_handle = mcp.wait_for_accessible_label(
+                client, root_handle, "New thread", timeout=3
+            )
+            # The control may remain in the accessibility tree while its
+            # TouchArea is disabled; clicking it must still be a no-op.
+            mcp.click(client, new_thread_handle)
+        except RuntimeError:
+            # An implementation may hide the control entirely in the
+            # no-project state; that is equally valid evidence of the gate.
+            pass
+        time.sleep(1.0)
+        after_new = len([e for e in mcp.prompt_events(event_log) if e["method"] == "session/new"])
+        if after_new != before_new:
             raise Failure(
-                f"row5: new thread after Close still scoped to a project: {cwd_after_close!r}"
+                f"row5: Close left New-thread attachment reachable; session/new count "
+                f"changed from {before_new} to {after_new}"
             )
         results["row5_close_clears"] = "PASS"
-        log("PASS row5: Close clears the active project -- a new thread is unscoped again")
+        log("PASS row5: Close clears the active project -- no new session can attach")
 
     finally:
         if panel_proc is not None and panel_proc.poll() is None:

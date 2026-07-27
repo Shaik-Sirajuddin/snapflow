@@ -78,9 +78,15 @@ class McpClient:
 def get_root_element(client):
     windows = client.call_tool("list_windows")
     handles = windows.get("windowHandles") or [{}]
-    window_handle = handles[0]
-    props = client.call_tool("get_window_properties", {"windowHandle": window_handle})
-    return window_handle, props.get("rootElementHandle") or {}
+    # A project lifecycle recreation can leave the old Slint window handle
+    # in the testing backend briefly while the new window is already listed.
+    # Newest-first keeps MCP operations attached to the live component.
+    for window_handle in reversed(handles):
+        props = client.call_tool("get_window_properties", {"windowHandle": window_handle})
+        root = props.get("rootElementHandle") or {}
+        if root:
+            return window_handle, root
+    return handles[-1], {}
 
 
 def find_element_by_qualified_id(client, window_handle, qualified_id):

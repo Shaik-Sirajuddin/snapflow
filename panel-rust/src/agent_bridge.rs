@@ -7368,7 +7368,7 @@ done
     }
 
     #[test]
-    fn dropping_bridge_does_not_close_gateway_session() {
+    fn dropping_bridge_closes_gateway_session_with_bounded_cleanup() {
         let gateway = TestGateway::spawn();
         let names = ["Thread One"];
         let session_id;
@@ -7393,8 +7393,8 @@ done
         assert!(
             sessions
                 .iter()
-                .any(|session| session.acp_session_id == session_id),
-            "AgentBridge drop must not send session/close; got {sessions:?}"
+                .all(|session| session.acp_session_id != session_id),
+            "AgentBridge drop must close the foreground session; got {sessions:?}"
         );
     }
 

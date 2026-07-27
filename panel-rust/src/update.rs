@@ -1788,7 +1788,15 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let persistent = model.persistent_models();
             let thread_keys = persistent.thread_model_keys.clone();
             let startup_warnings = initial.startup_warnings.clone();
+            // InitialState is storage/bridge hydration and intentionally does
+            // not own the host lifecycle identity. Preserve the identity that
+            // was bound before hydration instead of letting Model::default()
+            // erase it during the wholesale reducer replacement.
+            let active_project = model.active_project.clone();
+            let active_project_path = model.active_project_path.clone();
             *model = Model::from_initial_state(initial);
+            model.active_project = active_project;
+            model.active_project_path = active_project_path;
             model.restore_persistent_models(persistent);
             let thread_list_dirty = thread_list_dirty_with_keys(model, thread_keys);
             // Cold start: everything is dirty, there is no prior row
@@ -1796,6 +1804,12 @@ fn update_effect(model: &mut Model, msg: EffectResultMsg) -> (Vec<Effect>, Vec<D
             let mut dirty = vec![
                 thread_list_dirty,
                 Dirty::Scalar(ScalarField::SelectedThread),
+                // The identity is installed before hydration, but the root
+                // Slint property is projection-owned. Without this marker a
+                // valid initial project remained visually "no project" and
+                // disabled the composer/New-thread controls until a later
+                // host lifecycle event.
+                Dirty::ProjectPath,
             ];
             // Non-fatal cold-start failures (settings load, panel-defaults
             // sync, thread-record restoration, ...) previously only
@@ -2833,6 +2847,13 @@ mod tests {
             .collect();
         let mut model = Model {
             threads,
+            // Reducer tests that exercise thread creation/send represent an
+            // already-open project. Keep the no-project contract covered by
+            // dedicated Model::default() tests instead of silently testing
+            // the rejected path through this shared fixture.
+            active_project: crate::model::ProjectIdentity::Saved(
+                "/tmp/update-test-project.mlt".to_owned(),
+            ),
             ..Model::default()
         };
         model.rebuild_thread_indices();
@@ -3021,6 +3042,9 @@ mod tests {
         }
 
         let mut model = Model::default();
+        model.active_project = crate::model::ProjectIdentity::Saved(
+            "/tmp/send-queue-test-project.mlt".to_owned(),
+        );
         update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
         let thread_id = model.threads[0].thread_id.clone();
         model.threads[0]
@@ -3380,6 +3404,38 @@ mod tests {
             model.threads[1].permission_profile, None,
             "a literal \"default\" permission-profile must never be stored"
         );
+    }
+
+    #[test]
+    fn no_project_blocks_new_send_and_late_attach_results() {
+        let mut model = Model::default();
+
+        let (effects, dirty) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert!(model.threads.is_empty());
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested("blocked".to_owned()))),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+
+        let (effects, dirty) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Thread(ThreadMsg::NewResolved {
+                display_name: "late".to_owned(),
+                provider: "codex-acp".to_owned(),
+                profile_name: None,
+                permission_profile: None,
+                session_id: Some("late-session".to_owned()),
+                thread_id: Some("late-thread".to_owned()),
+            })),
+        );
+        assert!(effects.is_empty());
+        assert!(dirty.is_empty());
+        assert!(model.threads.is_empty());
     }
 
     #[test]
