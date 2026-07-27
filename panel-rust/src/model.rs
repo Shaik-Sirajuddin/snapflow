@@ -223,6 +223,10 @@ pub struct Model {
     /// Lifecycle identity; `active_project_path` remains as a UI/compatibility
     /// projection until the per-project store migration is complete.
     pub active_project: ProjectIdentity,
+    /// Monotonic lifecycle generation; every host project transition bumps
+    /// this before any asynchronous snapshot/control-client work starts.
+    pub project_generation: u64,
+    pub project_lifecycle_reason: String,
     /// PISO-2 (project-isolation-mlt-binding plan): the `active_project_
     /// path` value the currently-applied thread list (`visible_indices`/
     /// `thread_rows`) was actually synced against -- distinct from

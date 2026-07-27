@@ -1659,6 +1659,15 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
             (vec![], vec![Dirty::Language])
         }
         HostMsg::ProjectPathChanged(path) => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = if model.active_project_path.is_some() {
+                "switched"
+            } else if path.is_some() {
+                "opened"
+            } else {
+                "closed"
+            }
+            .to_owned();
             model.active_project = path
                 .clone()
                 .map(crate::model::ProjectIdentity::Saved)
@@ -1670,6 +1679,8 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
             )
         }
         HostMsg::ProjectCreatedUntitled => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = "created_untitled".to_owned();
             let id = uuid::Uuid::new_v4().to_string();
             model.active_project = crate::model::ProjectIdentity::Untitled(id);
             model.active_project_path = None;
@@ -1679,6 +1690,8 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
             )
         }
         HostMsg::ProjectClosed => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = "closed".to_owned();
             let old_keys = model.message_model_keys.borrow().clone();
             model.displayed_thread = None;
             model.list_owner_thread_id = None;
@@ -1705,6 +1718,8 @@ fn update_host(model: &mut Model, msg: HostMsg) -> (Vec<Effect>, Vec<Dirty>) {
             )
         }
         HostMsg::ProjectPathRenamed { old, new } => {
+            model.project_generation = model.project_generation.saturating_add(1);
+            model.project_lifecycle_reason = "saved_as".to_owned();
             // PISO-7: this is a SEPARATE branch from ProjectPathChanged
             // above, by design -- rebinding on a bare active-path change
             // would be unable to tell "Save-As A -> B" apart from "close

@@ -1279,11 +1279,15 @@ impl PanelSingleton {
     /// This must stay separate from `dispatch_project_path_changed`, which
     /// creates that effect; calling the dispatcher here would recurse forever.
     pub(crate) fn apply_active_project_path(&self, path: Option<String>) {
+        let (reason, generation) = {
+            let model = self.model.borrow();
+            (model.project_lifecycle_reason.clone(), model.project_generation)
+        };
         if let Some(bridge) = self.bridge.as_ref() {
             bridge.set_active_project_path(path.clone().map(std::path::PathBuf::from));
         }
         if let Some(registration) = self.snapshotd_registration.as_ref() {
-            registration.update(path, "lifecycle", 0);
+            registration.update(path, reason, generation);
         }
     }
 
