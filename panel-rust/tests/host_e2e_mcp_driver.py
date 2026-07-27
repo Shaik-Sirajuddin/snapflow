@@ -126,7 +126,22 @@ def wait_for_accessible_label(client, root_handle, label, timeout=10, max_elemen
         if matches:
             return matches[0]["handle"]
         time.sleep(0.2)
-    raise RuntimeError(f"no element with accessibleLabel={label!r} appeared in time")
+    try:
+        diagnostics = client.call_tool(
+            "get_element_tree", {"elementHandle": root_handle, "maxElements": max_elements}
+        )
+        labels = sorted(
+            {
+                element.get("accessibleLabel")
+                for element in diagnostics.get("elements", [])
+                if element.get("accessibleLabel")
+            }
+        )
+    except Exception as error:
+        labels = [f"diagnostics failed: {error}"]
+    raise RuntimeError(
+        f"no element with accessibleLabel={label!r} appeared in time; labels={labels[:80]!r}"
+    )
 
 
 def wait_for_accessible_label_prefix(client, root_handle, prefix, timeout=10, max_elements=600):
