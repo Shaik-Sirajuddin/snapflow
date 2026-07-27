@@ -271,6 +271,15 @@ export component SidebarThreadRow inherits HoverSurface {
                         max-width: 64px;
                     }
                     if expanded && rename-thread-index != index
+                        && thread.project-instance-live : Text {
+                        text: "OPEN ELSEWHERE";
+                        color: Theme.text-accent-bright;
+                        font-size: 7px * Theme.font-scale;
+                        font-family: Theme.font-mono;
+                        vertical-alignment: center;
+                        horizontal-stretch: 0;
+                    }
+                    if expanded && rename-thread-index != index
                         && show-archived-badge && thread.archived : Text {
                         // Archive is a local presentation flag
                         // (no gateway call) -- without this badge
