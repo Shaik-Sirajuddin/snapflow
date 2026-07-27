@@ -152,6 +152,67 @@ func TestDaemon_Dispatch_RoutesAllDaemonMethods(t *testing.T) {
 	}
 }
 
+func TestDaemon_ExternalRegistrationAndMcpContextIsolation(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	projectA, err := d.CreateProject(ctx, CreateProjectParams{Name: "project-a"})
+	if err != nil {
+		t.Fatalf("create project A: %v", err)
+	}
+	projectB, err := d.CreateProject(ctx, CreateProjectParams{Name: "project-b"})
+	if err != nil {
+		t.Fatalf("create project B: %v", err)
+	}
+
+	params := RegisterExternalInstanceParams{
+		InstanceNonce: "nonce-a",
+		PID:           os.Getpid(),
+		ProcessStart:  "test-start-a",
+		ProjectPath:   filepath.Join(projectA.RootDir, projectA.MltFileName),
+	}
+	first, err := d.RegisterExternalInstance(ctx, params)
+	if err != nil {
+		t.Fatalf("register external instance: %v", err)
+	}
+	second, err := d.RegisterExternalInstance(ctx, params)
+	if err != nil || second.Instance.ID != first.Instance.ID {
+		t.Fatalf("registration must be idempotent: first=%+v second=%+v err=%v", first, second, err)
+	}
+	updated, err := d.UpdateOpenProject(ctx, UpdateExternalProjectParams{
+		InstanceID:  first.Instance.ID,
+		ProjectPath: filepath.Join(projectB.RootDir, projectB.MltFileName),
+		Reason:      "switched",
+		Generation:  2,
+	})
+	if err != nil || updated.ProjectPath != filepath.Join(projectB.RootDir, projectB.MltFileName) {
+		t.Fatalf("update project: %+v err=%v", updated, err)
+	}
+	if _, err := d.HeartbeatExternalInstance(ctx, first.Instance.ID); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+
+	owner, err := d.RegisterMcpContext(ctx, RegisterMcpContextParams{
+		ContextToken:           "token-a",
+		ACPSessionID:           "acp-a",
+		ChatProjectID:          projectA.ID,
+		DefaultTargetProjectID: projectA.ID,
+	})
+	if err != nil {
+		t.Fatalf("register MCP context: %v", err)
+	}
+	target, err := d.SetMcpProjectTarget(ctx, owner.ContextToken, projectB.ID)
+	if err != nil || target.ChatProjectID != projectA.ID || target.TargetProjectID != projectB.ID {
+		t.Fatalf("MCP target must be mutable without moving chat ownership: %+v err=%v", target, err)
+	}
+	if err := d.UnregisterExternalInstance(ctx, first.Instance.ID); err != nil {
+		t.Fatalf("unregister external instance: %v", err)
+	}
+	closed, err := d.Reg.GetExternalInstance(first.Instance.ID)
+	if err != nil || closed.Status != registry.ExternalStatusClosed {
+		t.Fatalf("expected closed external instance: %+v err=%v", closed, err)
+	}
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // TestDaemon_StopRequest covers the cross-platform stop path added to

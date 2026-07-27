@@ -64,6 +64,48 @@ type ProcessInstance struct {
 
 func (ProcessInstance) TableName() string { return "process_instances" }
 
+// ExternalInstance is the authoritative registration for a separately
+// launched Snapflow GUI. It is deliberately separate from ProcessInstance:
+// the latter is daemon-owned child-process state, while this record is a
+// lease held by an external process that the daemon must never launch or
+// kill implicitly.
+type ExternalInstance struct {
+	ID               string    `gorm:"primaryKey" json:"instanceId"`
+	InstanceNonce    string    `gorm:"uniqueIndex" json:"instanceNonce"`
+	PID              int       `json:"pid"`
+	ProcessStart     string    `json:"processStart"`
+	ProjectPath      string    `json:"projectPath,omitempty"`
+	SAPSocketPath    string    `json:"sapSocketPath,omitempty"`
+	CapabilitiesJSON string    `json:"capabilities,omitempty"`
+	Status           string    `json:"status"`
+	LastSeenAt       time.Time `json:"lastSeenAt"`
+	LeaseExpiresAt   time.Time `json:"leaseExpiresAt"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+}
+
+func (ExternalInstance) TableName() string { return "external_instances" }
+
+const (
+	ExternalStatusOpen   = "open"
+	ExternalStatusStale  = "stale"
+	ExternalStatusClosed = "closed"
+)
+
+// McpContext binds one opaque agent-session token to one chat owner and its
+// current target. The target is mutable, but the chat owner is not.
+type McpContext struct {
+	ContextToken           string    `gorm:"primaryKey" json:"contextToken"`
+	ACPSessionID           string    `gorm:"index" json:"acpSessionId"`
+	ChatProjectID          string    `json:"chatProjectId"`
+	DefaultTargetProjectID string    `json:"defaultTargetProjectId"`
+	TargetProjectID        string    `json:"targetProjectId"`
+	LastSeenAt             time.Time `json:"lastSeenAt"`
+	LeaseExpiresAt         time.Time `json:"leaseExpiresAt"`
+}
+
+func (McpContext) TableName() string { return "mcp_contexts" }
+
 // Process instance statuses, per 07's schema comment and 08's
 // two-liveness-signal discussion.
 const (

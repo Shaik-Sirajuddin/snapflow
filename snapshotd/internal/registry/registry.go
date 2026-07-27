@@ -47,7 +47,7 @@ func Open(path string) (*Registry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry: open %s: %w", path, err)
 	}
-	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &AuditEvent{}); err != nil {
+	if err := db.AutoMigrate(&Project{}, &ProcessInstance{}, &ExternalInstance{}, &McpContext{}, &AuditEvent{}); err != nil {
 		return nil, fmt.Errorf("registry: automigrate: %w", err)
 	}
 	return &Registry{db: db}, nil
@@ -222,6 +222,68 @@ func (r *Registry) UpdateProcessInstanceStatus(id, status string) error {
 
 func (r *Registry) TouchHealthCheck(id string) error {
 	return r.db.Model(&ProcessInstance{}).Where("id = ?", id).Update("last_health_check_at", time.Now().UTC()).Error
+}
+
+// GetExternalInstanceByNonce returns the one registration owned by a GUI
+// instance nonce, allowing reconnect/retry to be idempotent.
+func (r *Registry) GetExternalInstanceByNonce(nonce string) (*ExternalInstance, error) {
+	var instance ExternalInstance
+	if err := r.db.First(&instance, "instance_nonce = ?", nonce).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &instance, nil
+}
+
+func (r *Registry) GetExternalInstance(id string) (*ExternalInstance, error) {
+	var instance ExternalInstance
+	if err := r.db.First(&instance, "id = ?", id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &instance, nil
+}
+
+func (r *Registry) ListExternalInstances() ([]ExternalInstance, error) {
+	var out []ExternalInstance
+	if err := r.db.Order("updated_at desc").Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (r *Registry) SaveExternalInstance(instance *ExternalInstance) error {
+	return r.db.Save(instance).Error
+}
+
+func (r *Registry) GetMcpContext(token string) (*McpContext, error) {
+	var context McpContext
+	if err := r.db.First(&context, "context_token = ?", token).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &context, nil
+}
+
+func (r *Registry) SaveMcpContext(context *McpContext) error {
+	return r.db.Save(context).Error
+}
+
+func (r *Registry) DeleteMcpContext(token string) error {
+	result := r.db.Delete(&McpContext{}, "context_token = ?", token)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // --- Audit ---

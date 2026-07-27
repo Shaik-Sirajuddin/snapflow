@@ -10,10 +10,12 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,8 @@ import (
 	"snapshotd/internal/sapproxy"
 	"snapshotd/internal/session"
 )
+
+const externalInstanceLease = 30 * time.Second
 
 // Daemon is the shared core described above.
 type Daemon struct {
@@ -59,6 +63,182 @@ type Daemon struct {
 	// so a PID+signal-based `stop` command can never work there.
 	stopCh   chan struct{}
 	stopOnce sync.Once
+}
+
+type RegisterExternalInstanceParams struct {
+	InstanceNonce string         `json:"instanceNonce"`
+	PID           int            `json:"pid"`
+	ProcessStart  string         `json:"processStart"`
+	ProjectPath   string         `json:"projectPath,omitempty"`
+	SAPSocketPath string         `json:"sapSocketPath,omitempty"`
+	Capabilities  map[string]any `json:"capabilities,omitempty"`
+}
+
+type ExternalInstanceResult struct {
+	Instance       registry.ExternalInstance `json:"instance"`
+	HeartbeatEvery time.Duration             `json:"heartbeatEvery"`
+	LeaseDuration  time.Duration             `json:"leaseDuration"`
+}
+
+func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExternalInstanceParams) (ExternalInstanceResult, error) {
+	if strings.TrimSpace(p.InstanceNonce) == "" || p.PID <= 0 || strings.TrimSpace(p.ProcessStart) == "" {
+		return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: instanceNonce, pid, and processStart are required")
+	}
+	projectPath := ""
+	if p.ProjectPath != "" {
+		abs, err := filepath.Abs(p.ProjectPath)
+		if err != nil {
+			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: projectPath: %w", err)
+		}
+		projectPath = filepath.Clean(abs)
+	}
+	now := time.Now().UTC()
+	instance, err := d.Reg.GetExternalInstanceByNonce(p.InstanceNonce)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return ExternalInstanceResult{}, err
+	}
+	if instance == nil {
+		instance = &registry.ExternalInstance{ID: uuid.NewString(), InstanceNonce: p.InstanceNonce, CreatedAt: now}
+	}
+	capabilities, err := json.Marshal(p.Capabilities)
+	if err != nil {
+		return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: capabilities: %w", err)
+	}
+	instance.PID = p.PID
+	instance.ProcessStart = p.ProcessStart
+	instance.ProjectPath = projectPath
+	instance.SAPSocketPath = p.SAPSocketPath
+	instance.CapabilitiesJSON = string(capabilities)
+	instance.Status = registry.ExternalStatusOpen
+	instance.LastSeenAt = now
+	instance.LeaseExpiresAt = now.Add(externalInstanceLease)
+	instance.UpdatedAt = now
+	if err := d.Reg.SaveExternalInstance(instance); err != nil {
+		return ExternalInstanceResult{}, err
+	}
+	return ExternalInstanceResult{Instance: *instance, HeartbeatEvery: externalInstanceLease / 3, LeaseDuration: externalInstanceLease}, nil
+}
+
+type UpdateExternalProjectParams struct {
+	InstanceID  string `json:"instanceId"`
+	ProjectPath string `json:"projectPath,omitempty"`
+	Reason      string `json:"reason"`
+	Generation  uint64 `json:"generation"`
+}
+
+func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectParams) (registry.ExternalInstance, error) {
+	instance, err := d.Reg.GetExternalInstance(p.InstanceID)
+	if err != nil {
+		return registry.ExternalInstance{}, err
+	}
+	if p.Reason == "" {
+		return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: reason is required")
+	}
+	if p.ProjectPath != "" {
+		path, err := filepath.Abs(p.ProjectPath)
+		if err != nil {
+			return registry.ExternalInstance{}, err
+		}
+		instance.ProjectPath = filepath.Clean(path)
+	} else {
+		instance.ProjectPath = ""
+	}
+	instance.Status = registry.ExternalStatusOpen
+	instance.LastSeenAt = time.Now().UTC()
+	instance.LeaseExpiresAt = instance.LastSeenAt.Add(externalInstanceLease)
+	instance.UpdatedAt = instance.LastSeenAt
+	if err := d.Reg.SaveExternalInstance(instance); err != nil {
+		return registry.ExternalInstance{}, err
+	}
+	_ = d.Reg.Audit("", "external_project_"+p.Reason, fmt.Sprintf("instance=%s generation=%d", p.InstanceID, p.Generation))
+	return *instance, nil
+}
+
+func (d *Daemon) HeartbeatExternalInstance(ctx context.Context, instanceID string) (ExternalInstanceResult, error) {
+	instance, err := d.Reg.GetExternalInstance(instanceID)
+	if err != nil {
+		return ExternalInstanceResult{}, err
+	}
+	now := time.Now().UTC()
+	instance.Status = registry.ExternalStatusOpen
+	instance.LastSeenAt = now
+	instance.LeaseExpiresAt = now.Add(externalInstanceLease)
+	instance.UpdatedAt = now
+	if err := d.Reg.SaveExternalInstance(instance); err != nil {
+		return ExternalInstanceResult{}, err
+	}
+	return ExternalInstanceResult{Instance: *instance, HeartbeatEvery: externalInstanceLease / 3, LeaseDuration: externalInstanceLease}, nil
+}
+
+func (d *Daemon) UnregisterExternalInstance(ctx context.Context, instanceID string) error {
+	instance, err := d.Reg.GetExternalInstance(instanceID)
+	if errors.Is(err, registry.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	instance.Status = registry.ExternalStatusClosed
+	instance.LeaseExpiresAt = time.Now().UTC()
+	instance.UpdatedAt = time.Now().UTC()
+	return d.Reg.SaveExternalInstance(instance)
+}
+
+type RegisterMcpContextParams struct {
+	ContextToken           string `json:"contextToken"`
+	ACPSessionID           string `json:"acpSessionId"`
+	ChatProjectID          string `json:"chatProjectId"`
+	DefaultTargetProjectID string `json:"defaultTargetProjectId"`
+}
+
+func (d *Daemon) RegisterMcpContext(ctx context.Context, p RegisterMcpContextParams) (registry.McpContext, error) {
+	if strings.TrimSpace(p.ContextToken) == "" || strings.TrimSpace(p.ACPSessionID) == "" || strings.TrimSpace(p.ChatProjectID) == "" {
+		return registry.McpContext{}, fmt.Errorf("daemon: registerMcpContext: contextToken, acpSessionId, and chatProjectId are required")
+	}
+	if _, err := d.Reg.GetProject(p.ChatProjectID); err != nil {
+		return registry.McpContext{}, fmt.Errorf("daemon: registerMcpContext: chat project: %w", err)
+	}
+	if p.DefaultTargetProjectID == "" {
+		p.DefaultTargetProjectID = p.ChatProjectID
+	}
+	if _, err := d.Reg.GetProject(p.DefaultTargetProjectID); err != nil {
+		return registry.McpContext{}, fmt.Errorf("daemon: registerMcpContext: target project: %w", err)
+	}
+	contextRecord, err := d.Reg.GetMcpContext(p.ContextToken)
+	if err != nil && !errors.Is(err, registry.ErrNotFound) {
+		return registry.McpContext{}, err
+	}
+	if contextRecord == nil {
+		contextRecord = &registry.McpContext{ContextToken: p.ContextToken}
+	}
+	now := time.Now().UTC()
+	contextRecord.ACPSessionID = p.ACPSessionID
+	contextRecord.ChatProjectID = p.ChatProjectID
+	contextRecord.DefaultTargetProjectID = p.DefaultTargetProjectID
+	contextRecord.TargetProjectID = p.DefaultTargetProjectID
+	contextRecord.LastSeenAt = now
+	contextRecord.LeaseExpiresAt = now.Add(externalInstanceLease)
+	if err := d.Reg.SaveMcpContext(contextRecord); err != nil {
+		return registry.McpContext{}, err
+	}
+	return *contextRecord, nil
+}
+
+func (d *Daemon) SetMcpProjectTarget(ctx context.Context, token, projectID string) (registry.McpContext, error) {
+	contextRecord, err := d.Reg.GetMcpContext(token)
+	if err != nil {
+		return registry.McpContext{}, err
+	}
+	if _, err := d.Reg.GetProject(projectID); err != nil {
+		return registry.McpContext{}, fmt.Errorf("daemon: setMcpProjectTarget: target project: %w", err)
+	}
+	contextRecord.TargetProjectID = projectID
+	contextRecord.LastSeenAt = time.Now().UTC()
+	contextRecord.LeaseExpiresAt = contextRecord.LastSeenAt.Add(externalInstanceLease)
+	if err := d.Reg.SaveMcpContext(contextRecord); err != nil {
+		return registry.McpContext{}, err
+	}
+	return *contextRecord, nil
 }
 
 // RequestStop signals StopRequested's channel exactly once (idempotent --
@@ -482,6 +662,55 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 
 	case "daemon.listProjects":
 		return d.ListProjects(ctx)
+
+	case "daemon.registerExternalInstance":
+		var p RegisterExternalInstanceParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.RegisterExternalInstance(ctx, p)
+
+	case "daemon.updateOpenProject":
+		var p UpdateExternalProjectParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.UpdateOpenProject(ctx, p)
+
+	case "daemon.heartbeat":
+		var p struct {
+			InstanceID string `json:"instanceId"`
+		}
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.HeartbeatExternalInstance(ctx, p.InstanceID)
+
+	case "daemon.unregisterExternalInstance":
+		var p struct {
+			InstanceID string `json:"instanceId"`
+		}
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return nil, d.UnregisterExternalInstance(ctx, p.InstanceID)
+
+	case "daemon.registerMcpContext":
+		var p RegisterMcpContextParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.RegisterMcpContext(ctx, p)
+
+	case "daemon.setMcpProjectTarget":
+		var p struct {
+			ContextToken string `json:"contextToken"`
+			ProjectID    string `json:"projectId"`
+		}
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.SetMcpProjectTarget(ctx, p.ContextToken, p.ProjectID)
 
 	case "daemon.launch":
 		var p LaunchParams
