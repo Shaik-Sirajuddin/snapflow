@@ -80,6 +80,10 @@ type LaunchOptions struct {
 	// (kept optional so callers that only care about ProjectRoot, e.g.
 	// older tests, don't need updating).
 	MltFileName string
+
+	// ProjectType is "folder" | "file", forwarded as SNAPSHOT_PROJECT_TYPE
+	// so the first bind-only open can set MLT.projectFolder before save.
+	ProjectType string
 }
 
 // Manager launches and tracks per-project child processes.
@@ -349,6 +353,7 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		"SNAPSHOT_HEADLESS="+headlessVal,
 		"SNAPSHOT_PROJECT_ROOT="+opts.ProjectRoot,
 		"SNAPSHOT_PROJECT_MLT_FILENAME="+opts.MltFileName,
+		"SNAPSHOT_PROJECT_TYPE="+opts.ProjectType,
 		"SNAPSHOT_AUDIO_ENABLED="+audioEnabledVal,
 	)
 	// The child's own embedded chat panel (panel-rust's agent_bridge.rs)

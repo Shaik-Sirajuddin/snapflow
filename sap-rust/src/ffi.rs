@@ -479,6 +479,27 @@ extern "C" {
     /// filename is invalid.
     pub fn sap_set_project_file(main_window_handle: *mut c_void, filename: *const c_char) -> c_int;
 
+    /// C++ side: `int sap_open_project(void* mainWindowHandle, const char*
+    /// path);` -- headless-safe load of an existing `.mlt` via
+    /// `MainWindow::openForSap`. Returns 0 on success, -1 on failure.
+    pub fn sap_open_project(main_window_handle: *mut c_void, path: *const c_char) -> c_int;
+
+    /// C++ side: `int sap_close_project(void* mainWindowHandle);` -- resets
+    /// to untitled/empty without quitting. Not wired to MCP project.exit
+    /// in the current plan (session Unbind only).
+    pub fn sap_close_project(main_window_handle: *mut c_void) -> c_int;
+
+    /// C++ side: `int sap_is_project_folder(void* mainWindowHandle);`
+    /// 1 = folder-type, 0 = file-type, -1 = error.
+    pub fn sap_is_project_folder(main_window_handle: *mut c_void) -> c_int;
+
+    /// C++ side: `int sap_set_project_folder(void* mainWindowHandle, const
+    /// char* folder);` — empty/null clears (file-type).
+    pub fn sap_set_project_folder(
+        main_window_handle: *mut c_void,
+        folder: *const c_char,
+    ) -> c_int;
+
     /// C++ side: `int sap_export_project_xml(void* mainWindowHandle, const
     /// char* outputXmlPath);` -- writes the current project (via the real
     /// `MainWindow::saveXML()`) to an arbitrary scratch path as a

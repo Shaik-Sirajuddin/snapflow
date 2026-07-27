@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -463,24 +464,165 @@ type CreateProjectParams struct {
 }
 
 func (d *Daemon) CreateProject(ctx context.Context, p CreateProjectParams) (registry.Project, error) {
+	// Deprecated thin wrapper: name-only create under Cfg.ProjectsRoot.
 	if p.Name == "" {
 		return registry.Project{}, fmt.Errorf("daemon: createProject: name is required")
 	}
-	root := filepath.Join(d.Cfg.ProjectsRoot, p.Name)
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return registry.Project{}, fmt.Errorf("daemon: createProject: mkdir %s: %w", root, err)
+	return d.ProjectCreate(ctx, ProjectCreateParams{
+		Path: filepath.Join(d.Cfg.ProjectsRoot, p.Name),
+	})
+}
+
+// ProjectCreateParams implements project.create (path-first).
+type ProjectCreateParams struct {
+	// Path is an arbitrary filesystem path for the project folder (or parent
+	// for file-type). Required unless Name is set (legacy name-only).
+	Path string `json:"path"`
+	// Name is only used when Path is empty: creates under Cfg.ProjectsRoot/Name
+	// (daemon.createProject compatibility).
+	Name string `json:"name,omitempty"`
+	// Open when true: caller should chain project.open+project.save after
+	// create (MCP tool does this). The daemon method itself only mkdir+register.
+	Open *bool `json:"open,omitempty"`
+	// MltFileName defaults to project.mlt.
+	MltFileName string `json:"mltFileName,omitempty"`
+	// ProjectType is "folder" (default) or "file".
+	ProjectType string `json:"projectType,omitempty"`
+}
+
+// ProjectCreateResult is project.create's response.
+type ProjectCreateResult struct {
+	Project     registry.Project `json:"project"`
+	MltCreated  bool             `json:"mltCreated"`
+	ProjectState json.RawMessage `json:"projectState,omitempty"`
+}
+
+// ProjectCreate creates a project folder at an arbitrary path and registers it.
+// Does not launch/open; open:true chaining is done by the MCP tool layer.
+func (d *Daemon) ProjectCreate(ctx context.Context, p ProjectCreateParams) (registry.Project, error) {
+	root := strings.TrimSpace(p.Path)
+	if root == "" {
+		if p.Name == "" {
+			return registry.Project{}, fmt.Errorf("daemon: project.create: path or name is required")
+		}
+		root = filepath.Join(d.Cfg.ProjectsRoot, p.Name)
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return registry.Project{}, fmt.Errorf("daemon: project.create: path: %w", err)
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return registry.Project{}, fmt.Errorf("daemon: project.create: mkdir %s: %w", abs, err)
+	}
+	mlt := p.MltFileName
+	if mlt == "" {
+		mlt = registry.DefaultMltFileName
+	}
+	ptype := p.ProjectType
+	if ptype == "" {
+		ptype = registry.ProjectTypeFolder
+	}
+	if ptype != registry.ProjectTypeFolder && ptype != registry.ProjectTypeFile {
+		return registry.Project{}, fmt.Errorf("daemon: project.create: projectType must be folder or file")
+	}
+	// If already registered at this root, return existing.
+	if existing, err := d.Reg.ListProjects(); err == nil {
+		for _, e := range existing {
+			if e.RootDir == abs {
+				registry.FillProjectPathFields(&e)
+				return e, nil
+			}
+		}
 	}
 	proj := registry.Project{
 		ID:          uuid.NewString(),
-		RootDir:     root,
-		MltFileName: registry.DefaultMltFileName,
+		RootDir:     abs,
+		MltFileName: mlt,
+		ProjectType: ptype,
 		Status:      "active",
 	}
 	if err := d.Reg.CreateProject(&proj); err != nil {
 		return registry.Project{}, err
 	}
-	_ = d.Reg.Audit(proj.ID, registry.AuditCreate, "created project folder "+root)
+	_ = d.Reg.Audit(proj.ID, registry.AuditCreate, "created project at "+abs)
+	registry.FillProjectPathFields(&proj)
 	return proj, nil
+}
+
+// ProjectCloneParams implements project.clone.
+type ProjectCloneParams struct {
+	SourcePath string `json:"sourcePath"`
+	DestPath   string `json:"destPath"`
+	Open       *bool  `json:"open,omitempty"`
+}
+
+// ProjectClone copies a project directory tree and registers a new row.
+func (d *Daemon) ProjectClone(ctx context.Context, p ProjectCloneParams) (registry.Project, error) {
+	if strings.TrimSpace(p.SourcePath) == "" || strings.TrimSpace(p.DestPath) == "" {
+		return registry.Project{}, fmt.Errorf("daemon: project.clone: sourcePath and destPath are required")
+	}
+	src, err := d.resolveOrRegisterProjectByPath(p.SourcePath)
+	if err != nil {
+		return registry.Project{}, fmt.Errorf("daemon: project.clone: source: %w", err)
+	}
+	destAbs, err := filepath.Abs(p.DestPath)
+	if err != nil {
+		return registry.Project{}, err
+	}
+	if _, err := os.Stat(destAbs); err == nil {
+		return registry.Project{}, fmt.Errorf("daemon: project.clone: destPath already exists: %s", destAbs)
+	}
+	if err := copyDir(src.RootDir, destAbs); err != nil {
+		return registry.Project{}, fmt.Errorf("daemon: project.clone: copy: %w", err)
+	}
+	proj := registry.Project{
+		ID:          uuid.NewString(),
+		RootDir:     destAbs,
+		MltFileName: src.MltFileName,
+		ProjectType: src.ProjectType,
+		Status:      "active",
+	}
+	if proj.ProjectType == "" {
+		proj.ProjectType = registry.ProjectTypeFolder
+	}
+	if err := d.Reg.CreateProject(&proj); err != nil {
+		return registry.Project{}, err
+	}
+	_ = d.Reg.Audit(proj.ID, registry.AuditCreate, "cloned from "+src.RootDir+" to "+destAbs)
+	registry.FillProjectPathFields(&proj)
+	return proj, nil
+}
+
+// copyDir recursively copies src directory to dst.
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode())
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+		if err != nil {
+			return err
+		}
+		defer out.Close()
+		_, err = io.Copy(out, in)
+		return err
+	})
 }
 
 // DeleteProject implements daemon.deleteProject. It removes the registry row
@@ -582,6 +724,7 @@ func (d *Daemon) Launch(ctx context.Context, p LaunchParams) (LaunchResult, erro
 		Headless:     headless,
 		ProjectRoot:  proj.RootDir,
 		MltFileName:  proj.MltFileName,
+		ProjectType:  proj.ProjectType,
 		AudioEnabled: d.Cfg.AudioEnabled,
 	})
 	if err != nil {
@@ -632,12 +775,18 @@ func (d *Daemon) resolveOrRegisterProjectByPath(path string) (registry.Project, 
 		ID:          uuid.NewString(),
 		RootDir:     rootDir,
 		MltFileName: mltFileName,
+		ProjectType: registry.ProjectTypeFolder,
 		Status:      "active",
+	}
+	// Bare .mlt path registration defaults to file-type until open reads the flag.
+	if !info.IsDir() {
+		proj.ProjectType = registry.ProjectTypeFile
 	}
 	if err := d.Reg.CreateProject(&proj); err != nil {
 		return registry.Project{}, err
 	}
 	_ = d.Reg.Audit(proj.ID, registry.AuditCreate, "registered from launch path "+rootDir)
+	registry.FillProjectPathFields(&proj)
 	return proj, nil
 }
 
@@ -711,21 +860,47 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 		d.Log.Info("mcp sap edit call", args...)
 	}
 
-	if method == "project.select" {
+	// project.open is the primary name; project.select is the deprecated alias.
+	// Both share this Launch-or-reuse + Bind path.
+	if method == "project.select" || method == "project.open" {
 		var p struct {
-			ProjectID string `json:"projectId"`
+			ProjectID   string `json:"projectId"`
+			Path        string `json:"path"`
+			ProjectPath string `json:"projectPath"` // alias of path (daemon.launch shape)
 		}
 		if err := unmarshalParams(params, &p); err != nil {
 			logMethod(err)
 			return nil, err
 		}
+		path := p.Path
+		if path == "" {
+			path = p.ProjectPath
+		}
+		if p.ProjectID == "" && path != "" {
+			proj, err := d.resolveOrRegisterProjectByPath(path)
+			if err != nil {
+				err = fmt.Errorf("daemon: project.select: path: %w", err)
+				logMethod(err)
+				return nil, err
+			}
+			p.ProjectID = proj.ID
+		}
 		if p.ProjectID == "" {
-			err := fmt.Errorf("daemon: project.select: projectId is required")
+			err := fmt.Errorf("daemon: project.select: projectId or path is required")
 			logMethod(err)
 			return nil, err
 		}
 		if _, err := d.Reg.GetProject(p.ProjectID); err != nil {
 			err = fmt.Errorf("daemon: project.select: %w", err)
+			logMethod(err, "projectId", p.ProjectID)
+			return nil, err
+		}
+		// Launch-or-reuse before Bind so project.select / project.open
+		// do not require a separate daemon.launch. Proc.Launch's
+		// findLiveInstance path reuses an already-running child.
+		headless := true
+		if _, err := d.Launch(ctx, LaunchParams{ProjectID: p.ProjectID, Headless: &headless}); err != nil {
+			err = fmt.Errorf("daemon: project.select: launch: %w", err)
 			logMethod(err, "projectId", p.ProjectID)
 			return nil, err
 		}
@@ -735,23 +910,36 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 			return nil, err
 		}
 		_ = d.Sessions.BindProject(sessionID, p.ProjectID)
+		// Init audit + persist projectType from response.
+		var st struct {
+			Opened      bool   `json:"opened"`
+			ProjectType string `json:"projectType"`
+		}
+		if json.Unmarshal(result, &st) == nil {
+			if st.Opened {
+				_ = d.Reg.AuditOnce(p.ProjectID, registry.AuditInit, "project.select opened")
+			}
+			if st.ProjectType == registry.ProjectTypeFolder || st.ProjectType == registry.ProjectTypeFile {
+				_ = d.Reg.UpdateProjectType(p.ProjectID, st.ProjectType)
+			}
+		}
 		logMethod(nil, "projectId", p.ProjectID)
 		return result, nil
 	}
 
-	if method == "project.exit" {
+	// project.close is the primary name; project.exit is the deprecated alias.
+	if method == "project.exit" || method == "project.close" {
 		// Deliberately NOT forwarded to sap-rust: internal/sapproxy pools one
 		// SAP connection per project, shared by every session bound to that
 		// project, and sap-rust's own project.select gate lives on that one
 		// shared connection (see sap-rust/src/server.rs's per-connection
 		// `session.project_id`), not per Go-level session. Forwarding a raw
 		// "project.exit" through the shared connection would unselect the
-		// project for every OTHER session still bound to it too. "Exit" is
-		// therefore purely local bookkeeping: it clears this session's own
-		// Router binding (sapproxy.Router.Unbind) so a later project.select
+		// project for every OTHER session still bound to it too. Close/exit
+		// is therefore purely local bookkeeping: it clears this session's own
+		// Router binding (sapproxy.Router.Unbind) so a later project.open
 		// -- possibly to a different project -- is no longer rejected by
-		// Bind's already-bound guard. This matches sap-rust's own
-		// project.exit being harmless/idempotent when called while unbound.
+		// Bind's already-bound guard.
 		d.SAP.Unbind(sessionID)
 		_ = d.Sessions.BindProject(sessionID, "")
 		logMethod(nil)
@@ -832,6 +1020,27 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return d.CreateProject(ctx, p)
+
+	case "project.create":
+		var p ProjectCreateParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		proj, err := d.ProjectCreate(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		return ProjectCreateResult{Project: proj, MltCreated: false}, nil
+
+	case "project.clone":
+		var p ProjectCloneParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.ProjectClone(ctx, p)
+
+	case "project.list":
+		return d.ListProjects(ctx)
 
 	case "daemon.deleteProject":
 		var p struct {

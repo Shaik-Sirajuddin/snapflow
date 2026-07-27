@@ -202,6 +202,17 @@ pub struct ProjectState {
     pub dirty: bool,
     pub undo_depth: usize,
     pub redo_depth: usize,
+    /// True after this process completed its one-time open/bind
+    /// (`FfiBackend.opened` / mock project presence). Lets the daemon log
+    /// a single `init` audit row when a `project.select` response first
+    /// reports the live project is open, without inventing a new SAP
+    /// method.
+    #[serde(default)]
+    pub opened: bool,
+    /// `"folder"` | `"file"` from the live `kSnapflowProjectFolder` /
+    /// `MLT.projectFolder()` flag after open (empty when unknown).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_type: String,
 }
 
 /// A meaningful subset of 01-jsonrpc-spec.md's method surface — enough to
@@ -719,6 +730,15 @@ impl MockBackend {
             dirty: data.map(|d| d.dirty).unwrap_or(false),
             undo_depth: data.map(|d| d.undo_depth).unwrap_or(0),
             redo_depth: data.map(|d| d.redo_depth).unwrap_or(0),
+            // Mock: presence in the in-memory map means this project was
+            // selected (project_select inserts via project_mut).
+            opened: data.is_some(),
+            // Mock has no real MLT flag; default folder-type when present.
+            project_type: if data.is_some() {
+                "folder".to_string()
+            } else {
+                String::new()
+            },
         }
     }
 }
@@ -2404,6 +2424,19 @@ mod tests {
         // grow the list -- same dedupe contract `recent_add` already has.
         b.project_select("proj").unwrap();
         assert_eq!(b.recent_list("proj").unwrap(), vec!["proj".to_string()]);
+    }
+
+    /// project-open-init-close: ProjectState.opened is true after select so
+    /// the daemon can emit a single init audit row.
+    #[test]
+    fn project_select_sets_opened_true() {
+        let mut b = MockBackend::new();
+        let state = b.project_select("proj").unwrap();
+        assert!(state.opened, "first select must report opened=true");
+        let again = b.project_select("proj").unwrap();
+        assert!(again.opened, "re-select must still report opened=true");
+        let get = b.project_get_state("proj").unwrap();
+        assert!(get.opened);
     }
 
     #[test]

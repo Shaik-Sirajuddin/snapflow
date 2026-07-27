@@ -518,6 +518,27 @@ impl SnapshotdControlClient {
         self.call("daemon.listProjects", json!({})).await
     }
 
+    /// Open (or attach to) a project via the control socket. Reaches the
+    /// same ForwardSAP `project.select` / Router.Bind path as the MCP
+    /// tool of that name -- first select loads .mlt; later attaches reuse
+    /// the pooled process/connection without reloading.
+    pub async fn open_project(&self, project_id: &str) -> Result<Value, SnapshotdClientError> {
+        self.call("project.open", json!({"projectId": project_id}))
+            .await
+    }
+
+    /// Open or attach via filesystem path (folder or .mlt).
+    pub async fn open_project_path(&self, path: &str) -> Result<Value, SnapshotdClientError> {
+        self.call("project.open", json!({"path": path})).await
+    }
+
+    /// Release this control-socket session's project binding. Other
+    /// sessions bound to the same project are unaffected (Router.Unbind
+    /// only). Same semantics as MCP `project.close`.
+    pub async fn close_project(&self) -> Result<Value, SnapshotdClientError> {
+        self.call("project.close", json!({})).await
+    }
+
     pub async fn subscribe_projects(&self) -> Result<Value, SnapshotdClientError> {
         self.call("daemon.subscribeProjects", json!({})).await
     }
