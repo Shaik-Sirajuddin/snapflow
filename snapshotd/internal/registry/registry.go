@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -144,6 +145,38 @@ func (r *Registry) ListProjects() ([]Project, error) {
 	var out []Project
 	if err := r.db.Order("created_at asc").Find(&out).Error; err != nil {
 		return nil, err
+	}
+	instances, err := r.ListExternalInstances()
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		projectRoot := filepath.Clean(out[i].RootDir)
+		for _, instance := range instances {
+			if instance.ProjectPath == "" {
+				continue
+			}
+			instanceRoot := filepath.Clean(instance.ProjectPath)
+			if filepath.Ext(instanceRoot) == ".mlt" {
+				instanceRoot = filepath.Dir(instanceRoot)
+			} else if info, statErr := os.Stat(instanceRoot); statErr == nil && !info.IsDir() {
+				instanceRoot = filepath.Dir(instanceRoot)
+			}
+			if instanceRoot != projectRoot {
+				continue
+			}
+			out[i].InstanceCount++
+			if instance.Status == ExternalStatusOpen && instance.LeaseExpiresAt.After(time.Now().UTC()) {
+				out[i].Open = true
+				out[i].DiscoveryState = "registered"
+			}
+			if instance.LastSeenAt.After(out[i].LastSeenAt) {
+				out[i].LastSeenAt = instance.LastSeenAt
+			}
+		}
+		if out[i].DiscoveryState == "" {
+			out[i].DiscoveryState = "known"
+		}
 	}
 	return out, nil
 }

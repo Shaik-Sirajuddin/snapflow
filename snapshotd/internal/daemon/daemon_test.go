@@ -213,6 +213,43 @@ func TestDaemon_ExternalRegistrationAndMcpContextIsolation(t *testing.T) {
 	}
 }
 
+func TestDaemon_ReconcileExternalLeaseAndProjectAggregate(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "aggregate"})
+	if err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	registered, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "aggregate-nonce",
+		PID:           os.Getpid(),
+		ProcessStart:  "aggregate-start",
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	projects, err := d.ListProjects(ctx)
+	if err != nil || len(projects) != 1 || !projects[0].Open || projects[0].InstanceCount != 1 {
+		t.Fatalf("expected registered project aggregate, projects=%+v err=%v", projects, err)
+	}
+	row, err := d.Reg.GetExternalInstance(registered.Instance.ID)
+	if err != nil {
+		t.Fatalf("get external instance: %v", err)
+	}
+	row.LeaseExpiresAt = time.Now().UTC().Add(-time.Second)
+	if err := d.Reg.SaveExternalInstance(row); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	if _, err := d.ReconcileExternalInstances(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	row, err = d.Reg.GetExternalInstance(registered.Instance.ID)
+	if err != nil || row.Status != registry.ExternalStatusStale {
+		t.Fatalf("expected stale lease: %+v err=%v", row, err)
+	}
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // TestDaemon_StopRequest covers the cross-platform stop path added to

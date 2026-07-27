@@ -17,12 +17,16 @@ import "time"
 // usually "project.mlt" but honors an existing filename for project.open on
 // legacy projects that don't follow the folder convention.
 type Project struct {
-	ID           string `gorm:"primaryKey"`
-	RootDir      string `gorm:"uniqueIndex"`
-	MltFileName  string
-	CreatedAt    time.Time
-	LastOpenedAt time.Time
-	Status       string // "active" | "archived"
+	ID             string `gorm:"primaryKey"`
+	RootDir        string `gorm:"uniqueIndex"`
+	MltFileName    string
+	CreatedAt      time.Time
+	LastOpenedAt   time.Time
+	Status         string    // "active" | "archived"
+	Open           bool      `gorm:"-" json:"open"`
+	InstanceCount  int       `gorm:"-" json:"instanceCount"`
+	LastSeenAt     time.Time `gorm:"-" json:"lastSeenAt,omitempty"`
+	DiscoveryState string    `gorm:"-" json:"discoveryState"`
 }
 
 // TableName pins the table name explicitly so it doesn't depend on GORM's
@@ -78,6 +82,9 @@ type ExternalInstance struct {
 	SAPSocketPath    string    `json:"sapSocketPath,omitempty"`
 	CapabilitiesJSON string    `json:"capabilities,omitempty"`
 	Status           string    `json:"status"`
+	Source           string    `json:"source"`
+	Generation       uint64    `json:"generation"`
+	LifecycleReason  string    `json:"lifecycleReason,omitempty"`
 	LastSeenAt       time.Time `json:"lastSeenAt"`
 	LeaseExpiresAt   time.Time `json:"leaseExpiresAt"`
 	CreatedAt        time.Time `json:"createdAt"`

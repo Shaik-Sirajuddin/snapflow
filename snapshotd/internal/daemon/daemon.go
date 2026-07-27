@@ -110,6 +110,7 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	instance.SAPSocketPath = p.SAPSocketPath
 	instance.CapabilitiesJSON = string(capabilities)
 	instance.Status = registry.ExternalStatusOpen
+	instance.Source = "external_registered"
 	instance.LastSeenAt = now
 	instance.LeaseExpiresAt = now.Add(externalInstanceLease)
 	instance.UpdatedAt = now
@@ -144,6 +145,8 @@ func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectP
 		instance.ProjectPath = ""
 	}
 	instance.Status = registry.ExternalStatusOpen
+	instance.Generation = p.Generation
+	instance.LifecycleReason = p.Reason
 	instance.LastSeenAt = time.Now().UTC()
 	instance.LeaseExpiresAt = instance.LastSeenAt.Add(externalInstanceLease)
 	instance.UpdatedAt = instance.LastSeenAt
@@ -182,6 +185,29 @@ func (d *Daemon) UnregisterExternalInstance(ctx context.Context, instanceID stri
 	instance.LeaseExpiresAt = time.Now().UTC()
 	instance.UpdatedAt = time.Now().UTC()
 	return d.Reg.SaveExternalInstance(instance)
+}
+
+// ReconcileExternalInstances expires external leases without ever launching
+// or killing a GUI process. A PID is only a liveness hint; processStart is
+// retained in the record so a future platform-specific identity check can
+// reject PID reuse without changing the wire contract.
+func (d *Daemon) ReconcileExternalInstances(ctx context.Context) ([]registry.ExternalInstance, error) {
+	instances, err := d.Reg.ListExternalInstances()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	for i := range instances {
+		if instances[i].Status == registry.ExternalStatusOpen &&
+			(instances[i].LeaseExpiresAt.Before(now) || !health.PIDAlive(instances[i].PID)) {
+			instances[i].Status = registry.ExternalStatusStale
+			instances[i].UpdatedAt = now
+			if err := d.Reg.SaveExternalInstance(&instances[i]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return d.Reg.ListExternalInstances()
 }
 
 type RegisterMcpContextParams struct {
@@ -323,6 +349,9 @@ func (d *Daemon) Reconcile(ctx context.Context) ([]registry.ReconcileOutcome, er
 	}
 	for _, o := range outcomes {
 		d.Log.Info("reconcile", "instance", o.Instance.ID, "action", o.Action, "err", o.Err)
+	}
+	if _, err := d.ReconcileExternalInstances(ctx); err != nil {
+		return nil, fmt.Errorf("daemon: reconcile external instances: %w", err)
 	}
 	return outcomes, nil
 }
