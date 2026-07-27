@@ -79,12 +79,111 @@ enum RegistrationCommand {
     Stop,
 }
 
+#[cfg(unix)]
+struct DiscoveryEndpoint {
+    stop: Sender<()>,
+    descriptor: PathBuf,
+    socket: PathBuf,
+    project_path: Arc<Mutex<Option<String>>>,
+}
+
+#[cfg(unix)]
+impl DiscoveryEndpoint {
+    fn start(home: &Path, nonce: &str, project_path: Option<String>) -> Option<Self> {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        let apps = home.join("apps");
+        std::fs::create_dir_all(&apps).ok()?;
+        let socket = apps.join(format!("{}-{}.sock", std::process::id(), nonce));
+        let descriptor = apps.join(format!("{}-{}.json", std::process::id(), nonce));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).ok()?;
+        listener.set_nonblocking(true).ok()?;
+        let project_path = Arc::new(Mutex::new(project_path));
+        let project_for_thread = Arc::clone(&project_path);
+        let nonce_for_thread = nonce.to_owned();
+        let process_start = process_start_identity();
+        let descriptor_value = json!({
+            "endpoint": socket,
+            "pid": std::process::id(),
+            "processStart": process_start,
+            "instanceNonce": nonce,
+            "protocolVersion": 1,
+        });
+        std::fs::write(&descriptor, serde_json::to_vec(&descriptor_value).ok()?).ok()?;
+        let (stop, stop_rx) = mpsc::channel();
+        let descriptor_for_thread = descriptor.clone();
+        let socket_for_thread = socket.clone();
+        std::thread::Builder::new()
+            .name("snapshotd-discovery".into())
+            .spawn(move || {
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut line = String::new();
+                            if std::io::BufReader::new(&stream).read_line(&mut line).is_ok() {
+                                if let Ok(request) = serde_json::from_str::<Value>(&line) {
+                                    let challenge = request["params"]["challenge"]
+                                        .as_str()
+                                        .unwrap_or_default();
+                                    let project = project_for_thread
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .clone();
+                                    let response = json!({
+                                        "jsonrpc": "2.0", "id": request["id"], "result": {
+                                            "instanceNonce": nonce_for_thread,
+                                            "pid": std::process::id(),
+                                            "processStart": process_start,
+                                            "projectPath": project,
+                                            "challenge": challenge,
+                                        }
+                                    });
+                                    let _ = writeln!(stream, "{response}");
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = std::fs::remove_file(descriptor_for_thread);
+                let _ = std::fs::remove_file(socket_for_thread);
+            })
+            .ok()?;
+        Some(Self { stop, descriptor, socket, project_path })
+    }
+
+    fn update(&self, project_path: Option<String>) {
+        *self
+            .project_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = project_path;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DiscoveryEndpoint {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        let _ = std::fs::remove_file(&self.descriptor);
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
 /// Owns the non-UI lifecycle loop for one external Snapflow process. The
 /// registration and heartbeat never run on the Slint/Qt thread; the returned
 /// handle only sends small commands to the worker.
 pub struct SnapshotdRegistration {
     commands: Sender<RegistrationCommand>,
     instance_id: Arc<Mutex<Option<String>>>,
+    #[cfg(unix)]
+    discovery: DiscoveryEndpoint,
 }
 
 impl SnapshotdRegistration {
@@ -101,6 +200,7 @@ impl SnapshotdRegistration {
                 .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd")))?;
             let client = SnapshotdControlClient::new(home.join("control.sock"));
             let nonce = uuid::Uuid::new_v4().to_string();
+            let discovery = DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone())?;
             let (commands, receiver) = mpsc::channel();
             let instance_id = Arc::new(Mutex::new(None));
             let published_id = Arc::clone(&instance_id);
@@ -115,10 +215,10 @@ impl SnapshotdRegistration {
                         }
                     };
                     let registration = ExternalInstanceRegistration {
-                        instance_nonce: nonce,
+                        instance_nonce: nonce.clone(),
                         pid: std::process::id(),
                         process_start: process_start_identity(),
-                        project_path: initial_project_path,
+                        project_path: initial_project_path.clone(),
                         sap_socket_path: None,
                         capabilities: Some(json!({"lifecycle": true, "mcpContexts": true})),
                     };
@@ -160,11 +260,13 @@ impl SnapshotdRegistration {
                     }
                 })
                 .ok()?;
-            Some(Self { commands, instance_id })
+            Some(Self { commands, instance_id, discovery })
         }
     }
 
     pub fn update(&self, project_path: Option<String>, reason: impl Into<String>, generation: u64) {
+        #[cfg(unix)]
+        self.discovery.update(project_path.clone());
         let _ = self.commands.send(RegistrationCommand::Update { project_path, reason: reason.into(), generation });
     }
 
