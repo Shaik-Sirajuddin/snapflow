@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"snapshotd/internal/config"
+	"snapshotd/internal/discovery"
 	"snapshotd/internal/health"
 	"snapshotd/internal/mcpsupervisor"
 	"snapshotd/internal/procmgr"
@@ -185,6 +186,10 @@ func (d *Daemon) UnregisterExternalInstance(ctx context.Context, instanceID stri
 	instance.LeaseExpiresAt = time.Now().UTC()
 	instance.UpdatedAt = time.Now().UTC()
 	return d.Reg.SaveExternalInstance(instance)
+}
+
+func (d *Daemon) DiscoverExternalInstances(ctx context.Context) ([]discovery.Candidate, error) {
+	return discovery.ScanAndPing(filepath.Join(d.Cfg.HomeDir, "apps"))
 }
 
 // ReconcileExternalInstances expires external leases without ever launching
@@ -740,6 +745,9 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 			return nil, err
 		}
 		return d.SetMcpProjectTarget(ctx, p.ContextToken, p.ProjectID)
+
+	case "daemon.discoverExternalInstances":
+		return d.DiscoverExternalInstances(ctx)
 
 	case "daemon.launch":
 		var p LaunchParams
