@@ -30,8 +30,16 @@ import (
 func realSapRustBinary(t *testing.T) string {
 	t.Helper()
 	repoRoot := filepath.Join("..", "..", "..")
-	matches, err := filepath.Glob(filepath.Join(repoRoot, "shotcut", "build*", "src", "shotcut"))
-	if err == nil {
+	// Prefer rebranded snapflow binary; fall back to legacy shotcut name.
+	patterns := []string{
+		filepath.Join(repoRoot, "shotcut", "build*", "src", "snapflow"),
+		filepath.Join(repoRoot, "shotcut", "build*", "src", "shotcut"),
+	}
+	for _, pat := range patterns {
+		matches, err := filepath.Glob(pat)
+		if err != nil {
+			continue
+		}
 		for _, candidate := range matches {
 			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
 				abs, absErr := filepath.Abs(candidate)
@@ -42,7 +50,7 @@ func realSapRustBinary(t *testing.T) string {
 			}
 		}
 	}
-	t.Skip("real Qt/real_ffi shotcut binary not found under shotcut/build*/src/shotcut; run `cmake -S shotcut -B shotcut/build-real-ffi -G Ninja && ninja -C shotcut/build-real-ffi` first to run this integration test")
+	t.Skip("real Qt/real_ffi snapflow/shotcut binary not found under shotcut/build*/src/{snapflow,shotcut}; run `cmake -S shotcut -B shotcut/build-real-ffi -G Ninja && ninja -C shotcut/build-real-ffi snapflow` first to run this integration test")
 	return ""
 }
 
@@ -366,6 +374,10 @@ func TestForwardSAP_RealSapRust_PhaseB_SameProjectConcurrentSessions(t *testing.
 	if _, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "edit.addTrack", mustJSON(t, map[string]any{"kind": "video"})); err != nil {
 		t.Fatalf("edit.addTrack: %v", err)
 	}
+	// Selection-state gate: appendClip requires track.enter (mcp-selection-state).
+	if _, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "track.enter", mustJSON(t, map[string]any{"trackIndex": 0})); err != nil {
+		t.Fatalf("track.enter: %v", err)
+	}
 	clipRaw, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "edit.appendClip", mustJSON(t, map[string]any{
 		"trackIndex": 0,
 		"source":     map[string]any{"playlistIndex": 0},
@@ -380,6 +392,10 @@ func TestForwardSAP_RealSapRust_PhaseB_SameProjectConcurrentSessions(t *testing.
 	clipID, _ := clip["clipId"].(string)
 	if clipID == "" {
 		t.Fatalf("expected clipId in edit.appendClip result, got %+v", clip)
+	}
+	// Selection-state gate: filter.* requires clip.enter.
+	if _, err := d.ForwardSAP(ctx, "phaseb-a", sinkA, "clip.enter", mustJSON(t, map[string]any{"clipId": clipID})); err != nil {
+		t.Fatalf("clip.enter A: %v", err)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -400,6 +416,13 @@ func TestForwardSAP_RealSapRust_PhaseB_SameProjectConcurrentSessions(t *testing.
 		"clipId": clipID, "filterIndex": 0, "property": "level", "value": 0.25,
 	})); err != nil {
 		t.Fatalf("filter.setProperty (A, first): %v", err)
+	}
+	// Session B must enter the same track/clip before filter writes (selection is per-session).
+	if _, err := d.ForwardSAP(ctx, "phaseb-b", sinkB, "track.enter", mustJSON(t, map[string]any{"trackIndex": 0})); err != nil {
+		t.Fatalf("track.enter B: %v", err)
+	}
+	if _, err := d.ForwardSAP(ctx, "phaseb-b", sinkB, "clip.enter", mustJSON(t, map[string]any{"clipId": clipID})); err != nil {
+		t.Fatalf("clip.enter B: %v", err)
 	}
 	// Session B writes last: last-write-wins means B's value must stick,
 	// regardless of which session reads it back afterward.
@@ -575,6 +598,10 @@ func TestForwardSAP_RealSapRust_PhaseC_DifferentProjectsIsolation(t *testing.T) 
 		if _, err := d.ForwardSAP(ctx, session, sink, "edit.addTrack", mustJSON(t, map[string]any{"kind": "video"})); err != nil {
 			t.Fatalf("edit.addTrack (%s): %v", session, err)
 		}
+		// Selection-state gate: appendClip requires track.enter.
+		if _, err := d.ForwardSAP(ctx, session, sink, "track.enter", mustJSON(t, map[string]any{"trackIndex": 0})); err != nil {
+			t.Fatalf("track.enter (%s): %v", session, err)
+		}
 		raw, err := d.ForwardSAP(ctx, session, sink, "edit.appendClip", mustJSON(t, map[string]any{
 			"trackIndex": 0,
 			"source":     map[string]any{"playlistIndex": 0},
@@ -589,6 +616,9 @@ func TestForwardSAP_RealSapRust_PhaseC_DifferentProjectsIsolation(t *testing.T) 
 		id, _ := clip["clipId"].(string)
 		if id == "" {
 			t.Fatalf("expected clipId (%s), got %+v", session, clip)
+		}
+		if _, err := d.ForwardSAP(ctx, session, sink, "clip.enter", mustJSON(t, map[string]any{"clipId": id})); err != nil {
+			t.Fatalf("clip.enter (%s): %v", session, err)
 		}
 		return id
 	}
@@ -668,12 +698,21 @@ func TestForwardSAP_RealSapRust_PhaseC_DifferentProjectsIsolation(t *testing.T) 
 	}
 
 	// -- A clipId minted by project B means nothing in project A. --
+	// Selection lock always injects the session's entered clipId, so to
+	// prove a foreign id is meaningless we must clip.enter it first; the
+	// backend then fails when that id is not present in project A's timeline.
+	if _, err := d.ForwardSAP(ctx, "phasec-a", sinkA, "clip.enter", mustJSON(t, map[string]any{"clipId": clipIDB2})); err != nil {
+		t.Fatalf("clip.enter foreign id on A: %v", err)
+	}
 	if _, err := d.ForwardSAP(ctx, "phasec-a", sinkA, "filter.add", mustJSON(t, map[string]any{
 		"clipId": clipIDB2, "mltService": "brightness",
 	})); err == nil {
 		t.Fatalf("expected project A to reject project B's clipId %s", clipIDB2)
 	}
-	// Sanity: the SAME call succeeds for project A's own clip.
+	// Sanity: re-enter A's own clip and the SAME call succeeds.
+	if _, err := d.ForwardSAP(ctx, "phasec-a", sinkA, "clip.enter", mustJSON(t, map[string]any{"clipId": clipIDA})); err != nil {
+		t.Fatalf("clip.enter A own: %v", err)
+	}
 	if _, err := d.ForwardSAP(ctx, "phasec-a", sinkA, "filter.add", mustJSON(t, map[string]any{
 		"clipId": clipIDA, "mltService": "brightness",
 	})); err != nil {

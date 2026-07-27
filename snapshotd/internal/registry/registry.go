@@ -121,6 +121,9 @@ func (r *Registry) CreateProject(p *Project) error {
 	if p.Status == "" {
 		p.Status = "active"
 	}
+	if p.ProjectType == "" {
+		p.ProjectType = ProjectTypeFolder
+	}
 	now := time.Now().UTC()
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
@@ -129,6 +132,27 @@ func (r *Registry) CreateProject(p *Project) error {
 		p.LastOpenedAt = now
 	}
 	return r.db.Create(p).Error
+}
+
+// UpdateProjectType persists the authoritative file|folder type after open.
+func (r *Registry) UpdateProjectType(id, projectType string) error {
+	if projectType != ProjectTypeFolder && projectType != ProjectTypeFile {
+		return fmt.Errorf("registry: invalid projectType %q", projectType)
+	}
+	return r.db.Model(&Project{}).Where("id = ?", id).Update("project_type", projectType).Error
+}
+
+// FillProjectPathFields sets Path and ProjectID on a Project for path-first APIs.
+func FillProjectPathFields(p *Project) {
+	if p == nil {
+		return
+	}
+	p.ProjectID = p.ID
+	if p.ProjectType == ProjectTypeFile {
+		p.Path = filepath.Join(p.RootDir, p.MltFileName)
+	} else {
+		p.Path = p.RootDir
+	}
 }
 
 func (r *Registry) GetProject(id string) (*Project, error) {
@@ -211,6 +235,7 @@ func (r *Registry) ListProjects() ([]Project, error) {
 		if out[i].DiscoveryState == "" {
 			out[i].DiscoveryState = "known"
 		}
+		FillProjectPathFields(&out[i])
 	}
 	return out, nil
 }
@@ -370,6 +395,22 @@ func (r *Registry) Audit(projectID, kind, detail string) error {
 		Detail:    detail,
 		Timestamp: time.Now().UTC(),
 	}).Error
+}
+
+// AuditOnce records an audit event only if no prior row exists for the
+// same projectID+kind pair. Used for AuditInit so multi-client
+// project.select/Bind re-attaches do not spam init rows.
+func (r *Registry) AuditOnce(projectID, kind, detail string) error {
+	var n int64
+	if err := r.db.Model(&AuditEvent{}).
+		Where("project_id = ? AND kind = ?", projectID, kind).
+		Count(&n).Error; err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	return r.Audit(projectID, kind, detail)
 }
 
 func (r *Registry) ListAuditEvents(projectID string) ([]AuditEvent, error) {

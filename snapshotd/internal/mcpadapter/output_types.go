@@ -240,13 +240,18 @@ type FileProbe struct {
 	Codec           string  `json:"codec"`
 }
 
-// ProjectState mirrors sap-rust's backend::ProjectState (project_open/
-// project.getState).
+// ProjectState mirrors sap-rust's backend::ProjectState (project.open /
+// project.getState / project.select).
 type ProjectState struct {
 	ProjectID string `json:"projectId"`
 	Dirty     bool   `json:"dirty"`
 	UndoDepth int    `json:"undoDepth"`
 	RedoDepth int    `json:"redoDepth"`
+	// Opened is true after the process completed its one-time open/bind.
+	// Used by the daemon to emit a single audit_events kind=init row.
+	Opened bool `json:"opened"`
+	// ProjectType is "folder" | "file" from kSnapflowProjectFolder / MLT.projectFolder().
+	ProjectType string `json:"projectType,omitempty"`
 }
 
 // EmptyResult is the output schema for every sap-rust method whose success

@@ -57,16 +57,14 @@ import (
 // this text must stay meaningful for any deployment, not just this repo's
 // own checkout.
 const serverInstructions = "Video/media editing MCP server. Typical flow: " +
-	"(1) use the daemon.* tools (createProject, listProjects, launch, list, health, close) " +
-	"to manage project folders and start a project's editing process; " +
-	"(2) call project.select with {\"projectId\": ...} to bind this session to one project " +
-	"(required before any other project-scoped tool call); " +
-	"(3) use the typed edit.*/playlist.*/filter.*/transitions.*/generator.*/file.*/jobs.*/" +
-	"playback.*/subtitles.*/markers.*/recent.*/notes.* tools (and audio.* when that namespace " +
-	"is enabled) to perform the edit -- each tool's own schema documents its parameters, no " +
-	"separate discovery call is needed. A session may only be bound to one project at a time: " +
-	"call project.exit before selecting a different project, or project.select will be " +
-	"rejected with an already-bound error."
+	"(1) project.create {path, open?} / project.list / project.clone to manage projects " +
+	"(path-first; projectId is returned and still accepted); " +
+	"(2) project.open {path|projectId} to open or attach this session " +
+	"(required before project-scoped edit tools); project.close to release this session only; " +
+	"(3) use typed edit.*/playlist.*/filter.*/file.*/jobs.*/playback.* tools for the edit. " +
+	"Deprecated aliases: project.select/project.exit (same as open/close), " +
+	"daemon.createProject/daemon.launch/daemon.listProjects (prefer project.*). " +
+	"daemon.list/health/close still manage process instances."
 
 // Handler is the subset of internal/daemon.Daemon this adapter depends on --
 // kept as a small interface for the same reason internal/sdp.Handler is: the
@@ -120,7 +118,7 @@ func New(h Handler) *server.MCPServer {
 
 	s.AddTools(
 		tool("daemon.createProject",
-			"Create a new project folder under the daemon's projects root and register it in the registry.",
+			"[Deprecated: use project.create] Create a new project folder under the daemon's projects root.",
 			mcp.WithString("name", mcp.Required(), mcp.Description("Project folder name to create")),
 			h),
 		tool("daemon.deleteProject",
@@ -128,11 +126,11 @@ func New(h Handler) *server.MCPServer {
 			mcp.WithString("projectId", mcp.Required(), mcp.Description("Project ID to delete")),
 			h),
 		tool("daemon.listProjects",
-			"List all known projects.",
+			"[Deprecated: use project.list] List all known projects.",
 			nil,
 			h),
 		tool("daemon.launch",
-			"Launch (spawn) a Snapshot child process for a project.",
+			"[Deprecated: use project.open to open/attach; this only spawns the process] Launch a Snapshot child for a project.",
 			mcp.WithString("projectId", mcp.Description("Project ID to launch (use this or projectPath)")),
 			h,
 			mcp.WithString("projectPath", mcp.Description("Filesystem path to a project folder or legacy .mlt file (use this or projectId)")),

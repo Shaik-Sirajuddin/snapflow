@@ -16,17 +16,33 @@ import "time"
 // sandbox root), not a bare .mlt path. RootDir is that folder; MltFileName is
 // usually "project.mlt" but honors an existing filename for project.open on
 // legacy projects that don't follow the folder convention.
+// Project type values (kSnapflowProjectFolder / MLT.projectFolder()).
+const (
+	ProjectTypeFolder = "folder"
+	ProjectTypeFile   = "file"
+)
+
 type Project struct {
-	ID             string `gorm:"primaryKey"`
-	RootDir        string `gorm:"uniqueIndex"`
-	MltFileName    string
-	CreatedAt      time.Time
-	LastOpenedAt   time.Time
-	Status         string    // "active" | "archived"
+	ID          string `gorm:"primaryKey" json:"id"`
+	RootDir     string `gorm:"uniqueIndex" json:"rootDir"`
+	MltFileName string `json:"mltFileName"`
+	// ProjectType is "folder" | "file". Folder-type projects have a sibling
+	// asset directory (clips/audio/photos); file-type is a standalone .mlt.
+	// Authoritative value is the in-.mlt kSnapflowProjectFolder flag after
+	// open; creation-time value is the caller's request (default folder).
+	ProjectType    string    `json:"projectType"`
+	CreatedAt      time.Time `json:"createdAt"`
+	LastOpenedAt   time.Time `json:"lastOpenedAt"`
+	Status         string    `json:"status"` // "active" | "archived"
+	// Path is RootDir for folder-type list rows, or RootDir/MltFileName for
+	// file-type; filled by list helpers (not persisted).
+	Path           string    `gorm:"-" json:"path"`
 	Open           bool      `gorm:"-" json:"open"`
 	InstanceCount  int       `gorm:"-" json:"instanceCount"`
 	LastSeenAt     time.Time `gorm:"-" json:"lastSeenAt,omitempty"`
 	DiscoveryState string    `gorm:"-" json:"discoveryState"`
+	// ProjectID is an alias of ID for path-first API responses.
+	ProjectID string `gorm:"-" json:"projectId"`
 }
 
 // TableName pins the table name explicitly so it doesn't depend on GORM's
@@ -126,7 +142,7 @@ const (
 type AuditEvent struct {
 	ID        uint   `gorm:"primaryKey;autoIncrement"`
 	ProjectID string `gorm:"index"`
-	Kind      string // "launch" | "crash" | "restart" | "close"
+	Kind      string // "launch" | "crash" | "restart" | "close" | "init" | "create" | "delete"
 	Detail    string
 	Timestamp time.Time
 }
@@ -141,4 +157,8 @@ const (
 	AuditClose   = "close"
 	AuditCreate  = "create"
 	AuditDelete  = "delete"
+	// AuditInit is recorded once when a project's first real open succeeds
+	// (project.select response with opened=true). Distinct from AuditLaunch
+	// (process spawn) so empty-project investigations can query init rows.
+	AuditInit = "init"
 )
