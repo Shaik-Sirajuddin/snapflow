@@ -30,6 +30,7 @@ mod local_terminal;
 mod markdown;
 mod model;
 pub mod project_store;
+pub mod snapshotd_client;
 pub mod models;
 mod msg;
 mod permission;
