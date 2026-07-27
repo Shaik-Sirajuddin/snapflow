@@ -2834,6 +2834,7 @@ mod tests {
     use crate::msg::FrameInput;
     // row_count()/row_data() on the persistent messages_model VecModel.
     use slint::Model as _;
+    use std::path::Path;
 
     fn model_with_threads(names: &[&str]) -> Model {
         let threads = names
@@ -2973,6 +2974,208 @@ mod tests {
             dirty,
             vec![Dirty::ProjectPath, Dirty::SkillsListDiff(Vec::new())]
         );
+    }
+
+    /// GUI matrix: Open → Save As → switch → close (panel lifecycle identity).
+    #[test]
+    fn gui_matrix_open_save_as_switch_close_bumps_generation_and_reasons() {
+        let mut model = Model::default();
+        assert_eq!(model.project_generation, 0);
+
+        let (_, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/work/a/project.mlt".to_owned(),
+            ))),
+        );
+        assert_eq!(model.project_lifecycle_reason, "opened");
+        assert_eq!(model.project_generation, 1);
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::Saved(_)
+        ));
+
+        let (effects, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathRenamed {
+                old: "/work/a/project.mlt".to_owned(),
+                new: "/work/b/project.mlt".to_owned(),
+            }),
+        );
+        assert_eq!(model.project_lifecycle_reason, "saved_as");
+        assert_eq!(model.project_generation, 2);
+        assert_eq!(
+            model.active_project_path.as_deref(),
+            Some("/work/b/project.mlt")
+        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::RenameProjectAssociation { old, new, .. }
+                if old == "/work/a/project.mlt" && new == "/work/b/project.mlt"
+        )));
+
+        let gen_before_switch = model.project_generation;
+        let (_, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/work/a/project.mlt".to_owned(),
+            ))),
+        );
+        assert_eq!(model.project_lifecycle_reason, "switched");
+        assert_eq!(model.project_generation, gen_before_switch + 1);
+
+        let (_, dirty) = update(&mut model, Msg::Host(HostMsg::ProjectClosed));
+        assert_eq!(model.project_lifecycle_reason, "closed");
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::None
+        ));
+        assert_eq!(model.active_project_path, None);
+        assert!(dirty.iter().any(|d| matches!(d, Dirty::ProjectPath)));
+    }
+
+    /// GUI matrix: untitled staging then first Save emits rename association
+    /// with empty old path so the staging store can move.
+    #[test]
+    fn gui_matrix_untitled_then_first_save_moves_staging_store() {
+        let mut model = Model::default();
+        let (_, _) = update(&mut model, Msg::Host(HostMsg::ProjectCreatedUntitled));
+        assert_eq!(model.project_lifecycle_reason, "created_untitled");
+        let crate::model::ProjectIdentity::Untitled(staging_id) = model.active_project.clone()
+        else {
+            panic!("expected Untitled identity after ProjectCreatedUntitled");
+        };
+        assert!(!staging_id.is_empty());
+        assert_eq!(model.active_project_path, None);
+
+        let old_identity = model.active_project.clone();
+        let (effects, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathRenamed {
+                old: String::new(),
+                new: "/work/saved/first.mlt".to_owned(),
+            }),
+        );
+        assert_eq!(model.project_lifecycle_reason, "saved_as");
+        assert_eq!(
+            model.active_project_path.as_deref(),
+            Some("/work/saved/first.mlt")
+        );
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::Saved(_)
+        ));
+        assert!(
+            effects.iter().any(|e| match e {
+                Effect::RenameProjectAssociation {
+                    old,
+                    new,
+                    old_identity: oi,
+                } => {
+                    old.is_empty()
+                        && new == "/work/saved/first.mlt"
+                        && oi == &old_identity
+                }
+                _ => false,
+            }),
+            "first Save must migrate the untitled staging store: {effects:?}"
+        );
+        // Store dirs differ: staging UUID vs .snapflow/<stem>
+        let staging = crate::project_store::project_store_dir(
+            &crate::model::ProjectIdentity::Untitled(staging_id),
+            Path::new("/cache"),
+        );
+        let saved = crate::project_store::project_store_dir(
+            &crate::model::ProjectIdentity::Saved("/work/saved/first.mlt".into()),
+            Path::new("/cache"),
+        );
+        assert_ne!(staging, saved);
+        assert_eq!(
+            saved,
+            Some(std::path::PathBuf::from("/work/saved/.snapflow/first"))
+        );
+    }
+
+    /// GUI matrix: no project open → New/Send/late attach all no-ops.
+    #[test]
+    fn gui_matrix_no_project_rejects_new_session_and_send() {
+        let mut model = Model::default();
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::None
+        ));
+        let (e1, d1) = update(&mut model, Msg::Ui(UiMsg::Thread(ThreadMsg::New)));
+        assert!(e1.is_empty() && d1.is_empty() && model.threads.is_empty());
+        let (e2, d2) = update(
+            &mut model,
+            Msg::Ui(UiMsg::Compose(ComposeMsg::SendRequested(
+                "should-not-attach".into(),
+            ))),
+        );
+        assert!(e2.is_empty() && d2.is_empty());
+    }
+
+    /// GUI matrix: A→B switch drops late A thread-list snapshots (view isolation).
+    #[test]
+    fn gui_matrix_project_a_to_b_drops_stale_a_snapshots() {
+        let mut model = model_with_threads(&["a0", "a1", "b0"]);
+        model.active_project_path = Some("/work/b/project.mlt".to_owned());
+        model.synced_project_path = Some("/work/b/project.mlt".to_owned());
+        model.visible_indices = vec![2];
+        model.selected_thread = 0;
+        *model.thread_model_keys.borrow_mut() = vec!["thread-2".to_owned()];
+
+        let (_, dirty) = update(
+            &mut model,
+            Msg::Frame(FrameInput {
+                thread_list_snapshot: Some(crate::msg::ThreadListSnapshot {
+                    visible_indices: vec![0, 1],
+                    visible_thread_ids: vec!["thread-0".to_owned(), "thread-1".to_owned()],
+                    rows: vec![visible_row(0, "thread-0"), visible_row(1, "thread-1")],
+                    archived_flags: vec![],
+                    active_project_path: Some("/work/a/project.mlt".to_owned()),
+                }),
+                ..FrameInput::default()
+            }),
+        );
+        assert_eq!(model.visible_indices, vec![2]);
+        assert!(!dirty
+            .iter()
+            .any(|item| matches!(item, Dirty::ThreadListDiff(_))));
+    }
+
+    /// GUI matrix: initial open sets Saved identity before any session attach
+    /// effect beyond SetActiveProjectPath (attach gate path).
+    #[test]
+    fn gui_matrix_initial_project_sets_identity_before_attach() {
+        let mut model = Model::default();
+        let (effects, _) = update(
+            &mut model,
+            Msg::Host(HostMsg::ProjectPathChanged(Some(
+                "/projects/demo/cut.mlt".to_owned(),
+            ))),
+        );
+        assert!(matches!(
+            model.active_project,
+            crate::model::ProjectIdentity::Saved(ref p) if p == "/projects/demo/cut.mlt"
+        ));
+        // Only path-binding effect — no New/Attach effect is emitted here.
+        assert_eq!(
+            effects,
+            vec![Effect::SetActiveProjectPath {
+                path: Some("/projects/demo/cut.mlt".to_owned())
+            }]
+        );
+        let store = crate::project_store::project_store_dir(
+            &model.active_project,
+            Path::new("/cache"),
+        )
+        .expect("saved project must have a store dir");
+        assert_eq!(
+            store,
+            std::path::PathBuf::from("/projects/demo/.snapflow/cut")
+        );
+        assert_ne!(store.as_os_str(), "/projects/demo/cut.mlt");
     }
 
     #[test]
