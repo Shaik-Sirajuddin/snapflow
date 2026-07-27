@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -405,6 +406,184 @@ func TestDaemon_DiscoveryPromotesVerifiedCandidate(t *testing.T) {
 	registered, err := d.Reg.GetExternalInstanceByNonce(nonce)
 	if err != nil || registered.Status != registry.ExternalStatusOpen {
 		t.Fatalf("expected verified candidate to be registered open: %+v err=%v", registered, err)
+	}
+}
+
+func TestDaemon_RegisterExternalInstanceRejectsProcessIdentityMismatch(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	_, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "bad-identity",
+		PID:           os.Getpid(),
+		ProcessStart:  "unix:0",
+		ProjectPath:   "",
+	})
+	if err == nil {
+		t.Fatal("expected pid/processStart mismatch to reject registration")
+	}
+	if !strings.Contains(err.Error(), "identity does not match") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDaemon_DiscoveryEmptyProjectPathDoesNotCreateOpenRow(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	apps := filepath.Join(d.Cfg.HomeDir, "apps")
+	if err := os.MkdirAll(apps, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := filepath.Join(apps, "no-project.sock")
+	listener, err := net.Listen("unix", endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	processStart := mustProcessStart(t)
+	nonce := "discovery-no-project"
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var request struct {
+			Params struct {
+				Challenge string `json:"challenge"`
+			} `json:"params"`
+		}
+		if json.NewDecoder(bufio.NewReader(conn)).Decode(&request) != nil {
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(map[string]any{"result": map[string]any{
+			"instanceNonce": nonce,
+			"pid":           os.Getpid(),
+			"processStart":  processStart,
+			"projectPath":   "",
+			"challenge":     request.Params.Challenge,
+		}})
+	}()
+	descriptor, err := json.Marshal(map[string]any{
+		"endpoint":        endpoint,
+		"pid":             os.Getpid(),
+		"processStart":    processStart,
+		"instanceNonce":   nonce,
+		"protocolVersion": 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apps, "no-project.json"), descriptor, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := d.DiscoverExternalInstances(ctx)
+	if err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	if len(candidates) != 1 || !candidates[0].Verified {
+		t.Fatalf("expected one verified candidate without project: %+v", candidates)
+	}
+	if _, err := d.Reg.GetExternalInstanceByNonce(nonce); !errors.Is(err, registry.ErrNotFound) {
+		t.Fatalf("empty projectPath must not create open external row, err=%v", err)
+	}
+	projects, err := d.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, p := range projects {
+		if p.Open || p.Active || p.IsOpen {
+			t.Fatalf("legacy/no-project discovery must not mark open: %+v", p)
+		}
+	}
+}
+
+func TestDaemon_ResolvePrefersReadyProcessInstanceOverExternal(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "pref-project"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	daemonSocket := filepath.Join(t.TempDir(), "daemon.sap.sock")
+	if err := d.Reg.CreateProcessInstance(&registry.ProcessInstance{
+		ID:         "pi-ready",
+		ProjectID:  project.ID,
+		PID:        os.Getpid(),
+		SocketPath: daemonSocket,
+		Token:      "daemon-token",
+		Status:     registry.StatusReady,
+	}); err != nil {
+		t.Fatalf("create process instance: %v", err)
+	}
+	if _, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "pref-external",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+		SAPSocketPath: filepath.Join(t.TempDir(), "external.sap.sock"),
+	}); err != nil {
+		t.Fatalf("register external: %v", err)
+	}
+	socket, token, err := d.resolveProjectInstance(project.ID)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if socket != daemonSocket || token != "daemon-token" {
+		t.Fatalf("ready process instance must win: socket=%q token=%q", socket, token)
+	}
+}
+
+func TestDaemon_ListProjectsMarksReadyProcessAndClearsExpiredExternal(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "list-agg"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := d.Reg.CreateProcessInstance(&registry.ProcessInstance{
+		ID:         "pi-list",
+		ProjectID:  project.ID,
+		PID:        os.Getpid(),
+		SocketPath: filepath.Join(t.TempDir(), "list.sap.sock"),
+		Status:     registry.StatusReady,
+	}); err != nil {
+		t.Fatalf("create process instance: %v", err)
+	}
+	listed, err := d.ListProjects(ctx)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("list after ready PI: %+v err=%v", listed, err)
+	}
+	if !listed[0].Open || !listed[0].Active || !listed[0].IsOpen || listed[0].InstanceCount < 1 {
+		t.Fatalf("ready process instance must set open/active aggregates: %+v", listed[0])
+	}
+
+	ext, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "list-ext",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
+	})
+	if err != nil {
+		t.Fatalf("register external: %v", err)
+	}
+	row, err := d.Reg.GetExternalInstance(ext.Instance.ID)
+	if err != nil {
+		t.Fatalf("get external: %v", err)
+	}
+	row.LeaseExpiresAt = time.Now().UTC().Add(-time.Second)
+	if err := d.Reg.SaveExternalInstance(row); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if _, err := d.ReconcileExternalInstances(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	after, err := d.ListProjects(ctx)
+	if err != nil || len(after) != 1 {
+		t.Fatalf("list after expire: %+v err=%v", after, err)
+	}
+	// Daemon-launched ready instance still keeps the project open.
+	if !after[0].Open || !after[0].Active {
+		t.Fatalf("ready process instance should keep project open after external expiry: %+v", after[0])
 	}
 }
 

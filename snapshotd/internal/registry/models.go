@@ -36,8 +36,13 @@ type Project struct {
 	Status         string    `json:"status"` // "active" | "archived"
 	// Path is RootDir for folder-type list rows, or RootDir/MltFileName for
 	// file-type; filled by list helpers (not persisted).
-	Path           string    `gorm:"-" json:"path"`
-	Open           bool      `gorm:"-" json:"open"`
+	Path string `gorm:"-" json:"path"`
+	// Active / IsOpen: true iff the project's most recent ProcessInstance
+	// has Status == "ready" (DB-only by default; refresh:true re-probes).
+	// Same bit under two names for plan + client convenience.
+	Active         bool      `gorm:"-" json:"active"`
+	IsOpen         bool      `gorm:"-" json:"isOpen"`
+	Open           bool      `gorm:"-" json:"open"` // external GUI lease still open
 	InstanceCount  int       `gorm:"-" json:"instanceCount"`
 	LastSeenAt     time.Time `gorm:"-" json:"lastSeenAt,omitempty"`
 	DiscoveryState string    `gorm:"-" json:"discoveryState"`

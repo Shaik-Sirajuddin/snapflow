@@ -55,6 +55,15 @@ mod tests {
     }
 
     #[test]
+    fn raw_mlt_path_is_never_the_store_or_acp_cwd() {
+        let mlt = "/work/cut/project.mlt";
+        let store = project_store_dir(&ProjectIdentity::Saved(mlt.into()), Path::new("/global"))
+            .expect("saved identity must resolve a store");
+        assert_ne!(store, PathBuf::from(mlt));
+        assert!(!store.as_os_str().to_string_lossy().ends_with(".mlt"));
+    }
+
+    #[test]
     fn untitled_projects_are_not_global_none() {
         assert_eq!(
             project_store_dir(

@@ -17,6 +17,11 @@ import (
 // ErrNotFound is returned by lookups that find no matching row.
 var ErrNotFound = errors.New("registry: not found")
 
+// ErrProjectAlreadyExists is returned by project.create when the path is
+// already registered or already exists on disk. Distinct from project.open,
+// which attaches to whatever is already there.
+var ErrProjectAlreadyExists = errors.New("registry: project already exists")
+
 // Registry wraps a GORM database handle and exposes the daemon's persistence
 // operations. It is safe for concurrent use (GORM/database/sql pool their own
 // connections internally).
@@ -208,6 +213,18 @@ func (r *Registry) ListProjects() ([]Project, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Newest process instance per project (for active/isOpen marker).
+	allPI, err := r.ListProcessInstances()
+	if err != nil {
+		return nil, err
+	}
+	newestPI := map[string]ProcessInstance{}
+	for i := len(allPI) - 1; i >= 0; i-- { // ListProcessInstances is started_at asc
+		pi := allPI[i]
+		if _, ok := newestPI[pi.ProjectID]; !ok {
+			newestPI[pi.ProjectID] = pi
+		}
+	}
 	for i := range out {
 		projectRoot := filepath.Clean(out[i].RootDir)
 		for _, instance := range instances {
@@ -235,9 +252,35 @@ func (r *Registry) ListProjects() ([]Project, error) {
 		if out[i].DiscoveryState == "" {
 			out[i].DiscoveryState = "known"
 		}
+		// active/isOpen: most recent ProcessInstance Status == ready (DB-only).
+		// Also fold daemon-launched ready instances into open/instanceCount so
+		// list aggregates cover both external leases and owned children.
+		if pi, ok := newestPI[out[i].ID]; ok && pi.Status == StatusReady {
+			out[i].Active = true
+			out[i].IsOpen = true
+			out[i].Open = true
+			out[i].InstanceCount++
+			out[i].DiscoveryState = "registered"
+			if pi.LastHealthCheckAt.After(out[i].LastSeenAt) {
+				out[i].LastSeenAt = pi.LastHealthCheckAt
+			}
+		}
 		FillProjectPathFields(&out[i])
 	}
 	return out, nil
+}
+
+// GetProjectByRootDir returns the project registered at rootDir, or ErrNotFound.
+func (r *Registry) GetProjectByRootDir(rootDir string) (*Project, error) {
+	var p Project
+	if err := r.db.Where("root_dir = ?", rootDir).First(&p).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	FillProjectPathFields(&p)
+	return &p, nil
 }
 
 func (r *Registry) DeleteProject(id string) error {

@@ -35,8 +35,8 @@ func projectTools(s *server.MCPServer, h Handler) []server.ServerTool {
 		),
 		projectCreateTool(s, h),
 		tool("project.list",
-			"List known projects. Each row leads with path and projectType; projectId is secondary.",
-			nil,
+			"List known projects. Each row leads with path, projectType, projectId, and active/isOpen (true when the most recent process instance is ready). Optional refresh:true re-probes PID+socket liveness.",
+			mcp.WithBoolean("refresh", mcp.Description("If true, probe live process liveness per project instead of DB-only ready status")),
 			h),
 		projectCloneTool(s, h),
 		// --- deprecated aliases (same behavior) ---

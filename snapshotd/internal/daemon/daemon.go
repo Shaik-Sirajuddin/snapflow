@@ -534,6 +534,10 @@ type ProjectCreateResult struct {
 
 // ProjectCreate creates a project folder at an arbitrary path and registers it.
 // Does not launch/open; open:true chaining is done by the MCP tool layer.
+//
+// Fail-closed on duplicate path (registry row or existing filesystem path):
+// returns registry.ErrProjectAlreadyExists rather than silently reusing —
+// that reuse behavior belongs to project.open, not create.
 func (d *Daemon) ProjectCreate(ctx context.Context, p ProjectCreateParams) (registry.Project, error) {
 	root := strings.TrimSpace(p.Path)
 	if root == "" {
@@ -546,9 +550,6 @@ func (d *Daemon) ProjectCreate(ctx context.Context, p ProjectCreateParams) (regi
 	if err != nil {
 		return registry.Project{}, fmt.Errorf("daemon: project.create: path: %w", err)
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
-		return registry.Project{}, fmt.Errorf("daemon: project.create: mkdir %s: %w", abs, err)
-	}
 	mlt := p.MltFileName
 	if mlt == "" {
 		mlt = registry.DefaultMltFileName
@@ -560,14 +561,22 @@ func (d *Daemon) ProjectCreate(ctx context.Context, p ProjectCreateParams) (regi
 	if ptype != registry.ProjectTypeFolder && ptype != registry.ProjectTypeFile {
 		return registry.Project{}, fmt.Errorf("daemon: project.create: projectType must be folder or file")
 	}
-	// If already registered at this root, return existing.
-	if existing, err := d.Reg.ListProjects(); err == nil {
-		for _, e := range existing {
-			if e.RootDir == abs {
-				registry.FillProjectPathFields(&e)
-				return e, nil
-			}
-		}
+
+	// 1) Registry-level dedup (same query shape as EnsureProjectForPath).
+	if existing, err := d.Reg.GetProjectByRootDir(abs); err == nil {
+		return registry.Project{}, fmt.Errorf("%w: id=%s rootDir=%s", registry.ErrProjectAlreadyExists, existing.ID, existing.RootDir)
+	} else if !errors.Is(err, registry.ErrNotFound) {
+		return registry.Project{}, err
+	}
+	// 2) Filesystem-level: reject if path already exists even when unregistered.
+	if _, err := os.Stat(abs); err == nil {
+		return registry.Project{}, fmt.Errorf("%w: path already exists on disk: %s", registry.ErrProjectAlreadyExists, abs)
+	} else if !os.IsNotExist(err) {
+		return registry.Project{}, fmt.Errorf("daemon: project.create: stat %s: %w", abs, err)
+	}
+
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return registry.Project{}, fmt.Errorf("daemon: project.create: mkdir %s: %w", abs, err)
 	}
 	proj := registry.Project{
 		ID:          uuid.NewString(),
@@ -673,9 +682,54 @@ func (d *Daemon) DeleteProject(ctx context.Context, projectID string) error {
 	return nil
 }
 
-// ListProjects implements daemon.listProjects.
+// ProjectListParams implements project.list optional refresh.
+type ProjectListParams struct {
+	// Refresh when true re-probes PID+socket liveness for each project's
+	// most recent ready ProcessInstance (marks crashed if dead). Default
+	// is DB-only (eventually consistent until boot reconcile).
+	Refresh bool `json:"refresh"`
+}
+
+// ListProjects implements daemon.listProjects (thin wrapper of ProjectList).
 func (d *Daemon) ListProjects(ctx context.Context) ([]registry.Project, error) {
-	return d.Reg.ListProjects()
+	return d.ProjectList(ctx, ProjectListParams{})
+}
+
+// ProjectList returns all projects with path-first fields and active/isOpen
+// markers. When refresh is true, probes live readiness per project.
+func (d *Daemon) ProjectList(ctx context.Context, p ProjectListParams) ([]registry.Project, error) {
+	projects, err := d.Reg.ListProjects()
+	if err != nil {
+		return nil, err
+	}
+	if !p.Refresh {
+		return projects, nil
+	}
+	for i := range projects {
+		projects[i].Active = false
+		projects[i].IsOpen = false
+		instances, err := d.Reg.ListProcessInstancesByProject(projects[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(instances) == 0 {
+			continue
+		}
+		// Newest first from ListProcessInstancesByProject.
+		row := instances[0]
+		if row.Status != registry.StatusReady {
+			continue
+		}
+		if health.PIDAlive(row.PID) && health.SocketResponsive(row.SocketPath, time.Second) {
+			projects[i].Active = true
+			projects[i].IsOpen = true
+			continue
+		}
+		// Stale ready row: mark crashed so default list is corrected next time.
+		_ = d.Reg.UpdateProcessInstanceStatus(row.ID, registry.StatusCrashed)
+		_ = d.Reg.Audit(projects[i].ID, registry.AuditCrash, "project.list refresh: registered ready but not actually alive")
+	}
+	return projects, nil
 }
 
 // ProjectSubscription is the control-plane inventory subscription response.
@@ -1075,7 +1129,11 @@ func (d *Daemon) Dispatch(ctx context.Context, method string, params json.RawMes
 		return d.ProjectClone(ctx, p)
 
 	case "project.list":
-		return d.ListProjects(ctx)
+		var p ProjectListParams
+		if err := unmarshalParams(params, &p); err != nil {
+			return nil, err
+		}
+		return d.ProjectList(ctx, p)
 
 	case "daemon.deleteProject":
 		var p struct {
