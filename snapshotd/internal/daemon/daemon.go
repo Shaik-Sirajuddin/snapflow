@@ -85,13 +85,16 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	if strings.TrimSpace(p.InstanceNonce) == "" || p.PID <= 0 || strings.TrimSpace(p.ProcessStart) == "" {
 		return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: instanceNonce, pid, and processStart are required")
 	}
+	if !health.ProcessIdentityMatches(p.PID, p.ProcessStart) {
+		return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: pid/processStart identity does not match a live process")
+	}
 	projectPath := ""
 	if p.ProjectPath != "" {
-		abs, err := filepath.Abs(p.ProjectPath)
+		abs, err := canonicalExternalPath(p.ProjectPath)
 		if err != nil {
 			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: projectPath: %w", err)
 		}
-		projectPath = filepath.Clean(abs)
+		projectPath = abs
 	}
 	now := time.Now().UTC()
 	instance, err := d.Reg.GetExternalInstanceByNonce(p.InstanceNonce)
@@ -121,6 +124,29 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	return ExternalInstanceResult{Instance: *instance, HeartbeatEvery: externalInstanceLease / 3, LeaseDuration: externalInstanceLease}, nil
 }
 
+// canonicalExternalPath accepts a path whose final project file may not have
+// been created yet (for example during an untitled-to-save transition), while
+// still resolving the existing parent and rejecting NUL/control injection.
+func canonicalExternalPath(raw string) (string, error) {
+	if strings.IndexByte(raw, 0) >= 0 {
+		return "", fmt.Errorf("path contains NUL")
+	}
+	abs, err := filepath.Abs(raw)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	parent := filepath.Dir(abs)
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", fmt.Errorf("path parent is not accessible: %w", err)
+	}
+	return filepath.Join(resolvedParent, filepath.Base(abs)), nil
+}
+
 type UpdateExternalProjectParams struct {
 	InstanceID  string `json:"instanceId"`
 	ProjectPath string `json:"projectPath,omitempty"`
@@ -137,11 +163,11 @@ func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectP
 		return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: reason is required")
 	}
 	if p.ProjectPath != "" {
-		path, err := filepath.Abs(p.ProjectPath)
+		path, err := canonicalExternalPath(p.ProjectPath)
 		if err != nil {
 			return registry.ExternalInstance{}, err
 		}
-		instance.ProjectPath = filepath.Clean(path)
+		instance.ProjectPath = path
 	} else {
 		instance.ProjectPath = ""
 	}

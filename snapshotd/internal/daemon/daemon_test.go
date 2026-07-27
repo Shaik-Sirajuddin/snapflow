@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"snapshotd/internal/config"
+	"snapshotd/internal/health"
 	"snapshotd/internal/registry"
 )
 
@@ -167,7 +168,7 @@ func TestDaemon_ExternalRegistrationAndMcpContextIsolation(t *testing.T) {
 	params := RegisterExternalInstanceParams{
 		InstanceNonce: "nonce-a",
 		PID:           os.Getpid(),
-		ProcessStart:  "test-start-a",
+		ProcessStart:  mustProcessStart(t),
 		ProjectPath:   filepath.Join(projectA.RootDir, projectA.MltFileName),
 	}
 	first, err := d.RegisterExternalInstance(ctx, params)
@@ -223,7 +224,7 @@ func TestDaemon_ReconcileExternalLeaseAndProjectAggregate(t *testing.T) {
 	registered, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
 		InstanceNonce: "aggregate-nonce",
 		PID:           os.Getpid(),
-		ProcessStart:  "aggregate-start",
+		ProcessStart:  mustProcessStart(t),
 		ProjectPath:   filepath.Join(project.RootDir, project.MltFileName),
 	})
 	if err != nil {
@@ -248,6 +249,15 @@ func TestDaemon_ReconcileExternalLeaseAndProjectAggregate(t *testing.T) {
 	if err != nil || row.Status != registry.ExternalStatusStale {
 		t.Fatalf("expected stale lease: %+v err=%v", row, err)
 	}
+}
+
+func mustProcessStart(t *testing.T) string {
+	t.Helper()
+	start, err := health.ProcessStartIdentity(os.Getpid())
+	if err != nil {
+		t.Fatalf("process start identity: %v", err)
+	}
+	return start
 }
 
 func boolPtr(b bool) *bool { return &b }

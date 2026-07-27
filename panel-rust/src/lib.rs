@@ -1630,7 +1630,14 @@ fn panel_rust_create_with_initial_identity(
         //                explicit OPT-IN for dev/QA/demo harnesses that
         //                genuinely want named fixture content, not
         //                something a real launch falls into by default.
-        let initial_specs: Vec<ThreadSpec> = if restored_records.is_empty() {
+        // D6/D7: a panel created before Qt has supplied a complete project
+        // identity is display-only. In particular, do not seed the default
+        // "Chat" thread or construct AgentBridge here: doing either would
+        // let ACP capture the host process cwd before the lifecycle binding
+        // arrives, and a later path setter cannot repair that session's cwd.
+        let initial_specs: Vec<ThreadSpec> = if initial_identity.is_none() {
+            Vec::new()
+        } else if restored_records.is_empty() {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
                 Ok(v) => {
@@ -1683,13 +1690,17 @@ fn panel_rust_create_with_initial_identity(
             .chain(std::iter::repeat(None))
             .take(initial_specs.len())
             .collect();
-        let (bridge, bridge_available) = match AgentBridge::new_with_thread_specs(&initial_specs) {
-            Ok(b) => (Some(b), true),
-            Err(e) => {
-                let message = format!("agent bridge unavailable, chat panel is display-only: {e}");
-                eprintln!("panel-rust: {message}");
-                startup_warnings.push(message);
-                (None, false)
+        let (bridge, bridge_available) = if initial_identity.is_none() {
+            (None, false)
+        } else {
+            match AgentBridge::new_with_thread_specs(&initial_specs) {
+                Ok(b) => (Some(b), true),
+                Err(e) => {
+                    let message = format!("agent bridge unavailable, chat panel is display-only: {e}");
+                    eprintln!("panel-rust: {message}");
+                    startup_warnings.push(message);
+                    (None, false)
+                }
             }
         };
         let initial_selected_thread_id = panel_state
