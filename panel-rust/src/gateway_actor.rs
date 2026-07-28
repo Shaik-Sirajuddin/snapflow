@@ -44,15 +44,19 @@
 //! from that crate's own `lib.rs`, only the shared-type import source
 //! moved from `rui_acp_client::*` to `crate::protocol_types::*`.
 
+mod session_opener;
 mod thread_actor;
 
 pub use crate::protocol_types::{
     AgentEvent, ChatMessage, ConfigOptionInfo, ConfigOptionValue, MessageKind, SessionModeInfo,
     SessionModesEvent,
 };
+pub use session_opener::{provider_profile_key, GatewaySessionOpener, NO_PROFILE_SENTINEL};
 pub use thread_actor::{
-    spawn_acpx_thread, spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_gateway,
-    AcpxThreadError, AcpxThreadGatewaySetter, AcpxThreadHandle, ProfileSummary, RemoteThreadInfo,
+    spawn_acpx_thread, spawn_acpx_thread_with_delayed_gateway,
+    spawn_acpx_thread_with_delayed_gateway_and_pool, spawn_acpx_thread_with_gateway,
+    spawn_acpx_thread_with_gateway_and_pool, AcpxThreadError, AcpxThreadGatewaySetter,
+    AcpxThreadHandle, AttachedSession, ProfileSummary, RemoteThreadInfo, SharedSessionPool,
 };
 
 /// Maps one raw `session/update` JSON-RPC notification (as returned in

@@ -537,6 +537,242 @@ def scenario_real_agent_smoke(args):
     print(f"PASS real_agent_smoke scenario: real assistant reply observed: {reply_text!r}")
 
 
+def open_new_thread(client, window_handle, root_handle, timeout=15):
+    """acpx-client-session-lease-pool: expand the collapsed sidebar, click
+    "New thread", then collapse it again -- the MCP-driver equivalent of
+    `host_e2e_driver.py`'s `open_second_thread`, but via accessible-label
+    lookup (`sidebar.slint`'s `button-accessible-label`s) instead of blind
+    pixel-coordinate scanning. Every real `+`-thread creation this drives
+    goes through `AgentBridge::add_thread_with_profile_and_provider` ->
+    `build_slot` -> (now) `pool_for`/`acquire_and_attach` -- so a scenario
+    built on this helper genuinely exercises the pool cutover in the real
+    compiled app, not just the Rust-level test suite.
+    """
+    expand_handle = wait_for_accessible_label(
+        client, root_handle, "Expand thread sidebar", timeout=timeout
+    )
+    click(client, expand_handle)
+    new_thread_handle = wait_for_accessible_label(
+        client, root_handle, "New thread", timeout=timeout
+    )
+    click(client, new_thread_handle)
+    collapse_handle = wait_for_accessible_label(
+        client, root_handle, "Collapse thread sidebar", timeout=timeout
+    )
+    click(client, collapse_handle)
+
+
+def send_message_in_active_thread(client, window_handle, text, timeout=15):
+    """acpx-client-session-lease-pool: "New thread" alone does NOT attach a
+    session -- it dispatches `Effect::NewThreadDeferred`
+    (`AgentBridge::add_thread_deferred`), which opens no ACP session until
+    the first message actually sends (`attach_deferred_thread`, PUI-014's
+    lazy-attach optimization). Every pool scenario here needs a real
+    `session/new`, so it must send a message, not just create the thread.
+
+    Retries the compose element lookup: creating/switching a thread can
+    momentarily recreate the ChatInputLayout component (same "Slint
+    invalidates element handles when a component tree is recreated" race
+    `wait_for_accessible_label` already handles), and `find_element_by_
+    qualified_id` alone (unlike the accessible-label helpers) has no
+    retry of its own.
+    """
+    deadline = time.monotonic() + timeout
+    compose_handle = None
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            compose_handle = find_element_by_qualified_id(
+                client, window_handle, "ChatInputLayout::compose"
+            )
+            break
+        except (McpError, RuntimeError) as error:
+            last_error = error
+            time.sleep(0.2)
+    if compose_handle is None:
+        raise RuntimeError(
+            f"ChatInputLayout::compose never appeared within {timeout}s: {last_error}"
+        )
+    click(client, compose_handle)
+    set_text(client, compose_handle, text)
+    press_return(client, window_handle)
+
+
+def session_id_for_prompt_text(event_log, prompt_text, timeout=15):
+    """acpx-client-session-lease-pool: resolves which session id a specific
+    prompt landed on, by its exact (scenario-chosen, unique) text --
+    robust against unrelated `session/new` traffic elsewhere in the same
+    run (e.g. `provision_mock_profile_via_admin`'s own admin-plane
+    verification session), unlike counting/ordering raw `session/new`
+    records directly.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for event in prompt_events(event_log):
+            if event["method"] == "session/prompt" and event["detail"] == prompt_text:
+                return event["session_id"]
+        time.sleep(0.2)
+    raise RuntimeError(f"no session/prompt with text {prompt_text!r} observed within {timeout}s")
+
+
+def scenario_pool_two_new_threads_distinct_sessions(args):
+    """acpx-client-session-lease-pool verification-matrix row "Cold first
+    provider" / "Concurrent + threads": two "New thread" clicks (same
+    default provider) must produce two DISTINCT `session/new` session ids
+    -- proving `ProjectSessionPool::acquire`'s single-flight/no-double-
+    creation guarantee holds through the real UI -> AgentBridge ->
+    thread_actor -> pool -> real acpx-server -> real mock-agent chain, not
+    just in pool.rs's own unit tests. Each thread's own prompt must also
+    land tagged with *its own* session id, not the other thread's --
+    proving `acquire_and_attach`'s exclusive lease (not a shared/aliased
+    session) really is wired end to end.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    text_one = "pool scenario thread one"
+    text_two = "pool scenario thread two"
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    send_message_in_active_thread(client, window_handle, text_one)
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    send_message_in_active_thread(client, window_handle, text_two)
+
+    session_one = session_id_for_prompt_text(args.event_log, text_one, timeout=args.timeout)
+    session_two = session_id_for_prompt_text(args.event_log, text_two, timeout=args.timeout)
+    if session_one == session_two:
+        raise RuntimeError(
+            f"two distinct 'New thread' clicks produced the SAME session id {session_one!r} -- "
+            f"the pool handed out one session to two threads (exclusive-lease violation)"
+        )
+    print(
+        f"PASS pool_two_new_threads_distinct_sessions: two 'New thread' clicks opened "
+        f"distinct sessions {[session_one, session_two]!r} through the real pool-cutover attach path"
+    )
+
+
+def scenario_pool_rapid_concurrent_new_threads(args):
+    """acpx-client-session-lease-pool verification-matrix row "Concurrent +
+    threads" under real UI timing (near-zero think time between clicks,
+    unlike the previous scenario's implicit settle time): three rapid
+    "New thread" clicks must still yield three distinct session ids and no
+    duplicate -- proving the pool's per-key `open_gate` single-flighting
+    (acpx-client's pool.rs) actually serializes concurrent real acquires
+    instead of racing two `session/new` calls for the same slot.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    texts = [f"pool rapid scenario thread {i}" for i in range(3)]
+    for text in texts:
+        open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+        send_message_in_active_thread(client, window_handle, text)
+
+    session_ids = [
+        session_id_for_prompt_text(args.event_log, text, timeout=args.timeout) for text in texts
+    ]
+    if len(set(session_ids)) != len(session_ids):
+        raise RuntimeError(
+            f"rapid 'New thread' clicks produced duplicate session ids {session_ids!r} -- "
+            f"a concurrent acquire race handed out the same session twice"
+        )
+    print(
+        f"PASS pool_rapid_concurrent_new_threads: 3 rapid clicks -> 3 distinct sessions {session_ids!r}"
+    )
+
+
+def scenario_pool_send_immediately_after_new_thread(args):
+    """acpx-client-session-lease-pool: sending a prompt immediately after
+    "New thread" (no settle time) must reach the backend on a real,
+    resolvable session -- proving `Command::AcquireAndAttach` (which does
+    the pool acquire + notification wiring inline, before this actor
+    accepts `SendPrompt`) genuinely blocks the send until attach completes
+    rather than dropping/misrouting it under real UI timing pressure with
+    zero settle time between "New thread" and typing.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+
+    prompt_text = "pool immediate send scenario"
+    send_message_in_active_thread(client, window_handle, prompt_text, timeout=args.timeout)
+
+    opened_session_id = session_id_for_prompt_text(
+        args.event_log, prompt_text, timeout=args.timeout
+    )
+    print(
+        "PASS pool_send_immediately_after_new_thread: immediate send after 'New thread' "
+        f"(zero settle time) reached a real, correctly-attached session {opened_session_id!r}"
+    )
+
+
+def scenario_pool_switch_between_threads_preserves_session_routing(args):
+    """acpx-client-session-lease-pool: create two threads (two distinct
+    pool-acquired sessions), switch focus back to the FIRST thread, and
+    send a second message there -- it must land on thread one's own
+    already-acquired session, not thread two's, and must NOT trigger a
+    second `session/new` for thread one (the lease stays attached across a
+    focus switch; switching tabs is not a release/reacquire). Proves the
+    pool's exclusive per-thread lease survives real UI navigation, not
+    just a single linear create-and-send flow.
+    """
+    client = McpClient(args.mcp_url)
+    client.wait_until_up()
+    window_handle, root_handle = get_root_element(client)
+
+    text_one = "pool switch scenario thread one first message"
+    text_two = "pool switch scenario thread two"
+    text_one_again = "pool switch scenario thread one second message"
+
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    send_message_in_active_thread(client, window_handle, text_one)
+    session_one = session_id_for_prompt_text(args.event_log, text_one, timeout=args.timeout)
+
+    open_new_thread(client, window_handle, root_handle, timeout=args.timeout)
+    send_message_in_active_thread(client, window_handle, text_two)
+    session_two = session_id_for_prompt_text(args.event_log, text_two, timeout=args.timeout)
+    if session_two == session_one:
+        raise RuntimeError(
+            f"thread two was handed thread one's own session {session_one!r} -- "
+            f"exclusive-lease violation"
+        )
+
+    # Switch back to thread one via its own sidebar row (accessible label
+    # is the thread's display name -- sidebar_thread_row.slint's
+    # `button-accessible-label: thread.name`) and send again.
+    expand_handle = wait_for_accessible_label(
+        client, root_handle, "Expand thread sidebar", timeout=args.timeout
+    )
+    click(client, expand_handle)
+    thread_one_row = wait_for_accessible_label(
+        client, root_handle, "New thread 1", timeout=args.timeout
+    )
+    click(client, thread_one_row)
+    collapse_handle = wait_for_accessible_label(
+        client, root_handle, "Collapse thread sidebar", timeout=args.timeout
+    )
+    click(client, collapse_handle)
+
+    send_message_in_active_thread(client, window_handle, text_one_again, timeout=args.timeout)
+    session_one_again = session_id_for_prompt_text(
+        args.event_log, text_one_again, timeout=args.timeout
+    )
+    if session_one_again != session_one:
+        raise RuntimeError(
+            f"switching back to thread one and sending again landed on session "
+            f"{session_one_again!r}, expected its original session {session_one!r} -- "
+            f"the lease was lost/reassigned across a focus switch"
+        )
+    print(
+        "PASS pool_switch_between_threads_preserves_session_routing: switching focus back to "
+        f"thread one and sending again correctly reused its own session {session_one!r} "
+        f"(not thread two's {session_two!r})"
+    )
+
+
 SCENARIOS = {
     "send-now": scenario_send_now,
     "fast-track": scenario_fast_track,
@@ -544,6 +780,10 @@ SCENARIOS = {
     "startup-warning": scenario_startup_warning,
     "mid-session-write-failure": scenario_mid_session_write_failure,
     "real-agent-smoke": scenario_real_agent_smoke,
+    "pool-two-new-threads-distinct-sessions": scenario_pool_two_new_threads_distinct_sessions,
+    "pool-rapid-concurrent-new-threads": scenario_pool_rapid_concurrent_new_threads,
+    "pool-send-immediately-after-new-thread": scenario_pool_send_immediately_after_new_thread,
+    "pool-switch-between-threads-preserves-session-routing": scenario_pool_switch_between_threads_preserves_session_routing,
 }
 
 

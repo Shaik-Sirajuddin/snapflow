@@ -59,8 +59,9 @@
 
 use crate::conversation::ConversationState;
 use crate::gateway_actor::{
-    spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_gateway,
-    AcpxThreadGatewaySetter, AcpxThreadHandle,
+    spawn_acpx_thread_with_delayed_gateway, spawn_acpx_thread_with_delayed_gateway_and_pool,
+    spawn_acpx_thread_with_gateway, spawn_acpx_thread_with_gateway_and_pool,
+    AcpxThreadGatewaySetter, AcpxThreadHandle, GatewaySessionOpener, SharedSessionPool,
 };
 use crate::jsonl_store::{
     JsonlStore, TerminalRuntimeSnapshot, ThreadRuntimeSnapshot, ThreadTrailer,
@@ -158,10 +159,6 @@ struct ThreadSlot {
     thread_id: String,
     provider: String,
     handle: Arc<AcpxThreadHandle>,
-    /// Opaque per-ACP-session token presented to snapshotd's MCP endpoint.
-    /// It is never used as a project identity and is regenerated for a new
-    /// panel attachment, so concurrent sessions cannot share target state.
-    mcp_context_token: String,
     history: Mutex<Vec<ChatMessage>>,
     acp_session_id: Mutex<Option<String>>,
     /// Phase 3 (chat-panel-production-ui/execution-plan.md): whether
@@ -399,6 +396,18 @@ pub struct AgentBridge {
     // multi-URL-per-provider scenario stays representable without a
     // schema change, even though provider and URL are 1:1 today.
     gateways: Arc<Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>>,
+    // acpx-client-session-lease-pool: one ProjectSessionPool per (project
+    // directory, gateway base_url) pair -- since mcp_servers is computed
+    // per (project_dir, provider) and provider maps 1:1 to base_url today
+    // (same granularity as `gateways` above), one pool's GatewaySessionOpener
+    // config applies uniformly to every PoolKey (agent/profile) opened
+    // through it. The `Vec<Value>` alongside each pool is the last mcp_servers
+    // this bridge applied to that pool's opener -- compared on every
+    // `pool_for` call so a genuine config change (skills dir moved,
+    // snapshotd address changed, ...) triggers `set_mcp_servers` +
+    // `refresh_key`/`refresh_all`, while an unchanged value is a no-op
+    // (never refreshes/drops warm sessions needlessly).
+    project_pools: Arc<Mutex<std::collections::HashMap<String, (SharedSessionPool, Vec<serde_json::Value>)>>>,
     /// Background-filled gateway catalog (profiles/mcp/agents/sessions).
     /// Frame poll clones this with `try_lock` only — never waits on the
     /// background publisher and never performs RPC on the UI thread.
@@ -1153,14 +1162,6 @@ fn snapflowd_mcp_servers_entry(
     project_dir: Option<&std::path::Path>,
     provider: &str,
 ) -> Vec<serde_json::Value> {
-    snapflowd_mcp_servers_entry_with_context(project_dir, provider, None)
-}
-
-fn snapflowd_mcp_servers_entry_with_context(
-    project_dir: Option<&std::path::Path>,
-    provider: &str,
-    context_token: Option<&str>,
-) -> Vec<serde_json::Value> {
     let mut entries = Vec::new();
     // Whether MCP-free, filesystem-only skill delivery is safe for
     // `provider` (an ACP registry agent id or its short-form alias) now
@@ -1188,7 +1189,7 @@ fn snapflowd_mcp_servers_entry_with_context(
             "env": [],
         }));
     }
-    entries.extend(snapshotd_mcp_server_entry_with_context(provider, context_token));
+    entries.extend(snapshotd_mcp_server_entry(provider));
     entries
 }
 
@@ -1322,41 +1323,26 @@ pub fn snapshotd_mcp_addr() -> Option<String> {
 
 #[allow(dead_code)]
 fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
-    snapshotd_mcp_server_entry_with_context(provider, None)
-}
-
-fn snapshotd_mcp_server_entry_with_context(
-    provider: &str,
-    context_token: Option<&str>,
-) -> Vec<serde_json::Value> {
     let _ = provider; // kept for call-site symmetry / future per-provider gating if a real incompatibility turns up.
-    snapshotd_mcp_server_entry_for_addr_and_context(snapshotd_mcp_addr().as_deref(), context_token)
+    snapshotd_mcp_server_entry_for_addr(snapshotd_mcp_addr().as_deref())
 }
 
 #[allow(dead_code)]
+// acpx-client-session-lease-pool: this entry is deliberately context-token
+// free -- per-thread `X-Snapshotd-Context-Token` scoping was removed (not
+// required) because a warm-pooled session's `mcpServers` is fixed at
+// `session/new` time, before any specific consuming thread (and its own
+// token) is known; see GatewaySessionOpener's mcp_servers refresh path for
+// how project/provider-level MCP config changes now propagate instead.
 fn snapshotd_mcp_server_entry_for_addr(addr: Option<&str>) -> Vec<serde_json::Value> {
-    snapshotd_mcp_server_entry_for_addr_and_context(addr, None)
-}
-
-fn snapshotd_mcp_server_entry_for_addr_and_context(
-    addr: Option<&str>,
-    context_token: Option<&str>,
-) -> Vec<serde_json::Value> {
     let Some(addr) = addr.filter(|addr| !addr.is_empty()) else {
         return Vec::new();
     };
-    let headers = context_token
-        .filter(|token| !token.is_empty())
-        .map(|token| vec![serde_json::json!({
-            "name": "X-Snapshotd-Context-Token",
-            "value": token,
-        })])
-        .unwrap_or_default();
     vec![serde_json::json!({
         "type": "http",
         "name": "snapshotd",
         "url": format!("http://{addr}/mcp"),
-        "headers": headers,
+        "headers": [],
     })]
 }
 
@@ -2512,6 +2498,48 @@ fn spawn_event_forwarder(
     });
 }
 
+/// acpx-client-session-lease-pool: shared implementation behind both
+/// `AgentBridge::pool_for` and `spawn_background_attachment`'s own
+/// freshly-recomputed-cwd re-lookup (see that function's PISO-7 re-
+/// snapshot comment) -- a free function, not an `AgentBridge` method, so
+/// the background-attachment task (which only has these two `Arc`s, not
+/// `&AgentBridge`) can call the identical logic rather than duplicating
+/// it. See `AgentBridge::pool_for`'s doc comment for the full contract.
+fn resolve_pool_for(
+    project_pools: &Mutex<
+        std::collections::HashMap<String, (SharedSessionPool, Vec<serde_json::Value>)>,
+    >,
+    gateways: &Mutex<std::collections::HashMap<String, Arc<acpx_client::Gateway>>>,
+    runtime: &tokio::runtime::Handle,
+    project_dir: &str,
+    base_url: &str,
+    mcp_servers: &[serde_json::Value],
+) -> Option<SharedSessionPool> {
+    let map_key = format!("{project_dir}|{base_url}");
+    let mut pools = project_pools.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((pool, last_mcp_servers)) = pools.get_mut(&map_key) {
+        if last_mcp_servers.as_slice() != mcp_servers {
+            pool.opener()
+                .set_mcp_servers(serde_json::Value::Array(mcp_servers.to_vec()));
+            *last_mcp_servers = mcp_servers.to_vec();
+            let pool_to_refresh = pool.clone();
+            runtime.spawn(async move {
+                pool_to_refresh.refresh_all().await;
+            });
+        }
+        return Some(pool.clone());
+    }
+    let gateway = gateways
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(base_url)
+        .cloned()?;
+    let opener = GatewaySessionOpener::new(gateway, serde_json::Value::Array(mcp_servers.to_vec()));
+    let pool: SharedSessionPool = Arc::new(acpx_client::pool::ProjectSessionPool::new(opener));
+    pools.insert(map_key, (pool.clone(), mcp_servers.to_vec()));
+    Some(pool)
+}
+
 fn spawn_background_attachment(
     runtime: &tokio::runtime::Runtime,
     slot: Arc<ThreadSlot>,
@@ -2525,6 +2553,13 @@ fn spawn_background_attachment(
     profile_name: Option<String>,
     attachment_gate: Arc<tokio::sync::Mutex<()>>,
     session_cwd_override: Arc<Mutex<Option<PathBuf>>>,
+    // acpx-client-session-lease-pool: whether `handle` was constructed
+    // with a pool (`build_slot`'s `pool_for` returned `Some` at spawn
+    // time) -- `false` for every call site not yet cut over (currently
+    // the constructor's own bulk cold-start restore loop), which keeps
+    // their exact pre-existing dual reattach/resume-by-staleness
+    // behavior untouched.
+    uses_pool: bool,
 ) {
     // Resolved synchronously, before the async task below, not inside it:
     // snapflowd_mcp_servers_entry now transitively probes snapshotd's MCP
@@ -2551,11 +2586,7 @@ fn spawn_background_attachment(
     // directory than the `cwd` it now correctly attaches with, which is
     // the half of this leak that actually lets an agent read/write the
     // wrong project's files.
-    let mcp_servers = snapflowd_mcp_servers_entry_with_context(
-        thread_project_dir.as_deref(),
-        &slot.provider,
-        Some(&slot.mcp_context_token),
-    );
+    let mcp_servers = snapflowd_mcp_servers_entry(thread_project_dir.as_deref(), &slot.provider);
 
     // Reactive-sync trigger (2) (memory/acpx/gen/plans/acpx-skills/
     // README.md#reactive-sync): before/at session setup, make sure this
@@ -2609,7 +2640,38 @@ fn spawn_background_attachment(
         // with an already-stale path.
         let slot_project_path = slot.project_path_snapshot();
         let cwd = cwd_for_session(slot_project_path.as_deref(), &session_cwd_override);
-        let result = if let Some(session_id) = requested_session_id.clone() {
+
+        // acpx-client-session-lease-pool: `handle` only accepts
+        // `AcquireAndAttach` if it was constructed via `build_slot`'s
+        // pool-aware branch (`uses_pool`, set from whether `pool_for`
+        // returned `Some` at spawn time). The pool path is deliberately
+        // ONE strategy, not the legacy dual reattach-vs-load-by-staleness
+        // branch below: `SessionOpener` exposes only `resume` (`session/
+        // resume`, no history replay) and `create` (`session/new`),
+        // never a `session/load`-shaped replay call, matching the plan's
+        // "on reconnect, resume the leased/idle session but do not replay
+        // session/load history" rule -- a pool-attached thread relies on
+        // its own jsonl cache for history, never a live server replay.
+        let result = if uses_pool {
+            let key = acpx_client::pool::PoolKey::new(
+                cwd.to_string_lossy().into_owned(),
+                slot.provider.clone(),
+                crate::gateway_actor::provider_profile_key(profile_name.as_deref()),
+            );
+            match handle
+                .acquire_and_attach(
+                    key,
+                    slot.thread_id.clone(),
+                    requested_session_id.clone(),
+                    cwd.clone(),
+                    mcp_servers.clone(),
+                )
+                .await
+            {
+                Ok(attached) => Ok(attached.session_id),
+                Err(error) => Err(error),
+            }
+        } else if let Some(session_id) = requested_session_id.clone() {
             let remote_sessions = handle
                 .list_sessions_for_agent(slot.provider.clone())
                 .await
@@ -2665,7 +2727,6 @@ fn spawn_background_attachment(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(session_id);
                 persist_thread_snapshot(store.as_ref(), &slot, now_token());
-                spawn_snapshotd_mcp_context_registration(&tokio::runtime::Handle::current(), &slot);
 
                 if requested_session_id.is_some() {
                     let mut cached_index = 0usize;
@@ -2719,60 +2780,6 @@ fn spawn_background_attachment(
     });
 }
 
-/// Registers the MCP context only after ACPX has accepted the session. The
-/// lookup and control-socket RPC are background work: attachment success and
-/// the UI frame are never held hostage by a daemon that is starting,
-/// restarting, or unavailable.
-fn spawn_snapshotd_mcp_context_registration(
-    runtime: &tokio::runtime::Handle,
-    slot: &Arc<ThreadSlot>,
-) {
-    let Some(project_path) = slot.project_path_snapshot() else {
-        return;
-    };
-    let Some(client) = crate::snapshotd_client::SnapshotdControlClient::from_default_runtime()
-    else {
-        return;
-    };
-    let token = slot.mcp_context_token.clone();
-    let acp_session_id = slot
-        .acp_session_id
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let Some(acp_session_id) = acp_session_id else {
-        return;
-    };
-    runtime.spawn(async move {
-        let Ok(Some(project_id)) = client.project_id_for_path(&project_path).await else {
-            return;
-        };
-        let default_target = std::env::var("SNAPSHOTD_DEFAULT_TARGET_PROJECT_ID")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| project_id.clone());
-        let registration = crate::snapshotd_client::McpContextRegistration {
-            context_token: token,
-            acp_session_id,
-            chat_project_id: project_id,
-            default_target_project_id: Some(default_target),
-        };
-        let _ = client.register_mcp_context(&registration).await;
-    });
-}
-
-fn spawn_snapshotd_mcp_context_cleanup(runtime: &tokio::runtime::Handle, slot: &Arc<ThreadSlot>) {
-    let Some(client) = crate::snapshotd_client::SnapshotdControlClient::from_default_runtime()
-    else {
-        return;
-    };
-    let token = slot.mcp_context_token.clone();
-    runtime.spawn(async move {
-        let _ = client.unregister_mcp_context(&token).await;
-    });
-}
-
-#[allow(dead_code)]
 impl AgentBridge {
     /// Production constructor: every thread's acpx gateway URL resolved
     /// (env-override-or-local-autospawn, see [`provision_gateway`]) +
@@ -3030,7 +3037,6 @@ impl AgentBridge {
                 thread_id: thread_id.clone(),
                 provider: spec.provider.clone(),
                 handle: handle.clone(),
-                mcp_context_token: uuid::Uuid::new_v4().to_string(),
                 transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
                     &thread_id, &seeded,
                 )),
@@ -3106,6 +3112,11 @@ impl AgentBridge {
                 spec.profile_name.clone(),
                 attachment_gate,
                 session_cwd_override.clone(),
+                // acpx-client-session-lease-pool: bulk cold-start restore
+                // is not yet cut over to the pool (SQL binding hydration
+                // isn't built yet either -- see meta.json) -- unchanged
+                // legacy behavior for every restored thread.
+                false,
             );
         }
         drop(_guard);
@@ -3149,6 +3160,7 @@ impl AgentBridge {
             events,
             gateway_urls: resolved_urls,
             gateways,
+            project_pools: Arc::new(Mutex::new(std::collections::HashMap::new())),
             gateway_catalog: Arc::new(Mutex::new(GatewayCatalogCache::default())),
             gateway_catalog_refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             agent_operations: Arc::new(Mutex::new(HashSet::new())),
@@ -3218,6 +3230,37 @@ impl AgentBridge {
             });
         }
         Ok(())
+    }
+
+    /// acpx-client-session-lease-pool: the pool for one (project directory,
+    /// gateway base_url) pair, creating it on first request. `None` only in
+    /// the narrow window right after construction before the background
+    /// `Gateway::connect` task (see `ensure_gateway_provisioned`) has
+    /// resolved yet -- callers fall back to the legacy delayed-gateway
+    /// non-pool path for that one rare race rather than blocking on it.
+    ///
+    /// `mcp_servers` is compared against the last value this bridge applied
+    /// to this exact pool's opener; a change triggers `set_mcp_servers` +
+    /// `refresh_all` (see `GatewaySessionOpener::set_mcp_servers`'s doc
+    /// comment for why a warm-pooled session's MCP config can only be
+    /// changed for *future* sessions, never an already-open one) so the
+    /// next acquire for any key on this pool opens fresh with the new
+    /// config; an unchanged value is a no-op, never disturbing warm
+    /// sessions needlessly.
+    fn pool_for(
+        &self,
+        project_dir: &str,
+        base_url: &str,
+        mcp_servers: &[serde_json::Value],
+    ) -> Option<SharedSessionPool> {
+        resolve_pool_for(
+            &self.project_pools,
+            &self.gateways,
+            self.runtime.handle(),
+            project_dir,
+            base_url,
+            mcp_servers,
+        )
     }
 
     /// `chat_sessions_project_path` phase: called from the FFI-driven
@@ -3360,6 +3403,7 @@ impl AgentBridge {
             tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
             Option<String>,
             bool,
+            bool,
         ),
         BridgeError,
     > {
@@ -3371,9 +3415,36 @@ impl AgentBridge {
             seed_thread_from_cache(self.store.as_ref(), thread_id, HISTORY_PAGE_SIZE);
         let has_cached_transcript = !seeded.is_empty();
 
+        let project_path_for_slot = self
+            .session_project_path_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // acpx-client-session-lease-pool: PoolKey::project_dir must match
+        // the real ACP `cwd` this thread will attach with, so `pool_for`
+        // uses the same resolution `cwd_for_session` (below, at attach
+        // time) will use -- computed here, once, so both agree.
+        let pool_cwd = cwd_for_session(project_path_for_slot.as_deref(), &self.session_cwd_override);
+        let mcp_servers = snapflowd_mcp_servers_entry(
+            thread_project_dir(project_path_for_slot.as_deref(), &self.session_cwd_override)
+                .as_deref(),
+            provider,
+        );
+        let pool = self.pool_for(&pool_cwd.to_string_lossy(), &base_url, &mcp_servers);
+        let uses_pool = pool.is_some();
+
         let (mut handle, gateway_setter) = {
             let _guard = self.runtime.enter();
-            spawn_acpx_thread_with_delayed_gateway()
+            match pool.clone() {
+                Some(pool) => spawn_acpx_thread_with_delayed_gateway_and_pool(pool),
+                // Only reachable in the narrow window right after
+                // construction, before the background `Gateway::connect`
+                // task (spawned in the constructor) has resolved yet --
+                // `pool_for` itself needs a real `Arc<Gateway>` to build a
+                // `GatewaySessionOpener`, so this one rare race falls back
+                // to the legacy non-pool path rather than blocking on it.
+                None => spawn_acpx_thread_with_delayed_gateway(),
+            }
         };
         match self
             .gateways
@@ -3410,16 +3481,10 @@ impl AgentBridge {
         }
         let events_rx = handle.take_events();
         let handle = Arc::new(handle);
-        let project_path_for_slot = self
-            .session_project_path_override
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         let slot = Arc::new(ThreadSlot {
             thread_id: thread_id.to_string(),
             provider: provider.to_string(),
             handle: handle.clone(),
-            mcp_context_token: uuid::Uuid::new_v4().to_string(),
             transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
                 thread_id, &seeded,
             )),
@@ -3469,7 +3534,14 @@ impl AgentBridge {
             deferred,
             background: Mutex::new(false),
         });
-        Ok((slot, handle, events_rx, cached_session_id, has_cached_transcript))
+        Ok((
+            slot,
+            handle,
+            events_rx,
+            cached_session_id,
+            has_cached_transcript,
+            uses_pool,
+        ))
     }
 
     /// PUI-014 / PROF-1: resolves a caller-requested agent id to a
@@ -3526,7 +3598,7 @@ impl AgentBridge {
         }
         let idx = self.slots.len();
         let provider = self.resolve_provider_for(preferred_provider)?;
-        let (slot, _handle, _events_rx, _cached_session_id, _has_cached_transcript) =
+        let (slot, _handle, _events_rx, _cached_session_id, _has_cached_transcript, _uses_pool) =
             self.build_slot(&thread_id, &provider, true)?;
         self.slots.push(slot);
         Ok(idx)
@@ -3556,7 +3628,7 @@ impl AgentBridge {
         }
         let thread_id = existing.thread_id.clone();
         let provider = self.resolve_provider_for(preferred_provider)?;
-        let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
+        let (slot, handle, events_rx, cached_session_id, has_cached_transcript, uses_pool) =
             self.build_slot(&thread_id, &provider, false)?;
         self.slots[idx] = slot.clone();
         spawn_background_attachment(
@@ -3572,6 +3644,7 @@ impl AgentBridge {
             profile.map(str::to_string),
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
+            uses_pool,
         );
         Ok(())
     }
@@ -3603,7 +3676,7 @@ impl AgentBridge {
         // "selected claude-acp, codex-acp underneath" failure reported
         // live on the VNC demo.
         let provider = self.resolve_provider_for(preferred_provider)?;
-        let (slot, handle, events_rx, cached_session_id, has_cached_transcript) =
+        let (slot, handle, events_rx, cached_session_id, has_cached_transcript, uses_pool) =
             self.build_slot(&thread_id, &provider, false)?;
         self.slots.push(slot.clone());
 
@@ -3620,6 +3693,7 @@ impl AgentBridge {
             profile.map(str::to_string),
             Arc::new(tokio::sync::Mutex::new(())),
             self.session_cwd_override.clone(),
+            uses_pool,
         );
 
         Ok(idx)
@@ -3747,7 +3821,6 @@ impl AgentBridge {
             thread_id: thread_id.clone(),
             provider: provider.to_string(),
             handle: handle.clone(),
-            mcp_context_token: uuid::Uuid::new_v4().to_string(),
             transcript: Mutex::new(crate::conversation::rebuild_from_chat_messages(
                 &thread_id,
                 &[],
@@ -3787,11 +3860,7 @@ impl AgentBridge {
         let slot_project_path = slot.project_path_snapshot();
         let cwd = cwd_for_session(slot_project_path.as_deref(), &self.session_cwd_override);
         let project_dir = thread_project_dir(slot_project_path.as_deref(), &self.session_cwd_override);
-        let mcp_servers = snapflowd_mcp_servers_entry_with_context(
-            project_dir.as_deref(),
-            provider,
-            Some(&slot.mcp_context_token),
-        );
+        let mcp_servers = snapflowd_mcp_servers_entry(project_dir.as_deref(), provider);
         self.runtime
             .block_on(handle.resume_session(session_id.to_string(), cwd, mcp_servers))
             .map_err(|error| BridgeError::Gateway(error.to_string()))?;
@@ -3800,7 +3869,6 @@ impl AgentBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
         persist_thread_snapshot(self.store.as_ref(), &slot, now_token());
-        spawn_snapshotd_mcp_context_registration(self.runtime.handle(), &slot);
 
         // `resume_session`'s own replayed `session/update` history has
         // already fully arrived on `events_rx` by the time the call
@@ -4087,9 +4155,6 @@ impl AgentBridge {
             .is_ok();
         if ok {
             *slot.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
-            if !background {
-                spawn_snapshotd_mcp_context_cleanup(self.runtime.handle(), slot);
-            }
         }
         ok
     }
@@ -4112,7 +4177,6 @@ impl AgentBridge {
         let ok = self.runtime.block_on(handle.delete_session()).is_ok();
         if ok {
             *slot.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
-            spawn_snapshotd_mcp_context_cleanup(self.runtime.handle(), slot);
         }
         ok
     }
@@ -5130,7 +5194,6 @@ impl Drop for AgentBridge {
         // returns `None` and unwinds cleanly, instead of relying purely on
         // the runtime's own shutdown-cancels-outstanding-tasks behavior.
         for slot in &self.slots {
-            spawn_snapshotd_mcp_context_cleanup(self.runtime.handle(), slot);
             // Project recreation detaches foreground thread actors. Stopping
             // only the local actor leaves the ACPX session live until server
             // expiry, so repeated A -> B -> restart cycles exhaust the
@@ -9415,22 +9478,6 @@ done
     #[test]
     fn snapshotd_mcp_server_entry_is_absent_without_cached_daemon_status() {
         assert!(snapshotd_mcp_server_entry_for_addr(None).is_empty());
-    }
-
-    #[test]
-    fn snapshotd_mcp_server_entry_carries_the_per_session_context_header() {
-        let entries = snapshotd_mcp_server_entry_for_addr_and_context(
-            Some("127.0.0.1:43210"),
-            Some("context-a"),
-        );
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0]["headers"][0],
-            serde_json::json!({
-                "name": "X-Snapshotd-Context-Token",
-                "value": "context-a"
-            })
-        );
     }
 
     /// **Regression test for the real, live-found MCP transport bug**
