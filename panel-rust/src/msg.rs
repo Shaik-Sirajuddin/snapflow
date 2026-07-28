@@ -27,6 +27,7 @@ pub enum UiMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadMsg {
     New,
+    #[allow(dead_code)]
     NewResolved {
         display_name: String,
         provider: String,
@@ -57,6 +58,7 @@ pub enum ThreadMsg {
 pub enum ComposeMsg {
     SendRequested(String),
     StopRequested,
+    #[allow(dead_code)]
     GenerationStopped,
     /// Drop one send-queue entry (QueuedMessageBar cancel).
     /// `message_index` is the Slint message-list index (`MessageItem.index`).
@@ -89,23 +91,28 @@ pub enum ComposeMsg {
     /// Stop in-flight generation and pause auto-drain of the send queue
     /// (QueuedMessageBar stop while an entry is marked `sending`).
     QueueStop,
+    #[allow(dead_code)]
     MentionTokenPrefix {
         text: String,
         cursor: i32,
     },
+    #[allow(dead_code)]
     MentionTokenQuery {
         text: String,
         cursor: i32,
     },
+    #[allow(dead_code)]
     MentionTokenReplace {
         text: String,
         cursor: i32,
         replacement: String,
     },
+    #[allow(dead_code)]
     WordBoundaryBefore {
         text: String,
         cursor: i32,
     },
+    #[allow(dead_code)]
     ContainsCi {
         haystack: String,
         needle: String,
@@ -266,7 +273,9 @@ pub enum ChromeMsg {
         show_global: bool,
     },
     ToggleExpanded(usize),
-    CopyMessageRequested { text: String },
+    CopyMessageRequested {
+        text: String,
+    },
     ErrorBannerDismissed,
 }
 
@@ -293,7 +302,10 @@ pub enum HostMsg {
     /// so it must say so explicitly. `old` empty means "this project was
     /// untitled and is being saved for the first time", which is NOT a
     /// rename (see `update_host`'s handler).
-    ProjectPathRenamed { old: String, new: String },
+    ProjectPathRenamed {
+        old: String,
+        new: String,
+    },
     // language-switch-sync plan: a QSettings "language" locale code (e.g.
     // "fr", "zh_CN") pushed live from Qt's Settings > Language picker --
     // see MainWindow::languageChanged's doc comment for why this is a

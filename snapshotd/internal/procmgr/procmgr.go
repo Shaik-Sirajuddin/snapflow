@@ -145,10 +145,10 @@ func (m *Manager) lockProject(projectID string) func() {
 // New constructs a Manager with sane defaults for unset fields.
 func New(reg *registry.Registry, binPath, runDir, logDir string) *Manager {
 	return &Manager{
-		Reg:      reg,
-		BinPath:  binPath,
-		RunDir:   runDir,
-		LogDir:   logDir,
+		Reg:     reg,
+		BinPath: binPath,
+		RunDir:  runDir,
+		LogDir:  logDir,
 		// 5s (the original default here) only ever worked for headless/
 		// MockBackend-style cold starts. A real Qt/MLT GUI cold start
 		// (real_ffi's FfiBackend, the only backend `daemon serve`'s
@@ -298,7 +298,12 @@ func (m *Manager) Launch(ctx context.Context, projectID string, opts LaunchOptio
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: generate instance id: %w", err)
 	}
 	instanceID := shortID
-	sockPath := filepath.Join(m.RunDir, shortID+".sock")
+	// Keep the registry identity at 64 bits, but use a shorter bounded socket
+	// basename. RunDir may be a deeply nested worktree-scoped SNAPSHOTD_HOME;
+	// using all 16 hex characters can exceed the conservative AF_UNIX limit
+	// before the child has even started.
+	socketID := shortID[:12]
+	sockPath := filepath.Join(m.RunDir, socketID+".sock")
 	const maxSockPathLen = 100 // conservative margin under the ~108-byte sun_path limit
 	if len(sockPath) > maxSockPathLen {
 		return registry.ProcessInstance{}, false, fmt.Errorf("procmgr: socket path %q exceeds Unix domain socket path length limits; configure a shorter RunDir", sockPath)
@@ -496,6 +501,11 @@ func (m *Manager) Close(instanceID string) error {
 
 	if ok && cmd.Process != nil {
 		_ = cmd.Process.Kill()
+		// Reap the child before publishing the closed registry state. Without
+		// waiting, a GUI handoff can return while the old daemon process is
+		// still visible in the OS process table, briefly violating the
+		// single-live-instance invariant.
+		_ = cmd.Wait()
 	}
 
 	pi, err := m.Reg.GetProcessInstance(instanceID)

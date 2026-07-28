@@ -432,6 +432,7 @@ impl SkillManager {
         self.with_conn(|conn| TargetsRepo::delete_for_skill_and_vendor(conn, skill_id, vendor_id))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn central_store_dir(&self) -> &std::path::Path {
         &self.central_store_dir
     }

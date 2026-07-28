@@ -35,6 +35,9 @@ const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// gateway that's mid-restart gets a little more time on each retry
 /// rather than being hammered at a fixed interval.
 const RECONNECT_BACKOFF_STEP: Duration = Duration::from_millis(500);
+/// Bound the first WebSocket handshake too. A delayed initial handshake must
+/// degrade to a later bounded request error, not strand thread actors.
+const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Gateway {
     base_url: String,
@@ -105,7 +108,13 @@ impl Gateway {
     pub async fn connect(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
         let http = GatewayClient::new(base_url.clone());
-        let websocket = GatewayWsClient::connect(&base_url).await.ok();
+        let websocket = tokio::time::timeout(
+            INITIAL_CONNECT_TIMEOUT,
+            GatewayWsClient::connect(&base_url),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
         Self {
             base_url,
             http,
@@ -166,14 +175,20 @@ impl Gateway {
             )
             .await;
             if let Ok(Ok(client)) = attempt_result {
-                *self.websocket.write().expect("gateway websocket lock poisoned") = Some(client);
+                *self
+                    .websocket
+                    .write()
+                    .expect("gateway websocket lock poisoned") = Some(client);
                 return true;
             }
             if attempt < RECONNECT_MAX_ATTEMPTS {
                 tokio::time::sleep(RECONNECT_BACKOFF_STEP * attempt).await;
             }
         }
-        *self.websocket.write().expect("gateway websocket lock poisoned") = None;
+        *self
+            .websocket
+            .write()
+            .expect("gateway websocket lock poisoned") = None;
         false
     }
 
@@ -184,10 +199,7 @@ impl Gateway {
     /// Subscribes to notifications for one ACP session on the shared
     /// WebSocket. Responses still use the pending request map; only live
     /// notifications are demultiplexed here.
-    pub fn subscribe_session(
-        &self,
-        session_id: &str,
-    ) -> Option<SessionSubscription> {
+    pub fn subscribe_session(&self, session_id: &str) -> Option<SessionSubscription> {
         self.current_websocket()
             .map(|client| client.subscribe_session(session_id))
     }
@@ -249,7 +261,10 @@ impl Gateway {
             "cwd": replay.params.get("cwd").cloned().unwrap_or_default(),
         });
         client
-            .call("session/resume", with_profile(params, replay.profile.as_deref()))
+            .call(
+                "session/resume",
+                with_profile(params, replay.profile.as_deref()),
+            )
             .await
             .map(|_| ())
     }
@@ -348,9 +363,7 @@ impl Gateway {
                     )),
                 }
             }
-            None => {
-                self.call_after_reconnect(method, params, profile).await
-            }
+            None => self.call_after_reconnect(method, params, profile).await,
         }
     }
 
@@ -452,21 +465,19 @@ impl Gateway {
             )
         };
         let result = match self.current_websocket() {
-            Some(websocket) => {
-                match websocket.call("acpx/agent_response", params.clone()).await {
-                    Err(ClientError::WebSocket(_)) => {
-                        if self.reconnect().await {
-                            match self.current_websocket() {
-                                Some(client) => client.call("acpx/agent_response", params).await?,
-                                None => return Err(no_interactive_connection()),
-                            }
-                        } else {
-                            return Err(no_interactive_connection());
+            Some(websocket) => match websocket.call("acpx/agent_response", params.clone()).await {
+                Err(ClientError::WebSocket(_)) => {
+                    if self.reconnect().await {
+                        match self.current_websocket() {
+                            Some(client) => client.call("acpx/agent_response", params).await?,
+                            None => return Err(no_interactive_connection()),
                         }
+                    } else {
+                        return Err(no_interactive_connection());
                     }
-                    other => other?,
                 }
-            }
+                other => other?,
+            },
             None => {
                 if self.reconnect().await {
                     match self.current_websocket() {

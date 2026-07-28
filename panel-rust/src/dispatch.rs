@@ -625,7 +625,10 @@ pub(crate) fn dispatch_queue_stop(panel: &PanelSingleton) {
         update_persistent(panel, Msg::Ui(UiMsg::Compose(ComposeMsg::QueueStop)));
     debug_assert!(
         effects.is_empty()
-            || matches!(effects.as_slice(), [crate::effect::Effect::CancelGeneration { .. }]),
+            || matches!(
+                effects.as_slice(),
+                [crate::effect::Effect::CancelGeneration { .. }]
+            ),
         "Compose::QueueStop must produce zero or one CancelGeneration effect"
     );
     execute_effects(panel, effects);
@@ -755,8 +758,10 @@ pub(crate) fn dispatch_terminal_kill_requested(
     component: &ChatPanel,
     terminal_id: String,
 ) {
-    let (effects, _dirty) =
-        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::Kill(terminal_id))));
+    let (effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::Kill(terminal_id))),
+    );
     let _ = component;
     execute_effects(panel, effects);
 }
@@ -779,8 +784,10 @@ pub(crate) fn dispatch_terminal_close_overlay(panel: &PanelSingleton) {
 /// switching the active tab never touches which ids are open, only which
 /// one's content the overlay currently renders.
 pub(crate) fn dispatch_terminal_tab_selected(panel: &PanelSingleton, terminal_id: String) {
-    let (_effects, _dirty) =
-        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab(terminal_id))));
+    let (_effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::SelectTab(terminal_id))),
+    );
     panel.dispatch_frame_input(crate::msg::FrameInput {
         selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
             .collect_selected_thread_snapshot(),
@@ -794,8 +801,10 @@ pub(crate) fn dispatch_terminal_tab_selected(panel: &PanelSingleton, terminal_id
 /// user action); the terminal itself is untouched, just no longer pinned
 /// open as a tab.
 pub(crate) fn dispatch_terminal_tab_closed(panel: &PanelSingleton, terminal_id: String) {
-    let (_effects, _dirty) =
-        update_persistent(panel, Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab(terminal_id))));
+    let (_effects, _dirty) = update_persistent(
+        panel,
+        Msg::Ui(UiMsg::Terminal(TerminalMsg::CloseTab(terminal_id))),
+    );
     panel.dispatch_frame_input(crate::msg::FrameInput {
         selected_thread_snapshot: crate::external_snapshot::ExternalSnapshotSource::new(panel)
             .collect_selected_thread_snapshot(),
@@ -1307,13 +1316,15 @@ pub(crate) fn dispatch_search_submitted(
 }
 
 pub(crate) fn dispatch_toggle_expanded(panel: &PanelSingleton, index: usize) {
-    let (_, dirty) = update_persistent(
+    // ToggleExpanded intentionally emits a one-row MessageRowPatch.  The
+    // reducer test covers that contract; requiring MessagesDiff here was an
+    // obsolete assertion that caused debug builds to abort during normal
+    // expand/collapse interaction, especially while project state was being
+    // refreshed concurrently.
+    let _ = update_persistent(
         panel,
         Msg::Ui(UiMsg::Chrome(ChromeMsg::ToggleExpanded(index))),
     );
-    debug_assert!(dirty
-        .iter()
-        .any(|item| matches!(item, Dirty::MessagesDiff { .. })));
 }
 
 pub(crate) fn dispatch_copy_message(panel: &PanelSingleton, text: String) {
@@ -1361,7 +1372,8 @@ pub(crate) fn dispatch_project_path_renamed(panel: &PanelSingleton, old: String,
     } else {
         old
     };
-    let (effects, _) = update_persistent(panel, Msg::Host(HostMsg::ProjectPathRenamed { old, new }));
+    let (effects, _) =
+        update_persistent(panel, Msg::Host(HostMsg::ProjectPathRenamed { old, new }));
     execute_effects(panel, effects);
 }
 

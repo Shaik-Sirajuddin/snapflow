@@ -150,10 +150,7 @@ pub(crate) fn agent_text_is_hard_failure(text: &str) -> bool {
 /// for the editor's Preview toggle -- same renderer/wrap as agent chat
 /// bodies, so the "MD formatter" applies to the skill's editing section.
 pub fn skill_markdown_preview(text: &str) -> ModelRc<MarkdownLine> {
-    lines_to_slint_model(markdown::render_document(
-        text,
-        markdown::DEFAULT_WRAP_COLS,
-    ))
+    lines_to_slint_model(markdown::render_document(text, markdown::DEFAULT_WRAP_COLS))
 }
 
 /// Incremental render for an in-flight agent message.
@@ -795,10 +792,8 @@ fn append_option_entries(items: &mut Vec<DropdownEntry>, option: ConfigOptionInf
 fn looks_on_value(value: &str, name: &str) -> bool {
     let v = value.to_ascii_lowercase();
     let n = name.to_ascii_lowercase();
-    matches!(
-        v.as_str(),
-        "on" | "true" | "1" | "yes" | "enabled" | "fast"
-    ) || matches!(n.as_str(), "on" | "true" | "yes" | "enabled" | "fast")
+    matches!(v.as_str(), "on" | "true" | "1" | "yes" | "enabled" | "fast")
+        || matches!(n.as_str(), "on" | "true" | "yes" | "enabled" | "fast")
 }
 
 fn looks_off_value(value: &str, name: &str) -> bool {
@@ -807,7 +802,10 @@ fn looks_off_value(value: &str, name: &str) -> bool {
     matches!(
         v.as_str(),
         "off" | "false" | "0" | "no" | "disabled" | "slow" | "quality"
-    ) || matches!(n.as_str(), "off" | "false" | "no" | "disabled" | "slow" | "quality")
+    ) || matches!(
+        n.as_str(),
+        "off" | "false" | "no" | "disabled" | "slow" | "quality"
+    )
 }
 
 /// UI projection for the compose-bar Fast toggle. Empty/unavailable when
@@ -1134,7 +1132,10 @@ pub fn retain_items_for_project(
 /// empty recorded path already means "visible/neutral everywhere", not
 /// "assume the active project").
 pub fn display_project_path(recorded: Option<&str>) -> String {
-    recorded.filter(|path| !path.is_empty()).unwrap_or("").to_owned()
+    recorded
+        .filter(|path| !path.is_empty())
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// PISO-8 (project-isolation-mlt-binding plan): true only when
@@ -1509,7 +1510,7 @@ pub fn to_mcp_server_option_rows(
         .collect()
 }
 
-/// PUI-015: the built-in `snapshotd` daemon MCP row for the Settings list,
+/// PUI-015: the built-in `snapflow` daemon MCP row for the Settings list,
 /// or `None` when the watcher has no current authoritative MCP status. This
 /// is the same endpoint the panel injects into sessions, surfaced here as a
 /// first-class, non-removable row so the always-on daemon server the model
@@ -1520,7 +1521,7 @@ pub fn to_mcp_server_option_rows(
 pub fn builtin_snapshotd_option(addr: Option<String>) -> Option<McpServerOption> {
     let addr = addr?;
     Some(McpServerOption {
-        name: "snapshotd".into(),
+        name: "snapflow".into(),
         command: String::new().into(),
         status_line: "built-in daemon · always available".into(),
         transport: "http".into(),
@@ -1855,9 +1856,9 @@ mod tests {
             "no built-in row when the daemon is unreachable"
         );
         let addr = "127.0.0.1:43210";
-        let row = builtin_snapshotd_option(Some(addr.to_owned()))
-            .expect("row present when reachable");
-        assert_eq!(row.name.as_str(), "snapshotd");
+        let row =
+            builtin_snapshotd_option(Some(addr.to_owned())).expect("row present when reachable");
+        assert_eq!(row.name.as_str(), "snapflow");
         assert!(!row.removable, "built-in daemon row must not be removable");
         assert_eq!(row.transport.as_str(), "http");
         assert!(
@@ -1903,7 +1904,15 @@ mod tests {
 
     #[test]
     fn empty_query_returns_every_thread_in_order() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "",
+        );
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].item.name, "Fix timeline crash");
         assert_eq!(items[0].real_index, 0);
@@ -1913,8 +1922,15 @@ mod tests {
 
     #[test]
     fn substring_match_is_case_insensitive() {
-        let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "FADE");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "FADE",
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
         // Real index must survive filtering -- "Add fade transition" is
@@ -1922,8 +1938,15 @@ mod tests {
         // list. This is exactly the mismatch `real_index` exists to fix.
         assert_eq!(items[0].real_index, 1);
 
-        let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "fade",
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.name, "Add fade transition");
     }
@@ -1933,7 +1956,15 @@ mod tests {
         // "x" appears in 2 non-adjacent names (index 0 and 3); must come
         // back in the same relative order as NAMES, not re-sorted, and
         // must skip the non-matching ones in between.
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "x");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "x",
+        );
         let matched_names: Vec<&str> = items.iter().map(|i| i.item.name.as_str()).collect();
         assert_eq!(
             matched_names,
@@ -1959,13 +1990,29 @@ mod tests {
 
     #[test]
     fn whitespace_only_query_behaves_like_empty() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "   ");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "   ",
+        );
         assert_eq!(items.len(), 4);
     }
 
     #[test]
     fn status_is_carried_through_unfiltered() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "",
+        );
         assert_eq!(items[1].item.status, "loading");
         assert_eq!(items[2].item.status, "error");
     }
@@ -1977,7 +2024,15 @@ mod tests {
         // whatever transient `ThreadState` it was last in -- STATE[1]
         // is `Loading` here, proving the override wins even over that.
         let closed: &[bool] = &[false, true, false, false];
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            closed,
+            NO_ARCHIVED,
+            "",
+        );
         assert_eq!(items[1].item.status, "closed");
         assert!(items[1].item.closed);
         assert_eq!(items[0].item.status, "idle");
@@ -1993,7 +2048,15 @@ mod tests {
         // may already be closed.
         let closed: &[bool] = &[false, true, false, false];
         let archived: &[bool] = &[false, true, false, false];
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, closed, archived, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            closed,
+            archived,
+            "",
+        );
         assert_eq!(items[1].item.status, "archived");
         assert!(items[1].item.archived);
         assert!(items[1].item.closed);
@@ -2009,21 +2072,44 @@ mod tests {
             "".into(),
             "Bug still open".into(),
         ];
-        let items = build_thread_items(NAMES, STATE, &descriptions, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            &descriptions,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "fade",
+        );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].item.description, "Added a fade");
     }
 
     #[test]
     fn description_defaults_to_empty_when_shorter_than_names() {
-        let items = build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "",
+        );
         assert!(items.iter().all(|i| i.item.description.is_empty()));
     }
 
     #[test]
     fn background_policy_is_preserved_after_filtering() {
-        let items =
-            build_thread_items(NAMES, STATE, NO_DESCRIPTIONS, BACKGROUND, NO_CLOSED, NO_ARCHIVED, "fade");
+        let items = build_thread_items(
+            NAMES,
+            STATE,
+            NO_DESCRIPTIONS,
+            BACKGROUND,
+            NO_CLOSED,
+            NO_ARCHIVED,
+            "fade",
+        );
         assert!(items[0].item.background);
     }
 
@@ -2138,7 +2224,10 @@ mod tests {
         assert_eq!(rows[0].title.as_str(), "cargo test");
         assert_eq!(rows[0].last_command.as_str(), "cargo test --lib");
         assert!(rows[0].active, "a non-exited terminal is active");
-        assert_eq!(rows[0].started_at.as_str(), "2026-07-24T05:00:00.000000000Z");
+        assert_eq!(
+            rows[0].started_at.as_str(),
+            "2026-07-24T05:00:00.000000000Z"
+        );
     }
 
     #[test]
@@ -2168,8 +2257,8 @@ mod tests {
     #[test]
     fn to_mcp_server_options_parses_tools_url_and_needs_auth() {
         use slint::Model;
-        let servers = vec![crate::protocol_types::McpServerEntry::from_json(
-            &serde_json::json!({
+        let servers = vec![
+            crate::protocol_types::McpServerEntry::from_json(&serde_json::json!({
                 "name": "remote-tools",
                 "url": "https://example.com/mcp",
                 "type": "remote",
@@ -2178,9 +2267,9 @@ mod tests {
                     { "name": "read", "enabled": true, "deferred": false, "token_usage": 12 },
                     { "name": "write", "enabled": false, "deferred": true }
                 ]
-            }),
-        )
-        .unwrap()];
+            }))
+            .unwrap(),
+        ];
         let model = to_mcp_server_options(servers);
         let row = model.row_data(0).unwrap();
         assert_eq!(row.transport.as_str(), "http");
@@ -2248,7 +2337,13 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["codex-acp", "claude-acp", "blocked-acp", "aardvark-acp", "zebra-acp"],
+            vec![
+                "codex-acp",
+                "claude-acp",
+                "blocked-acp",
+                "aardvark-acp",
+                "zebra-acp"
+            ],
             "expected installed/installed_no_session first, then runtime_missing, then \
              not_installed with original relative order preserved within each group"
         );
@@ -2516,7 +2611,10 @@ mod transcript_model_tests {
         assert!(entries.row_data(0).unwrap().is_current);
         assert_eq!(entries.row_data(1).unwrap().label.as_str(), "claude-acp");
         assert_eq!(entries.row_data(2).unwrap().id.as_str(), "__new_provider__");
-        assert_eq!(entries.row_data(2).unwrap().label.as_str(), "+ New provider");
+        assert_eq!(
+            entries.row_data(2).unwrap().label.as_str(),
+            "+ New provider"
+        );
         assert_eq!(
             current_provider_trigger_label(&profiles, "work"),
             "codex-acp"
@@ -2547,8 +2645,14 @@ mod transcript_model_tests {
         // authoritative from models/list/session state; the panel no longer
         // drops namespaced values using string heuristics.
         assert_eq!(filtered.row_count(), 3);
-        assert_eq!(filtered.row_data(1).unwrap().value.as_str(), "codex-acp/gpt-5");
-        assert_eq!(filtered.row_data(2).unwrap().value.as_str(), "claude-acp/sonnet");
+        assert_eq!(
+            filtered.row_data(1).unwrap().value.as_str(),
+            "codex-acp/gpt-5"
+        );
+        assert_eq!(
+            filtered.row_data(2).unwrap().value.as_str(),
+            "claude-acp/sonnet"
+        );
     }
 
     /// PROF-10: a provider whose agent the catalog genuinely reports as
@@ -2866,7 +2970,10 @@ mod transcript_model_tests {
 
         let reasoning = to_reasoning_dropdown_entries(options.clone());
         assert_eq!(reasoning.row_count(), 4); // header + low/medium/high
-        assert_eq!(reasoning.row_data(0).unwrap().label.as_str(), "Reasoning effort");
+        assert_eq!(
+            reasoning.row_data(0).unwrap().label.as_str(),
+            "Reasoning effort"
+        );
         assert!(reasoning.row_data(2).unwrap().is_current); // medium
         assert_eq!(current_reasoning_trigger_label(&options), "Medium");
         assert_eq!(current_config_trigger_label(&options), "GPT-5");

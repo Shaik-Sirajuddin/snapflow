@@ -24,7 +24,7 @@ type Memory struct {
 // goroutine at the given interval (a sensible default is used if <= 0).
 func NewMemory(sweepInterval time.Duration) *Memory {
 	if sweepInterval <= 0 {
-		sweepInterval = 30 * time.Second
+		sweepInterval = DefaultSweepInterval
 	}
 	m := &Memory{
 		sessions:      make(map[string]Session),

@@ -88,6 +88,11 @@ fn fetch_daemon_project_instances_reports_a_real_agent_launched_headless_project
     // ordinary folder path is the same shape a real agent's `daemon.launch`
     // MCP call would be given, not a synthetic edge case.
     std::fs::create_dir_all(project_dir.path()).expect("project dir exists");
+    // Launch/open intentionally never manufactures an MLT file.  Keep the
+    // caller contract explicit in this real-daemon fixture by creating the
+    // minimal project document before asking the daemon to launch it.
+    std::fs::write(project_dir.path().join("project.mlt"), "<mlt/>\n")
+        .expect("write minimal project.mlt");
 
     let mut serve = Command::new(&snapshotd_bin)
         .args(["serve", "--no-mcp"])

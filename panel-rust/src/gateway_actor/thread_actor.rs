@@ -562,7 +562,8 @@ impl AcpxThreadHandle {
         &self,
         agent_id: String,
     ) -> Result<Vec<ConfigOptionInfo>, AcpxThreadError> {
-        self.call(|resp| Command::ListModels { agent_id, resp }).await
+        self.call(|resp| Command::ListModels { agent_id, resp })
+            .await
     }
 
     /// `agents/status` for one agent id. Typed `AgentCatalogEntry`, same
@@ -842,8 +843,14 @@ fn parse_capability_update(update: &serde_json::Value) -> Option<AgentEvent> {
         .and_then(|k| k.as_str())?
     {
         "usage_update" => {
-            let used = session_update.get("used").and_then(|v| v.as_i64()).unwrap_or(0);
-            let size = session_update.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+            let used = session_update
+                .get("used")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let size = session_update
+                .get("size")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             Some(AgentEvent::UsageUpdate { used, size })
         }
         "current_mode_update" => {
@@ -1337,9 +1344,7 @@ fn spawn_session_live_forwarder(
             };
             if rehydrate_after_connect {
                 if let Err(error) = client.rehydrate_session(&session_id).await {
-                    eprintln!(
-                        "panel-rust: session rehydration failed for {session_id}: {error}"
-                    );
+                    eprintln!("panel-rust: session rehydration failed for {session_id}: {error}");
                 }
                 rehydrate_after_connect = false;
             }
@@ -1754,8 +1759,7 @@ async fn run_thread_actor(
                     let _ = resp.send(Err(AcpxThreadError::NoActiveSession));
                     continue;
                 };
-                let params =
-                    serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
+                let params = serde_json::json!({ "sessionId": sid, "terminalId": terminal_id });
                 let result = client.call("terminal/kill", params, None).await;
                 let _ = resp.send(result.map(|_| ()).map_err(Into::into));
             }

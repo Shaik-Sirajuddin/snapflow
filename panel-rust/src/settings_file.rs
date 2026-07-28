@@ -365,6 +365,7 @@ impl SettingsWatcher {
         }
     }
 
+    #[allow(dead_code)]
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {

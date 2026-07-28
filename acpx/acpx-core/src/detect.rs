@@ -23,6 +23,7 @@
 use acpx_proto::agent::AgentStatus;
 use acpx_registry::Distribution;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,83 @@ use std::time::{Duration, Instant};
 /// started (e.g. `uv` installed mid-session) is picked up without a
 /// restart, just not on literally the next request.
 const WHICH_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Make Node-based ACP runtimes visible when acpx-server itself was started
+/// by systemd (or another non-login supervisor). Such services intentionally
+/// receive a small, deterministic PATH and therefore do not source nvm's
+/// shell initialization. Follow Omni's production fallback: preserve a
+/// working global runtime, otherwise select the newest complete nvm prefix
+/// under `$NVM_DIR` or `~/.nvm` and prepend its bin directory.
+///
+/// This is called once during acpx-server startup, before config resolution,
+/// agent detection, or any backend process is spawned. Children inherit the
+/// repaired PATH, so discovery and launch use the same Node/npm/npx prefix.
+pub fn prepare_node_runtime_path() -> Option<PathBuf> {
+    if node_runtime_available_on_path() {
+        return None;
+    }
+
+    if let Some(home) = std::env::var_os("SNAPFLOW_ACP_NODE_HOME") {
+        let bin_dir = PathBuf::from(home).join("bin");
+        if complete_node_prefix(&bin_dir) {
+            prepend_path(&bin_dir);
+            return Some(bin_dir);
+        }
+    }
+
+    let nvm_dir = std::env::var_os("NVM_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".nvm")))?;
+    let bin_dir = newest_nvm_node_bin(&nvm_dir)?;
+    prepend_path(&bin_dir);
+    Some(bin_dir)
+}
+
+fn node_runtime_available_on_path() -> bool {
+    ["node", "npm", "npx"]
+        .iter()
+        .all(|name| which_uncached(name))
+}
+
+fn complete_node_prefix(bin_dir: &Path) -> bool {
+    ["node", "npm", "npx"]
+        .iter()
+        .all(|name| is_executable_file(&bin_dir.join(name)))
+}
+
+fn newest_nvm_node_bin(nvm_dir: &Path) -> Option<PathBuf> {
+    let pattern = nvm_dir.join("versions").join("node");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let entries = std::fs::read_dir(pattern).ok()?;
+    for entry in entries.flatten() {
+        let bin_dir = entry.path().join("bin");
+        if !complete_node_prefix(&bin_dir) {
+            continue;
+        }
+        let Ok(node_mtime) =
+            std::fs::metadata(bin_dir.join("node")).and_then(|meta| meta.modified())
+        else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .map_or(true, |(mtime, _)| node_mtime > *mtime)
+        {
+            newest = Some((node_mtime, bin_dir));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+fn prepend_path(bin_dir: &Path) {
+    let mut paths = vec![bin_dir.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(path) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", path);
+    }
+}
 
 /// Best-effort detection for a single registry entry's preferred
 /// distribution method.
@@ -177,6 +255,46 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn executable(path: &Path) {
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[test]
+    fn newest_complete_nvm_prefix_is_selected() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("versions/node/v20.0.0/bin");
+        let new = root.path().join("versions/node/v22.0.0/bin");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        for dir in [&old, &new] {
+            for name in ["node", "npm", "npx"] {
+                executable(&dir.join(name));
+            }
+        }
+        // The selector follows Omni's newest-file policy. Make the second
+        // prefix observably newer even on filesystems with coarse mtimes.
+        std::thread::sleep(Duration::from_millis(20));
+        executable(&new.join("node"));
+        assert_eq!(newest_nvm_node_bin(root.path()), Some(new));
+    }
+
+    #[test]
+    fn incomplete_nvm_prefix_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("versions/node/v22.0.0/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        executable(&bin.join("node"));
+        executable(&bin.join("npm"));
+        assert_eq!(newest_nvm_node_bin(root.path()), None);
+    }
 
     #[test]
     fn which_finds_a_real_binary_known_to_exist_in_this_test_environment() {

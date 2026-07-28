@@ -49,7 +49,7 @@ snapshotd serve
 
    ```sh
    curl -sf "http://127.0.0.1:8790/health"
-   # POST /rpc mcp_servers/list → entry name "snapshotd"
+   # POST /rpc mcp_servers/list → entry name "snapflow"
    ```
 
 ## Env (Phase 1 child)

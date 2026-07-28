@@ -185,6 +185,9 @@ export component ChatPanel inherits Window {
     // decide whether a thread's own project-path differs from "here".
     in property <string> active-project-path: "";
     in property <bool> project-open: false;
+    // The panel-level ACPX connection is usable even before a project or
+    // thread exists; this gates chat creation/input, not project metadata.
+    in property <bool> gateway-ready: false;
     callback skill-content-edited(string, string /* path, new content */);
     callback skill-copy-path-requested(string);
     callback skill-open-in-editor-requested(string, string /* editor name, path */);
@@ -471,6 +474,7 @@ export component ChatPanel inherits Window {
                 threads: threads;
                 selected-thread: selected-thread;
                 project-open: root.project-open;
+                gateway-ready: root.gateway-ready;
                 compact: compact;
                 narrow: root.narrow;
                 expanded: sidebar-expanded;
@@ -516,7 +520,7 @@ export component ChatPanel inherits Window {
                 }
             }
             chat-area := ChatArea {
-                no-project: !root.project-open;
+                no-project: !root.gateway-ready;
                 visible: root.active-pane == "chat";
                 x: sidebar.width;
                 y: 0px;
@@ -549,7 +553,7 @@ export component ChatPanel inherits Window {
                     ? threads[selected-thread].provider
                         + (threads[selected-thread].model != "" ? " . " + threads[selected-thread].model : "")
                     : "agent . ask";
-                inputs-enabled: root.project-open
+                inputs-enabled: root.gateway-ready
                     && !(threads.length > 0 && threads[selected-thread].archived);
                 mcp-connect-requested(name) => { root.mcp-server-authenticate(name); }
                 mcp-enabled-changed(name, enabled) => { root.mcp-server-enabled-changed(name, enabled); }

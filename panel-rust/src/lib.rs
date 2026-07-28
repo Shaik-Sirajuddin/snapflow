@@ -29,19 +29,19 @@ mod list_model;
 mod local_terminal;
 mod markdown;
 mod model;
-pub mod project_store;
-pub mod snapshotd_client;
 pub mod models;
 mod msg;
 mod permission;
+pub mod project_store;
 pub mod protocol_types;
 mod send_queue;
 mod settings_file;
+pub mod snapshotd_client;
 // `pub` (not just `mod`) so the `snapflowd-mcp` bin target can
 // reuse `scan_skills_dir`/`global_skills_dir`/`project_skills_dir` instead
 // of duplicating the SKILL.md front-matter parsing logic.
-pub mod skills_state;
 mod skills_manager_adapter;
+pub mod skills_state;
 mod state_store;
 mod sync;
 // `pub` (not just `mod`) so `tests/*.rs` integration tests -- separate
@@ -76,7 +76,9 @@ use protocol_types::{ChatMessage, MessageKind};
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, RepaintBufferType,
 };
-use slint::platform::{EventLoopProxy, Key, Platform, PointerEventButton, WindowAdapter, WindowEvent};
+use slint::platform::{
+    EventLoopProxy, Key, Platform, PointerEventButton, WindowAdapter, WindowEvent,
+};
 use slint::{SharedString, VecModel};
 use state_store::{PanelDefaults, PanelStateStore};
 use std::cell::{Cell, RefCell};
@@ -133,7 +135,10 @@ const DEFAULT_THREAD_NAMES: &[&str] = &[
 /// (`RouterError::UnknownProfile`) -- strictly worse than today's
 /// graceful native/unmanaged degrade -- so with nothing configured at
 /// all, `profile_name` stays `None`.
-fn cold_start_thread_specs(seed_names: &[&str], configured_agent_id: Option<String>) -> Vec<ThreadSpec> {
+fn cold_start_thread_specs(
+    seed_names: &[&str],
+    configured_agent_id: Option<String>,
+) -> Vec<ThreadSpec> {
     let seed_provider = configured_agent_id
         .clone()
         .unwrap_or_else(|| NO_PROVIDER_REQUESTED_FALLBACK.to_owned());
@@ -184,13 +189,21 @@ mod cold_start_thread_specs_tests {
     #[test]
     fn with_a_configured_default_agent_id_every_seed_thread_binds_to_it_as_its_profile() {
         let specs = cold_start_thread_specs(
-            &["Fix timeline crash", "Add fade transition", "Refactor filters"],
+            &[
+                "Fix timeline crash",
+                "Add fade transition",
+                "Refactor filters",
+            ],
             Some("codex-acp".to_owned()),
         );
         assert_eq!(specs.len(), 3);
         for spec in &specs {
             assert_eq!(spec.provider, "codex-acp");
-            assert_eq!(spec.profile_name.as_deref(), Some("codex-acp"), "got: {specs:?}");
+            assert_eq!(
+                spec.profile_name.as_deref(),
+                Some("codex-acp"),
+                "got: {specs:?}"
+            );
         }
     }
 }
@@ -402,7 +415,10 @@ fn maybe_migrate_sqlite_defaults_to_json(store: &PanelStateStore, warnings: &mut
 
 /// Load multi-process panel prefs from JSON (project → global → default).
 /// `selected_thread_id` remains process-local (SQLite) when provided.
-fn load_panel_prefs(selected_thread_id: Option<String>, warnings: &mut Vec<String>) -> PanelDefaults {
+fn load_panel_prefs(
+    selected_thread_id: Option<String>,
+    warnings: &mut Vec<String>,
+) -> PanelDefaults {
     let paths = settings_file::SettingsPaths::from_env();
     match paths.load_resolved() {
         Ok(resolved) => settings_file::resolved_to_panel_defaults(&resolved, selected_thread_id),
@@ -1077,11 +1093,7 @@ impl PanelSingleton {
     /// `auth_status`/`needs_auth` on the entry via `mcp_servers/update`
     /// so the Connect button can clear and the status line updates on
     /// the next settings gateway snapshot.
-    pub(crate) fn dispatch_mcp_server_authenticate(
-        &self,
-        _component: &ChatPanel,
-        name: &str,
-    ) {
+    pub(crate) fn dispatch_mcp_server_authenticate(&self, _component: &ChatPanel, name: &str) {
         let Some(bridge) = &self.bridge else { return };
         let gw = self.settings_gateway_index();
         let Some(mut entry) = bridge
@@ -1127,10 +1139,7 @@ impl PanelSingleton {
             );
             return;
         };
-        let tools = entry
-            .extra
-            .get_mut("tools")
-            .and_then(|v| v.as_array_mut());
+        let tools = entry.extra.get_mut("tools").and_then(|v| v.as_array_mut());
         if let Some(tools) = tools {
             let mut found = false;
             for tool in tools.iter_mut() {
@@ -1351,10 +1360,10 @@ impl PanelSingleton {
         } else {
             let moved_store = self.project_state_stores.borrow_mut().remove(old_identity);
             if let Some(store) = moved_store {
-            // The SQLite connection remains valid after the directory move,
-            // but its registry key must move with the project identity or a
-            // later switch can reopen the old path and leave two live cache
-            // entries for the same physical store.
+                // The SQLite connection remains valid after the directory move,
+                // but its registry key must move with the project identity or a
+                // later switch can reopen the old path and leave two live cache
+                // entries for the same physical store.
                 self.project_state_stores
                     .borrow_mut()
                     .insert(new_identity, store);
@@ -1489,8 +1498,8 @@ fn panel_rust_create_with_initial_identity(
             let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
             static FIRST_PLATFORM_CLAIMED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
-            let is_first_platform = !FIRST_PLATFORM_CLAIMED
-                .swap(true, std::sync::atomic::Ordering::SeqCst);
+            let is_first_platform =
+                !FIRST_PLATFORM_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst);
             slint::platform::set_platform(Box::new(SpikePlatform {
                 window: window.clone(),
                 is_first_platform,
@@ -1651,18 +1660,22 @@ fn panel_rust_create_with_initial_identity(
         //                explicit OPT-IN for dev/QA/demo harnesses that
         //                genuinely want named fixture content, not
         //                something a real launch falls into by default.
-        // D6/D7: a panel created before Qt has supplied a complete project
-        // identity is display-only. In particular, do not seed the default
-        // "Chat" thread or construct AgentBridge here: doing either would
-        // let ACP capture the host process cwd before the lifecycle binding
-        // arrives, and a later path setter cannot repair that session's cwd.
-        let mut initial_specs: Vec<ThreadSpec> = if initial_identity.is_none() {
-            Vec::new()
-        } else if restored_records.is_empty() {
+        // A panel without a project identity must still restore durable
+        // *unscoped* records from the global panel store. Only the synthetic
+        // cold-start seed is suppressed in that state; otherwise restart
+        // would erase the visible thread list until the user opened a
+        // project. Restored records carry their own project_path, so this
+        // does not invent a cwd or bind an old session to the host process.
+        let mut initial_specs: Vec<ThreadSpec> = if restored_records.is_empty()
+            && initial_identity.is_some()
+        {
             let seed_names: Vec<&str> = match std::env::var("RUI_SEED_THREADS") {
                 Ok(v) if v.trim() == "0" => vec!["Chat"],
                 Ok(v) => {
-                    let n = v.trim().parse::<usize>().unwrap_or(DEFAULT_THREAD_NAMES.len());
+                    let n = v
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap_or(DEFAULT_THREAD_NAMES.len());
                     DEFAULT_THREAD_NAMES.iter().copied().take(n).collect()
                 }
                 Err(_) => vec!["Chat"],
@@ -1670,9 +1683,11 @@ fn panel_rust_create_with_initial_identity(
             let configured_agent_id = settings_file::SettingsPaths::from_env()
                 .load_resolved()
                 .ok()
-                .and_then(|resolved| settings_file::non_default_sentinel(resolved.default_agent_id));
+                .and_then(|resolved| {
+                    settings_file::non_default_sentinel(resolved.default_agent_id)
+                });
             cold_start_thread_specs(&seed_names, configured_agent_id)
-        } else {
+        } else if !restored_records.is_empty() {
             restored_records
                 .iter()
                 .map(|record| ThreadSpec {
@@ -1692,9 +1707,7 @@ fn panel_rust_create_with_initial_identity(
                     // forever ("the default thread's chat input isn't
                     // linked to a real agent"). Guard here too, at this
                     // third point of use.
-                    profile_name: settings_file::non_default_sentinel(
-                        record.profile_name.clone(),
-                    ),
+                    profile_name: settings_file::non_default_sentinel(record.profile_name.clone()),
                     // PISO-3: hydrate the durable per-thread project
                     // association straight from the persisted record, so
                     // `AgentBridge::new_with_thread_specs` can bind the
@@ -1704,6 +1717,8 @@ fn panel_rust_create_with_initial_identity(
                     project_path: record.project_path.clone(),
                 })
                 .collect()
+        } else {
+            Vec::new()
         };
         if let Some(identity) = initial_identity.as_ref() {
             // Fresh and legacy rows in this project-local store inherit the
@@ -1724,12 +1739,16 @@ fn panel_rust_create_with_initial_identity(
             .chain(std::iter::repeat(None))
             .take(initial_specs.len())
             .collect();
-        let (bridge, bridge_available) = if initial_identity.is_none() {
-            (None, false)
-        } else {
-            let initial_cwd = initial_identity.as_ref().and_then(|identity| {
-                crate::project_store::project_store_dir(identity, &resolve_cache_dir())
-            });
+        // The bridge owns the panel-level ACPX server connection as well as
+        // per-thread sessions. Construct it even before a project is open or
+        // a chat thread exists, so Settings > Agents/MCP can discover the
+        // live gateway on the empty-project screen. Project identity remains
+        // optional input to the constructor; it only controls persistence
+        // scope and session cwd.
+        let initial_cwd = initial_identity.as_ref().and_then(|identity| {
+            crate::project_store::project_store_dir(identity, &resolve_cache_dir())
+        });
+        let (bridge, bridge_available) =
             match AgentBridge::new_with_thread_specs_and_initial_identity(
                 &initial_specs,
                 initial_cwd,
@@ -1739,13 +1758,13 @@ fn panel_rust_create_with_initial_identity(
             ) {
                 Ok(b) => (Some(b), true),
                 Err(e) => {
-                    let message = format!("agent bridge unavailable, chat panel is display-only: {e}");
+                    let message =
+                        format!("agent bridge unavailable, chat panel is display-only: {e}");
                     eprintln!("panel-rust: {message}");
                     startup_warnings.push(message);
                     (None, false)
                 }
-            }
-        };
+            };
         if let Some(bridge) = bridge.as_ref() {
             if let Some(store) = panel_state.as_ref() {
                 for (index, record) in restored_records.iter().enumerate() {
@@ -1778,9 +1797,7 @@ fn panel_rust_create_with_initial_identity(
         let initial_thread_ids: Vec<String> = restored_records
             .iter()
             .map(|record| record.thread_id.clone())
-            .chain(
-                (restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")),
-            )
+            .chain((restored_records.len()..initial_specs.len()).map(|idx| format!("thread:{idx}")))
             .collect();
         // Each thread's send queue persists to its own
         // <thread_id>.sendqueue.jsonl (see send_queue.rs's module doc) --
@@ -1843,12 +1860,19 @@ fn panel_rust_create_with_initial_identity(
             settings_reload_pending,
             settings_ignore_watch_until: Cell::new(None),
             _settings_watcher: settings_watcher,
-            snapshotd_registration: initial_identity.as_ref().and_then(|identity| {
-                snapshotd_client::SnapshotdRegistration::start(
-                    identity.saved_path().map(str::to_owned),
-                )
-            }),
+            // Register the GUI process even when no project is open yet.  The
+            // daemon owns the process lifecycle independently of project
+            // selection; waiting for an initial identity made a fresh panel
+            // invisible to snapshotd until the first project was opened.
+            snapshotd_registration: snapshotd_client::SnapshotdRegistration::start(
+                initial_identity
+                    .as_ref()
+                    .and_then(|identity| identity.saved_path().map(str::to_owned)),
+            ),
         };
+        // Gateway availability is panel-scoped, independent of project-open.
+        // This enables the first `+` thread on the empty-project screen.
+        panel.component.set_gateway_ready(bridge_available);
         if let Some(identity) = initial_identity {
             let saved_path = identity.saved_path().map(str::to_owned);
             let mut model = panel.model.borrow_mut();
@@ -1912,9 +1936,12 @@ fn panel_rust_create_with_initial_identity(
             selected_from_sqlite.clone(),
             &mut post_hydration_warnings,
         );
-        let defaults = scoped_prefs.as_ref().map(|prefs| prefs.defaults.clone()).unwrap_or_else(
-            || load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings),
-        );
+        let defaults = scoped_prefs
+            .as_ref()
+            .map(|prefs| prefs.defaults.clone())
+            .unwrap_or_else(|| {
+                load_panel_prefs(selected_from_sqlite, &mut post_hydration_warnings)
+            });
         panel.sync_runtime_defaults(&defaults);
         for message in post_hydration_warnings {
             let _ = dispatch::update_persistent(
@@ -2142,29 +2169,21 @@ fn panel_rust_create_with_initial_identity(
                 });
             });
 
-        panel
-            .component
-            .on_md_link_activated(move |target| {
-                open_md_link_target(target.as_str());
-            });
+        panel.component.on_md_link_activated(move |target| {
+            open_md_link_target(target.as_str());
+        });
 
         let component_weak = panel.component.as_weak();
-        panel
-            .component
-            .on_mcp_server_authenticate(move |name| {
-                let Some(component) = component_weak.upgrade() else {
-                    return;
-                };
-                PANEL.with(|cell| {
-                    if let Some(panel) = cell.borrow().as_ref() {
-                        dispatch::dispatch_mcp_server_authenticate(
-                            panel,
-                            &component,
-                            name.to_string(),
-                        );
-                    }
-                });
+        panel.component.on_mcp_server_authenticate(move |name| {
+            let Some(component) = component_weak.upgrade() else {
+                return;
+            };
+            PANEL.with(|cell| {
+                if let Some(panel) = cell.borrow().as_ref() {
+                    dispatch::dispatch_mcp_server_authenticate(panel, &component, name.to_string());
+                }
             });
+        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_mcp_server_tool_enabled_changed(
@@ -2235,13 +2254,15 @@ fn panel_rust_create_with_initial_identity(
             });
         });
 
-        panel.component.on_agent_set_enabled(move |agent_id, enabled| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_agent_set_enabled(panel, agent_id.to_string(), enabled);
-                }
+        panel
+            .component
+            .on_agent_set_enabled(move |agent_id, enabled| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_agent_set_enabled(panel, agent_id.to_string(), enabled);
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2450,20 +2471,24 @@ fn panel_rust_create_with_initial_identity(
             });
         });
 
-        panel.component.on_queue_cancel_requested(move |message_index| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_queue_cancel(panel, message_index as usize);
-                }
+        panel
+            .component
+            .on_queue_cancel_requested(move |message_index| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_queue_cancel(panel, message_index as usize);
+                    }
+                });
             });
-        });
-        panel.component.on_queue_edit_requested(move |message_index| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_queue_edit(panel, message_index as usize);
-                }
+        panel
+            .component
+            .on_queue_edit_requested(move |message_index| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_queue_edit(panel, message_index as usize);
+                    }
+                });
             });
-        });
         panel.component.on_queue_stop_requested(move || {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
@@ -2471,13 +2496,15 @@ fn panel_rust_create_with_initial_identity(
                 }
             });
         });
-        panel.component.on_queue_send_now_requested(move |message_index| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_queue_send_now(panel, message_index as usize);
-                }
+        panel
+            .component
+            .on_queue_send_now_requested(move |message_index| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_queue_send_now(panel, message_index as usize);
+                    }
+                });
             });
-        });
         panel.component.on_queue_fast_track_requested(move || {
             PANEL.with(|cell| {
                 if let Some(panel) = cell.borrow().as_ref() {
@@ -2493,13 +2520,15 @@ fn panel_rust_create_with_initial_identity(
         // delete above -- archive_thread itself never sends an ACP
         // request, it's a purely local, durable (see AgentBridge::
         // archive_thread's doc comment) presentation flag.
-        panel.component.on_thread_archive_requested(move |filtered_idx| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_thread_archive(panel, filtered_idx as usize);
-                }
+        panel
+            .component
+            .on_thread_archive_requested(move |filtered_idx| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_thread_archive(panel, filtered_idx as usize);
+                    }
+                });
             });
-        });
 
         // Interactive agent-request relay addition: approve/reject
         // buttons on the request card. Both handlers re-read the exact
@@ -2584,20 +2613,22 @@ fn panel_rust_create_with_initial_identity(
 
         // PUI-002b: terminals popup's `[x]` kill button.
         let component_weak = panel.component.as_weak();
-        panel.component.on_terminal_kill_requested(move |terminal_id| {
-            let Some(component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_terminal_kill_requested(
-                        panel,
-                        &component,
-                        terminal_id.to_string(),
-                    );
-                }
+        panel
+            .component
+            .on_terminal_kill_requested(move |terminal_id| {
+                let Some(component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_terminal_kill_requested(
+                            panel,
+                            &component,
+                            terminal_id.to_string(),
+                        );
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_close_terminal_overlay(move || {
@@ -2615,16 +2646,18 @@ fn panel_rust_create_with_initial_identity(
         // from the overlay's open set, both fired from the tab strip
         // inside `TerminalOverlay` itself (not the popup).
         let component_weak = panel.component.as_weak();
-        panel.component.on_terminal_tab_selected(move |terminal_id| {
-            let Some(_component) = component_weak.upgrade() else {
-                return;
-            };
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_terminal_tab_selected(panel, terminal_id.to_string());
-                }
+        panel
+            .component
+            .on_terminal_tab_selected(move |terminal_id| {
+                let Some(_component) = component_weak.upgrade() else {
+                    return;
+                };
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_terminal_tab_selected(panel, terminal_id.to_string());
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel.component.on_terminal_tab_closed(move |terminal_id| {
@@ -2707,17 +2740,19 @@ fn panel_rust_create_with_initial_identity(
             });
         });
 
-        panel.component.on_profile_selected(move |profile_name, agent_id| {
-            PANEL.with(|cell| {
-                if let Some(panel) = cell.borrow().as_ref() {
-                    dispatch::dispatch_profile_selected(
-                        panel,
-                        profile_name.to_string(),
-                        agent_id.to_string(),
-                    );
-                }
+        panel
+            .component
+            .on_profile_selected(move |profile_name, agent_id| {
+                PANEL.with(|cell| {
+                    if let Some(panel) = cell.borrow().as_ref() {
+                        dispatch::dispatch_profile_selected(
+                            panel,
+                            profile_name.to_string(),
+                            agent_id.to_string(),
+                        );
+                    }
+                });
             });
-        });
 
         let component_weak = panel.component.as_weak();
         panel
@@ -2826,7 +2861,9 @@ pub extern "C" fn panel_rust_create_with_identity(
     untitled: bool,
 ) -> *mut PanelHandle {
     let identity = if untitled {
-        Some(model::ProjectIdentity::Untitled(uuid::Uuid::new_v4().to_string()))
+        Some(model::ProjectIdentity::Untitled(
+            uuid::Uuid::new_v4().to_string(),
+        ))
     } else if path_ptr.is_null() || path_len == 0 {
         None
     } else {
@@ -3213,7 +3250,9 @@ pub extern "C" fn panel_rust_set_project_path(
 pub extern "C" fn panel_rust_project_created_untitled(_handle: *mut PanelHandle) -> bool {
     PANEL.with(|cell| {
         let slot = cell.borrow();
-        let Some(panel) = slot.as_ref() else { return false };
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
         dispatch::dispatch_project_created_untitled(panel);
         true
     })
@@ -3223,7 +3262,9 @@ pub extern "C" fn panel_rust_project_created_untitled(_handle: *mut PanelHandle)
 pub extern "C" fn panel_rust_project_closed(_handle: *mut PanelHandle) -> bool {
     PANEL.with(|cell| {
         let slot = cell.borrow();
-        let Some(panel) = slot.as_ref() else { return false };
+        let Some(panel) = slot.as_ref() else {
+            return false;
+        };
         dispatch::dispatch_project_closed(panel);
         true
     })
@@ -4269,7 +4310,6 @@ mod keyboard_shortcut_tests {
     }
 }
 
-
 /// Phase 17 (`markdown_highlight_and_real_links`): opens a Ctrl+Clicked
 /// markdown link target -- file paths and external URLs both go through
 /// the platform opener (`xdg-open` on Linux). `RUI_LINK_OPEN_CMD`
@@ -4297,6 +4337,8 @@ pub(crate) fn open_md_link_target(target: &str) {
                 let _ = child.wait();
             });
         }
-        Err(error) => eprintln!("panel-rust: failed to open link {target:?} via {opener:?}: {error}"),
+        Err(error) => {
+            eprintln!("panel-rust: failed to open link {target:?} via {opener:?}: {error}")
+        }
     }
 }

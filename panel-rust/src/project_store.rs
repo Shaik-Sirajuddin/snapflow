@@ -113,7 +113,10 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(a.defaults().unwrap().profile_name.as_deref(), Some("project-a"));
+        assert_eq!(
+            a.defaults().unwrap().profile_name.as_deref(),
+            Some("project-a")
+        );
         assert_eq!(b.defaults().unwrap().profile_name, None);
     }
 

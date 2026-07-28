@@ -39,6 +39,10 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    if let Some(bin_dir) = acpx_core::detect::prepare_node_runtime_path() {
+        tracing::info!(path = %bin_dir.display(), "using discovered Node runtime prefix");
+    }
+
     let config = ServerConfig::from_env();
     tracing::info!(
         default_agent_id = %config.default_agent_id,

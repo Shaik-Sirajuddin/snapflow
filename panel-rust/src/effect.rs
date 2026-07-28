@@ -179,6 +179,7 @@ pub enum Effect {
         scope: String,
         active_project_path: Option<String>,
     },
+    #[allow(dead_code)]
     SkillDelete {
         path: std::path::PathBuf,
     },
@@ -257,10 +258,14 @@ pub enum EffectResultMsg {
     /// acpx-skills/README.md's "reactive-sync failures are invisible to
     /// the user" gap. Sent alongside (not instead of) the existing
     /// eprintln! at each call site; best-effort, not retried.
-    SkillReactiveSyncFailed { operation: String, detail: String },
+    SkillReactiveSyncFailed {
+        operation: String,
+        detail: String,
+    },
     /// A streamed token/chunk arriving mid-generation -- not a
     /// completion. See 00-plan.md's stale-target no-op contract: if
     /// `thread_id` no longer exists in `Model`, `update()` must no-op.
+    #[allow(dead_code)]
     PromptStreamDelta {
         thread_id: String,
         message_id: String,
@@ -271,6 +276,7 @@ pub enum EffectResultMsg {
         result: Result<(), EffectError>,
     },
     SettingsSaved(Result<(), EffectError>),
+    #[allow(dead_code)]
     GatewayCallCompleted {
         real_index: usize,
         result: Result<(), EffectError>,

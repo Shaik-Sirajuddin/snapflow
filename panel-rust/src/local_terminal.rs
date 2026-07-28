@@ -81,9 +81,8 @@ impl LocalTerminal {
                         // state_store.rs's convention -- a panic elsewhere while
                         // holding this lock must not permanently stop this reader
                         // thread from ever processing PTY output again.
-                        let mut parser = parser_for_reader
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
+                        let mut parser =
+                            parser_for_reader.lock().unwrap_or_else(|e| e.into_inner());
                         parser.process(&buf[..n]);
                     }
                 }

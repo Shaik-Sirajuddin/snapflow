@@ -1,12 +1,13 @@
 // Package config holds snapshotd's daemon-wide configuration: file paths,
-// socket locations, and the child-process binary location. Values can be
-// overridden via environment variables so `snapshotd serve` is configurable
-// without a config file for v1.
+// socket locations, and the child-process binary location. Explicit
+// environment variables override the persisted Snapflow runtime config.
 package config
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -105,7 +106,11 @@ type Config struct {
 // the child binary; SNAPSHOTD_HOME for relocating all daemon state, mainly
 // useful in tests).
 func Default() Config {
+	persisted := readPersistedRuntimeConfig()
 	home := os.Getenv("SNAPSHOTD_HOME")
+	if home == "" {
+		home = persisted["SNAPSHOTD_HOME"]
+	}
 	if home == "" {
 		if uh, err := os.UserHomeDir(); err == nil {
 			home = filepath.Join(uh, ".snapshotd")
@@ -127,6 +132,9 @@ func Default() Config {
 	}
 
 	mcpAddr := os.Getenv("SNAPSHOTD_MCP_SSE_ADDR")
+	if mcpAddr == "" {
+		mcpAddr = persisted["SNAPSHOTD_MCP_SSE_ADDR"]
+	}
 	if mcpAddr == "" {
 		mcpAddr = "127.0.0.1:7777"
 	}
@@ -177,6 +185,72 @@ func Default() Config {
 		AcpxConfigPath:        acpxConfig,
 		AcpxDefaultAcpCommand: acpxDefaultAcpCommand,
 	}
+}
+
+// persistedRuntimeConfigPath is shared conceptually with panel-rust's
+// runtime config lookup. Keep this file outside SNAPSHOTD_HOME so relocating
+// daemon state does not make the panel lose the path needed to find it.
+func persistedRuntimeConfigPath() string {
+	if path := os.Getenv("SNAPFLOW_CONFIG_FILE"); path != "" {
+		return path
+	}
+	if dir := os.Getenv("SNAPFLOW_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, "runtime.env")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	if configHome := os.Getenv("XDG_CONFIG_HOME"); configHome != "" && runtimeGOOS != "darwin" {
+		return filepath.Join(configHome, "snapflow", "runtime.env")
+	}
+	switch runtimeGOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "Snapflow", "runtime.env")
+	case "windows":
+		if appData := os.Getenv("APPDATA"); appData != "" {
+			return filepath.Join(appData, "Snapflow", "runtime.env")
+		}
+		return filepath.Join(home, "AppData", "Roaming", "Snapflow", "runtime.env")
+	default:
+		return filepath.Join(home, ".config", "snapflow", "runtime.env")
+	}
+}
+
+// runtimeGOOS is a variable to keep path-selection tests independent from
+// the host platform without making the public Config API platform-specific.
+var runtimeGOOS = runtime.GOOS
+
+func readPersistedRuntimeConfig() map[string]string {
+	file, err := os.Open(persistedRuntimeConfigPath())
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	values := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
+			value = value[1 : len(value)-1]
+		}
+		if key != "" && value != "" {
+			values[key] = value
+		}
+	}
+	return values
 }
 
 // discoverAcpxServerBinPath looks for acpx-server next to the running

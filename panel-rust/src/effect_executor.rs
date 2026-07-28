@@ -122,8 +122,8 @@ fn schedule_debounced_skill_resync(skill_dir: std::path::PathBuf) {
 /// mutations, re-scan and fold an explicit skills snapshot so the list
 /// stays in sync without a dual-path `refresh_skills_model`.
 fn refresh_skills_after_effect(panel: &PanelSingleton) {
-    let skills_snapshot = crate::external_snapshot::ExternalSnapshotSource::new(panel)
-        .collect_skills_snapshot();
+    let skills_snapshot =
+        crate::external_snapshot::ExternalSnapshotSource::new(panel).collect_skills_snapshot();
     panel.dispatch_frame_input(FrameInput {
         skills_snapshot: Some(skills_snapshot),
         ..FrameInput::default()
@@ -644,7 +644,11 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                         eprintln!(
                             "panel-rust: skills-manager agent-enabled reactive sync failed for {agent_id} (enabled={enabled}): {error}"
                         );
-                        let operation = if enabled { "agent-enable" } else { "agent-disable" };
+                        let operation = if enabled {
+                            "agent-enable"
+                        } else {
+                            "agent-disable"
+                        };
                         dispatch_reactive_sync_failed(operation, error.to_string());
                     }
                 });
@@ -666,9 +670,8 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                 // socket dial -- off the UI thread, per `agent_bridge::
                 // fetch_daemon_project_instances`'s own doc comment.
                 std::thread::spawn(move || {
-                    let result =
-                        crate::agent_bridge::fetch_daemon_project_instances()
-                            .map_err(EffectError::new);
+                    let result = crate::agent_bridge::fetch_daemon_project_instances()
+                        .map_err(EffectError::new);
                     let _ = slint::invoke_from_event_loop(move || {
                         crate::PANEL.with(|cell| {
                             let slot = cell.borrow();
@@ -743,9 +746,9 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     let background = thread_id
                         .as_ref()
                         .and_then(|thread_id| {
-                            store
-                                .as_ref()
-                                .and_then(|store| store.effective_background_session(thread_id).ok())
+                            store.as_ref().and_then(|store| {
+                                store.effective_background_session(thread_id).ok()
+                            })
                         })
                         .unwrap_or(false);
                     if !bridge.close_thread(real_index, background) {
@@ -761,7 +764,10 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                     }
                 }
             }
-            Effect::ArchiveThread { real_index, archived } => {
+            Effect::ArchiveThread {
+                real_index,
+                archived,
+            } => {
                 if let Some(bridge) = panel.bridge.as_ref() {
                     // Keep main's toggle-capable archive (archived=false
                     // resumes) and adopt the audit branch's failure surfacing
@@ -907,7 +913,10 @@ pub(crate) fn execute_effects(panel: &PanelSingleton, effects: Vec<Effect>) {
                             };
                             let _ = update_persistent(
                                 panel,
-                                Msg::Effect(EffectResultMsg::ThreadPersisted { real_index, result }),
+                                Msg::Effect(EffectResultMsg::ThreadPersisted {
+                                    real_index,
+                                    result,
+                                }),
                             );
                         });
                     });
@@ -1159,7 +1168,10 @@ mod debounce_tests {
 
         // Must not have run yet -- still inside the debounce window.
         std::thread::sleep(Duration::from_millis(10));
-        assert!(!*ran.lock().unwrap(), "must not run before the delay elapses");
+        assert!(
+            !*ran.lock().unwrap(),
+            "must not run before the delay elapses"
+        );
 
         std::thread::sleep(Duration::from_millis(40));
         assert!(*ran.lock().unwrap(), "must run once the delay has elapsed");

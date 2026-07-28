@@ -48,6 +48,17 @@ ACPX_HTTP_BIND="127.0.0.1:8790" \
   target/release/acpx-server
 ```
 
+### Node runtimes under systemd
+
+`acpx-server` repairs a restricted service `PATH` at startup when the
+Node-based ACP runtime is otherwise unavailable. It first preserves a
+complete `node`/`npm`/`npx` runtime already on `PATH`; otherwise it scans
+`$NVM_DIR/versions/node/*/bin` (falling back to `~/.nvm`) and prepends the
+newest complete prefix to `PATH`. The repaired prefix is inherited by agent
+detection and every spawned ACP adapter, so login-shell initialization is not
+required. `SNAPFLOW_ACP_NODE_HOME` remains an explicit higher-priority
+override for a product-bundled Node runtime.
+
 Any HTTP/JSON-RPC client can now talk to `POST http://127.0.0.1:8790/rpc`,
 or upgrade `GET /ws` for a persistent connection with live
 `session/update` streaming. `acpx-server` also serves its own stdin/stdout

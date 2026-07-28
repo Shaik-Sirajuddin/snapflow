@@ -48,6 +48,7 @@ impl ProjectIdentity {
 pub struct ThreadListUiCache {
     pub keys: Vec<String>,
     pub rows: Vec<crate::MessageItem>,
+    #[allow(dead_code)]
     pub gen: u64,
 }
 
@@ -407,7 +408,8 @@ impl Model {
         self.agent_catalog_model = persistent.agent_catalog_model;
         *self.agent_catalog_model_keys.borrow_mut() = persistent.agent_catalog_model_keys;
         self.recoverable_sessions_model = persistent.recoverable_sessions_model;
-        *self.recoverable_session_model_keys.borrow_mut() = persistent.recoverable_session_model_keys;
+        *self.recoverable_session_model_keys.borrow_mut() =
+            persistent.recoverable_session_model_keys;
         self.terminals_model = persistent.terminals_model;
         *self.terminal_model_keys.borrow_mut() = persistent.terminal_model_keys;
         self.open_terminals_model = persistent.open_terminals_model;

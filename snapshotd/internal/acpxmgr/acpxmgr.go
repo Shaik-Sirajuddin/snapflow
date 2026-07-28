@@ -72,7 +72,7 @@ type Manager struct {
 	err    error
 }
 
-// WriteConfig writes an ACPX provisioning JSON that registers snapshotd MCP
+// WriteConfig writes an ACPX provisioning JSON that registers the snapflow MCP
 // and a default profile that attaches it.
 func WriteConfig(path, mcpURL, agentID string) error {
 	if agentID == "" {
@@ -83,7 +83,7 @@ func WriteConfig(path, mcpURL, agentID string) error {
 		"mcp_servers": []any{
 			map[string]any{
 				"type":    "http",
-				"name":    "snapshotd",
+				"name":    "snapflow",
 				"url":     mcpURL,
 				"headers": []any{},
 			},
@@ -111,9 +111,9 @@ func WriteConfig(path, mcpURL, agentID string) error {
 				// This profile only exists to auto-attach the snapshotd
 				// MCP server; giving it a name that can never equal a
 				// real `agentID` value keeps it out of that lookup.
-				"name":        "snapshotd-mcp-attach",
+				"name":        "snapflow-mcp-attach",
 				"agent_id":    agentID,
-				"mcp_servers": []string{"snapshotd"},
+				"mcp_servers": []string{"snapflow"},
 			},
 		},
 	}

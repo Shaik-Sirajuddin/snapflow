@@ -232,3 +232,33 @@ func TestProjectOpen_PathViaForwardSAP(t *testing.T) {
 		t.Fatalf("project.close: %v", err)
 	}
 }
+
+func TestProjectOpen_MissingPathDoesNotCreateProject(t *testing.T) {
+	bin := buildSapFixture(t)
+	d := newSapFixtureDaemon(t, bin)
+	ctx := context.Background()
+
+	root := filepath.Join(t.TempDir(), "missing-project")
+	before, err := d.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list before: %v", err)
+	}
+
+	_, err = d.ForwardSAP(ctx, "s-missing", &fanoutSink{}, "project.open", mustJSON(t, map[string]any{
+		"path": filepath.Join(root, "missing.mlt"),
+	}))
+	if err == nil || !strings.Contains(err.Error(), "use project.create first") {
+		t.Fatalf("project.open missing path error=%v, want explicit create guidance", err)
+	}
+
+	after, err := d.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list after: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("missing project.open created a registry row: before=%d after=%d", len(before), len(after))
+	}
+	if _, statErr := os.Stat(root); !os.IsNotExist(statErr) {
+		t.Fatalf("missing project.open created filesystem path %s: stat err=%v", root, statErr)
+	}
+}

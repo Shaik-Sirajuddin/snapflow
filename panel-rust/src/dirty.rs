@@ -267,7 +267,9 @@ pub enum Dirty {
     /// One existing thread row changed shape-preservingly (rename,
     /// toggle-background, status) -- `set_row_data(idx, ..)`, no
     /// insert/remove.
-    ThreadRow { thread_id: String },
+    ThreadRow {
+        thread_id: String,
+    },
     /// The thread list's *shape* changed (add/remove/reorder) -- id-keyed
     /// diff ops, never a full replace (see 00-plan.md's known gap).
     ThreadListDiff(Vec<RowOp<crate::models::VisibleThreadItem>>),
@@ -334,6 +336,7 @@ pub enum Dirty {
     /// view in one place (fixes "settings not propagated to chat view").
     Settings,
     SkillsListDiff(Vec<RowOp<crate::SkillOption>>),
+    #[allow(dead_code)]
     SkillRow(usize),
     SkillEditor,
     Capabilities {
@@ -349,6 +352,7 @@ pub enum ScalarField {
     ComposeText,
     SettingsOpen,
     SettingsScope,
+    #[allow(dead_code)]
     ExpandedTerminal,
     SearchQuery,
 }

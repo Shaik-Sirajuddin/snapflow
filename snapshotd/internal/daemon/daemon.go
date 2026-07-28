@@ -82,6 +82,10 @@ type ExternalInstanceResult struct {
 	LeaseDuration  time.Duration             `json:"leaseDuration"`
 }
 
+type discardSink struct{}
+
+func (discardSink) Notify(string, json.RawMessage) {}
+
 func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExternalInstanceParams) (ExternalInstanceResult, error) {
 	if strings.TrimSpace(p.InstanceNonce) == "" || p.PID <= 0 || strings.TrimSpace(p.ProcessStart) == "" {
 		return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: instanceNonce, pid, and processStart are required")
@@ -98,6 +102,16 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 		projectPath = abs
 		if _, err := d.Reg.EnsureProjectForPath(projectPath); err != nil {
 			return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: project: %w", err)
+		}
+		// A GUI may register its process identity before its SAP endpoint is
+		// listening. In that startup window keep the registration advisory and
+		// let the later project-open/update path perform the handoff; attempting
+		// a save through a socket that is not live would incorrectly reject GUI
+		// startup. Once the endpoint is responsive, drain the daemon owner now.
+		if p.SAPSocketPath != "" && health.SocketResponsive(p.SAPSocketPath, time.Second) {
+			if err := d.handoffDaemonProjectToGUI(ctx, projectPath); err != nil {
+				return ExternalInstanceResult{}, fmt.Errorf("daemon: registerExternalInstance: GUI handoff: %w", err)
+			}
 		}
 	}
 	now := time.Now().UTC()
@@ -128,6 +142,40 @@ func (d *Daemon) RegisterExternalInstance(ctx context.Context, p RegisterExterna
 	return ExternalInstanceResult{Instance: *instance, HeartbeatEvery: externalInstanceLease / 3, LeaseDuration: externalInstanceLease}, nil
 }
 
+// handoffDaemonProjectToGUI drains a daemon-owned instance before publishing
+// the external GUI lease. Registration is the GUI's ownership claim, so the
+// old child must be saved and stopped before the claim becomes visible; this
+// prevents daemon-first -> GUI-open from ever exposing two live processes for
+// one canonical project path.
+func (d *Daemon) handoffDaemonProjectToGUI(ctx context.Context, projectPath string) error {
+	project, err := d.Reg.EnsureProjectForPath(projectPath)
+	if err != nil {
+		return err
+	}
+	instances, err := d.Reg.ListProcessInstancesByProject(project.ID)
+	if err != nil {
+		return err
+	}
+	for _, instance := range instances {
+		if instance.Status != registry.StatusReady || !health.PIDAlive(instance.PID) {
+			continue
+		}
+		sessionID := "gui-handoff-" + instance.ID
+		if _, err := d.SAP.Bind(ctx, sessionID, project.ID, discardSink{}); err != nil {
+			return fmt.Errorf("bind old instance %s: %w", instance.ID, err)
+		}
+		_, saveErr := d.SAP.Call(ctx, sessionID, "project.save", json.RawMessage(`{}`))
+		d.SAP.Unbind(sessionID)
+		if saveErr != nil {
+			return fmt.Errorf("save old instance %s: %w", instance.ID, saveErr)
+		}
+		if err := d.Proc.Close(instance.ID); err != nil {
+			return fmt.Errorf("close old instance %s: %w", instance.ID, err)
+		}
+	}
+	return nil
+}
+
 // canonicalExternalPath accepts a path whose final project file may not have
 // been created yet (for example during an untitled-to-save transition), while
 // still resolving the existing parent and rejecting NUL/control injection.
@@ -149,6 +197,37 @@ func canonicalExternalPath(raw string) (string, error) {
 		return "", fmt.Errorf("path parent is not accessible: %w", err)
 	}
 	return filepath.Join(resolvedParent, filepath.Base(abs)), nil
+}
+
+// validateOpenProjectPath is stricter than canonicalExternalPath. The latter
+// intentionally permits a not-yet-created final path during initial untitled
+// registration; path-based project.open/project.select/daemon.launch must
+// describe a project that exists now, otherwise the daemon would publish an
+// open registry row for a typo or deleted project.
+func validateOpenProjectPath(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("project path is not accessible: %w", err)
+	}
+	if !info.IsDir() {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("project path is not a regular file or directory")
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".mlt") {
+			return fmt.Errorf("project file must use the .mlt extension")
+		}
+		return nil
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("project directory is not readable: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.EqualFold(filepath.Ext(entry.Name()), ".mlt") {
+			return nil
+		}
+	}
+	return fmt.Errorf("project directory contains no .mlt file")
 }
 
 type UpdateExternalProjectParams struct {
@@ -174,6 +253,11 @@ func (d *Daemon) UpdateOpenProject(ctx context.Context, p UpdateExternalProjectP
 		instance.ProjectPath = path
 		if _, err := d.Reg.EnsureProjectForPath(path); err != nil {
 			return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: project: %w", err)
+		}
+		if instance.SAPSocketPath != "" && health.SocketResponsive(instance.SAPSocketPath, time.Second) {
+			if err := d.handoffDaemonProjectToGUI(ctx, path); err != nil {
+				return registry.ExternalInstance{}, fmt.Errorf("daemon: updateOpenProject: GUI handoff: %w", err)
+			}
 		}
 	} else {
 		instance.ProjectPath = ""
@@ -388,7 +472,7 @@ func New(cfg config.Config, logger *slog.Logger) (*Daemon, error) {
 	d := &Daemon{
 		Cfg:      cfg,
 		Reg:      reg,
-		Sessions: session.NewMemory(30 * time.Second),
+		Sessions: session.NewMemory(session.DefaultSweepInterval),
 		Proc:     pm,
 		Log:      logger,
 		stopCh:   make(chan struct{}),
@@ -527,9 +611,9 @@ type ProjectCreateParams struct {
 
 // ProjectCreateResult is project.create's response.
 type ProjectCreateResult struct {
-	Project     registry.Project `json:"project"`
-	MltCreated  bool             `json:"mltCreated"`
-	ProjectState json.RawMessage `json:"projectState,omitempty"`
+	Project      registry.Project `json:"project"`
+	MltCreated   bool             `json:"mltCreated"`
+	ProjectState json.RawMessage  `json:"projectState,omitempty"`
 }
 
 // ProjectCreate creates a project folder at an arbitrary path and registers it.
@@ -829,17 +913,22 @@ func (d *Daemon) AudioNamespaceEnabled() bool {
 }
 
 // resolveOrRegisterProjectByPath implements the projectPath side of
-// daemon.launch: find an existing Project by RootDir, or register a new one,
-// per 09-project-folder-layout.md's two root-resolution rules (a directory
-// is the root directly; a bare .mlt file's parent directory is the root).
+// daemon.launch/project.open: find an existing Project by RootDir, or register
+// an existing filesystem project. It deliberately does not create a project
+// for a missing path; callers must use project.create (and explicitly confirm
+// creation) before opening a new project.
 func (d *Daemon) resolveOrRegisterProjectByPath(path string) (registry.Project, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return registry.Project{}, fmt.Errorf("daemon: resolving path %s: %w", path, err)
 	}
+	abs = filepath.Clean(abs)
+	if err := validateOpenProjectPath(abs); err != nil {
+		return registry.Project{}, fmt.Errorf("daemon: project path %s: %w; use project.create first for a new project", abs, err)
+	}
 	info, err := os.Stat(abs)
 	if err != nil {
-		return registry.Project{}, fmt.Errorf("daemon: launch: project path %s: %w", abs, err)
+		return registry.Project{}, fmt.Errorf("daemon: project path %s: %w", abs, err)
 	}
 
 	rootDir := abs
@@ -913,7 +1002,7 @@ func (d *Daemon) CloseInstance(ctx context.Context, instanceID string) error {
 // proxy's own session bookkeeping (separate from sap-rust's own connection
 // lifetime, which is pooled per-project, not per-session -- see
 // internal/sapproxy).
-const proxySessionTTL = 10 * time.Minute
+const proxySessionTTL = session.DefaultIdleTTL
 
 // ForwardSAP is the generic, opaque proxy entry point used by both
 // internal/sdp.Server and internal/mcpadapter for every method that is NOT
@@ -984,14 +1073,24 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 			logMethod(err, "projectId", p.ProjectID)
 			return nil, err
 		}
-		// Launch-or-reuse before Bind so project.select / project.open
-		// do not require a separate daemon.launch. Proc.Launch's
-		// findLiveInstance path reuses an already-running child.
-		headless := true
-		if _, err := d.Launch(ctx, LaunchParams{ProjectID: p.ProjectID, Headless: &headless}); err != nil {
-			err = fmt.Errorf("daemon: project.select: launch: %w", err)
+		// Launch-or-reuse before Bind so project.select / project.open do not
+		// require a separate daemon.launch. A live external GUI registration
+		// is already the project's authoritative process and must be reused;
+		// calling Proc.Launch first would create a second headless child before
+		// resolveProjectInstance gets a chance to select the GUI socket.
+		externalGUI, err := d.hasLiveExternalProject(ctx, p.ProjectID)
+		if err != nil {
+			err = fmt.Errorf("daemon: project.select: external ownership: %w", err)
 			logMethod(err, "projectId", p.ProjectID)
 			return nil, err
+		}
+		if !externalGUI {
+			headless := true
+			if _, err := d.Launch(ctx, LaunchParams{ProjectID: p.ProjectID, Headless: &headless}); err != nil {
+				err = fmt.Errorf("daemon: project.select: launch: %w", err)
+				logMethod(err, "projectId", p.ProjectID)
+				return nil, err
+			}
 		}
 		result, err := d.SAP.Bind(ctx, sessionID, p.ProjectID, sink)
 		if err != nil {
@@ -1038,6 +1137,39 @@ func (d *Daemon) ForwardSAP(ctx context.Context, sessionID string, sink sapproxy
 	result, err := d.SAP.Call(ctx, sessionID, method, params)
 	logMethod(err)
 	return result, err
+}
+
+// hasLiveExternalProject reports whether an external GUI currently owns the
+// project. project.open must consult this before daemon.launch: the external
+// registration is the GUI's process identity, and launching first would
+// briefly create a duplicate headless process even though SAP resolution
+// would later prefer the GUI socket. Lease expiry and PID liveness fence stale
+// registrations; reconcile will mark them stale on its next sweep.
+func (d *Daemon) hasLiveExternalProject(ctx context.Context, projectID string) (bool, error) {
+	project, err := d.Reg.GetProject(projectID)
+	if err != nil {
+		return false, err
+	}
+	instances, err := d.Reg.ListExternalInstances()
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UTC()
+	for _, instance := range instances {
+		if instance.Status != registry.ExternalStatusOpen ||
+			(!instance.LeaseExpiresAt.IsZero() && !instance.LeaseExpiresAt.After(now)) ||
+			!health.PIDAlive(instance.PID) ||
+			externalProjectRoot(instance.ProjectPath) != filepath.Clean(project.RootDir) {
+			continue
+		}
+		if instance.SAPSocketPath != "" && health.SocketResponsive(instance.SAPSocketPath, time.Second) {
+			if err := d.handoffDaemonProjectToGUI(ctx, instance.ProjectPath); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // ForwardSAPWithContext applies the registered per-ACP-session MCP target

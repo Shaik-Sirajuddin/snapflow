@@ -127,7 +127,10 @@ pub enum AgentEvent {
     /// Phase 18: live `usage_update` session/update (used/size tokens)
     /// -- streams DURING a turn so the compose context ring updates
     /// actively, not only at turn end.
-    UsageUpdate { used: i64, size: i64 },
+    UsageUpdate {
+        used: i64,
+        size: i64,
+    },
     /// PUI-003: the agent's own built-in slash commands, from an ACP
     /// `available_commands_update` session/update (schema
     /// `AvailableCommandsUpdate { available_commands: Vec<AvailableCommand> }`).

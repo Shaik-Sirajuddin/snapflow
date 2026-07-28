@@ -73,6 +73,13 @@ func TestCLI_ListAndClose_AgainstRealDaemon(t *testing.T) {
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir project dir: %v", err)
 	}
+	// `daemon.launch`/the CLI open path intentionally rejects an existing
+	// project directory that has no .mlt.  Creating a new project is a
+	// separate, explicit `project.create` operation; this test exercises
+	// launch/list/close for an existing project.
+	if err := os.WriteFile(filepath.Join(projectDir, "project.mlt"), []byte("<mlt/>\n"), 0o644); err != nil {
+		t.Fatalf("create project mlt: %v", err)
+	}
 
 	serveCmd := exec.CommandContext(context.Background(), snapshotdBin, "serve", "--no-mcp")
 	serveCmd.Env = append(os.Environ(),

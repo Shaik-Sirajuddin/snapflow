@@ -92,21 +92,25 @@ pub enum ConversationEvent {
         raw_input: Option<String>,
         raw_output: Option<String>,
     },
+    #[allow(dead_code)]
     TerminalCreated {
         thread_id: String,
         terminal_id: String,
         title: String,
     },
+    #[allow(dead_code)]
     TerminalOutput {
         thread_id: String,
         terminal_id: String,
         text: String,
     },
+    #[allow(dead_code)]
     TerminalExited {
         thread_id: String,
         terminal_id: String,
         exit_code: i32,
     },
+    #[allow(dead_code)]
     Notice {
         thread_id: String,
         text: String,
@@ -396,8 +400,8 @@ pub fn rebuild_from_chat_messages(
                 // streamed chunks. In particular, reconnect attempts may
                 // carry the same message id (or no id at all); never merge
                 // them into one growing assistant bubble.
-                let standalone_status = msg.kind == ChatKind::Agent
-                    && is_standalone_agent_status(&msg.text);
+                let standalone_status =
+                    msg.kind == ChatKind::Agent && is_standalone_agent_status(&msg.text);
                 let message_id = if standalone_status {
                     open_run = None;
                     next_synthetic(&mut synthetic_counter)

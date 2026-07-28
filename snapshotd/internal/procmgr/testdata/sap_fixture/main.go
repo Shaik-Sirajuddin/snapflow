@@ -59,11 +59,11 @@ type sharedState struct {
 	token     string
 	mltExists bool
 
-	mu         sync.Mutex
-	opened     bool
-	selectN    int
-	tracks     []string
-	undoDepth  int
+	mu        sync.Mutex
+	opened    bool
+	selectN   int
+	tracks    []string
+	undoDepth int
 }
 
 func handleConn(nc net.Conn, st *sharedState) {
@@ -144,13 +144,13 @@ func handleConn(nc net.Conn, st *sharedState) {
 			selectN := st.selectN
 			st.mu.Unlock()
 			respond(map[string]any{
-				"projectId":  p.ProjectID,
-				"dirty":      undo > 0,
-				"undoDepth":  undo,
-				"redoDepth":  0,
-				"opened":     opened,
+				"projectId":   p.ProjectID,
+				"dirty":       undo > 0,
+				"undoDepth":   undo,
+				"redoDepth":   0,
+				"opened":      opened,
 				"selectCount": selectN, // test-only observability
-				"mltExisted": st.mltExists,
+				"mltExisted":  st.mltExists,
 			}, "")
 		case "project.getState":
 			if !authenticated {
@@ -200,6 +200,12 @@ func handleConn(nc net.Conn, st *sharedState) {
 			}
 			st.mu.Unlock()
 			respond(out, "")
+		case "project.save":
+			if !authenticated {
+				respond(nil, "unauthenticated")
+				continue
+			}
+			respond(map[string]any{"saved": true}, "")
 		case "project.exit":
 			// Real sap-rust no-op; daemon never forwards this for multi-session safety.
 			respond(map[string]any{}, "")

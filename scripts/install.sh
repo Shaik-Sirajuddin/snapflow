@@ -35,6 +35,38 @@ case "$os" in
     ;;
 esac
 
+# Persist daemon discovery settings outside SNAPSHOTD_HOME so relocating the
+# daemon state does not also relocate the panel's discovery metadata. Both
+# snapshotd (Go) and panel-rust read this small KEY=value file. Explicit env
+# values win; otherwise an existing file value is preserved across upgrades.
+case "$platform" in
+  linux)
+    runtime_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/snapflow"
+    ;;
+  macos)
+    runtime_config_dir="$HOME/Library/Application Support/Snapflow"
+    ;;
+esac
+runtime_config_file="$runtime_config_dir/runtime.env"
+read_runtime_value() {
+  [ -f "$runtime_config_file" ] || return 0
+  sed -n "s/^$1=//p" "$runtime_config_file" | head -n1
+}
+runtime_home="${SNAPSHOTD_HOME:-$(read_runtime_value SNAPSHOTD_HOME)}"
+runtime_home="${runtime_home:-$HOME/.snapshotd}"
+runtime_mcp_addr="${SNAPSHOTD_MCP_SSE_ADDR:-$(read_runtime_value SNAPSHOTD_MCP_SSE_ADDR)}"
+runtime_mcp_addr="${runtime_mcp_addr:-127.0.0.1:7777}"
+mkdir -p "$runtime_config_dir"
+old_umask="$(umask)"
+umask 077
+{
+  echo "# Snapflow daemon runtime configuration; managed by scripts/install.sh"
+  echo "SNAPSHOTD_HOME=$runtime_home"
+  echo "SNAPSHOTD_MCP_SSE_ADDR=$runtime_mcp_addr"
+} > "$runtime_config_file"
+umask "$old_umask"
+info "Persisted daemon discovery config -> $runtime_config_file"
+
 arch="$(uname -m)"
 case "$arch" in
   x86_64|amd64) ;;

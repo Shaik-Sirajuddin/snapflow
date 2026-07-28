@@ -1148,6 +1148,7 @@ pub fn fetch_daemon_project_instances() -> Result<Vec<DaemonProjectInstance>, St
 /// confirmed live via `/mcp`: an identical stdio entry without `env`
 /// never appeared in the configured-servers listing at all; the exact
 /// same entry with `"env": []` added did.
+#[allow(dead_code)]
 fn snapflowd_mcp_servers_entry(
     project_dir: Option<&std::path::Path>,
     provider: &str,
@@ -1319,6 +1320,7 @@ pub fn snapshotd_mcp_addr() -> Option<String> {
         .clone()
 }
 
+#[allow(dead_code)]
 fn snapshotd_mcp_server_entry(provider: &str) -> Vec<serde_json::Value> {
     snapshotd_mcp_server_entry_with_context(provider, None)
 }
@@ -1331,6 +1333,7 @@ fn snapshotd_mcp_server_entry_with_context(
     snapshotd_mcp_server_entry_for_addr_and_context(snapshotd_mcp_addr().as_deref(), context_token)
 }
 
+#[allow(dead_code)]
 fn snapshotd_mcp_server_entry_for_addr(addr: Option<&str>) -> Vec<serde_json::Value> {
     snapshotd_mcp_server_entry_for_addr_and_context(addr, None)
 }
@@ -2769,6 +2772,7 @@ fn spawn_snapshotd_mcp_context_cleanup(runtime: &tokio::runtime::Handle, slot: &
     });
 }
 
+#[allow(dead_code)]
 impl AgentBridge {
     /// Production constructor: every thread's acpx gateway URL resolved
     /// (env-override-or-local-autospawn, see [`provision_gateway`]) +

@@ -262,7 +262,6 @@ fn primary_chat_controls_are_addressable_and_invoke_their_callbacks() {
         // This target had rotted out of compiling entirely; it is not built
         // by `cargo test --lib` nor by any single-target run, so the drift
         // accumulated silently.
-        can_send_now: false,
         tool_group_len: 0,
         kind: "agent".into(),
         text: "streamed response".into(),
@@ -634,7 +633,8 @@ fn settings_and_capability_controls_are_addressable_and_dispatch_typed_values() 
         name: "Claude".into(),
         version: "1.0".into(),
         status: "not installed".into(),
-        enabled: true,
+            enabled: true,
+            loading: false,
     }])));
     panel.set_recoverable_sessions(ModelRc::new(VecModel::from(vec![RemoteSessionOption {
         session_id: "orphan-session-1".into(),
@@ -1016,7 +1016,8 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
         name: "Claude".into(),
         version: "1.0".into(),
         status: "installed".into(),
-        enabled: true,
+            enabled: true,
+            loading: false,
     }])));
 
     let set_enabled_calls = Rc::new(RefCell::new(Vec::<(String, bool)>::new()));
@@ -1049,7 +1050,8 @@ fn agent_card_enable_toggle_is_addressable_and_dispatches_set_enabled() {
         name: "Claude".into(),
         version: "1.0".into(),
         status: "installed".into(),
-        enabled: false,
+            enabled: false,
+            loading: false,
     }])));
     assert!(
         ElementHandle::find_by_accessible_label(&panel, "Disable Claude")
@@ -1091,21 +1093,24 @@ fn agents_settings_search_filters_catalog_cards() {
             name: "Claude".into(),
             version: "1.0".into(),
             status: "installed".into(),
-            enabled: true,
+        enabled: true,
+        loading: false,
         },
         AgentCatalogEntry {
             id: "codex".into(),
             name: "Codex".into(),
             version: "1.0".into(),
             status: "installed".into(),
-            enabled: true,
+        enabled: true,
+        loading: false,
         },
         AgentCatalogEntry {
             id: "gemini".into(),
             name: "Gemini".into(),
             version: "1.0".into(),
             status: "available".into(),
-            enabled: false,
+        enabled: false,
+        loading: false,
         },
     ])));
     panel.set_settings_open(true);
@@ -1778,7 +1783,6 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
-                link: "".into(),
             },
             panel_rust::MarkdownRun {
                 link: "".into(),
@@ -1787,7 +1791,6 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
-                link: "".into(),
             },
             panel_rust::MarkdownRun {
                 link: "".into(),
@@ -1796,7 +1799,6 @@ fn agent_message_markdown_is_left_aligned_not_centered() {
                 italic: false,
                 code: false,
                 strike: false,
-                link: "".into(),
             },
         ])),
         indent: 0,

@@ -113,12 +113,29 @@ impl DiscoveryEndpoint {
         use std::io::{BufRead, Write};
         use std::os::unix::net::UnixListener;
         let apps = home.join("apps");
-        std::fs::create_dir_all(&apps).ok()?;
-        let socket = apps.join(format!("{}-{}.sock", std::process::id(), nonce));
-        let descriptor = apps.join(format!("{}-{}.json", std::process::id(), nonce));
+        if let Err(error) = std::fs::create_dir_all(&apps) {
+            eprintln!("panel-rust: snapshotd discovery create_dir_all({}) failed: {error}", apps.display());
+            return None;
+        }
+        // AF_UNIX socket paths are limited to roughly 108 bytes on Linux.
+        // Keep the filesystem names short because SNAPSHOTD_HOME may itself
+        // be a long worktree-scoped runtime path.  The nonce is still carried
+        // in the descriptor and registration payload, so the PID filename is
+        // only a bounded transport name, not the instance identity.
+        let socket = apps.join(format!("{}.sock", std::process::id()));
+        let descriptor = apps.join(format!("{}.json", std::process::id()));
         let _ = std::fs::remove_file(&socket);
-        let listener = UnixListener::bind(&socket).ok()?;
-        listener.set_nonblocking(true).ok()?;
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("panel-rust: snapshotd discovery bind({}) failed: {error}", socket.display());
+                return None;
+            }
+        };
+        if let Err(error) = listener.set_nonblocking(true) {
+            eprintln!("panel-rust: snapshotd discovery nonblocking setup failed: {error}");
+            return None;
+        }
         let project_path = Arc::new(Mutex::new(project_path));
         let project_for_thread = Arc::clone(&project_path);
         let nonce_for_thread = nonce.to_owned();
@@ -130,11 +147,21 @@ impl DiscoveryEndpoint {
             "instanceNonce": nonce,
             "protocolVersion": 1,
         });
-        std::fs::write(&descriptor, serde_json::to_vec(&descriptor_value).ok()?).ok()?;
+        let descriptor_bytes = match serde_json::to_vec(&descriptor_value) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("panel-rust: snapshotd discovery descriptor serialization failed: {error}");
+                return None;
+            }
+        };
+        if let Err(error) = std::fs::write(&descriptor, descriptor_bytes) {
+            eprintln!("panel-rust: snapshotd discovery write({}) failed: {error}", descriptor.display());
+            return None;
+        }
         let (stop, stop_rx) = mpsc::channel();
         let descriptor_for_thread = descriptor.clone();
         let socket_for_thread = socket.clone();
-        std::thread::Builder::new()
+        if let Err(error) = std::thread::Builder::new()
             .name("snapshotd-discovery".into())
             .spawn(move || {
                 loop {
@@ -177,7 +204,12 @@ impl DiscoveryEndpoint {
                 let _ = std::fs::remove_file(descriptor_for_thread);
                 let _ = std::fs::remove_file(socket_for_thread);
             })
-            .ok()?;
+        {
+            eprintln!("panel-rust: snapshotd discovery listener thread failed: {error}");
+            let _ = std::fs::remove_file(&descriptor);
+            let _ = std::fs::remove_file(&socket);
+            return None;
+        }
         Some(Self {
             stop,
             descriptor,
@@ -232,10 +264,23 @@ impl SnapshotdRegistration {
                 .map(PathBuf::from)
                 .or_else(|| {
                     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".snapshotd"))
+                })
+                .or_else(|| {
+                    eprintln!("panel-rust: snapshotd registration has no SNAPSHOTD_HOME or HOME");
+                    None
                 })?;
             let client = SnapshotdControlClient::new(home.join("control.sock"));
             let nonce = uuid::Uuid::new_v4().to_string();
-            let discovery = DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone())?;
+            let discovery = match DiscoveryEndpoint::start(&home, &nonce, initial_project_path.clone()) {
+                Some(discovery) => discovery,
+                None => {
+                    eprintln!(
+                        "panel-rust: snapshotd discovery endpoint failed (home={})",
+                        home.display()
+                    );
+                    return None;
+                }
+            };
             let (commands, receiver) = mpsc::channel();
             let instance_id = Arc::new(Mutex::new(None));
             let project_inventory = Arc::new(Mutex::new(None));
@@ -256,9 +301,8 @@ impl SnapshotdRegistration {
                             return;
                         };
                         while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                            let subscription = runtime.block_on(
-                                inventory_client.subscribe_projects_stream(),
-                            );
+                            let subscription =
+                                runtime.block_on(inventory_client.subscribe_projects_stream());
                             let Ok(mut subscription) = subscription else {
                                 std::thread::sleep(Duration::from_secs(1));
                                 continue;
@@ -273,10 +317,13 @@ impl SnapshotdRegistration {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(initial);
                             inventory_dirty.store(true, Ordering::SeqCst);
                             while !stop.load(Ordering::SeqCst) {
-                                let next = runtime.block_on(tokio::time::timeout(
-                                    Duration::from_secs(1),
-                                    subscription.updates.recv(),
-                                ));
+                                let next = runtime.block_on(async {
+                                    tokio::time::timeout(
+                                        Duration::from_secs(1),
+                                        subscription.updates.recv(),
+                                    )
+                                    .await
+                                });
                                 match next {
                                     Ok(Some(value)) => {
                                         *inventory_snapshot
@@ -455,12 +502,30 @@ async fn register_and_extract_id(
     client: &SnapshotdControlClient,
     registration: &ExternalInstanceRegistration,
 ) -> Option<String> {
-    let value = client.register_external_instance(registration).await.ok()?;
-    value
-        .get("instance")?
-        .get("instanceId")?
-        .as_str()
-        .map(str::to_owned)
+    let mut last_error = None;
+    for attempt in 0..10 {
+        match client.register_external_instance(registration).await {
+            Ok(value) => {
+                return value
+                    .get("instance")?
+                    .get("instanceId")?
+                    .as_str()
+                    .map(str::to_owned);
+            }
+            Err(error) => {
+                if attempt == 0 || attempt == 9 {
+                    eprintln!(
+                        "panel-rust: snapshotd external registration attempt {} failed: {error}",
+                        attempt + 1
+                    );
+                }
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    let _ = last_error;
+    None
 }
 
 fn process_start_identity() -> String {

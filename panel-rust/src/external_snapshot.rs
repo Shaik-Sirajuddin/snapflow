@@ -56,9 +56,9 @@ thread_local! {
 
 fn last_prefs_snapshot_if_scope(scope: &str) -> Option<msg::SettingsPreferencesSnapshot> {
     LAST_PREFS_SNAPSHOT.with(|cell| {
-        cell.borrow().as_ref().and_then(|(cached_scope, snap)| {
-            (cached_scope == scope).then(|| snap.clone())
-        })
+        cell.borrow()
+            .as_ref()
+            .and_then(|(cached_scope, snap)| (cached_scope == scope).then(|| snap.clone()))
     })
 }
 
@@ -120,7 +120,9 @@ impl<'a> ExternalSnapshotSource<'a> {
             .as_ref()
             .map(|bridge| {
                 (0..bridge.thread_count())
-                    .filter_map(|index| bridge.thread_binding(index).map(|binding| (index, binding)))
+                    .filter_map(|index| {
+                        bridge.thread_binding(index).map(|binding| (index, binding))
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -310,8 +312,11 @@ impl<'a> ExternalSnapshotSource<'a> {
             // Scope changed mid-window: fall through to one disk read.
         }
         let mut discarded_warnings = Vec::new();
-        let prefs =
-            crate::load_scoped_panel_prefs(scope, selected_thread_id.clone(), &mut discarded_warnings);
+        let prefs = crate::load_scoped_panel_prefs(
+            scope,
+            selected_thread_id.clone(),
+            &mut discarded_warnings,
+        );
         let (defaults, default_agent_id) = prefs
             .map(|prefs| (prefs.defaults, prefs.default_agent_id))
             .unwrap_or_else(|| {
@@ -538,7 +543,9 @@ impl<'a> ExternalSnapshotSource<'a> {
                 // rather than kept now that PISO-3 supplies a real
                 // recorded value for restored threads.
                 let project_path = models::display_project_path(
-                    thread_project_paths.get(item.real_index).map(String::as_str),
+                    thread_project_paths
+                        .get(item.real_index)
+                        .map(String::as_str),
                 );
                 row.project_name = std::path::Path::new(&project_path)
                     .file_name()
@@ -723,7 +730,9 @@ impl<'a> ExternalSnapshotSource<'a> {
         // one id (PUI-002c's expanded full-view source).
         let expanded_terminal = expanded_id.and_then(|id| {
             let buffer = bridge.terminal_buffer(real_idx, &id)?;
-            models::to_terminal_item_rows(vec![(id, Some(buffer))]).into_iter().next()
+            models::to_terminal_item_rows(vec![(id, Some(buffer))])
+                .into_iter()
+                .next()
         });
         // Terminal-tabs phase: resolve every currently-open tab id the same
         // way, in `open_terminal_ids`' own order (not `terminals`' order --

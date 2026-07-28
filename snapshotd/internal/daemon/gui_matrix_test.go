@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"snapshotd/internal/health"
 	"snapshotd/internal/registry"
 )
 
@@ -59,6 +60,203 @@ func TestGUIMatrix_DaemonAvailableAtGUIStart(t *testing.T) {
 	}
 	if listed[0].DiscoveryState != "registered" {
 		t.Fatalf("expected discoveryState=registered, got %q", listed[0].DiscoveryState)
+	}
+}
+
+func TestGUIMatrix_GUIRegistrationPreventsHeadlessDuplicateOnProjectOpen(t *testing.T) {
+	d := newTestDaemon(t, buildFixture(t))
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "gui-reuse"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	path := filepath.Join(project.RootDir, project.MltFileName)
+	if _, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "gui-reuse-nonce",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   path,
+		SAPSocketPath: filepath.Join(t.TempDir(), "not-a-real-gui.sap.sock"),
+	}); err != nil {
+		t.Fatalf("register GUI: %v", err)
+	}
+
+	// The fake GUI socket makes the final SAP bind fail, but the important
+	// invariant is checked before that bind: project.open must not launch a
+	// daemon-owned headless process while the GUI registration is live.
+	_, _ = d.ForwardSAP(ctx, "gui-reuse-session", &fanoutSink{}, "project.open", mustJSON(t, map[string]any{
+		"projectId": project.ID,
+	}))
+	instances, err := d.Reg.ListProcessInstancesByProject(project.ID)
+	if err != nil {
+		t.Fatalf("list process instances: %v", err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("GUI-owned project.open launched a duplicate daemon process: %+v", instances)
+	}
+}
+
+func TestGUIMatrix_DaemonFirstGUIRegistrationDrainsHeadlessBeforeLease(t *testing.T) {
+	d := newSapFixtureDaemon(t, buildSapFixture(t))
+	d.Proc.RunDir = filepath.Join("/tmp", "gui-matrix-handoff-run")
+	if err := os.MkdirAll(d.Proc.RunDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "daemon-first-handoff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project.RootDir, project.MltFileName)
+	guiSocket := filepath.Join(t.TempDir(), "gui.sap.sock")
+	guiListener, err := net.Listen("unix", guiSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = guiListener.Close() })
+	if !health.SocketResponsive(guiSocket, time.Second) {
+		t.Fatalf("GUI socket test listener was not responsive: %s", guiSocket)
+	}
+	launched, err := d.Launch(ctx, LaunchParams{ProjectID: project.ID})
+	if err != nil {
+		t.Fatalf("daemon launch: %v", err)
+	}
+	registered, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "daemon-first-handoff-nonce",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   path,
+		SAPSocketPath: guiSocket,
+	})
+	if err != nil {
+		t.Fatalf("GUI registration/handoff: %v", err)
+	}
+	if registered.Instance.Status != registry.ExternalStatusOpen {
+		t.Fatalf("GUI lease not open: %+v", registered.Instance)
+	}
+	row, err := d.Reg.GetProcessInstance(launched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status == registry.StatusReady || health.PIDAlive(row.PID) {
+		t.Fatalf("daemon-first handoff left headless process alive: %+v", row)
+	}
+	instances, err := d.Reg.ListProcessInstancesByProject(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, instance := range instances {
+		if instance.Status == registry.StatusStarting || instance.Status == registry.StatusReady {
+			t.Fatalf("handoff exposed a live daemon instance: %+v", instances)
+		}
+	}
+}
+
+func TestGUIMatrix_LateGuiSocketUpdateCompletesHandoff(t *testing.T) {
+	d := newSapFixtureDaemon(t, buildSapFixture(t))
+	d.Proc.RunDir = filepath.Join("/tmp", "gui-matrix-late-socket-run")
+	if err := os.MkdirAll(d.Proc.RunDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "late-gui-socket"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project.RootDir, project.MltFileName)
+	launched, err := d.Launch(ctx, LaunchParams{ProjectID: project.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guiSocket := filepath.Join(t.TempDir(), "late-gui.sap.sock")
+	registered, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "late-gui-socket-nonce",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   path,
+		SAPSocketPath: guiSocket,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guiListener, err := net.Listen("unix", guiSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = guiListener.Close() })
+	if _, err := d.UpdateOpenProject(ctx, UpdateExternalProjectParams{
+		InstanceID:  registered.Instance.ID,
+		ProjectPath: path,
+		Reason:      "opened",
+		Generation:  1,
+	}); err != nil {
+		t.Fatalf("late GUI update: %v", err)
+	}
+	row, err := d.Reg.GetProcessInstance(launched.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status == registry.StatusReady || health.PIDAlive(row.PID) {
+		t.Fatalf("late GUI socket update left daemon process alive: %+v", row)
+	}
+}
+
+func TestGUIMatrix_McpCloseDoesNotKillGuiOwnerThenRetryAfterGuiClose(t *testing.T) {
+	d := newSapFixtureDaemon(t, buildSapFixture(t))
+	d.Proc.RunDir = filepath.Join("/tmp", "gui-matrix-close-run")
+	if err := os.MkdirAll(d.Proc.RunDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	project, err := d.CreateProject(ctx, CreateProjectParams{Name: "close-order"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project.RootDir, project.MltFileName)
+	registered, err := d.RegisterExternalInstance(ctx, RegisterExternalInstanceParams{
+		InstanceNonce: "close-order-gui-nonce",
+		PID:           os.Getpid(),
+		ProcessStart:  mustProcessStart(t),
+		ProjectPath:   path,
+		SAPSocketPath: filepath.Join(t.TempDir(), "gui.sap.sock"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.RegisterMcpContext(ctx, RegisterMcpContextParams{
+		ContextToken:  "close-order-mcp",
+		ACPSessionID:  "close-order-session",
+		ChatProjectID: project.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UnregisterMcpContext(ctx, "close-order-mcp"); err != nil {
+		t.Fatal(err)
+	}
+	stillGui, err := d.Reg.GetExternalInstance(registered.Instance.ID)
+	if err != nil || stillGui.Status != registry.ExternalStatusOpen {
+		t.Fatalf("MCP close killed GUI lease: %+v err=%v", stillGui, err)
+	}
+
+	if err := d.UnregisterExternalInstance(ctx, registered.Instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	launched, err := d.Launch(ctx, LaunchParams{ProjectID: project.ID})
+	if err != nil {
+		t.Fatalf("headless retry after GUI close: %v", err)
+	}
+	instances, err := d.Reg.ListProcessInstancesByProject(project.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := 0
+	for _, instance := range instances {
+		if instance.Status == registry.StatusReady {
+			ready++
+		}
+	}
+	if ready != 1 || launched.Status != registry.StatusReady {
+		t.Fatalf("explicit retry did not create exactly one headless instance: %+v", instances)
 	}
 }
 

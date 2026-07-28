@@ -574,7 +574,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn save_thread_record_supersedes_a_dead_session_binding() {
         // consolidation plan phase 9: relaunch after a failed resume
@@ -664,7 +663,8 @@ mod tests {
     /// name untouched, using the exact same composition lib.rs's cold
     /// start calls.
     #[test]
-    fn a_persisted_default_sentinel_profile_is_stripped_on_restore_not_forwarded_to_a_real_session() {
+    fn a_persisted_default_sentinel_profile_is_stripped_on_restore_not_forwarded_to_a_real_session()
+    {
         let store = PanelStateStore::in_memory().unwrap();
         let poisoned = ThreadRecord {
             thread_id: "legacy-thread".to_owned(),

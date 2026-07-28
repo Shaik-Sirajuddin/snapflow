@@ -63,8 +63,16 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             apply_thread_ops(model, ops);
             // Phase 19: section counters (active vs archived) follow every
             // thread-list rebuild.
-            let archived = model.threads.iter().filter(|t| t.archived && !t.closed).count() as i32;
-            let active = model.threads.iter().filter(|t| !t.archived && !t.closed).count() as i32;
+            let archived = model
+                .threads
+                .iter()
+                .filter(|t| t.archived && !t.closed)
+                .count() as i32;
+            let active = model
+                .threads
+                .iter()
+                .filter(|t| !t.archived && !t.closed)
+                .count() as i32;
             component.set_active_thread_count(active);
             component.set_archived_thread_count(archived);
         }
@@ -135,8 +143,8 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
             // Match durable thread_id *or* session_id (same contract as
             // MessageStreamingDelta / frame snapshots). Comparing only
             // session_id dropped banners for pre-attach threads.
-            let for_displayed = thread_id.is_empty()
-                || displayed_thread_for_id(model, thread_id).is_some();
+            let for_displayed =
+                thread_id.is_empty() || displayed_thread_for_id(model, thread_id).is_some();
             if for_displayed {
                 component.set_last_error(detail.message.clone().into());
                 // PROF-8: same displayed-thread gate as last_error above --
@@ -275,7 +283,9 @@ fn sync_one(model: &Model, component: &ChatPanel, dirty: &Dirty) {
                 component.set_context_limit_tokens(thread.usage.1 as i32);
                 component.set_context_ratio(if thread.usage.1 > 0 {
                     (thread.usage.0 as f32 / thread.usage.1 as f32).clamp(0.0, 1.0)
-                } else { 0.0 });
+                } else {
+                    0.0
+                });
                 // PROF-11: agent-reported execution plan/todo list, and
                 // any live-pushed session title -- see `ChatArea.plan-
                 // entries`/`.live-session-title`'s doc comments.
@@ -371,9 +381,7 @@ pub(crate) fn apply_thread_row(model: &Model, real_index: usize) {
         })
         .unwrap_or(true);
     if needs_write {
-        model
-            .thread_model
-            .set_row_data(row_index, row.item.clone());
+        model.thread_model.set_row_data(row_index, row.item.clone());
     }
     // Keep the key cache on the durable id so the next lookup and
     // ThreadListDiff reconcile don't miss this slot.
@@ -390,7 +398,9 @@ fn thread_for_id<'a>(model: &'a Model, thread_id: &str) -> Option<&'a crate::mod
 
 fn displayed_thread_for_id(model: &Model, thread_id: &str) -> Option<usize> {
     let index = model.thread_index_for_id(thread_id)?;
-    model.displayed_thread.filter(|displayed| *displayed == index)
+    model
+        .displayed_thread
+        .filter(|displayed| *displayed == index)
 }
 
 fn sync_message_snapshot(model: &Model, thread_id: &str) {
@@ -617,12 +627,18 @@ fn apply_thread_ops(model: &Model, ops: &[RowOp<crate::models::VisibleThreadItem
     // self-heals within one frame instead of accumulating.
     let desired_len = model.thread_rows.len();
     while model.thread_model.row_count() > desired_len {
-        model.thread_model.remove(model.thread_model.row_count() - 1);
+        model
+            .thread_model
+            .remove(model.thread_model.row_count() - 1);
     }
     while keys.len() > desired_len {
         keys.pop();
     }
-    for row in model.thread_rows.iter().skip(model.thread_model.row_count()) {
+    for row in model
+        .thread_rows
+        .iter()
+        .skip(model.thread_model.row_count())
+    {
         model.thread_model.push(row.item.clone());
     }
     for row in model.thread_rows.iter().skip(keys.len()) {
@@ -797,7 +813,9 @@ fn apply_skill_ops(model: &Model, ops: &[RowOp<crate::SkillOption>]) {
         .map(|skill| skill.path.clone())
         .collect();
     while model.skills_model.row_count() > rows.len() {
-        model.skills_model.remove(model.skills_model.row_count() - 1);
+        model
+            .skills_model
+            .remove(model.skills_model.row_count() - 1);
     }
     while keys.len() > row_paths.len() {
         keys.pop();
@@ -1433,8 +1451,11 @@ mod tests {
 
         let row = model.thread_model.row_data(0).unwrap();
         assert_eq!(row.status, "loading");
-        assert!(row.busy, "the sidebar spinner's busy flag must flip immediately, not on the \
-                           next unrelated thread-list rebuild");
+        assert!(
+            row.busy,
+            "the sidebar spinner's busy flag must flip immediately, not on the \
+                           next unrelated thread-list rebuild"
+        );
     }
 
     #[test]
@@ -1607,7 +1628,7 @@ mod tests {
         // alone would already return; set displayed to A briefly to
         // isolate the owner-gap that streaming already closed).
         model.displayed_thread = Some(0); // weaker gate would allow
-        // list_owner still B — that is the inconsistent/race state.
+                                          // list_owner still B — that is the inconsistent/race state.
         let ops = vec![crate::dirty::RowOp::Insert {
             at: 0,
             row: crate::MessageItem {
@@ -1675,7 +1696,10 @@ mod tests {
 
         apply_message_row_patch(&model, "thread-a", 0);
 
-        assert_eq!(model.messages_model.row_data(0).unwrap().text, "belongs to B");
+        assert_eq!(
+            model.messages_model.row_data(0).unwrap().text,
+            "belongs to B"
+        );
         assert!(
             !model.messages_model.row_data(0).unwrap().expanded,
             "row patch for non-owner must not flip on-screen expand"
@@ -1719,7 +1743,10 @@ mod tests {
         sync_message_snapshot(&model, "thread-a");
 
         assert_eq!(model.messages_model.row_count(), 1);
-        assert_eq!(model.messages_model.row_data(0).unwrap().text, "belongs to B");
+        assert_eq!(
+            model.messages_model.row_data(0).unwrap().text,
+            "belongs to B"
+        );
         assert_eq!(
             *model.message_model_keys.borrow(),
             vec!["assistant:b-1".to_owned()]
@@ -1814,7 +1841,6 @@ mod tests {
         *model.message_model_keys.borrow_mut() = vec!["assistant:m-1".to_owned()];
 
         apply_message_streaming(&model, "thread-1", "m-1", " world");
-
 
         let row = model.messages_model.row_data(0).unwrap();
         assert_eq!(row.text, "hello world");
