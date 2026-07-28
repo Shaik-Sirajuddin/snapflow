@@ -161,6 +161,11 @@ impl SessionOpener for GatewaySessionOpener {
                 .ok_or_else(|| {
                     OpenError::retryable("session/new response had no sessionId field")
                 })?;
+            // The full response (including `configOptions`/`sessionModes`)
+            // is kept, not discarded -- a freshly pool-created session is
+            // never independently `session/resume`d by any other code
+            // path, so this is the only place its capabilities can ever be
+            // captured. See `SessionLease::capabilities`'s doc comment.
             Ok((session_id, Some(value)))
         })
     }

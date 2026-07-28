@@ -1803,11 +1803,18 @@ async fn run_thread_actor(
                     // `GatewaySessionOpener::create` already ran
                     // `session/new` for this session -- no second RPC
                     // here, just local notification wiring so future
-                    // reconnects can rehydrate it. Per the plan's
-                    // capability-loading precedence, this actor has no
-                    // `session/new` response to emit capability events
-                    // from; the caller is expected to fall back to
-                    // `models/list` for a freshly pool-created session.
+                    // reconnects can rehydrate it. `lease.capabilities`
+                    // carries that `session/new` response's configOptions/
+                    // sessionModes (see `SessionLease::capabilities`'s doc
+                    // comment) -- emitted here exactly like the resumed
+                    // branch above, so ChatInput's model/mode/agent
+                    // dropdowns populate for a freshly pool-created session
+                    // too, not just a resumed one. Only falls through to
+                    // `models/list` (the caller's own responsibility) when
+                    // the opener genuinely didn't report a response.
+                    if let Some(value) = lease.capabilities.as_ref() {
+                        emit_capability_events(value, &event_tx);
+                    }
                     client.register_session_replay(
                         &sid,
                         "session/load",

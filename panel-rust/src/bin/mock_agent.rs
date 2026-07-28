@@ -23,9 +23,9 @@ use agent_client_protocol::schema::v1::{
     DeleteSessionResponse, InitializeResponse, ListSessionsResponse, LoadSessionResponse,
     NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority,
     PlanEntryStatus, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    ResumeSessionRequest, ResumeSessionResponse, SessionId, SessionInfo, SessionInfoUpdate,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallId,
-    ToolCallUpdate, ToolCallUpdateFields,
+    ResumeSessionRequest, ResumeSessionResponse, SessionConfigOption, SessionConfigSelectOption,
+    SessionId, SessionInfo, SessionInfoUpdate, SessionNotification, SessionUpdate, StopReason,
+    TextContent, ToolCall, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result, Stdio};
 use std::collections::HashMap;
@@ -224,7 +224,28 @@ async fn main() -> Result<()> {
                 // this crate keys off `detail` by exact string match on
                 // prompt text, never `session/new`'s, so this is additive.
                 record_gateway_event("session/new", Some(&id), &request.cwd.to_string_lossy());
-                responder.respond(NewSessionResponse::new(SessionId::new(id)))
+                // acpx-client-session-lease-pool regression coverage: a real
+                // backend (claude-acp) advertises configOptions on its
+                // session/new response; this mock previously returned a
+                // bare response with none at all, which meant the
+                // "fresh-create sessions never got capability events" bug
+                // (see thread_actor.rs's AcquireAndAttach) was invisible to
+                // every mock-agent-backed e2e scenario -- there was nothing
+                // to fail to propagate. One fake "model" select option is
+                // enough for a test to assert ChatInput's config dropdown
+                // actually populates for a pool-created thread.
+                let config_options = vec![SessionConfigOption::select(
+                    "model",
+                    "Model",
+                    "mock-model-a",
+                    vec![
+                        SessionConfigSelectOption::new("mock-model-a", "Mock Model A"),
+                        SessionConfigSelectOption::new("mock-model-b", "Mock Model B"),
+                    ],
+                )];
+                responder.respond(
+                    NewSessionResponse::new(SessionId::new(id)).config_options(config_options),
+                )
             },
             agent_client_protocol::on_receive_request!(),
         )

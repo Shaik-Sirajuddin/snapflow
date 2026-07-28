@@ -108,7 +108,7 @@ struct Entry {
     /// resume response to read capabilities from -- can still populate its
     /// model/mode/agent config options instead of leaving them permanently
     /// empty. See `acpx-client-session-lease-pool`'s
-    /// `no-capabilities-on-fresh-create` fix note.
+    /// `fresh-create-had-no-capabilities-regression` fix note.
     capabilities: Option<serde_json::Value>,
 }
 
@@ -771,6 +771,10 @@ mod tests {
         /// `create()`) or an ordinary retryable failure (falls back).
         resume_failure_terminal: bool,
         create_delay: Duration,
+        /// What `create()` reports as the raw `session/new` response --
+        /// `None` by default (most tests don't care), settable per test to
+        /// verify capability threading through `acquire()`/warmup.
+        create_capabilities: Option<serde_json::Value>,
     }
 
     impl CountingOpener {
@@ -781,6 +785,7 @@ mod tests {
                 fail_resume: false,
                 resume_failure_terminal: false,
                 create_delay: Duration::from_millis(0),
+                create_capabilities: None,
             }
         }
     }
@@ -820,7 +825,7 @@ mod tests {
                     tokio::time::sleep(self.create_delay).await;
                 }
                 let n = self.creates.fetch_add(1, Ordering::SeqCst);
-                Ok((format!("session-{n}"), None))
+                Ok((format!("session-{n}"), self.create_capabilities.clone()))
             })
         }
     }
@@ -904,6 +909,62 @@ mod tests {
         assert!(lease.resumed_from_saved);
         assert_eq!(pool.opener.creates.load(Ordering::SeqCst), 0);
         assert_eq!(pool.opener.resumes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_create_carries_session_new_response_into_the_lease() {
+        // Regression test: a freshly pool-created session (never itself
+        // `session/resume`d by anyone) previously had no way to surface its
+        // `session/new` response's capabilities (configOptions/
+        // sessionModes) to the caller -- ChatInput's model/mode/agent
+        // dropdowns stayed permanently empty for every thread the pool
+        // created, since acpx's own capability-event emission only ran for
+        // the resumed branch. `SessionLease::capabilities` closes that gap.
+        let mut opener = CountingOpener::new();
+        opener.create_capabilities = Some(serde_json::json!({
+            "sessionId": "ignored-here",
+            "configOptions": [{"id": "model", "currentValue": "sonnet"}],
+        }));
+        let pool = Arc::new(ProjectSessionPool::new(opener));
+        let key = test_key();
+        let lease = pool
+            .acquire(key, "thread-a".to_string(), OpenSpec::default())
+            .await
+            .expect("acquire");
+        assert!(!lease.resumed_from_saved);
+        let capabilities = lease
+            .capabilities
+            .expect("a freshly created session must carry its session/new response");
+        assert_eq!(capabilities["configOptions"][0]["id"], "model");
+    }
+
+    #[tokio::test]
+    async fn a_warmed_idle_entry_still_carries_its_capabilities_when_later_leased() {
+        // Same gap, different path: the fast "reuse an already-idle entry"
+        // branch of acquire() must not silently drop the capabilities that
+        // were captured when that entry was originally created (by an
+        // earlier acquire() or by background warmup).
+        let mut opener = CountingOpener::new();
+        opener.create_capabilities = Some(serde_json::json!({"configOptions": []}));
+        let pool = Arc::new(ProjectSessionPool::new(opener));
+        let key = test_key();
+        let lease = pool
+            .clone()
+            .acquire(key.clone(), "thread-a".to_string(), OpenSpec::default())
+            .await
+            .expect("acquire");
+        pool.mark_turn_finished(&lease).await.ok();
+        pool.release(&lease).await.expect("release");
+        assert_eq!(pool.idle_for_key(&key).await, 1);
+
+        let lease2 = pool
+            .acquire(key, "thread-b".to_string(), OpenSpec::default())
+            .await
+            .expect("reacquire idle entry");
+        assert!(
+            lease2.capabilities.is_some(),
+            "reusing an idle entry must not drop its captured capabilities"
+        );
     }
 
     #[tokio::test]
